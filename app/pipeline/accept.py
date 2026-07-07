@@ -79,8 +79,7 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
 
         _assert_masters_active(sess, session_id, good_subs)  # [R6], scoped to reviewed subsystems
 
-        dal.mark_profiles_accepted(sess, session_id, good_subs)
-        # [R8] same scope as the profile update; subset=None means "accept all"
+        # [R8] subset=None means "accept all"
         dal.mark_scenarios_accepted(sess, session_id, good_subs, subset=subset)
 
         # AFTER the Accepted=1 update so promotion can gate on the scenarios the
@@ -91,7 +90,7 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
         dal.complete_session(sess, session_id)  # [R1] releases the M4 lock
 
         decision = AuditDecision.partial if subset is not None else AuditDecision.accept
-        for event in (AuditEventType.profiles_accepted, AuditEventType.scenarios_accepted, AuditEventType.review_decision):
+        for event in (AuditEventType.scenarios_accepted, AuditEventType.review_decision):
             dal.append_audit(sess, AuditID=guid(), SessionID=session_id, TenantID=session["TenantID"],
                              EntityID=str(entity_id), EventType=event, Decision=decision, ActorUserID=user_id,
                              DetailJSON=json.dumps({"subset": subset}) if subset is not None else None)

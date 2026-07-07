@@ -2,10 +2,10 @@
 sense, flagging problems for a human to see rather than silently pretending
 everything is fine.
 
-LLM response-shape validation (SDD §5.2/§5.6, [R8]) — the counterpart to
+LLM response-shape validation (SDD §5.6, [R8]) — the counterpart to
 prompts.py's outbound redaction. `parse_json` raises on malformed output so a
 stage fails LOUDLY through the existing `_record_failure` machinery (no new
-error plumbing); the `validate_*` checks are deterministic-only (SDD §8.4:
+error plumbing); `validate_scenario` is deterministic-only (SDD §8.4:
 grounding/validation is "not a correctness proof") — structural completeness
 plus a cheap keyword consistency proxy, no LLM-judge call.
 """
@@ -38,7 +38,7 @@ def parse_json(text: str, *, stage: str, expected_type: type = dict) -> Any:
 
     Parse an LLM reply as JSON, stripping a ```-fence if present. Raises
     LLMResponseParseError on decode failure OR wrong top-level type (threats must
-    be a list, profile/scenario a dict). Never returns a default ([R8]: parse
+    be a list, scenario a dict). Never returns a default ([R8]: parse
     failures are terminal stage errors, not silently-fabricated successes)."""
     t = (text or "").strip()
     if t.startswith("```"):
@@ -64,13 +64,13 @@ def _check_fields(obj: dict[str, Any], required: tuple[str, ...]) -> list[str]:
     """ checks that a list of required fields are all
     actually filled in with real text.
 
-    Shared structural check for validate_profile/validate_scenario: a field
+    Shared structural check validate_scenario uses: a field
     counts as missing if absent, None, or blank/whitespace-only, not just absent."""
     return [f"missing {f}" for f in required if not str(obj.get(f) or "").strip()]
 
 
 def _result(errors: list[str]) -> dict[str, Any]:
-    """Shared ValidationJSON envelope for validate_profile/validate_scenario —
+    """Shared ValidationJSON envelope validate_scenario uses —
     any error at all downgrades status to warning, never a hard failure."""
     status = ValidationStatus.ok if not errors else ValidationStatus.warning
     return {"validation_status": str(status), "errors": errors}
@@ -86,21 +86,6 @@ def _normalize_str_list(raw: Any) -> list[str]:
     if isinstance(raw, list):
         return [x for x in raw if isinstance(x, str)]
     return []
-
-
-def validate_profile(profile: dict[str, Any], sub_name: str) -> dict[str, Any]:
-    """ sanity-checks the Stage-1 profile — are the required
-    fields there, and does the summary actually mention the right subsystem?
-
-    §5.2 — structural (fields present, non-empty) + consistency proxy (summary
-    mentions the subsystem it describes). The model's self-reported `assumptions`
-    ("mark unverifiable statements", §5.2) pass through for the reviewer — never
-    a pass/fail trigger. Flags via ValidationJSON, never raises."""
-    errors = _check_fields(profile, ("subsystem_name", "summary"))
-    summary = str(profile.get("summary") or "")
-    if summary and sub_name and sub_name.lower() not in summary.lower():
-        errors.append("summary does not reference subsystem name")
-    return {**_result(errors), "assumptions": _normalize_str_list(profile.get("assumptions"))}
 
 
 def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_name: str | None) -> dict[str, Any]:
@@ -125,19 +110,14 @@ def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_
 if __name__ == "__main__":  # tiny self-check (no framework)
     for bad in ("not json", "[]"):
         try:
-            parse_json(bad, stage="profile", expected_type=dict)
+            parse_json(bad, stage="threats", expected_type=list)
             raise AssertionError(f"expected LLMResponseParseError for {bad!r}")
         except LLMResponseParseError as exc:
             assert "not json" not in str(exc)  # raw text never in the message
-    assert parse_json('{"a": 1}', stage="profile") == {"a": 1}
+    assert parse_json('{"a": 1}', stage="scenario") == {"a": 1}
     assert parse_json("```json\n[1, 2]\n```", stage="threats", expected_type=list) == [1, 2]
     # fenced list-of-OBJECTS (the threats shape): slice from the leading '[', not the inner '{'
     assert parse_json('```json\n[{"c": "Spoofing"}]\n```', stage="threats", expected_type=list) == [{"c": "Spoofing"}]
-
-    assert validate_profile({"subsystem_name": "CAD", "summary": "CAD supports the asset."}, "CAD") == \
-        {"validation_status": "ok", "errors": [], "assumptions": []}
-    assert validate_profile({"subsystem_name": "CAD", "summary": "Unrelated."}, "CAD")["validation_status"] == "warning"
-    assert validate_profile({}, "CAD")["errors"] == ["missing subsystem_name", "missing summary"]
 
     ok = validate_scenario({"scenario_title": "t", "scenario_statement": "Bootloader implant abuses X",
                             "business_impact": "b", "operational_impact": "o"}, "Firmware Tampering", "Bootloader implant")
@@ -146,7 +126,8 @@ if __name__ == "__main__":  # tiny self-check (no framework)
     # assumptions/excluded_details: pass-through + defensive coercion, never pass/fail
     assert _normalize_str_list(None) == [] and _normalize_str_list("guess") == ["guess"]
     assert _normalize_str_list(["a", 3, None, "b"]) == ["a", "b"]
-    rich = validate_profile({"subsystem_name": "CAD", "summary": "CAD supports the asset.",
-                             "assumptions": ["assumed 24x7 ops"]}, "CAD")
+    rich = validate_scenario({"scenario_title": "t", "scenario_statement": "Bootloader implant abuses X",
+                              "business_impact": "b", "operational_impact": "o",
+                              "assumptions": ["assumed 24x7 ops"]}, "Firmware Tampering", "Bootloader implant")
     assert rich["validation_status"] == "ok" and rich["assumptions"] == ["assumed 24x7 ops"]
     print("validation self-check ok")

@@ -47,6 +47,7 @@ Scenario_Session = Table(
     Column("ErrorMessage", UnicodeText),
     Column("IdempotencyKey", Unicode(200)),  # M8 — dedup key for POST /v1/sessions
     Column("SectorIDsJSON", UnicodeText),  # R6 — [sector_id, parent_sector_id] from gather_asset_details; NULL = [] (global-only masters)
+    Column("AssetContextJSON", UnicodeText),  # UI-supplied asset-level context (cii_asset_description, critical_service, sector, sub_sector, data_handled) — feeds the AI-prompt allowlist
     Column("CreatedAt", DateTime),
     Column("UpdatedAt", DateTime),
     Column("CompletedAt", DateTime),
@@ -73,20 +74,6 @@ Subsystem_Stage_State = Table(
 # ---------------------------------------------------------------------------
 # Pipeline outputs (entity resolved via the session; carry TenantID+SubsystemID)
 # ---------------------------------------------------------------------------
-Subsystem_Profile = Table(
-    "Subsystem_Profile", metadata,
-    Column("ProfileID", GUID, primary_key=True),
-    Column("SessionID", GUID, nullable=False),
-    Column("TenantID", Unicode(200)),
-    Column("EntityID", Unicode(200)),
-    Column("SubsystemID", Integer, nullable=False),
-    Column("ProfileJSON", UnicodeText, nullable=False),
-    Column("ValidationJSON", UnicodeText),  #  deterministic structural/consistency result
-    Column("Accepted", Integer, nullable=False, default=0),
-    Column("Superseded", Integer, nullable=False, default=0),
-    Column("CreatedAt", DateTime),
-)
-
 Identified_Threat = Table(
     "Identified_Threat", metadata,
     Column("ThreatID", GUID, primary_key=True),
@@ -246,7 +233,7 @@ Prompt_Log = Table(
     Column("EntityID", Unicode(200)),
     Column("UserID", Unicode(200)),
     Column("SubsystemID", Integer, nullable=False),
-    Column("Stage", Unicode(20), nullable=False),          # 'profile' | 'threats' | 'scenario'
+    Column("Stage", Unicode(20), nullable=False),          # 'threats' | 'scenario'
     Column("PromptVersion", Unicode(20), nullable=False),
     Column("Messages", UnicodeText, nullable=False),        # exact prompt sent (already redacted/allowlisted)
     Column("ResponseText", UnicodeText),                    # raw LLM reply, including malformed ones
@@ -328,17 +315,50 @@ onboarding_supporting_systems = Table(
     "onboarding_supporting_systems", metadata,
     Column("id", Integer, primary_key=True),
     Column("name", Unicode(300)),
-    Column("asset_type", Unicode(200)),
+    Column("asset_type", Integer),  # confirmed live: real int column (was mis-typed Unicode(200))
     Column("technology_used", UnicodeText),
-    Column("hosting_location", Unicode(200)),
+    Column("hosting_location", Integer),  # confirmed live: real int column (was mis-typed Unicode(200)); -> option_value.value where option_id=1015
     Column("url", Unicode(500)),
     Column("user_base_count", Integer),
     Column("vendor_name", Unicode(200)),
     Column("database_platforms", Unicode(300)),
-    Column("accessability_channel", Integer),  # [sic] real column is misspelled in the live DB; FK-like int, likely -> option_value
+    Column("accessability_channel", Integer),  # [sic] real column is misspelled in the live DB; -> option_value.value where option_id=1012
     Column("managed_by", Integer),  # FK-like int, likely -> user or option_value (not a display name); NOT NULL in the real DB, unenforced here like this table's other required columns
     Column("data_residency_restrictions", Boolean),  # bit flag, not free text
     Column("incident_description", UnicodeText),  # narrative of past incidents
+)
+
+# Read-only platform mirrors used by validate_ui_supplied_context (app/pipeline/context.py)
+# to check every UI-supplied session-creation field against the real DB.
+onboarding_services = Table(
+    "onboarding_services", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("name", Unicode(255)),
+)
+
+# "option" is a plain word but shares a name pattern with option_value below — the curator's
+# named option GROUP (e.g. "Accessibility Channel", id 1012; "Hosting Environment", id 1015).
+option = Table(
+    "option", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("option", Unicode(255)),
+)
+
+option_value = Table(
+    "option_value", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("name", Unicode(50)),
+    Column("value", Integer),  # CONFIRMED LIVE: the real FK target from onboarding_supporting_systems is THIS column, not `id`
+    Column("option_id", Integer),
+)
+
+user = Table(  # "user" is a reserved word; SQLAlchemy quotes it automatically — dbo.[user]
+    "user", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("name", Unicode(55)),
+    Column("surname", Unicode(55)),
+    Column("username", Unicode(55)),
+    Column("email", Unicode(55)),
 )
 
 # Tables that carry EntityID directly (DAL filters these by EntityID).

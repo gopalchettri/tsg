@@ -1,13 +1,13 @@
 """ This file runs the AI process for every supporting system in a session.
-For each supporting system, three things happen in order: the AI first writes
-a short profile describing the supporting system, then it suggests possible security
-threats for it, and finally it writes a full, detailed scenario for each
-threat that's worth pursuing. Doing this exact same three-part process once
+For each supporting system, two things happen in order: the AI first suggests
+possible security threats for it, using the asset/subsystem context the UI
+already supplied, and then it writes a full, detailed scenario for each
+threat that's worth pursuing. Doing this exact same two-part process once
 per supporting system, instead of once for the whole session, is what
 "fan-out" means in the technical note below — the same work is repeated
 ("fanned out") once for every item in a list, rather than run a single time.
 
-Pipeline orchestration — AUTO fan-out over supporting systems, Stages 1→3,
+Pipeline orchestration — AUTO fan-out over supporting systems, Stages 1→2,
 stopping at the single REVIEW.
 
 In even simpler terms: this file is written so it can be safely tested without a real
@@ -60,7 +60,7 @@ log = get_logger(__name__)
 # twice, the second attempt recognizes "this exact generation is already done" and
 # safely does nothing instead of duplicating the work.
 _EPOCH = 1
-_WORK_LEVELS = (SubsystemLevel.PROFILE, SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS)
+_WORK_LEVELS = (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS)
 
 
 def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, session: dict,
@@ -138,19 +138,32 @@ def set_up_progress_tracking(sess: Session, session_id: str, tenant_id: str, ent
             })
 
 
-def write_profile(sess: Session, session: dict, sub: dict, llm: LLMClient, task_id: str,
-                epoch: int = _EPOCH) -> tuple[dict | None, Provenance | None]:
-    """This is the first of the three steps described in the
-    module notes above — it asks the AI to write a short description of one
-    supporting system, and saves that description.
+def _safe_text(v: Any, default: str | None) -> str | None:
+    """Safely turns an AI-provided value into text, or a
+    safe default if it's not text.
 
-    Stage 1: Compare-And-Swap (CAS) claim PROFILE for this subsystem, generate the profile via
-    LLM, and persist it. Returns (None, None) if the claim fails (already COMPLETE or
-    owned by another worker) — callers must treat that as an idempotent no-op, not
-    an error."""
-    sid, ss, tenant, entity_id = session["SessionID"], sub["id"], session["TenantID"], session["EntityID"]
-    if not dal.claim_stage(sess, sid, ss, SubsystemLevel.PROFILE, epoch, task_id):
-        return None, None  # nothing to do — this step is already finished, or another worker is already handling it
+    Coerce an untrusted model field to `str`, or `default` for null / non-string, before it
+    reaches a DB string column; a `None` default lets the nullable `ThreatName` column stay
+    NULL. Now DELEGATES to `grounding.ensure_text` rather than mirroring it, so the two can never
+    drift apart."""
+    return grounding.ensure_text(v, default)
+
+
+def find_threats(sess: Session, session: dict, sub: dict, asset_context: dict, llm: LLMClient, task_id: str,
+                 epoch: int = _EPOCH) -> tuple[list[dict], Provenance | None]:
+    """This is the first of the two steps — it asks the
+    AI to suggest possible security threats for the supporting system, grounded in
+    the UI-supplied asset/subsystem context, then checks each suggested threat
+    against the organization's real, approved threat library.
+
+    Stage 1: CAS-claim THREATS, ask the LLM for threat proposals, then
+    ground each one before persisting. Returns ([], None) on a
+    failed claim — callers must treat that as an idempotent no-op, not an error
+    (THREATS is now the pipeline's first stage, so nothing precedes it that could
+    be lost on a Celery redelivery)."""
+    sid, ss, tenant = session["SessionID"], sub["id"], session["TenantID"]
+    if not dal.claim_stage(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
+        return [], None
     #  talking to the AI takes a while. This app handles many sessions
     # at once by having lots of small tasks quickly take turns — but the way this app
     # talks to its database can't take a "break" mid-task: once it starts waiting on
@@ -172,49 +185,8 @@ def write_profile(sess: Session, session: dict, sub: dict, llm: LLMClient, task_
     # immediately; a crash before the stage finishes is exactly the "mid-flight retry
     # resumes it" case claim_stage's own CAS (same task_id) already handles.
     sess.commit()
-    _send_live_update(sid, SSEEventType.stage_started, ss, SubsystemLevel.PROFILE, StageStatus.RUNNING, epoch)
-    profile, prov = _ask_ai(sess, llm, prompts.profile_prompt(session["AssetName"], sub),
-                              session=session, subsystem_id=ss, stage="profile", expected_type=dict)
-    val = validation.validate_profile(profile, sub["name"])  # checks the profile for obvious problems and notes them for a human reviewer — it never stops the pipeline, just leaves a note
-    dal.supersede(sess, m.Subsystem_Profile, sid, ss)
-    dal.insert_row(sess, m.Subsystem_Profile, {
-        "ProfileID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "SubsystemID": ss,
-        "ProfileJSON": json.dumps(profile), "ValidationJSON": json.dumps(val),
-        "Accepted": 0, "Superseded": 0, "CreatedAt": now(),
-    })
-    dal.set_stage(sess, sid, ss, SubsystemLevel.PROFILE, StageStatus.COMPLETE)
-    _send_live_update(sid, SSEEventType.stage_completed, ss, SubsystemLevel.PROFILE, StageStatus.COMPLETE, epoch)
-    log.info("stage.complete", session_id=sid, subsystem=ss, stage="PROFILE")
-    return profile, prov
-
-
-def _safe_text(v: Any, default: str | None) -> str | None:
-    """Safely turns an AI-provided value into text, or a
-    safe default if it's not text.
-
-    Coerce an untrusted model field to `str`, or `default` for null / non-string, before it
-    reaches a DB string column; a `None` default lets the nullable `ThreatName` column stay
-    NULL. Now DELEGATES to `grounding.ensure_text` rather than mirroring it, so the two can never
-    drift apart."""
-    return grounding.ensure_text(v, default)
-
-
-def find_threats(sess: Session, session: dict, sub: dict, profile: dict, llm: LLMClient, task_id: str,
-                 epoch: int = _EPOCH) -> tuple[list[dict], Provenance | None]:
-    """This is the second of the three steps — it asks the
-    AI to suggest possible security threats for the supporting system, then
-    checks each suggested threat against the organization's real, approved
-    threat library.
-
-    Stage 2: CAS-claim THREATS, ask the LLM for threat proposals, then
-    ground each one before persisting. Returns ([], None) on a
-    failed claim — same idempotent-no-op contract as write_profile."""
-    sid, ss, tenant = session["SessionID"], sub["id"], session["TenantID"]
-    if not dal.claim_stage(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
-        return [], None
-    sess.commit()  # saves progress to the database before waiting on the AI's reply — same reason explained in write_profile above
     _send_live_update(sid, SSEEventType.stage_started, ss, SubsystemLevel.THREATS, StageStatus.RUNNING, epoch)
-    proposals, prov = _ask_ai(sess, llm, prompts.threats_prompt(session["AssetName"], sub, profile),
+    proposals, prov = _ask_ai(sess, llm, prompts.threats_prompt(session["AssetName"], asset_context, sub),
                                 session=session, subsystem_id=ss, stage="threats", expected_type=list)
     dal.supersede(sess, m.Identified_Threat, sid, ss)
     threats: list[dict] = []
@@ -288,7 +260,7 @@ def _write_one_scenario(sess: Session, session: dict, sub: dict, sc, scoped_id: 
 
 def write_scenarios(sess: Session, session: dict, sub: dict, threats: list[dict], llm: LLMClient, task_id: str,
                   epoch: int = _EPOCH, target_threat_ids: set[str] | None = None) -> list[Provenance]:
-    """This is the third and final step — it scores and
+    """This is the second and final step — it scores and
     ranks all the threats found in the previous step, then writes a full,
     detailed scenario for each threat that's worth pursuing.
 
@@ -302,7 +274,7 @@ def write_scenarios(sess: Session, session: dict, sub: dict, threats: list[dict]
     sid, ss, tenant = session["SessionID"], sub["id"], session["TenantID"]
     if not dal.claim_stage(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id):
         return []
-    sess.commit()  # saves progress to the database before making the (possibly many) AI calls below — same reason explained in write_profile above
+    sess.commit()  # saves progress to the database before making the (possibly many) AI calls below — same reason explained in find_threats above
     _send_live_update(sid, SSEEventType.stage_started, ss, SubsystemLevel.SCENARIOS, StageStatus.RUNNING, epoch)
     # Look up any scoring rules that apply to these threats' matched types, and read the
     # score/count limits from the app's settings — these decide which threats are worth
@@ -510,14 +482,13 @@ def _announce_starting_supporting_system(sess: Session, session: dict, sub: dict
 
 def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClient, task_id: str) -> None:
     """The main loop — goes through every supporting system
-    in the session, one at a time, running all three steps (profile, then
-    threats, then scenarios) for each one. If one supporting system runs into a
-    problem, that failure is recorded and the loop simply moves on to the next
-    supporting system — one bad supporting system never stops the others from
-    being processed.
+    in the session, one at a time, running both steps (threats, then scenarios)
+    for each one. If one supporting system runs into a problem, that failure is
+    recorded and the loop simply moves on to the next supporting system — one bad
+    supporting system never stops the others from being processed.
 
     Top-level orchestration for one session: per-subsystem M4 lock,
-    then Stages 1→3 in order, committing after each stage so a crash mid-subsystem
+    then Stages 1→2 in order, committing after each stage so a crash mid-subsystem
     resumes cleanly rather than replaying from an in-memory checkpoint. A stage
     exception is caught here (not left to escape to the Celery wrapper) so one
     subsystem's failure doesn't abort the others still queued in this loop. The
@@ -527,6 +498,7 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
         return
     session = dict(session)
     subsystems = json.loads(session["SubsystemsJSON"])
+    asset_context = json.loads(session.get("AssetContextJSON") or "{}")  # parsed ONCE per session, not per-subsystem
     log.info("pipeline.start", session_id=session_id, subsystems=len(subsystems), task_id=task_id)
     for idx, sub in enumerate(subsystems):
         if not dal.acquire_lock(sess, session_id, sub["id"], task_id):
@@ -537,19 +509,9 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
                          .where(m.Scenario_Session.c.SessionID == session_id)
                          .values(CurrentSubsystemIndex=idx, UpdatedAt=now()))
             _announce_starting_supporting_system(sess, session, sub, idx)
-            profile, prov_p = write_profile(sess, session, sub, llm, task_id)
+            threats, prov_i = find_threats(sess, session, sub, asset_context, llm, task_id)
             sess.commit()
-            # If this exact step was already finished in an earlier attempt (for example,
-            # the worker crashed and this whole function is now running again), the
-            # function above won't redo the work — it just comes back with nothing new. So
-            # here we check: if we got nothing back, go fetch the ALREADY-SAVED result from
-            # the database instead, so the next step always has real information to work
-            # with, rather than accidentally working from an empty blank.
-            if profile is None:
-                profile = dal.get_active_profile(sess, session_id, sub["id"])
-            threats, prov_i = find_threats(sess, session, sub, profile or {}, llm, task_id)
-            sess.commit()
-            if not threats:  # same idea as above: either this step was already done before, or there truly are no threats — either way, re-checking the database gives the right answer
+            if not threats:  # either this step was already done before (idempotent no-op), or there truly are no threats — either way, re-checking the database gives the right answer
                 threats = dal.active_threats(sess, session_id, sub["id"])
             scen_provs = write_scenarios(sess, session, sub, threats, llm, task_id)
             # Save a record of exactly which AI calls produced this subsystem's results,
@@ -558,8 +520,7 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
                              EntityID=session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,
                              SubsystemID=sub["id"], EventType=AuditEventType.generation_complete,
                              DetailJSON=json.dumps({
-                                 "subsystem_id": sub["id"], "profile_provenance": _summarize_ai_call(prov_p),
-                                 "identify_provenance": _summarize_ai_call(prov_i),
+                                 "subsystem_id": sub["id"], "identify_provenance": _summarize_ai_call(prov_i),
                                  "scenario_provenances": [_summarize_ai_call(p) for p in scen_provs],
                                  "scenario_count": len(scen_provs)}))
             sess.commit()

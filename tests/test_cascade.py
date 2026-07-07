@@ -104,7 +104,7 @@ def test_concurrent_regen_same_subsystem_one_wins(db):
     res2 = db.execute(update(m.Scenario_Session).where(
         m.Scenario_Session.c.SessionID == sid, m.Scenario_Session.c.SessionStatus == "active",
         m.Scenario_Session.c.CurrentStage == WorkflowStage.REVIEW,
-    ).values(CurrentStage=WorkflowStage.PROFILE, StageStatus=StageStatus.RUNNING))
+    ).values(CurrentStage=WorkflowStage.THREAT_IDENTIFICATION, StageStatus=StageStatus.RUNNING))
     assert res1.rowcount == 1
     assert res2.rowcount == 0  # second request's identical CAS loses the race
 

@@ -8,7 +8,7 @@ from sqlalchemy import inspect
 
 from app.core.config import get_settings
 from app.db import dal
-from tests.conftest import make_client
+from tests.conftest import make_client, session_body
 from tests.test_slice import _seed_session
 
 
@@ -28,8 +28,8 @@ def test_idempotency_key_returns_same_session(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
     client = make_client({"5"})
     headers = {"Idempotency-Key": "k1"}
-    r1 = client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}, headers=headers)
-    r2 = client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}, headers=headers)
+    r1 = client.post("/v1/sessions", json=session_body(100), headers=headers)
+    r2 = client.post("/v1/sessions", json=session_body(100), headers=headers)
     assert r1.json()["session_id"] == r2.json()["session_id"]
     assert r2.status_code == 200
 
@@ -38,8 +38,8 @@ def test_idempotency_key_conflict_different_body(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
     client = make_client({"5"})
     headers = {"Idempotency-Key": "k2"}
-    client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}, headers=headers)
-    r2 = client.post("/v1/sessions", json={"asset_id": 200, "entity_id": "5"}, headers=headers)
+    client.post("/v1/sessions", json=session_body(100), headers=headers)
+    r2 = client.post("/v1/sessions", json=session_body(200), headers=headers)
     assert r2.status_code == 409
     assert r2.json()["error_code"] == "idempotency_key_conflict"
 
@@ -63,7 +63,7 @@ def test_create_session_race_distinguishes_idempotency_from_asset_conflict(db):
 
     base = {
         "TenantID": "default", "UserID": "u1", "EntityID": "5", "SessionStatus": SessionStatus.active,
-        "CurrentStage": WorkflowStage.PROFILE, "StageStatus": StageStatus.IDLE, "Mode": SessionMode.AUTO,
+        "CurrentStage": WorkflowStage.THREAT_IDENTIFICATION, "StageStatus": StageStatus.IDLE, "Mode": SessionMode.AUTO,
         "CurrentSubsystemIndex": 0, "SubsystemsJSON": "[]", "CreatedAt": now(), "UpdatedAt": now(),
         "IdempotencyKey": "shared-key",
     }

@@ -1,6 +1,6 @@
 """Unit tests for pure helpers in the pipeline orchestrator (`tasks.py`).
 
-Orchestration flow (write_profile/find_threats/write_scenarios) is covered end-to-end in
+Orchestration flow (find_threats/write_scenarios) is covered end-to-end in
 `test_slice.py` / `test_cascade.py`; this file pins the small, pure boundaries.
 """
 from __future__ import annotations

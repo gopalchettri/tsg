@@ -15,12 +15,32 @@ from pydantic import BaseModel, Field
 _MAX_BATCH = 50
 
 
+class SupportingSystemInput(BaseModel):
+    """One UI-supplied supporting system (13-field mapping item 7 onward) — `id` is the
+    real onboarding_supporting_systems PK (required; every downstream storage keys rows
+    by it), the rest is descriptive context validated against the DB by
+    `app.pipeline.context.validate_ui_supplied_context`."""
+    id: int
+    name: str
+    asset_type: int | None = None  # raw code — no label-lookup table exists for it
+    accessibility_channel: str | None = None
+    system_managed_by: str | None = None
+    hosting_environment: str | None = None
+    past_incidents: str | None = None
+    data_residency: bool | None = None
+
+
 class CreateSessionBody(BaseModel):
     asset_id: int
     entity_id: str
     sector_id: int | None = None
     user_id: str | None = None
-    service_id: int | None = None
+    cii_asset_description: str | None = None
+    critical_service: str | None = None
+    sector: str | None = None
+    sub_sector: str | None = None
+    data_handled: str | None = None
+    supporting_systems: list[SupportingSystemInput] = Field(min_length=1, max_length=_MAX_BATCH)
 
 
 class AcceptBody(BaseModel):
@@ -53,12 +73,6 @@ class CreateSessionResponse(BaseModel):
     session_id: str
 
 
-class ProfileResult(BaseModel):
-    supporting_system_id: int
-    profile: dict[str, Any]
-    accepted: bool
-
-
 class ThreatResult(BaseModel):
     threat_id: str
     supporting_system_id: int
@@ -77,7 +91,6 @@ class ScenarioResult(BaseModel):
 
 class SessionResults(BaseModel):
     session_id: str
-    profiles: list[ProfileResult]
     threats: list[ThreatResult]
     scenarios: list[ScenarioResult]
 

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import Principal, get_principal
 from app.api.schemas import (
     AcceptBody, AcceptedScenario, AcceptedScenariosResponse, AcceptResponse, CancelResponse, CreateSessionBody,
-    CreateSessionResponse, ProfileResult, RegenerateResponse, RegenerateScenariosBody, ScenarioResult, SessionBoard,
+    CreateSessionResponse, RegenerateResponse, RegenerateScenariosBody, ScenarioResult, SessionBoard,
     SessionResults, SupportingSystemBoard, ThreatResult,
 )
 from app.core.config import get_settings
@@ -31,7 +31,7 @@ from app.db.engine import db_session
 from app.pipeline import cascade
 from app.pipeline.accept import accept_session
 from app.pipeline.celery_app import regenerate_task, run_pipeline_task
-from app.pipeline.context import check_asset_belongs_to_entity, gather_asset_details
+from app.pipeline.context import check_asset_belongs_to_entity, gather_asset_details, validate_ui_supplied_context
 from app.pipeline.tasks import set_up_progress_tracking
 
 router = APIRouter(prefix="/v1")
@@ -43,13 +43,13 @@ def enqueue_pipeline(session_id: str) -> None:
 
 
 # --- status board ---
-def get_overall_status(profile: str, threats: str, scenarios: str, session_status: str) -> SubsystemProgress:
+def get_overall_status(threats: str, scenarios: str, session_status: str) -> SubsystemProgress:
     """Derived overall, evaluated top-to-bottom, first match wins. A subsystem
     that genuinely errored or completed still reports that specific fact even on a
     cancelled session (ERROR/COMPLETE checked first) — `cancelled` only applies where
     there's nothing more specific to say (e.g. AWAITING_DECISION would otherwise read
     as still-actionable on a session that's actually dead)."""
-    vals = (profile, threats, scenarios)
+    vals = (threats, scenarios)
     if StageStatus.ERROR in vals:
         return SubsystemProgress.error
     if all(v == StageStatus.COMPLETE for v in vals):
@@ -71,13 +71,12 @@ def build_board(sess: Session, session: dict) -> dict:
         pivot.setdefault(row["SubsystemID"], {})[str(row["Level"]).lower()] = str(row["Status"])
     supporting_systems = []
     for ssid, stages in pivot.items():
-        p = stages.get("profile", StageStatus.IDLE)
         t = stages.get("threats", StageStatus.IDLE)
         sc = stages.get("scenarios", StageStatus.IDLE)
         supporting_systems.append({
             "id": ssid, "name": names.get(ssid),
-            "stages": {"profile": p, "threats": t, "scenarios": sc},
-            "overall": str(get_overall_status(p, t, sc, session["SessionStatus"])),
+            "stages": {"threats": t, "scenarios": sc},
+            "overall": str(get_overall_status(t, sc, session["SessionStatus"])),
         })
     return {
         "session_id": session["SessionID"], "entity_id": session["EntityID"],
@@ -122,14 +121,23 @@ def create_session(
 
         dal.assert_capacity_available(sess)  # 503 before the more expensive gather_asset_details
 
+        supporting_systems = [s.model_dump() for s in body.supporting_systems]
         ctx = gather_asset_details(sess, asset_id=body.asset_id, entity_id=body.entity_id,
-                              sector_id=body.sector_id, user_id=body.user_id)
+                              sector_id=body.sector_id, user_id=body.user_id,
+                              supporting_systems=supporting_systems)
+        validate_ui_supplied_context(sess, asset_row=ctx["asset"], sector_row=ctx["sector"],
+                              parent_sector_row=ctx["parent_sector"], supporting_systems=supporting_systems, body=body)
+        asset_context = {
+            "cii_asset_description": body.cii_asset_description, "critical_service": body.critical_service,
+            "sector": body.sector, "sub_sector": body.sub_sector, "data_handled": body.data_handled,
+        }
         dal.create_session(sess, {
             "SessionID": sid, "TenantID": tenant, "EntityID": str(body.entity_id), "UserID": str(body.user_id),
             "AssetName": ctx["asset"]["name"], "AssetExternalID": str(body.asset_id),
-            "SessionStatus": SessionStatus.active, "CurrentStage": WorkflowStage.PROFILE,
+            "SessionStatus": SessionStatus.active, "CurrentStage": WorkflowStage.THREAT_IDENTIFICATION,
             "StageStatus": StageStatus.IDLE, "Mode": SessionMode.AUTO, "CurrentSubsystemIndex": 0,
             "SubsystemsJSON": ctx["subsystems_json"], "SectorIDsJSON": json.dumps(ctx["sector_ids"]),
+            "AssetContextJSON": json.dumps(asset_context),
             "CreatedAt": now(), "UpdatedAt": now(),
             "IdempotencyKey": idempotency_key,
         })
@@ -151,7 +159,7 @@ def get_session(session_id: str, principal: Principal = Depends(get_principal)) 
 
 @router.get("/sessions/{session_id}/results", response_model=SessionResults)
 def get_results(session_id: str, principal: Principal = Depends(get_principal)) -> SessionResults:
-    """Returns the current profiles/threats/scenarios for a session, filtered to the
+    """Returns the current threats/scenarios for a session, filtered to the
     non-superseded rows a regenerate cycle leaves behind. REVIEW-ONLY surface (SDD §9):
     includes unaccepted/rejected rows for the human reviewer — downstream consumers
     must use `GET /v1/assets/{asset_id}/accepted-scenarios` instead ([R13])."""
@@ -166,9 +174,6 @@ def get_results(session_id: str, principal: Principal = Depends(get_principal)) 
                 select(*cols).where(table.c.SessionID == sid, table.c.Superseded == 0)
             ).mappings()]
 
-        profiles = get_current_rows(m.Subsystem_Profile,
-                           [m.Subsystem_Profile.c.SubsystemID, m.Subsystem_Profile.c.ProfileJSON,
-                            m.Subsystem_Profile.c.Accepted])
         threats = get_current_rows(m.Identified_Threat,
                           [m.Identified_Threat.c.ThreatID, m.Identified_Threat.c.SubsystemID,
                            m.Identified_Threat.c.ThreatType, m.Identified_Threat.c.ThreatName,
@@ -179,9 +184,6 @@ def get_results(session_id: str, principal: Principal = Depends(get_principal)) 
 
         return SessionResults(
             session_id=sid,
-            profiles=[ProfileResult(supporting_system_id=p["SubsystemID"],
-                                    profile=json.loads(p["ProfileJSON"]),
-                                    accepted=bool(p["Accepted"])) for p in profiles],
             threats=[ThreatResult(threat_id=t["ThreatID"], supporting_system_id=t["SubsystemID"],
                                   threat_type=t["ThreatType"], threat_name=t["ThreatName"],
                                   grounding_status=t["GroundingStatus"],

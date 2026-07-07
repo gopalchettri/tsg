@@ -1,5 +1,5 @@
 """ this file contains the exact instructions sent to the AI
-at each of the 3 stages, written carefully so the AI can't be tricked into
+at each of the 2 stages, written carefully so the AI can't be tricked into
 treating a user's data as if it were a command.
 
 Fixed, versioned prompts (SDD §8.2). Context is inserted as clearly delimited
@@ -7,9 +7,8 @@ data (§10.2), never as instructions, and is built from an explicit allowlist of
 named fields (§10.3) — anything not on the list never reaches the model. This is
 the last-mile boundary before any external LLM call, so every free-text value is
 also run through the secret/PII redaction pass (recursively, nested lists/dicts
-included) — including the AI-generated `profile` reused downstream, named in
-§10.2 as untrusted data-plane input. Kept separate from orchestration so prompt
-changes are isolated, reviewable, and versioned via PROMPT_VERSION.
+included). Kept separate from orchestration so prompt changes are isolated,
+reviewable, and versioned via PROMPT_VERSION.
 """
 from __future__ import annotations
 
@@ -18,14 +17,17 @@ from typing import Any
 
 from app.core.security import allowlist_context, redact
 
-PROMPT_VERSION = "1.3"  # bump on ANY prompt-text change (SDD §8.2); recorded per call in Prompt_Log
+PROMPT_VERSION = "1.4"  # bump on ANY prompt-text change (SDD §8.2); recorded per call in Prompt_Log
 
-# §10.3 allowlists. `sub` carries exactly {id,name,exposure_level,criticality,interfaces}
-# from gather_asset_details — `id` excluded (internal FK, no informational value to the model).
-# `profile` is the Stage-1 LLM's own JSON output: only its two requested fields pass;
-# any hallucinated/injected extra key is structurally dropped, not just redacted.
-_SUB_ALLOWED = {"name", "exposure_level", "criticality", "interfaces"}
-_PROFILE_ALLOWED = {"subsystem_name", "summary"}
+# §10.3 allowlists. `asset_context` carries the UI-supplied asset-level fields (the PROFILE
+# stage's summarization step is gone — this is now the AI's only asset-level descriptive
+# context). `sub` carries the UI-supplied supporting-system fields from gather_asset_details
+# — `id` excluded (internal FK, no informational value to the model); `exposure_level`/
+# `criticality` also excluded from the model's view (they stay in the subsystem dict itself
+# for [R12] scoping, just aren't shown to the model).
+_ASSET_CONTEXT_ALLOWED = {"cii_asset_description", "critical_service", "sector", "sub_sector", "data_handled"}
+_SUB_ALLOWED = {"name", "asset_type", "accessibility_channel", "system_managed_by",
+               "hosting_environment", "data_residency", "past_incidents"}
 
 # STRIDE is a fixed, definitional taxonomy — enumerate it in the prompt so category
 # labels land on canonical names (grounding.find_category still does the real
@@ -44,45 +46,28 @@ _GENERATION_CONSTRAINTS = {"do_not_invent_facts": True, "no_exploit_instructions
                            "defensive_risk_language_only": True}
 
 
-def profile_prompt(asset_name: str, sub: dict[str, Any]) -> list[dict]:
-    """ builds the question that asks the AI to write a short
-    description of one supporting system.
-
-    Stage-1 call: asks the model to summarize how `sub` supports `asset_name`,
-    grounded only in the allowlisted subsystem fields. Its JSON output becomes the
-    untrusted `profile` re-fed into threats_prompt and scenario_prompt (SDD §10.2).
-    """
-    return [
-        {"role": "system", "content": "You describe how a supporting system supports an asset. "
-         "Do not invent facts not present in the provided context — assert only what the context states. "
-         "Do not describe attacks, vulnerabilities, or exploits. "
-         "Return JSON {subsystem_name, summary, assumptions} — list anything you had to assume in assumptions."},
-        {"role": "user", "content": _CONTEXT_PREFIX + json.dumps(
-            {"asset": redact(asset_name), "subsystem": allowlist_context(sub, _SUB_ALLOWED),
-             "generation_constraints": _GENERATION_CONSTRAINTS})},
-    ]
-
-
-def threats_prompt(asset_name: str, sub: dict[str, Any], profile: dict) -> list[dict]:
+def threats_prompt(asset_name: str, asset_context: dict[str, Any], sub: dict[str, Any]) -> list[dict]:
     """ builds the question that asks the AI to suggest
-    possible security threats based on the Stage-1 description — these are
-    just suggestions, never the final answer.
+    possible security threats for the supporting system, grounded in the
+    UI-supplied asset/subsystem context — these are just suggestions, never the
+    final answer.
 
-    Stage-2 call: proposes candidate STRIDE threats from the Stage-1 `profile`.
+    Stage-1 call: proposes candidate STRIDE threats from the UI-supplied context (the
+    PROFILE summarization step is gone — this is the pipeline's first stage now).
     These are suggestions only — the model decides nothing final, since every
     candidate is independently matched against the approved threat library
     downstream and anything unverified is discarded.
     """
     return [
         {"role": "system", "content": "Propose STRIDE threats using ONLY these categories: "
-         + ", ".join(_STRIDE_CATEGORIES) + ". Ground proposals ONLY in the supplied profile/context; "
+         + ", ".join(_STRIDE_CATEGORIES) + ". Ground proposals ONLY in the supplied asset/subsystem context; "
          "do not propose threats irrelevant to it. These are suggestions only — every candidate is "
          "independently verified against an approved threat library and unverified ones are discarded; "
          "you decide nothing. No exploit instructions, payloads, or procedural attack steps."
          " Return JSON list of {category, type, name, actors:[]}."},
         {"role": "user", "content": _CONTEXT_PREFIX + json.dumps(
-            {"asset": redact(asset_name), "subsystem": allowlist_context(sub, _SUB_ALLOWED),
-             "profile": allowlist_context(profile, _PROFILE_ALLOWED),
+            {"asset": redact(asset_name), "asset_context": allowlist_context(asset_context, _ASSET_CONTEXT_ALLOWED),
+             "subsystem": allowlist_context(sub, _SUB_ALLOWED),
              "generation_constraints": _GENERATION_CONSTRAINTS})},
     ]
 
@@ -92,8 +77,8 @@ def scenario_prompt(asset_name: str, sub: dict[str, Any], threat_type: str | Non
     full scenario for ONE threat that's already been checked against the real
     threat library.
 
-    Stage-3 call: narrates a single verified threat into a scenario. `threat_type`/
-    `threat_name` come from the library match, not the raw Stage-2 proposal, so the
+    Stage-2 call: narrates a single verified threat into a scenario. `threat_type`/
+    `threat_name` come from the library match, not the raw Stage-1 proposal, so the
     scenario stays anchored to an approved threat even though the write-up itself is
     still model-generated free text (redacted like every other field here).
     """

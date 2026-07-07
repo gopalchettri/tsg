@@ -11,7 +11,8 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.security import AuthError
 from app.db.dal import (
-    CapacityExceeded, EntityForbidden, IdempotencyKeyConflict, NotFoundError, RegenerateConflict, SessionConflict,
+    CapacityExceeded, ContextMismatchError, EntityForbidden, IdempotencyKeyConflict, NotFoundError,
+    RegenerateConflict, SessionConflict,
 )
 from app.pipeline.accept import AcceptConflict, MasterInactive
 
@@ -61,6 +62,13 @@ def register_error_handlers(app: FastAPI) -> None:
     async def _not_found(_: Request, exc: NotFoundError):
         """Requested entity doesn't exist (or isn't visible to this caller) -> 404."""
         return JSONResponse(status_code=404, content=_env("not_found", str(exc)))
+
+    @app.exception_handler(ContextMismatchError)
+    async def _context_mismatch(_: Request, exc: ContextMismatchError):
+        """One or more UI-supplied session-creation fields don't match the platform's records -> 422."""
+        return JSONResponse(status_code=422, content=_env(
+            "context_mismatch", "one or more supplied values don't match the platform's records",
+            mismatches=exc.mismatches))
 
     @app.exception_handler(CapacityExceeded)
     async def _capacity(_: Request, exc: CapacityExceeded):

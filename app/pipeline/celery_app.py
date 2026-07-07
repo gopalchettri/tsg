@@ -93,9 +93,8 @@ def run_pipeline_task(self, session_id: str) -> None:
 @celery_app.task(bind=True, name="tsg.regenerate")
 def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
                     target_ids: list[str] | list[int] | None, epoch: int, user_note: str | None = None) -> None:
-    """ this is the background job that redoes one or more parts of a
-    session (scenarios, threats, threat types/categories, or the profile) when the user
-    clicks "regenerate."
+    """ this is the background job that redoes one or more scenarios
+    of a session when the user clicks "regenerate."
 
     `target_ids` carries the full requested list across the Celery task boundary — plain
     JSON-serializable list, no broker change needed (plan item 0). `epoch` is reserved once

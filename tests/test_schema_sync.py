@@ -17,7 +17,8 @@ _SQL = (Path(__file__).resolve().parents[1] / "scripts" / "bootstrap_schema.sql"
 
 # Platform-owned tables the script deliberately does not create (SDD §7.7).
 _PLATFORM = {"group", "onboarding_sectors", "ctm_scan_entity", "onboarding_service_entity",
-             "ctm_scan_entity_supporting_system", "onboarding_supporting_systems"}
+             "ctm_scan_entity_supporting_system", "onboarding_supporting_systems",
+             "onboarding_services", "option", "option_value", "user"}
 
 
 def _create_block(table_name: str) -> str:

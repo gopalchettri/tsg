@@ -16,7 +16,7 @@ process level, and doing that inside an asyncio process broke every request
 module instead of here.
 
 A second, related freeze was found and fixed after this patch landed: `claim_stage`'s
-row lock (in tasks.write_profile/find_threats/write_scenarios) used to stay open
+row lock (in tasks.find_threats/write_scenarios) used to stay open
 across the LLM call that followed it, because the caller's only commit came after
 the whole stage returned — so any other pyodbc query touching that same row (the
 reaper's own targeted UPDATE, if a stage ever ran past its lease) could block-wait

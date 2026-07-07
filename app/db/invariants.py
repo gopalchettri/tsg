@@ -53,10 +53,9 @@ from app.db import models as m
 # code now depends on.
 # ============================================================================
 REQUIRED_INDEXES = [
-    # One active session per asset / one active profile per subsystem / one
-    # active scenario per scoped threat. Stops duplicate "current" rows from
-    # a retried or racing request.
-    "UX_Session_ActiveAsset", "UX_Profile_Active", "UX_Scenario_ActiveIdentity",
+    # One active session per asset / one active scenario per scoped threat. Stops
+    # duplicate "current" rows from a retried or racing request.
+    "UX_Session_ActiveAsset", "UX_Scenario_ActiveIdentity",
     # Master-library natural-key UNIQUE. Stops two people accepting sessions at
     # the same moment from both creating a DUPLICATE "Ransomware via USB"
     # threat type in the shared library (safe concurrent promotion, R10).
@@ -108,7 +107,6 @@ REQUIRED_NOT_NULL = [
 # not a missing setup step like checklists 1 and 2.
 #
 # Each entry is (table, [columns that define "one group"]):
-#   - Subsystem_Profile: one active profile per (session, subsystem)
 #   - Threat_Scenario_Output: one active scenario per (session, scoped threat)
 # Identified_Threat / Scoped_Threat are deliberately NOT here — those tables
 # are meant to hold MANY active rows per subsystem (a whole set of threats),
@@ -117,7 +115,6 @@ REQUIRED_NOT_NULL = [
 # compare-and-swap), not this uniqueness check.
 # ============================================================================
 ACTIVE_UNIQUE = [
-    (m.Subsystem_Profile, ["SessionID", "SubsystemID"]),
     (m.Threat_Scenario_Output, ["SessionID", "ScopedThreatID"]),
 ]
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from app.pipeline.validation import (
-    LLMResponseParseError, _normalize_str_list, parse_json, validate_profile, validate_scenario,
+    LLMResponseParseError, _normalize_str_list, parse_json, validate_scenario,
 )
 
 GARBAGE = "Sorry, I can't produce JSON right now {{{"
@@ -71,25 +71,6 @@ def test_parse_json_wraps_recursion_error_as_terminal(monkeypatch):
         parse_json('{"deep": 1}', stage="threats", expected_type=dict)
 
 
-# --- validate_profile (§5.2) ---
-def test_validate_profile_ok():
-    v = validate_profile({"subsystem_name": "CAD System", "summary": "The CAD System supports dispatch."},
-                         "CAD System")
-    assert v == {"validation_status": "ok", "errors": [], "assumptions": []}
-
-
-def test_validate_profile_warns_when_summary_unrelated():
-    v = validate_profile({"subsystem_name": "CAD System", "summary": "Something else entirely."}, "CAD System")
-    assert v["validation_status"] == "warning"
-    assert "summary does not reference subsystem name" in v["errors"]
-
-
-def test_validate_profile_warns_on_missing_fields_and_never_raises():
-    v = validate_profile({}, "CAD System")  # garbage in → warning out, no exception
-    assert v["validation_status"] == "warning"
-    assert v["errors"] == ["missing subsystem_name", "missing summary"]
-
-
 # --- validate_scenario (§5.6) ---
 def test_validate_scenario_ok():
     v = validate_scenario(
@@ -129,14 +110,6 @@ def test_normalize_str_list_coerces_malformed_shapes():
     assert _normalize_str_list("assumed 24x7 ops") == ["assumed 24x7 ops"]
     assert _normalize_str_list(["a", 3, None, {"x": 1}, "b"]) == ["a", "b"]
     assert _normalize_str_list({"not": "a list"}) == []
-
-
-def test_validate_profile_passes_through_assumptions():
-    v = validate_profile(
-        {"subsystem_name": "CAD System", "summary": "The CAD System supports dispatch.",
-         "assumptions": ["assumed internet-facing"]}, "CAD System")
-    assert v["assumptions"] == ["assumed internet-facing"]
-    assert v["validation_status"] == "ok"  # disclosure is informational, never a warning trigger
 
 
 def test_validate_scenario_passes_through_assumptions_and_exclusions():

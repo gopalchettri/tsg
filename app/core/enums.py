@@ -27,11 +27,10 @@ class SessionMode(StrEnum):
 
 
 class WorkflowStage(StrEnum):
-    """PROFILE through APPROVED are ordered forward steps of the pipeline.
+    """THREAT_IDENTIFICATION through APPROVED are ordered forward steps of the pipeline.
     CANCELLED is not a step — it's a terminal exit from any of them."""
-    PROFILE = "PROFILE"                              # Stage 1: AI writes each supporting system's descriptive profile
-    THREAT_IDENTIFICATION = "THREAT_IDENTIFICATION"  # Stage 2: AI proposes STRIDE threats, each grounded against the library
-    SCENARIO_GENERATION = "SCENARIO_GENERATION"      # Stage 3: AI narrates one scenario per selected threat; ends at AWAITING_DECISION
+    THREAT_IDENTIFICATION = "THREAT_IDENTIFICATION"  # Stage 1: AI proposes STRIDE threats, each grounded against the library
+    SCENARIO_GENERATION = "SCENARIO_GENERATION"      # Stage 2: AI narrates one scenario per selected threat; ends at AWAITING_DECISION
     REVIEW = "REVIEW"                                # every subsystem reached its review barrier; session waits on the one human decision
     APPROVED = "APPROVED"                            # the human accepted (all or partial) — terminal, pairs with SessionStatus.completed
     CANCELLED = "CANCELLED"                          # terminal exit from any stage above — user cancel, fatal error, or reaper
@@ -50,15 +49,14 @@ class StageStatus(StrEnum):
 
 class SubsystemLevel(StrEnum):
     """One work cell within a subsystem — NOT a one-to-one mirror of `WorkflowStage`:
-    only 3 of its 6 members correspond (with different names: THREATS vs
+    only 2 of its 3 real-work members correspond (with different names: THREATS vs
     THREAT_IDENTIFICATION, SCENARIOS vs SCENARIO_GENERATION), `LOCK` has no
     `WorkflowStage` counterpart at all, and `WorkflowStage`'s REVIEW/APPROVED/CANCELLED
     have no `SubsystemLevel` counterpart. Different enum on a different column
     (`Subsystem_Stage_State.Level` vs `Scenario_Session.CurrentStage`); never conflate
     the two, a mistake this codebase's own docs warn against repeatedly."""
-    PROFILE = "PROFILE"      # this subsystem's Stage-1 row — mirrors WorkflowStage.PROFILE
-    THREATS = "THREATS"      # this subsystem's Stage-2 row — mirrors WorkflowStage.THREAT_IDENTIFICATION
-    SCENARIOS = "SCENARIOS"  # this subsystem's Stage-3 row — mirrors WorkflowStage.SCENARIO_GENERATION
+    THREATS = "THREATS"      # this subsystem's Stage-1 row — mirrors WorkflowStage.THREAT_IDENTIFICATION
+    SCENARIOS = "SCENARIOS"  # this subsystem's Stage-2 row — mirrors WorkflowStage.SCENARIO_GENERATION
     LOCK = "_LOCK"          # member named LOCK; DB value is the literal "_LOCK". A per-subsystem
                             # mutex sentinel row (acquired/released as a CAS lock) — not a fourth
                             # real work stage, which is why code filters `Level != LOCK` so often.
@@ -122,8 +120,7 @@ class AuditEventType(StrEnum):
     generation_complete = "generation_complete"         # written once per subsystem after all 3 stages finish; DetailJSON carries full LLM provenance
     entered_review = "entered_review"                   # written once per session when every subsystem reaches the review barrier
     review_decision = "review_decision"                 # the human's verdict at the single review gate (accept/partial)
-    profiles_accepted = "profiles_accepted"             # Stage-1 outputs (Subsystem_Profile) flipped Accepted=1
-    scenarios_accepted = "scenarios_accepted"           # Stage-3 outputs (Threat_Scenario_Output) flipped Accepted=1
+    scenarios_accepted = "scenarios_accepted"           # Stage-2 outputs (Threat_Scenario_Output) flipped Accepted=1
     regeneration_completed = "regeneration_completed"   # one regenerate request finished its stage re-runs
     threat_regrounded = "threat_regrounded"             # a threat was re-matched to the library during threat-granularity regen
     subsystem_advanced = "subsystem_advanced"           # written once per subsystem at the START of its work, not on completion
@@ -158,14 +155,14 @@ class RegenGranularity(StrEnum):
 class SubsystemProgress(StrEnum):
     """Fully derived (`get_overall_status()` in app/api/sessions.py) — never a stored column. The
     status board's `overall` field is built fresh on every read, not persisted.
-    Evaluated top-to-bottom, first match wins: any stage ERROR -> error; all three
+    Evaluated top-to-bottom, first match wins: any stage ERROR -> error; both
     COMPLETE -> complete; the session itself cancelled -> cancelled; SCENARIOS =
-    AWAITING_DECISION -> awaiting_review; all three IDLE -> pending; otherwise -> in_progress."""
-    pending = "pending"                # nothing started yet — all three stage rows are IDLE
+    AWAITING_DECISION -> awaiting_review; both IDLE -> pending; otherwise -> in_progress."""
+    pending = "pending"                # nothing started yet — both stage rows are IDLE
     in_progress = "in_progress"        # the fallback/default rollup — some stage work is underway
     awaiting_review = "awaiting_review"  # SCENARIOS reached AWAITING_DECISION — this subsystem's part of the review barrier
-    complete = "complete"              # all three stages reached StageStatus.COMPLETE
-    error = "error"                    # any of the three stages is StageStatus.ERROR — takes priority over every other rollup
+    complete = "complete"              # both stages reached StageStatus.COMPLETE
+    error = "error"                    # either stage is StageStatus.ERROR — takes priority over every other rollup
     cancelled = "cancelled"            # the session itself was cancelled while this subsystem had no more specific outcome
 
 

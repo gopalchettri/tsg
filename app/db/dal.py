@@ -6,7 +6,6 @@ once, correctly.
 """
 from __future__ import annotations
 
-import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -48,6 +47,18 @@ class EntityForbidden(Exception):
 
 class NotFoundError(Exception):
     """Requested entity does not exist → 404."""
+
+
+class ContextMismatchError(Exception):
+    """One or more UI-supplied session-creation fields don't match the platform's own
+    records (`validate_ui_supplied_context`) → 422. Carries every mismatch found in one
+    pass, not just the first, so the caller can report them all at once."""
+
+    def __init__(self, mismatches: list[dict]):
+        """`mismatches` is a list of {field, expected, got} dicts — one per field that
+        failed the check, collected before raising (never raised on the first failure)."""
+        self.mismatches = mismatches
+        super().__init__(mismatches)
 
 
 def active(table) -> Any:
@@ -381,7 +392,7 @@ def next_epoch(sess: Session, session_id: str, subsystem_id: int, levels: tuple)
     """max(GenerationEpoch) scoped to ONLY the levels touched in this regen hop, +1.
     Deliberately narrower than a subsystem-wide max: an untouched level's epoch
     lineage is never disturbed by an unrelated regen (e.g. regenerating SCENARIOS
-    doesn't bump PROFILE's epoch number)."""
+    doesn't bump THREATS' epoch number)."""
     current = sess.execute(
         select(func.max(m.Subsystem_Stage_State.c.GenerationEpoch)).where(
             m.Subsystem_Stage_State.c.SessionID == session_id,
@@ -485,31 +496,6 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
         .where(out.c.SessionID == session_id, out.c.Accepted == 1, out.c.Superseded == 0)
         .order_by(out.c.SubsystemID, out.c.OutputID)
     ).mappings()]
-
-
-def get_active_profile(sess: Session, session_id: str, subsystem_id: int) -> dict | None:
-    """The current active profile dict, for granularities that don't regenerate
-    PROFILE itself but still need it to build the threats prompt (`threat_type`)."""
-    row = sess.execute(
-        select(m.Subsystem_Profile.c.ProfileJSON).where(
-            m.Subsystem_Profile.c.SessionID == session_id,
-            m.Subsystem_Profile.c.SubsystemID == subsystem_id,
-            m.Subsystem_Profile.c.Superseded == 0,
-        )
-    ).scalar()
-    return json.loads(row) if row else None
-
-
-def mark_profiles_accepted(sess: Session, session_id: str, subsystem_ids: list[int]) -> None:
-    """Sets Accepted=1 on every non-superseded profile for these subsystems (accept, §5.7)."""
-    sess.execute(
-        update(m.Subsystem_Profile)
-        .where(
-            m.Subsystem_Profile.c.SessionID == session_id, m.Subsystem_Profile.c.Superseded == 0,
-            m.Subsystem_Profile.c.SubsystemID.in_(subsystem_ids),
-        )
-        .values(Accepted=1)
-    )
 
 
 def mark_scenarios_accepted(

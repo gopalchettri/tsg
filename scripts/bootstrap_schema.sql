@@ -1,10 +1,12 @@
 -- ============================================================================
 -- TSG bootstrap schema — THE one-stop production script for the TSG database.
--- Consolidates the baseline TSG tables + migrations 0002-0017 into one
+-- Consolidates the baseline TSG tables + migrations 0002-0020 into one
 -- idempotent T-SQL script. (0017 is a legacy-data vocabulary rename on
 -- Scenario_Audit.EventType — no schema/DDL change, so a fresh bootstrap DB
--- has nothing to apply for it; it only matters when healing an existing DB.) Production databases are stood up AND upgraded by
--- re-running this script alone; alembic is the dev-environment mechanism.
+-- has nothing to apply for it; it only matters when healing an existing DB.
+-- 0019 drops Subsystem_Profile — the PROFILE stage no longer exists.) Production
+-- databases are stood up AND upgraded by re-running this script alone; alembic
+-- is the dev-environment mechanism.
 --
 -- Contract (safe to re-run any time, from any prior version of this script):
 --   * creates any missing table (final, fully-migrated shape);
@@ -25,9 +27,9 @@
 --
 -- Alembic is NOT required for a database managed by this script. Only if
 -- alembic will ever manage this database (dev environments): run
--- `alembic stamp 0017` once after this script (its DDL matches migrations
--- 0002-0017 exactly). If newer migrations exist by the time you're reading
--- this (check migrations/versions/ against the range above), stamp 0017
+-- `alembic stamp 0020` once after this script (its DDL matches migrations
+-- 0002-0020 exactly). If newer migrations exist by the time you're reading
+-- this (check migrations/versions/ against the range above), stamp 0020
 -- first, then run `alembic upgrade head` to pick up anything added since.
 --
 -- tests/test_schema_sync.py asserts every models.py column appears in the
@@ -56,6 +58,7 @@ CREATE TABLE Scenario_Session (
     ErrorMessage          nvarchar(max)  NULL,
     IdempotencyKey        nvarchar(200)  NULL,              -- M8/[R9]
     SectorIDsJSON         nvarchar(max)  NULL,              -- R6: sector_ids from gather_asset_details
+    AssetContextJSON      nvarchar(max)  NULL,              -- 0020: UI-supplied asset-level context
     CreatedAt             datetime2      NULL,
     UpdatedAt             datetime2      NULL,
     CompletedAt           datetime2      NULL
@@ -77,20 +80,6 @@ CREATE TABLE Subsystem_Stage_State (
     AttemptCount     int           NOT NULL CONSTRAINT DF_SSS_AttemptCount DEFAULT 0,  -- M8 poison-terminal cap
     ErrorMessage     nvarchar(max) NULL,
     UpdatedAt        datetime2     NOT NULL
-);
-
-IF OBJECT_ID('dbo.Subsystem_Profile', 'U') IS NULL
-CREATE TABLE Subsystem_Profile (
-    ProfileID       nvarchar(36)  NOT NULL CONSTRAINT PK_Subsystem_Profile PRIMARY KEY,
-    SessionID       nvarchar(36)  NOT NULL,
-    TenantID        nvarchar(200) NULL,
-    EntityID        nvarchar(200) NULL,
-    SubsystemID     int           NOT NULL,
-    ProfileJSON     nvarchar(max) NOT NULL,
-    ValidationJSON  nvarchar(max) NULL,                     -- 0011/§5.2
-    Accepted        int           NOT NULL,
-    Superseded      int           NOT NULL,
-    CreatedAt       datetime2     NULL
 );
 
 IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NULL
@@ -176,7 +165,7 @@ CREATE TABLE Prompt_Log (
     EntityID        nvarchar(200) NULL,
     UserID          nvarchar(200) NULL,
     SubsystemID     int           NOT NULL,
-    Stage           nvarchar(20)  NOT NULL,                 -- 'profile'|'threats'|'scenario'
+    Stage           nvarchar(20)  NOT NULL,                 -- 'threats'|'scenario'
     PromptVersion   nvarchar(20)  NOT NULL,
     Messages        nvarchar(max) NOT NULL,                 -- already-redacted/allowlisted prompt sent
     ResponseText    nvarchar(max) NULL,                     -- raw LLM reply, incl. malformed ones
@@ -383,6 +372,8 @@ IF COL_LENGTH('dbo.Scenario_Session', 'IdempotencyKey') IS NULL
     ALTER TABLE Scenario_Session ADD IdempotencyKey nvarchar(200) NULL;             -- 0009/M8
 IF COL_LENGTH('dbo.Scenario_Session', 'SectorIDsJSON') IS NULL
     ALTER TABLE Scenario_Session ADD SectorIDsJSON nvarchar(max) NULL;              -- 0013/R6
+IF COL_LENGTH('dbo.Scenario_Session', 'AssetContextJSON') IS NULL
+    ALTER TABLE Scenario_Session ADD AssetContextJSON nvarchar(max) NULL;           -- 0020
 
 IF COL_LENGTH('dbo.Subsystem_Stage_State', 'LeaseExpiresAt') IS NULL
     ALTER TABLE Subsystem_Stage_State ADD LeaseExpiresAt datetime2 NULL;            -- 0007/M7
@@ -390,9 +381,6 @@ IF COL_LENGTH('dbo.Subsystem_Stage_State', 'HeartbeatAt') IS NULL
     ALTER TABLE Subsystem_Stage_State ADD HeartbeatAt datetime2 NULL;               -- 0007/M7
 IF COL_LENGTH('dbo.Subsystem_Stage_State', 'AttemptCount') IS NULL
     ALTER TABLE Subsystem_Stage_State ADD AttemptCount int NOT NULL CONSTRAINT DF_SSS_AttemptCount DEFAULT 0;  -- 0008/M8
-
-IF COL_LENGTH('dbo.Subsystem_Profile', 'ValidationJSON') IS NULL
-    ALTER TABLE Subsystem_Profile ADD ValidationJSON nvarchar(max) NULL;            -- 0011/§5.2
 
 IF COL_LENGTH('dbo.Identified_Threat', 'ThreatTypeID') IS NULL
     ALTER TABLE Identified_Threat ADD ThreatTypeID int NULL;                        -- 0002/M1
@@ -421,10 +409,6 @@ CREATE UNIQUE INDEX UX_Session_IdempotencyKey ON Scenario_Session(EntityID, Idem
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Session_Active' AND object_id = OBJECT_ID('dbo.Scenario_Session'))
 CREATE NONCLUSTERED INDEX IX_Session_Active ON Scenario_Session(SessionStatus) WHERE SessionStatus = 'active';
 -- M8/[R9]: cheap index-only COUNT for the admission-control backpressure ceiling.
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Profile_Active' AND object_id = OBJECT_ID('dbo.Subsystem_Profile'))
-CREATE UNIQUE INDEX UX_Profile_Active ON Subsystem_Profile(SessionID, SubsystemID) WHERE Superseded = 0;
--- M5/[R3]: one active profile per (session, subsystem) — idempotent Stage-1 writes.
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveIdentity' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
 CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output(SessionID, IdentityHash) WHERE Superseded = 0;
