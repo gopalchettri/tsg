@@ -8,9 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
-
-from app.pipeline.prompts import _STRIDE_CATEGORIES
+from pydantic import BaseModel, Field
 
 # Plan item 1b: bound every list-of-targets field so one HTTP request can't turn into an
 # unbounded synchronous AI/DB workload inside a single Celery task (no chunking exists).
@@ -32,40 +30,6 @@ class AcceptBody(BaseModel):
 class RegenerateScenariosBody(BaseModel):
     supporting_system_id: int
     output_ids: list[str] = Field(min_length=1, max_length=_MAX_BATCH)
-    user_note: str | None = None
-
-
-class RegenerateThreatsBody(BaseModel):
-    supporting_system_id: int
-    threat_ids: list[str] = Field(min_length=1, max_length=_MAX_BATCH)
-    user_note: str | None = None
-
-
-class RegenerateThreatTypesBody(BaseModel):
-    supporting_system_id: int
-    threat_type_ids: list[int] = Field(min_length=1, max_length=_MAX_BATCH)
-    user_note: str | None = None
-
-
-class RegenerateThreatCategoriesBody(BaseModel):
-    supporting_system_id: int
-    # Plan item 1a — prompt-injection safety: reject anything outside the fixed 6-name STRIDE
-    # allowlist with a 422 here, BEFORE it ever reaches a prompt. Never interpolate arbitrary
-    # caller-supplied text into the system message.
-    categories: list[str] = Field(min_length=1, max_length=_MAX_BATCH)
-    user_note: str | None = None
-
-    @field_validator("categories")
-    @classmethod
-    def _categories_must_be_stride(cls, v: list[str]) -> list[str]:
-        bad = [c for c in v if c not in _STRIDE_CATEGORIES]
-        if bad:
-            raise ValueError(f"invalid STRIDE categor(y/ies): {bad}; must be one of {list(_STRIDE_CATEGORIES)}")
-        return v
-
-
-class RegenerateProfileBody(BaseModel):
-    supporting_system_id: int
     user_note: str | None = None
 
 

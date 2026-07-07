@@ -307,8 +307,9 @@ ctm_scan_entity = Table(
     Column("owner_custodian", Unicode(200)),
     Column("target_rto_hours", Integer),
     Column("target_rpo_hours", Integer),
-    Column("tier1_critical_service_id", Integer), 
-    Column("group_id", Integer),                  
+    Column("tier1_critical_service_id", Integer),
+    Column("group_id", Integer),
+    Column("data_handled", UnicodeText),  # types of data this asset processes/stores
 )
 
 onboarding_service_entity = Table(  # maps a service to its owning entity/group
@@ -334,6 +335,10 @@ onboarding_supporting_systems = Table(
     Column("user_base_count", Integer),
     Column("vendor_name", Unicode(200)),
     Column("database_platforms", Unicode(300)),
+    Column("accessability_channel", Integer),  # [sic] real column is misspelled in the live DB; FK-like int, likely -> option_value
+    Column("managed_by", Integer),  # FK-like int, likely -> user or option_value (not a display name); NOT NULL in the real DB, unenforced here like this table's other required columns
+    Column("data_residency_restrictions", Boolean),  # bit flag, not free text
+    Column("incident_description", UnicodeText),  # narrative of past incidents
 )
 
 # Tables that carry EntityID directly (DAL filters these by EntityID).

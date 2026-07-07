@@ -28,8 +28,8 @@ def test_idempotency_key_returns_same_session(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
     client = make_client({"5"})
     headers = {"Idempotency-Key": "k1"}
-    r1 = client.post("/v1/sessions", json={"asset_id": 100, "entity": "5"}, headers=headers)
-    r2 = client.post("/v1/sessions", json={"asset_id": 100, "entity": "5"}, headers=headers)
+    r1 = client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}, headers=headers)
+    r2 = client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}, headers=headers)
     assert r1.json()["session_id"] == r2.json()["session_id"]
     assert r2.status_code == 200
 
@@ -38,8 +38,8 @@ def test_idempotency_key_conflict_different_body(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
     client = make_client({"5"})
     headers = {"Idempotency-Key": "k2"}
-    client.post("/v1/sessions", json={"asset_id": 100, "entity": "5"}, headers=headers)
-    r2 = client.post("/v1/sessions", json={"asset_id": 200, "entity": "5"}, headers=headers)
+    client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}, headers=headers)
+    r2 = client.post("/v1/sessions", json={"asset_id": 200, "entity_id": "5"}, headers=headers)
     assert r2.status_code == 409
     assert r2.json()["error_code"] == "idempotency_key_conflict"
 

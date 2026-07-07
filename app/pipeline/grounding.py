@@ -92,33 +92,6 @@ def find_category(sess: Session, proposed: str) -> int | None:
     return row[0] if row else None
 
 
-def find_categories(sess: Session, proposed_names: list[str]) -> dict[str, int | None]:
-    """Batched sibling of `find_category`: resolves several proposed names in ONE query
-    instead of one `find_category` call per name. Returns a dict keyed by each ORIGINAL
-    input string (not lowercased) → its matched ThreatCategoryID, or None if unmatched —
-    same "no match is not an error" contract as `find_category`, just for many names at once.
-    """
-    wanted = {(n or "").strip().lower() for n in proposed_names if (n or "").strip()}
-    out: dict[str, int | None] = {n: None for n in proposed_names}
-    if not wanted:
-        return out
-    rows = sess.execute(
-        select(m.Threat_Category.c.ThreatCategoryID, m.Threat_Category.c.ThreatCategoryName,
-              m.Threat_Category.c.ThreatCategoryCode)
-        .where(m.Threat_Category.c.IsActive == True)  # noqa: E712 — SQLAlchemy binary expr
-        .order_by(m.Threat_Category.c.ThreatCategoryID)
-    ).all()
-    by_key: dict[str, int] = {}
-    for cid, name, code in rows:
-        for key in (name, code):
-            k = (key or "").strip().lower()
-            if k and k not in by_key:  # first (lowest-id) match wins, same tie-break as find_category
-                by_key[k] = cid
-    for n in proposed_names:
-        out[n] = by_key.get((n or "").strip().lower())
-    return out
-
-
 def get_possible_types(sess: Session, category_id: int | None, sector_ids: list[int]) -> list[dict[str, Any]]:
     """Candidate Threat_Type rows for find_closest_match: sector-filtered, and
     narrowed to category_id (or every category if None, [R6]). Pre-sorted by

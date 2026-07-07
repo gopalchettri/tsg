@@ -200,8 +200,7 @@ def _safe_text(v: Any, default: str | None) -> str | None:
 
 
 def find_threats(sess: Session, session: dict, sub: dict, profile: dict, llm: LLMClient, task_id: str,
-                 epoch: int = _EPOCH, only_type_ids: list[int] | None = None,
-                 only_category_ids: list[int] | None = None) -> tuple[list[dict], Provenance | None]:
+                 epoch: int = _EPOCH) -> tuple[list[dict], Provenance | None]:
     """This is the second of the three steps — it asks the
     AI to suggest possible security threats for the supporting system, then
     checks each suggested threat against the organization's real, approved
@@ -209,42 +208,17 @@ def find_threats(sess: Session, session: dict, sub: dict, profile: dict, llm: LL
 
     Stage 2: CAS-claim THREATS, ask the LLM for threat proposals, then
     ground each one before persisting. Returns ([], None) on a
-    failed claim — same idempotent-no-op contract as write_profile.
-
-    `only_type_ids`/`only_category_ids` (plan items 1/1a, `threat_type`/`threat_category`
-    regen — mutually exclusive, caller passes at most one): resolved to canonical
-    library names by the CALLER before this runs (never raw ids/caller text), threaded
-    into the prompt as an efficiency nudge, then used again here as the DEFENSIVE
-    POST-FILTER — the correctness guarantee, since an LLM won't obey the prompt
-    instruction 100% of the time. An out-of-scope proposal is dropped BEFORE grounding
-    (skips its embedding/rerank cost too), never persisted. Only the two scoped
-    Identified_Threat rows are superseded (dal.supersede_by_types/_by_categories); the
-    existing unscoped `dal.supersede(...)` stays exactly as-is for the initial/profile-level run."""
+    failed claim — same idempotent-no-op contract as write_profile."""
     sid, ss, tenant = session["SessionID"], sub["id"], session["TenantID"]
     if not dal.claim_stage(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
         return [], None
     sess.commit()  # saves progress to the database before waiting on the AI's reply — same reason explained in write_profile above
     _send_live_update(sid, SSEEventType.stage_started, ss, SubsystemLevel.THREATS, StageStatus.RUNNING, epoch)
-    only_type_names = None
-    only_category_names = None
-    if only_type_ids:
-        only_type_names = sorted({r["ThreatTypeName"] for r in dal.active_threat_types(sess, only_type_ids)})
-    elif only_category_ids:
-        only_category_names = sorted({r["ThreatCategoryName"] for r in dal.active_threat_categories(sess, only_category_ids)})
-    proposals, prov = _ask_ai(sess, llm, prompts.threats_prompt(session["AssetName"], sub, profile,
-                              only_types=only_type_names, only_categories=only_category_names),
+    proposals, prov = _ask_ai(sess, llm, prompts.threats_prompt(session["AssetName"], sub, profile),
                                 session=session, subsystem_id=ss, stage="threats", expected_type=list)
-    if only_type_ids:
-        dal.supersede_by_types(sess, m.Identified_Threat, sid, ss, only_type_ids)
-    elif only_category_ids:
-        dal.supersede_by_categories(sess, m.Identified_Threat, sid, ss, only_category_ids)
-    else:
-        dal.supersede(sess, m.Identified_Threat, sid, ss)
+    dal.supersede(sess, m.Identified_Threat, sid, ss)
     threats: list[dict] = []
     sector_ids = json.loads(session["SectorIDsJSON"]) if session.get("SectorIDsJSON") else []
-    _type_names_lower = {n.lower() for n in (only_type_names or [])}
-    _category_names_lower = {n.lower() for n in (only_category_names or [])}
-    out_of_scope_rejected = 0
     for p in proposals:
         # The AI's raw reply can't be fully trusted to have the right shape — it might send a
         # number, or nothing at all, where we expect text. This next part makes sure we only
@@ -253,17 +227,6 @@ def find_threats(sess: Session, session: dict, sub: dict, profile: dict, llm: LL
         ptype = _safe_text(p.get("type"), "")
         pcat = _safe_text(p.get("category"), "")
         pname = _safe_text(p.get("name"), None)  # it's okay for the threat's name to be left blank in the database, so we allow that here
-        # Defensive post-filter (plan item 1): reject an out-of-scope proposal on its RAW
-        # type/category text BEFORE grounding — the correctness backstop for the prompt
-        # constraint above, which an LLM can still ignore. Counted (not just dropped) so the
-        # audit below can distinguish "AI ignored the scope, everything filtered" from a
-        # genuinely empty result — both would otherwise look identical (count: 0).
-        if _type_names_lower and (ptype or "").strip().lower() not in _type_names_lower:
-            out_of_scope_rejected += 1
-            continue
-        if _category_names_lower and (pcat or "").strip().lower() not in _category_names_lower:
-            out_of_scope_rejected += 1
-            continue
         gr = grounding.find_threat_in_library(sess, llm, p, sector_ids=sector_ids)
         tid = guid()
         dal.insert_row(sess, m.Identified_Threat, {
@@ -290,7 +253,7 @@ def find_threats(sess: Session, session: dict, sub: dict, profile: dict, llm: LL
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=session["EntityID"],
                      Stage=WorkflowStage.THREAT_IDENTIFICATION, SubsystemID=ss,
                      EventType=AuditEventType.grounding_summary,
-                     DetailJSON=json.dumps({"count": len(threats), "out_of_scope_rejected": out_of_scope_rejected}))
+                     DetailJSON=json.dumps({"count": len(threats)}))
     _send_live_update(sid, SSEEventType.stage_completed, ss, SubsystemLevel.THREATS, StageStatus.COMPLETE, epoch)
     log.info("stage.complete", session_id=sid, subsystem=ss, stage="THREATS", count=len(threats))
     return threats, prov

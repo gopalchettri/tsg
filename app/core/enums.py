@@ -150,14 +150,9 @@ class AuditDecision(StrEnum):
 
 
 class RegenGranularity(StrEnum):
-    """Ordered finest -> broadest. `profile` cascades to threats+scenarios too, not just
-    itself — see cascade.py's LEVELS_BY_GRANULARITY for exactly which stage levels each
-    granularity resets."""
-    scenario = "scenario"                  # narrowest: rebuild one scenario's narrative only
-    threat = "threat"                      # re-ground the existing threat proposal against the library (no new LLM call) + its scenario
-    threat_type = "threat_type"            # re-identify every threat of these type(s) (scoped), then re-ground and regenerate their scenarios
-    threat_category = "threat_category"    # re-identify every threat of these STRIDE category(s) (scoped), then re-ground and regenerate their scenarios
-    profile = "profile"                    # broadest: rewrite the profile, then cascade through threats and scenarios too
+    """Only `scenario` regen is implemented — see cascade.py's LEVELS_BY_GRANULARITY for
+    exactly which stage levels it resets."""
+    scenario = "scenario"                  # rebuild one or more scenarios' narratives only
 
 
 class SubsystemProgress(StrEnum):

@@ -34,7 +34,7 @@ def test_404_uses_error_envelope(engine, monkeypatch):
 
 def test_403_uses_error_envelope(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
-    sid = make_client({"5"}).post("/v1/sessions", json={"asset_id": 100, "entity": "5"}).json()["session_id"]
+    sid = make_client({"5"}).post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}).json()["session_id"]
     r = make_client({"6"}).get(f"/v1/sessions/{sid}")
     assert r.status_code == 403
     assert r.json()["error_code"] == "forbidden"
@@ -42,7 +42,7 @@ def test_403_uses_error_envelope(engine, monkeypatch):
 
 def test_422_uses_error_envelope(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
-    r = make_client({"5"}).post("/v1/sessions", json={"entity": "5"})  # missing required asset_id
+    r = make_client({"5"}).post("/v1/sessions", json={"entity_id": "5"})  # missing required asset_id
     assert r.status_code == 422
     body = r.json()
     assert body["error_code"] == "validation_error"
@@ -88,7 +88,7 @@ def test_sse_ping_configured(engine, monkeypatch):
     from app.core.config import get_settings
 
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
-    sid = make_client({"5"}).post("/v1/sessions", json={"asset_id": 100, "entity": "5"}).json()["session_id"]
+    sid = make_client({"5"}).post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}).json()["session_id"]
 
     principal = Principal(claims={"sub": "u1"}, entities={"5"})
     response = asyncio.run(session_events(sid, principal))
@@ -106,7 +106,7 @@ def test_sse_heartbeat_is_a_real_client_visible_event(engine, monkeypatch):
     from app.api.sessions import session_events
 
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
-    sid = make_client({"5"}).post("/v1/sessions", json={"asset_id": 100, "entity": "5"}).json()["session_id"]
+    sid = make_client({"5"}).post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}).json()["session_id"]
 
     principal = Principal(claims={"sub": "u1"}, entities={"5"})
     response = asyncio.run(session_events(sid, principal))

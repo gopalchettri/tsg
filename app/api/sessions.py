@@ -16,8 +16,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import Principal, get_principal
 from app.api.schemas import (
     AcceptBody, AcceptedScenario, AcceptedScenariosResponse, AcceptResponse, CancelResponse, CreateSessionBody,
-    CreateSessionResponse, ProfileResult, RegenerateProfileBody, RegenerateResponse, RegenerateScenariosBody,
-    RegenerateThreatCategoriesBody, RegenerateThreatsBody, RegenerateThreatTypesBody, ScenarioResult, SessionBoard,
+    CreateSessionResponse, ProfileResult, RegenerateResponse, RegenerateScenariosBody, ScenarioResult, SessionBoard,
     SessionResults, SupportingSystemBoard, ThreatResult,
 )
 from app.core.config import get_settings
@@ -29,21 +28,11 @@ from app.db import dal
 from app.db import models as m
 from app.db.dal import EntityForbidden, IdempotencyKeyConflict, RegenerateConflict, now
 from app.db.engine import db_session
-from app.pipeline import cascade, grounding
+from app.pipeline import cascade
 from app.pipeline.accept import accept_session
 from app.pipeline.celery_app import regenerate_task, run_pipeline_task
 from app.pipeline.context import check_asset_belongs_to_entity, gather_asset_details
 from app.pipeline.tasks import set_up_progress_tracking
-
-# The stage a session shows while a regen hop is in flight (leaves REVIEW so accept
-# is blocked session-wide, [R5]) — the stage that would normally produce this granularity.
-_REGEN_STAGE = {
-    RegenGranularity.profile: WorkflowStage.PROFILE,
-    RegenGranularity.threat: WorkflowStage.THREAT_IDENTIFICATION,
-    RegenGranularity.threat_type: WorkflowStage.THREAT_IDENTIFICATION,
-    RegenGranularity.threat_category: WorkflowStage.THREAT_IDENTIFICATION,
-    RegenGranularity.scenario: WorkflowStage.SCENARIO_GENERATION,
-}
 
 router = APIRouter(prefix="/v1")
 
@@ -91,7 +80,7 @@ def build_board(sess: Session, session: dict) -> dict:
             "overall": str(get_overall_status(p, t, sc, session["SessionStatus"])),
         })
     return {
-        "session_id": session["SessionID"], "entity": session["EntityID"],
+        "session_id": session["SessionID"], "entity_id": session["EntityID"],
         "session_status": session["SessionStatus"],
         "current_stage": session["CurrentStage"], "stage_status": session["StageStatus"],
         "supporting_systems": supporting_systems,
@@ -119,13 +108,13 @@ def create_session(
     """Creates the session row plus initial stage state and kicks off the pipeline
     task; an `Idempotency-Key` short-circuits to the existing session on retry instead
     of creating a duplicate."""
-    principal.require_entity(body.entity)
+    principal.require_entity(body.entity_id)
     tenant = get_settings().tenant_id
     sid = dal.guid()
     with db_session() as sess:
         if idempotency_key:
             existing_id, conflict = dal.reserve_idempotency_key_or_get_existing(
-                sess, str(body.entity), idempotency_key, str(body.asset_id))
+                sess, str(body.entity_id), idempotency_key, str(body.asset_id))
             if conflict:
                 raise IdempotencyKeyConflict(existing_id)
             if existing_id:
@@ -133,8 +122,8 @@ def create_session(
 
         dal.assert_capacity_available(sess)  # 503 before the more expensive gather_asset_details
 
-        ctx = gather_asset_details(sess, asset_id=body.asset_id, entity_id=body.entity,
-                              sector_id=body.sector, user_id=body.user_id)
+        ctx = gather_asset_details(sess, asset_id=body.asset_id, entity_id=body.entity_id,
+                              sector_id=body.sector_id, user_id=body.user_id)
         dal.create_session(sess, {
             "SessionID": sid, "TenantID": tenant, "EntityID": str(body.entity_id), "UserID": str(body.user_id),
             "AssetName": ctx["asset"]["name"], "AssetExternalID": str(body.asset_id),
@@ -145,7 +134,7 @@ def create_session(
             "IdempotencyKey": idempotency_key,
         })
         set_up_progress_tracking(sess, sid, tenant, str(body.entity_id), ctx["subsystems"])
-        dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant, EntityID=str(body.entity),
+        dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant, EntityID=str(body.entity_id),
                          EventType=AuditEventType.session_started, ActorUserID=body.user_id)
     enqueue_pipeline(sid)
     return CreateSessionResponse(session_id=sid)
@@ -221,20 +210,11 @@ def enqueue_regeneration(session_id: str, subsystem_id: int, granularity: RegenG
 
 
 def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, granularity: RegenGranularity,
-                   target_ids: list[str] | list[int] | None, user_note: str | None,
-                   resolve_target_ids=None) -> RegenerateResponse:
-    """Shared body for all 5 `/regenerate/*` routes (plan item 0/10): validates the
+                   target_ids: list[str] | list[int] | None, user_note: str | None) -> RegenerateResponse:
+    """Shared body for the `/regenerate/*` route (plan item 0/10): validates the
     target(s) and reserves the epoch under a session-level CAS ([R5]), then hands off to
     the async cascade; must run at REVIEW/AWAITING_DECISION and loses the race cleanly
-    (RegenerateConflict) to a concurrent accept or regen. Only the target RESOLUTION
-    differs per endpoint — everything else (auth, CAS, epoch reservation, dispatch) is
-    identical across all five, so it lives here once instead of five times.
-
-    `resolve_target_ids` (optional `(sess) -> target_ids`): lets a caller resolve its raw
-    input (e.g. STRIDE category names) to real ids using THIS SAME `sess`/transaction,
-    before the CAS below — so name resolution and the CAS/lock/epoch-reservation it guards
-    are no longer two separate transactions (closing the drift window a caller opening its
-    own db_session() first would have)."""
+    (RegenerateConflict) to a concurrent accept or regen."""
     with db_session() as sess:
         session = get_authorized_session(sess, session_id, principal)
         if session["CurrentStage"] != WorkflowStage.REVIEW or session["StageStatus"] != StageStatus.AWAITING_DECISION:
@@ -244,9 +224,6 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
         subsystems = json.loads(session["SubsystemsJSON"])
         if not any(s["id"] == subsystem_id for s in subsystems):
             raise dal.NotFoundError(f"subsystem {subsystem_id} not in session {session_id}")
-
-        if resolve_target_ids is not None:
-            target_ids = resolve_target_ids(sess)
 
         # Fast, read-only, BATCHED check (plan item 2) — the same validation cascade.py
         # re-runs under the subsystem's _LOCK before it mutates anything (closes the gap
@@ -273,7 +250,7 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
             .where(m.Scenario_Session.c.SessionID == session_id,
                   m.Scenario_Session.c.SessionStatus == SessionStatus.active,
                   m.Scenario_Session.c.CurrentStage == WorkflowStage.REVIEW)
-            .values(CurrentStage=_REGEN_STAGE[granularity], StageStatus=StageStatus.RUNNING, UpdatedAt=now())
+            .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING, UpdatedAt=now())
         )
         if res.rowcount != 1:
             raise RegenerateConflict("another regeneration/accept won the race")
@@ -297,61 +274,8 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
 def post_regenerate_scenarios(session_id: str, body: RegenerateScenariosBody,
                               principal: Principal = Depends(get_principal)) -> RegenerateResponse:
     """Rebuild one or more scenarios' narratives only — siblings untouched (scenarios 1, 2)."""
-    return _do_regenerate(session_id, principal, body.subsystem_id, RegenGranularity.scenario,
+    return _do_regenerate(session_id, principal, body.supporting_system_id, RegenGranularity.scenario,
                           body.output_ids, body.user_note)
-
-
-@router.post("/sessions/{session_id}/regenerate/threats", status_code=202, response_model=RegenerateResponse)
-def post_regenerate_threats(session_id: str, body: RegenerateThreatsBody,
-                            principal: Principal = Depends(get_principal)) -> RegenerateResponse:
-    """Re-ground one or more existing threat proposals against the library (no new LLM
-    call) + their scenarios (scenarios 3, 4). Per-item crash-resume (plan item 12)."""
-    return _do_regenerate(session_id, principal, body.subsystem_id, RegenGranularity.threat,
-                          body.threat_ids, body.user_note)
-
-
-@router.post("/sessions/{session_id}/regenerate/threat-types", status_code=202, response_model=RegenerateResponse)
-def post_regenerate_threat_types(session_id: str, body: RegenerateThreatTypesBody,
-                                 principal: Principal = Depends(get_principal)) -> RegenerateResponse:
-    """Re-identify every threat of these type(s) only — the AI prompt itself is scoped to
-    just these types, with a defensive post-filter backstop (scenarios 5, 6)."""
-    return _do_regenerate(session_id, principal, body.subsystem_id, RegenGranularity.threat_type,
-                          body.threat_type_ids, body.user_note)
-
-
-@router.post("/sessions/{session_id}/regenerate/threat-categories", status_code=202, response_model=RegenerateResponse)
-def post_regenerate_threat_categories(session_id: str, body: RegenerateThreatCategoriesBody,
-                                      principal: Principal = Depends(get_principal)) -> RegenerateResponse:
-    """Re-identify every threat of these STRIDE categor(y/ies) only — same real AI-prompt
-    scoping + defensive post-filter as threat-types (scenarios 7, 8). `body.categories` is
-    already allowlist-validated to the 6 fixed STRIDE names (Pydantic validator above); this
-    resolves those canonical names to their DB category ids via the batched
-    `grounding.find_categories` (plan item 8, case-insensitive STRIDE match — ONE query, not
-    one per name) INSIDE `_do_regenerate`'s own CAS transaction (`resolve_target_ids`), so
-    name resolution and the CAS/lock/epoch-reservation it guards are a single transaction —
-    not two, as a separate db_session() here would leave them."""
-    names = list(dict.fromkeys(body.categories))  # dedupe, preserve order
-
-    def _resolve(sess: Session) -> list[int]:
-        resolved = grounding.find_categories(sess, names)
-        category_ids = []
-        for name in names:
-            cid = resolved[name]
-            if cid is None:
-                raise dal.NotFoundError(f"threat category {name!r} not found or not active")
-            category_ids.append(cid)
-        return category_ids
-
-    return _do_regenerate(session_id, principal, body.subsystem_id, RegenGranularity.threat_category,
-                          None, body.user_note, resolve_target_ids=_resolve)
-
-
-@router.post("/sessions/{session_id}/regenerate/profile", status_code=202, response_model=RegenerateResponse)
-def post_regenerate_profile(session_id: str, body: RegenerateProfileBody,
-                            principal: Principal = Depends(get_principal)) -> RegenerateResponse:
-    """Rewrite the profile, then cascade through threats and scenarios too (scenario 9)."""
-    return _do_regenerate(session_id, principal, body.subsystem_id, RegenGranularity.profile,
-                          None, body.user_note)
 
 
 @router.post("/sessions/{session_id}/cancel", response_model=CancelResponse)

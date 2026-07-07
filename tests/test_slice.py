@@ -217,7 +217,7 @@ def test_rules_gate_and_factors_persist_end_to_end(engine, monkeypatch):
 
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", sync)
     client = make_client({"5"})
-    sid = client.post("/v1/sessions", json={"asset_id": 100, "entity": "5"}).json()["session_id"]
+    sid = client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}).json()["session_id"]
 
     with db_session() as s:
         rows = s.execute(select(m.Scoped_Threat).where(
@@ -362,7 +362,7 @@ def test_session_sector_ids_reach_grounding(engine, monkeypatch):
 
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", sync)
     client = make_client({"5"})
-    client.post("/v1/sessions", json={"asset_id": 100, "entity": "5", "sector": 51})
+    client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5", "sector_id": 51})
 
     assert captured == [[51, 50]]  # sub-sector first, then parent — gather_asset_details's own ordering
 
@@ -621,14 +621,14 @@ def test_accept_releases_lock(db, stub_llm):
 # --- API: object-level authz + happy path ---
 def test_idor_denied(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
-    sid = make_client({"5"}).post("/v1/sessions", json={"asset_id": 100, "entity": "5"}).json()["session_id"]
+    sid = make_client({"5"}).post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}).json()["session_id"]
     assert make_client({"6"}).get(f"/v1/sessions/{sid}").status_code == 403
 
 
 def test_asset_entity_mismatch_denied(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
     # authorized for 999, but asset 100 is owned by entity 5 → [R2] binding reject
-    r = make_client({"999"}).post("/v1/sessions", json={"asset_id": 100, "entity": "999"})
+    r = make_client({"999"}).post("/v1/sessions", json={"asset_id": 100, "entity_id": "999"})
     assert r.status_code == 403
 
 
@@ -641,7 +641,7 @@ def test_happy_path_and_conflict_and_smoke(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", sync)
     client = make_client({"5"})
 
-    sid = client.post("/v1/sessions", json={"asset_id": 100, "entity": "5"}).json()["session_id"]
+    sid = client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}).json()["session_id"]
     board = client.get(f"/v1/sessions/{sid}").json()
     assert board["supporting_systems"][0]["overall"] == "awaiting_review"
 
@@ -652,9 +652,9 @@ def test_happy_path_and_conflict_and_smoke(engine, monkeypatch):
     assert accepted.status_code == 200 and accepted.json()["status"] == "completed"
 
     # concurrency smoke: different assets ok; duplicate active same-asset → 409
-    r200 = client.post("/v1/sessions", json={"asset_id": 200, "entity": "5"})
+    r200 = client.post("/v1/sessions", json={"asset_id": 200, "entity_id": "5"})
     assert r200.status_code == 202
-    dup = client.post("/v1/sessions", json={"asset_id": 200, "entity": "5"})
+    dup = client.post("/v1/sessions", json={"asset_id": 200, "entity_id": "5"})
     assert dup.status_code == 409 and dup.json()["details"]["active_session_id"]
 
 
@@ -669,7 +669,7 @@ def test_cancel_from_review_shows_cancelled_everywhere(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", sync)
     client = make_client({"5"})
 
-    sid = client.post("/v1/sessions", json={"asset_id": 100, "entity": "5"}).json()["session_id"]
+    sid = client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}).json()["session_id"]
     board = client.get(f"/v1/sessions/{sid}").json()
     assert board["session_status"] == "active" and board["supporting_systems"][0]["overall"] == "awaiting_review"
 
@@ -1502,7 +1502,7 @@ def test_downstream_returns_only_accepted(engine, monkeypatch):
 
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", sync)
     client = make_client({"5"})
-    sid = client.post("/v1/sessions", json={"asset_id": 100, "entity": "5"}).json()["session_id"]
+    sid = client.post("/v1/sessions", json={"asset_id": 100, "entity_id": "5"}).json()["session_id"]
     assert client.post(f"/v1/sessions/{sid}/accept", json={}).status_code == 200
 
     # Plant the two exclusion cases directly on the completed session: a REJECTED row

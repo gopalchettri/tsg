@@ -63,8 +63,7 @@ def profile_prompt(asset_name: str, sub: dict[str, Any]) -> list[dict]:
     ]
 
 
-def threats_prompt(asset_name: str, sub: dict[str, Any], profile: dict,
-                   only_types: list[str] | None = None, only_categories: list[str] | None = None) -> list[dict]:
+def threats_prompt(asset_name: str, sub: dict[str, Any], profile: dict) -> list[dict]:
     """ builds the question that asks the AI to suggest
     possible security threats based on the Stage-1 description — these are
     just suggestions, never the final answer.
@@ -73,25 +72,13 @@ def threats_prompt(asset_name: str, sub: dict[str, Any], profile: dict,
     These are suggestions only — the model decides nothing final, since every
     candidate is independently matched against the approved threat library
     downstream and anything unverified is discarded.
-
-    `only_types`/`only_categories` (plan item 1, `threat_type`/`threat_category` regen):
-    both are already-resolved, library-owned canonical names (Threat_Type.ThreatTypeName /
-    the fixed STRIDE allowlist) by the time they reach here — never raw caller-supplied
-    text — so it's safe to interpolate them straight into the system message. This is the
-    efficiency win only; `find_threats` ALSO defensively post-filters the AI's response
-    against the same scope, since a model won't obey an instruction 100% of the time.
     """
-    scope_line = ""
-    if only_types:
-        scope_line = " Propose ONLY threats matching these threat type(s): " + ", ".join(only_types) + "."
-    elif only_categories:
-        scope_line = " Propose ONLY threats matching these STRIDE categor(y/ies): " + ", ".join(only_categories) + "."
     return [
         {"role": "system", "content": "Propose STRIDE threats using ONLY these categories: "
          + ", ".join(_STRIDE_CATEGORIES) + ". Ground proposals ONLY in the supplied profile/context; "
          "do not propose threats irrelevant to it. These are suggestions only — every candidate is "
          "independently verified against an approved threat library and unverified ones are discarded; "
-         "you decide nothing. No exploit instructions, payloads, or procedural attack steps." + scope_line +
+         "you decide nothing. No exploit instructions, payloads, or procedural attack steps."
          " Return JSON list of {category, type, name, actors:[]}."},
         {"role": "user", "content": _CONTEXT_PREFIX + json.dumps(
             {"asset": redact(asset_name), "subsystem": allowlist_context(sub, _SUB_ALLOWED),

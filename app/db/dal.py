@@ -436,22 +436,6 @@ def active_threats(sess: Session, session_id: str, subsystem_id: int) -> list[di
     ]
 
 
-def count_active_flagged_threats(sess: Session, session_id: str, subsystem_id: int) -> int:
-    """Count active, ThreatTypeID-IS-NULL ("flagged", ungrounded) threats for a subsystem —
-    `supersede_by_categories`'s correlated subquery structurally can never match these rows
-    (no ThreatTypeID to join through Threat_Type.PrimaryThreatCategoryID), so a
-    `threat_category` regen silently leaves them untouched. Used to surface that gap in the
-    regen audit trail instead of reporting a clean success that omits it."""
-    return sess.execute(
-        select(func.count()).where(
-            m.Identified_Threat.c.SessionID == session_id,
-            m.Identified_Threat.c.SubsystemID == subsystem_id,
-            m.Identified_Threat.c.Superseded == 0,
-            m.Identified_Threat.c.ThreatTypeID.is_(None),
-        )
-    ).scalar()
-
-
 def active_threat_rules(sess: Session, threat_type_ids: list[int]) -> list[dict]:
     """Active scoping rules for the given grounded master types ([R12], SDD §5.4) — one
     query for the whole subsystem, ordered by ThreatRuleID so rule evaluation (and the
@@ -464,33 +448,6 @@ def active_threat_rules(sess: Session, threat_type_ids: list[int]) -> list[dict]
         .where(ct.c.ThreatTypeID.in_(threat_type_ids),
                ct.c.IsActive == True, ct.c.IsDeleted == False)  # noqa: E712 — SQLAlchemy binary expr
         .order_by(ct.c.ThreatRuleID)
-    ).mappings()]
-
-
-def active_threat_types(sess: Session, type_ids: list[int]) -> list[dict]:
-    """Resolve `threat_type_ids` to their canonical, active `ThreatTypeName`s in ONE batched
-    query (plan item 1a) — the caller then passes ONLY these library-owned names into the
-    prompt, never the raw ids/caller text. Also doubles as the batched existence/active-check
-    for the endpoint's fail-atomically validation (item 2): fewer returned rows than requested
-    ids means at least one id is missing/inactive."""
-    if not type_ids:
-        return []
-    tt = m.Threat_Type
-    return [dict(r) for r in sess.execute(
-        select(tt.c.ThreatTypeID, tt.c.ThreatTypeName)
-        .where(tt.c.ThreatTypeID.in_(type_ids), tt.c.IsActive == True, tt.c.IsDeleted == False)  # noqa: E712
-    ).mappings()]
-
-
-def active_threat_categories(sess: Session, category_ids: list[int]) -> list[dict]:
-    """Resolve `category_ids` to their canonical, active `ThreatCategoryName`s in ONE batched
-    query — same role as `active_threat_types` above, for the `threat_category` granularity."""
-    if not category_ids:
-        return []
-    tc = m.Threat_Category
-    return [dict(r) for r in sess.execute(
-        select(tc.c.ThreatCategoryID, tc.c.ThreatCategoryName)
-        .where(tc.c.ThreatCategoryID.in_(category_ids), tc.c.IsActive == True, tc.c.IsDeleted == False)  # noqa: E712
     ).mappings()]
 
 
@@ -584,63 +541,10 @@ def supersede(sess: Session, table, session_id: str, subsystem_id: int) -> None:
     )
 
 
-def supersede_by_threat(sess: Session, table, session_id: str, subsystem_id: int, threat_id: str) -> None:
-    """Row-scoped supersede for regeneration: only the ONE row matching `threat_id`
-    (Identified_Threat/Scoped_Threat — both carry a ThreatID column) — siblings stay
-    untouched. Does not replace `supersede` (its 10+ existing call sites unaffected)."""
-    sess.execute(
-        update(table)
-        .where(
-            table.c.SessionID == session_id,
-            table.c.SubsystemID == subsystem_id,
-            table.c.ThreatID == threat_id,
-            table.c.Superseded == 0,
-        )
-        .values(Superseded=1)
-    )
-
-
-def supersede_by_types(sess: Session, table, session_id: str, subsystem_id: int, type_ids: list[int]) -> None:
-    """Batch row-scoped supersede for `threat_type` regen: every active Identified_Threat row
-    whose ThreatTypeID is in the requested set (Scoped_Threat carries no ThreatTypeID column,
-    so callers supersede its rows via the existing per-id `supersede_by_threat` inside
-    `write_scenarios`'s target_threat_ids loop instead). One UPDATE, not a loop."""
-    sess.execute(
-        update(table)
-        .where(
-            table.c.SessionID == session_id,
-            table.c.SubsystemID == subsystem_id,
-            table.c.ThreatTypeID.in_(type_ids),
-            table.c.Superseded == 0,
-        )
-        .values(Superseded=1)
-    )
-
-
-def supersede_by_categories(sess: Session, table, session_id: str, subsystem_id: int, category_ids: list[int]) -> None:
-    """Batch row-scoped supersede for `threat_category` regen: every active Identified_Threat
-    row whose grounded Threat_Type.PrimaryThreatCategoryID is in the requested set (join —
-    category isn't a column on Identified_Threat itself). Flagged threats with no ThreatTypeID
-    are NOT reachable here (known limitation, plan item 4) — only a broader `profile`-level
-    regen catches those. One UPDATE via a correlated subquery, not a loop."""
-    sess.execute(
-        update(table)
-        .where(
-            table.c.SessionID == session_id,
-            table.c.SubsystemID == subsystem_id,
-            table.c.Superseded == 0,
-            table.c.ThreatTypeID.in_(
-                select(m.Threat_Type.c.ThreatTypeID).where(m.Threat_Type.c.PrimaryThreatCategoryID.in_(category_ids))
-            ),
-        )
-        .values(Superseded=1)
-    )
-
-
 def active_scoped_threat_ids(sess: Session, session_id: str, subsystem_id: int, threat_ids) -> list[str]:
-    """Batched sibling of `active_scoped_threat_id`: every current active ScopedThreatID for
-    a SET of ThreatIDs in ONE query — used by `write_scenarios`'s multi-target regen path so
-    an up-to-`_MAX_BATCH` target list doesn't do one SELECT per id."""
+    """Every current active ScopedThreatID for a SET of ThreatIDs in ONE query — used by
+    `write_scenarios`'s multi-target regen path so an up-to-`_MAX_BATCH` target list
+    doesn't do one SELECT per id."""
     if not threat_ids:
         return []
     return list(sess.execute(
@@ -654,8 +558,8 @@ def active_scoped_threat_ids(sess: Session, session_id: str, subsystem_id: int, 
 
 
 def supersede_by_threats(sess: Session, table, session_id: str, subsystem_id: int, threat_ids) -> None:
-    """Batched sibling of `supersede_by_threat`: every active row (Identified_Threat/
-    Scoped_Threat) whose ThreatID is in the requested set — one UPDATE, not a loop."""
+    """Every active row (Identified_Threat/Scoped_Threat) whose ThreatID is in the
+    requested set — one UPDATE, not a loop."""
     if not threat_ids:
         return
     sess.execute(
@@ -671,8 +575,8 @@ def supersede_by_threats(sess: Session, table, session_id: str, subsystem_id: in
 
 
 def supersede_by_scoped_threats(sess: Session, session_id: str, subsystem_id: int, scoped_threat_ids) -> None:
-    """Batched sibling of `supersede_by_scoped_threat`: every active Threat_Scenario_Output
-    row whose ScopedThreatID is in the requested set — one UPDATE, not a loop."""
+    """Every active Threat_Scenario_Output row whose ScopedThreatID is in the requested
+    set — one UPDATE, not a loop."""
     if not scoped_threat_ids:
         return
     sess.execute(
@@ -681,35 +585,6 @@ def supersede_by_scoped_threats(sess: Session, session_id: str, subsystem_id: in
             m.Threat_Scenario_Output.c.SessionID == session_id,
             m.Threat_Scenario_Output.c.SubsystemID == subsystem_id,
             m.Threat_Scenario_Output.c.ScopedThreatID.in_(scoped_threat_ids),
-            m.Threat_Scenario_Output.c.Superseded == 0,
-        )
-        .values(Superseded=1)
-    )
-
-
-def active_scoped_threat_id(sess: Session, session_id: str, subsystem_id: int, threat_id: str) -> str | None:
-    """The current active ScopedThreatID for a ThreatID — Threat_Scenario_Output links
-    via ScopedThreatID, not ThreatID directly, so a row-scoped regen must resolve this
-    FIRST (before Scoped_Threat gets superseded) to find the Output row to supersede."""
-    return sess.execute(
-        select(m.Scoped_Threat.c.ScopedThreatID).where(
-            m.Scoped_Threat.c.SessionID == session_id,
-            m.Scoped_Threat.c.SubsystemID == subsystem_id,
-            m.Scoped_Threat.c.ThreatID == threat_id,
-            m.Scoped_Threat.c.Superseded == 0,
-        )
-    ).scalar()
-
-
-def supersede_by_scoped_threat(sess: Session, session_id: str, subsystem_id: int, scoped_threat_id: str) -> None:
-    """Row-scoped supersede for Threat_Scenario_Output (keyed by ScopedThreatID, not
-    ThreatID)."""
-    sess.execute(
-        update(m.Threat_Scenario_Output)
-        .where(
-            m.Threat_Scenario_Output.c.SessionID == session_id,
-            m.Threat_Scenario_Output.c.SubsystemID == subsystem_id,
-            m.Threat_Scenario_Output.c.ScopedThreatID == scoped_threat_id,
             m.Threat_Scenario_Output.c.Superseded == 0,
         )
         .values(Superseded=1)
