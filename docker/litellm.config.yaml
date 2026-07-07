@@ -1,0 +1,26 @@
+# litellm proxy — single entry point for all models (SDD §8.1).
+# Fill in real deployment creds via env; router does load-balance + fallback ([R8]).
+model_list:
+  - model_name: gpt-5
+    litellm_params:
+      model: azure/gpt-5
+      api_base: os.environ/AZURE_API_BASE
+      api_key: os.environ/AZURE_API_KEY
+  - model_name: glm-5           # open-model fallback target
+    litellm_params:
+      model: openai/glm-5
+      api_base: os.environ/OPEN_MODELS_BASE
+  - model_name: multilingual-e5-large
+    litellm_params:
+      model: openai/multilingual-e5-large   # served by TEI/vLLM
+      api_base: os.environ/TEI_BASE
+  - model_name: bge-reranker-v2-m3
+    litellm_params:
+      model: openai/bge-reranker-v2-m3
+      api_base: os.environ/TEI_RERANK_BASE
+
+router_settings:
+  routing_strategy: latency-based-routing
+  fallbacks: [{ gpt-5: ["glm-5"] }]
+  num_retries: 2
+  timeout: 90

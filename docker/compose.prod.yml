@@ -1,0 +1,56 @@
+# Production-style run of the three TSG processes from one image.
+# Usage (from the tsg folder):
+#   docker build -t tsg:latest .            # add --build-arg EXTRAS=prod,local for in-process models
+#   docker compose -f docker/compose.prod.yml --env-file .env.prod up -d
+#
+# MSSQL (TSG) is EXTERNAL — point TSG_DB_DSN in .env.prod at your real server.
+# For local in-process models, uncomment the volume mounts and set EMBEDDING_MODEL /
+# RERANKER_MODEL in .env.prod to the CONTAINER paths (/models/...).
+services:
+  api:
+    image: tsg:latest
+    command: ["gunicorn", "app.main:app", "-k", "uvicorn.workers.UvicornWorker",
+              "-w", "4", "-b", "0.0.0.0:8000", "--timeout", "120"]
+    env_file: [../.env.prod]
+    ports: ["8000:8000"]
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/readyz').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    volumes:  # local models (default provider=local); host paths come from .env.prod
+      - "${EMBEDDING_MODEL_HOST}:/models/e5:ro"
+      - "${RERANKER_MODEL_HOST}:/models/reranker:ro"
+
+  worker:
+    image: tsg:latest
+    command: ["celery", "-A", "app.pipeline.celery_worker.celery_app", "worker",
+              "-P", "gevent", "-c", "50", "-l", "info"]
+    env_file: [../.env.prod]
+    depends_on:
+      redis: { condition: service_healthy }
+    volumes:
+      - "${EMBEDDING_MODEL_HOST}:/models/e5:ro"
+      - "${RERANKER_MODEL_HOST}:/models/reranker:ro"
+
+  beat:
+    image: tsg:latest
+    command: ["celery", "-A", "app.pipeline.celery_app.celery_app", "beat", "-l", "info"]
+    env_file: [../.env.prod]
+    depends_on:
+      redis: { condition: service_healthy }
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:
