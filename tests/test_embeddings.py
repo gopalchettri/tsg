@@ -151,3 +151,22 @@ def test_l2_write_failure_is_best_effort(mongo_store, monkeypatch):
     stub = _Stub()
     out = embeddings.get_vectors(stub, ["x"], model_id="m", group="g")
     assert out == {"x": _vec("x")} and stub.calls == [["x"]]
+
+
+def test_l2_connect_failure_opens_breaker_so_outage_is_not_retried_per_call(mongo_store, monkeypatch):
+    # _vector_store() itself failing (the connect+create_index handshake, not a query)
+    # must trip the breaker: further calls within the cooldown skip _vector_store()
+    # entirely instead of re-paying the handshake on every get_vectors() call.
+    calls = {"n": 0}
+
+    def _boom():
+        calls["n"] += 1
+        raise RuntimeError("mongo unreachable")
+
+    monkeypatch.setattr(embeddings, "_vector_store", _boom)
+    stub = _Stub()
+    embeddings.get_vectors(stub, ["x"], model_id="m", group="g")
+    embeddings.get_vectors(stub, ["y"], model_id="m", group="g")
+    embeddings.get_vectors(stub, ["z"], model_id="m", group="g")
+    assert calls["n"] == 1  # one handshake attempt for the whole outage window, not one per call
+    assert stub.calls == [["x"], ["y"], ["z"]]  # grounding still gets vectors throughout

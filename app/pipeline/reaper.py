@@ -8,9 +8,9 @@ Stuck-job reaper.
 A worker that dies leaves a session that never reaches its terminal state → the per-asset
 lock leaks and the asset is `409` forever. The reaper is the safety net for *every*
 abandonment point:
-  - a work stage RUNNING with an expired lease (died mid-stage) → ERROR;
-  - a `_LOCK` RUNNING with an expired lease → reclaimed to IDLE;
-  - then any session with NO live lease (no worker running now) that is either proven dead
+- a work stage RUNNING with an expired lease (died mid-stage) → ERROR;
+- a `_LOCK` RUNNING with an expired lease → reclaimed to IDLE;
+- then any session with NO live lease (no worker running now) that is either proven dead
     (a row carries an expired lease) or never-started-and-stale is driven through the SAME
     `decide_session_outcome` rule the pipeline uses — partial success → REVIEW, total failure →
     cancelled — **under the `_LOCK` mutex** so it can never race a live worker or an
@@ -68,8 +68,9 @@ def clean_up_abandoned_sessions(sess: Session) -> list[str]:
 
     Return the session ids driven to a terminal 'cancelled' state this pass."""
     ss = m.Subsystem_Stage_State
-    lease = ss.c.LeaseExpiresAt
+    lease = ss.LeaseExpiresAt
     _now = now()
+    # A row only counts as "expired" if it actually has a lease AND that lease's time has already passed.
     expired = and_(lease.isnot(None), lease < _now)
 
     #  this step only LOOKS at the data first, without changing
@@ -80,11 +81,11 @@ def clean_up_abandoned_sessions(sess: Session) -> list[str]:
     # Read-only, RCSI-safe candidate scan (module docstring) — a plain SELECT never locks
     # what it reads, so finding candidates can't collide with a live worker's open transaction.
     expired_work = sess.execute(
-        select(ss.c.StateID, ss.c.SessionID).where(
-            ss.c.Level != SubsystemLevel.LOCK, ss.c.Status == StageStatus.RUNNING, expired)).all()
+        select(ss.StateID, ss.SessionID).where(
+            ss.Level != SubsystemLevel.LOCK, ss.Status == StageStatus.RUNNING, expired)).all()
     expired_locks = sess.execute(
-        select(ss.c.StateID, ss.c.SessionID).where(
-            ss.c.Level == SubsystemLevel.LOCK, ss.c.Status == StageStatus.RUNNING, expired)).all()
+        select(ss.StateID, ss.SessionID).where(
+            ss.Level == SubsystemLevel.LOCK, ss.Status == StageStatus.RUNNING, expired)).all()
 
     #  before we touch anything, we write down exactly which
     # sessions are DEFINITELY dead right now — because the very next steps are
@@ -111,7 +112,7 @@ def clean_up_abandoned_sessions(sess: Session) -> list[str]:
     for chunk in _split_into_batches(work_ids):  # split into batches: a big crash could affect more rows than the database can handle in one request
         sess.execute(
             update(ss)
-            .where(ss.c.StateID.in_(chunk), ss.c.Status == StageStatus.RUNNING, expired)
+            .where(ss.StateID.in_(chunk), ss.Status == StageStatus.RUNNING, expired)
             .values(Status=StageStatus.ERROR, LeaseExpiresAt=None, UpdatedAt=_now)
         )
     #  step 2 — any "lock" that a dead worker never released also
@@ -122,7 +123,7 @@ def clean_up_abandoned_sessions(sess: Session) -> list[str]:
     for chunk in _split_into_batches(lock_ids):
         sess.execute(
             update(ss)
-            .where(ss.c.StateID.in_(chunk), ss.c.Status == StageStatus.RUNNING, expired)
+            .where(ss.StateID.in_(chunk), ss.Status == StageStatus.RUNNING, expired)
             .values(Status=StageStatus.IDLE, ActiveTaskID=None, LeaseExpiresAt=None, UpdatedAt=_now)
         )
     sess.commit()  # make sure steps 1-2 are safely saved before we go on to lock anything in step 3
@@ -159,13 +160,14 @@ def _find_abandoned_sessions(sess: Session, _now: datetime, proven_dead: set[str
     window between a regenerate request's CAS and its Celery task actually starting)."""
     grace = _now - timedelta(seconds=get_settings().stage_lease_seconds)
     ss = m.Subsystem_Stage_State
+    # True if this session still has a row whose lease hasn't expired yet — i.e. some worker is still actively working on it.
     live_lease = (select(1).select_from(ss)
-                  .where(ss.c.SessionID == m.Scenario_Session.c.SessionID, ss.c.LeaseExpiresAt > _now)
-                  .exists())
-    base = (select(m.Scenario_Session.c.SessionID, m.Scenario_Session.c.TenantID, m.Scenario_Session.c.EntityID)
-            .where(m.Scenario_Session.c.SessionStatus == SessionStatus.active,
-                   m.Scenario_Session.c.CurrentStage != WorkflowStage.REVIEW,
-                   ~live_lease))
+                .where(ss.SessionID == m.Scenario_Session.SessionID, ss.LeaseExpiresAt > _now)
+                .exists())
+    base = (select(m.Scenario_Session.SessionID, m.Scenario_Session.TenantID, m.Scenario_Session.EntityID)
+            .where(m.Scenario_Session.SessionStatus == SessionStatus.active,
+                m.Scenario_Session.CurrentStage != WorkflowStage.REVIEW,
+                ~live_lease))
     #  a session can qualify as abandoned for two different
     # reasons (definitely dead, or just untouched too long) — this checks both
     # reasons separately, then combines the results so the same session is never
@@ -175,15 +177,15 @@ def _find_abandoned_sessions(sess: Session, _now: datetime, proven_dead: set[str
     # chunked so a mass crash can't exceed SQL Server's ~2100-param IN cap (the staleness branch
     # carries no IN list). Equivalent to the old `or_(UpdatedAt<grace, SessionID IN proven_dead)`.
     out: dict = {}
-    for row in sess.execute(base.where(m.Scenario_Session.c.UpdatedAt < grace)).mappings():
+    for row in sess.execute(base.where(m.Scenario_Session.UpdatedAt < grace)).mappings():
         out[row["SessionID"]] = row
     for chunk in _split_into_batches(proven_dead):
-        for row in sess.execute(base.where(m.Scenario_Session.c.SessionID.in_(chunk))).mappings():
+        for row in sess.execute(base.where(m.Scenario_Session.SessionID.in_(chunk))).mappings():
             out[row["SessionID"]] = row
     return list(out.values())
 
 
-def _close_out_one_abandoned_session(sess: Session, session: dict) -> str | None:
+def _close_out_one_abandoned_session(sess: Session, scenario_session: dict) -> str | None:
     """ safely closes out ONE abandoned session, but only if
     no other live worker is still using it.
 
@@ -194,11 +196,12 @@ def _close_out_one_abandoned_session(sess: Session, session: dict) -> str | None
     SAME finalize — partial→REVIEW (preserving committed partial success), total→cancelled."""
     from app.pipeline.tasks import decide_session_outcome  # imported here, not at the top of the file, only to avoid these two files needing each other at the same time when the app starts up
 
-    sid = session["SessionID"]
+    sid = scenario_session["SessionID"]
+    # Find every subsystem that has a _LOCK row for this session — we need to grab all of their locks before we can safely touch anything.
     lock_subs = [r[0] for r in sess.execute(
-        select(m.Subsystem_Stage_State.c.SubsystemID)
-        .where(m.Subsystem_Stage_State.c.SessionID == sid,
-               m.Subsystem_Stage_State.c.Level == SubsystemLevel.LOCK)).all()]
+        select(m.Subsystem_Stage_State.SubsystemID)
+        .where(m.Subsystem_Stage_State.SessionID == sid,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK)).all()]
     acquired: list[int] = []
     try:
         for ssid in lock_subs:
@@ -215,14 +218,23 @@ def _close_out_one_abandoned_session(sess: Session, session: dict) -> str | None
         # finalize sees a fully-terminal board (and doesn't wait forever on a dead worker's IDLE row).
         sess.execute(
             update(m.Subsystem_Stage_State)
-            .where(m.Subsystem_Stage_State.c.SessionID == sid,
-                   m.Subsystem_Stage_State.c.Level != SubsystemLevel.LOCK,
-                   m.Subsystem_Stage_State.c.Status.in_([StageStatus.IDLE, StageStatus.RUNNING]))
+            .where(m.Subsystem_Stage_State.SessionID == sid,
+                m.Subsystem_Stage_State.Level != SubsystemLevel.LOCK,
+                m.Subsystem_Stage_State.Status.in_([StageStatus.IDLE, StageStatus.RUNNING]))
             # use the current time here (not the time this whole cleanup pass started), since this write happens later, while we're holding the lock
             .values(Status=StageStatus.ERROR, ErrorMessage="reaped: worker gone", LeaseExpiresAt=None, UpdatedAt=now())
         )
-        return decide_session_outcome(sess, session)
+        return decide_session_outcome(sess, scenario_session)
     finally:
+        # Isolate each release attempt (same discipline as accept.py's lock-release cleanup):
+        # one lock's release raising (e.g. a transient connection error) must not skip the
+        # remaining acquired locks, and must not stop us from reaching the commit below —
+        # otherwise a mid-loop failure would leave every lock from that point on (including
+        # ones already released earlier in this same loop, since the release is only durable
+        # once committed) stuck RUNNING until the reaper's own next-pass lease-expiry reclaim.
         for ssid in acquired:
-            dal.release_lock(sess, sid, ssid)
+            try:
+                dal.release_lock(sess, sid, ssid, task_id=sid)  # same holder id we acquired under
+            except Exception:
+                log.warning("reaper.lock_release_failed", session_id=sid, subsystem=ssid, exc_info=True)
         sess.commit()

@@ -25,7 +25,7 @@ class StubLLM:
                     "name": "Bootloader implant", "actors": ["Hacker", "Nation-state"]}]
         else:
             out = {"scenario_title": "Bootloader implant on CAD", "scenario_statement": "S",
-                   "business_impact": "B", "operational_impact": "O"}
+                   "business_impact": "B", "operational_impact": "O", "risk_statement": "R"}
         return json.dumps(out), Provenance(model="stub")
 
     def embed(self, texts, *, model=None, kind="query"):
@@ -41,6 +41,7 @@ def _clear_embed_cache():
     from app.pipeline import embeddings
 
     embeddings.clear_cache()
+    embeddings._breaker_open_until = 0.0  # a breaker-test failure shouldn't leak into later tests
     yield
     embeddings.clear_cache()
 
@@ -57,25 +58,22 @@ def stub_llm():
     return StubLLM()
 
 
-# Shared session-creation UI-context fixtures — matched exactly against the DB seed rows
-# below so a plain create_session POST passes validate_ui_supplied_context.
+# DEFAULT_ASSET_CONTEXT (below) is a plain dict passed directly to
+# find_threats/write_scenarios/prompts.threats_prompt in tests that call the pipeline
+# functions directly, not through the HTTP API — unaffected by the ids-only body change
+# below. It's also matched against the DB seed rows for tests that DO go through the API.
 DEFAULT_ASSET_CONTEXT = {
     "cii_asset_description": "CAD design and drafting platform",
     "critical_service": "Design Service",
     "data_handled": "Engineering drawings and specs",
 }
-DEFAULT_SUPPORTING_SYSTEMS = [{
-    "id": 1019, "name": "CAD System", "asset_type": 1, "accessibility_channel": "Internal Network",
-    "system_managed_by": "EYAdmin", "hosting_environment": "Entity Data Centre", "data_residency": True,
-    "past_incidents": "None",
-}]
+DEFAULT_SUPPORTING_SYSTEM_ID = [1019]
 
 
 def session_body(asset_id=100, entity_id="5", **overrides):
-    """A full, DB-matching POST /v1/sessions body — every test that creates a session
-    over HTTP needs one now that validate_ui_supplied_context rejects any mismatch."""
-    body = {"asset_id": asset_id, "entity_id": entity_id, **DEFAULT_ASSET_CONTEXT,
-            "supporting_systems": DEFAULT_SUPPORTING_SYSTEMS}
+    """A minimal, ids-only POST /v1/sessions body — descriptive context is resolved
+    server-side from the DB seed rows below (gather_asset_details), not supplied here."""
+    body = {"asset_id": asset_id, "entity_id": entity_id, "supporting_system_id": DEFAULT_SUPPORTING_SYSTEM_ID}
     body.update(overrides)
     return body
 
@@ -86,7 +84,7 @@ def _create_schema_and_seed(engine) -> None:
     m.metadata.create_all(engine)
     with engine.begin() as c:
         # Partial unique indexes (M4/M6/M8) — SQLite supports filtered indexes.
-        c.execute(text('CREATE UNIQUE INDEX "UX_Session_ActiveAsset" ON "Scenario_Session"(EntityID, AssetExternalID) WHERE SessionStatus = \'active\''))
+        c.execute(text('CREATE UNIQUE INDEX "UX_Session_ActiveAsset" ON "Scenario_Session"(EntityID, AssetID) WHERE SessionStatus = \'active\''))
         c.execute(text('CREATE UNIQUE INDEX "UX_Scenario_ActiveIdentity" ON "Threat_Scenario_Output"(SessionID, IdentityHash) WHERE Superseded = 0'))
         c.execute(text('CREATE UNIQUE INDEX "UX_Session_IdempotencyKey" ON "Scenario_Session"(EntityID, IdempotencyKey) WHERE IdempotencyKey IS NOT NULL'))
         # M2 — master-library natural-key UNIQUE (safe concurrent promotion, no duplicate masters).
@@ -97,23 +95,25 @@ def _create_schema_and_seed(engine) -> None:
         c.execute(insert(m.group_table).values(id=5, name="Org A", code="A"))
         c.execute(insert(m.group_table).values(id=6, name="Org B", code="B"))
         c.execute(insert(m.onboarding_services).values(id=500, name="Design Service"))
+        # No group_id on the asset — the live ctm_scan_entity has no such column. Entity
+        # ownership comes solely from onboarding_service_entity below (asset→service→entity).
         c.execute(insert(m.ctm_scan_entity).values(
-            id=100, name="CAD", type="app", criticality=1, group_id=5, tier1_critical_service_id=500,
+            id=100, name="CAD", type="app", criticality=1, tier1_critical_service_id=500,
             description="CAD design and drafting platform", data_handled="Engineering drawings and specs"))
         c.execute(insert(m.ctm_scan_entity).values(
-            id=200, name="EPCR", type="app", criticality=1, group_id=5, tier1_critical_service_id=500,
+            id=200, name="EPCR", type="app", criticality=1, tier1_critical_service_id=500,
             description="CAD design and drafting platform", data_handled="Engineering drawings and specs"))
-        c.execute(insert(m.onboarding_service_entity).values(service_id=500, group_id=5))  # asset→service→entity 5
+        c.execute(insert(m.onboarding_service_entity).values(sector_id=1, service_id=500, group_id=5))  # asset→service→entity 5
         # option_value: option 1012 (Accessibility Channel) code 2 -> "Internal Network";
         # option 1015 (Hosting Environment) code 7 -> "Entity Data Centre".
         c.execute(insert(m.option).values(id=1012, option="Accessibility Channel"))
         c.execute(insert(m.option).values(id=1015, option="Hosting Environment"))
         c.execute(insert(m.option_value).values(id=1, name="Internal Network", value=2, option_id=1012))
         c.execute(insert(m.option_value).values(id=2, name="Entity Data Centre", value=7, option_id=1015))
-        c.execute(insert(m.user).values(id=1, name="EY", surname="Admin", username="EYAdmin", email="eyadmin@example.com"))
+        # ctm_scan_category: real live rows include id=1 "Physical infrastructure" (asset_type FK target).
+        c.execute(insert(m.ctm_scan_category).values(id=1, name="Physical infrastructure"))
         c.execute(insert(m.onboarding_supporting_systems).values(
-            id=1019, name="CAD System", asset_type=1, accessability_channel=2, hosting_location=7,
-            data_residency_restrictions=True, incident_description="None"))
+            id=1019, name="CAD System", asset_type=1, incident_description="None"))
         c.execute(insert(m.ctm_scan_entity_supporting_system).values(ctm_scan_entity_id=100, onboarding_supporting_system_id=1019))
         c.execute(insert(m.ctm_scan_entity_supporting_system).values(ctm_scan_entity_id=200, onboarding_supporting_system_id=1019))
         # Masters: category Tampering → types 10/11 → catalogue 20/21; actor Hacker on type 10.
@@ -133,8 +133,6 @@ def engine(tmp_path, monkeypatch):
     monkeypatch.setenv("EMBEDDING_PROVIDER", "litellm_proxy")  # tests use StubLLM, don't load torch
     monkeypatch.setenv("RERANKER_PROVIDER", "litellm_proxy")
     monkeypatch.setenv("EMBEDDING_STORE", "memory")  # tests don't touch Mongo
-    monkeypatch.setenv("ASSET_ENTITY_BINDING", "service")  # pin: don't inherit the dev .env value
-    # binding defaults to 'service' → uses the seeded onboarding_service_entity mapping
     from app.core.config import get_settings
     from app.db.engine import _sessionmaker, get_engine
 

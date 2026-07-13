@@ -21,6 +21,8 @@ async def lifespan(app: FastAPI):
     local-model path) before the app accepts traffic, so a broken deployment never
     silently serves requests against an unsafe config.
     """
+    # Note: the `app` parameter above is required by FastAPI's lifespan signature but
+    # isn't used in the body below — all the checks operate on global settings/engine.
     from app.core.logging import configure_logging
     from app.db.engine import get_engine
     from app.db.invariants import verify_startup
@@ -30,7 +32,7 @@ async def lifespan(app: FastAPI):
     from app.core.logging import get_logger
 
     configure_logging()
-    assert_security_posture()  # fail-closed: refuse to boot with auth/binding disabled in prod
+    assert_security_posture()  # fail-closed: refuse to boot with auth disabled in prod
     if get_settings().auth_dev_mode:
         get_logger().warning("AUTH_DEV_MODE is ON — authentication is bypassed. Dev/local only.")
     verify_startup(get_engine())  # fail-fast if a required DB guard is missing

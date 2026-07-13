@@ -8,52 +8,52 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Plan item 1b: bound every list-of-targets field so one HTTP request can't turn into an
 # unbounded synchronous AI/DB workload inside a single Celery task (no chunking exists).
 _MAX_BATCH = 50
 
 
-class SupportingSystemInput(BaseModel):
-    """One UI-supplied supporting system (13-field mapping item 7 onward) — `id` is the
-    real onboarding_supporting_systems PK (required; every downstream storage keys rows
-    by it), the rest is descriptive context validated against the DB by
-    `app.pipeline.context.validate_ui_supplied_context`."""
-    id: int
-    name: str
-    asset_type: int | None = None  # raw code — no label-lookup table exists for it
-    accessibility_channel: str | None = None
-    system_managed_by: str | None = None
-    hosting_environment: str | None = None
-    past_incidents: str | None = None
-    data_residency: bool | None = None
-
-
 class CreateSessionBody(BaseModel):
+    """Ids only — asset/subsystem/sector descriptive context is resolved server-side,
+    authoritatively, from the DB (`app.pipeline.context.gather_asset_details`), never
+    accepted from the client. This is deliberate: the client can no longer inject
+    arbitrary text into the LLM prompt just by having it happen to match the DB, because
+    there's no client-supplied text to inject in the first place."""
     asset_id: int
     entity_id: str
     sector_id: int | None = None
     user_id: str | None = None
-    cii_asset_description: str | None = None
-    critical_service: str | None = None
-    sector: str | None = None
-    sub_sector: str | None = None
-    data_handled: str | None = None
-    supporting_systems: list[SupportingSystemInput] = Field(min_length=1, max_length=_MAX_BATCH)
+    supporting_system_id: list[int] = Field(min_length=1, max_length=_MAX_BATCH)
+
+    @field_validator("supporting_system_id")
+    @classmethod
+    def _no_duplicate_ids(cls, v: list[int]) -> list[int]:
+        """Reject the request if the same supporting-system id appears more than once."""
+        # A repeated id would corrupt the CAS-keyed Subsystem_Stage_State rows one-per-id
+        # downstream — reject at the request boundary, before any DB work happens.
+        if len(set(v)) != len(v):
+            dupes = sorted({i for i in v if v.count(i) > 1})
+            raise ValueError(f"supporting_system_id contains duplicates: {dupes}")
+        return v
 
 
 class AcceptBody(BaseModel):
-    subset: list[str] | None = None
+    """Body for the "accept scenarios" endpoint."""
+    # No `min_length`: [R8] reads `subset=[]` as "accept none", distinct from `subset=None` = "accept all".
+    subset: list[str] | None = Field(default=None, max_length=_MAX_BATCH)
 
 
 class RegenerateScenariosBody(BaseModel):
+    """Body for asking the pipeline to regenerate scenarios for one supporting system."""
     supporting_system_id: int
     output_ids: list[str] = Field(min_length=1, max_length=_MAX_BATCH)
     user_note: str | None = None
 
 
 class SupportingSystemBoard(BaseModel):
+    """One supporting system's row on the session status board: its per-stage statuses plus an overall status."""
     id: int
     name: str | None
     stages: dict[str, str]
@@ -61,6 +61,7 @@ class SupportingSystemBoard(BaseModel):
 
 
 class SessionBoard(BaseModel):
+    """Full status board for a session: session-level info plus one row per supporting system."""
     session_id: str
     entity_id: str
     session_status: str
@@ -70,10 +71,12 @@ class SessionBoard(BaseModel):
 
 
 class CreateSessionResponse(BaseModel):
+    """Response returned after a new session is created."""
     session_id: str
 
 
 class ThreatResult(BaseModel):
+    """One threat identified for a supporting system, as returned to the client."""
     threat_id: str
     supporting_system_id: int
     threat_type: str
@@ -83,6 +86,7 @@ class ThreatResult(BaseModel):
 
 
 class ScenarioResult(BaseModel):
+    """One generated scenario for a supporting system, plus whether it has been accepted."""
     output_id: str
     supporting_system_id: int
     scenario: dict[str, Any] | None
@@ -90,22 +94,27 @@ class ScenarioResult(BaseModel):
 
 
 class SessionResults(BaseModel):
+    """All threats and scenarios produced so far for a session."""
     session_id: str
+    entity_id: str
     threats: list[ThreatResult]
     scenarios: list[ScenarioResult]
 
 
 class AcceptResponse(BaseModel):
+    """Response confirming an accept request was processed."""
     session_id: str
     status: str
 
 
 class RegenerateResponse(BaseModel):
+    """Response confirming a regenerate request was processed."""
     session_id: str
     status: str
 
 
 class CancelResponse(BaseModel):
+    """Response confirming a session was cancelled."""
     session_id: str
     status: str
 
@@ -122,6 +131,7 @@ class AcceptedScenario(BaseModel):
 
 
 class AcceptedScenariosResponse(BaseModel):
+    """All scenarios ever accepted for an asset, across sessions, plus the latest completed session (if any)."""
     asset_id: int
     entity_id: str
     session_id: str | None      # None - the asset has no completed session yet (scenarios == [])

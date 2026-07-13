@@ -68,8 +68,8 @@ def test_create_session_race_distinguishes_idempotency_from_asset_conflict(db):
         "IdempotencyKey": "shared-key",
     }
     winner_id = str(uuid.uuid4())
-    dal.create_session(db, {**base, "SessionID": winner_id, "AssetName": "CAD", "AssetExternalID": "100"})
+    dal.create_session(db, {**base, "SessionID": winner_id, "AssetName": "CAD", "AssetID": "100"})
 
     with pytest.raises(dal.IdempotencyKeyConflict) as exc_info:
-        dal.create_session(db, {**base, "SessionID": str(uuid.uuid4()), "AssetName": "EPCR", "AssetExternalID": "200"})
+        dal.create_session(db, {**base, "SessionID": str(uuid.uuid4()), "AssetName": "EPCR", "AssetID": "200"})
     assert exc_info.value.existing_session_id == winner_id

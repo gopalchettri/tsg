@@ -62,6 +62,13 @@ if (-not (Test-Path $venvActivate)) {
     throw "venv not found at $venvActivate. From $ProjectRoot run:`n  python -m venv .venv`n  ./.venv/Scripts/pip install -e `".[dev]`""
 }
 
+# Always address the venv's own celery.exe by full path. A bare `celery` resolves
+# via PATH, and THIS window never activates the venv (only the spawned ones do) --
+# so it silently hits whatever global Python is installed. That global has celery
+# but no gevent/fastapi, so the readiness probe below errored out and reported
+# "worker NOT READY" on every single run, even against a perfectly healthy worker.
+$celeryExe = Join-Path $ProjectRoot '.venv\Scripts\celery.exe'
+
 $envFile = Join-Path $ProjectRoot '.env'
 if (-not (Test-Path $envFile)) {
     Write-Warning "$envFile not found. Copy .env.example to .env and fill in real values first."
@@ -139,7 +146,7 @@ if (Test-Path $alembic) {
     # launching the rest of the stack) -- so failures degrade to a warning.
     try {
         # A revision-id line in this repo's own convention is a 4+ digit/hex token
-        # (0001..0013 today). Requiring a MINIMUM length + a trailing word boundary
+        # (0001..0022 today). Requiring a MINIMUM length + a trailing word boundary
         # is deliberate, not cosmetic: a bare `^[0-9a-f]+` is case-insensitive by
         # default in PowerShell, so an alembic failure banner like "FAILED: ..."
         # itself matches (F/A are valid hex digits) -- Select-String then returns
@@ -254,7 +261,13 @@ function Start-InNewWindow {
 # 3. Celery worker (new window) -- gevent pool, matches compose.prod.yml's -c 50
 # ---------------------------------------------------------------------------
 
-$celeryCmd = "celery -A app.pipeline.celery_worker.celery_app worker -P gevent -c $Concurrency -l info"
+# Full path, not a bare `celery` -- same reason $celeryExe exists above: if
+# Activate.ps1 doesn't finish prepending .venv\Scripts to PATH before this line
+# runs in the spawned window (profile-script timing, execution-policy quirks,
+# etc.), a bare `celery` silently falls through to whatever global Python is on
+# PATH, which has celery but not gevent -- reproduced live, worker crashes with
+# "ModuleNotFoundError: No module named 'gevent'" instead of starting.
+$celeryCmd = "& '$celeryExe' -A app.pipeline.celery_worker.celery_app worker -P gevent -c $Concurrency -l info"
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
                   -InnerCommand $celeryCmd -WindowTitle 'tsg-celery'
 Write-Host "Celery worker starting in a new window (title: tsg-celery)..." -ForegroundColor Green
@@ -279,7 +292,8 @@ if ((Test-Path $beatScheduleDat) -and (Get-Item $beatScheduleDat).Length -eq 0) 
     Remove-Item -Path (Join-Path $ProjectRoot 'celerybeat-schedule.*') -Force -ErrorAction SilentlyContinue
 }
 
-$beatCmd = "celery -A app.pipeline.celery_app.celery_app beat -l info"
+# Full path -- same reason as $celeryCmd above.
+$beatCmd = "& '$celeryExe' -A app.pipeline.celery_app.celery_app beat -l info"
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
                   -InnerCommand $beatCmd -WindowTitle 'tsg-beat'
 Write-Host "Celery beat starting in a new window (title: tsg-beat)..." -ForegroundColor Green
@@ -294,7 +308,7 @@ Write-Host "Celery beat starting in a new window (title: tsg-beat)..." -Foregrou
 function Test-CeleryWorkerReady {
     param([int]$TimeoutSec = 3)
     try {
-        $output = & celery -A app.pipeline.celery_app.celery_app inspect ping -t $TimeoutSec 2>&1
+        $output = & $celeryExe -A app.pipeline.celery_app.celery_app inspect ping -t $TimeoutSec 2>&1
         return ($output -match 'pong')
     } catch {
         return $false
@@ -330,7 +344,9 @@ if (-not $workerReady) {
 
 Stop-ProcessOnPort -Port $Port -Label 'uvicorn (pre-existing)'
 
-$uvicornCmd = "uvicorn app.main:app --host 0.0.0.0 --port $Port"
+# Full path -- same reason as $celeryCmd/$beatCmd above.
+$uvicornExe = Join-Path $ProjectRoot '.venv\Scripts\uvicorn.exe'
+$uvicornCmd = "& '$uvicornExe' app.main:app --host 0.0.0.0 --port $Port"
 if ($Reload.IsPresent) { $uvicornCmd += ' --reload' }
 
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `

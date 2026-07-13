@@ -1,4 +1,4 @@
-"""Coverage for the `/regenerate/scenarios` API — the single surviving regenerate
+﻿"""Coverage for the `/regenerate/scenarios` API — the single surviving regenerate
 granularity — plus the check that the old overloaded endpoint is gone.
 """
 from __future__ import annotations
@@ -22,10 +22,10 @@ def test_scenario_1_single_output_id(db):
     _leave_review(db, sid)
     epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
     outcome = cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [output_id], epoch,
-                                       StubLLM(), "t")
+                                       StubLLM(), "11111111-1111-4111-8111-111111111111")
     assert outcome == "review"
-    assert db.execute(select(m.Threat_Scenario_Output.c.Superseded)
-                      .where(m.Threat_Scenario_Output.c.OutputID == output_id)).scalar() == 1
+    assert db.execute(select(m.Threat_Scenario_Output.Superseded)
+                      .where(m.Threat_Scenario_Output.OutputID == output_id)).scalar() == 1
 
 
 def test_scenario_2_multi_output_ids_siblings_untouched(db):
@@ -37,13 +37,13 @@ def test_scenario_2_multi_output_ids_siblings_untouched(db):
     assert len(outputs) == 2
     _leave_review(db, sid)
     epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
-    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, outputs, epoch, _TwoThreatLLM(), "t")
+    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, outputs, epoch, _TwoThreatLLM(), "11111111-1111-4111-8111-111111111111")
 
     for oid in outputs:
-        assert db.execute(select(m.Threat_Scenario_Output.c.Superseded)
-                          .where(m.Threat_Scenario_Output.c.OutputID == oid)).scalar() == 1
-    active = db.execute(select(m.Threat_Scenario_Output).where(
-        m.Threat_Scenario_Output.c.SessionID == sid, m.Threat_Scenario_Output.c.Superseded == 0)).mappings().all()
+        assert db.execute(select(m.Threat_Scenario_Output.Superseded)
+                          .where(m.Threat_Scenario_Output.OutputID == oid)).scalar() == 1
+    active = db.execute(select(m.Threat_Scenario_Output.__table__).where(
+        m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)).mappings().all()
     assert len(active) == 2  # both regenerated, none lost
 
 

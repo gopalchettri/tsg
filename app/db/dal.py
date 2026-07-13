@@ -8,15 +8,46 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
-from sqlalchemy import and_, func, insert, or_, select, update
+from sqlalchemy import Executable, RowMapping, and_, func, insert, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.enums import SessionStatus, StageStatus, SubsystemLevel
+from app.core.enums import SessionStatus, StageStatus, SubsystemLevel, WorkflowStage
 from app.db import models as m
+
+
+def execute_dml(sess: Session, stmt: Executable) -> CursorResult[Any]:
+    """Run a Core INSERT/UPDATE/DELETE, returning the result narrowed to `CursorResult` —
+    the only `Result` subclass carrying `.rowcount` and `.inserted_primary_key`.
+
+    `Session.execute()` is annotated `-> Result[Any]` because it also serves ORM queries,
+    which return `ChunkedIteratorResult`/`ScalarResult`. Core DML always yields a
+    `CursorResult` at runtime, but the annotation cannot say so, and every CAS below reads
+    `.rowcount` off it. Narrowing once here beats a cast at each call site.
+
+    NOTE `.rowcount` is only a trustworthy CAS signal while no `SET NOCOUNT ON` is in
+    effect and no trigger fires on the target table — either would make it -1 or inflated.
+    """
+    return cast("CursorResult[Any]", sess.execute(stmt))
+
+
+def inserted_pk(res: CursorResult[Any]) -> int:
+    """First column of the primary key of the row just inserted.
+
+    `CursorResult.inserted_primary_key` is annotated `Optional[Any]`, but for a single-row
+    `insert()` against an IDENTITY table SQLAlchemy either returns a `Row` or raises
+    `InvalidRequestError` — it never hands back None. Check anyway: the `upsert_*` callers
+    below run inside an IntegrityError retry, where a bare `NoneType is not subscriptable`
+    would be far harder to trace back here than an explicit failure.
+    """
+    pk = res.inserted_primary_key
+    if pk is None:
+        raise RuntimeError("INSERT yielded no primary key (not an IDENTITY table?)")
+    return pk[0]
 
 
 def now() -> datetime:
@@ -34,134 +65,13 @@ def guid() -> str:
 class SessionConflict(Exception):
     """An active session already exists for this (entity, asset) → 409."""
 
-    def __init__(self, active_session_id: str | None):
-        """Carries the conflicting session's id (may be None if the M4 winner
-        couldn't be re-resolved) so the API layer can surface it in the 409 body."""
+    def __init__(self, active_session_id: str):
+        """Carries the conflicting session's id so the API layer can surface it in the
+        409 body. Never None: `create_session` raises this only once it has positively
+        identified the active row that beat us, and re-raises any IntegrityError it
+        cannot attribute to a known unique index instead of mislabelling it a conflict."""
         self.active_session_id = active_session_id
         super().__init__(active_session_id)
-
-
-class EntityForbidden(Exception):
-    """Requested object is outside the caller's entity scope → 403."""
-
-
-class NotFoundError(Exception):
-    """Requested entity does not exist → 404."""
-
-
-class ContextMismatchError(Exception):
-    """One or more UI-supplied session-creation fields don't match the platform's own
-    records (`validate_ui_supplied_context`) → 422. Carries every mismatch found in one
-    pass, not just the first, so the caller can report them all at once."""
-
-    def __init__(self, mismatches: list[dict]):
-        """`mismatches` is a list of {field, expected, got} dicts — one per field that
-        failed the check, collected before raising (never raised on the first failure)."""
-        self.mismatches = mismatches
-        super().__init__(mismatches)
-
-
-def active(table) -> Any:
-    """Active-row predicate: only `Superseded = 0` rows are valid (§5.8)."""
-    return table.c.Superseded == 0
-
-
-# ---------------------------------------------------------------------------
-# Sessions (carry EntityID directly — filtered by it, INV-1)
-# ---------------------------------------------------------------------------
-def create_session(sess: Session, values: Mapping[str, Any]) -> str:
-    """Insert a session. Two independent unique indexes can reject the insert: M4
-    (EntityID, AssetExternalID) WHERE active, and M8 (EntityID, IdempotencyKey) WHERE
-    IdempotencyKey IS NOT NULL — a concurrent request racing the SAME idempotency key
-    past `reserve_idempotency_key_or_get_existing`'s pre-check TOCTOU window can violate
-    EITHER. Check the idempotency-key index first when a key was supplied: it's the
-    more specific match, and re-scoping by (EntityID, AssetExternalID) alone would
-    silently miss a same-key/different-asset winner (that row need not share our
-    AssetExternalID), returning the wrong conflict type with no session id.
-    """
-    try:
-        with sess.begin_nested():  # savepoint so a violation doesn't kill the txn
-            sess.execute(insert(m.Scenario_Session).values(**values))
-    except IntegrityError:
-        idem_key = values.get("IdempotencyKey")
-        if idem_key:
-            winner = sess.execute(
-                select(m.Scenario_Session.c.SessionID).where(
-                    m.Scenario_Session.c.EntityID == values["EntityID"],
-                    m.Scenario_Session.c.IdempotencyKey == idem_key,
-                )
-            ).scalar()
-            if winner is not None:
-                raise IdempotencyKeyConflict(winner)
-        existing = sess.execute(
-            select(m.Scenario_Session.c.SessionID).where(
-                m.Scenario_Session.c.EntityID == values["EntityID"],
-                m.Scenario_Session.c.AssetExternalID == values["AssetExternalID"],
-                m.Scenario_Session.c.SessionStatus == SessionStatus.active,
-            )
-        ).scalar()
-        raise SessionConflict(existing)
-    return values["SessionID"]
-
-
-def load_session(sess: Session, session_id: str) -> Mapping[str, Any] | None:
-    """Load a session by id WITHOUT an entity filter — the API then checks the
-    row's EntityID is in the caller's authorized set ([R2] object-level authz).
-    """
-    return sess.execute(
-        select(m.Scenario_Session).where(m.Scenario_Session.c.SessionID == session_id)
-    ).mappings().first()
-
-
-def get_session(sess: Session, session_id: str, entity_id: str) -> Mapping[str, Any] | None:
-    """Fetch a session **only within the caller's entity** — the data-layer IDOR
-    guard (INV-1): another entity's session is invisible even with a valid token.
-    """
-    return sess.execute(
-        select(m.Scenario_Session).where(
-            m.Scenario_Session.c.SessionID == session_id,
-            m.Scenario_Session.c.EntityID == str(entity_id),
-        )
-    ).mappings().first()
-
-
-def complete_session(sess: Session, session_id: str) -> None:
-    """Accept path: flip to completed/APPROVED — this releases the M4 lock."""
-    from app.core.enums import WorkflowStage
-
-    sess.execute(
-        update(m.Scenario_Session)
-        .where(m.Scenario_Session.c.SessionID == session_id)
-        .values(
-            SessionStatus=SessionStatus.completed,
-            CurrentStage=WorkflowStage.APPROVED,
-            CompletedAt=now(),
-            UpdatedAt=now(),
-        )
-    )
-
-
-def cancel_session(sess: Session, session_id: str) -> None:
-    """Cancel/reaper path → cancelled (also releases the M4 lock). Mirrors
-    `complete_session`'s pattern: CurrentStage/StageStatus move to a real terminal
-    value too, not just SessionStatus — otherwise the board keeps showing the stale
-    pre-cancel stage forever (e.g. AWAITING_DECISION on a session that's actually dead)."""
-    from app.core.enums import WorkflowStage
-
-    sess.execute(
-        update(m.Scenario_Session)
-        .where(m.Scenario_Session.c.SessionID == session_id)
-        .values(SessionStatus=SessionStatus.cancelled, CurrentStage=WorkflowStage.CANCELLED,
-                StageStatus=StageStatus.CANCELLED, UpdatedAt=now())
-    )
-
-
-# ---------------------------------------------------------------------------
-# Admission control — backpressure + idempotent create
-# ---------------------------------------------------------------------------
-class CapacityExceeded(Exception):
-    """Active-session ceiling reached → 503 (soft, deliberately racy — see
-    `count_active_sessions`)."""
 
 
 class IdempotencyKeyConflict(Exception):
@@ -175,6 +85,170 @@ class IdempotencyKeyConflict(Exception):
         super().__init__(existing_session_id)
 
 
+class CapacityExceeded(Exception):
+    """Active-session ceiling reached → 503 (soft, deliberately racy — see
+    `count_active_sessions`)."""
+
+
+class RegenerateConflict(Exception):
+    """Regenerate rejected: not at REVIEW, target lock held, or a concurrent
+    regen/accept won the race → 409. Distinct from AcceptConflict — a different
+    action, so it needs its own error_code."""
+
+
+class CancelConflict(Exception):
+    """Cancel rejected: the session was already terminal (completed/cancelled by a
+    concurrent writer) when `cancel_session`'s CAS ran → 409. Distinct from
+    AcceptConflict/RegenerateConflict — a different action, own error_code."""
+
+
+class EntityForbidden(Exception):
+    """Requested object is outside the caller's entity scope → 403."""
+
+
+class NotFoundError(Exception):
+    """Requested entity does not exist → 404."""
+
+
+# ---------------------------------------------------------------------------
+# Sessions (carry EntityID directly — filtered by it)
+# ---------------------------------------------------------------------------
+def create_session(sess: Session, values: Mapping[str, Any]) -> str:
+    """Insert a session. Two independent unique indexes can reject the insert:
+    (EntityID, AssetID) WHERE active, and (EntityID, IdempotencyKey) WHERE
+    IdempotencyKey IS NOT NULL — a concurrent request racing the SAME idempotency key
+    past `reserve_idempotency_key_or_get_existing`'s pre-check TOCTOU window can violate
+    EITHER. Check the idempotency-key index first when a key was supplied: it's the
+    more specific match, and re-scoping by (EntityID, AssetID) alone would
+    silently miss a same-key/different-asset winner (that row need not share our
+    AssetID), returning the wrong conflict type with no session id.
+
+    An IntegrityError attributable to NEITHER index (NOT NULL, FK, truncation) is
+    re-raised untouched. Blindly answering `SessionConflict(None)` turned every
+    server-side schema fault into a 409 that told the client "asset already has an
+    active session" — naming an asset that has no such session — and buried the real
+    cause. Same fail-loud rule the `upsert_*` helpers below apply to their own
+    natural-key retries: only a violation you can positively identify may be absorbed.
+    """
+    try:
+        with sess.begin_nested():  # savepoint so a violation doesn't kill the txn
+            sess.execute(insert(m.Scenario_Session).values(**values))
+    except IntegrityError as exc:
+        idem_key = values.get("IdempotencyKey")
+        # If the caller sent an idempotency key, see if it already points at a session first —
+        # that's the more specific match, checked before the plain asset-conflict lookup below.
+        if idem_key:
+            winner = sess.execute(
+                select(m.Scenario_Session.SessionID).where(
+                    m.Scenario_Session.EntityID == values["EntityID"],
+                    m.Scenario_Session.IdempotencyKey == idem_key,
+                )
+            ).scalar()
+            if winner is not None:
+                raise IdempotencyKeyConflict(winner) from exc
+        existing = sess.execute(
+            select(m.Scenario_Session.SessionID).where(
+                m.Scenario_Session.EntityID == values["EntityID"],
+                m.Scenario_Session.AssetID == values["AssetID"],
+                m.Scenario_Session.SessionStatus == SessionStatus.active,
+            )
+        ).scalar()
+        if existing is None:
+            raise  # neither unique index fired — a real constraint fault, not a conflict
+        raise SessionConflict(existing) from exc
+    return values["SessionID"]
+
+
+def _valid_guid(value: str) -> bool:
+    """SessionID (and every other row-key column) is now a real `uniqueidentifier`
+    on MSSQL -- a caller-supplied id that isn't UUID-shaped (a stale bookmark, a
+    scanner probe, a typo'd path param) must never reach a WHERE clause on that
+    column: MSSQL rejects the conversion with a raw pyodbc.ProgrammingError, not
+    a clean empty result (confirmed against a live DB). Checked here, once, so
+    every id-keyed lookup gets a "not found" instead of a 500.
+    """
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def load_session(sess: Session, session_id: str) -> RowMapping | None:
+    """Load a session by id WITHOUT an entity filter — the API then checks the
+    row's EntityID is in the caller's authorized set ([R2] object-level authz).
+    """
+    if not _valid_guid(session_id):
+        return None
+    return sess.execute(
+        select(m.Scenario_Session.__table__).where(m.Scenario_Session.SessionID == session_id)
+    ).mappings().first()
+
+
+def get_session(sess: Session, session_id: str, entity_id: str) -> RowMapping | None:
+    """Fetch a session **only within the caller's entity** — the data-layer IDOR
+    guard (INV-1): another entity's session is invisible even with a valid token.
+    """
+    if not _valid_guid(session_id):
+        return None
+    return sess.execute(
+        select(m.Scenario_Session.__table__).where(
+            m.Scenario_Session.SessionID == session_id,
+            m.Scenario_Session.EntityID == str(entity_id),
+        )
+    ).mappings().first()
+
+
+def complete_session(sess: Session, session_id: str) -> bool:
+    """Accept path: flip to completed/APPROVED — this releases the M4 lock.
+
+    CAS-fenced on `SessionStatus == active` (same discipline as every other
+    state-transition write in this file — claim_stage/acquire_lock/release_lock/
+    finish_stage): returns True iff THIS call made the transition, False if the
+    session was no longer active (already completed/cancelled by a concurrent
+    writer, or the id doesn't exist) — a lost race the caller must surface, never
+    a silent overwrite of whatever the other writer already committed.
+    """
+    res = execute_dml(
+        sess,
+        update(m.Scenario_Session)
+        .where(m.Scenario_Session.SessionID == session_id,
+            m.Scenario_Session.SessionStatus == SessionStatus.active)
+        .values(
+            SessionStatus=SessionStatus.completed,
+            CurrentStage=WorkflowStage.APPROVED,
+            CompletedAt=now(),
+            UpdatedAt=now(),
+        )
+    )
+    return res.rowcount == 1
+
+
+def cancel_session(sess: Session, session_id: str) -> bool:
+    """Cancel/reaper path → cancelled (also releases the M4 lock). Mirrors
+    `complete_session`'s pattern: CurrentStage/StageStatus move to a real terminal
+    value too, not just SessionStatus — otherwise the board keeps showing the stale
+    pre-cancel stage forever (e.g. AWAITING_DECISION on a session that's actually dead).
+
+    Same CAS fencing as `complete_session`: only a session still `active` can be
+    cancelled. Returns True iff this call made the transition, False if it was
+    already terminal (or never existed) — the caller must treat that as a
+    conflict, not silently flip an already-completed/-cancelled session.
+    """
+    res = execute_dml(
+        sess,
+        update(m.Scenario_Session)
+        .where(m.Scenario_Session.SessionID == session_id,
+            m.Scenario_Session.SessionStatus == SessionStatus.active)
+        .values(SessionStatus=SessionStatus.cancelled, CurrentStage=WorkflowStage.CANCELLED,
+                StageStatus=StageStatus.CANCELLED, UpdatedAt=now())
+    )
+    return res.rowcount == 1
+
+
+# ---------------------------------------------------------------------------
+# Admission control — backpressure + idempotent create
+# ---------------------------------------------------------------------------
 def count_active_sessions(sess: Session) -> int:
     """Index-only-scan COUNT against the filtered `IX_Session_Active` index — never
     touches the base table. Deliberately racy under concurrency: a soft backpressure
@@ -183,8 +257,8 @@ def count_active_sessions(sess: Session) -> int:
     """
     return sess.execute(
         select(func.count()).select_from(m.Scenario_Session)
-        .where(m.Scenario_Session.c.SessionStatus == SessionStatus.active)
-    ).scalar()
+        .where(m.Scenario_Session.SessionStatus == SessionStatus.active)
+    ).scalar() or 0
 
 
 def assert_capacity_available(sess: Session) -> None:
@@ -195,27 +269,29 @@ def assert_capacity_available(sess: Session) -> None:
 
 
 def reserve_idempotency_key_or_get_existing(
-    sess: Session, entity_id: str, idempotency_key: str, asset_external_id: str,
+    sess: Session, entity_id: str, idempotency_key: str, asset_id: str,
 ) -> tuple[str | None, bool]:
     """One indexed SELECT against `UX_Session_IdempotencyKey`. Returns:
-      - (None, False)        — key unused, caller proceeds to create.
-      - (session_id, False)  — same key + same asset → return the existing session.
-      - (session_id, True)   — same key + a DIFFERENT asset → caller raises 409
+    - (None, False)        — key unused, caller proceeds to create.
+    - (session_id, False)  — same key + same asset → return the existing session.
+    - (session_id, True)   — same key + a DIFFERENT asset → caller raises 409
         (silently ignoring a reused key against a different payload would be a worse
         trap than a loud conflict).
     The actual create-time race (two concurrent requests racing this same read) is
     caught by `create_session`'s IntegrityError handler, which checks the
     IdempotencyKey index FIRST (before falling back to the M4 asset index) — the two
-    racing requests need NOT share (EntityID, AssetExternalID).
+    racing requests need NOT share (EntityID, AssetID).
     """
     row = sess.execute(
-        select(m.Scenario_Session.c.SessionID, m.Scenario_Session.c.AssetExternalID)
-        .where(m.Scenario_Session.c.EntityID == entity_id,
-               m.Scenario_Session.c.IdempotencyKey == idempotency_key)
+        select(m.Scenario_Session.SessionID, m.Scenario_Session.AssetID)
+        .where(m.Scenario_Session.EntityID == entity_id,
+            m.Scenario_Session.IdempotencyKey == idempotency_key)
     ).mappings().first()
     if row is None:
         return None, False
-    return row["SessionID"], row["AssetExternalID"] != asset_external_id
+    # Second value is True only when the existing row used this key for a DIFFERENT asset —
+    # that's the "reused key, different payload" conflict case the caller must reject.
+    return row["SessionID"], row["AssetID"] != asset_id
 
 
 # ---------------------------------------------------------------------------
@@ -234,38 +310,67 @@ def claim_stage(
     `AttemptCount` reaches `stage_max_attempts` the row stops being re-claimable
     (and so stops refreshing its lease); the existing reaper sweep + `decide_session_outcome`
     then carry it to a terminal state with no new plumbing.
+
+    Paired with `finish_stage`, which fences the exit on this same (epoch, task_id).
+
+    This primitive intentionally does NOT check `_LOCK` ownership — it's usable standalone
+    (poison-loop/redelivery tests exercise it directly, with no `_LOCK` row staged at all).
+    A caller that must not resume work after losing the `_LOCK` mutex mid-flight needs its
+    own explicit `holds_lock` check — see `write_scenarios`' `require_lock` param, which is
+    exactly that: the gap this alone can't close is a zombie claiming a stage this row's
+    *sibling* level never even touched (so no epoch/task_id fencing on THAT row applies yet).
     """
     s = get_settings()
-    res = sess.execute(
+    _now = now()  # one instant for lease/heartbeat/updated — three now() calls drift apart
+    res = execute_dml(
+        sess,
         update(m.Subsystem_Stage_State)
         .where(
-            m.Subsystem_Stage_State.c.SessionID == session_id,
-            m.Subsystem_Stage_State.c.SubsystemID == subsystem_id,
-            m.Subsystem_Stage_State.c.Level == level,
-            m.Subsystem_Stage_State.c.GenerationEpoch == epoch,
-            m.Subsystem_Stage_State.c.AttemptCount < s.stage_max_attempts,
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == level,
+            m.Subsystem_Stage_State.GenerationEpoch == epoch,
+            m.Subsystem_Stage_State.AttemptCount < s.stage_max_attempts,
+            # Claimable if the row is fresh/failed (IDLE/ERROR), OR it's already RUNNING but
+            # owned by this same task (so a retry of our own in-flight attempt can resume it).
             or_(
-                m.Subsystem_Stage_State.c.Status.in_([StageStatus.IDLE, StageStatus.ERROR]),
-                and_(m.Subsystem_Stage_State.c.ActiveTaskID == task_id,
-                     m.Subsystem_Stage_State.c.Status == StageStatus.RUNNING),
+                m.Subsystem_Stage_State.Status.in_([StageStatus.IDLE, StageStatus.ERROR]),
+                and_(m.Subsystem_Stage_State.ActiveTaskID == task_id,
+                    m.Subsystem_Stage_State.Status == StageStatus.RUNNING),
             ),
         )
         .values(
             Status=StageStatus.RUNNING,
             ActiveTaskID=task_id,
-            LeaseExpiresAt=now() + timedelta(seconds=s.stage_lease_seconds),
-            HeartbeatAt=now(),
-            AttemptCount=m.Subsystem_Stage_State.c.AttemptCount + 1,
-            UpdatedAt=now(),
+            LeaseExpiresAt=_now + timedelta(seconds=s.stage_lease_seconds),
+            HeartbeatAt=_now,
+            AttemptCount=m.Subsystem_Stage_State.AttemptCount + 1,
+            UpdatedAt=_now,
         )
     )
     return res.rowcount == 1
 
 
+def holds_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
+    """True iff `task_id` currently holds this subsystem's `_LOCK` row (RUNNING, owned by
+    it). A stalled worker whose lease expired has this reclaimed by the reaper out from
+    under it — checking this right before resuming multi-step work catches that without
+    needing every downstream `claim_stage` call to carry its own `_LOCK` check (see
+    `write_scenarios`'s `require_lock` param, the one place this is actually needed)."""
+    return sess.execute(
+        select(1).select_from(m.Subsystem_Stage_State)
+        .where(m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK,
+            m.Subsystem_Stage_State.Status == StageStatus.RUNNING,
+            m.Subsystem_Stage_State.ActiveTaskID == task_id)
+    ).first() is not None
+
+
 def acquire_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
-    """[R5] Compare-and-set on the `_LOCK` row — serialises work on one subsystem.
+    """Compare-and-set on the `_LOCK` row — serialises work on one subsystem.
     Only one caller can flip IDLE→RUNNING; returns True iff we hold it. A lease is
-    set so the reaper can reclaim it if the holder dies ([R1]).
+    set so the reaper can reclaim it if the holder dies.
     """
     s = get_settings()
     # A lock may only be taken while the owning session is still 'active'. This closes the
@@ -273,17 +378,18 @@ def acquire_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str
     # concurrently cancelled/completed — the _LOCK row is the mutex, this is its session gate.
     session_active = (
         select(1)
-        .where(m.Scenario_Session.c.SessionID == session_id,
-               m.Scenario_Session.c.SessionStatus == SessionStatus.active)
+        .where(m.Scenario_Session.SessionID == session_id,
+            m.Scenario_Session.SessionStatus == SessionStatus.active)
         .exists()
     )
-    res = sess.execute(
+    res = execute_dml(
+        sess,
         update(m.Subsystem_Stage_State)
         .where(
-            m.Subsystem_Stage_State.c.SessionID == session_id,
-            m.Subsystem_Stage_State.c.SubsystemID == subsystem_id,
-            m.Subsystem_Stage_State.c.Level == SubsystemLevel.LOCK,
-            m.Subsystem_Stage_State.c.Status == StageStatus.IDLE,
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK,
+            m.Subsystem_Stage_State.Status == StageStatus.IDLE,
             session_active,
         )
         .values(
@@ -294,55 +400,113 @@ def acquire_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str
     return res.rowcount == 1
 
 
-def release_lock(sess: Session, session_id: str, subsystem_id: int) -> None:
-    """Unconditionally flip the `_LOCK` row back to IDLE, freeing it for the next
-    `acquire_lock` caller. No CAS guard here — the holder proved ownership when it
-    won `acquire_lock`, so release is a plain write, not another compare-and-set."""
-    sess.execute(
+def release_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
+    """Flip the `_LOCK` row back to IDLE — but ONLY if we still hold it. Returns True
+    iff the release landed; False means the lock was taken from us while we worked.
+
+    Winning `acquire_lock` does NOT prove ownership *later*. A holder that stalls past
+    its lease has the lock reclaimed to IDLE by the reaper (reaper.py step 2) and
+    immediately re-taken by the reaper's own finalize or by a redelivered task. An
+    unconditional release would then free a lock belonging to that new owner, putting
+    two writers on one subsystem — precisely the [R5] mutual exclusion the `_LOCK` row
+    exists to enforce. Fencing on `ActiveTaskID` makes a stale holder's release a no-op.
+    """
+    res = execute_dml(
+        sess,
         update(m.Subsystem_Stage_State)
         .where(
-            m.Subsystem_Stage_State.c.SessionID == session_id,
-            m.Subsystem_Stage_State.c.SubsystemID == subsystem_id,
-            m.Subsystem_Stage_State.c.Level == SubsystemLevel.LOCK,
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK,
+            m.Subsystem_Stage_State.Status == StageStatus.RUNNING,
+            m.Subsystem_Stage_State.ActiveTaskID == task_id,  # fencing token
         )
         # Clear the lease too: a released lock holds no lease, so the reaper's "any live
         # lease?" liveness check never mistakes a freed lock for a running worker.
         .values(Status=StageStatus.IDLE, ActiveTaskID=None, LeaseExpiresAt=None, UpdatedAt=now())
     )
+    return res.rowcount == 1
 
 
-def set_stage(
-    sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel,
-    status: StageStatus, error: str | None = None,
-) -> None:
-    """A row's `LeaseExpiresAt` means "someone is actively RUNNING this right now" —
-    every transition AWAY from RUNNING (COMPLETE/AWAITING_DECISION/ERROR) must clear
-    it. Otherwise a long-finished row keeps carrying its original (now long-expired)
-    lease forever, and the reaper's `dead_lease` check — meant to catch a genuinely
-    abandoned mid-flight attempt — fires on a session that simply left REVIEW minutes
-    ago for a routine regeneration, bypassing the grace-period fallback entirely."""
-    sess.execute(
+def renew_lease(sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel,
+                epoch: int, task_id: str) -> bool:
+    """Push a held stage's lease forward — call this before a long operation (an LLM call)
+    so a still-alive worker's claim doesn't expire and get reaped out from under it mid-work.
+    `claim_stage` sets the lease once; a stage that makes several long calls in a row
+    (write_scenarios, one per selected threat) can otherwise outlive it under entirely normal
+    latency, not just a crash. Fenced on (epoch, task_id, Status==RUNNING) — same discipline as
+    `finish_stage` — so a zombie that already lost the claim can never resurrect it by renewing
+    a lease it no longer legitimately holds. Best-effort: a caller that gets False back should
+    let the existing `finish_stage` fencing at the end of its own work catch the lost claim,
+    exactly as it always has, rather than treat this as a new distinct failure to handle.
+    """
+    s = get_settings()
+    _now = now()
+    res = execute_dml(
+        sess,
         update(m.Subsystem_Stage_State)
         .where(
-            m.Subsystem_Stage_State.c.SessionID == session_id,
-            m.Subsystem_Stage_State.c.SubsystemID == subsystem_id,
-            m.Subsystem_Stage_State.c.Level == level,
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == level,
+            m.Subsystem_Stage_State.GenerationEpoch == epoch,
+            m.Subsystem_Stage_State.ActiveTaskID == task_id,
+            m.Subsystem_Stage_State.Status == StageStatus.RUNNING,
+        )
+        .values(LeaseExpiresAt=_now + timedelta(seconds=s.stage_lease_seconds), HeartbeatAt=_now, UpdatedAt=_now)
+    )
+    return res.rowcount == 1
+
+
+def finish_stage(
+    sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel,
+    status: StageStatus, epoch: int, task_id: str, error: str | None = None,
+) -> bool:
+    """Terminal transition OUT of a stage — the exit half of `claim_stage`'s CAS, fenced
+    on the same (epoch, task_id) identity. Only the worker that still owns THIS
+    generation of the row may record its outcome. Returns True iff the write landed.
+
+    Unfenced, a stalled worker's late result overwrites whatever replaced it. Two ways
+    that bites, both observed:
+      * the reaper flips an abandoned RUNNING row to ERROR; the zombie wakes and stamps
+        COMPLETE back over it, so a dead session reports success;
+      * a regeneration resets the row to a fresh claimable IDLE at epoch N+1; the
+        epoch-N zombie stamps AWAITING_DECISION over it, after which the epoch-N+1 task
+        can never claim it (`claim_stage` refuses a non-IDLE/ERROR row) and the
+        subsystem serves its stale scenarios as though they were the regenerated ones.
+
+    `LeaseExpiresAt` is cleared on the way out: the lease means "someone is actively
+    RUNNING this right now", so every transition away from RUNNING must drop it, or a
+    long-finished row carries a stale lease and the reaper's `dead_lease` check fires on
+    a session that simply left REVIEW for a routine regeneration.
+    """
+    res = execute_dml(
+        sess,
+        update(m.Subsystem_Stage_State)
+        .where(
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == level,
+            m.Subsystem_Stage_State.GenerationEpoch == epoch,   # fencing token: our generation
+            m.Subsystem_Stage_State.ActiveTaskID == task_id,    # fencing token: our claim
+            m.Subsystem_Stage_State.Status == StageStatus.RUNNING,
         )
         .values(Status=status, ErrorMessage=error, LeaseExpiresAt=None, UpdatedAt=now())
     )
+    return res.rowcount == 1
 
 
-def stage_rows(sess: Session, session_id: str) -> list[Mapping[str, Any]]:
+def stage_rows(sess: Session, session_id: str) -> list[RowMapping]:
     """Per-subsystem stage rows for the status board (§6.1), excluding `_LOCK`."""
     return list(
         sess.execute(
             select(
-                m.Subsystem_Stage_State.c.SubsystemID,
-                m.Subsystem_Stage_State.c.Level,
-                m.Subsystem_Stage_State.c.Status,
+                m.Subsystem_Stage_State.SubsystemID,
+                m.Subsystem_Stage_State.Level,
+                m.Subsystem_Stage_State.Status,
             ).where(
-                m.Subsystem_Stage_State.c.SessionID == session_id,
-                m.Subsystem_Stage_State.c.Level != SubsystemLevel.LOCK,
+                m.Subsystem_Stage_State.SessionID == session_id,
+                m.Subsystem_Stage_State.Level != SubsystemLevel.LOCK,
             )
         ).mappings()
     )
@@ -354,10 +518,11 @@ def subsystem_ids_at_level(
     """Every SubsystemID for this session at a given Subsystem_Stage_State Level,
     optionally narrowed to a specific Status (e.g. accept's REVIEW-barrier check:
     which subsystems are `_LOCK`ed, or which reached `SCENARIOS`/`AWAITING_DECISION`)."""
-    where = [m.Subsystem_Stage_State.c.SessionID == session_id, m.Subsystem_Stage_State.c.Level == level]
+    where = [m.Subsystem_Stage_State.SessionID == session_id, m.Subsystem_Stage_State.Level == level]
+    # Only filter by Status if the caller actually asked for one; otherwise return all statuses.
     if status is not None:
-        where.append(m.Subsystem_Stage_State.c.Status == status)
-    return [r[0] for r in sess.execute(select(m.Subsystem_Stage_State.c.SubsystemID).where(*where)).all()]
+        where.append(m.Subsystem_Stage_State.Status == status)
+    return [r[0] for r in sess.execute(select(m.Subsystem_Stage_State.SubsystemID).where(*where)).all()]
 
 
 def subsystem_has_pending_work(sess: Session, session_id: str, subsystem_id: int) -> bool:
@@ -371,10 +536,10 @@ def subsystem_has_pending_work(sess: Session, session_id: str, subsystem_id: int
     doesn't re-announce a subsystem nothing is actually about to happen to."""
     return sess.execute(
         select(1).where(
-            m.Subsystem_Stage_State.c.SessionID == session_id,
-            m.Subsystem_Stage_State.c.SubsystemID == subsystem_id,
-            m.Subsystem_Stage_State.c.Level != SubsystemLevel.LOCK,
-            m.Subsystem_Stage_State.c.Status.in_([StageStatus.IDLE, StageStatus.RUNNING]),
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level != SubsystemLevel.LOCK,
+            m.Subsystem_Stage_State.Status.in_([StageStatus.IDLE, StageStatus.RUNNING]),
         )
     ).first() is not None
 
@@ -382,22 +547,16 @@ def subsystem_has_pending_work(sess: Session, session_id: str, subsystem_id: int
 # ---------------------------------------------------------------------------
 # Regeneration (M2, [R9]) — per-(subsystem, level) generation epoch bump
 # ---------------------------------------------------------------------------
-class RegenerateConflict(Exception):
-    """Regenerate rejected: not at REVIEW, target lock held, or a concurrent
-    regen/accept won the race → 409. Distinct from AcceptConflict — a different
-    action, so it needs its own error_code."""
-
-
 def next_epoch(sess: Session, session_id: str, subsystem_id: int, levels: tuple) -> int:
     """max(GenerationEpoch) scoped to ONLY the levels touched in this regen hop, +1.
     Deliberately narrower than a subsystem-wide max: an untouched level's epoch
     lineage is never disturbed by an unrelated regen (e.g. regenerating SCENARIOS
     doesn't bump THREATS' epoch number)."""
     current = sess.execute(
-        select(func.max(m.Subsystem_Stage_State.c.GenerationEpoch)).where(
-            m.Subsystem_Stage_State.c.SessionID == session_id,
-            m.Subsystem_Stage_State.c.SubsystemID == subsystem_id,
-            m.Subsystem_Stage_State.c.Level.in_(levels),
+        select(func.max(m.Subsystem_Stage_State.GenerationEpoch)).where(
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level.in_(levels),
         )
     ).scalar()
     return (current or 0) + 1
@@ -412,12 +571,12 @@ def reset_stage_for_regen(sess: Session, session_id: str, subsystem_id: int, lev
     sess.execute(
         update(m.Subsystem_Stage_State)
         .where(
-            m.Subsystem_Stage_State.c.SessionID == session_id,
-            m.Subsystem_Stage_State.c.SubsystemID == subsystem_id,
-            m.Subsystem_Stage_State.c.Level.in_(levels),
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level.in_(levels),
         )
         .values(GenerationEpoch=new_epoch, Status=StageStatus.IDLE, AttemptCount=0,
-               ErrorMessage=None, UpdatedAt=now())
+            ErrorMessage=None, UpdatedAt=now())
     )
 
 
@@ -435,13 +594,13 @@ def active_threats(sess: Session, session_id: str, subsystem_id: int) -> list[di
             "threat_type_id": r["ThreatTypeID"],  # [R12] scoping rules key on the grounded type
         }
         for r in sess.execute(
-            select(m.Identified_Threat.c.ThreatID, m.Identified_Threat.c.GroundingStatus,
-                  m.Identified_Threat.c.ThreatType, m.Identified_Threat.c.ThreatName,
-                  m.Identified_Threat.c.LibraryThreatType, m.Identified_Threat.c.LibraryThreatName,
-                  m.Identified_Threat.c.ThreatTypeID).where(
-                m.Identified_Threat.c.SessionID == session_id,
-                m.Identified_Threat.c.SubsystemID == subsystem_id,
-                m.Identified_Threat.c.Superseded == 0,
+            select(m.Identified_Threat.ThreatID, m.Identified_Threat.GroundingStatus,
+                m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName,
+                m.Identified_Threat.LibraryThreatType, m.Identified_Threat.LibraryThreatName,
+                m.Identified_Threat.ThreatTypeID).where(
+                m.Identified_Threat.SessionID == session_id,
+                m.Identified_Threat.SubsystemID == subsystem_id,
+                m.Identified_Threat.Superseded == 0,
             )
         ).mappings()
     ]
@@ -455,27 +614,27 @@ def active_threat_rules(sess: Session, threat_type_ids: list[int]) -> list[dict]
         return []
     ct = m.Config_Threat_Rule
     return [dict(r) for r in sess.execute(
-        select(ct.c.RuleType, ct.c.ThreatTypeID, ct.c.RuleKey, ct.c.RuleValue, ct.c.Metadata)
-        .where(ct.c.ThreatTypeID.in_(threat_type_ids),
-               ct.c.IsActive == True, ct.c.IsDeleted == False)  # noqa: E712 — SQLAlchemy binary expr
-        .order_by(ct.c.ThreatRuleID)
+        select(ct.RuleType, ct.ThreatTypeID, ct.RuleKey, ct.RuleValue, ct.Metadata)
+        .where(ct.ThreatTypeID.in_(threat_type_ids),
+            ct.IsActive == True, ct.IsDeleted == False)  # noqa: E712 — SQLAlchemy binary expr
+        .order_by(ct.ThreatRuleID)
     ).mappings()]
 
 
-def latest_completed_session(sess: Session, entity_id: str, asset_external_id: str) -> Mapping[str, Any] | None:
+def latest_completed_session(sess: Session, entity_id: str, asset_id: str) -> RowMapping | None:
     """The asset's most recent COMPLETED session — the downstream contract's "current
     accepted truth" ([R13]): older completed sessions' rows are never cross-session
     superseded, so without this scope a consumer would ingest stale generations
     alongside current ones. Entity filter lives here in the DAL (INV-1)."""
     return sess.execute(
-        select(m.Scenario_Session)
-        .where(m.Scenario_Session.c.EntityID == str(entity_id),
-               m.Scenario_Session.c.AssetExternalID == str(asset_external_id),
-               m.Scenario_Session.c.SessionStatus == SessionStatus.completed)
+        select(m.Scenario_Session.__table__)
+        .where(m.Scenario_Session.EntityID == str(entity_id),
+            m.Scenario_Session.AssetID == str(asset_id),
+            m.Scenario_Session.SessionStatus == SessionStatus.completed)
         # SessionID tie-break: two sessions completing in the same clock tick must
         # still yield ONE deterministic "current" pick (same convention as scoping's
         # score-desc/id-asc ordering) — never a query-plan-dependent answer.
-        .order_by(m.Scenario_Session.c.CompletedAt.desc(), m.Scenario_Session.c.SessionID)
+        .order_by(m.Scenario_Session.CompletedAt.desc(), m.Scenario_Session.SessionID)
         .limit(1)
     ).mappings().first()
 
@@ -488,13 +647,13 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
     on the joined tables — a completed session's rows are immutable."""
     out, st, it = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
     return [dict(r) for r in sess.execute(
-        select(out.c.OutputID, out.c.SubsystemID, out.c.ScopedThreatID, out.c.ScenarioJSON,
-               it.c.ThreatTypeID, it.c.ThreatCatalogueID, it.c.ThreatType, it.c.ThreatName,
-               it.c.LibraryThreatType, it.c.LibraryThreatName)
-        .select_from(out.join(st, out.c.ScopedThreatID == st.c.ScopedThreatID)
-                     .join(it, st.c.ThreatID == it.c.ThreatID))
-        .where(out.c.SessionID == session_id, out.c.Accepted == 1, out.c.Superseded == 0)
-        .order_by(out.c.SubsystemID, out.c.OutputID)
+        select(out.OutputID, out.SubsystemID, out.ScopedThreatID, out.ScenarioJSON,
+            it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
+            it.LibraryThreatType, it.LibraryThreatName)
+        .select_from(out.__table__.join(st, out.ScopedThreatID == st.ScopedThreatID)
+                    .join(it, st.ThreatID == it.ThreatID))
+        .where(out.SessionID == session_id, out.Accepted == 1, out.Superseded == 0)
+        .order_by(out.SubsystemID, out.OutputID)
     ).mappings()]
 
 
@@ -504,10 +663,11 @@ def mark_scenarios_accepted(
     """Sets Accepted=1 on every non-superseded scenario for these subsystems (accept, §5.7),
     optionally narrowed to `subset` OutputIDs ([R8] partial accept — `subset=[]` means
     "accept none", distinct from `subset=None` meaning "accept all")."""
-    where = [m.Threat_Scenario_Output.c.SessionID == session_id, m.Threat_Scenario_Output.c.Superseded == 0,
-             m.Threat_Scenario_Output.c.SubsystemID.in_(subsystem_ids)]
+    where = [m.Threat_Scenario_Output.SessionID == session_id, m.Threat_Scenario_Output.Superseded == 0,
+            m.Threat_Scenario_Output.SubsystemID.in_(subsystem_ids)]
+    # Narrow to specific OutputIDs only if the caller passed a subset; None means "accept all".
     if subset is not None:
-        where.append(m.Threat_Scenario_Output.c.OutputID.in_(subset))
+        where.append(m.Threat_Scenario_Output.OutputID.in_(subset))
     sess.execute(update(m.Threat_Scenario_Output).where(*where).values(Accepted=1))
 
 
@@ -519,9 +679,9 @@ def supersede(sess: Session, table, session_id: str, subsystem_id: int) -> None:
     sess.execute(
         update(table)
         .where(
-            table.c.SessionID == session_id,
-            table.c.SubsystemID == subsystem_id,
-            table.c.Superseded == 0,
+            table.SessionID == session_id,
+            table.SubsystemID == subsystem_id,
+            table.Superseded == 0,
         )
         .values(Superseded=1)
     )
@@ -534,11 +694,11 @@ def active_scoped_threat_ids(sess: Session, session_id: str, subsystem_id: int, 
     if not threat_ids:
         return []
     return list(sess.execute(
-        select(m.Scoped_Threat.c.ScopedThreatID).where(
-            m.Scoped_Threat.c.SessionID == session_id,
-            m.Scoped_Threat.c.SubsystemID == subsystem_id,
-            m.Scoped_Threat.c.ThreatID.in_(threat_ids),
-            m.Scoped_Threat.c.Superseded == 0,
+        select(m.Scoped_Threat.ScopedThreatID).where(
+            m.Scoped_Threat.SessionID == session_id,
+            m.Scoped_Threat.SubsystemID == subsystem_id,
+            m.Scoped_Threat.ThreatID.in_(threat_ids),
+            m.Scoped_Threat.Superseded == 0,
         )
     ).scalars().all())
 
@@ -551,10 +711,10 @@ def supersede_by_threats(sess: Session, table, session_id: str, subsystem_id: in
     sess.execute(
         update(table)
         .where(
-            table.c.SessionID == session_id,
-            table.c.SubsystemID == subsystem_id,
-            table.c.ThreatID.in_(threat_ids),
-            table.c.Superseded == 0,
+            table.SessionID == session_id,
+            table.SubsystemID == subsystem_id,
+            table.ThreatID.in_(threat_ids),
+            table.Superseded == 0,
         )
         .values(Superseded=1)
     )
@@ -568,10 +728,10 @@ def supersede_by_scoped_threats(sess: Session, session_id: str, subsystem_id: in
     sess.execute(
         update(m.Threat_Scenario_Output)
         .where(
-            m.Threat_Scenario_Output.c.SessionID == session_id,
-            m.Threat_Scenario_Output.c.SubsystemID == subsystem_id,
-            m.Threat_Scenario_Output.c.ScopedThreatID.in_(scoped_threat_ids),
-            m.Threat_Scenario_Output.c.Superseded == 0,
+            m.Threat_Scenario_Output.SessionID == session_id,
+            m.Threat_Scenario_Output.SubsystemID == subsystem_id,
+            m.Threat_Scenario_Output.ScopedThreatID.in_(scoped_threat_ids),
+            m.Threat_Scenario_Output.Superseded == 0,
         )
         .values(Superseded=1)
     )
@@ -579,7 +739,7 @@ def supersede_by_scoped_threats(sess: Session, session_id: str, subsystem_id: in
 
 def insert_row(sess: Session, table, values: Mapping[str, Any]) -> None:
     """Generic single-row insert shared by callers writing a new active record
-    (profile/threat/scenario output) — no active-row or Superseded handling of its
+    (threat/scenario output) — no active-row or Superseded handling of its
     own, callers are expected to `supersede` the prior row first."""
     sess.execute(insert(table).values(**values))
 
@@ -591,29 +751,29 @@ def append_audit(sess: Session, **cols: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Threat-library promotion (R10, SDD §5.7 step 1) — race-safe insert-if-not-exists,
+# Threat-library promotion — race-safe insert-if-not-exists,
 # guarded by the M2 natural-key UNIQUE indexes (migration 0010). Same savepoint +
 # catch-IntegrityError + select idiom as `create_session` above: two concurrent
 # accepts proposing the identical new master lose the DB race deterministically,
 # and the loser gets back the winner's id instead of a crash.
 # ---------------------------------------------------------------------------
 def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector_id: int | None,
-                       description: str | None = None) -> int:
+                    description: str | None = None) -> int:
     """Insert-if-not-exists keyed by (ThreatTypeName, PrimaryThreatCategoryID, SectorID) —
     `UX_ThreatType_NaturalKey`. Returns the winning ThreatTypeID either way."""
     try:
         with sess.begin_nested():
-            res = sess.execute(insert(m.Threat_Type).values(
+            res = execute_dml(sess, insert(m.Threat_Type).values(
                 ThreatTypeName=name, PrimaryThreatCategoryID=category_id, SectorID=sector_id,
                 Description=description, IsActive=True, IsDeleted=False))
-        return res.inserted_primary_key[0]
+        return inserted_pk(res)
     except IntegrityError:
-        sector_pred = m.Threat_Type.c.SectorID.is_(None) if sector_id is None else m.Threat_Type.c.SectorID == sector_id
+        sector_pred = m.Threat_Type.SectorID.is_(None) if sector_id is None else m.Threat_Type.SectorID == sector_id
         winner = sess.execute(
-            select(m.Threat_Type.c.ThreatTypeID).where(
-                m.Threat_Type.c.ThreatTypeName == name,
-                m.Threat_Type.c.PrimaryThreatCategoryID == category_id, sector_pred,
-                m.Threat_Type.c.IsActive == True, m.Threat_Type.c.IsDeleted == False)
+            select(m.Threat_Type.ThreatTypeID).where(
+                m.Threat_Type.ThreatTypeName == name,
+                m.Threat_Type.PrimaryThreatCategoryID == category_id, sector_pred,
+                m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
         ).scalar()
         if winner is None:  # not a natural-key duplicate (NOT NULL / missing IDENTITY /
             raise           # truncation / other violation) — fail loud, never return a NULL id
@@ -626,17 +786,17 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int, sector_id: i
     `UX_ThreatCatalogue_NaturalKey`. Returns the winning ThreatCatalogueID either way."""
     try:
         with sess.begin_nested():
-            res = sess.execute(insert(m.Threat_Catalogue).values(
+            res = execute_dml(sess, insert(m.Threat_Catalogue).values(
                 ThreatTypeID=type_id, ThreatName=name, SectorID=sector_id,
                 Description=description, IsActive=True, IsDeleted=False))
-        return res.inserted_primary_key[0]
+        return inserted_pk(res)
     except IntegrityError:
-        sector_pred = (m.Threat_Catalogue.c.SectorID.is_(None) if sector_id is None
-                       else m.Threat_Catalogue.c.SectorID == sector_id)
+        sector_pred = (m.Threat_Catalogue.SectorID.is_(None) if sector_id is None
+                    else m.Threat_Catalogue.SectorID == sector_id)
         winner = sess.execute(
-            select(m.Threat_Catalogue.c.ThreatCatalogueID).where(
-                m.Threat_Catalogue.c.ThreatTypeID == type_id, m.Threat_Catalogue.c.ThreatName == name,
-                sector_pred, m.Threat_Catalogue.c.IsActive == True, m.Threat_Catalogue.c.IsDeleted == False)
+            select(m.Threat_Catalogue.ThreatCatalogueID).where(
+                m.Threat_Catalogue.ThreatTypeID == type_id, m.Threat_Catalogue.ThreatName == name,
+                sector_pred, m.Threat_Catalogue.IsActive == True, m.Threat_Catalogue.IsDeleted == False)
         ).scalar()
         if winner is None:  # see upsert_threat_type — only a real duplicate may resolve here
             raise
@@ -648,14 +808,14 @@ def upsert_threat_actor(sess: Session, name: str) -> int:
     (no sector on this table). Returns the winning ThreatActorID either way."""
     try:
         with sess.begin_nested():
-            res = sess.execute(insert(m.Threat_Actor).values(
+            res = execute_dml(sess, insert(m.Threat_Actor).values(
                 ThreatActorName=name, IsCapable=1, IsActive=True, IsDeleted=False))
-        return res.inserted_primary_key[0]
+        return inserted_pk(res)
     except IntegrityError:
         winner = sess.execute(
-            select(m.Threat_Actor.c.ThreatActorID).where(
-                m.Threat_Actor.c.ThreatActorName == name,
-                m.Threat_Actor.c.IsActive == True, m.Threat_Actor.c.IsDeleted == False)
+            select(m.Threat_Actor.ThreatActorID).where(
+                m.Threat_Actor.ThreatActorName == name,
+                m.Threat_Actor.IsActive == True, m.Threat_Actor.IsDeleted == False)
         ).scalar()
         if winner is None:  # see upsert_threat_type — only a real duplicate may resolve here
             raise
@@ -667,10 +827,24 @@ def link_type_actor(sess: Session, type_id: int, actor_id: int) -> bool:
     ThreatActorID) PRIMARY KEY itself guards duplicates, so a repeat call is a race-safe
     no-op (savepoint absorbs the IntegrityError; the link now exists either way).
     Returns True iff a NEW link row was inserted, False if it already existed — so callers
-    (accept._promote_flagged_threats) can audit real library growth, not a re-affirmed link."""
+    (accept._add_flagged_threats_to_library) can audit real library growth, not a re-affirmed link.
+
+    The IntegrityError is absorbed only once the link is CONFIRMED present. A bad
+    type_id/actor_id raises an FK (or NOT NULL) violation through this same branch, and
+    answering False there would report "already linked" for a link that does not exist
+    and never will — the caller then audits library growth that never happened. Same
+    fail-loud rule as `upsert_threat_type`: only a violation you can positively identify
+    may be swallowed.
+    """
     try:
         with sess.begin_nested():
             sess.execute(insert(m.ThreatType_ThreatActor_Map).values(ThreatTypeID=type_id, ThreatActorID=actor_id))
         return True
     except IntegrityError:
+        exists = sess.execute(
+            select(1).where(m.ThreatType_ThreatActor_Map.ThreatTypeID == type_id,
+                            m.ThreatType_ThreatActor_Map.ThreatActorID == actor_id)
+        ).first()
+        if exists is None:  # not a duplicate link — FK/NOT NULL/other violation
+            raise
         return False

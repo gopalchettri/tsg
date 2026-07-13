@@ -1,73 +1,62 @@
 -- ============================================================================
--- TSG bootstrap schema — THE one-stop script for BOTH production and dev.
--- Consolidates the baseline TSG tables + migrations 0002-0024 into one
--- idempotent T-SQL script. Run this alone, on either database, any time you
--- need to stand up a fresh TSG database or bring an existing one current.
+-- TSG production setup — THE single script to run against a production or
+-- dev database. Combines, in order: (0) enable RCSI, (0b) fix a platform
+-- table TSG's app code depends on, (1-5) the full TSG schema bootstrap,
+-- (6) seed real Config_Threat_Rule scoping data. Idempotent throughout —
+-- safe to run once on a fresh database or repeatedly on an existing one.
 --
--- >>> READ THIS BEFORE YOU RUN IT, IF YOU'RE USING SSMS <<<
--- Section 2b below contains a conditional DROP TABLE + rename sequence (only
--- fires on a legacy database whose Threat_Type/Catalogue/Actor tables predate
--- IDENTITY columns — a no-op on every database checked so far). SSMS's
--- IntelliSense / "Error List" panel does NOT understand that the table comes
--- back under the same name a few lines later via sp_rename — it will show
--- "Invalid object name 'Threat_Type'" (and Catalogue/Actor) as a squiggly-
--- underline / Error List warning for the rest of the file, EVEN THOUGH THE
--- SCRIPT RUNS FINE. This is a known, harmless false positive, confirmed by
--- direct execution against two real databases (both empty-schema drops
--- passed clean). The only errors that matter are in the "Messages" tab AFTER
--- you actually execute (F5) — real SQL Server errors always look like
--- "Msg 208, Level 16, State 1, Line 530", never plain English with no Msg
--- number. If the Error List is red but Messages says nothing failed, the
--- script worked. Prefer `sqlcmd -S <server> -d <database> -E -i bootstrap_schema.sql`
--- if you want a clean run with zero IntelliSense noise — it has no static
--- analysis pass and reports only real execution results.
+-- This file is a concatenation of 3 already-independently-reviewed scripts
+-- plus one new section, kept in sync manually (same "migration triangle"
+-- discipline this repo already uses for models.py <-> migrations <->
+-- bootstrap_schema.sql — see tests/test_schema_sync.py):
+--   - scripts/bootstrap_schema.sql        (Sections 1-5, byte-for-byte)
+--   - scripts/add_ctm_scan_entity_columns.sql (Section 0b)
+--   - scripts/seed_threat_rules_asset_type.sql (Section 6)
+-- If you only need to re-run one piece, those individual files still work
+-- standalone — this file exists so you don't have to run 3-4 files by hand.
 --
--- (0017 is a legacy-data vocabulary rename on Scenario_Audit.EventType — no
--- schema/DDL change, so a fresh bootstrap has nothing to apply for it; it
--- only matters when healing an existing DB. 0019 drops Subsystem_Profile —
--- the PROFILE stage no longer exists. 0021 renames
--- Scenario_Session.AssetExternalID -> AssetID; Section 1 creates the new name
--- outright, Section 3 sp_renames an older DB into line. 0022 converts every
--- GUID-shaped id column from nvarchar(36) to uniqueidentifier — Section 1
--- creates it that way outright, Section 3b heals an older DB. 0023 drops 3
--- confirmed-dead columns — Section 1 never creates them, Section 3c drops
--- them from an older DB that still has them.)
+-- NOT included, and must NOT be run in production:
+--   scripts/backfill_null_platform_fields_for_testing.sql — explicitly
+--   local-dev-only test data for one hardcoded test asset (id=7).
 --
--- Contract (safe to re-run any time, from any prior version of this script):
---   * creates any missing table (final, fully-migrated shape);
---   * adds any missing column to a table that already exists (Section 3 —
---     the migration chain's ALTER logic, synced in);
---   * creates any missing index;
---   * drops EXACTLY 3 columns, and only those 3 (Section 3c) — each verified
---     dead by a full-repo grep before being added here (see 0023's docstring
---     for the evidence); nothing else is ever dropped, and no row DATA is
---     ever modified or deleted (0021's sp_rename changes a column's NAME —
---     the rows and the index ride along; 0022's type conversions preserve
---     every value, just narrow the storage).
+-- >>> READ THIS BEFORE YOU RUN IT <<<
+-- 1. Section 0 (RCSI) needs EXCLUSIVE database access to apply. If other
+--    connections are open it will WAIT, not fail (this script deliberately
+--    does not use WITH ROLLBACK IMMEDIATE, which would forcibly kill other
+--    users' transactions — that requires your own explicit judgment call,
+--    not a default in an unattended script). Run this during a maintenance
+--    window with no other active connections, or expect Section 0 to hang
+--    until they clear.
+--    ONGOING cost once RCSI is on (not just an enable-time concern): every
+--    row UPDATE/DELETE keeps its pre-image in tempdb's version store until
+--    the oldest active read transaction closes. Under sustained write load
+--    (Scenario_Audit is append-only-growing; Prompt_Log.Messages/ResponseText
+--    are nvarchar(max) on every LLM call) plus any long-open reader (an idle
+--    SSMS session, a slow report query), tempdb can grow unbounded and, if it
+--    fills, causes an instance-wide outage — not just for this database.
+--    Monitor tempdb free space and watch for long-running read transactions;
+--    this script only turns RCSI on, it does not monitor it afterward.
+-- 2. Section 2b contains a conditional DROP TABLE + rename sequence (legacy
+--    IDENTITY retrofit, a no-op on every database checked so far). SSMS's
+--    IntelliSense / "Error List" panel does NOT understand the table comes
+--    back under the same name a few lines later — it will show "Invalid
+--    object name 'Threat_Type'" (and Catalogue/Actor) as a squiggly-
+--    underline warning for the rest of the file, EVEN THOUGH THE SCRIPT
+--    RUNS FINE. Real SQL Server errors always look like "Msg 208, Level 16,
+--    State 1, Line 530" in the Messages tab, never plain English with no Msg
+--    number in the Error List. Prefer `sqlcmd -S <server> -d <database> -E
+--    -i production_setup.sql` for a completely clean run with zero
+--    IntelliSense noise.
+-- 3. Run connected to (or `sqlcmd -d`'d into) the actual target database,
+--    not master — Section 0 uses `ALTER DATABASE CURRENT`.
 --
--- Creates TSG's own pipeline tables AND the threat-library master tables
--- (Threat_Category/Type/Catalogue/Actor + the type-actor map) — the latter
--- are schema-only, seeded externally, not populated here. Assumes only the
--- ASSET/ONBOARDING platform tables already exist (group, onboarding_*,
--- ctm_scan_*) — a different system's schema TSG reuses but does not create
--- (SDD §7.7). No FOREIGN KEYs by design — ids are app-enforced (SDD §7.7).
---
--- Run with SSMS or sqlcmd — the script uses GO batch separators so each
--- section's DDL commits before the next section's statements compile
--- against it (this is not optional: SQL Server binds object/column names for
--- an entire batch before executing any of it, so a table created earlier in
--- the SAME unbroken batch as a later reference to it will fail to resolve —
--- GO forces the boundary that makes sequential CREATE-then-USE safe).
+-- Prerequisite (not created by this script): the base platform tables
+-- (group, onboarding_*, ctm_scan_*) must already exist — TSG reuses another
+-- system's schema and never creates it (SDD §7.7).
 --
 -- Alembic is NOT required for a database managed by this script. Only if
 -- alembic will ever manage this database (dev environments): run
--- `alembic stamp 0024` once after this script (its DDL matches migrations
--- 0002-0024 exactly). If newer migrations exist by the time you're reading
--- this (check migrations/versions/ against the range above), stamp 0024
--- first, then run `alembic upgrade head` to pick up anything added since.
---
--- tests/test_schema_sync.py asserts every models.py column appears in the
--- CREATE TABLE blocks below — keep both in lockstep.
+-- `alembic stamp 0024` once after this script.
 -- ============================================================================
 
 -- ODBC/OLE DB connections default these ON, but not every client does (some
@@ -79,6 +68,65 @@
 -- Session-scoped only; no effect on stored data.
 SET QUOTED_IDENTIFIER ON;
 SET ANSI_NULLS ON;
+
+-- ============================================================
+-- SECTION 0 — Enable Read Committed Snapshot Isolation (RCSI), once.
+-- Required by the app's CAS/lock concurrency design (claim_stage,
+-- acquire_lock, status-machine CAS updates all assume readers don't block
+-- writers; under default READ COMMITTED locking, the status-board reads and
+-- worker CAS updates would contend). Not checked by app/db/invariants.py —
+-- this script is what actually turns it on. Guarded so a second run is a
+-- fast no-op once RCSI is already on. See warning #1 above about exclusive
+-- access.
+-- ============================================================
+
+IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE database_id = DB_ID() AND is_read_committed_snapshot_on = 1)
+    ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON;
+
+GO
+
+-- ============================================================
+-- SECTION 0b — Platform table fix: add asset/subsystem-level columns TSG's
+-- app code depends on. ctm_scan_entity/onboarding_supporting_systems are
+-- platform tables TSG reuses but never creates (SDD §7.7) —
+-- app/pipeline/context.py's asset/subsystem lookups select these on every
+-- POST /v1/sessions call. These were added out-of-band on specific databases
+-- at different points in this engagement and never propagated to every
+-- database, since no TSG migration tracks platform-table schema. Guarded —
+-- a no-op if already present. Skipped entirely (not an error) if the table
+-- doesn't exist yet — the platform tables are an assumed prerequisite (see
+-- header), not something this script creates. Byte-for-byte the same as
+-- scripts/add_ctm_scan_entity_columns.sql — see that file for the full
+-- per-column rationale/type notes.
+-- ============================================================
+
+IF OBJECT_ID('dbo.ctm_scan_entity', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.ctm_scan_entity', 'data_handled') IS NULL
+        ALTER TABLE ctm_scan_entity ADD data_handled ntext NULL;
+    IF COL_LENGTH('dbo.ctm_scan_entity', 'system_managed_by') IS NULL
+        ALTER TABLE ctm_scan_entity ADD system_managed_by nvarchar(100) NULL;
+    IF COL_LENGTH('dbo.ctm_scan_entity', 'operating_system') IS NULL
+        ALTER TABLE ctm_scan_entity ADD operating_system nvarchar(200) NULL;
+    IF COL_LENGTH('dbo.ctm_scan_entity', 'location') IS NULL
+        ALTER TABLE ctm_scan_entity ADD location nvarchar(200) NULL;
+    IF COL_LENGTH('dbo.ctm_scan_entity', 'target_rto_hours') IS NULL
+        ALTER TABLE ctm_scan_entity ADD target_rto_hours int NULL;
+    IF COL_LENGTH('dbo.ctm_scan_entity', 'target_rpo_hours') IS NULL
+        ALTER TABLE ctm_scan_entity ADD target_rpo_hours int NULL;
+END
+
+IF OBJECT_ID('dbo.onboarding_supporting_systems', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.onboarding_supporting_systems', 'technology_used') IS NULL
+        ALTER TABLE onboarding_supporting_systems ADD technology_used nvarchar(max) NULL;
+    IF COL_LENGTH('dbo.onboarding_supporting_systems', 'vendor_name') IS NULL
+        ALTER TABLE onboarding_supporting_systems ADD vendor_name nvarchar(200) NULL;
+    IF COL_LENGTH('dbo.onboarding_supporting_systems', 'database_platforms') IS NULL
+        ALTER TABLE onboarding_supporting_systems ADD database_platforms nvarchar(300) NULL;
+END
+
+GO
 
 -- ============================================================
 -- SECTION 1 — TSG's own tables, in final (fully-migrated) shape
@@ -236,14 +284,15 @@ CREATE TABLE Threat_Candidate_Review (   -- M9/R10: audit ledger of promotion ev
 -- ============================================================
 -- SECTION 2 — Threat-library master tables (models.py "Threat library
 -- masters" section). Schema only — these tables are EMPTY after this
--- script; seeding real Threat_Type/Catalogue/Actor/Category rows is a
--- separate manual task. Threat_Type/Catalogue/Actor PKs are IDENTITY: the
--- R10 promote-on-accept path INSERTs new masters without ids
--- (dal.upsert_threat_* reads the generated key back) — without IDENTITY the
--- first real promotion fails with "Cannot insert NULL into ...ID". Seeding
--- reference data with explicit ids therefore needs
--- SET IDENTITY_INSERT <table> ON around the seed batch. Threat_Category
--- stays a plain int PK — the app never inserts categories (fixed STRIDE set).
+-- script (except Config_Threat_Rule, seeded in Section 6 below); seeding
+-- real Threat_Type/Catalogue/Actor/Category rows is a separate manual task.
+-- Threat_Type/Catalogue/Actor PKs are IDENTITY: the R10 promote-on-accept
+-- path INSERTs new masters without ids (dal.upsert_threat_* reads the
+-- generated key back) — without IDENTITY the first real promotion fails
+-- with "Cannot insert NULL into ...ID". Seeding reference data with
+-- explicit ids therefore needs SET IDENTITY_INSERT <table> ON around the
+-- seed batch. Threat_Category stays a plain int PK — the app never inserts
+-- categories (fixed STRIDE set).
 -- ============================================================
 
 IF OBJECT_ID('dbo.Threat_Category', 'U') IS NULL
@@ -337,94 +386,100 @@ GO
 -- limitation, not a real error — verify against the Messages tab.
 -- ============================================================
 
+-- Each block below is wrapped in its own explicit transaction (TRY/CATCH +
+-- ROLLBACK on failure) so a mid-sequence failure (e.g. a row that can't
+-- survive the rebuild) leaves the original table exactly as it was instead
+-- of a half-renamed/dropped state that breaks the guard's own re-entry
+-- condition on the next run — see the finding this closes in
+-- documents/TSG_Gap_Analysis.md §13.14.
+
 IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL
 AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Type'), 'ThreatTypeID', 'IsIdentity') = 0
 BEGIN
-    CREATE TABLE Threat_Type_New (
-        ThreatTypeID             int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Type_New PRIMARY KEY,
-        ThreatTypeName           nvarchar(300)  NOT NULL,
-        Description              nvarchar(max)  NULL,
-        SectorID                 int            NULL,
-        PrimaryThreatCategoryID  int            NULL,
-        IsActive                 bit            NOT NULL,
-        IsDeleted                bit            NOT NULL
-    );
-    SET IDENTITY_INSERT Threat_Type_New ON;
-    INSERT INTO Threat_Type_New (ThreatTypeID, ThreatTypeName, Description, SectorID, PrimaryThreatCategoryID, IsActive, IsDeleted)
-    SELECT ThreatTypeID, ThreatTypeName, Description, SectorID, PrimaryThreatCategoryID, IsActive, IsDeleted FROM Threat_Type;
-    SET IDENTITY_INSERT Threat_Type_New OFF;
-    DROP TABLE Threat_Type;
-    EXEC sp_rename 'Threat_Type_New', 'Threat_Type';
-    EXEC sp_rename 'PK_Threat_Type_New', 'PK_Threat_Type';
+    BEGIN TRY
+        BEGIN TRAN;
+        CREATE TABLE Threat_Type_New (
+            ThreatTypeID             int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Type_New PRIMARY KEY,
+            ThreatTypeName           nvarchar(300)  NOT NULL,
+            Description              nvarchar(max)  NULL,
+            SectorID                 int            NULL,
+            PrimaryThreatCategoryID  int            NULL,
+            IsActive                 bit            NOT NULL,
+            IsDeleted                bit            NOT NULL
+        );
+        SET IDENTITY_INSERT Threat_Type_New ON;
+        INSERT INTO Threat_Type_New (ThreatTypeID, ThreatTypeName, Description, SectorID, PrimaryThreatCategoryID, IsActive, IsDeleted)
+        SELECT ThreatTypeID, ThreatTypeName, Description, SectorID, PrimaryThreatCategoryID, IsActive, IsDeleted FROM Threat_Type;
+        SET IDENTITY_INSERT Threat_Type_New OFF;
+        DROP TABLE Threat_Type;
+        EXEC sp_rename 'Threat_Type_New', 'Threat_Type';
+        EXEC sp_rename 'PK_Threat_Type_New', 'PK_Threat_Type';
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL
 AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Catalogue'), 'ThreatCatalogueID', 'IsIdentity') = 0
 BEGIN
-    CREATE TABLE Threat_Catalogue_New (
-        ThreatCatalogueID  int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Catalogue_New PRIMARY KEY,
-        ThreatTypeID       int            NOT NULL,
-        ThreatName         nvarchar(500)  NOT NULL,
-        Description        nvarchar(max)  NULL,
-        SectorID           int            NULL,
-        IsActive           bit            NOT NULL,
-        IsDeleted          bit            NOT NULL
-    );
-    SET IDENTITY_INSERT Threat_Catalogue_New ON;
-    INSERT INTO Threat_Catalogue_New (ThreatCatalogueID, ThreatTypeID, ThreatName, Description, SectorID, IsActive, IsDeleted)
-    SELECT ThreatCatalogueID, ThreatTypeID, ThreatName, Description, SectorID, IsActive, IsDeleted FROM Threat_Catalogue;
-    SET IDENTITY_INSERT Threat_Catalogue_New OFF;
-    DROP TABLE Threat_Catalogue;
-    EXEC sp_rename 'Threat_Catalogue_New', 'Threat_Catalogue';
-    EXEC sp_rename 'PK_Threat_Catalogue_New', 'PK_Threat_Catalogue';
+    BEGIN TRY
+        BEGIN TRAN;
+        CREATE TABLE Threat_Catalogue_New (
+            ThreatCatalogueID  int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Catalogue_New PRIMARY KEY,
+            ThreatTypeID       int            NOT NULL,
+            ThreatName         nvarchar(500)  NOT NULL,
+            Description        nvarchar(max)  NULL,
+            SectorID           int            NULL,
+            IsActive           bit            NOT NULL,
+            IsDeleted          bit            NOT NULL
+        );
+        SET IDENTITY_INSERT Threat_Catalogue_New ON;
+        INSERT INTO Threat_Catalogue_New (ThreatCatalogueID, ThreatTypeID, ThreatName, Description, SectorID, IsActive, IsDeleted)
+        SELECT ThreatCatalogueID, ThreatTypeID, ThreatName, Description, SectorID, IsActive, IsDeleted FROM Threat_Catalogue;
+        SET IDENTITY_INSERT Threat_Catalogue_New OFF;
+        DROP TABLE Threat_Catalogue;
+        EXEC sp_rename 'Threat_Catalogue_New', 'Threat_Catalogue';
+        EXEC sp_rename 'PK_Threat_Catalogue_New', 'PK_Threat_Catalogue';
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL
 AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Actor'), 'ThreatActorID', 'IsIdentity') = 0
 BEGIN
-    CREATE TABLE Threat_Actor_New (
-        ThreatActorID    int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Actor_New PRIMARY KEY,
-        ThreatActorName  nvarchar(200)  NOT NULL,
-        IsCapable        int            NOT NULL,
-        IsActive         bit            NOT NULL,
-        IsDeleted        bit            NOT NULL
-    );
-    SET IDENTITY_INSERT Threat_Actor_New ON;
-    INSERT INTO Threat_Actor_New (ThreatActorID, ThreatActorName, IsCapable, IsActive, IsDeleted)
-    SELECT ThreatActorID, ThreatActorName, IsCapable, IsActive, IsDeleted FROM Threat_Actor;
-    SET IDENTITY_INSERT Threat_Actor_New OFF;
-    DROP TABLE Threat_Actor;
-    EXEC sp_rename 'Threat_Actor_New', 'Threat_Actor';
-    EXEC sp_rename 'PK_Threat_Actor_New', 'PK_Threat_Actor';
+    BEGIN TRY
+        BEGIN TRAN;
+        CREATE TABLE Threat_Actor_New (
+            ThreatActorID    int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Actor_New PRIMARY KEY,
+            ThreatActorName  nvarchar(200)  NOT NULL,
+            IsCapable        int            NOT NULL,
+            IsActive         bit            NOT NULL,
+            IsDeleted        bit            NOT NULL
+        );
+        SET IDENTITY_INSERT Threat_Actor_New ON;
+        INSERT INTO Threat_Actor_New (ThreatActorID, ThreatActorName, IsCapable, IsActive, IsDeleted)
+        SELECT ThreatActorID, ThreatActorName, IsCapable, IsActive, IsDeleted FROM Threat_Actor;
+        SET IDENTITY_INSERT Threat_Actor_New OFF;
+        DROP TABLE Threat_Actor;
+        EXEC sp_rename 'Threat_Actor_New', 'Threat_Actor';
+        EXEC sp_rename 'PK_Threat_Actor_New', 'PK_Threat_Actor';
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 GO
 
--- ============================================================
--- SECTION 3 — Column upgrades for tables that already existed (the
--- migration chain's ALTER logic, synced in). Each guard is a no-op on a
--- fresh database (Section 1 created the column) and heals a database stood
--- up from an older version of this script. This is what makes re-running
--- the latest script the complete production upgrade path.
---
--- NOTE: whole NEW tables (e.g. Prompt_Log/0012, Threat_Candidate_Review/0014,
--- Config_Threat_Rule/0016) need NO entry here — their IF OBJECT_ID guards in
--- Sections 1-2 already create them on re-run against an older DB. This section
--- is only for columns added to a table whose CREATE gets skipped because the
--- table already exists.
---
--- Deliberately absent: 0003's ALTER-to-NOT-NULL (every version of this
--- script ever shipped already created those columns NOT NULL) and 0006's
--- drop-of-old-unfiltered-IdentityHash-index cleanup (only pre-0006
--- EYShield-baseline DBs had that index; this script never targets those).
--- ============================================================
-
-IF COL_LENGTH('dbo.Scenario_Session', 'IdempotencyKey') IS NULL
-    ALTER TABLE Scenario_Session ADD IdempotencyKey nvarchar(200) NULL;             -- 0009/M8
-IF COL_LENGTH('dbo.Scenario_Session', 'SectorIDsJSON') IS NULL
-    ALTER TABLE Scenario_Session ADD SectorIDsJSON nvarchar(max) NULL;              -- 0013/R6
-IF COL_LENGTH('dbo.Scenario_Session', 'AssetContextJSON') IS NULL
-    ALTER TABLE Scenario_Session ADD AssetContextJSON nvarchar(max) NULL;           -- 0020
 
 -- 0021: rename, not add+drop — preserves the data and the UX_Session_ActiveAsset index
 -- (SQL Server indexes bind to column_id, not name). Both guards matter: the first skips a
@@ -473,82 +528,152 @@ GO
 -- removed. This is why they no longer appear in the two blocks below.
 -- ============================================================
 
+-- Each block below is wrapped in its own explicit transaction (TRY/CATCH +
+-- ROLLBACK on failure) — a conversion error partway through (e.g. a legacy
+-- row whose nvarchar(36) value isn't a valid GUID) previously left the PK
+-- dropped and never recreated, which then broke the guard's own re-entry
+-- condition on the next run. See documents/TSG_Gap_Analysis.md §13.14.
+
 IF EXISTS (SELECT 1 FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE c.object_id = OBJECT_ID('dbo.Scenario_Session') AND c.name = 'SessionID' AND t.name = 'nvarchar')
 BEGIN
-    ALTER TABLE Scenario_Session DROP CONSTRAINT PK_Scenario_Session;
-    ALTER TABLE Scenario_Session ALTER COLUMN SessionID uniqueidentifier NOT NULL;
-    ALTER TABLE Scenario_Session ADD CONSTRAINT PK_Scenario_Session PRIMARY KEY CLUSTERED (SessionID);
+    BEGIN TRY
+        BEGIN TRAN;
+        ALTER TABLE Scenario_Session DROP CONSTRAINT PK_Scenario_Session;
+        ALTER TABLE Scenario_Session ALTER COLUMN SessionID uniqueidentifier NOT NULL;
+        ALTER TABLE Scenario_Session ADD CONSTRAINT PK_Scenario_Session PRIMARY KEY CLUSTERED (SessionID);
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 IF EXISTS (SELECT 1 FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE c.object_id = OBJECT_ID('dbo.Subsystem_Stage_State') AND c.name = 'StateID' AND t.name = 'nvarchar')
 BEGIN
-    ALTER TABLE Subsystem_Stage_State DROP CONSTRAINT PK_Subsystem_Stage_State;
-    ALTER TABLE Subsystem_Stage_State ALTER COLUMN StateID uniqueidentifier NOT NULL;
-    ALTER TABLE Subsystem_Stage_State ALTER COLUMN SessionID uniqueidentifier NOT NULL;
-    ALTER TABLE Subsystem_Stage_State ALTER COLUMN ActiveTaskID uniqueidentifier NULL;
-    ALTER TABLE Subsystem_Stage_State ADD CONSTRAINT PK_Subsystem_Stage_State PRIMARY KEY CLUSTERED (StateID);
+    BEGIN TRY
+        BEGIN TRAN;
+        ALTER TABLE Subsystem_Stage_State DROP CONSTRAINT PK_Subsystem_Stage_State;
+        ALTER TABLE Subsystem_Stage_State ALTER COLUMN StateID uniqueidentifier NOT NULL;
+        ALTER TABLE Subsystem_Stage_State ALTER COLUMN SessionID uniqueidentifier NOT NULL;
+        ALTER TABLE Subsystem_Stage_State ALTER COLUMN ActiveTaskID uniqueidentifier NULL;
+        ALTER TABLE Subsystem_Stage_State ADD CONSTRAINT PK_Subsystem_Stage_State PRIMARY KEY CLUSTERED (StateID);
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 IF EXISTS (SELECT 1 FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE c.object_id = OBJECT_ID('dbo.Identified_Threat') AND c.name = 'ThreatID' AND t.name = 'nvarchar')
 BEGIN
-    ALTER TABLE Identified_Threat DROP CONSTRAINT PK_Identified_Threat;
-    ALTER TABLE Identified_Threat ALTER COLUMN ThreatID uniqueidentifier NOT NULL;
-    ALTER TABLE Identified_Threat ALTER COLUMN SessionID uniqueidentifier NOT NULL;
-    ALTER TABLE Identified_Threat ADD CONSTRAINT PK_Identified_Threat PRIMARY KEY CLUSTERED (ThreatID);
+    BEGIN TRY
+        BEGIN TRAN;
+        ALTER TABLE Identified_Threat DROP CONSTRAINT PK_Identified_Threat;
+        ALTER TABLE Identified_Threat ALTER COLUMN ThreatID uniqueidentifier NOT NULL;
+        ALTER TABLE Identified_Threat ALTER COLUMN SessionID uniqueidentifier NOT NULL;
+        ALTER TABLE Identified_Threat ADD CONSTRAINT PK_Identified_Threat PRIMARY KEY CLUSTERED (ThreatID);
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 IF EXISTS (SELECT 1 FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE c.object_id = OBJECT_ID('dbo.Scoped_Threat') AND c.name = 'ScopedThreatID' AND t.name = 'nvarchar')
 BEGIN
-    ALTER TABLE Scoped_Threat DROP CONSTRAINT PK_Scoped_Threat;
-    ALTER TABLE Scoped_Threat ALTER COLUMN ScopedThreatID uniqueidentifier NOT NULL;
-    ALTER TABLE Scoped_Threat ALTER COLUMN SessionID uniqueidentifier NOT NULL;
-    ALTER TABLE Scoped_Threat ALTER COLUMN ThreatID uniqueidentifier NOT NULL;
-    ALTER TABLE Scoped_Threat ADD CONSTRAINT PK_Scoped_Threat PRIMARY KEY CLUSTERED (ScopedThreatID);
+    BEGIN TRY
+        BEGIN TRAN;
+        ALTER TABLE Scoped_Threat DROP CONSTRAINT PK_Scoped_Threat;
+        ALTER TABLE Scoped_Threat ALTER COLUMN ScopedThreatID uniqueidentifier NOT NULL;
+        ALTER TABLE Scoped_Threat ALTER COLUMN SessionID uniqueidentifier NOT NULL;
+        ALTER TABLE Scoped_Threat ALTER COLUMN ThreatID uniqueidentifier NOT NULL;
+        ALTER TABLE Scoped_Threat ADD CONSTRAINT PK_Scoped_Threat PRIMARY KEY CLUSTERED (ScopedThreatID);
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 IF EXISTS (SELECT 1 FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE c.object_id = OBJECT_ID('dbo.Threat_Scenario_Output') AND c.name = 'OutputID' AND t.name = 'nvarchar')
 BEGIN
-    IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveIdentity' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
-        DROP INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output;
-    ALTER TABLE Threat_Scenario_Output DROP CONSTRAINT PK_Threat_Scenario_Output;
-    ALTER TABLE Threat_Scenario_Output ALTER COLUMN OutputID uniqueidentifier NOT NULL;
-    ALTER TABLE Threat_Scenario_Output ALTER COLUMN SessionID uniqueidentifier NOT NULL;
-    ALTER TABLE Threat_Scenario_Output ALTER COLUMN ScopedThreatID uniqueidentifier NOT NULL;
-    ALTER TABLE Threat_Scenario_Output ADD CONSTRAINT PK_Threat_Scenario_Output PRIMARY KEY CLUSTERED (OutputID);
+    BEGIN TRY
+        BEGIN TRAN;
+        IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveIdentity' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
+            DROP INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output;
+        ALTER TABLE Threat_Scenario_Output DROP CONSTRAINT PK_Threat_Scenario_Output;
+        ALTER TABLE Threat_Scenario_Output ALTER COLUMN OutputID uniqueidentifier NOT NULL;
+        ALTER TABLE Threat_Scenario_Output ALTER COLUMN SessionID uniqueidentifier NOT NULL;
+        ALTER TABLE Threat_Scenario_Output ALTER COLUMN ScopedThreatID uniqueidentifier NOT NULL;
+        ALTER TABLE Threat_Scenario_Output ADD CONSTRAINT PK_Threat_Scenario_Output PRIMARY KEY CLUSTERED (OutputID);
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 IF EXISTS (SELECT 1 FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE c.object_id = OBJECT_ID('dbo.Scenario_Audit') AND c.name = 'AuditID' AND t.name = 'nvarchar')
 BEGIN
-    ALTER TABLE Scenario_Audit DROP CONSTRAINT PK_Scenario_Audit;
-    ALTER TABLE Scenario_Audit ALTER COLUMN AuditID uniqueidentifier NOT NULL;
-    ALTER TABLE Scenario_Audit ALTER COLUMN SessionID uniqueidentifier NOT NULL;
-    ALTER TABLE Scenario_Audit ADD CONSTRAINT PK_Scenario_Audit PRIMARY KEY CLUSTERED (AuditID);
+    BEGIN TRY
+        BEGIN TRAN;
+        ALTER TABLE Scenario_Audit DROP CONSTRAINT PK_Scenario_Audit;
+        ALTER TABLE Scenario_Audit ALTER COLUMN AuditID uniqueidentifier NOT NULL;
+        ALTER TABLE Scenario_Audit ALTER COLUMN SessionID uniqueidentifier NOT NULL;
+        ALTER TABLE Scenario_Audit ADD CONSTRAINT PK_Scenario_Audit PRIMARY KEY CLUSTERED (AuditID);
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 IF EXISTS (SELECT 1 FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE c.object_id = OBJECT_ID('dbo.Prompt_Log') AND c.name = 'LogID' AND t.name = 'nvarchar')
 BEGIN
-    IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
-        DROP INDEX IX_PromptLog_Session ON Prompt_Log;
-    ALTER TABLE Prompt_Log DROP CONSTRAINT PK_Prompt_Log;
-    ALTER TABLE Prompt_Log ALTER COLUMN LogID uniqueidentifier NOT NULL;
-    ALTER TABLE Prompt_Log ALTER COLUMN SessionID uniqueidentifier NOT NULL;
-    ALTER TABLE Prompt_Log ADD CONSTRAINT PK_Prompt_Log PRIMARY KEY CLUSTERED (LogID);
+    BEGIN TRY
+        BEGIN TRAN;
+        IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
+            DROP INDEX IX_PromptLog_Session ON Prompt_Log;
+        ALTER TABLE Prompt_Log DROP CONSTRAINT PK_Prompt_Log;
+        ALTER TABLE Prompt_Log ALTER COLUMN LogID uniqueidentifier NOT NULL;
+        ALTER TABLE Prompt_Log ALTER COLUMN SessionID uniqueidentifier NOT NULL;
+        ALTER TABLE Prompt_Log ADD CONSTRAINT PK_Prompt_Log PRIMARY KEY CLUSTERED (LogID);
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 IF EXISTS (SELECT 1 FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
         WHERE c.object_id = OBJECT_ID('dbo.Threat_Candidate_Review') AND c.name = 'CandidateID' AND t.name = 'nvarchar')
 BEGIN
-    ALTER TABLE Threat_Candidate_Review DROP CONSTRAINT PK_Threat_Candidate_Review;
-    ALTER TABLE Threat_Candidate_Review ALTER COLUMN CandidateID uniqueidentifier NOT NULL;
-    ALTER TABLE Threat_Candidate_Review ALTER COLUMN SessionID uniqueidentifier NOT NULL;
-    ALTER TABLE Threat_Candidate_Review ADD CONSTRAINT PK_Threat_Candidate_Review PRIMARY KEY CLUSTERED (CandidateID);
+    BEGIN TRY
+        BEGIN TRAN;
+        ALTER TABLE Threat_Candidate_Review DROP CONSTRAINT PK_Threat_Candidate_Review;
+        ALTER TABLE Threat_Candidate_Review ALTER COLUMN CandidateID uniqueidentifier NOT NULL;
+        ALTER TABLE Threat_Candidate_Review ALTER COLUMN SessionID uniqueidentifier NOT NULL;
+        ALTER TABLE Threat_Candidate_Review ADD CONSTRAINT PK_Threat_Candidate_Review PRIMARY KEY CLUSTERED (CandidateID);
+        COMMIT TRAN;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRAN;
+        THROW;
+    END CATCH
 END
 
 GO
@@ -637,3 +762,104 @@ CREATE UNIQUE INDEX UX_ThreatActor_NaturalKey ON Threat_Actor(ThreatActorName) W
 -- index boots happily and just table-scans. Hence it must be created here, not caught at startup.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatType_Category_Active' AND object_id = OBJECT_ID('dbo.Threat_Type'))
 CREATE INDEX IX_ThreatType_Category_Active ON Threat_Type(PrimaryThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
+
+GO
+
+-- ============================================================
+-- SECTION 6 — Seed real Config_Threat_Rule exclusion rules keyed on
+-- asset_type: 12 OT-equipment-specific tech_gate rules. Classification
+-- basis: all 71 active Threat_Type rows were reviewed against one rule — a
+-- threat is OT-equipment-specific ONLY when its own name hardwires OT field
+-- equipment (SCADA, RTU, IED, protection relay/breaker) as the target, so it
+-- cannot attach to a non-OT asset. Generic mechanisms (privilege escalation,
+-- credential theft, log/audit gaps, DoS, tampering, spoofing) stay universal
+-- even when their catalogue examples happen to be OT-flavored.
+--
+-- Effect once run: a supporting system whose asset_type resolves to
+-- anything OTHER than "Operational Technology (OT)" stops getting scenarios
+-- written for these 12 threat types — the tech_gate fails, Selected=0,
+-- reason "tech_gate:asset_type failed", recorded in Scoped_Threat.FactorsJSON.
+--
+-- Idempotent — guarded IF NOT EXISTS per row, safe to re-run. Depends on
+-- Threat_Type already holding real seeded rows at ids
+-- 5/9/15/16/20/23/26/27/28/54/64/68 — true on this engagement's live
+-- database via a separate external seed process (Section 2 above creates
+-- Threat_Type schema-only, it does not populate these ids). No FK
+-- constraints (by design), so these INSERTs still succeed even if that data
+-- doesn't exist yet — they're just inert until it does.
+--
+-- ThreatRuleID is a plain int PK, NOT IDENTITY (app/db/models.py:239 —
+-- same "curator-seeded, explicit id" pattern as Threat_Category; confirmed
+-- via grep that app/ never INSERTs into this table, only SELECTs it in
+-- dal.py:541). Every INSERT below supplies ThreatRuleID explicitly — 1-12.
+-- ============================================================
+
+-- DECLARE @RuleValue nvarchar(450) = N'Operational Technology (OT)';
+-- DECLARE @CreatedBy nvarchar(200) = N'production_setup.sql';
+
+-- ThreatRuleID 1  / ThreatTypeID 5  — Disruption of RTU availability or responsiveness
+-- ThreatRuleID 2  / ThreatTypeID 9  — Exposure of sensitive RTU data
+-- ThreatRuleID 3  / ThreatTypeID 15 — Identity spoofing of RTU components
+-- ThreatRuleID 4  / ThreatTypeID 16 — Unauthorized modification of SCADA data or configuration
+-- ThreatRuleID 5  / ThreatTypeID 20 — Unauthorized privilege escalation within RTU subsystem
+-- ThreatRuleID 6  / ThreatTypeID 23 — Unauthorized access to SCADA operational or configuration information
+-- ThreatRuleID 7  / ThreatTypeID 26 — Interruption or degradation of SCADA availability from internal actions or failures
+-- ThreatRuleID 8  / ThreatTypeID 27 — Unauthorized privilege escalation within the internal SCADA environment
+-- ThreatRuleID 9  / ThreatTypeID 28 — Unauthorized modification of RTU data or configuration
+-- ThreatRuleID 10 / ThreatTypeID 54 — Device/response suppression (protection-relay/breaker communication)
+-- ThreatRuleID 11 / ThreatTypeID 64 — Network-level DoS to SCADA/RTU
+-- ThreatRuleID 12 / ThreatTypeID 68 — Telemetry spoofing (forged RTU/IED field telemetry)
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 5 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (1, 'tech_gate', 5, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 9 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (2, 'tech_gate', 9, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 15 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (3, 'tech_gate', 15, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 16 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (4, 'tech_gate', 16, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 20 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (5, 'tech_gate', 20, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 23 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (6, 'tech_gate', 23, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 26 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (7, 'tech_gate', 26, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 27 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (8, 'tech_gate', 27, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 28 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (9, 'tech_gate', 28, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 54 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (10, 'tech_gate', 54, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 64 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (11, 'tech_gate', 64, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule WHERE ThreatTypeID = 68 AND RuleKey = 'asset_type' AND RuleType = 'tech_gate')
+--     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted, CreateDate, CreatedBy)
+--     VALUES (12, 'tech_gate', 68, 'asset_type', @RuleValue, 1, 0, SYSUTCDATETIME(), @CreatedBy);
+
+-- -- Verify
+-- SELECT ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, CreatedBy
+-- FROM Config_Threat_Rule
+-- WHERE RuleKey = 'asset_type'
+-- ORDER BY ThreatTypeID;

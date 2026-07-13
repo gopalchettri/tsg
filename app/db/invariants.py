@@ -1,4 +1,4 @@
-"""Startup invariants (mandated assertion module; remediation INV-1..5).
+"""Startup invariants (mandated assertion module; remediation).
 
 WHAT THIS FILE IS, IN ONE SENTENCE: a bouncer that stands at the front door of
 the app. Before the API (or a worker) starts serving real traffic, it checks
@@ -84,7 +84,7 @@ REQUIRED_INDEXES = [
 # the app starting fine and then crashing on the very first "Accept" click.
 # ============================================================================
 REQUIRED_NOT_NULL = [
-    ("Scenario_Session", "EntityID"), ("Scenario_Session", "AssetExternalID"),
+    ("Scenario_Session", "EntityID"), ("Scenario_Session", "AssetID"),
     ("Threat_Candidate_Review", "TenantID"),
 ]
 
@@ -100,7 +100,7 @@ REQUIRED_NOT_NULL = [
 # for a given group of rows (e.g. one session + one subsystem), there must
 # NEVER be more than one row simultaneously marked "still active" — if there
 # were, nothing downstream would know which one is really "the" current
-# profile or scenario.
+# scenario.
 #
 # This catches a live BUG (a partial write, a bad backfill script, a
 # regression) that already happened and slipped past every other safeguard —
@@ -119,6 +119,29 @@ ACTIVE_UNIQUE = [
 ]
 
 
+# ============================================================================
+# CHECKLIST 4 — "is the database actually running in the concurrency mode the
+# whole app assumes?"
+#
+# Read-Committed Snapshot Isolation (RCSI) is a database-wide setting, turned
+# on ONCE with `ALTER DATABASE <name> SET READ_COMMITTED_SNAPSHOT ON` (see
+# scripts/production_setup.sql Section 0, and scripts/readme.txt). With it on,
+# a plain read never blocks behind — or gets blocked by — a concurrent writer;
+# every CAS/lock-fencing pattern in dal.py (claim_stage, acquire_lock,
+# cancel_session, complete_session, ...) was designed assuming reads work this
+# way. WITHOUT it, this app still mostly "works", but under real concurrent
+# load, readers and writers start blocking each other in ways this codebase
+# was never designed to handle — the kind of intermittent, load-dependent
+# freeze that's extremely hard to diagnose after the fact, because nothing
+# crashes; requests just get slower and slower under contention.
+#
+# This was previously a manual, easy-to-forget deployment step with no code
+# anywhere checking it actually happened. This checklist entry closes that gap
+# the same way checklists 1/2 do: the app refuses to boot instead of silently
+# running in a concurrency mode it was never tested against.
+# ============================================================================
+
+
 class StartupInvariantError(RuntimeError):
     """Raised when any check above fails. The app is expected to let this
     exception propagate all the way up and crash the boot process — that's
@@ -130,16 +153,17 @@ def verify_startup(engine: Engine) -> None:
     exists to support. Call it once, at boot (and in CI).
 
     Step by step:
-      1. If we're talking to real MSSQL, run checklist 1 (indexes exist?) and
-         checklist 2 (NOT-NULL columns really are NOT NULL?). These need
-         MSSQL's system tables, so they're skipped entirely on SQLite (where
-         those system tables don't exist in the same form — running the tests
-         there would either error out or trivially always pass, neither of
-         which tells us anything useful).
-      2. ALWAYS run checklist 3 (no duplicate "active" rows) — this one works
-         identically on SQLite and MSSQL since it's just a plain COUNT/GROUP BY
-         query, no dialect-specific system tables involved. This is why it's
-         the only check exercised by the SQLite-based automated test suite.
+    1. If we're talking to real MSSQL, run checklist 1 (indexes exist?),
+        checklist 2 (NOT-NULL columns really are NOT NULL?), and checklist 4
+        (is RCSI actually turned on?). These need MSSQL's system tables, so
+        they're skipped entirely on SQLite (where those system tables don't
+        exist in the same form — running the tests there would either error
+        out or trivially always pass, neither of which tells us anything
+        useful).
+    2. ALWAYS run checklist 3 (no duplicate "active" rows) — this one works
+        identically on SQLite and MSSQL since it's just a plain COUNT/GROUP BY
+        query, no dialect-specific system tables involved. This is why it's
+        the only check exercised by the SQLite-based automated test suite.
 
     If any single check fails, a StartupInvariantError is raised and the caller
     (the FastAPI app's startup hook, or the Celery worker's boot hook) is
@@ -148,54 +172,104 @@ def verify_startup(engine: Engine) -> None:
     if engine.dialect.name == "mssql":
         _assert_indexes(engine)
         _assert_not_null(engine)
+        _assert_rcsi_enabled(engine)
     _assert_no_duplicate_active(engine)
 
 
 def _assert_indexes(engine: Engine) -> None:
     """Runs CHECKLIST 1. How it works: ask SQL Server's own system catalog
-    (`sys.indexes`) for the names of every index that currently exists in the
-    database, then compare that list against `REQUIRED_INDEXES` above. Any
-    name in `REQUIRED_INDEXES` that ISN'T in the real database gets collected
-    into `missing`, and if that list is non-empty, the app refuses to boot
-    with a clear error message naming exactly which index(es) are missing —
-    so whoever sees the error knows precisely which migration didn't run.
+    (`sys.indexes`), filtered server-side to just the names in
+    `REQUIRED_INDEXES` above (a single round trip, not a full-catalog scan),
+    for whether each one exists and is actually enforcing anything — i.e.
+    not disabled (`is_disabled = 0`) and unique (`is_unique = 1`, since every
+    entry in `REQUIRED_INDEXES` is a UNIQUE index some invariant depends on).
+    A name that's missing entirely, or present but disabled/non-unique, means
+    the app refuses to boot with a clear error naming exactly which index(es)
+    need attention — so whoever sees the error knows precisely what to fix.
     """
+    # Names here always come from the hardcoded REQUIRED_INDEXES list above
+    # (never from user input); the parameter binding below is just to keep
+    # the query itself simple, not because these names need sanitizing.
+    params = {f"ix{i}": name for i, name in enumerate(REQUIRED_INDEXES)}
+    placeholders = ", ".join(f":ix{i}" for i in range(len(REQUIRED_INDEXES)))
     with engine.connect() as c:
-        present = {
-            r[0] for r in c.execute(text("SELECT name FROM sys.indexes WHERE name IS NOT NULL"))
-        }
+        rows = c.execute(
+            text(f"SELECT name, is_disabled, is_unique FROM sys.indexes WHERE name IN ({placeholders})"),
+            params,
+        ).all()
+    present = {r[0]: (bool(r[1]), bool(r[2])) for r in rows}
     missing = [ix for ix in REQUIRED_INDEXES if ix not in present]
     if missing:
         raise StartupInvariantError(f"missing required indexes (run migrations): {missing}")
+    unhealthy = [ix for ix in REQUIRED_INDEXES if present[ix][0] or not present[ix][1]]
+    if unhealthy:
+        raise StartupInvariantError(
+            f"required indexes exist but are not enforcing (disabled and/or non-unique): {unhealthy}"
+        )
+
+
+def _assert_rcsi_enabled(engine: Engine) -> None:
+    """Runs CHECKLIST 4. How it works: ask SQL Server's own catalog
+    (`sys.databases`) whether RCSI is on for the database this connection is
+    actually talking to right now (`DB_ID()` — the current database, not a
+    hardcoded name, so this works the same in dev/staging/prod). If it's off,
+    the app refuses to boot with the exact `ALTER DATABASE` command needed to
+    fix it, so whoever sees the error can resolve it in one copy-paste.
+    """
+    with engine.connect() as c:
+        row = c.execute(
+            text("SELECT DB_NAME(), is_read_committed_snapshot_on FROM sys.databases WHERE database_id = DB_ID()")
+        ).one()
+    db_name, rcsi_on = row[0], bool(row[1])
+    if not rcsi_on:
+        raise StartupInvariantError(
+            f"Read-Committed Snapshot Isolation is OFF on database '{db_name}', but this app's "
+            "concurrency model (CAS writes, stage locking) assumes it's on. Fix with: "
+            f"ALTER DATABASE [{db_name}] SET READ_COMMITTED_SNAPSHOT ON;"
+        )
 
 
 def _assert_not_null(engine: Engine) -> None:
-    """Runs CHECKLIST 2. How it works: for every (table, column) pair in
-    `REQUIRED_NOT_NULL` above, ask SQL Server's own metadata
-    (`INFORMATION_SCHEMA.COLUMNS`) whether that column is nullable. Two ways
-    this can fail:
-      - the column doesn't exist at all (e.g. the whole table is missing,
+    """Runs CHECKLIST 2. How it works: one query, not one per pair — ask SQL
+    Server's own metadata (`INFORMATION_SCHEMA.COLUMNS`) for every
+    (table, column) pair in `REQUIRED_NOT_NULL` above at once (a single round
+    trip that stays O(1) as that list grows), then check each pair in Python.
+    Two ways a pair can fail:
+    - the column doesn't exist at all (e.g. the whole table is missing,
         like `Threat_Candidate_Review` would be if its migration never ran)
-        → `nullable` comes back as `None`, and we raise "missing column".
-      - the column DOES exist, but it's still marked nullable in the real
+        → it's simply absent from the results, and we raise "missing column".
+    - the column DOES exist, but it's still marked nullable in the real
         schema (e.g. someone forgot to add the `NOT NULL` constraint when
         writing the migration) → we raise "must be NOT NULL".
     Either way, the app won't start until the real database schema actually
     matches what the code assumes.
     """
+    # Table/column names here always come from the hardcoded REQUIRED_NOT_NULL
+    # list above (never from user input); the parameter binding below is just
+    # to keep the query itself simple, not because these names need sanitizing.
+    params: dict[str, str] = {}
+    clauses = []
+    for i, (table, col) in enumerate(REQUIRED_NOT_NULL):
+        params[f"t{i}"] = table
+        params[f"c{i}"] = col
+        clauses.append(f"(TABLE_NAME = :t{i} AND COLUMN_NAME = :c{i})")
     with engine.connect() as c:
-        for table, col in REQUIRED_NOT_NULL:
-            nullable = c.execute(
-                text(
-                    "SELECT is_nullable FROM INFORMATION_SCHEMA.COLUMNS "
-                    "WHERE TABLE_NAME = :t AND COLUMN_NAME = :col"
-                ),
-                {"t": table, "col": col},
-            ).scalar()
-            if nullable is None:
-                raise StartupInvariantError(f"missing column {table}.{col}")
-            if str(nullable).upper() in ("YES", "1", "TRUE"):
-                raise StartupInvariantError(f"{table}.{col} must be NOT NULL (M3/[R7])")
+        rows = c.execute(
+            text(
+                "SELECT TABLE_NAME, COLUMN_NAME, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE " + " OR ".join(clauses)
+            ),
+            params,
+        ).all()
+    found = {(r[0], r[1]): r[2] for r in rows}
+    for table, col in REQUIRED_NOT_NULL:
+        nullable = found.get((table, col))
+        if nullable is None:
+            raise StartupInvariantError(f"missing column {table}.{col}")
+        # Different drivers can hand back "is this nullable?" as different
+        # shapes (the string "YES", or a truthy "1"), so check all of them.
+        if str(nullable).upper() in ("YES", "1", "TRUE"):
+            raise StartupInvariantError(f"{table}.{col} must be NOT NULL (M3/[R7])")
 
 
 def _assert_no_duplicate_active(engine: Engine) -> None:
@@ -205,7 +279,7 @@ def _assert_no_duplicate_active(engine: Engine) -> None:
     that groups all "still active" rows (`Superseded = 0`) by that grouping
     key and counts how many rows land in each group. If any group has MORE
     THAN ONE row in it, that's a live bug — two rows are simultaneously
-    claiming to be "the current" profile/scenario for the same
+    claiming to be "the current" scenario for the same
     session+subsystem, which is a state nothing else in the app expects to
     ever see. The app refuses to start (or the CI check fails) with a message
     naming exactly which table and how many offending groups were found.
@@ -213,13 +287,16 @@ def _assert_no_duplicate_active(engine: Engine) -> None:
     with engine.connect() as c:
         for table, cols in ACTIVE_UNIQUE:
             grp = ", ".join(cols)
+            # Table/column names here always come from the hardcoded ACTIVE_UNIQUE
+            # list above (never from user input), so building SQL with an f-string
+            # is safe — there's nothing to sanitize.
             dupes = c.execute(
                 text(
-                    f"SELECT COUNT(*) FROM (SELECT {grp} FROM {table.name} "
+                    f"SELECT COUNT(*) FROM (SELECT {grp} FROM {table.__tablename__} "
                     f"WHERE Superseded = 0 GROUP BY {grp} HAVING COUNT(*) > 1) d"
                 )
             ).scalar()
             if dupes:
                 raise StartupInvariantError(
-                    f"{table.name}: {dupes} ({grp}) groups have >1 active row (INV-2)"
+                    f"{table.__tablename__}: {dupes} ({grp}) groups have >1 active row (INV-2)"
                 )

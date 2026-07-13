@@ -75,7 +75,7 @@ def test_parse_json_wraps_recursion_error_as_terminal(monkeypatch):
 def test_validate_scenario_ok():
     v = validate_scenario(
         {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
-         "business_impact": "b", "operational_impact": "o"},
+         "business_impact": "b", "operational_impact": "o", "risk_statement": "r"},
         "Firmware Tampering", "Bootloader implant")
     assert v == {"validation_status": "ok", "errors": [], "assumptions": [], "excluded_details": []}
 
@@ -83,13 +83,14 @@ def test_validate_scenario_ok():
 def test_validate_scenario_warns_on_missing_fields():
     v = validate_scenario({"scenario_title": "t"}, "Firmware Tampering", "Bootloader implant")
     assert v["validation_status"] == "warning"
-    assert set(v["errors"]) == {"missing scenario_statement", "missing business_impact", "missing operational_impact"}
+    assert set(v["errors"]) == {"missing scenario_statement", "missing business_impact",
+                                "missing operational_impact", "missing risk_statement"}
 
 
 def test_validate_scenario_warns_when_statement_ignores_threat():
     v = validate_scenario(
         {"scenario_title": "t", "scenario_statement": "Vague trouble happens.",
-         "business_impact": "b", "operational_impact": "o"},
+         "business_impact": "b", "operational_impact": "o", "risk_statement": "r"},
         "Firmware Tampering", "Bootloader implant")
     assert "scenario_statement does not reference the threat name/type" in v["errors"]
 
@@ -97,7 +98,7 @@ def test_validate_scenario_warns_when_statement_ignores_threat():
 def test_validate_scenario_falls_back_to_type_when_name_missing():
     v = validate_scenario(
         {"scenario_title": "t", "scenario_statement": "Firmware Tampering hits the OTA channel.",
-         "business_impact": "b", "operational_impact": "o"},
+         "business_impact": "b", "operational_impact": "o", "risk_statement": "r"},
         "Firmware Tampering", None)
     assert v["validation_status"] == "ok"
 
@@ -115,7 +116,7 @@ def test_normalize_str_list_coerces_malformed_shapes():
 def test_validate_scenario_passes_through_assumptions_and_exclusions():
     v = validate_scenario(
         {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
-         "business_impact": "b", "operational_impact": "o",
+         "business_impact": "b", "operational_impact": "o", "risk_statement": "r",
          "assumptions": ["assumed no EDR"], "excluded_details": ["exploit mechanics"]},
         "Firmware Tampering", "Bootloader implant")
     assert v["assumptions"] == ["assumed no EDR"]

@@ -4,20 +4,22 @@ Workers `publish` (sync, from Celery) to a per-session channel; the API SSE
 handler `subscribe`s **asynchronously** (redis.asyncio) so the FastAPI event loop
 is never blocked. Publishing is best-effort but logged — SSE is a hint layer, the
 DB status board is the source of truth. Reconnect reconciles from the DB (chosen
-[R4] approach: no replay log).
+approach: no replay log).
 """
 from __future__ import annotations
 
 import json
-import logging
 import time
 from functools import lru_cache
 from typing import AsyncIterator
 
 from app.core.config import get_settings
+from app.core.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
+# Timestamp (monotonic clock) until which the circuit breaker stays open;
+# 0.0 means the breaker is closed (Redis publishing is allowed).
 _breaker_until = 0.0
 
 
@@ -52,15 +54,19 @@ def publish(session_id: str, event: dict) -> None:
     the pipeline. On failure the breaker opens; publishes are instant no-ops until it
     closes."""
     global _breaker_until
+    # Breaker is still open (we're inside the cooldown window from a recent
+    # failure) — skip Redis entirely and return immediately, no-op.
     if time.monotonic() < _breaker_until:
         return
     cooldown = get_settings().sse_breaker_cooldown_seconds
     try:
         _redis().publish(channel(session_id), json.dumps(event, default=str))
     except Exception:  # noqa: BLE001 — best-effort, but never silent
+        # Publish failed (Redis down/slow) — open the breaker for `cooldown`
+        # seconds so we fail fast next time instead of retrying every event.
         _breaker_until = time.monotonic() + cooldown
         logger.warning("SSE publish failed for session %s (event %s); pausing SSE %.0fs",
-                       session_id, event.get("type"), cooldown, exc_info=True)
+                    session_id, event.get("type"), cooldown, exc_info=True)
 
 
 async def subscribe(session_id: str) -> AsyncIterator[dict]:
@@ -70,11 +76,16 @@ async def subscribe(session_id: str) -> AsyncIterator[dict]:
     r = aioredis.Redis.from_url(get_settings().redis_url, decode_responses=True,
                                 socket_connect_timeout=get_settings().sse_subscribe_connect_timeout_seconds)
     pub = r.pubsub()
-    await pub.subscribe(channel(session_id))
     try:
+        await pub.subscribe(channel(session_id))
+        # pub.listen() also yields non-data events (e.g. the subscribe
+        # confirmation itself); only "message" entries are actual published
+        # events, so anything else is silently skipped.
         async for msg in pub.listen():
             if msg.get("type") == "message":
                 yield json.loads(msg["data"])
     finally:
+        # Always clean up, even if the caller stops iterating early
+        # (e.g. client disconnects) or an error is raised mid-stream.
         await pub.aclose()
         await r.aclose()

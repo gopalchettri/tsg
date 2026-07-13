@@ -2,7 +2,7 @@
 sense, flagging problems for a human to see rather than silently pretending
 everything is fine.
 
-LLM response-shape validation (SDD §5.6, [R8]) — the counterpart to
+LLM response-shape validation — the counterpart to
 prompts.py's outbound redaction. `parse_json` raises on malformed output so a
 stage fails LOUDLY through the existing `_record_failure` machinery (no new
 error plumbing); `validate_scenario` is deterministic-only (SDD §8.4:
@@ -80,7 +80,10 @@ def _normalize_str_list(raw: Any) -> list[str]:
     """A malformed assumptions/excluded_details field from the model (a bare
     string, null, or a list containing non-strings) must never reach the caller
     as-is — mirrors grounding's actor normalization. Pass-through informational
-    data only: never affects validation_status."""
+    data only: never affects validation_status.
+
+    In plain terms: always returns a list of strings — a lone string becomes a
+    one-item list, and anything else that isn't a list of strings becomes []."""
     if isinstance(raw, str):
         return [raw]
     if isinstance(raw, list):
@@ -89,45 +92,23 @@ def _normalize_str_list(raw: Any) -> list[str]:
 
 
 def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_name: str | None) -> dict[str, Any]:
-    """ sanity-checks the Stage-3 scenario — are all four
+    """ sanity-checks the Stage-2 scenario — are all five
     required parts there, and does it actually talk about the threat it's
     supposed to be about?
 
-    §5.6 — structural (all 4 narrative fields present, non-empty) + consistency
+    structural (all 5 narrative fields present, non-empty) + consistency
     proxy (statement references the threat it narrates). Self-reported
     `assumptions`/`excluded_details` pass through for the reviewer. Flags, never raises."""
     errors = _check_fields(
-        scenario, ("scenario_title", "scenario_statement", "business_impact", "operational_impact"))
+        scenario, ("scenario_title", "scenario_statement", "business_impact", "operational_impact",
+                "risk_statement"))
     statement = str(scenario.get("scenario_statement") or "").lower()
     needle = (threat_name or threat_type or "").lower()
+    # Only compare when both sides actually have text — a blank statement/threat name
+    # is already reported by _check_fields above, so don't double-flag it here.
     if statement and needle and needle not in statement:
         errors.append("scenario_statement does not reference the threat name/type")
     return {**_result(errors),
             "assumptions": _normalize_str_list(scenario.get("assumptions")),
             "excluded_details": _normalize_str_list(scenario.get("excluded_details"))}
 
-
-if __name__ == "__main__":  # tiny self-check (no framework)
-    for bad in ("not json", "[]"):
-        try:
-            parse_json(bad, stage="threats", expected_type=list)
-            raise AssertionError(f"expected LLMResponseParseError for {bad!r}")
-        except LLMResponseParseError as exc:
-            assert "not json" not in str(exc)  # raw text never in the message
-    assert parse_json('{"a": 1}', stage="scenario") == {"a": 1}
-    assert parse_json("```json\n[1, 2]\n```", stage="threats", expected_type=list) == [1, 2]
-    # fenced list-of-OBJECTS (the threats shape): slice from the leading '[', not the inner '{'
-    assert parse_json('```json\n[{"c": "Spoofing"}]\n```', stage="threats", expected_type=list) == [{"c": "Spoofing"}]
-
-    ok = validate_scenario({"scenario_title": "t", "scenario_statement": "Bootloader implant abuses X",
-                            "business_impact": "b", "operational_impact": "o"}, "Firmware Tampering", "Bootloader implant")
-    assert ok["validation_status"] == "ok"
-    assert len(validate_scenario({}, None, None)["errors"]) == 4
-    # assumptions/excluded_details: pass-through + defensive coercion, never pass/fail
-    assert _normalize_str_list(None) == [] and _normalize_str_list("guess") == ["guess"]
-    assert _normalize_str_list(["a", 3, None, "b"]) == ["a", "b"]
-    rich = validate_scenario({"scenario_title": "t", "scenario_statement": "Bootloader implant abuses X",
-                              "business_impact": "b", "operational_impact": "o",
-                              "assumptions": ["assumed 24x7 ops"]}, "Firmware Tampering", "Bootloader implant")
-    assert rich["validation_status"] == "ok" and rich["assumptions"] == ["assumed 24x7 ops"]
-    print("validation self-check ok")

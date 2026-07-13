@@ -8,9 +8,9 @@ changing retry behavior only ever needs to happen in this one file, never in
 every caller scattered across the codebase.
 
 There is NOT one single - "which AI provider" switch. There are THREE independent switches:
-  - `LLM_PROVIDER`       — controls chat() (azure_openai / openai / litellm proxy)
-  - `EMBEDDING_PROVIDER` — controls embed()  (local in-process / litellm proxy)
-  - `RERANKER_PROVIDER`  — controls rerank() (local in-process / litellm proxy)
+- `LLM_PROVIDER`       — controls chat() (azure_openai / openai / litellm proxy)
+- `EMBEDDING_PROVIDER` — controls embed()  (local in-process / litellm proxy)
+- `RERANKER_PROVIDER`  — controls rerank() (local in-process / litellm proxy)
 These are completely independent of each other. A real, valid setup can have
 chat going through Azure while embeddings run locally on this machine and
 reranking goes through the proxy — any combination is allowed. If something
@@ -57,16 +57,16 @@ class Provenance:
     back to what actually produced it.
 
     Fields:
-      model         — the model name/deployment that was REQUESTED.
-      model_version — what the provider says it ACTUALLY served (can differ
-                      from `model` — see chat()'s comment on this below).
-      params        — a dict of the relevant call settings (provider,
-                      timeout, retry count, etc.) — see chat() for exactly
-                      what goes in here and why.
-      prompt_version — NOT set by this file; the pipeline code that calls
-                      chat() fills this in afterward, so one record can tie
-                      together both "which prompt template" and "which model"
-                      produced a given answer.
+    model         — the model name/deployment that was REQUESTED.
+    model_version — what the provider says it ACTUALLY served (can differ
+                    from `model` — see chat()'s comment on this below).
+    params        — a dict of the relevant call settings (provider,
+                    timeout, retry count, etc.) — see chat() for exactly
+                    what goes in here and why.
+    prompt_version — NOT set by this file; the pipeline code that calls
+                    chat() fills this in afterward, so one record can tie
+                    together both "which prompt template" and "which model"
+                    produced a given answer.
     """
     model: str
     model_version: str = ""
@@ -117,14 +117,30 @@ def _apply_embed_prefix(s: Settings, texts: list[str], kind: str) -> list[str]:
     where it happens to be running.
 
     Controlled by the `embedding_prefix_style` setting:
-      - "auto" (the default): look at the configured model's name — if it
+    - "auto" (the default): look at the configured model's name — if it
         contains "e5", treat it as an e5 model and add the prefix.
-      - "none" (or any non-e5 model name under "auto"): don't touch the
-        text at all — return it completely unchanged.
+    - "none": don't touch the text at all — return it completely unchanged.
+
+    "auto" with a model name that doesn't contain "e5" is AMBIGUOUS, not a
+    signal to skip the prefix: the name might just be an opaque litellm-proxy
+    deployment alias (e.g. "prod-embed-v2") that's actually serving an e5
+    model underneath. EMBEDDING_PROVIDER=local has its own startup-time
+    version of this same check (local_models._check_embedding_prefix_style),
+    but that one is gated on the local path only — it never runs for
+    EMBEDDING_PROVIDER=litellm_proxy. This check runs here instead, for BOTH
+    providers (this function is the shared prefix logic each one calls),
+    so an ambiguous config fails loud on the first embed() call rather than
+    silently resolving to "none" and dropping the prefix with no log line
+    anywhere.
     """
     style = s.embedding_prefix_style
     if style == "auto":
-        style = "e5" if "e5" in s.embedding_model.lower() else "none"
+        if "e5" not in s.embedding_model.lower():
+            raise RuntimeError(
+                f"EMBEDDING_PREFIX_STYLE=auto cannot infer the prefix scheme from "
+                f"'{s.embedding_model}'. Set EMBEDDING_PREFIX_STYLE explicitly to 'e5' or 'none' "
+                "so prefixes aren't silently dropped.")
+        style = "e5"
     if style != "e5":
         return texts
     prefix = {"query": "query: ", "passage": "passage: "}.get(kind, "")
@@ -160,37 +176,37 @@ class LiteLLMClient:
 
         How it decides, based on the `llm_provider` setting (an env var):
 
-          llm_provider == "azure_openai"
+        llm_provider == "azure_openai"
             → talk to an Azure OpenAI deployment. Azure addresses a
-              DEPLOYMENT NAME (something an admin configured on the Azure
-              side), not a generic model name — so if a caller passed a
-              `model=` argument to chat(), THAT ARGUMENT IS SILENTLY IGNORED
-              here; only `s.azure_openai_deployment_name` (from settings) is
-              ever used for Azure. A debug log line is written so this
-              surprising behavior is at least visible if you go looking for
-              it, but the caller's requested model name never wins.
+            DEPLOYMENT NAME (something an admin configured on the Azure
+            side), not a generic model name — so if a caller passed a
+            `model=` argument to chat(), THAT ARGUMENT IS SILENTLY IGNORED
+            here; only `s.azure_openai_deployment_name` (from settings) is
+            ever used for Azure. A debug log line is written so this
+            surprising behavior is at least visible if you go looking for
+            it, but the caller's requested model name never wins.
 
-          llm_provider == "openai"
+        llm_provider == "openai"
             → talk to OpenAI's API directly (or a self-hosted
-              OpenAI-compatible server, if `openai_base_url` is set).
-              Here the caller's `model=` argument DOES apply (falling back
-              to `s.inference_model` if none was given).
+            OpenAI-compatible server, if `openai_base_url` is set).
+            Here the caller's `model=` argument DOES apply (falling back
+            to `s.inference_model` if none was given).
 
-          anything else (the default)
+        anything else (the default)
             → talk to the litellm PROXY server (a separate service this app
-              is configured to route through). Same model-argument-applies
-              behavior as the OpenAI branch above.
+            is configured to route through). Same model-argument-applies
+            behavior as the OpenAI branch above.
 
         Every branch also gets these common settings merged in:
-          - `timeout` / `num_retries` — the bounded timeout/retry
+        - `timeout` / `num_retries` — the bounded timeout/retry
             budget mentioned in the module docstring, applied identically
             regardless of which provider was chosen.
-          - `response_format: {"type": "json_object"}` — ONLY added if the
+        - `response_format: {"type": "json_object"}` — ONLY added if the
             `llm_json_mode` setting is turned on (it's off by default). When
             on, this tells the provider to enforce that its reply is valid
             JSON at the API level, instead of just hoping the model's plain
             text happens to parse as JSON.
-          - `temperature` / `reasoning_effort` — ONLY added if an operator
+        - `temperature` / `reasoning_effort` — ONLY added if an operator
             explicitly set LLM_TEMPERATURE / LLM_REASONING_EFFORT (both
             unset/None by default — see config.py). Left unset, litellm/the
             provider picks its own default for each.
@@ -206,7 +222,7 @@ class LiteLLMClient:
         if s.llm_provider == "azure_openai":
             if model:  # Azure addresses a DEPLOYMENT, not a model name — a per-call model can't apply here
                 log.debug("llm.azure_ignores_per_call_model", requested=model,
-                          deployment=s.azure_openai_deployment_name)
+                        deployment=s.azure_openai_deployment_name)
             return {"model": f"azure/{s.azure_openai_deployment_name}", "api_base": s.azure_openai_endpoint,
                     "api_key": s.azure_openai_api_key, "api_version": s.azure_openai_api_version, **common}
         if s.llm_provider == "openai":
@@ -226,21 +242,21 @@ class LiteLLMClient:
         answered).
 
         STEP BY STEP:
-          1. Import `litellm` LOCALLY (inside the function, not at the top
-             of the file) — this means a test run that only ever uses the
-             fake `StubLLMClient` never needs the real `litellm` package
-             installed at all, since this line of code is simply never
-             reached in that case.
-          2. Call `_chat_kwargs(model)` to get the provider-specific
-             connection details (see that method's own comment above for
-             the full azure_openai / openai / litellm-proxy breakdown).
-          3. Make the actual call: `litellm.completion(messages=..., **kwargs)`.
-             `litellm` itself handles the timeout/retry logic using the
-             `timeout`/`num_retries` values baked into `kwargs`.
-          4. Pull the reply text out of the response shape every provider
-             normalizes to: `resp["choices"][0]["message"]["content"]`.
-          5. Build and return the `Provenance` record (see field-by-field
-             notes below) alongside that text.
+        1. Import `litellm` LOCALLY (inside the function, not at the top
+            of the file) — this means a test run that only ever uses the
+            fake `StubLLMClient` never needs the real `litellm` package
+            installed at all, since this line of code is simply never
+            reached in that case.
+        2. Call `_chat_kwargs(model)` to get the provider-specific
+            connection details (see that method's own comment above for
+            the full azure_openai / openai / litellm-proxy breakdown).
+        3. Make the actual call: `litellm.completion(messages=..., **kwargs)`.
+            `litellm` itself handles the timeout/retry logic using the
+            `timeout`/`num_retries` values baked into `kwargs`.
+        4. Pull the reply text out of the response shape every provider
+            normalizes to: `resp["choices"][0]["message"]["content"]`.
+        5. Build and return the `Provenance` record (see field-by-field
+            notes below) alongside that text.
 
         A NON-OBVIOUS DETAIL — `model` vs. `model_version`: `model=kwargs["model"]`
         is what we ASKED for (e.g. the deployment/model name from
@@ -277,7 +293,7 @@ class LiteLLMClient:
                 # provider picks its own default and this dict stays unchanged.
                 **({"temperature": self.s.llm_temperature} if self.s.llm_temperature is not None else {}),
                 **({"reasoning_effort": self.s.llm_reasoning_effort}
-                   if self.s.llm_reasoning_effort is not None else {}),
+                if self.s.llm_reasoning_effort is not None else {}),
             },
         )
 
@@ -293,20 +309,20 @@ class LiteLLMClient:
         search/similarity matching elsewhere in the pipeline.
 
         STEP BY STEP:
-          1. Apply the e5 query:/passage: prefix if needed (`_apply_embed_prefix`,
-             explained in detail above) — this happens BEFORE routing to
-             either provider, since both need the prefix if the model is e5.
-          2. Check `embedding_provider`:
-               - "local"  → hand the (already-prefixed) texts straight to
-                 `local_models.embed()`, which runs the model in-process on
-                 this machine. No network call happens at all here, so the
-                 timeout/retry settings simply don't apply to this path
-                 — there's nothing to time out or retry.
-               - anything else (the default) → import `litellm` locally
-                 (same reasoning as in `chat()` — keeps the dependency
-                 optional for stub-only test runs) and call
-                 `litellm.embedding(...)` with the same [R8] timeout/retry
-                 bounds used everywhere else in this file.
+        1. Apply the e5 query:/passage: prefix if needed (`_apply_embed_prefix`,
+            explained in detail above) — this happens BEFORE routing to
+            either provider, since both need the prefix if the model is e5.
+        2. Check `embedding_provider`:
+            - "local"  → hand the (already-prefixed) texts straight to
+                `local_models.embed()`, which runs the model in-process on
+                this machine. No network call happens at all here, so the
+                timeout/retry settings simply don't apply to this path
+                — there's nothing to time out or retry.
+            - anything else (the default) → import `litellm` locally
+                (same reasoning as in `chat()` — keeps the dependency
+                optional for stub-only test runs) and call
+                `litellm.embedding(...)` with the same [R8] timeout/retry
+                bounds used everywhere else in this file.
 
         A REAL CORRECTNESS FIX, NOT JUST STYLE (the last line of this
         method): the litellm proxy's response can come back with its
@@ -357,13 +373,20 @@ class LiteLLMClient:
         order than `docs` was given in, and each result also comes back as a
         RAW score in some provider-specific range rather than the 0-100
         scale this method promises callers. So the code below:
-          1. Pre-allocates a `scores` list of zeros, the same length as `docs`.
-          2. For each result the API returns, reads its `"index"` field (which
-             input document it corresponds to) and writes the score into
-             THAT exact position in `scores` — never just appending results
-             in the order the API happened to return them.
-          3. Multiplies each raw relevance score by 100 (§8.4) to normalize
-             it onto the promised 0-100 scale.
+        1. Reads each result's `"index"` field (which input document it
+            corresponds to) and writes the score into THAT exact position
+            — never just appending results in the order the API happened
+            to return them.
+        2. Multiplies each raw relevance score by 100 (§8.4) to normalize
+            it onto the promised 0-100 scale.
+        3. Fails loud if the response doesn't cover every index in `docs`
+            (a truncated/partial reply, a documents-limit being hit, a
+            transient provider glitch) instead of defaulting the missing
+            document(s) to a fabricated 0.0 — a fake worst-possible score
+            would silently mispair scores to candidates with no log line
+            or exception anywhere pointing at the cause (this is what lets
+            grounding.find_closest_match's own `len(rr) != len(docs)` guard
+            actually fire, instead of it being unreachable dead code).
         The end result always lines up position-for-position with the input
         `docs` list, and is always on a 0-100 scale, regardless of what the
         underlying provider's raw response shape happens to look like.
@@ -380,10 +403,13 @@ class LiteLLMClient:
             api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
             timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
         )
-        scores = [0.0] * len(docs)
-        for r in resp["results"]:          # normalise relevance to the 0–100 scale
-            scores[r["index"]] = float(r["relevance_score"]) * 100.0
-        return scores
+        by_index = {r["index"]: float(r["relevance_score"]) * 100.0 for r in resp["results"]}
+        missing = [i for i in range(len(docs)) if i not in by_index]
+        if missing:
+            raise RuntimeError(
+                f"rerank returned {len(by_index)} scores for {len(docs)} docs "
+                f"(missing index(es): {missing})")
+        return [by_index[i] for i in range(len(docs))]
 
 
 @lru_cache

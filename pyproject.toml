@@ -19,11 +19,10 @@ dependencies = [
   "litellm>=1.40",
   "pymongo>=4.7",
   "structlog>=24.1",
-  "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2", "httpx>=0.27"]
+dev = ["pytest>=8.2", "httpx>=0.27", "ruff>=0.15", "mypy>=1.11"]
 local = ["sentence-transformers>=3.0"]   # local embedding + reranker (EMBEDDING/RERANKER_PROVIDER=local)
 prod = ["gunicorn>=22.0"]                # production process manager for the API (uvicorn workers)
 
@@ -36,3 +35,25 @@ include = ["app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Without this, mypy treats every Settings field lacking a literal `= default` as a
+# required constructor argument — it can't see that pydantic-settings actually resolves
+# them from environment variables at runtime (Settings() below is called with zero args
+# and works fine; mypy just doesn't know that without the plugin).
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+
+# Pins the linter that was already running here unconfigured (the stale .ruff_cache and the
+# `# noqa: BLE001` markers are its fingerprints). Default rule set (E4/E7/E9 + F) — E501 is
+# NOT in it, so the long dict-literal lines below are fine as written.
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint.per-file-ignores]
+# SQLAlchemy Core turns `col == True` into a SQL expression. Ruff's suggested `if col:` would
+# instead evaluate the Column's Python truthiness and silently emit the wrong query.
+"app/db/dal.py" = ["E712"]
+"app/pipeline/accept.py" = ["E712"]
+"app/pipeline/grounding.py" = ["E712"]
+# Deliberate `get_settings.cache_clear(); get_engine.cache_clear(); ...` triples.
+"tests/conftest.py" = ["E702"]

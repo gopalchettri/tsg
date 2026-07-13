@@ -305,18 +305,10 @@ def test_security_posture_blocks_dev_auth_in_prod():
         assert_security_posture(s)
 
 
-def test_security_posture_blocks_unbound_asset_in_prod():
-    from app.core.config import Settings, assert_security_posture
-
-    s = Settings(app_env="prod", auth_dev_mode=False, asset_entity_binding="none")
-    with pytest.raises(RuntimeError, match="binding"):
-        assert_security_posture(s)
-
-
 def test_security_posture_allows_dev():
     from app.core.config import Settings, assert_security_posture
 
-    assert_security_posture(Settings(app_env="dev", auth_dev_mode=True, asset_entity_binding="none"))  # no raise
+    assert_security_posture(Settings(app_env="dev", auth_dev_mode=True))  # no raise
 
 
 def test_config_local_aliases():

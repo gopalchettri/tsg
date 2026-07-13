@@ -34,10 +34,11 @@ from __future__ import annotations
 
 import sys
 
+
 #  turn on gevent's "many tasks at once" mode now, before any
 # other file gets imported and locks in the normal (patched-too-late) behavior.
 if "pytest" not in sys.modules:
-    from gevent import monkey
+    from gevent import monkey  # type: ignore[import]
     monkey.patch_all()
 
 from app.pipeline.celery_app import celery_app  # noqa: E402 -- must import after patching

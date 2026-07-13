@@ -31,6 +31,14 @@ services:
     env_file: [../.env.prod]
     depends_on:
       redis: { condition: service_healthy }
+    # Compose's 10s default (SIGTERM then SIGKILL) is far shorter than a single in-flight LLM
+    # call can legitimately take (llm_timeout_seconds x llm_max_retries = up to 270s), so every
+    # routine restart/redeploy/scale-down would hard-kill mid-work instead of letting Celery's
+    # warm shutdown finish it — the same "orphaned message" exposure a killed worker causes
+    # (see app/pipeline/celery_app.py's visibility_timeout comment). 300s covers one full
+    # LLM-call retry cycle; a reasoned starting point, not measured against this deployment's
+    # real P99 stage duration — tune once that data exists.
+    stop_grace_period: 300s
     volumes:
       - "${EMBEDDING_MODEL_HOST}:/models/e5:ro"
       - "${RERANKER_MODEL_HOST}:/models/reranker:ro"

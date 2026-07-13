@@ -19,13 +19,21 @@ def configure_logging(level: int | None = None) -> None:
     worker_process_init signal without corrupting already-emitted log state.
     """
     if level is None:
+        # No explicit level given, so convert the LOG_LEVEL setting (a string like
+        # "DEBUG") into the numeric level the stdlib logging module expects.
         level = getattr(logging, get_settings().log_level)
+    # Plain "%(message)s" format: structlog's JSONRenderer below already builds the
+    # full formatted message, so stdlib logging shouldn't add its own prefix on top.
     logging.basicConfig(format="%(message)s", level=level)
     structlog.configure(
+        # Processors run top to bottom: merge context vars in, tag the log level,
+        # add a timestamp, render stack/exception info, then serialize to JSON last.
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(level),

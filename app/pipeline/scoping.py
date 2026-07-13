@@ -2,7 +2,7 @@
 writing a full scenario for, and in what order — using a scoring system plus
 any rules an admin/curator has set up.
 
-Threat scoping (SDD §5.4, [R12]) — deterministic rule evaluation.
+Threat scoping  — deterministic rule evaluation.
 
 Base score + grounding-confidence weight, then the `Config_Threat_Rule` engine:
 `tech_gate` rules are a hard include/exclude (a failed gate → `Selected = 0`, the
@@ -31,21 +31,30 @@ BASE_SCORE = 50.0
 _CONFIDENCE_WEIGHT = {GroundingStatus.grounded: 20.0, GroundingStatus.confirm: 10.0, GroundingStatus.flagged: 0.0}
 _DEFAULT_RULE_WEIGHT = 10.0  # relevance_* delta when the rule's Metadata carries no {"weight": N}
 
-# [R12] §5.4 step 1 — the fixed RuleKey → context-field allowlist. Each entry maps a
+# step 1 — the fixed RuleKey → context-field allowlist. Each entry maps a
 # RuleKey to (subsystem field it reads, default expected value used when RuleValue is
-# NULL; None = plain truthy check). # ponytail: v1 map covers the fields SubsystemsJSON
-# actually carries today (context.py::gather_asset_details); extending it is one line per key
-# + curator sign-off on the RuleKey→field mapping (SDD §15 open item).
+# NULL; None = plain truthy check). Keys removed 2026-07-12: internet_facing/
+# exposure_level/accessibility_channel/hosting_environment/data_residency — the
+# onboarding_supporting_systems columns they read (accessability_channel,
+# hosting_location, data_residency_restrictions) don't exist on the real platform
+# table, so gather_asset_details no longer produces them (see
+# TSG_Gap_Analysis.md's table cross-check entry). Extending this map is one line
+# per key + curator sign-off on the RuleKey→field mapping.
+# Note: asset_type's value is now resolved text (ctm_scan_category.name,
+# Part E), so _matches() takes its case-insensitive TEXT branch here, not the numeric one.
 _RULE_KEY_FIELDS: dict[str, tuple[str, str | None]] = {
-    "internet_facing": ("exposure_level", "internet-facing"),
-    "exposure_level": ("exposure_level", None),
     "criticality": ("criticality", None),
     "subsystem_name": ("name", None),
+    "asset_type": ("asset_type", None),
+    "past_incidents": ("past_incidents", None),
 }
 
 
 @dataclass
 class Scored:
+    """In plain English: the scored/ranked result for one threat — its score,
+    rank, whether it made the cut, why, and which rules contributed."""
+
     threat_id: str
     score: float
     rank: int
@@ -92,17 +101,20 @@ def _matches(value: Any, expected: str | None) -> bool:
     No expected value → plain truthy check. Otherwise numeric-tolerant equality
     first ("05" / "5.0" / 5 all match — curator-typed text vs int/str context fields),
     falling back to case-insensitive string comparison. Booleans never take the
-    numeric branch (float(True)==1.0 would silently match RuleValue "1" — a bool
-    field compares as text: "true"/"false"). A curator-typed "NaN" never matches on
-    the numeric branch (IEEE754), then falls to text comparison — intended. Pure
-    function of its inputs — deterministic either way."""
+    float-coercion branch; instead a real bool accepts the equivalent canonical
+    spellings (case-insensitive, stripped): True matches "1" or "true", False matches
+    "0" or "false" — any other expected string never matches a bool. A curator-typed
+    "NaN" never matches on the numeric branch (IEEE754), then falls to text
+    comparison — intended. Pure function of its inputs — deterministic either way."""
     if expected is None:
         return bool(value)
-    if not isinstance(value, bool):  # bools are not numbers here — text branch below
-        try:
-            return float(value) == float(expected)
-        except (TypeError, ValueError):
-            pass
+    if isinstance(value, bool):  # bools never take the float branch — canonical spellings only
+        exp = expected.strip().lower()
+        return exp in ("1", "true") if value else exp in ("0", "false")
+    try:
+        return float(value) == float(expected)
+    except (TypeError, ValueError):
+        pass
     return str(value).strip().lower() == expected.strip().lower()
 
 
@@ -147,9 +159,38 @@ def _apply_rules(threat: dict, subsystem: dict | None, rules_by_type: dict) -> t
     return delta, selected, gate_failures, factors
 
 
+def _scoring_reason(gate_failures: list[str], grounding_status: Any) -> str:
+    """In plain English: builds the human-readable reason string for one
+    threat's score — which gate it failed, or (if none) what grounding basis
+    the score was built on.
+
+    Reason records the gate on exclusion (§5.4 step 2), else the grounding basis."""
+    if gate_failures:
+        return f"tech_gate:{','.join(gate_failures)} failed"
+    return f"grounding={grounding_status}"
+
+
+def _apply_selection_cutoffs(selected: bool, score: float, reason: str, kept: int, *,
+                            score_threshold: float | None, top_n: int | None) -> tuple[bool, str, int]:
+    """In plain English: enforces the two independent, config-driven selection
+    cutoffs (score-threshold and top-N) against one already-ranked threat.
+
+    Config-driven selection cutoff (§5.4 step 3) — applied in rank order, deterministic.
+    top_n only counts threats that are still selected at this point — ones already
+    excluded by the gate or threshold don't use up a slot. Returns the possibly-updated
+    (selected, reason) plus the running `kept` count for the caller's next threat."""
+    if selected and score_threshold is not None and score < score_threshold:
+        selected, reason = False, f"below score threshold ({score_threshold})"
+    if selected and top_n is not None:
+        kept += 1
+        if kept > top_n:
+            selected, reason = False, f"beyond top-{top_n} cutoff"
+    return selected, reason, kept
+
+
 def score_threats(threats: list[dict[str, Any]], *, subsystem: dict | None = None,
-                  rules: list[dict] | None = None, score_threshold: float | None = None,
-                  top_n: int | None = None) -> list[Scored]:
+                rules: list[dict] | None = None, score_threshold: float | None = None,
+                top_n: int | None = None) -> list[Scored]:
     """In plain English: the main function here — takes the threats for one
     subsystem, scores and ranks them, and decides which ones move forward to
     get a written scenario.
@@ -157,29 +198,27 @@ def score_threats(threats: list[dict[str, Any]], *, subsystem: dict | None = Non
     Deterministic: same inputs → same ranking (acceptance: test_scoping_deterministic).
     Called with only `threats` (no rules, no cutoff) this is exactly the pre-R12
     behavior: base + grounding weight, everything selected."""
+    # Bucket the curator's rules by threat type, so each threat below only gets
+    # checked against the rules that actually apply to its type.
     rules_by_type: dict[int, list[dict]] = {}
     for r in rules or []:
         rules_by_type.setdefault(r["ThreatTypeID"], []).append(r)
 
+    # Score every threat: start from base + grounding-confidence weight, then
+    # layer on whatever the config rules add or exclude.
     evaluated = []
     for t in threats:
         score = BASE_SCORE + _CONFIDENCE_WEIGHT.get(GroundingStatus(t["grounding_status"]), 0.0)
         delta, selected, gate_failures, factors = _apply_rules(t, subsystem, rules_by_type)
         score += delta
-        # Reason records the gate on exclusion (§5.4 step 2), else the grounding basis.
-        reason = f"tech_gate:{','.join(gate_failures)} failed" if gate_failures else f"grounding={t['grounding_status']}"
+        reason = _scoring_reason(gate_failures, t["grounding_status"])
         evaluated.append((t["threat_id"], score, selected, reason, factors))
 
     evaluated.sort(key=lambda x: (-x[1], x[0]))  # score desc, id asc — stable (§5.4 step 3)
     out: list[Scored] = []
     kept = 0  # fresh per call — cutoff state never crosses subsystems/invocations
     for rank, (tid, score, selected, reason, factors) in enumerate(evaluated, start=1):
-        # Config-driven selection cutoff (§5.4 step 3) — applied in rank order, deterministic.
-        if selected and score_threshold is not None and score < score_threshold:
-            selected, reason = False, f"below score threshold ({score_threshold})"
-        if selected and top_n is not None:
-            kept += 1
-            if kept > top_n:
-                selected, reason = False, f"beyond top-{top_n} cutoff"
+        selected, reason, kept = _apply_selection_cutoffs(
+            selected, score, reason, kept, score_threshold=score_threshold, top_n=top_n)
         out.append(Scored(threat_id=tid, score=score, rank=rank, selected=selected, reason=reason, factors=factors))
     return out

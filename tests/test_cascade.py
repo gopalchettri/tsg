@@ -1,4 +1,4 @@
-"""Regeneration cascade (SDD [R9]) — redo one subsystem's scenario(s) without
+﻿"""Regeneration cascade (SDD [R9]) — redo one subsystem's scenario(s) without
 re-running the whole pipeline. Row-scoped (the whole point: redo one bad item
 without discarding its siblings); reuses the same _LOCK/epoch/decide_session_outcome
 machinery the initial pipeline uses, so it's concurrency-correct by construction.
@@ -23,7 +23,7 @@ from app.pipeline import cascade, prompts
 from app.pipeline.accept import AcceptConflict, accept_session
 from app.pipeline.reaper import clean_up_abandoned_sessions
 from app.pipeline.tasks import _process_all_supporting_systems, write_scenarios
-from tests.conftest import StubLLM
+from tests.conftest import DEFAULT_ASSET_CONTEXT, StubLLM
 from tests.test_slice import SUB, _seed_session
 
 
@@ -48,14 +48,14 @@ class _TwoThreatLLM(StubLLM):
 def _run_to_review(db, llm, subs=None):
     session = _seed_session(db, subs=subs)
     sid = session["SessionID"]
-    _process_all_supporting_systems(db, sid, llm, "t")
+    _process_all_supporting_systems(db, sid, llm, "11111111-1111-4111-8111-111111111111")
     assert load_session(db, sid)["CurrentStage"] == WorkflowStage.REVIEW
     return sid
 
 
 def _leave_review(db, sid, stage=WorkflowStage.SCENARIO_GENERATION):
     """Simulates the API endpoint's own leave-REVIEW CAS."""
-    db.execute(update(m.Scenario_Session).where(m.Scenario_Session.c.SessionID == sid)
+    db.execute(update(m.Scenario_Session).where(m.Scenario_Session.SessionID == sid)
                .values(CurrentStage=stage, StageStatus=StageStatus.RUNNING, UpdatedAt=dal.now()))
 
 
@@ -69,9 +69,9 @@ def _reserve_epoch(db, sid, subsystem_id, granularity):
 
 def _output_ids(db, sid):
     return db.execute(
-        select(m.Threat_Scenario_Output.c.OutputID)
-        .where(m.Threat_Scenario_Output.c.SessionID == sid, m.Threat_Scenario_Output.c.Superseded == 0)
-        .order_by(m.Threat_Scenario_Output.c.OutputID)
+        select(m.Threat_Scenario_Output.OutputID)
+        .where(m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)
+        .order_by(m.Threat_Scenario_Output.OutputID)
     ).scalars().all()
 
 
@@ -83,14 +83,14 @@ def test_regen_at_review_returns_to_review(db):
     _leave_review(db, sid)
     epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
     outcome = cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [output_id], epoch,
-                                       StubLLM(), "regen-t")
+                                       StubLLM(), "55555555-5555-4555-8555-555555555555")
     assert outcome == "review"
     assert load_session(db, sid)["CurrentStage"] == WorkflowStage.REVIEW
 
 
 def test_accept_rejected_during_regen(db):
     sid = _run_to_review(db, StubLLM())
-    dal.acquire_lock(db, sid, SUB["id"], "live-regen-task")  # simulate a regen holding the lock
+    dal.acquire_lock(db, sid, SUB["id"], "66666666-6666-4666-8666-666666666666")  # simulate a regen holding the lock
     with pytest.raises(AcceptConflict):
         accept_session(db, sid, "5", "u1")
 
@@ -98,12 +98,12 @@ def test_accept_rejected_during_regen(db):
 def test_concurrent_regen_same_subsystem_one_wins(db):
     sid = _run_to_review(db, StubLLM())
     res1 = db.execute(update(m.Scenario_Session).where(
-        m.Scenario_Session.c.SessionID == sid, m.Scenario_Session.c.SessionStatus == "active",
-        m.Scenario_Session.c.CurrentStage == WorkflowStage.REVIEW,
+        m.Scenario_Session.SessionID == sid, m.Scenario_Session.SessionStatus == "active",
+        m.Scenario_Session.CurrentStage == WorkflowStage.REVIEW,
     ).values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING))
     res2 = db.execute(update(m.Scenario_Session).where(
-        m.Scenario_Session.c.SessionID == sid, m.Scenario_Session.c.SessionStatus == "active",
-        m.Scenario_Session.c.CurrentStage == WorkflowStage.REVIEW,
+        m.Scenario_Session.SessionID == sid, m.Scenario_Session.SessionStatus == "active",
+        m.Scenario_Session.CurrentStage == WorkflowStage.REVIEW,
     ).values(CurrentStage=WorkflowStage.THREAT_IDENTIFICATION, StageStatus=StageStatus.RUNNING))
     assert res1.rowcount == 1
     assert res2.rowcount == 0  # second request's identical CAS loses the race
@@ -139,7 +139,7 @@ def test_reaper_eventually_reclaims_a_regen_that_never_actually_started(db, monk
     _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
     # Backdate UpdatedAt past the (now tiny) grace window to simulate a task that
     # really did get lost (broker down, worker crash before ever starting).
-    db.execute(update(m.Scenario_Session).where(m.Scenario_Session.c.SessionID == sid)
+    db.execute(update(m.Scenario_Session).where(m.Scenario_Session.SessionID == sid)
                .values(UpdatedAt=dal.now().replace(year=2000)))
     clean_up_abandoned_sessions(db)
     row = load_session(db, sid)
@@ -154,13 +154,13 @@ def test_regen_creates_new_epoch_supersedes_old(db):
     old_output = _output_ids(db, sid)[0]
     _leave_review(db, sid)
     epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
-    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [old_output], epoch, StubLLM(), "regen-t")
+    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [old_output], epoch, StubLLM(), "55555555-5555-4555-8555-555555555555")
 
-    assert db.execute(select(m.Threat_Scenario_Output.c.Superseded)
-                      .where(m.Threat_Scenario_Output.c.OutputID == old_output)).scalar() == 1
+    assert db.execute(select(m.Threat_Scenario_Output.Superseded)
+                      .where(m.Threat_Scenario_Output.OutputID == old_output)).scalar() == 1
 
-    active = db.execute(select(m.Threat_Scenario_Output).where(
-        m.Threat_Scenario_Output.c.SessionID == sid, m.Threat_Scenario_Output.c.Superseded == 0)).mappings().all()
+    active = db.execute(select(m.Threat_Scenario_Output.__table__).where(
+        m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)).mappings().all()
     assert len(active) == 1
     assert active[0]["GenerationEpoch"] == 2
 
@@ -170,25 +170,25 @@ def test_regen_idempotent_redelivery(db):
     session = dict(load_session(db, sid))
     old_output = _output_ids(db, sid)[0]
     threat_id = db.execute(
-        select(m.Scoped_Threat.c.ThreatID)
-        .select_from(m.Threat_Scenario_Output.join(
-            m.Scoped_Threat, m.Threat_Scenario_Output.c.ScopedThreatID == m.Scoped_Threat.c.ScopedThreatID))
-        .where(m.Threat_Scenario_Output.c.OutputID == old_output)
+        select(m.Scoped_Threat.ThreatID)
+        .select_from(m.Threat_Scenario_Output.__table__.join(
+            m.Scoped_Threat, m.Threat_Scenario_Output.ScopedThreatID == m.Scoped_Threat.ScopedThreatID))
+        .where(m.Threat_Scenario_Output.OutputID == old_output)
     ).scalar()
 
     epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,))
     dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,), epoch)
     threats = dal.active_threats(db, sid, SUB["id"])
-    tid = "same-redelivered-task"
+    tid = "44444444-4444-4444-8444-444444444444"  # same task_id both calls -- exercises redelivery
 
-    provs1 = write_scenarios(db, session, SUB, threats, StubLLM(), tid, epoch=epoch, target_threat_ids={threat_id})
+    provs1 = write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, threats, StubLLM(), tid, epoch=epoch, target_threat_ids={threat_id})
     assert len(provs1) == 1
     # Redelivery: SAME task_id, SAME epoch — the stage is now AWAITING_DECISION, not
     # claimable, so this is a true no-op (mirrors test_redelivered_stage_is_noop).
-    provs2 = write_scenarios(db, session, SUB, threats, StubLLM(), tid, epoch=epoch, target_threat_ids={threat_id})
+    provs2 = write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, threats, StubLLM(), tid, epoch=epoch, target_threat_ids={threat_id})
     assert provs2 == []
     active = db.execute(select(func.count()).select_from(m.Threat_Scenario_Output).where(
-        m.Threat_Scenario_Output.c.SessionID == sid, m.Threat_Scenario_Output.c.Superseded == 0)).scalar()
+        m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)).scalar()
     assert active == 1  # no duplicate insert
 
 
@@ -197,12 +197,12 @@ def test_regen_after_poison_exhaustion_not_permanently_blocked(db, monkeypatch):
     monkeypatch.setattr(get_settings(), "stage_max_attempts", 1)
     session = _seed_session(db)
     sid = session["SessionID"]
-    dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, 1, "poisoned-task")
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, 1, "poisoned-task") is False  # exhausted
+    dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, 1, "77777777-7777-4777-8777-777777777777")
+    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, 1, "77777777-7777-4777-8777-777777777777") is False  # exhausted
 
     new_epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,))
     dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,), new_epoch)
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, new_epoch, "fresh-task") is True
+    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, new_epoch, "88888888-8888-4888-8888-888888888888") is True
 
 
 # --- row-scoping (the real fix for the "regen wipes siblings" gap) ---
@@ -214,18 +214,18 @@ def test_regen_scenario_only_targets_one_output_siblings_untouched(db):
     target, sibling = outputs[0], outputs[1]
     _leave_review(db, sid)
     epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
-    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [target], epoch, _TwoThreatLLM(), "regen-t")
+    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [target], epoch, _TwoThreatLLM(), "55555555-5555-4555-8555-555555555555")
 
-    sibling_row = db.execute(select(m.Threat_Scenario_Output.c.Superseded)
-                             .where(m.Threat_Scenario_Output.c.OutputID == sibling)).scalar()
+    sibling_row = db.execute(select(m.Threat_Scenario_Output.Superseded)
+                             .where(m.Threat_Scenario_Output.OutputID == sibling)).scalar()
     assert sibling_row == 0  # untouched
 
-    target_row = db.execute(select(m.Threat_Scenario_Output.c.Superseded)
-                            .where(m.Threat_Scenario_Output.c.OutputID == target)).scalar()
+    target_row = db.execute(select(m.Threat_Scenario_Output.Superseded)
+                            .where(m.Threat_Scenario_Output.OutputID == target)).scalar()
     assert target_row == 1  # regenerated — old one superseded
 
     active = db.execute(select(func.count()).select_from(m.Threat_Scenario_Output).where(
-        m.Threat_Scenario_Output.c.SessionID == sid, m.Threat_Scenario_Output.c.Superseded == 0)).scalar()
+        m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)).scalar()
     assert active == 2  # sibling + the freshly regenerated one — still 2 total, none lost
 
 
@@ -233,9 +233,9 @@ def test_regen_scenario_only_targets_one_output_siblings_untouched(db):
 def _spy_scenario_prompt(monkeypatch, captured):
     real_scenario_prompt = prompts.scenario_prompt
 
-    def _spy(asset_name, sub, threat_type, threat_name):
+    def _spy(asset_name, asset_context, sub, threat_type, threat_name, actors=None):
         captured.append((threat_type, threat_name))
-        return real_scenario_prompt(asset_name, sub, threat_type, threat_name)
+        return real_scenario_prompt(asset_name, asset_context, sub, threat_type, threat_name, actors=actors)
 
     monkeypatch.setattr("app.pipeline.prompts.scenario_prompt", _spy)
 
@@ -248,28 +248,28 @@ def test_regen_scenario_granularity_threads_target_threat_not_sibling(db, monkey
     session = dict(load_session(db, sid))
     target, sibling = _output_ids(db, sid)
     target_threat_id = db.execute(
-        select(m.Scoped_Threat.c.ThreatID)
-        .select_from(m.Threat_Scenario_Output.join(
-            m.Scoped_Threat, m.Threat_Scenario_Output.c.ScopedThreatID == m.Scoped_Threat.c.ScopedThreatID))
-        .where(m.Threat_Scenario_Output.c.OutputID == target)
+        select(m.Scoped_Threat.ThreatID)
+        .select_from(m.Threat_Scenario_Output.__table__.join(
+            m.Scoped_Threat, m.Threat_Scenario_Output.ScopedThreatID == m.Scoped_Threat.ScopedThreatID))
+        .where(m.Threat_Scenario_Output.OutputID == target)
     ).scalar()
-    expected_name = db.execute(select(m.Identified_Threat.c.LibraryThreatName)
-                               .where(m.Identified_Threat.c.ThreatID == target_threat_id)).scalar()
+    expected_name = db.execute(select(m.Identified_Threat.LibraryThreatName)
+                               .where(m.Identified_Threat.ThreatID == target_threat_id)).scalar()
     sibling_threat_id = db.execute(
-        select(m.Scoped_Threat.c.ThreatID)
-        .select_from(m.Threat_Scenario_Output.join(
-            m.Scoped_Threat, m.Threat_Scenario_Output.c.ScopedThreatID == m.Scoped_Threat.c.ScopedThreatID))
-        .where(m.Threat_Scenario_Output.c.OutputID == sibling)
+        select(m.Scoped_Threat.ThreatID)
+        .select_from(m.Threat_Scenario_Output.__table__.join(
+            m.Scoped_Threat, m.Threat_Scenario_Output.ScopedThreatID == m.Scoped_Threat.ScopedThreatID))
+        .where(m.Threat_Scenario_Output.OutputID == sibling)
     ).scalar()
-    sibling_name = db.execute(select(m.Identified_Threat.c.LibraryThreatName)
-                              .where(m.Identified_Threat.c.ThreatID == sibling_threat_id)).scalar()
+    sibling_name = db.execute(select(m.Identified_Threat.LibraryThreatName)
+                              .where(m.Identified_Threat.ThreatID == sibling_threat_id)).scalar()
     assert expected_name != sibling_name  # the two threats really are distinguishable
 
     _leave_review(db, sid)
     epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
     captured = []
     _spy_scenario_prompt(monkeypatch, captured)
-    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [target], epoch, _TwoThreatLLM(), "regen-t")
+    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [target], epoch, _TwoThreatLLM(), "55555555-5555-4555-8555-555555555555")
 
     assert len(captured) == 1
     assert captured[0][1] == expected_name  # matches the TARGET, not the sibling

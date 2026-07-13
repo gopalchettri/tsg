@@ -25,6 +25,13 @@
 -- later, swap tier1_critical_service_id below and the "critical_service" text in
 -- your test payload to match.
 --
+-- Known imperfection #2: ctm_scan_entity.system_managed_by (new asset-level
+-- column, added directly to the DB this session) is NULL on every asset,
+-- including id 7. There is zero signal anywhere in this DB for what asset 7's
+-- real value should be -- this script defaults it to 'In-house' so the live
+-- smoke test has something real to send, NOT because that's a verified fact.
+-- Replace 'In-house' below with the real value once you have it.
+--
 -- Contract (same as scripts/bootstrap_schema.sql): idempotent (WHERE ... IS NULL
 -- guards, safe to re-run), never touches any other row, never drops anything.
 -- Read this before running -- this touches platform-owned tables (app/db/models.py
@@ -42,6 +49,11 @@ SET data_handled = 'Substation telemetry (voltage, current, breaker/switch statu
 WHERE id = 7
   AND data_handled IS NULL
   AND tier1_critical_service_id IS NULL;
+
+UPDATE ctm_scan_entity
+SET system_managed_by = 'In-house'  -- placeholder default, not a verified fact -- see "Known imperfection #2" above
+WHERE id = 7
+  AND system_managed_by IS NULL;
 
 UPDATE onboarding_supporting_systems
 SET incident_description = 'Unauthorized configuration change detected on an engineering workstation during a scheduled maintenance window, 2024-06-14; confirmed accidental misconfiguration by an authorized technician, no operational impact, access controls tightened afterward.'
@@ -64,5 +76,5 @@ SET incident_description = 'False-positive alarm storm from the substation contr
 WHERE id = 1007 AND incident_description IS NULL;  -- SCMS
 
 -- Verify
-SELECT id, name, data_handled, tier1_critical_service_id FROM ctm_scan_entity WHERE id = 7;
+SELECT id, name, data_handled, tier1_critical_service_id, system_managed_by FROM ctm_scan_entity WHERE id = 7;
 SELECT id, name, incident_description FROM onboarding_supporting_systems WHERE id IN (1003, 1004, 1005, 1006, 1007);

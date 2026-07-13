@@ -49,6 +49,21 @@ def test_422_uses_error_envelope(engine, monkeypatch):
     assert body["details"]["errors"]
 
 
+def test_accept_subset_is_bounded_without_losing_empty_semantics():
+    """`subset` feeds `OutputID.in_(subset)` unchunked, so it is bounded like its siblings —
+    but [R8]'s `[]` ("accept none") vs `None` ("accept all") distinction must survive the bound."""
+    import pytest
+    from pydantic import ValidationError
+
+    from app.api.schemas import _MAX_BATCH, AcceptBody
+
+    assert AcceptBody(subset=None).subset is None
+    assert AcceptBody(subset=[]).subset == []
+    assert len(AcceptBody(subset=["o"] * _MAX_BATCH).subset) == _MAX_BATCH
+    with pytest.raises(ValidationError):
+        AcceptBody(subset=["o"] * (_MAX_BATCH + 1))
+
+
 def test_500_hides_internals_in_prod(engine, monkeypatch):
     monkeypatch.setenv("APP_ENV", "prod")
     from app.core.config import get_settings

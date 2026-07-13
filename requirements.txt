@@ -1,0 +1,28 @@
+# Generated from pyproject.toml's [project.dependencies] — keep in sync manually.
+# For local development, `pip install -e ".[dev]"` (pyproject.toml) is still the
+# canonical install path; this file exists for tooling that specifically wants
+# requirements.txt (e.g. a Docker build step or a platform that doesn't read
+# pyproject.toml).
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sse-starlette>=2.1
+celery[redis]>=5.4
+redis>=5.0
+gevent>=24.2
+sqlalchemy>=2.0
+pyodbc>=5.1
+alembic>=1.13
+pydantic>=2.7
+pydantic-settings>=2.3
+pyjwt[crypto]>=2.8
+litellm>=1.40
+pymongo>=4.7
+structlog>=24.1
+sentence-transformers>=3.0
+
+# Optional extras (pyproject.toml's [project.optional-dependencies]) — install
+# with `pip install -e ".[dev]"` / ".[local]"` / ".[prod]"`, not via this file:
+#   dev:   pytest>=8.2, httpx>=0.27, ruff>=0.15, mypy>=1.11
+#   local: sentence-transformers>=3.0   (local embedding/reranker provider)
+#   prod:  gunicorn>=22.0               (production process manager for the API)

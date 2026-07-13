@@ -89,15 +89,18 @@ def _reranker(path: str):
 def embed(texts: Sequence[str]) -> list[list[float]]:
     """ turns a batch of text into vectors, using the local model.
 
-    Encode already-prefixed texts on a worker thread (keeps the gevent hub alive)."""
+    Encode already-prefixed texts on a worker thread (keeps the gevent hub alive).
+    The (cached, usually-instant) model lookup runs inside `_run` too, not before
+    it — a cache-miss disk load is exactly the non-yielding work `_offload` exists
+    to protect the hub from, so it must never run on the calling greenlet either."""
     texts = list(texts)
     if not texts:  # ponytail: empty batch → no model load, no threadpool hop, []-in-[]-out
         return []
-    model = _embedder(get_settings().embedding_model)
 
     def _run():
-        """The actual torch forward pass, closed over `model`/`texts` so `_offload` can
-        run it as a zero-arg callable on the native threadpool."""
+        """The actual model lookup + torch forward pass, closed over `texts` so
+        `_offload` can run it as a zero-arg callable on the native threadpool."""
+        model = _embedder(get_settings().embedding_model)
         vectors = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
         return [v.tolist() for v in vectors]
 
@@ -113,16 +116,47 @@ def rerank(query: str, docs: Sequence[str]) -> list[float]:
     (do NOT sigmoid again). Re-calibrate the 60/75 bands per §8.4 if the model changes."""
     if not docs:  # ponytail: no candidates → no model load, aligns with []-in-[]-out
         return []
-    model = _reranker(get_settings().reranker_model)
     pairs = [(query, d) for d in docs]
 
     def _run():
-        """The actual torch forward pass, closed over `model`/`pairs` so `_offload` can
-        run it as a zero-arg callable on the native threadpool."""
-        scores = model.predict(pairs)
-        return [max(0.0, min(100.0, 100.0 * float(x))) for x in scores]
+        """The actual model lookup + torch forward pass, closed over `pairs` so
+        `_offload` can run it as a zero-arg callable on the native threadpool."""
+        model = _reranker(get_settings().reranker_model)
+        scores = [float(x) for x in model.predict(pairs)]
+        out_of_range = [x for x in scores if x < -0.05 or x > 1.05]
+        if out_of_range:
+            # RERANKER_MODEL is operator-configurable; this transform assumes a sigmoid-
+            # bounded [0,1] output (bge-reranker's num_labels==1 predict()). A model that
+            # doesn't sigmoid internally would otherwise clamp silently to 0/100 and destroy
+            # relative ranking with no error anywhere downstream — surface it instead.
+            log.warning("local.reranker.score_out_of_expected_range",
+                        model=get_settings().reranker_model, sample=out_of_range[:5])
+        return [max(0.0, min(100.0, 100.0 * x)) for x in scores]
 
     return _offload(_run)
+
+
+def _require_path_exists(setting_name: str, path: str) -> None:
+    """Raise if a configured local-model path (EMBEDDING_MODEL / RERANKER_MODEL) doesn't exist on disk."""
+    if not os.path.exists(path):
+        raise RuntimeError(f"{setting_name} path not found: {path}")
+
+
+def _check_embedding_prefix_style(model_path: str, prefix_style: str) -> None:
+    """e5 prefix scheme is unambiguous: reject EMBEDDING_PREFIX_STYLE=auto when the
+    model name can't be used to infer it, so query:/passage: prefixes aren't silently dropped."""
+    if prefix_style == "auto" and "e5" not in model_path.lower():
+        raise RuntimeError(
+            f"EMBEDDING_PREFIX_STYLE=auto cannot infer the prefix scheme from '{model_path}'. "
+            "Set EMBEDDING_PREFIX_STYLE explicitly to 'e5' or 'none' so prefixes aren't silently dropped.")
+
+
+def _require_sentence_transformers_installed() -> None:
+    """The package must be installed before we load models (warm-only load-time check)."""
+    if importlib.util.find_spec("sentence_transformers") is None:
+        raise RuntimeError(
+            "EMBEDDING/RERANKER_PROVIDER=local but 'sentence-transformers' is not installed. "
+            'Build the image with `--build-arg EXTRAS=prod,local` (or `pip install -e ".[local]"`).')
 
 
 def validate_local_models(settings: Settings | None = None, *, warm: bool) -> None:
@@ -140,22 +174,14 @@ def validate_local_models(settings: Settings | None = None, *, warm: bool) -> No
 
     # Config-level checks (always): paths exist, e5 prefix scheme is unambiguous.
     if s.embedding_provider == "local":
-        if not os.path.exists(s.embedding_model):
-            raise RuntimeError(f"EMBEDDING_MODEL path not found: {s.embedding_model}")
-        if s.embedding_prefix_style == "auto" and "e5" not in s.embedding_model.lower():
-            raise RuntimeError(
-                f"EMBEDDING_PREFIX_STYLE=auto cannot infer the prefix scheme from '{s.embedding_model}'. "
-                "Set EMBEDDING_PREFIX_STYLE explicitly to 'e5' or 'none' so prefixes aren't silently dropped.")
+        _require_path_exists("EMBEDDING_MODEL", s.embedding_model)
+        _check_embedding_prefix_style(s.embedding_model, s.embedding_prefix_style)
     if s.reranker_provider == "local":
-        if not os.path.exists(s.reranker_model):
-            raise RuntimeError(f"RERANKER_MODEL path not found: {s.reranker_model}")
+        _require_path_exists("RERANKER_MODEL", s.reranker_model)
 
     # Load-time checks (warm only): the package must be installed before we load models.
     if warm and local_used:
-        if importlib.util.find_spec("sentence_transformers") is None:
-            raise RuntimeError(
-                "EMBEDDING/RERANKER_PROVIDER=local but 'sentence-transformers' is not installed. "
-                'Build the image with `--build-arg EXTRAS=prod,local` (or `pip install -e ".[local]"`).')
+        _require_sentence_transformers_installed()
         if s.embedding_provider == "local":
             dim = _embedder(s.embedding_model).get_sentence_embedding_dimension()
             if dim != s.embedding_dimensions:

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -26,6 +26,7 @@ from app.db import models as m
 from app.pipeline import embeddings
 from app.pipeline.llm import LLMClient
 
+# Gives each grounding band a rank so two statuses can be compared (see pick_worse_of_two).
 _BAND_ORDER = {GroundingStatus.grounded: 2, GroundingStatus.confirm: 1, GroundingStatus.flagged: 0}
 
 
@@ -79,15 +80,15 @@ def find_category(sess: Session, proposed: str) -> int | None:
     if not p:
         return None
     row = sess.execute(
-        select(m.Threat_Category.c.ThreatCategoryID)
+        select(m.Threat_Category.ThreatCategoryID)
         .where(
-            m.Threat_Category.c.IsActive == True,
+            m.Threat_Category.IsActive == True,
             or_(
-                func.lower(m.Threat_Category.c.ThreatCategoryName) == p,
-                func.lower(m.Threat_Category.c.ThreatCategoryCode) == p,
+                func.lower(m.Threat_Category.ThreatCategoryName) == p,
+                func.lower(m.Threat_Category.ThreatCategoryCode) == p,
             ),
         )
-        .order_by(m.Threat_Category.c.ThreatCategoryID)
+        .order_by(m.Threat_Category.ThreatCategoryID)
     ).first()
     return row[0] if row else None
 
@@ -98,12 +99,21 @@ def get_possible_types(sess: Session, category_id: int | None, sector_ids: list[
     how_specific_is_this_sector so a later scoring tie breaks toward the more
     specific row.
     """
-    q = select(m.Threat_Type).where(
-        m.Threat_Type.c.IsActive == True,
-        visible_to_this_sector(m.Threat_Type.c.SectorID, sector_ids),
+    q = select(
+        m.Threat_Type.ThreatTypeID,
+        m.Threat_Type.ThreatTypeName,
+        m.Threat_Type.SectorID,
+    ).where(
+        m.Threat_Type.IsActive == True,
+        m.Threat_Type.IsDeleted == False,
+        visible_to_this_sector(m.Threat_Type.SectorID, sector_ids),
     )
     if category_id is not None:  # else fall back to searching all categories ([R6])
-        q = q.where(m.Threat_Type.c.PrimaryThreatCategoryID == category_id)
+        q = q.where(m.Threat_Type.PrimaryThreatCategoryID == category_id)
+    # ORDER BY makes the underlying row order deterministic (same reason find_category
+    # above orders by ThreatCategoryID) so the stable sort below breaks same-specificity
+    # ties the same way every time, instead of following SQL Server's arbitrary scan order.
+    q = q.order_by(m.Threat_Type.ThreatTypeID)
     rows = [dict(r) for r in sess.execute(q).mappings()]
     rows.sort(key=lambda r: how_specific_is_this_sector(r["SectorID"], sector_ids), reverse=True)
     return rows
@@ -111,15 +121,19 @@ def get_possible_types(sess: Session, category_id: int | None, sector_ids: list[
 
 def get_possible_names(sess: Session, type_id: int, sector_ids: list[int]) -> list[dict[str, Any]]:
     """Candidate Threat_Catalogue rows under the already-matched type ONLY
-    ([R6]) — keeps the name match consistent with the type match instead of
+    keeps the name match consistent with the type match instead of
     searching the whole library, where an unrelated type's entry could win on
     text similarity alone.
     """
-    q = select(m.Threat_Catalogue).where(
-        m.Threat_Catalogue.c.IsActive == True,
-        m.Threat_Catalogue.c.ThreatTypeID == type_id,
-        visible_to_this_sector(m.Threat_Catalogue.c.SectorID, sector_ids),
-    )
+    q = select(
+        m.Threat_Catalogue.ThreatCatalogueID,
+        m.Threat_Catalogue.ThreatName,
+        m.Threat_Catalogue.SectorID,
+    ).where(
+        m.Threat_Catalogue.IsActive == True,
+        m.Threat_Catalogue.ThreatTypeID == type_id,
+        visible_to_this_sector(m.Threat_Catalogue.SectorID, sector_ids),
+    ).order_by(m.Threat_Catalogue.ThreatCatalogueID)  # deterministic tie-break, see get_possible_types
     rows = [dict(r) for r in sess.execute(q).mappings()]
     rows.sort(key=lambda r: how_specific_is_this_sector(r["SectorID"], sector_ids), reverse=True)
     return rows
@@ -130,42 +144,62 @@ def get_allowed_actor_names(sess: Session, type_id: int) -> set[str]:
     actor the AI invented that doesn't belong to it.
     """
     rows = sess.execute(
-        select(m.Threat_Actor.c.ThreatActorName)
+        select(m.Threat_Actor.ThreatActorName)
         .join(m.ThreatType_ThreatActor_Map,
-              m.ThreatType_ThreatActor_Map.c.ThreatActorID == m.Threat_Actor.c.ThreatActorID)
-        .where(m.ThreatType_ThreatActor_Map.c.ThreatTypeID == type_id,
-               m.Threat_Actor.c.IsActive == True)
+            m.ThreatType_ThreatActor_Map.ThreatActorID == m.Threat_Actor.ThreatActorID)
+        .where(m.ThreatType_ThreatActor_Map.ThreatTypeID == type_id,
+            m.Threat_Actor.IsActive == True)
     )
     return {r[0] for r in rows}
 
 
-def find_closest_match(llm: LLMClient, query: str, rows: list[dict], name_key: str, s: Settings, group: str):
+def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs: dict[str, list[float]],
+                           name_key: str, s: Settings) -> list[dict[str, Any]]:
+    """Cosine-scores every candidate against the query embedding, best match
+    first. The semantic-match floor keeps only candidates above
+    `semantic_match_threshold`, but falls back to the top-K anyway if nothing
+    clears it, so a bad match still reaches label_match_from_score as
+    `flagged` instead of silently returning nothing.
+    """
+    # Score every candidate against the query by cosine similarity, best match first.
+    scored = sorted(((r, how_similar(qv, name_vecs[r[name_key]])) for r in rows), key=lambda rc: rc[1], reverse=True)
+    above = [rc for rc in scored if rc[1] >= s.semantic_match_threshold]
+    # Prefer candidates that clear the similarity floor; if none do, fall back to the
+    # top-K overall so we still return something (to be scored as "flagged" downstream).
+    return [r for r, _ in (above or scored)[: s.grounding_shortlist_k]]
+
+
+def find_closest_match(llm: LLMClient, query: str, rows: list[dict[str, Any]], name_key: str, s: Settings,
+                        group: str, qv: list[float] | None = None) -> tuple[dict[str, Any] | None, float]:
     """Embeds the query and every candidate, ranks by cosine similarity,
     shortlists, then reranks. Called twice by find_threat_in_library — once
     for the type match, once for the name match.
 
+    `qv`: an already-computed embedding for `query`. Pass this when the caller has
+    batched `query`'s embed together with a sibling query text (see
+    find_threat_in_library, which embeds the type+name text in one round trip
+    instead of two) — omit it (default None) for a one-off call, which embeds
+    `query` here exactly as before.
+
     embeddings.get_vectors() caches candidate vectors per (model, group), so
-    the library is embedded once, not on every call. The semantic-match floor
-    keeps only candidates above `semantic_match_threshold`, but falls back to
-    the top-K anyway if nothing clears it, so a bad match still reaches
-    label_match_from_score as `flagged` instead of silently returning nothing.
-    The final sort is stable, so an exact rerank-score tie falls back to the
-    sector-specificity order set by get_possible_types/get_possible_names ([R6]).
+    the library is embedded once, not on every call. The final sort is stable,
+    so an exact rerank-score tie falls back to the sector-specificity order set
+    by get_possible_types/get_possible_names ([R6]).
     """
     if not rows:
         return None, 0.0
     names = [r[name_key] for r in rows]
-    qv = llm.embed([query], kind="query")[0]
+    if qv is None:
+        qv = llm.embed([query], kind="query")[0]
     name_vecs = embeddings.get_vectors(llm, names, model_id=s.embedding_model, group=group, kind="passage")
-    scored = sorted(((r, how_similar(qv, name_vecs[r[name_key]])) for r in rows), key=lambda rc: rc[1], reverse=True)
-    above = [rc for rc in scored if rc[1] >= s.semantic_match_threshold]
-    shortlist = [r for r, _ in (above or scored)[: s.grounding_shortlist_k]]
+    shortlist = _shortlist_candidates(qv, rows, name_vecs, name_key, s)
     if not shortlist:  # e.g. grounding_shortlist_k == 0 → no rerank, no ranked[0] IndexError
         return None, 0.0
     docs = [r[name_key] for r in shortlist]
     rr = llm.rerank(query, docs)
     if len(rr) != len(docs):  # fail loud rather than silently mispair scores to candidates
         raise RuntimeError(f"rerank returned {len(rr)} scores for {len(docs)} docs")
+    # Pair each shortlisted row back up with its rerank score and pick the best.
     ranked = sorted(zip(shortlist, rr), key=lambda rs: rs[1], reverse=True)
     return ranked[0]  # (row, score)
 
@@ -211,21 +245,56 @@ def ensure_text(v: Any, default: str = "") -> str:
     return v if isinstance(v, str) else default
 
 
+def _cached(cache: dict[Any, Any], key: Any, compute: Callable[[], Any]) -> Any:
+    """Cache-on-first-use: `compute()` only runs if `key` hasn't been seen yet
+    this call, then every later hit reuses the stored result — see
+    find_threat_in_library's docstring for why (repeat category/type across
+    proposals in one find_threats() call reuses the earlier DB lookup).
+    """
+    if key not in cache:
+        cache[key] = compute()
+    return cache[key]
+
+
 def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, Any], sector_ids: list[int],
-                            settings: Settings | None = None) -> GroundingResult:
+                            settings: Settings | None = None, cache: dict[Any, Any] | None = None) -> GroundingResult:
     """Matches one AI-proposed threat ({"category", "type", "name", "actors"})
     against the real library. Matches TYPE first; if that's flagged, stops
     immediately — there's no confident ThreatTypeID to scope a name/actor
     search by — and returns actors raw/unvalidated. Otherwise matches NAME
     within that type only ([R6]), filters actors to the type's allowed set,
     and reports the weaker of the type/name confidence.
+
+    `cache`: optional dict, shared by the caller across every proposal in one
+    find_threats() call. sector_ids is fixed for that whole call, so a repeat
+    category/type across proposals (common — the AI only has ~6 STRIDE
+    categories to choose from) can reuse the earlier DB lookup instead of
+    re-querying. Pass None for a one-off call; each key is looked up fresh.
     """
     s = settings or get_settings()
+    cache = {} if cache is None else cache
     actors_in = ensure_actor_list(proposed.get("actors", []))
-    category_id = find_category(sess, ensure_text(proposed.get("category")))
+    category_text = ensure_text(proposed.get("category"))
 
-    types = get_possible_types(sess, category_id, sector_ids)
-    trow, tscore = find_closest_match(llm, ensure_text(proposed.get("type")), types, "ThreatTypeName", s, group="threat_type")
+    ckey = ("category", category_text)
+    category_id = _cached(cache, ckey, lambda: find_category(sess, category_text))
+
+    tkey = ("types", category_id)
+    types = _cached(cache, tkey, lambda: get_possible_types(sess, category_id, sector_ids))
+
+    # Both the type and name query text are known up front, regardless of the type-match
+    # outcome, so embed them together in ONE round trip instead of find_closest_match doing
+    # two separate single-item llm.embed() calls — one per proposal instead of up to two.
+    # Skipped when `types` is empty since find_closest_match would return (None, 0.0)
+    # without embedding anything anyway (see its `if not rows` guard).
+    type_text = ensure_text(proposed.get("type"))
+    name_text = ensure_text(proposed.get("name"))
+    type_qv: list[float] | None = None
+    name_qv: list[float] | None = None
+    if types:
+        type_qv, name_qv = llm.embed([type_text, name_text], kind="query")
+
+    trow, tscore = find_closest_match(llm, type_text, types, "ThreatTypeName", s, group="threat_type", qv=type_qv)
     tstatus = label_match_from_score(tscore, s)
 
     if trow is None or tstatus == GroundingStatus.flagged:
@@ -236,11 +305,14 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
         )
 
     type_id = trow["ThreatTypeID"]
-    cats = get_possible_names(sess, type_id, sector_ids)
-    crow, cscore = find_closest_match(llm, ensure_text(proposed.get("name")), cats, "ThreatName", s, group="threat_catalogue")
+    nkey = ("names", type_id)
+    cats = _cached(cache, nkey, lambda: get_possible_names(sess, type_id, sector_ids))
+    crow, cscore = find_closest_match(llm, name_text, cats, "ThreatName", s, group="threat_catalogue", qv=name_qv)
+    # crow is None when this type has no candidate catalogue names at all (cats was empty).
     cstatus = label_match_from_score(cscore, s) if crow is not None else GroundingStatus.flagged
 
-    allowed = get_allowed_actor_names(sess, type_id)
+    akey = ("actors", type_id)
+    allowed = _cached(cache, akey, lambda: get_allowed_actor_names(sess, type_id))
     actors = [a for a in actors_in if a in allowed]  # drop out-of-set (§8.4 step 5)
 
     return GroundingResult(

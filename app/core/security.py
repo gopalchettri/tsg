@@ -2,10 +2,10 @@
 
 Resource server only: we VALIDATE the platform/SSO JWT (signature + exp/iss/aud)
 and read its claims — we never issue tokens (§10.1). The set of entities the
-caller may act on comes from the JWT `entities[]` claim ([R2]); a missing/empty
+caller may act on comes from the JWT `entities[]` claim; a missing/empty
 set is a hard deny, never allow-all.
 
-Data plane (§10.2/§10.3): prompts are built from an allowlist of named context
+Data plane: prompts are built from an allowlist of named context
 fields, and free text is run through a secret/PII redaction pass before any
 model call — secrets/other entities' data are structurally excluded, not assumed
 absent.
@@ -37,14 +37,27 @@ def validate_jwt(token: str, settings: Settings | None = None) -> dict[str, Any]
     settings = settings or get_settings()
     if not token:
         raise AuthError("missing bearer token")
+    if not settings.jwt_issuer:
+        # PyJWT's issuer check no-ops entirely when issuer=None (it won't even require
+        # an 'iss' claim to be present, let alone match) -- unlike audience, which still
+        # rejects a token whose 'aud' claim is present when audience=None. Fail closed
+        # instead of silently accepting a token meant for some other issuer/app.
+        raise AuthError("TSG_JWT_ISSUER is not configured; refusing to skip issuer verification")
+    if not settings.jwt_audience:
+        # Same asymmetry as issuer above, other direction: audience=None only rejects a
+        # token that HAPPENS to carry an 'aud' claim -- one minted for a different
+        # first-party app that omits 'aud' would sail through unscoped. Fail closed.
+        raise AuthError("TSG_JWT_AUDIENCE is not configured; refusing to skip audience verification")
     try:
+        # Find the public key (by "kid" in the token header) from the issuer's published key
+        # set, then verify the token's signature and required claims against it.
         key = _jwks_client(settings.jwt_jwks_url).get_signing_key_from_jwt(token)
         return jwt.decode(
             token,
             key.key,
             algorithms=list(settings.jwt_algorithms),
             audience=settings.jwt_audience or None,
-            issuer=settings.jwt_issuer or None,
+            issuer=settings.jwt_issuer,
             options={"require": ["exp"]},
         )
     except jwt.PyJWTError as exc:
@@ -52,12 +65,14 @@ def validate_jwt(token: str, settings: Settings | None = None) -> dict[str, Any]
 
 
 def allowed_entities(claims: dict[str, Any], settings: Settings | None = None) -> set[str]:
-    """[R2] The `group.id` set the caller may act on, read from the JWT claim.
+    """The `group.id` set the caller may act on, read from the JWT claim.
 
     Empty/missing → empty set → every object-level check must then deny.
     """
     settings = settings or get_settings()
     raw = claims.get(settings.jwt_entities_claim) or []
+    # The claim may come in as a single value instead of a list; wrap it so the
+    # rest of this function can treat it uniformly as a collection.
     if isinstance(raw, (str, int)):
         raw = [raw]
     return {str(e) for e in raw}
@@ -70,7 +85,17 @@ _SECRET_PATTERNS = [
     # pattern can fragment its base64 body ([\s\S] spans newlines; non-greedy stops at the first END).
     re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+PRIVATE KEY-----"),
     re.compile(r"[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),  # JWT-like
-    re.compile(r"(?i)\b(?:api[_-]?key|key|secret|password|passwd|token)\b\s*[:=]\s*\S+"),
+    # name=value / name: free-text creds. `key`/`api_key` keep a strict word boundary
+    # (so e.g. `primary_key`/`cache_key` aren't swept up); secret/password/passwd/token
+    # additionally tolerate a snake_case/kebab-case prefix (db_password, access_token,
+    # client_secret, api_secret) since '_'/'-' are \w chars and never form a \b on their
+    # own. `=value` still stops at the next token (machine-generated values never have
+    # embedded spaces); `: value` runs to end of line, since colon-labelled values are
+    # free text that CAN contain spaces (e.g. a human-chosen passphrase).
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|key|(?:\w+[_-])?(?:secret|password|passwd|token))\b"
+        r"\s*(?:=\s*\S+|:\s*.+)"
+    ),
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),        # AWS access key id (near-zero false positives)
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),                 # long hex (keys/hashes)
     re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),         # email (PII)
@@ -114,16 +139,3 @@ def allowlist_context(fields: dict[str, Any], allowed: set[str]) -> dict[str, An
             out[name] = _redact_value(val)
     return out
 
-
-if __name__ == "__main__":  # tiny self-check (no framework)
-    assert redact("key=abcdef1234567890 contact a@b.com") == "[REDACTED] contact [REDACTED]"
-    assert redact("cred AKIAIOSFODNN7EXAMPLE end") == "cred [REDACTED] end"  # AWS access key id
-    assert redact("-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----") == "[REDACTED]"
-    assert redact(None) is None  # optional free-text field passes through unchanged
-    assert allowlist_context({"name": "CAD", "secret": "x", "url": None}, {"name", "url"}) == {"name": "CAD"}
-    assert allowlist_context(  # nested structures are redacted too, not just top-level strings
-        {"name": "CAD", "interfaces": [{"note": "password=hunter2secret"}]}, {"name", "interfaces"},
-    ) == {"name": "CAD", "interfaces": [{"note": "[REDACTED]"}]}
-    assert allowed_entities({"entities": [5, 8]}) == {"5", "8"}
-    assert allowed_entities({}) == set()
-    print("security self-check ok")
