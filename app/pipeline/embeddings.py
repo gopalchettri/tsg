@@ -18,14 +18,33 @@ from __future__ import annotations
 
 import hashlib
 import time
+import uuid
+from contextlib import contextmanager
 from functools import lru_cache
-from typing import Sequence
+from typing import Any, Sequence
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.pipeline.llm import LLMClient
+from app.db import models as m
+from app.pipeline.llm import LLMClient, LLMSlotUnavailable, _slot_redis
 
 log = get_logger(__name__)
+
+# group name -> (table, name column) — the single source of truth for "which table/column
+# each embedding group means". Both the admin API (app/api/admin.py) and the CLI script
+# (scripts/refresh_embeddings.py) call the functions below rather than re-deriving this
+# mapping, so they can never drift into embedding different things under the same group name.
+_GROUPS = {
+    "threat_type": (m.Threat_Type, m.Threat_Type.ThreatTypeName),
+    "threat_catalogue": (m.Threat_Catalogue, m.Threat_Catalogue.ThreatName),
+}
+
+
+class EmbeddingBusy(Exception):
+    """Another admin call is already recreating/deleting this group's cache -> 409."""
 
 # L1 cache: one small dict per (model_id, group, kind), mapping text -> its vector.
 _L1: dict[tuple[str, str, str], dict[str, list[float]]] = {}
@@ -79,8 +98,7 @@ def _store_if_healthy():
         col = _vector_store()
     except Exception:  # noqa: BLE001 — Mongo down → open the breaker, compute + L1
         _breaker_open_until = now + _BREAKER_COOLDOWN_S
-        log.warning("embedding store (mongo) unreachable; backing off %.0fs",
-                    _BREAKER_COOLDOWN_S, exc_info=True)
+        log.warning("embeddings.mongo_breaker_open", cooldown_seconds=_BREAKER_COOLDOWN_S, exc_info=True)
         return None
     _breaker_open_until = 0.0
     return col
@@ -217,8 +235,19 @@ def get_vectors(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: s
 
 def clear_cache(group: str | None = None) -> None:
     """ wipes the fast in-worker cache (not the shared
-    database) — for when the cached vectors might be stale. Not currently
-    called by any code path; a future master-edit feature would call this.
+    database) — for when the cached vectors might be stale.
+
+    [REVIEW-FIX] this docstring previously claimed "not currently called by any code
+    path" — false: `delete_cached` below already calls this on every group
+    recreate/delete. What's actually true: no in-app write path ever UPDATEs an
+    existing master's embedded text (`upsert_threat_type`/`upsert_threat_catalogue`
+    in dal.py are strictly insert-if-absent — a natural-key collision resolves to the
+    existing row's id and never rewrites its name column), so the cache can't go stale
+    from anything this app itself does. The only staleness scenario is an out-of-band
+    DB edit outside this codebase, which is exactly what the admin
+    `/v1/tsg/threat-library/embeddings/{recreate,delete}` routes (and
+    `scripts/refresh_embeddings.py --recreate`) exist to remediate manually — both
+    already route through `delete_cached` -> this function.
 
     Clear L1 (Mongo persists by design; delete Mongo docs explicitly if a master's text changes)."""
     if group is None:
@@ -228,3 +257,134 @@ def clear_cache(group: str | None = None) -> None:
         # drops entries belonging to the requested group and leaves the rest alone.
         for key in [k for k in _L1 if k[1] == group]:
             _L1.pop(key, None)
+
+
+def delete_cached(group: str, names: list[str] | None = None) -> int:
+    """ forces a full re-embed of one group (e.g. "threat_type",
+    "threat_catalogue"), or just specific named items within it, by wiping BOTH tiers —
+    L1 (via clear_cache) and, unlike clear_cache alone, the persisted Mongo docs too. Use
+    this for a genuine "recreate"/"delete" (a master's text changed under the same model,
+    or a vector needs regenerating) — a plain model/version bump needs no deletion at all,
+    since get_vectors' cache key already includes model_id and simply misses on its own.
+
+    `names`, when given, scopes the delete to just those texts (the Mongo docs already store
+    `text` — see _stage_for_write) instead of the whole group; L1 has no per-text filter, so
+    it's still cleared for the whole group (a few extra recomputes on next use, not a
+    correctness issue).
+
+    Returns the number of Mongo docs deleted (0 if Mongo is unreachable — best-effort,
+    same degrade-safe posture as every other Mongo access in this file)."""
+    clear_cache(group)
+    col = _store_if_healthy()
+    if col is None:
+        return 0
+    query: dict[str, Any] = {"group": group}
+    if names is not None:
+        query["text"] = {"$in": names}
+    return col.delete_many(query).deleted_count
+
+
+def _active_names(sess: Session, table, name_col) -> list[str]:
+    """Active (IsActive, not IsDeleted) names for one embedding group's table — the DB-side
+    counterpart to _GROUPS above. Shared by update_group/recreate_group so the CLI script and
+    the admin API resolve "every real item in this group" identically."""
+    return list(sess.execute(
+        select(name_col).where(table.IsActive == True, table.IsDeleted == False)  # noqa: E712
+    ).scalars().all())
+
+
+@contextmanager
+def _group_lock(group: str):
+    """Serializes recreate_group/delete_group per group via a short-lived Redis lock (reuses
+    the same dedicated client Part A's LLM-slot limiter uses). Without this, two concurrent
+    admin calls for the SAME group would both wipe then both re-embed (redundant paid LLM
+    calls), and any NORMAL grounding lookup mid-recreate could find the cache empty and be
+    forced to eagerly embed on what should have been a hit. A second concurrent call for the
+    same group raises EmbeddingBusy (409) instead of racing.
+
+    Fails OPEN if Redis itself is unreachable (same posture as the LLM-slot limiter): this
+    guards against redundant cost/a stampede, not correctness, so availability wins.
+    """
+    key = f"tsg:embed-lock:{group}"
+    token = str(uuid.uuid4())
+    try:
+        r = _slot_redis()
+        acquired = r.set(key, token, nx=True, ex=30)
+    except Exception:  # noqa: BLE001 — Redis down → fail open, don't block an admin action on it
+        log.warning("embeddings.group_lock_redis_unavailable_fail_open", group=group, exc_info=True)
+        yield
+        return
+    if not acquired:
+        raise EmbeddingBusy(f"group {group!r} is already being recreated/deleted")
+    try:
+        yield
+    finally:
+        try:
+            if r.get(key) == token:  # only release OUR OWN lock, never one a retry-after-TTL-expiry took
+                r.delete(key)
+        except Exception:  # noqa: BLE001 — best-effort release; the TTL is the backstop
+            pass
+
+
+def _for_each_group(group: str | None, fn) -> dict[str, int | str]:
+    """Shared fan-out for the group=None ("all groups") case every admin action supports:
+    resolves it to every real group, calls fn(group) for each, and isolates a per-group
+    failure so one group's error doesn't take down the other's result — the failing group's
+    slot holds an error string instead of a count."""
+    groups = sorted(_GROUPS) if group is None else [group]
+    results: dict[str, int | str] = {}
+    for g in groups:
+        try:
+            results[g] = fn(g)
+        except EmbeddingBusy:
+            # A real conflict app/api/celery_app.py's admin task must let propagate (surfaces as
+            # a FAILURE state on GET .../status/{job_id}, see app/api/admin.py) — not swallow
+            # into a results-dict string, unlike a generic per-group failure below.
+            raise
+        except LLMSlotUnavailable:
+            # A CONFIRMED, transient "no free LLM call slot" — Celery's autoretry_for on
+            # admin_embedding_action_task (celery_app.py) retries the whole action shortly.
+            # Swallowing this into "error: ..." would misreport a self-healing capacity squeeze
+            # as a permanent per-group failure, the exact bug tasks.py/cascade.py's own
+            # re-raise-before-generic-handler already exists to prevent elsewhere.
+            raise
+        except Exception as exc:  # noqa: BLE001 — one group's failure must not sink the others
+            log.warning("embeddings.group_action_failed", group=g, exc_info=True)
+            results[g] = f"error: {exc}"
+    return results
+
+
+def create_items(sess: Session, llm: LLMClient, group: str, names: list[str]) -> int:
+    """Fingerprint specific NEW item(s) by name — for right after a threat is added, without
+    rescanning the whole group. Already-cached names are skipped by get_vectors itself."""
+    if names:
+        get_vectors(llm, names, model_id=get_settings().embedding_model, group=group, kind="passage")
+    return len(names)
+
+
+def update_group(sess: Session, llm: LLMClient, group: str) -> int:
+    """Whole-group sync: embed whatever's missing across every active row. Rows already
+    cached (same model + text) are skipped by get_vectors itself — cheap, always safe."""
+    table, name_col = _GROUPS[group]
+    names = _active_names(sess, table, name_col)
+    if names:
+        get_vectors(llm, names, model_id=get_settings().embedding_model, group=group, kind="passage")
+    return len(names)
+
+
+def recreate_group(sess: Session, llm: LLMClient, group: str, names: list[str] | None = None) -> int:
+    """Force a full re-embed — deletes cached vectors first (scoped to `names` if given, else
+    the whole group), then re-embeds. Serialized per group (see _group_lock)."""
+    with _group_lock(group):
+        table, name_col = _GROUPS[group]
+        target_names = names if names is not None else _active_names(sess, table, name_col)
+        delete_cached(group, names=names)
+        if target_names:
+            get_vectors(llm, target_names, model_id=get_settings().embedding_model, group=group, kind="passage")
+        return len(target_names)
+
+
+def delete_group(group: str, names: list[str] | None = None) -> int:
+    """Wipe cached vectors only — no re-embed. Serialized per group (see _group_lock)."""
+    with _group_lock(group):
+        return delete_cached(group, names=names)

@@ -1,5 +1,6 @@
 ﻿"""Milestone-1 acceptance tests (subset of the remediation matrix that runs on
-SQLite). Integration/load tests needing real MSSQL run in CI against TSG.
+SQLite). Integration/load tests needing real MSSQL are currently verified manually
+against dev TSG, not in CI (no CI is configured in this repo yet).
 """
 from __future__ import annotations
 
@@ -139,12 +140,51 @@ def test_scoping_selection_cutoff():
     """§5.4 step 3: cutoff comes from config values, not constants — threshold and top-N."""
     threats = [{"threat_id": "a", "grounding_status": "grounded"},
                {"threat_id": "b", "grounding_status": "flagged"}]
-    out = {s.threat_id: s for s in scoping.score_threats(threats, score_threshold=60.0)}
-    assert out["a"].selected is True and out["b"].selected is False  # 70 vs 50
+    out = {s.threat_id: s for s in scoping.score_threats(threats, score_threshold=70.0)}
+    assert out["a"].selected is True and out["b"].selected is False  # 70 vs 65
     assert "below score threshold" in out["b"].reason
     out2 = scoping.score_threats(threats, top_n=1)
     assert [s.selected for s in out2] == [True, False]
     assert "beyond top-1 cutoff" in out2[1].reason
+
+
+def test_scoping_default_cutoff_does_not_silently_drop_flagged_threats():
+    """The real production defaults (Settings.scoping_score_threshold=55.0,
+    scoping_top_n=10 — no longer None/None) are what tasks.py::write_scenarios actually
+    passes to score_threats. Pairing a non-None threshold with the old flagged=0.0
+    confidence weight would have scored flagged threats at exactly BASE_SCORE (50) —
+    below the new 55 floor — silently excluding every novel/uncatalogued threat outright,
+    worse than the original low-rank bug. flagged=15.0 (scoping.py) keeps them at 65,
+    clear of the floor."""
+    from app.core.config import get_settings
+
+    s = get_settings()
+    assert (s.scoping_score_threshold, s.scoping_top_n) == (55.0, 10)
+    threats = [{"threat_id": "g", "grounding_status": "grounded"},
+               {"threat_id": "c", "grounding_status": "confirm"},
+               {"threat_id": "f", "grounding_status": "flagged"}]
+    out = {sc.threat_id: sc for sc in scoping.score_threats(
+        threats, score_threshold=s.scoping_score_threshold, top_n=s.scoping_top_n)}
+    assert out["g"].selected and out["c"].selected and out["f"].selected  # 70 / 60 / 65 — all clear 55
+
+
+def test_scoping_negative_rule_weight_can_still_exclude_below_the_default_floor():
+    """[REVIEW-FIX] the one documented way a threat still gets excluded below the default
+    55.0 floor with grounding-only scores all clearing it (config.py's own comment on
+    scoping_score_threshold): a relevance rule with a negative Metadata weight. _rule_weight
+    does no sign validation, so this is a real, reachable path against the production
+    default, not just the grounding-status case test_scoping_default_cutoff_... above covers."""
+    from app.core.config import get_settings
+
+    s = get_settings()
+    threats = [{"threat_id": "f", "grounding_status": "flagged", "threat_type_id": 10}]
+    rules = [{"RuleType": "relevance_flag", "ThreatTypeID": 10, "RuleKey": "past_incidents",
+              "RuleValue": None, "Metadata": '{"weight": -20}'}]
+    (sc,) = scoping.score_threats(threats, subsystem={"past_incidents": "None"}, rules=rules,
+                                score_threshold=s.scoping_score_threshold, top_n=s.scoping_top_n)
+    assert sc.score == 45.0  # 50 base + 15 flagged - 20 rule
+    assert sc.selected is False
+    assert "below score threshold" in sc.reason
 
 
 def test_rule_value_and_metadata_semantics_hardened():
@@ -327,7 +367,7 @@ def test_grounding_excludes_unrelated_sector(db, stub_llm):
     db.execute(insert(m.onboarding_sectors).values(id=50, name="Parent Sector", parent_id=None))
     db.execute(insert(m.onboarding_sectors).values(id=51, name="Sub Sector", parent_id=50))
     db.execute(insert(m.Threat_Type).values(
-        ThreatTypeID=200, ThreatTypeName="Firmware Tampering", PrimaryThreatCategoryID=2,
+        ThreatTypeID=200, ThreatTypeName="Firmware Tampering", ThreatCategoryID=2,
         SectorID=999, IsActive=True, IsDeleted=False))
     db.execute(insert(m.Threat_Catalogue).values(
         ThreatCatalogueID=200, ThreatTypeID=200, ThreatName="Bootloader implant",
@@ -346,10 +386,10 @@ def test_grounding_prefers_subsector_over_parent_on_tie(db, stub_llm):
     db.execute(insert(m.onboarding_sectors).values(id=50, name="Parent Sector", parent_id=None))
     db.execute(insert(m.onboarding_sectors).values(id=51, name="Sub Sector", parent_id=50))
     db.execute(insert(m.Threat_Type).values(
-        ThreatTypeID=201, ThreatTypeName="Scoped Tampering", PrimaryThreatCategoryID=2,
+        ThreatTypeID=201, ThreatTypeName="Scoped Tampering", ThreatCategoryID=2,
         SectorID=50, IsActive=True, IsDeleted=False))
     db.execute(insert(m.Threat_Type).values(
-        ThreatTypeID=202, ThreatTypeName="Scoped Tampering", PrimaryThreatCategoryID=2,
+        ThreatTypeID=202, ThreatTypeName="Scoped Tampering", ThreatCategoryID=2,
         SectorID=51, IsActive=True, IsDeleted=False))
 
     types = grounding.get_possible_types(db, category_id=2, sector_ids=[51, 50])
@@ -388,6 +428,28 @@ def test_grounding_zero_type_candidates_flags_not_crashes(db, stub_llm):
     assert gr.status == GroundingStatus.flagged
     assert gr.type_id is None and gr.catalogue_id is None
     assert gr.actors == ["Hacker"] and gr.actors_validated is False
+
+
+def test_get_possible_types_widened_by_catalogue_category_map(db):
+    # [A2] Type 10 "Firmware Tampering" defaults to ThreatCategoryID=2 (Tampering, seeded in
+    # conftest), but its own Catalogue 20 "Bootloader implant" ALSO legitimately carries
+    # Repudiation per the real Excel data's many-to-many pattern (74/75 threats span >1
+    # category) — recorded via Threat_Catalogue_Category_Map, not Type 10's single default.
+    db.execute(insert(m.Threat_Category).values(
+        ThreatCategoryID=3, ThreatCategoryName="Repudiation", ThreatCategoryCode="REP",
+        IsActive=True, IsDeleted=False))
+    db.execute(insert(m.Threat_Catalogue_Category_Map).values(ThreatCatalogueID=20, ThreatCategoryID=3))
+
+    # Type 10 must now surface as a Repudiation candidate (via the map), even though its
+    # own default is Tampering — Type 11 (no map row under category 3) must NOT.
+    ids = {r["ThreatTypeID"] for r in grounding.get_possible_types(db, category_id=3, sector_ids=[])}
+    assert 10 in ids
+    assert 11 not in ids
+
+    # Tampering search (Type 10's own default) must still work unchanged — the widening
+    # is additive, never a narrowing of the pre-existing default-match behavior.
+    ids = {r["ThreatTypeID"] for r in grounding.get_possible_types(db, category_id=2, sector_ids=[])}
+    assert {10, 11} <= ids
 
 
 # --- [R6] sector_ids threaded end-to-end: session's `sector` param → grounding.find_threat_in_library ---
@@ -438,6 +500,148 @@ def test_threats_prompt_redacts_secret_in_asset_context():
     assert "[REDACTED]" in serialized
 
 
+def test_threats_prompt_uses_live_categories_and_actors_when_provided():
+    # The whole point of the categories/actor_examples parameters: a caller with real DB
+    # data must see THAT data in the prompt, not the hardcoded fallback.
+    msgs = prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, SUB, MAX_THREATS,
+                                categories=["OnlyCategoryFromDB"],
+                                actor_examples=["OnlyActorFromDB"])
+    system = msgs[0]["content"]
+    assert "OnlyCategoryFromDB" in system
+    assert "OnlyActorFromDB" in system
+    assert "Spoofing" not in system  # fallback category must NOT leak through when real data is given
+    assert "Cybercriminal" not in system  # fallback actor must NOT leak through when real data is given
+
+
+def test_threats_prompt_falls_back_when_categories_and_actors_not_provided():
+    # Callers with no DB session handy (most existing tests) or a not-yet-seeded database
+    # must still get a working prompt — the fallback constants, not an empty/broken one.
+    msgs = prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, SUB, MAX_THREATS)
+    system = msgs[0]["content"]
+    assert "Spoofing" in system
+    assert "Cybercriminal" in system
+
+
+def test_threats_prompt_honors_curator_toggled_active_fields():
+    # A curator turning "location" off in Context_Field_Config must actually remove it from
+    # what reaches the model, while a field they left on stays.
+    payload = prompts.threats_prompt(
+        "CAD", DEFAULT_ASSET_CONTEXT, SUB, MAX_THREATS,
+        asset_active_fields=["critical_service"])[1]["content"]
+    assert '"critical_service"' in payload
+    assert '"cii_asset_description"' not in payload  # on the ceiling, but not in the curator's active list
+
+
+def test_threats_prompt_cannot_be_widened_beyond_the_hardcoded_ceiling():
+    # The whole point of the ceiling: a Context_Field_Config row naming something outside
+    # prompts.py's own hardcoded set must never reach the model, no matter what the database says.
+    payload = prompts.threats_prompt(
+        "CAD", {**DEFAULT_ASSET_CONTEXT, "not_a_real_field": "should never appear"}, SUB, MAX_THREATS,
+        asset_active_fields=["critical_service", "not_a_real_field"])[1]["content"]
+    assert "should never appear" not in payload
+
+
+def test_threats_prompt_fails_closed_when_active_fields_are_entirely_a_typo():
+    # [REVIEW-FIX] a non-empty active-fields list that shares NOTHING with the hardcoded ceiling
+    # (e.g. every row is a typo/renamed field) must narrow to sending NOTHING for that group —
+    # falling back to the full ceiling here would be a fail-OPEN response to a misconfiguration.
+    payload = prompts.threats_prompt(
+        "CAD", DEFAULT_ASSET_CONTEXT, SUB, MAX_THREATS,
+        asset_active_fields=["critical_srevice"])[1]["content"]  # typo, matches nothing on the ceiling
+    for field in ("cii_asset_description", "critical_service", "sector", "sub_sector", "data_handled"):
+        assert f'"{field}"' not in payload
+
+
+def test_threats_prompt_falls_back_to_ceiling_when_active_fields_empty():
+    # An unseeded Context_Field_Config table (or every row for this group switched off) must
+    # still produce a working prompt with the full hardcoded set, not an empty one.
+    payload = prompts.threats_prompt(
+        "CAD", DEFAULT_ASSET_CONTEXT, SUB, MAX_THREATS, asset_active_fields=[])[1]["content"]
+    assert '"critical_service"' in payload
+    assert '"cii_asset_description"' in payload
+
+
+def test_active_category_and_actor_names_read_live_and_filter_inactive(db):
+    # dal functions backing the dynamic prompt: only active, non-deleted rows, in a
+    # deterministic order.
+    db.execute(insert(m.Threat_Category).values(
+        ThreatCategoryID=3, ThreatCategoryName="Repudiation", IsActive=True, IsDeleted=False))
+    db.execute(insert(m.Threat_Category).values(
+        ThreatCategoryID=4, ThreatCategoryName="Retired Category", IsActive=False, IsDeleted=False))
+    names = dal.active_category_names(db)
+    assert "Repudiation" in names
+    assert "Retired Category" not in names
+
+    db.execute(insert(m.Threat_Actor).values(
+        ThreatActorName="Test Live Actor", IsCapable=1, IsActive=True, IsDeleted=False))
+    db.execute(insert(m.Threat_Actor).values(
+        ThreatActorName="Deleted Actor", IsCapable=1, IsActive=True, IsDeleted=True))
+    actor_names = dal.active_actor_names(db)
+    assert "Test Live Actor" in actor_names
+    assert "Deleted Actor" not in actor_names
+
+
+def test_active_context_fields_read_live_filter_inactive_and_scope_by_group(db):
+    db.execute(insert(m.Context_Field_Config).values(
+        ContextGroup="asset", FieldName="critical_service", IsActive=True, IsDeleted=False))
+    db.execute(insert(m.Context_Field_Config).values(
+        ContextGroup="asset", FieldName="location", IsActive=False, IsDeleted=False))
+    db.execute(insert(m.Context_Field_Config).values(
+        ContextGroup="subsystem", FieldName="vendor_name", IsActive=True, IsDeleted=False))
+    db.execute(insert(m.Context_Field_Config).values(
+        ContextGroup="asset", FieldName="deleted_but_active", IsActive=True, IsDeleted=True))
+
+    asset_fields = dal.active_context_fields(db, "asset")
+    assert "critical_service" in asset_fields
+    assert "location" not in asset_fields  # inactive
+    assert "deleted_but_active" not in asset_fields  # soft-deleted
+    assert "vendor_name" not in asset_fields  # wrong group
+
+    sub_fields = dal.active_context_fields(db, "subsystem")
+    assert sub_fields == ["vendor_name"]
+
+
+def test_assert_capacity_available_per_entity_cap_isolates_other_entities(db, monkeypatch):
+    # [REVIEW-FIX] one entity hitting its own per-entity cap must not affect a DIFFERENT
+    # entity's ability to create sessions — that isolation is the whole point of the fix.
+    from app.core.config import get_settings
+    from app.db.dal import CapacityExceeded
+
+    s = get_settings()
+    monkeypatch.setattr(s, "max_active_sessions_per_entity", 1)
+    _seed_session(db, asset_id=301, entity="entity-a")
+
+    with pytest.raises(CapacityExceeded):
+        dal.assert_capacity_available(db, entity_id="entity-a")  # entity-a already at its cap of 1
+
+    dal.assert_capacity_available(db, entity_id="entity-b")  # different entity — untouched by entity-a's cap
+
+
+def test_assert_capacity_available_per_entity_cap_disabled_by_default(db):
+    # default max_active_sessions_per_entity=0 — only the global ceiling applies.
+    _seed_session(db, asset_id=302, entity="entity-c")
+    dal.assert_capacity_available(db, entity_id="entity-c")  # no per-entity cap configured — must not raise
+
+
+def test_active_context_fields_by_group_fetches_both_groups_in_one_round_trip(db):
+    db.execute(insert(m.Context_Field_Config).values(
+        ContextGroup="asset", FieldName="critical_service", IsActive=True, IsDeleted=False))
+    db.execute(insert(m.Context_Field_Config).values(
+        ContextGroup="asset", FieldName="location", IsActive=False, IsDeleted=False))
+    db.execute(insert(m.Context_Field_Config).values(
+        ContextGroup="subsystem", FieldName="vendor_name", IsActive=True, IsDeleted=False))
+    db.execute(insert(m.Context_Field_Config).values(
+        ContextGroup="Asset", FieldName="typo_group", IsActive=True, IsDeleted=False))  # wrong-case group
+
+    result = dal.active_context_fields_by_group(db)
+    assert result["asset"] == ["critical_service"]
+    assert result["subsystem"] == ["vendor_name"]
+
+
+def test_active_context_fields_by_group_empty_when_table_unseeded(db):
+    assert dal.active_context_fields_by_group(db) == {"asset": [], "subsystem": []}
+
+
 def test_scenario_prompt_redacts_secret_in_raw_threat_name():
     # threat_name/threat_type can carry the AI's raw, unvalidated Stage-1 proposal
     # for a flagged/no-match threat.
@@ -452,7 +656,7 @@ class _TwoThreatLLM(StubLLM):
     catalogue 20 and type 11/catalogue 21) so per-threat prompt-threading tests
     have >1 threat to distinguish between."""
 
-    def chat(self, messages, *, model=None):
+    def chat(self, messages, *, model=None, temperature=None):
         sysc = messages[0]["content"].lower()
         if "stride threats" in sysc:
             from app.pipeline.llm import Provenance
@@ -471,7 +675,7 @@ class _FlaggedThreatLLM(StubLLM):
     """Proposes a single threat that matches NONE of the seeded masters, so
     grounding routes it `flagged` — exercises the raw-proposal fallback branch."""
 
-    def chat(self, messages, *, model=None):
+    def chat(self, messages, *, model=None, temperature=None):
         sysc = messages[0]["content"].lower()
         if "stride threats" in sysc:
             from app.pipeline.llm import Provenance
@@ -507,9 +711,9 @@ def test_scenario_prompt_threaded_with_grounded_threat_names(db, monkeypatch):
     captured = []
     real_scenario_prompt = prompts.scenario_prompt
 
-    def _spy(asset_name, asset_context, sub, threat_type, threat_name, actors=None):
+    def _spy(asset_name, asset_context, sub, threat_type, threat_name, actors=None, **kw):
         captured.append((threat_type, threat_name, tuple(actors or [])))
-        return real_scenario_prompt(asset_name, asset_context, sub, threat_type, threat_name, actors=actors)
+        return real_scenario_prompt(asset_name, asset_context, sub, threat_type, threat_name, actors=actors, **kw)
 
     monkeypatch.setattr("app.pipeline.prompts.scenario_prompt", _spy)
     session = _seed_session(db)
@@ -533,9 +737,9 @@ def test_scenario_prompt_falls_back_to_raw_name_when_flagged(db, monkeypatch):
     captured = []
     real_scenario_prompt = prompts.scenario_prompt
 
-    def _spy(asset_name, asset_context, sub, threat_type, threat_name, actors=None):
+    def _spy(asset_name, asset_context, sub, threat_type, threat_name, actors=None, **kw):
         captured.append((threat_type, threat_name))
-        return real_scenario_prompt(asset_name, asset_context, sub, threat_type, threat_name, actors=actors)
+        return real_scenario_prompt(asset_name, asset_context, sub, threat_type, threat_name, actors=actors, **kw)
 
     monkeypatch.setattr("app.pipeline.prompts.scenario_prompt", _spy)
     session = _seed_session(db)
@@ -569,11 +773,11 @@ def test_duplicate_master_natural_key_rejected_at_db(db):
     # SQLite harness can't verify — same category as the MSSQL-only boot checks
     # already gated behind `if engine.dialect.name == "mssql"` in invariants.py.
     db.execute(insert(m.Threat_Type).values(
-        ThreatTypeID=90, ThreatTypeName="Sector Threat", PrimaryThreatCategoryID=2,
+        ThreatTypeID=90, ThreatTypeName="Sector Threat", ThreatCategoryID=2,
         SectorID=7, IsActive=True, IsDeleted=False))
     with pytest.raises(IntegrityError):
         db.execute(insert(m.Threat_Type).values(
-            ThreatTypeID=91, ThreatTypeName="Sector Threat", PrimaryThreatCategoryID=2,
+            ThreatTypeID=91, ThreatTypeName="Sector Threat", ThreatCategoryID=2,
             SectorID=7, IsActive=True, IsDeleted=False))
     db.rollback()
 
@@ -606,19 +810,27 @@ def test_gather_asset_details_surfaces_asset_level_type(db):
 
 
 def test_gather_asset_details_surfaces_new_metadata_fields(db):
-    # ctm_scan_entity/onboarding_supporting_systems columns that exist but weren't
-    # previously read: asset-level operating_system/location/RTO/RPO, subsystem-level
-    # technology_used/vendor_name/database_platforms. None are FK ints (checked against
-    # app/db/models.py column types), so no id->name resolution is needed for any of them.
+    # ctm_scan_entity columns: asset-level operating_system/location/RTO/RPO (plain
+    # scalars, no id->name resolution needed). onboarding_supporting_systems.
+    # technology_used/database_platforms are JSON-array-of-option_value-codes
+    # (e.g. "[6]"), resolved via option/option_value the same way asset_type is —
+    # see _MULTISELECT_OPTION_CODES in context.py. vendor_name is a plain scalar.
     from app.pipeline.context import gather_asset_details
+
+    db.execute(insert(m.option).values(id=40, code="technology-used", option="Technology Used"))
+    db.execute(insert(m.option).values(id=41, code="database-platforms", option="Database Platforms"))
+    db.execute(insert(m.option_value).values(id=400, option_id=40, value=6, name="Kubernetes"))
+    db.execute(insert(m.option_value).values(id=401, option_id=40, value=7, name="Kafka"))
+    db.execute(insert(m.option_value).values(id=402, option_id=41, value=9, name="PostgreSQL"))
 
     db.execute(insert(m.ctm_scan_entity).values(
         id=350, name="Telemetry Hub", type="app", criticality=1, tier1_critical_service_id=500,
         operating_system="Linux", location="Regional DC 2",
         target_rto_hours=4, target_rpo_hours=1))
+    db.execute(insert(m.ctm_scan_entity_bu).values(id=350, ctm_scan_entity_id=350, group_id=5, service_id=500))
     db.execute(insert(m.onboarding_supporting_systems).values(
         id=1050, name="Telemetry System",
-        technology_used="Kafka, Kubernetes", vendor_name="Acme Corp", database_platforms="PostgreSQL"))
+        technology_used="[6,7]", vendor_name="Acme Corp", database_platforms="[9]"))
     db.execute(insert(m.ctm_scan_entity_supporting_system).values(
         ctm_scan_entity_id=350, onboarding_supporting_system_id=1050))
     db.commit()
@@ -630,9 +842,82 @@ def test_gather_asset_details_surfaces_new_metadata_fields(db):
     assert ctx["asset_context"]["target_rto_hours"] == 4
     assert ctx["asset_context"]["target_rpo_hours"] == 1
     sub = ctx["subsystems"][0]
-    assert sub["technology_used"] == "Kafka, Kubernetes"
+    assert sub["technology_used"] == ["Kubernetes", "Kafka"]
     assert sub["vendor_name"] == "Acme Corp"
-    assert sub["database_platforms"] == "PostgreSQL"
+    assert sub["database_platforms"] == ["PostgreSQL"]
+
+
+def test_gather_asset_details_surfaces_every_linked_critical_service(db):
+    # An asset can legitimately link to more than one service via ctm_scan_entity_bu
+    # (confirmed live: asset 1 has 2 rows) — critical_service must surface all of them,
+    # not silently pick one via an arbitrary tie-break.
+    from app.pipeline.context import gather_asset_details
+
+    db.execute(insert(m.onboarding_services).values(id=501, name="Manufacturing Service"))
+    db.execute(insert(m.ctm_scan_entity).values(
+        id=370, name="Multi-BU Asset", type="app", criticality=1))
+    db.execute(insert(m.ctm_scan_entity_bu).values(id=370, ctm_scan_entity_id=370, group_id=5, service_id=500))
+    db.execute(insert(m.ctm_scan_entity_bu).values(id=371, ctm_scan_entity_id=370, group_id=7, service_id=501))
+    db.execute(insert(m.onboarding_supporting_systems).values(id=1070, name="Shared System"))
+    db.execute(insert(m.ctm_scan_entity_supporting_system).values(
+        ctm_scan_entity_id=370, onboarding_supporting_system_id=1070))
+    db.commit()
+
+    ctx = gather_asset_details(db, asset_id=370, entity_id="5", sector_id=None, user_id=None,
+                            supporting_system_ids=[1070])
+    assert ctx["asset_context"]["critical_service"] == ["Design Service", "Manufacturing Service"]
+
+
+def test_gather_asset_details_resolves_supporting_system_dr_and_backup_fields(db):
+    # New columns added to _load_supporting_systems: single-value option_value codes
+    # (accessability_channel/hosting_location/network_connectivity_primary_dr/dr_drill_frequency,
+    # resolved via _SINGLESELECT_OPTION_CODES) plus DR/backup scalars. last_dr_test_date and
+    # rto_target_mins/rpo_target_mins are datetime/Decimal on the real table — must come back
+    # JSON-safe (str/float), since subsystems_json below is a straight json.dumps() of this list.
+    from datetime import datetime
+
+    from app.pipeline.context import gather_asset_details
+
+    db.execute(insert(m.option).values(id=50, code="acc-channel", option="Accessibility Channel"))
+    db.execute(insert(m.option).values(id=51, code="hosting-location", option="Hosting Environment"))
+    db.execute(insert(m.option).values(id=52, code="network-connectivity", option="Network Connectivity"))
+    db.execute(insert(m.option).values(id=53, code="dr-drill", option="DR Drill Frequency"))
+    db.execute(insert(m.option_value).values(id=500, option_id=50, value=2, name="Internal Network"))
+    db.execute(insert(m.option_value).values(id=501, option_id=51, value=7, name="Entity Data Centre"))
+    db.execute(insert(m.option_value).values(id=502, option_id=52, value=3, name="Dedicated Link"))
+    db.execute(insert(m.option_value).values(id=503, option_id=53, value=1, name="Quarterly"))
+
+    db.execute(insert(m.ctm_scan_entity).values(
+        id=360, name="Payments Gateway", type="app", criticality=1, tier1_critical_service_id=500))
+    db.execute(insert(m.ctm_scan_entity_bu).values(id=360, ctm_scan_entity_id=360, group_id=5, service_id=500))
+    db.execute(insert(m.onboarding_supporting_systems).values(
+        id=1060, name="Payments DR Node",
+        accessability_channel=2, hosting_location=7, network_connectivity_primary_dr=3, dr_drill_frequency=1,
+        user_base_count=5000, maintenance_contract_exists=True, dr_location="Regional DC 2",
+        last_dr_test_date=datetime(2026, 3, 1, 12, 0, 0),
+        backup_multi_site=True, backup_tested=True, offsite_air_gapped_backup=False,
+        data_residency_restrictions=True, document_drp_exists=True, saas_backup_required=False,
+        rto_target_mins=30, rpo_target_mins=15, data_loss_incident_last_3_years=False))
+    db.execute(insert(m.ctm_scan_entity_supporting_system).values(
+        ctm_scan_entity_id=360, onboarding_supporting_system_id=1060))
+    db.commit()
+
+    ctx = gather_asset_details(db, asset_id=360, entity_id="5", sector_id=None, user_id=None,
+                            supporting_system_ids=[1060])
+    sub = ctx["subsystems"][0]
+    assert sub["accessability_channel"] == "Internal Network"
+    assert sub["hosting_location"] == "Entity Data Centre"
+    assert sub["network_connectivity_primary_dr"] == "Dedicated Link"
+    assert sub["dr_drill_frequency"] == "Quarterly"
+    assert sub["user_base_count"] == 5000
+    assert sub["maintenance_contract_exists"] is True
+    assert sub["last_dr_test_date"] == "2026-03-01T12:00:00"
+    assert sub["rto_target_mins"] == 30.0
+    assert sub["rpo_target_mins"] == 15.0
+    assert sub["data_loss_incident_last_3_years"] is False
+    # must not raise — last_dr_test_date/rto/rpo above are the values json.dumps() would choke on
+    # if they'd been left as datetime/Decimal instead of converted in _build_subsystems.
+    json.loads(ctx["subsystems_json"])
 
 
 def test_gather_asset_details_rejects_asset_with_no_supporting_systems(db):
@@ -640,9 +925,10 @@ def test_gather_asset_details_rejects_asset_with_no_supporting_systems(db):
     # fails fast (SubsystemsJSON "must be populated") instead of spawning a doomed one.
     from app.pipeline.context import NotFoundError, gather_asset_details
 
-    # asset 300 is owned (service 500 → entity 5, like asset 100) but has NO supporting-system row.
+    # asset 300 is owned (ctm_scan_entity_bu → entity 5, like asset 100) but has NO supporting-system row.
     db.execute(insert(m.ctm_scan_entity).values(
         id=300, name="Orphan", type="app", criticality=1, tier1_critical_service_id=500))
+    db.execute(insert(m.ctm_scan_entity_bu).values(id=300, ctm_scan_entity_id=300, group_id=5, service_id=500))
     with pytest.raises(NotFoundError, match="no supporting systems"):
         gather_asset_details(db, asset_id=300, entity_id="5", sector_id=None, user_id=None, supporting_system_ids=[])
 
@@ -734,6 +1020,15 @@ def test_happy_path_and_conflict_and_smoke(engine, monkeypatch):
 
     results = client.get(f"/v1/sessions/{sid}/results").json()
     assert len(results["scenarios"]) == 1
+    # [REVIEW-FIX] moderation is off by default — the field must still round-trip through the
+    # whole stack (DB → ScenarioResult → JSON) as None, not silently absent from the response.
+    assert results["scenarios"][0]["moderation_flagged"] is None
+    assert results["scenarios"][0]["moderation_categories"] == []
+    # [REVIEW-FIX] validate_scenario's own report must round-trip the same way — StubLLM's canned
+    # risk_statement ("R") never references the seeded asset ("CAD"), so this must surface as a
+    # warning through the API, not silently vanish the way it did before ScenarioResult carried it.
+    assert results["scenarios"][0]["validation_status"] == "warning"
+    assert "risk_statement does not reference the asset (CAD)" in results["scenarios"][0]["validation_errors"]
 
     accepted = client.post(f"/v1/sessions/{sid}/accept", json={})
     assert accepted.status_code == 200 and accepted.json()["status"] == "completed"
@@ -743,6 +1038,40 @@ def test_happy_path_and_conflict_and_smoke(engine, monkeypatch):
     assert r200.status_code == 202
     dup = client.post("/v1/sessions", json=session_body(200))
     assert dup.status_code == 409 and dup.json()["details"]["active_session_id"]
+
+
+def test_moderation_summary_defensive_parsing():
+    # [REVIEW-FIX] _moderation_summary must never let a malformed/missing ValidationJSON blob
+    # (or a moderation sub-object with an unexpected shape) turn into a 500 for a reviewer
+    # asking about an unrelated field.
+    from app.api.sessions import _moderation_summary
+
+    assert _moderation_summary(None) == (None, [])
+    assert _moderation_summary("") == (None, [])
+    assert _moderation_summary("not json") == (None, [])
+    assert _moderation_summary(json.dumps({"other_field": 1})) == (None, [])  # no "moderation" key at all
+    assert _moderation_summary(json.dumps({"moderation": "not a dict"})) == (None, [])
+    assert _moderation_summary(json.dumps({"moderation": {"checked": False}})) == (None, [])  # never checked
+    assert _moderation_summary(json.dumps(
+        {"moderation": {"checked": True, "flagged": False, "categories": []}})) == (False, [])
+    assert _moderation_summary(json.dumps(
+        {"moderation": {"checked": True, "flagged": True, "categories": ["violence"]}})) == (True, ["violence"])
+
+
+def test_validation_summary_defensive_parsing():
+    # [REVIEW-FIX] _validation_summary must never let a malformed/missing ValidationJSON blob
+    # turn into a 500 for a reviewer asking about an unrelated field — same contract as
+    # _moderation_summary above, mirrored for validate_scenario's own report.
+    from app.api.sessions import _validation_summary
+
+    assert _validation_summary(None) == (None, [])
+    assert _validation_summary("") == (None, [])
+    assert _validation_summary("not json") == (None, [])
+    assert _validation_summary(json.dumps([1, 2])) == (None, [])  # wrong top-level type
+    assert _validation_summary(json.dumps({"other_field": 1})) == (None, [])  # no validation_status key at all
+    assert _validation_summary(json.dumps({"validation_status": "ok", "errors": []})) == ("ok", [])
+    assert _validation_summary(json.dumps(
+        {"validation_status": "warning", "errors": ["missing risk_statement"]})) == ("warning", ["missing risk_statement"])
 
 
 # --- cancelling a session that reached REVIEW must be reflected consistently on the
@@ -820,7 +1149,7 @@ def test_accept_rejected_off_review(db):
 
 # --- a stage exception is captured as ERROR + audit, and blocks REVIEW ([R8]) ---
 class _BoomLLM(StubLLM):
-    def chat(self, messages, *, model=None):
+    def chat(self, messages, *, model=None, temperature=None):
         if "stride threats" in messages[0]["content"].lower():
             raise RuntimeError("boom")
         return super().chat(messages, model=model)
@@ -874,7 +1203,7 @@ class _BoomSecondThreatsLLM(StubLLM):
     def __init__(self):
         self.threats = 0
 
-    def chat(self, messages, *, model=None):
+    def chat(self, messages, *, model=None, temperature=None):
         if "stride threats" in messages[0]["content"].lower():
             self.threats += 1
             if self.threats == 2:
@@ -1031,10 +1360,10 @@ def _seed_scenario_chain(sess, sid, ssid, threat_id):
     scenario'), so R10 tests must give their flagged threats a real scenario chain."""
     scoped_id, out_id = str(uuid.uuid4()), str(uuid.uuid4())
     sess.execute(insert(m.Scoped_Threat).values(
-        ScopedThreatID=scoped_id, SessionID=sid, TenantID="default", SubsystemID=ssid,
+        ScopedThreatID=scoped_id, SessionID=sid, TenantID="default", EntityID="5", UserID="u1", SubsystemID=ssid,
         ThreatID=threat_id, Score=50, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=now()))
     sess.execute(insert(m.Threat_Scenario_Output).values(
-        OutputID=out_id, SessionID=sid, TenantID="default", SubsystemID=ssid,
+        OutputID=out_id, SessionID=sid, TenantID="default", EntityID="5", UserID="u1", SubsystemID=ssid,
         ScopedThreatID=scoped_id, Status=ScenarioStatus.complete, ScenarioJSON="{}",
         Accepted=0, Superseded=0, IdentityHash=f"h-{out_id[:12]}", GenerationEpoch=1, CreatedAt=now()))
     return out_id
@@ -1058,11 +1387,19 @@ def test_accept_promotes_flagged_threat_and_actor(db):
 
     new_type = db.execute(select(m.Threat_Type.__table__).where(m.Threat_Type.ThreatTypeName == "Brand New Threat Type")).mappings().first()
     assert new_type is not None
-    assert new_type["PrimaryThreatCategoryID"] == 2  # resolved via grounding.find_category
+    assert new_type["ThreatCategoryID"] == 2  # resolved via grounding.find_category
+    assert new_type["Source"] == "ai_auto_promoted"
     new_cat = db.execute(select(m.Threat_Catalogue.__table__).where(
         m.Threat_Catalogue.ThreatName == "Brand New Catalogue Entry",
         m.Threat_Catalogue.ThreatTypeID == new_type["ThreatTypeID"])).mappings().first()
     assert new_cat is not None
+    assert new_cat["Source"] == "ai_auto_promoted"
+    # [A2]/production-grade fix: promotion also links the new catalogue entry into
+    # Threat_Catalogue_Category_Map, not just its Type's single rough default.
+    link = db.execute(select(m.Threat_Catalogue_Category_Map.__table__).where(
+        m.Threat_Catalogue_Category_Map.ThreatCatalogueID == new_cat["ThreatCatalogueID"],
+        m.Threat_Catalogue_Category_Map.ThreatCategoryID == 2)).first()
+    assert link is not None
 
     # [R6] §8.4 step 5: this threat's actors carry validated=False (flagged type) — raw
     # unvalidated LLM actor names must NEVER silently enter the shared master library.
@@ -1106,6 +1443,13 @@ def test_accept_promotes_only_missing_catalogue_when_type_already_grounded(db):
     new_cat = db.execute(select(m.Threat_Catalogue.__table__).where(
         m.Threat_Catalogue.ThreatName == "Never-seen variant", m.Threat_Catalogue.ThreatTypeID == 10)).mappings().first()
     assert new_cat is not None
+    assert new_cat["Source"] == "ai_auto_promoted"
+    # Type 10 was REUSED (not created here) — the category still gets resolved and linked
+    # for this new catalogue entry, not left to rely solely on the reused Type's default.
+    link = db.execute(select(m.Threat_Catalogue_Category_Map.__table__).where(
+        m.Threat_Catalogue_Category_Map.ThreatCatalogueID == new_cat["ThreatCatalogueID"],
+        m.Threat_Catalogue_Category_Map.ThreatCategoryID == 2)).first()
+    assert link is not None
     threat = db.execute(select(m.Identified_Threat.__table__).where(
         m.Identified_Threat.SessionID == sid, m.Identified_Threat.ThreatName == "Never-seen variant")).mappings().first()
     assert threat["ThreatTypeID"] == 10
@@ -1220,6 +1564,50 @@ def test_accept_empty_subset_accepts_no_scenarios(db):
         m.Scenario_Audit.SessionID == sid,
         m.Scenario_Audit.EventType == AuditEventType.review_decision)).scalar()
     assert json.loads(detail) == {"subset": []}  # recorded as a partial accept carrying the empty subset
+
+
+# --- [REVIEW-FIX] an unknown OutputID in `subset` previously no-op'd silently; the session
+# still completed with nothing actually accepted and no error surfaced to the caller.
+def test_accept_subset_with_unknown_output_id_is_rejected(db):
+    session = _seed_session(db)
+    sid = session["SessionID"]
+    _review_ready(db, sid, SUB["id"])
+    t = _seed_flagged_threat(db, sid, SUB["id"], "Tampering", "Some Type", "Some Entry", [])
+    out = _seed_scenario_chain(db, sid, SUB["id"], t)
+    decide_session_outcome(db, session)
+    with pytest.raises(dal.NotFoundError, match="did not match"):
+        # `out` is real; the second id is well-formed but belongs to no row — a mismatch
+        # (1 matched, 2 requested) must fail the whole accept, not silently accept just the
+        # real one. A malformed id (not a valid GUID) is a 422 at the schema layer already,
+        # not this code path — this test targets the "syntactically valid, doesn't exist" gap.
+        accept_session(db, sid, "5", "u1", subset=[out, dal.guid()])
+
+    # Rejected outright, not partially applied: the real scenario stays unaccepted and the
+    # session stays at REVIEW, ready to retry with a corrected subset.
+    accepted = db.execute(select(m.Threat_Scenario_Output.Accepted).where(
+        m.Threat_Scenario_Output.OutputID == out)).scalar()
+    assert accepted == 0
+    refreshed = dal.get_session(db, sid, "5")
+    assert refreshed["CurrentStage"] == WorkflowStage.REVIEW
+    assert refreshed["StageStatus"] == StageStatus.AWAITING_DECISION
+
+
+# --- [REVIEW-FIX] a duplicate id in `subset` must not be double-counted against the matched
+# rowcount — AcceptBody.subset (unlike its sibling RegenerateScenariosBody.output_ids) allows
+# duplicates, and a repeated id can only ever match its one row once.
+def test_accept_subset_with_duplicate_output_id_is_not_falsely_rejected(db):
+    session = _seed_session(db)
+    sid = session["SessionID"]
+    _review_ready(db, sid, SUB["id"])
+    t = _seed_flagged_threat(db, sid, SUB["id"], "Tampering", "Some Type", "Some Entry", [])
+    out = _seed_scenario_chain(db, sid, SUB["id"], t)
+    decide_session_outcome(db, session)
+    accept_session(db, sid, "5", "u1", subset=[out, out])  # same real id twice — must not raise
+    db.commit()
+
+    accepted = db.execute(select(m.Threat_Scenario_Output.Accepted).where(
+        m.Threat_Scenario_Output.OutputID == out)).scalar()
+    assert accepted == 1
 
 
 # --- [R10] a flagged row's stored catalogue id is a below-threshold match; the accepted
@@ -1382,7 +1770,7 @@ class _MalformedJSONLLM(StubLLM):
     def __init__(self, stage_marker: str):
         self.stage_marker = stage_marker  # substring of the targeted system prompt
 
-    def chat(self, messages, *, model=None):
+    def chat(self, messages, *, model=None, temperature=None):
         from app.pipeline.llm import Provenance
 
         sysc = messages[0]["content"].lower()
@@ -1465,6 +1853,16 @@ def test_unset_new_metadata_fields_dropped_from_prompt():
         assert f'"{key}"' not in payload
 
 
+def test_dr_backup_fields_reach_the_prompt_when_set():
+    # Companion to the test above: proves the 21 fields newly added to _SUB_ALLOWED (DR/backup
+    # posture, data-residency, usage scale) actually reach the prompt once a subsystem sets
+    # them, not just that they stay absent when unset — no existing test checked presence.
+    sub = {**SUB, "backup_tested": True, "data_residency_restrictions": True, "rto_target_mins": 30.0}
+    payload = prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, sub, MAX_THREATS)[1]["content"]
+    for key in ("backup_tested", "data_residency_restrictions", "rto_target_mins"):
+        assert f'"{key}"' in payload
+
+
 # --- §10.3 recursive redaction: nested list/dict values are scrubbed ---
 def test_allowlist_context_redacts_nested_structures():
     from app.core.security import allowlist_context
@@ -1473,6 +1871,17 @@ def test_allowlist_context_redacts_nested_structures():
         {"name": "CAD", "interfaces": [{"endpoint": "api", "note": "key=abcdef1234567890"}]},
         {"name", "interfaces"})
     assert out == {"name": "CAD", "interfaces": [{"endpoint": "api", "note": "[REDACTED]"}]}
+
+
+def test_allowlist_context_drops_empty_not_just_none():
+    # a field with no real value (empty string/list/dict) must never reach the model, same as
+    # a genuinely missing (None) one — but a real 0/False value is data, not "empty", and stays.
+    from app.core.security import allowlist_context
+
+    out = allowlist_context(
+        {"a": None, "b": "", "c": [], "d": {}, "e": 0, "f": False, "g": "real value", "h": ["x"]},
+        {"a", "b", "c", "d", "e", "f", "g", "h"})
+    assert out == {"e": 0, "f": False, "g": "real value", "h": ["x"]}
 
 
 # --- prompt content regressions: STRIDE enumeration (§8.4) + data-not-instructions framing (§10.2) ---
@@ -1506,7 +1915,7 @@ class _SelfDisclosingLLM(StubLLM):
     """Returns scenario JSON that includes the assumptions/excluded_details fields
     the v1.2 prompts request — proves end-to-end pass-through wiring."""
 
-    def chat(self, messages, *, model=None):
+    def chat(self, messages, *, model=None, temperature=None):
         from app.pipeline.llm import Provenance
 
         sysc = messages[0]["content"].lower()
@@ -1591,10 +2000,17 @@ def test_downstream_returns_only_accepted(engine, monkeypatch):
 
 def test_downstream_scoped_to_entity(engine):
     """[R2] the downstream route 403s when the claimed entity isn't in the caller's
-    authorized set (require_entity) — asset ownership is no longer independently
-    checked, so this is the one remaining access-control gate on this route."""
+    authorized set (require_entity)."""
     # claimed entity not in the caller's authorized set → require_entity reject
     assert make_client({"999"}).get("/v1/assets/100/accepted-scenarios?entity=5").status_code == 403
+
+
+def test_downstream_rejects_asset_not_owned_by_claimed_entity(engine):
+    """[R2] a caller authorized for their OWN entity can't read another entity's asset by
+    claiming their own entity alongside someone else's asset_id — require_entity alone
+    only checks the claimed entity is theirs; assert_asset_owned_by_entity (dal.py) checks
+    asset 100 actually belongs to that entity (fixture: service 500 -> entity 5)."""
+    assert make_client({"999"}).get("/v1/assets/100/accepted-scenarios?entity=999").status_code == 403
 
 
 def test_downstream_empty_when_no_completed_session(engine):

@@ -12,9 +12,12 @@ weights to `Score`. RuleKey→field resolution goes through the fixed
 absent context field means the rule has NO effect and is logged (§5.4 step 1:
 never silently false). Every rule that fires is recorded in `Scored.factors` →
 `Scoped_Threat.FactorsJSON` (provenance, §11). The selection cutoff (score
-threshold / top-N) comes from config (§5.4 step 3), not constants — both default
-off. Same inputs → same ranking (acceptance: test_scoping_deterministic,
-test_tech_gate_excludes).
+threshold / top-N) comes from config (§5.4 step 3), not constants — both now
+default ON (55.0 / 10, `Settings.scoping_score_threshold`/`scoping_top_n`); set
+either to None there to go back to no cutoff. Same inputs → same ranking
+(acceptance: test_scoping_deterministic, test_tech_gate_excludes) — this
+governs ranking a FIXED list of already-identified threats, not whether the
+LLM proposes the same threats twice (see TSG_SDD.md §9.1b for that).
 """
 from __future__ import annotations
 
@@ -28,7 +31,12 @@ from app.core.logging import get_logger
 log = get_logger(__name__)
 
 BASE_SCORE = 50.0
-_CONFIDENCE_WEIGHT = {GroundingStatus.grounded: 20.0, GroundingStatus.confirm: 10.0, GroundingStatus.flagged: 0.0}
+# flagged (novel/unmatched-to-library) threats are NOT nothing — they're the ones a curator
+# hasn't catalogued yet. flagged=0.0 previously left them at exactly BASE_SCORE (50), which the
+# scoping_score_threshold cutoff (55.0, below) would silently exclude outright. 15.0 keeps them
+# ranked below a real library match (grounded=70, confirm=60) but past that threshold (65), so
+# they still surface for a curator to review rather than vanishing before anyone sees them.
+_CONFIDENCE_WEIGHT = {GroundingStatus.grounded: 20.0, GroundingStatus.confirm: 10.0, GroundingStatus.flagged: 15.0}
 _DEFAULT_RULE_WEIGHT = 10.0  # relevance_* delta when the rule's Metadata carries no {"weight": N}
 
 # step 1 — the fixed RuleKey → context-field allowlist. Each entry maps a

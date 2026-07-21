@@ -91,9 +91,10 @@ class CapacityExceeded(Exception):
 
 
 class RegenerateConflict(Exception):
-    """Regenerate rejected: not at REVIEW, target lock held, or a concurrent
-    regen/accept won the race → 409. Distinct from AcceptConflict — a different
-    action, so it needs its own error_code."""
+    """Regenerate rejected: not at REVIEW, target lock held, a concurrent regen/accept won the
+    race, or (tasks.py::write_scenarios) every requested target no longer clears the scoping
+    cutoff on rescoring → 409. Distinct from AcceptConflict — a different action, so it needs
+    its own error_code."""
 
 
 class CancelConflict(Exception):
@@ -108,6 +109,41 @@ class EntityForbidden(Exception):
 
 class NotFoundError(Exception):
     """Requested entity does not exist → 404."""
+
+
+# ---------------------------------------------------------------------------
+# Object-level authz — asset ownership
+# ---------------------------------------------------------------------------
+def asset_owning_entities(sess: Session, asset_id: Any) -> set[str]:
+    """The group/entity id(s) that actually own `asset_id` (a `ctm_scan_entity` row), read
+    straight off `ctm_scan_entity_bu.group_id` — the direct asset->entity link per the CII
+    Onboarding DDD. An asset can have more than one `ctm_scan_entity_bu` row (confirmed live:
+    asset 1 currently has 2), hence the set return, not a single value.
+
+    `ctm_scan_entity.tier1_critical_service_id` (and the `onboarding_service_entity` service
+    ->entity mapping it used to be joined through) is NOT this path — that field is confirmed
+    unpopulated on every current asset. It's only still read by context.py to label the
+    grounding context's `critical_service`, which is unrelated to ownership.
+
+    Returns an empty set if the asset doesn't exist or has no `ctm_scan_entity_bu` row —
+    callers must treat that as "no proven owner" (deny), never as "open to everyone".
+    """
+    rows = sess.execute(
+        select(m.ctm_scan_entity_bu.group_id)
+        .where(m.ctm_scan_entity_bu.ctm_scan_entity_id == asset_id)
+    ).scalars().all()
+    return {str(g) for g in rows}
+
+
+def assert_asset_owned_by_entity(sess: Session, asset_id: Any, entity_id: Any) -> None:
+    """Deny unless `asset_id` is actually owned by `entity_id`. `require_entity()`
+    on its own only proves the caller may act AS entity_id — it says nothing about
+    whether this particular asset belongs to that entity. Without this check, any
+    caller authorized for their own entity could submit someone else's asset_id
+    (a plain IDOR) and pull that asset's context, threats, or accepted scenarios.
+    """
+    if str(entity_id) not in asset_owning_entities(sess, asset_id):
+        raise EntityForbidden(f"asset {asset_id} not owned by entity {entity_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -261,10 +297,29 @@ def count_active_sessions(sess: Session) -> int:
     ).scalar() or 0
 
 
-def assert_capacity_available(sess: Session) -> None:
+def count_active_sessions_for_entity(sess: Session, entity_id: str) -> int:
+    """Same racy-by-design soft count as count_active_sessions above, scoped to one entity —
+    backs the per-entity cap in assert_capacity_available so one entity looping session
+    creation can't silently exhaust the global ceiling for every other entity in the tenant."""
+    return sess.execute(
+        select(func.count()).select_from(m.Scenario_Session)
+        .where(m.Scenario_Session.SessionStatus == SessionStatus.active,
+            m.Scenario_Session.EntityID == entity_id)
+    ).scalar() or 0
+
+
+def assert_capacity_available(sess: Session, entity_id: str | None = None) -> None:
     """Raise CapacityExceeded if the active-session ceiling is at/over
-    `max_active_sessions`. Checked before the more expensive `gather_asset_details`."""
+    `max_active_sessions`. Checked before the more expensive `gather_asset_details`.
+
+    [REVIEW-FIX] also enforces a per-entity ceiling (`max_active_sessions_per_entity`, 0 =
+    disabled) when `entity_id` is given — without this, any single entity with a valid JWT
+    could create sessions in a loop and starve every other entity in the tenant of the entire
+    global ceiling with no isolation between them."""
     if count_active_sessions(sess) >= get_settings().max_active_sessions:
+        raise CapacityExceeded()
+    per_entity_cap = get_settings().max_active_sessions_per_entity
+    if entity_id and per_entity_cap and count_active_sessions_for_entity(sess, entity_id) >= per_entity_cap:
         raise CapacityExceeded()
 
 
@@ -545,7 +600,7 @@ def subsystem_has_pending_work(sess: Session, session_id: str, subsystem_id: int
 
 
 # ---------------------------------------------------------------------------
-# Regeneration (M2, [R9]) — per-(subsystem, level) generation epoch bump
+# Regeneration (per-(subsystem, level) generation epoch bump
 # ---------------------------------------------------------------------------
 def next_epoch(sess: Session, session_id: str, subsystem_id: int, levels: tuple) -> int:
     """max(GenerationEpoch) scoped to ONLY the levels touched in this regen hop, +1.
@@ -592,12 +647,13 @@ def active_threats(sess: Session, session_id: str, subsystem_id: int) -> list[di
             "threat_type": r["ThreatType"], "threat_name": r["ThreatName"],
             "library_threat_type": r["LibraryThreatType"], "library_threat_name": r["LibraryThreatName"],
             "threat_type_id": r["ThreatTypeID"],  # [R12] scoping rules key on the grounded type
+            "catalogue_id": r["ThreatCatalogueID"],  # keeps _dedup_key/IdentityHash identical to a full run's (find_threats) on regen
         }
         for r in sess.execute(
             select(m.Identified_Threat.ThreatID, m.Identified_Threat.GroundingStatus,
                 m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName,
                 m.Identified_Threat.LibraryThreatType, m.Identified_Threat.LibraryThreatName,
-                m.Identified_Threat.ThreatTypeID).where(
+                m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatCatalogueID).where(
                 m.Identified_Threat.SessionID == session_id,
                 m.Identified_Threat.SubsystemID == subsystem_id,
                 m.Identified_Threat.Superseded == 0,
@@ -619,6 +675,65 @@ def active_threat_rules(sess: Session, threat_type_ids: list[int]) -> list[dict]
             ct.IsActive == True, ct.IsDeleted == False)  # noqa: E712 — SQLAlchemy binary expr
         .order_by(ct.ThreatRuleID)
     ).mappings()]
+
+
+def active_category_names(sess: Session) -> list[str]:
+    """Real STRIDE category names, read live so prompts.threats_prompt never drifts from
+    Threat_Category — the same table grounding.find_category matches against. Empty result
+    means the table isn't seeded yet; the caller falls back to a hardcoded default."""
+    tc = m.Threat_Category
+    return [r[0] for r in sess.execute(
+        select(tc.ThreatCategoryName)
+        .where(tc.IsActive == True, tc.IsDeleted == False)  # noqa: E712
+        .order_by(tc.ThreatCategoryID)
+    )]
+
+
+def active_context_fields_by_group(sess: Session) -> dict[str, list[str]]:
+    """Same live-read contract as active_context_fields below, but fetches BOTH the 'asset' and
+    'subsystem' groups in one round-trip instead of two — every real caller (tasks.py) always
+    needs both together per session, never just one. A group with no active rows comes back as
+    an empty list, same "caller falls back to its hardcoded default" meaning as
+    active_context_fields; a row under any OTHER ContextGroup value (e.g. a curator's typo) is
+    silently excluded here too — same behavior active_context_fields already has when queried
+    with an exact group name, and selfcheck.check_dead_context_fields is what surfaces that kind
+    of drift to an operator, not this function."""
+    cfc = m.Context_Field_Config
+    by_group: dict[str, list[str]] = {"asset": [], "subsystem": []}
+    for group, field in sess.execute(
+        select(cfc.ContextGroup, cfc.FieldName)
+        .where(cfc.IsActive == True, cfc.IsDeleted == False)  # noqa: E712
+    ):
+        if group in by_group:
+            by_group[group].append(field)
+    return by_group
+
+
+def active_context_fields(sess: Session, context_group: str) -> list[str]:
+    """Field names a curator has currently turned ON for the AI prompt (Context_Field_Config).
+    The caller (prompts.py) intersects this with its own hardcoded ceiling before using it —
+    this function returns whatever's active in the DB, unrestricted; it never decides on its own
+    what's safe to send to an external model. Empty result means the table isn't seeded yet, or
+    every row for this group is off; the caller falls back to its hardcoded default either way.
+    Prefer active_context_fields_by_group above when both groups are needed at once (every real
+    caller) — this single-group form exists for direct/test callers that only want one."""
+    cfc = m.Context_Field_Config
+    return [r[0] for r in sess.execute(
+        select(cfc.FieldName)
+        .where(cfc.ContextGroup == context_group, cfc.IsActive == True, cfc.IsDeleted == False)  # noqa: E712
+    )]
+
+
+def active_actor_names(sess: Session) -> list[str]:
+    """Real Threat_Actor names, read live so prompts.threats_prompt never drifts from the
+    table grounding.get_allowed_actor_names matches proposed actors against by exact string.
+    Empty result means the table isn't seeded yet; the caller falls back to a hardcoded default."""
+    ta = m.Threat_Actor
+    return [r[0] for r in sess.execute(
+        select(ta.ThreatActorName)
+        .where(ta.IsActive == True, ta.IsDeleted == False)  # noqa: E712
+        .order_by(ta.ThreatActorName)
+    )]
 
 
 def latest_completed_session(sess: Session, entity_id: str, asset_id: str) -> RowMapping | None:
@@ -659,16 +774,23 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
 
 def mark_scenarios_accepted(
     sess: Session, session_id: str, subsystem_ids: list[int], subset: list[str] | None = None,
-) -> None:
+) -> int:
     """Sets Accepted=1 on every non-superseded scenario for these subsystems (accept, §5.7),
     optionally narrowed to `subset` OutputIDs ([R8] partial accept — `subset=[]` means
-    "accept none", distinct from `subset=None` meaning "accept all")."""
+    "accept none", distinct from `subset=None` meaning "accept all").
+
+    Returns the number of rows actually flipped. A `subset` id that doesn't match any
+    row here (wrong session/subsystem, already superseded, or simply never existed)
+    previously vanished silently — this return value is what lets the caller
+    (`accept.accept_session`) tell "N requested, N matched" apart from "N requested,
+    M<N matched" instead of reporting a clean accept either way."""
     where = [m.Threat_Scenario_Output.SessionID == session_id, m.Threat_Scenario_Output.Superseded == 0,
             m.Threat_Scenario_Output.SubsystemID.in_(subsystem_ids)]
     # Narrow to specific OutputIDs only if the caller passed a subset; None means "accept all".
     if subset is not None:
         where.append(m.Threat_Scenario_Output.OutputID.in_(subset))
-    sess.execute(update(m.Threat_Scenario_Output).where(*where).values(Accepted=1))
+    res = execute_dml(sess, update(m.Threat_Scenario_Output).where(*where).values(Accepted=1))
+    return res.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -759,20 +881,24 @@ def append_audit(sess: Session, **cols: Any) -> None:
 # ---------------------------------------------------------------------------
 def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector_id: int | None,
                     description: str | None = None) -> int:
-    """Insert-if-not-exists keyed by (ThreatTypeName, PrimaryThreatCategoryID, SectorID) —
-    `UX_ThreatType_NaturalKey`. Returns the winning ThreatTypeID either way."""
+    """Insert-if-not-exists keyed by (ThreatTypeName, ThreatCategoryID, SectorID) —
+    `UX_ThreatType_NaturalKey`. Returns the winning ThreatTypeID either way.
+
+    Only ever called from the R10 promotion path (accept.py), so `Source='ai_auto_promoted'`
+    is hardcoded rather than threaded through as a parameter — a curated/imported Type never
+    reaches this function, it's seeded directly by its own script instead."""
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Type).values(
-                ThreatTypeName=name, PrimaryThreatCategoryID=category_id, SectorID=sector_id,
-                Description=description, IsActive=True, IsDeleted=False))
+                ThreatTypeName=name, ThreatCategoryID=category_id, SectorID=sector_id,
+                Description=description, IsActive=True, IsDeleted=False, Source="ai_auto_promoted"))
         return inserted_pk(res)
     except IntegrityError:
         sector_pred = m.Threat_Type.SectorID.is_(None) if sector_id is None else m.Threat_Type.SectorID == sector_id
         winner = sess.execute(
             select(m.Threat_Type.ThreatTypeID).where(
                 m.Threat_Type.ThreatTypeName == name,
-                m.Threat_Type.PrimaryThreatCategoryID == category_id, sector_pred,
+                m.Threat_Type.ThreatCategoryID == category_id, sector_pred,
                 m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
         ).scalar()
         if winner is None:  # not a natural-key duplicate (NOT NULL / missing IDENTITY /
@@ -783,12 +909,16 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector
 def upsert_threat_catalogue(sess: Session, name: str, type_id: int, sector_id: int | None,
                             description: str | None = None) -> int:
     """Insert-if-not-exists keyed by (ThreatTypeID, ThreatName, SectorID) —
-    `UX_ThreatCatalogue_NaturalKey`. Returns the winning ThreatCatalogueID either way."""
+    `UX_ThreatCatalogue_NaturalKey`. Returns the winning ThreatCatalogueID either way.
+
+    Same Source-hardcoding rationale as upsert_threat_type above. Does NOT link the new
+    row into Threat_Catalogue_Category_Map — call link_catalogue_category separately once
+    you have a category id, same two-step shape as upsert_threat_type + link_type_actor."""
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Catalogue).values(
                 ThreatTypeID=type_id, ThreatName=name, SectorID=sector_id,
-                Description=description, IsActive=True, IsDeleted=False))
+                Description=description, IsActive=True, IsDeleted=False, Source="ai_auto_promoted"))
         return inserted_pk(res)
     except IntegrityError:
         sector_pred = (m.Threat_Catalogue.SectorID.is_(None) if sector_id is None
@@ -844,6 +974,29 @@ def link_type_actor(sess: Session, type_id: int, actor_id: int) -> bool:
         exists = sess.execute(
             select(1).where(m.ThreatType_ThreatActor_Map.ThreatTypeID == type_id,
                             m.ThreatType_ThreatActor_Map.ThreatActorID == actor_id)
+        ).first()
+        if exists is None:  # not a duplicate link — FK/NOT NULL/other violation
+            raise
+        return False
+
+
+def link_catalogue_category(sess: Session, catalogue_id: int, category_id: int) -> bool:
+    """Idempotent link into `Threat_Catalogue_Category_Map` — same composite-PK-guards-
+    duplicates, race-safe-no-op, fail-loud-on-real-violation contract as `link_type_actor`
+    above (see its docstring). Returns True iff a NEW link row was inserted.
+
+    Called once per (catalogue, category) pair a caller resolves — the map table is
+    naturally multi-valued (a catalogue entry can hold several categories), so promoting a
+    threat that later gains a second category is just a second call, not a schema change."""
+    try:
+        with sess.begin_nested():
+            sess.execute(insert(m.Threat_Catalogue_Category_Map).values(
+                ThreatCatalogueID=catalogue_id, ThreatCategoryID=category_id))
+        return True
+    except IntegrityError:
+        exists = sess.execute(
+            select(1).where(m.Threat_Catalogue_Category_Map.ThreatCatalogueID == catalogue_id,
+                            m.Threat_Catalogue_Category_Map.ThreatCategoryID == category_id)
         ).first()
         if exists is None:  # not a duplicate link — FK/NOT NULL/other violation
             raise

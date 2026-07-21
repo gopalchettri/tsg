@@ -32,6 +32,7 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from app.core.enums import SessionStatus
 from app.db import models as m
 
 # ============================================================================
@@ -51,15 +52,23 @@ from app.db import models as m
 #
 # This list grows by one line every time a new milestone adds a new index the
 # code now depends on.
+#
+# Each entry is (index name, the table it must be on, the columns it must cover
+# in order) — not just a bare name. `sys.indexes.name` is only unique PER TABLE,
+# not database-wide, so a name-only check would pass even if the real index
+# ended up on the wrong table (or missing a column) after a migration mishap.
 # ============================================================================
 REQUIRED_INDEXES = [
     # One active session per asset / one active scenario per scoped threat. Stops
     # duplicate "current" rows from a retried or racing request.
-    "UX_Session_ActiveAsset", "UX_Scenario_ActiveIdentity",
+    ("UX_Session_ActiveAsset", "Scenario_Session", ("EntityID", "AssetID")),
+    ("UX_Scenario_ActiveIdentity", "Threat_Scenario_Output", ("SessionID", "IdentityHash")),
     # Master-library natural-key UNIQUE. Stops two people accepting sessions at
     # the same moment from both creating a DUPLICATE "Ransomware via USB"
     # threat type in the shared library (safe concurrent promotion, R10).
-    "UX_ThreatType_NaturalKey", "UX_ThreatCatalogue_NaturalKey", "UX_ThreatActor_NaturalKey",
+    ("UX_ThreatType_NaturalKey", "Threat_Type", ("ThreatTypeName", "ThreatCategoryID", "SectorID")),
+    ("UX_ThreatCatalogue_NaturalKey", "Threat_Catalogue", ("ThreatTypeID", "ThreatName", "SectorID")),
+    ("UX_ThreatActor_NaturalKey", "Threat_Actor", ("ThreatActorName",)),
 ]
 
 # ============================================================================
@@ -125,7 +134,7 @@ ACTIVE_UNIQUE = [
 #
 # Read-Committed Snapshot Isolation (RCSI) is a database-wide setting, turned
 # on ONCE with `ALTER DATABASE <name> SET READ_COMMITTED_SNAPSHOT ON` (see
-# scripts/production_setup.sql Section 0, and scripts/readme.txt). With it on,
+# scripts/TSG_Core.sql Section 0, and scripts/readme.txt). With it on,
 # a plain read never blocks behind — or gets blocked by — a concurrent writer;
 # every CAS/lock-fencing pattern in dal.py (claim_stage, acquire_lock,
 # cancel_session, complete_session, ...) was designed assuming reads work this
@@ -140,6 +149,29 @@ ACTIVE_UNIQUE = [
 # the same way checklists 1/2 do: the app refuses to boot instead of silently
 # running in a concurrency mode it was never tested against.
 # ============================================================================
+
+# ============================================================================
+# CHECKLIST 5 — "do the filtered indexes' hardcoded status literals still
+# match the live SessionStatus enum?" (INV-5)
+#
+# Three filtered indexes bake a raw string literal ('active'/'completed')
+# straight into their CREATE INDEX ... WHERE clause: `UX_Session_ActiveAsset`
+# (migration 0004), `IX_Session_Active` (0009), `IX_Session_CompletedByAsset`
+# (0024) — all against `Scenario_Session.SessionStatus`. SQL Server stores
+# that WHERE text verbatim in `sys.indexes.filter_definition`, but nothing in
+# the database ties it to the `SessionStatus` enum (app/core/enums.py) it's
+# meant to track. If that enum is ever renamed without updating these
+# migrations to match, the index quietly stops matching any row the app
+# writes — M4's one-active-session lock and R13's completed-session lookup
+# would silently degrade or break, with no error anywhere pointing at why.
+#
+# Each entry is (index name, the SessionStatus member its filter must mention).
+# ============================================================================
+FILTERED_INDEX_LITERALS = [
+    ("UX_Session_ActiveAsset", SessionStatus.active),
+    ("IX_Session_Active", SessionStatus.active),
+    ("IX_Session_CompletedByAsset", SessionStatus.completed),
+]
 
 
 class StartupInvariantError(RuntimeError):
@@ -171,6 +203,7 @@ def verify_startup(engine: Engine) -> None:
     """
     if engine.dialect.name == "mssql":
         _assert_indexes(engine)
+        _assert_filtered_index_literals(engine)
         _assert_not_null(engine)
         _assert_rcsi_enabled(engine)
     _assert_no_duplicate_active(engine)
@@ -178,33 +211,86 @@ def verify_startup(engine: Engine) -> None:
 
 def _assert_indexes(engine: Engine) -> None:
     """Runs CHECKLIST 1. How it works: ask SQL Server's own system catalog
-    (`sys.indexes`), filtered server-side to just the names in
-    `REQUIRED_INDEXES` above (a single round trip, not a full-catalog scan),
-    for whether each one exists and is actually enforcing anything — i.e.
-    not disabled (`is_disabled = 0`) and unique (`is_unique = 1`, since every
-    entry in `REQUIRED_INDEXES` is a UNIQUE index some invariant depends on).
-    A name that's missing entirely, or present but disabled/non-unique, means
-    the app refuses to boot with a clear error naming exactly which index(es)
-    need attention — so whoever sees the error knows precisely what to fix.
+    (`sys.indexes` joined to `sys.index_columns`/`sys.columns`, filtered
+    server-side to just the names in `REQUIRED_INDEXES` above — a single round
+    trip, not a full-catalog scan) for each required index's real table,
+    column list, and whether it's actually enforcing anything — i.e. not
+    disabled (`is_disabled = 0`) and unique (`is_unique = 1`, since every entry
+    in `REQUIRED_INDEXES` is a UNIQUE index some invariant depends on).
+
+    Checking the table and column list, not just the name, matters because
+    `sys.indexes.name` is only unique PER TABLE — an index with the right name
+    that ended up on the wrong table (or missing a column) after a migration
+    mishap would otherwise pass a name-only check while enforcing nothing the
+    app actually depends on.
+
+    A name that's missing entirely, present on the wrong table/columns, or
+    present but disabled/non-unique, means the app refuses to boot with a
+    clear error naming exactly which index(es) need attention.
     """
+    by_name = {name: (table, cols) for name, table, cols in REQUIRED_INDEXES}
     # Names here always come from the hardcoded REQUIRED_INDEXES list above
     # (never from user input); the parameter binding below is just to keep
     # the query itself simple, not because these names need sanitizing.
-    params = {f"ix{i}": name for i, name in enumerate(REQUIRED_INDEXES)}
-    placeholders = ", ".join(f":ix{i}" for i in range(len(REQUIRED_INDEXES)))
+    params = {f"ix{i}": name for i, name in enumerate(by_name)}
+    placeholders = ", ".join(f":ix{i}" for i in range(len(by_name)))
     with engine.connect() as c:
         rows = c.execute(
-            text(f"SELECT name, is_disabled, is_unique FROM sys.indexes WHERE name IN ({placeholders})"),
+            text(
+                "SELECT i.name, OBJECT_NAME(i.object_id), i.is_disabled, i.is_unique, "
+                "STRING_AGG(c.name, ',') WITHIN GROUP (ORDER BY ic.key_ordinal) "
+                "FROM sys.indexes i "
+                "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+                "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+                f"WHERE i.name IN ({placeholders}) "
+                "GROUP BY i.name, i.object_id, i.is_disabled, i.is_unique"
+            ),
             params,
         ).all()
-    present = {r[0]: (bool(r[1]), bool(r[2])) for r in rows}
-    missing = [ix for ix in REQUIRED_INDEXES if ix not in present]
+    present = {r[0]: {"table": r[1], "disabled": bool(r[2]), "unique": bool(r[3]), "columns": tuple(r[4].split(","))}
+               for r in rows}
+    missing = [ix for ix in by_name if ix not in present]
     if missing:
         raise StartupInvariantError(f"missing required indexes (run migrations): {missing}")
-    unhealthy = [ix for ix in REQUIRED_INDEXES if present[ix][0] or not present[ix][1]]
+    mismatched = [ix for ix, (table, cols) in by_name.items()
+                if present[ix]["table"] != table or present[ix]["columns"] != cols]
+    if mismatched:
+        raise StartupInvariantError(
+            f"required indexes exist under the right name but on the wrong table/columns: "
+            f"{[(ix, present[ix]['table'], present[ix]['columns']) for ix in mismatched]}"
+        )
+    unhealthy = [ix for ix in by_name if present[ix]["disabled"] or not present[ix]["unique"]]
     if unhealthy:
         raise StartupInvariantError(
             f"required indexes exist but are not enforcing (disabled and/or non-unique): {unhealthy}"
+        )
+
+
+def _assert_filtered_index_literals(engine: Engine) -> None:
+    """Runs CHECKLIST 5. Reads each index's stored `filter_definition` text
+    (SQL Server keeps the exact WHERE clause used at CREATE INDEX time) and
+    confirms it still contains the CURRENT enum member's quoted literal
+    (e.g. `'active'`) — not a full SQL parse, just the same substring check a
+    human reviewing the DDL would do, run automatically at every boot instead
+    of only when someone remembers to look.
+    """
+    names = [name for name, _ in FILTERED_INDEX_LITERALS]
+    params = {f"ix{i}": name for i, name in enumerate(names)}
+    placeholders = ", ".join(f":ix{i}" for i in range(len(names)))
+    with engine.connect() as c:
+        rows = c.execute(
+            text(f"SELECT name, filter_definition FROM sys.indexes WHERE name IN ({placeholders})"),
+            params,
+        ).all()
+    present = {r[0]: (r[1] or "") for r in rows}
+    missing = [name for name in names if name not in present]
+    if missing:
+        raise StartupInvariantError(f"missing filtered indexes (run migrations): {missing}")
+    stale = [name for name, status in FILTERED_INDEX_LITERALS if f"'{status.value}'" not in present[name]]
+    if stale:
+        raise StartupInvariantError(
+            f"filtered index WHERE clause no longer matches the live SessionStatus enum value "
+            f"(enum renamed without updating the migration?): {stale}"
         )
 
 

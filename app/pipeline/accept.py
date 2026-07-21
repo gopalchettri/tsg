@@ -29,7 +29,7 @@ from app.core.enums import (
 from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
-from app.db.dal import EntityForbidden, guid, now
+from app.db.dal import EntityForbidden, NotFoundError, guid, now
 from app.pipeline import grounding
 
 log = get_logger(__name__)
@@ -85,7 +85,20 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
         _ensure_threat_data_still_active(sess, session_id, good_subs)
 
         # subset=None means "accept all"
-        dal.mark_scenarios_accepted(sess, session_id, good_subs, subset=subset)
+        matched = dal.mark_scenarios_accepted(sess, session_id, good_subs, subset=subset)
+        if subset is not None:
+            # [REVIEW-FIX] a subset id that doesn't match any row here (wrong session/
+            # subsystem, already superseded, or never existed) previously no-op'd
+            # silently — the session still completed as if the accept fully succeeded.
+            # set() first: AcceptBody.subset allows duplicate ids (unlike its sibling
+            # RegenerateScenariosBody.output_ids), and a repeated id can only ever
+            # match its row once, so counting raw len(subset) would false-flag a
+            # legitimate duplicate-id request as a mismatch.
+            requested = len(set(subset))
+            if matched != requested:
+                raise NotFoundError(
+                    f"{requested - matched} of {requested} requested OutputID(s) in `subset` did "
+                    f"not match an active, awaiting-decision scenario in session {session_id}")
 
         _add_flagged_threats_to_library(sess, scenario_session, good_subs, user_id)
 
@@ -230,18 +243,29 @@ def _find_or_create_type_and_catalogue(
     should end up pointing at: reuse the high-confidence type match recorded at Stage 2
     when present, otherwise resolve/create via category+type name; an accepted
     PROPOSED catalogue name always wins over any low-confidence stored catalogue id.
+
+    A newly-created Threat_Catalogue row also gets linked into Threat_Catalogue_Category_Map
+    under the same resolved category — [A2]'s "authoritative per-threat category source"
+    otherwise only ever gets populated by the curated Excel seed, never by AI promotion, so
+    every threat promoted through this path would be permanently stuck relying on its Type's
+    single rough default instead. One category today (the AI proposes exactly one); the map
+    table is already multi-valued, so a future threat gaining a second category is just
+    another link_catalogue_category call, not a schema change.
     """
+    def _category_id() -> int | None:
+        cat_key = ("category", row["ThreatCategory"])
+        if cat_key not in resolved:
+            resolved[cat_key] = grounding.find_category(sess, row["ThreatCategory"])
+        return resolved[cat_key]
+
     type_id = row["ThreatTypeID"]  # >=confirm-band match when set — trusted
     if type_id is None:
-        # No high-confidence type match was recorded earlier, so find/create one now:
-        # resolve (or cache) the category first, then upsert the type under it.
+        # No high-confidence type match was recorded earlier, so find/create one now,
+        # under the resolved category.
         key = ("type", row["ThreatCategory"], row["ThreatType"])
         type_id = resolved.get(key)
         if type_id is None:
-            cat_key = ("category", row["ThreatCategory"])
-            if cat_key not in resolved:
-                resolved[cat_key] = grounding.find_category(sess, row["ThreatCategory"])
-            type_id = dal.upsert_threat_type(sess, row["ThreatType"], resolved[cat_key], sector_id)
+            type_id = dal.upsert_threat_type(sess, row["ThreatType"], _category_id(), sector_id)
             resolved[key] = type_id
 
     catalogue_id = row["ThreatCatalogueID"]
@@ -251,6 +275,9 @@ def _find_or_create_type_and_catalogue(
         if catalogue_id is None:
             catalogue_id = dal.upsert_threat_catalogue(sess, row["ThreatName"], type_id, sector_id)
             resolved[ckey] = catalogue_id
+            category_id = _category_id()
+            if category_id is not None:  # [R6] None means "couldn't resolve" — nothing to link
+                dal.link_catalogue_category(sess, catalogue_id, category_id)
 
     return type_id, catalogue_id
 

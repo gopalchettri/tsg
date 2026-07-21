@@ -65,8 +65,8 @@ def publish(session_id: str, event: dict) -> None:
         # Publish failed (Redis down/slow) — open the breaker for `cooldown`
         # seconds so we fail fast next time instead of retrying every event.
         _breaker_until = time.monotonic() + cooldown
-        logger.warning("SSE publish failed for session %s (event %s); pausing SSE %.0fs",
-                    session_id, event.get("type"), cooldown, exc_info=True)
+        logger.warning("sse.publish_failed", session_id=session_id, event_type=event.get("type"),
+                    cooldown_seconds=cooldown, exc_info=True)
 
 
 async def subscribe(session_id: str) -> AsyncIterator[dict]:

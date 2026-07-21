@@ -6,13 +6,14 @@ the JWT `entities[]` claim. Tests override `get_principal` via
 """
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 
 from fastapi import Header
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.core.security import allowed_entities, validate_jwt
+from app.core.security import AuthError, allowed_entities, validate_jwt
 from app.db.dal import EntityForbidden
 
 _log = get_logger(__name__)
@@ -58,3 +59,19 @@ def get_principal(
     token = authorization[7:] if authorization.lower().startswith("bearer ") else ""
     claims = validate_jwt(token)
     return Principal(claims=claims, entities=allowed_entities(claims))
+
+
+def require_admin(x_admin_key: str = Header(default="", alias="X-Admin-Key")) -> None:
+    """FastAPI dependency gating the admin-only threat-library embedding endpoints
+    (app/api/admin.py) — deliberately NOT part of the JWT/entity model above: TSG has no
+    admin/curator role, and this operation touches shared, cross-tenant master data, not one
+    entity's data, so `get_principal`'s per-entity model doesn't fit it.
+
+    If `admin_api_key` was never configured (empty, the default), this ALWAYS denies — an
+    unconfigured gate must never silently become "open to everyone" just because both sides
+    of a naive equality check happen to be empty strings. Uses `secrets.compare_digest` for
+    the actual comparison so the check runs in constant time (no timing side-channel on how
+    many leading characters of a guessed key happen to match)."""
+    key = get_settings().admin_api_key
+    if not key or not secrets.compare_digest(x_admin_key, key):
+        raise AuthError("invalid or missing X-Admin-Key")

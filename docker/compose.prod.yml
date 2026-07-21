@@ -4,8 +4,14 @@
 #   docker compose -f docker/compose.prod.yml --env-file .env.prod up -d
 #
 # MSSQL (TSG) is EXTERNAL — point TSG_DB_DSN in .env.prod at your real server.
-# For local in-process models, uncomment the volume mounts and set EMBEDDING_MODEL /
-# RERANKER_MODEL in .env.prod to the CONTAINER paths (/models/...).
+# [REVIEW-FIX] The api/worker `volumes:` blocks below are ACTIVE by default (local
+# in-process models, provider=local) — set EMBEDDING_MODEL_HOST/RERANKER_MODEL_HOST in
+# .env.prod to real host paths, and EMBEDDING_MODEL/RERANKER_MODEL to the matching
+# CONTAINER paths (/models/...). If instead you're running with
+# EMBEDDING_PROVIDER=litellm_proxy / RERANKER_PROVIDER=litellm_proxy (no local models
+# needed), DELETE both `volumes:` blocks below — `docker compose up` fails outright on an
+# unset EMBEDDING_MODEL_HOST/RERANKER_MODEL_HOST otherwise, since Compose can't interpolate
+# an empty value into a bind-mount host path.
 services:
   api:
     image: tsg:latest
@@ -39,6 +45,25 @@ services:
     # LLM-call retry cycle; a reasoned starting point, not measured against this deployment's
     # real P99 stage duration — tune once that data exists.
     stop_grace_period: 300s
+    # [REVIEW-FIX] worker previously had no healthcheck at all — a gevent greenlet deadlock
+    # leaves the container process alive (Docker sees no crash) with nothing to restart it.
+    # `inspect ping` only succeeds if the worker's event loop is actually responsive, not just
+    # that the process exists.
+    # [REVIEW-FIX] start_period: `inspect ping` can't get a reply until Celery's Consumer
+    # bootstep is up, which only happens AFTER the synchronous worker_init handler
+    # (_init_worker, app/pipeline/celery_app.py) fully returns — a DB round-trip, a local
+    # embedding+reranker model warm-load (EMBEDDING/RERANKER_PROVIDER=local is the documented
+    # default; two real transformer models loaded from the bind-mounted volumes above) and an
+    # LLM-provider reachability ping, all blocking, all before the first tick. That routinely
+    # exceeds 30s (30s was measured against nothing — a reasoned starting point, tune down once
+    # this deployment's real cold-start P99 is known); until then every ping fails not because
+    # the worker is unhealthy but because it legitimately hasn't finished booting yet.
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.pipeline.celery_worker.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 240s
     volumes:
       - "${EMBEDDING_MODEL_HOST}:/models/e5:ro"
       - "${RERANKER_MODEL_HOST}:/models/reranker:ro"
@@ -49,6 +74,22 @@ services:
     env_file: [../.env.prod]
     depends_on:
       redis: { condition: service_healthy }
+    # [REVIEW-FIX] beat has no `inspect ping` equivalent, so this checks its own schedule
+    # file's mtime instead. [REVIEW-FIX] the file is NOT touched every time an entry fires —
+    # PersistentScheduler.should_sync() (celery/beat.py) is gated by Celery's own hardcoded
+    # `Scheduler.sync_every = 180`, which this app never overrides (no beat_sync_every set), so
+    # a disk sync only happens the first tick where time-since-last-sync exceeds 180s. Since
+    # that check itself only runs on ~60s ticks (the reaper is the soonest-due entry), the real
+    # write cadence is ~180-240s, not ~60s — so the file legitimately sits stale past 180s for
+    # part of every normal cycle even while beat is perfectly healthy. 360s (2x the ~240s
+    # worst-case real cadence) is comfortably above that, not just 3x an interval that isn't
+    # actually how this scheduler behaves.
+    healthcheck:
+      test: ["CMD-SHELL", "find /app -maxdepth 1 -name 'celerybeat-schedule*' -newermt '-360 seconds' | grep -q ."]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   redis:
     image: redis:7-alpine

@@ -207,6 +207,33 @@ def test_renew_lease_extends_the_live_holder_and_refuses_a_zombie(db):
                             "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb") is False  # never held it
 
 
+def test_find_threats_renews_lease_once_per_grounding_iteration(db, monkeypatch):
+    """The one _ask_ai renewal covers the threats-prompt LLM call itself, but find_threats
+    then loops once per proposed threat doing an embedding/rerank grounding match — no LLM
+    call of its own to renew the lease in between. Without a renewal inside that loop too, a
+    subsystem with many proposed threats (up to max_threats_per_subsystem) could outlive its
+    lease under normal per-iteration latency alone."""
+    from app.pipeline.tasks import find_threats
+    from tests.conftest import DEFAULT_ASSET_CONTEXT
+    from tests.test_slice import _TwoThreatLLM
+
+    session = _seed_session(db)
+    sid = session["SessionID"]
+    tid = str(uuid.uuid4())
+    real_renew = dal.renew_lease
+    calls = []
+
+    def _spy(sess, session_id, subsystem_id, level, epoch, task_id):
+        calls.append(level)
+        return real_renew(sess, session_id, subsystem_id, level, epoch, task_id)
+
+    monkeypatch.setattr(dal, "renew_lease", _spy)
+    threats, _ = find_threats(db, session, SUB, DEFAULT_ASSET_CONTEXT, _TwoThreatLLM(), tid)
+    assert len(threats) == 2
+    # 1 renewal before the threats-prompt LLM call (_ask_ai) + 1 per proposed threat (2) = 3
+    assert len(calls) == 3
+
+
 def test_write_scenarios_refuses_when_lock_was_lost(db):
     """The zombie-claims-a-different-stage bug: a worker whose THREATS stage stalled past its
     lease has its `_LOCK` reclaimed (and, since this session isn't at REVIEW, the reaper also
@@ -254,6 +281,16 @@ def test_link_type_actor_absorbs_only_a_real_duplicate(db):
     assert dal.link_type_actor(db, 1, 1) is False           # composite-PK duplicate
     with pytest.raises(IntegrityError):
         dal.link_type_actor(db, None, 1)                    # NOT NULL — never "already linked"
+
+
+def test_link_catalogue_category_absorbs_only_a_real_duplicate(db):
+    """Same idempotency/fail-loud contract as link_type_actor above, for the
+    Threat_Catalogue_Category_Map junction table. Uses the conftest-seeded catalogue 20 /
+    category 2 (Tampering)."""
+    assert dal.link_catalogue_category(db, 20, 2) is True
+    assert dal.link_catalogue_category(db, 20, 2) is False  # composite-PK duplicate
+    with pytest.raises(IntegrityError):
+        dal.link_catalogue_category(db, None, 2)            # NOT NULL — never "already linked"
 
 
 def test_create_session_reraises_a_violation_it_cannot_attribute(db):

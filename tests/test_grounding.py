@@ -33,6 +33,34 @@ def test_cosine_zero_vector_returns_zero_not_error():
     assert abs(grounding.how_similar([1.0, 0.0], [1.0, 0.0]) - 1.0) < 1e-9
 
 
+def test_cosine_raises_on_length_mismatch_instead_of_silently_truncating():
+    # [Fix] a length mismatch always means a real embedding-dimension problem (e.g. a stale
+    # cached vector from before an EMBEDDING_PROVIDER/EMBEDDING_DIMENSIONS change) — zip()
+    # would otherwise silently truncate to the shorter vector and return a numerically
+    # plausible but meaningless score, with no error anywhere.
+    with pytest.raises(ValueError, match="different lengths"):
+        grounding.how_similar([1.0, 0.0, 0.0], [1.0, 0.0])
+
+
+def test_shortlist_candidates_skips_a_dimension_mismatched_candidate_not_the_whole_call():
+    # [Fix] one corrupted cache entry (wrong-length vector) must not take down scoring for
+    # every OTHER candidate — it's skipped, logged, and the rest still get ranked normally.
+    from app.pipeline.grounding import _shortlist_candidates
+
+    s = Settings()
+    qv = [1.0, 0.0]
+    rows = [{"ThreatName": "good"}, {"ThreatName": "bad_dim"}, {"ThreatName": "also_good"}]
+    name_vecs = {
+        "good": [1.0, 0.0],           # matches qv's dimension, perfect match
+        "bad_dim": [1.0, 0.0, 0.0],   # wrong dimension — must be skipped, not crash the call
+        "also_good": [0.0, 1.0],      # matches qv's dimension, orthogonal (low score)
+    }
+    shortlist = _shortlist_candidates(qv, rows, name_vecs, "ThreatName", s)
+    names = {r["ThreatName"] for r in shortlist}
+    assert "bad_dim" not in names
+    assert "good" in names  # the well-formed candidates still get scored and returned
+
+
 class _BadRerankStub:
     """embed() is well-behaved; rerank() returns the WRONG count to trip the M1 guard."""
 

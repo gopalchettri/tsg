@@ -131,11 +131,20 @@ def allowlist_context(fields: dict[str, Any], allowed: set[str]) -> dict[str, An
     """Build model context from ONLY the named allowlisted fields (§10.3);
     redact string values recursively (nested lists/dicts included). Anything
     not on the allowlist never reaches the model.
+
+    A field with no real value never reaches the model either — not just None, but also an
+    empty string/list/dict (e.g. "" or []). Sending an empty field wastes prompt space and can
+    read to the AI as "this asset has no critical service" instead of "we don't know" — dropping
+    it means the model sees only what's actually filled in. A numeric 0 or boolean False is a
+    real value (e.g. target_rto_hours=0), so those are kept.
     """
     out: dict[str, Any] = {}
     for name in allowed:
         val = fields.get(name)
-        if val is not None:
-            out[name] = _redact_value(val)
+        if val is None:
+            continue
+        if isinstance(val, (str, list, dict, tuple, set)) and not val:
+            continue
+        out[name] = _redact_value(val)
     return out
 

@@ -31,7 +31,7 @@ def test_ids_only_body_creates_session_with_db_resolved_context(engine, monkeypa
     row = _session_row(db, r.json()["session_id"])
     ctx = json.loads(row["AssetContextJSON"])
     assert ctx["cii_asset_description"] == "CAD design and drafting platform"
-    assert ctx["critical_service"] == "Design Service"
+    assert ctx["critical_service"] == ["Design Service"]
     assert ctx["data_handled"] == "Engineering drawings and specs"
 
     subs = json.loads(row["SubsystemsJSON"])
@@ -117,6 +117,7 @@ def test_null_asset_and_subsystem_fields_pass_through_as_null(engine, monkeypatc
     db.execute(insert(m.ctm_scan_entity).values(
         id=400, name="Null Context Asset", type="app", criticality=1,
         tier1_critical_service_id=500))  # description/data_handled left NULL
+    db.execute(insert(m.ctm_scan_entity_bu).values(id=400, ctm_scan_entity_id=400, group_id=5, service_id=500))
     db.execute(insert(m.onboarding_supporting_systems).values(id=1020, name="Minimal System"))  # every optional col NULL
     db.execute(insert(m.ctm_scan_entity_supporting_system).values(ctm_scan_entity_id=400, onboarding_supporting_system_id=1020))
     db.commit()

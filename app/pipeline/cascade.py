@@ -30,11 +30,12 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import AuditEventType, RegenGranularity, SubsystemLevel
 from app.core.logging import get_logger
+from app.core.security import redact
 from app.db import dal
 from app.db import models as m
 from app.db.dal import RegenerateConflict, guid
 from app.pipeline import tasks
-from app.pipeline.llm import LLMClient
+from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 
 log = get_logger(__name__)
 
@@ -89,11 +90,16 @@ def _resolve_regen_subsystem(scenario_session: dict, subsystem_id: int) -> tuple
 
 def _build_regen_audit_detail(threat_ids: set[str] | None, target_ids: list[str] | list[int] | None,
                             epoch: int, user_note: str | None) -> str:
-    """Build the DetailJSON payload for the regeneration-completed audit record."""
+    """Build the DetailJSON payload for the regeneration-completed audit record.
+
+    [REVIEW-FIX] user_note is raw, unvalidated client free text (never reaches an LLM prompt —
+    confirmed, this isn't a prompt-injection path) but was previously written to the persistent
+    audit trail verbatim. redact() here matches the treatment every other free-text value in this
+    codebase gets before being persisted or logged."""
     return json.dumps({
         "target_ids": sorted(threat_ids) if threat_ids else None,
         "requested_ids": list(target_ids) if target_ids else None,
-        "epoch": epoch, "user_note": user_note})
+        "epoch": epoch, "user_note": redact(user_note)})
 
 
 def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, granularity: RegenGranularity,
@@ -136,6 +142,12 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
         # re-check target ids now that we hold the lock, in case state changed between the pre-check above and here
         threat_ids = get_threat_id_to_redo(sess, sid, subsystem_id, granularity, target_ids)
         threats = dal.active_threats(sess, sid, subsystem_id)
+        # asset_active_fields/sub_active_fields deliberately NOT passed — a regeneration
+        # intentionally reflects the CURRENT Context_Field_Config policy, not whatever was active
+        # when the session originally ran. If a curator has since turned a field off (e.g. for a
+        # compliance reason), a freshly regenerated scenario should honor that, not keep sending
+        # a field the curator explicitly disabled. write_scenarios resolves this once for the
+        # whole call (not once per threat) when left unset — see its own comment.
         scen_provs = tasks.write_scenarios(sess, scenario_session, sub, asset_context, threats, llm, task_id,
                                         epoch=epoch, target_threat_ids=threat_ids, require_lock=True)
         if not scen_provs:
@@ -151,6 +163,12 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
         # in the gap). Not a real pipeline failure: no ERROR state, no audit row, no SSE
         # error event — just report the outcome as-is, same as the pre-lock check does.
         log.info("regen.target_conflict", session_id=sid, subsystem=subsystem_id, reason=str(exc))
+    except LLMSlotUnavailable:
+        # Same treatment as _process_all_supporting_systems: a temporary "system was busy"
+        # condition, not a bug — re-raise past _record_failure so Celery's autoretry_for
+        # (celery_app.py) retries this regeneration shortly instead of recording a permanent
+        # ERROR.
+        raise
     except Exception as exc:  # noqa: BLE001 — capture, don't swallow ([R8], same discipline as _process_all_supporting_systems)
         tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch)
         sess.commit()

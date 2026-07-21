@@ -43,6 +43,15 @@ testpaths = ["tests"]
 [tool.mypy]
 plugins = ["pydantic.mypy"]
 
+# gevent and celery ship no type hints (no py.typed marker) and no maintained stub package
+# exists for either — this isn't a code error to fix, it's mypy correctly reporting it can't
+# verify calls into an untyped library. Ignoring here (once, centrally) instead of a
+# `# type: ignore` on every call site keeps the same intent from silently drifting out of sync
+# across app/pipeline/local_models.py, app/pipeline/celery_app.py, and app/api/admin.py.
+[[tool.mypy.overrides]]
+module = ["gevent.*", "celery.*"]
+ignore_missing_imports = true
+
 # Pins the linter that was already running here unconfigured (the stale .ruff_cache and the
 # `# noqa: BLE001` markers are its fingerprints). Default rule set (E4/E7/E9 + F) — E501 is
 # NOT in it, so the long dict-literal lines below are fine as written.

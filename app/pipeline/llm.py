@@ -40,14 +40,179 @@ that would run against a real model in production.
 """
 from __future__ import annotations
 
+import os
+import random
+import threading
+import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Protocol, Sequence
+from urllib.parse import urlparse
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
+
+_SLOTS_KEY = "tsg:llm:inflight"
+_POLL_SECONDS = 0.25
+_POLL_JITTER_SECONDS = 0.1
+
+# Safety caps against pathological input (a bug routing a document/long field somewhere a
+# short value was expected) — never expected to trip on real production text, see the
+# raise sites in embed()/chat() below for the reasoning behind each number.
+_MAX_EMBED_CHARS = 4000
+_MAX_CHAT_CHARS = 60_000
+
+# KEYS[1] = _SLOTS_KEY (a ZSET, one member per in-flight call); ARGV = now, stale_cutoff,
+# limit, token. Single Redis-side script so "prune stale tickets, count, admit" is ATOMIC —
+# no other caller can observe the count between the prune and the ZADD. Doing this as two
+# separate round-trips (ZCARD then ZADD) has two bugs: (1) a waiter's own ZADD, done BEFORE
+# checking capacity, counts against the very limit it's waiting to get under, so a freed slot
+# never actually reaches a waiter; (2) two waiters can both see room in the same instant and
+# both proceed (an admit race). One Lua script closes both at once (Redis runs it single-
+# threaded, so "prune+count+decide+register" can never be interleaved with another caller's).
+_ADMIT_SCRIPT = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
+local n = redis.call('ZCARD', KEYS[1])
+if n < tonumber(ARGV[3]) then
+    redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+    return 1
+end
+return 0
+"""
+
+
+class LLMSlotUnavailable(Exception):
+    """Raised only when _llm_slot waited the full llm_slot_wait_timeout_seconds and Redis
+    POSITIVELY CONFIRMED the concurrent-call limit is still exhausted — never raised for an
+    unreachable/erroring Redis (that fails open instead, see _llm_slot). Callers
+    (tasks.py/cascade.py) let this propagate past their generic per-subsystem exception
+    handler so Celery's autoretry_for (celery_app.py) retries the whole stage shortly,
+    resuming via the same claim_stage CAS logic crash-redelivery already relies on."""
+
+
+@lru_cache
+def _slot_redis():
+    """Cached sync Redis client DEDICATED to the LLM-slot ZSET/heartbeat traffic — deliberately
+    NOT app.sse.bus._redis(), whose 1s-timeout/zero-retry tuning is right for best-effort SSE
+    publish but wrong here: this traffic is a liveness signal an entire admission-control
+    mechanism depends on, so a brief Redis blip must not silently kill a heartbeat and cause a
+    false-stale eviction of a call that's still genuinely running."""
+    import redis
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
+
+    s = get_settings()
+    timeout = s.llm_slot_redis_timeout_seconds
+    return redis.Redis.from_url(
+        s.redis_url, decode_responses=True,
+        socket_connect_timeout=timeout, socket_timeout=timeout,
+        retry=Retry(NoBackoff(), 1))  # one immediate retry, unlike bus._redis()'s zero
+
+
+def current_llm_slot_count() -> int:
+    """Current in-flight LLM-call count (post-prune) — for selfcheck.py's observability check
+    only. Returns 0 if Redis is unreachable; this is an informational read, never worth
+    failing a self-check over."""
+    try:
+        r = _slot_redis()
+        now = time.time()
+        r.zremrangebyscore(_SLOTS_KEY, "-inf", now - get_settings().llm_slot_stale_after_seconds)
+        return r.zcard(_SLOTS_KEY)
+    except Exception:  # noqa: BLE001 — observability read, never raises
+        return 0
+
+
+def _try_admit(r, limit: int, stale_after: float, token: str) -> bool:
+    """One atomic round-trip: prune stale tickets, then admit `token` iff there's room.
+    Returns whether THIS call was admitted. Exceptions propagate — the caller decides how to
+    treat a Redis failure (always fail-open, never "confirmed over capacity")."""
+    now = time.time()
+    return bool(r.eval(_ADMIT_SCRIPT, 1, _SLOTS_KEY, now, now - stale_after, limit, token))
+
+
+def _heartbeat_loop(r, token: str, interval: float, stop_event: threading.Event) -> None:
+    """Runs on a background thread for the lifetime of one admitted call: refreshes the
+    ticket's score every `interval` seconds so staleness pruning (_try_admit's
+    ZREMRANGEBYSCORE) never mistakes a still-running call for a crashed one, REGARDLESS of
+    how long the call legitimately takes. `stop_event.wait(interval)` both sleeps and gives an
+    instant wake-up on release, instead of sleeping the full interval past when it's needed."""
+    while not stop_event.wait(interval):
+        try:
+            r.zadd(_SLOTS_KEY, {token: time.time()})
+        except Exception:  # noqa: BLE001 — a missed beat self-heals next tick; never worth crashing the call over
+            log.warning("llm.slot_heartbeat_failed", exc_info=True)
+
+
+@contextmanager
+def _llm_slot(s: Settings):
+    """Caps concurrent outbound chat/embed/rerank calls ACROSS EVERY WORKER REPLICA sharing
+    this Redis (`max_concurrent_llm_calls`, 0 = disabled — today's unbounded behavior).
+    `max_active_sessions` only counts sessions; this is the piece that actually protects the
+    shared Azure/GPU backend from being overwhelmed when workers scale out.
+
+    A Redis-side ZSET semaphore, admitted via one atomic Lua script (see _ADMIT_SCRIPT), with
+    a heartbeat thread keeping an admitted call's ticket alive for exactly as long as it
+    legitimately runs — duration and aliveness are different things, so staleness is detected
+    by MISSED HEARTBEATS (llm_slot_stale_after_seconds), never by a guessed fixed duration.
+
+    Any Redis error anywhere in this function — building the client, one admit attempt, or a
+    later poll — fails OPEN (log once, proceed unlimited for this call): an infra fault is not
+    evidence of being over capacity. LLMSlotUnavailable is raised ONLY when Redis positively
+    responds "still full" for the entire wait window — a confirmed, not inferred, condition.
+    """
+    limit = s.max_concurrent_llm_calls
+    if not limit:
+        yield
+        return
+
+    token = str(uuid.uuid4())
+    try:
+        r = _slot_redis()
+    except Exception:  # noqa: BLE001 — can't even build the client → fail open
+        log.warning("llm.slot_redis_unavailable_fail_open", exc_info=True)
+        yield
+        return
+
+    waited = 0.0
+    while True:
+        try:
+            admitted = _try_admit(r, limit, s.llm_slot_stale_after_seconds, token)
+        except Exception:  # noqa: BLE001 — Redis error (at first attempt OR mid-poll) → fail open, never "confirmed over capacity"
+            log.warning("llm.slot_redis_error_fail_open", exc_info=True)
+            yield
+            return
+        if admitted:
+            break
+        if waited >= s.llm_slot_wait_timeout_seconds:
+            raise LLMSlotUnavailable(
+                f"no free LLM call slot after waiting {waited:.0f}s (limit={limit})")
+        time.sleep(_POLL_SECONDS + random.uniform(0, _POLL_JITTER_SECONDS))  # jitter avoids synchronized thundering-herd wakeups
+        waited += _POLL_SECONDS
+
+    stop_event = threading.Event()
+    # plain threading.Thread, not gevent.spawn: under the gevent-patched Celery worker,
+    # monkey-patched `threading` already makes this cooperative (same reasoning
+    # local_models.py's own _offload comment documents); outside gevent (plain pytest) it's a
+    # harmless real OS thread doing near-nothing. Portable, no new gevent import here.
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop, args=(r, token, s.llm_slot_heartbeat_seconds, stop_event), daemon=True)
+    hb_thread.start()
+    try:
+        yield
+    finally:
+        # Stop + join the heartbeat BEFORE releasing the ticket: if the ticket were removed
+        # first, a heartbeat tick still in flight could re-add a now-orphaned entry that
+        # nothing would ever clean up.
+        stop_event.set()
+        hb_thread.join(timeout=s.llm_slot_heartbeat_seconds)
+        try:
+            r.zrem(_SLOTS_KEY, token)
+        except Exception:  # noqa: BLE001 — best-effort release; a leaked slot self-heals via staleness pruning
+            pass
 
 
 @dataclass
@@ -84,9 +249,12 @@ class LLMClient(Protocol):
     which implementation is behind it.
     """
 
-    def chat(self, messages: list[dict], *, model: str | None = None) -> tuple[str, Provenance]:
+    def chat(self, messages: list[dict], *, model: str | None = None,
+            temperature: float | None = None) -> tuple[str, Provenance]:
         """Single chat completion; returns (text, Provenance) so callers can persist model+params
-        alongside the output without threading litellm-specific response shapes around."""
+        alongside the output without threading litellm-specific response shapes around.
+        `temperature`, like `model`, is a per-call override — None means "use the configured
+        default" (Settings.llm_temperature or the provider's own)."""
         ...
 
     def embed(self, texts: Sequence[str], *, model: str | None = None, kind: str = "query") -> list[list[float]]:
@@ -168,7 +336,7 @@ class LiteLLMClient:
         which leaves this as None and falls back to the cached global settings."""
         self.s = settings or get_settings()
 
-    def _chat_kwargs(self, model: str | None = None) -> dict[str, Any]:
+    def _chat_kwargs(self, model: str | None = None, temperature: float | None = None) -> dict[str, Any]:
         """THE PROVIDER-DISPATCH POINT FOR chat() — this is the one function
         that decides "which actual AI backend am I about to call, and what
         connection details does it need." It's called exactly once, at the
@@ -206,17 +374,23 @@ class LiteLLMClient:
             on, this tells the provider to enforce that its reply is valid
             JSON at the API level, instead of just hoping the model's plain
             text happens to parse as JSON.
-        - `temperature` / `reasoning_effort` — ONLY added if an operator
-            explicitly set LLM_TEMPERATURE / LLM_REASONING_EFFORT (both
-            unset/None by default — see config.py). Left unset, litellm/the
-            provider picks its own default for each.
+        - `temperature` — the per-call `temperature` argument wins if given (e.g.
+            find_threats's threat_identification_temperature); otherwise falls back to the
+            operator-set LLM_TEMPERATURE (unset/None by default — see config.py). Neither
+            set → litellm/the provider picks its own default.
+        - `reasoning_effort` — ONLY added if an operator explicitly set
+            LLM_REASONING_EFFORT (unset/None by default). Left unset, litellm/the
+            provider picks its own default.
         """
         s = self.s
         common: dict[str, Any] = {"timeout": s.llm_timeout_seconds, "num_retries": s.llm_max_retries}
         if s.llm_json_mode:  # API-enforced JSON output; off by default (see config.py)
             common["response_format"] = {"type": "json_object"}
-        if s.llm_temperature is not None:  # operator-pinned; unset by default (see config.py)
-            common["temperature"] = s.llm_temperature
+        # per-call `temperature` (e.g. find_threats pinning threat_identification_temperature)
+        # wins over the global llm_temperature default, same precedence `model` already has.
+        effective_temperature = temperature if temperature is not None else s.llm_temperature
+        if effective_temperature is not None:
+            common["temperature"] = effective_temperature
         if s.llm_reasoning_effort is not None:  # operator-pinned; unset by default (see config.py)
             common["reasoning_effort"] = s.llm_reasoning_effort
         if s.llm_provider == "azure_openai":
@@ -231,10 +405,15 @@ class LiteLLMClient:
                 kw["api_base"] = s.openai_base_url
             return kw
         # default: litellm proxy
-        return {"model": model or s.inference_model, "api_base": s.litellm_base_url,
-                "api_key": s.litellm_api_key, **common}
+        kw = {"model": model or s.inference_model, "api_base": s.litellm_base_url,
+            "api_key": s.litellm_api_key, **common}
+        # operator-pinned guardrail name(s), pre-registered on the proxy itself; unset by
+        # default. Proxy-only — no azure_openai/openai equivalent, so this branch only.
+        if s.llm_guardrails:
+            kw["guardrails"] = s.llm_guardrails
+        return kw
 
-    def chat(self, messages, *, model=None):
+    def chat(self, messages, *, model=None, temperature=None):
         """Sends a conversation (a list of role/content message dicts, the
         same shape every AI chat API expects) to whichever provider
         `_chat_kwargs()` above selects, and returns a tuple of
@@ -267,17 +446,35 @@ class LiteLLMClient:
         precisely why BOTH are recorded separately instead of just one.
 
         ANOTHER NON-OBVIOUS DETAIL — temperature/reasoning_effort only show up
-        in the `params` dict below when an operator has explicitly pinned them
-        via LLM_TEMPERATURE/LLM_REASONING_EFFORT (see config.py). Left unset,
+        in the `params` dict below when they're actually pinned: either a per-call
+        `temperature=` override (e.g. find_threats's threat_identification_temperature) or an
+        operator-set LLM_TEMPERATURE/LLM_REASONING_EFFORT (see config.py). Left unset,
         litellm/the provider picks its own default and neither key appears —
         so the provenance record only ever lists settings that are ACTUALLY
         being controlled, not settings left to whatever the default happens
         to be.
+
+        A LENGTH GUARD, CHECKED BEFORE ANY PROVIDER WORK: unlike embed()'s guard, a long
+        chat prompt isn't inherently a bug — several allowlisted context fields (e.g.
+        technology_used, incident_description) are free text a user could legitimately
+        write a few paragraphs into, and the smallest known chat model's context window
+        (glm-5, 131k tokens) is enormous next to that. `_MAX_CHAT_CHARS` is set far above
+        any realistic legitimate prompt, purely as a safety net against genuinely
+        pathological input (a document landing in a field that expected a short value, a
+        bug duplicating content) — same fail-loud-not-silent reasoning as embed()'s guard.
         """
         import litellm
 
-        kwargs = self._chat_kwargs(model)
-        resp = litellm.completion(messages=messages, **kwargs)
+        total_chars = sum(len(m.get("content") or "") for m in messages)
+        if total_chars > _MAX_CHAT_CHARS:
+            raise ValueError(
+                f"chat() received a {total_chars}-char prompt, over the {_MAX_CHAT_CHARS}-char "
+                "safety cap — check for an unexpectedly large free-text field (e.g. "
+                "technology_used, incident_description, cii_asset_description)")
+
+        kwargs = self._chat_kwargs(model, temperature)
+        with _llm_slot(self.s):
+            resp = litellm.completion(messages=messages, **kwargs)
         return resp["choices"][0]["message"]["content"], Provenance(
             model=kwargs["model"],
             # record the model the proxy ACTUALLY served (resp["model"] may be a dated
@@ -288,10 +485,12 @@ class LiteLLMClient:
                 "timeout": self.s.llm_timeout_seconds,
                 "num_retries": self.s.llm_max_retries,
                 "json_mode": self.s.llm_json_mode,
-                # temperature/reasoning_effort only appear here when an operator actually
-                # pinned them (LLM_TEMPERATURE/LLM_REASONING_EFFORT); otherwise litellm/the
-                # provider picks its own default and this dict stays unchanged.
-                **({"temperature": self.s.llm_temperature} if self.s.llm_temperature is not None else {}),
+                # temperature/reasoning_effort only appear here when actually pinned — either a
+                # per-call override (e.g. find_threats's threat_identification_temperature) or an
+                # operator-pinned LLM_TEMPERATURE/LLM_REASONING_EFFORT; read back from `kwargs`
+                # (the resolved, effective value _chat_kwargs already computed) rather than
+                # re-deriving the same precedence here a second time.
+                **({"temperature": kwargs["temperature"]} if "temperature" in kwargs else {}),
                 **({"reasoning_effort": self.s.llm_reasoning_effort}
                 if self.s.llm_reasoning_effort is not None else {}),
             },
@@ -337,8 +536,27 @@ class LiteLLMClient:
         `texts` list, exactly the way every caller of this method assumes.
         (The `rerank()` method below has the exact same class of problem,
         solved the same way — see its comment for details.)
+
+        A LENGTH GUARD, CHECKED BEFORE EITHER PROVIDER BRANCH: every real caller of this
+        method embeds a short label for similarity matching against the threat library —
+        either a name already in the library (≤500 chars in the DB schema that stores it) or
+        the AI's own proposed type/name text (unbounded at the schema level, but the prompt
+        that produces it explicitly asks for a short label, not a document — see
+        prompts.threats_prompt). Either way it's a label, never a document. Something over
+        `_MAX_EMBED_CHARS` is never legitimate content, always a bug (a document/description
+        routed here instead of a name), so it's rejected outright
+        rather than silently truncated — truncating a name changes its meaning without
+        anyone noticing, which is worse than a clear, immediate error. Checked once here,
+        ahead of the local/remote split, so it protects both providers without duplicating
+        the check in each branch.
         """
         texts = _apply_embed_prefix(self.s, list(texts), kind)  # e5 prefixes, both providers
+        too_long = [t for t in texts if len(t) > _MAX_EMBED_CHARS]
+        if too_long:
+            raise ValueError(
+                f"embed() received {len(too_long)} text(s) over {_MAX_EMBED_CHARS} chars "
+                f"(longest {max(len(t) for t in too_long)}) — refusing to send to the embedding "
+                "model; this is never legitimate input for a short library-matching label")
         if self.s.embedding_provider == "local":
             from app.pipeline import local_models
 
@@ -346,11 +564,12 @@ class LiteLLMClient:
         import litellm
 
         model = model or self.s.embedding_model
-        resp = litellm.embedding(
-            model=model, input=texts,
-            api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
-            timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
-        )
+        with _llm_slot(self.s):
+            resp = litellm.embedding(
+                model=model, input=texts,
+                api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
+                timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
+            )
         # `data` MAY come back out of input order; sort by index so positional callers
         # (embeddings.get_vectors's zip) never cache a text against the wrong vector. cf. rerank().
         return [d["embedding"] for d in sorted(resp["data"], key=lambda d: d["index"])]
@@ -398,11 +617,12 @@ class LiteLLMClient:
         import litellm
 
         model = model or self.s.reranker_model
-        resp = litellm.rerank(
-            model=model, query=query, documents=list(docs),
-            api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
-            timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
-        )
+        with _llm_slot(self.s):
+            resp = litellm.rerank(
+                model=model, query=query, documents=list(docs),
+                api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
+                timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
+            )
         by_index = {r["index"]: float(r["relevance_score"]) * 100.0 for r in resp["results"]}
         missing = [i for i in range(len(docs)) if i not in by_index]
         if missing:
@@ -410,6 +630,342 @@ class LiteLLMClient:
                 f"rerank returned {len(by_index)} scores for {len(docs)} docs "
                 f"(missing index(es): {missing})")
         return [by_index[i] for i in range(len(docs))]
+
+
+@dataclass
+class ModerationResult:
+    """Outcome of one moderation check (see `moderate` below) — always returned, never raises,
+    so a scenario's ValidationJSON can always record what happened. `checked=False` covers
+    BOTH "the feature is off" and "the call itself failed" — `error` distinguishes the two;
+    either way, "not checked" must never be conflated with "checked and came back clean"."""
+    checked: bool
+    flagged: bool = False
+    categories: list[str] = field(default_factory=list)
+    error: str | None = None
+
+
+def moderate(text: str, *, settings: Settings | None = None) -> ModerationResult:
+    """Content-moderation check for one piece of AI-generated text, via the litellm proxy's
+    OpenAI-compatible /moderations endpoint. Off by default (LLM_MODERATION_ENABLED) — not
+    every deployment's proxy has a moderation model registered, and this app's whole job is
+    writing about attacks/breaches/sabotage, exactly what moderation categories are tuned to
+    flag, so this is advisory (see the caller in tasks.py), never a hard gate.
+
+    NOT on the `LLMClient` Protocol: moderation has exactly one real backend (the proxy),
+    unlike chat/embed/rerank's genuine provider-swap design (azure/openai/proxy, local/proxy)
+    — putting it on the Protocol would force a dead `.moderate()` onto the test-only
+    `StubLLMClient` for no reason. A free function, same shape as `verify_litellm_models`.
+
+    WHY THIS BYPASSES litellm.moderation() ENTIRELY: its sync `moderation()` does not thread
+    `timeout`/`num_retries` into the `openai.OpenAI()` client it builds internally — passing
+    them as kwargs is silently ignored, which would break this file's "every call is bounded"
+    rule. It also falls back to a GLOBAL `litellm.api_key`/`OPENAI_API_KEY` env var if
+    `api_key` isn't passed explicitly, which could silently hit real OpenAI instead of the
+    configured proxy. Building and calling `openai.OpenAI` directly here is the same "route
+    around a litellm limitation, call the documented client API directly" move
+    `verify_litellm_models` already makes for `/v1/models` via `httpx.Client`.
+
+    NEVER RAISES (except `LLMSlotUnavailable`, same "temporary, not a bug" contract as
+    chat/embed/rerank): a moderation-service failure must never block scenario generation —
+    moderation is a secondary safety net on top of the primary `chat()` call that wrote the
+    text, not equally critical. Every other failure returns `checked=False` with `error` set.
+
+    [REVIEW-FIX] applies `_ensure_litellm_proxy_bypassed` before constructing the client —
+    moderation's target host (`s.litellm_base_url`) is independent of `llm_provider`/
+    `embedding_provider`/`reranker_provider` (moderation has exactly one backend, unlike
+    those three), so a deployment using moderation WITHOUT routing chat/embed/rerank through
+    the proxy (e.g. llm_provider=azure_openai, moderation on) would never otherwise call the
+    bypass fix anywhere in the process — hitting the exact CONNECT-hang bug it exists to
+    solve, on every single moderation call, silently degrading to "always unavailable" with
+    only a warning log to notice by.
+    """
+    s = settings or get_settings()
+    if not s.llm_moderation_enabled:
+        return ModerationResult(checked=False)
+
+    _ensure_litellm_proxy_bypassed(s)
+    kwargs: dict[str, Any] = {"input": text}
+    if s.llm_moderation_model:
+        kwargs["model"] = s.llm_moderation_model
+    try:
+        client = _moderation_client(s.litellm_api_key, f"{s.litellm_base_url.rstrip('/')}/v1",
+                                    s.llm_timeout_seconds, s.llm_max_retries)
+        with _llm_slot(s):
+            resp = client.moderations.create(**kwargs)
+        # [REVIEW-FIX] parsing moved INSIDE the try: an empty resp.results (or any other
+        # unexpected response shape) previously raised IndexError past this function's own
+        # "never raises" contract, uncaught anywhere below tasks.py — silently turning a
+        # malformed moderation response into a full subsystem ERROR, exactly the outcome
+        # moderation being advisory-only was supposed to prevent.
+        result = resp.results[0]
+        flagged_categories = [cat for cat, is_flagged in result.categories.model_dump().items() if is_flagged]
+    except LLMSlotUnavailable:
+        raise
+    except Exception:  # noqa: BLE001 — a moderation-service failure must never block generation
+        log.warning("llm.moderation_call_failed", exc_info=True)
+        return ModerationResult(checked=False, error="moderation_unavailable")
+
+    return ModerationResult(checked=True, flagged=result.flagged, categories=flagged_categories)
+
+
+@lru_cache
+def _moderation_client(api_key: str, base_url: str, timeout: float, max_retries: int):
+    """[REVIEW-FIX] `moderate()` runs on the real generation hot path (once per scenario, via
+    `tasks.py::_moderation_report`) — unlike `verify_litellm_models`/`log_litellm_key_info`/
+    `check_litellm_proxy_health`, which each construct their own low-frequency (boot-time or
+    once-per-self-check-interval) client. Constructing a fresh `openai.OpenAI` on every call
+    would mean a fresh TCP/TLS handshake per scenario with no connection reuse — cached here
+    the same way `LiteLLMClient` itself is cached via `get_llm()`'s `@lru_cache`. Keyed on the
+    scalar values that actually determine client identity (not the whole `Settings` object,
+    which isn't hashable) — different `Settings` instances with the same values correctly
+    share one client; different values (e.g. a test's fake base_url) correctly get their own.
+
+    [REVIEW-FIX considered and rejected] moving `_ensure_litellm_proxy_bypassed` in here
+    (cache-populating path only, vs. every `moderate()` call) was considered to cut a redundant
+    call — but that call takes the `Settings` object, and this function only receives scalar
+    values, not the object itself. Reaching for `get_settings()` here instead of the exact `s`
+    `moderate()` was given would use the GLOBAL settings even when a caller (e.g. a test)
+    explicitly passed a different one — a real correctness bug traded for a no-op optimization
+    (the call is in-memory string/dict work, not I/O; its cost is unmeasurable next to the
+    network round-trip this function's result is used for). Left in `moderate()` as-is."""
+    import openai
+
+    return openai.OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=max_retries)
+
+
+def verify_litellm_models(settings: Settings | None = None) -> None:
+    """Fail-fast at worker startup: confirm every model this deployment is actually
+    configured to reach THROUGH THE LITELLM PROXY is really registered there — same
+    "don't silently run broken" discipline as local_models.validate_local_models for the
+    in-process path (same `settings: Settings | None = None` override-for-tests shape too),
+    called alongside it in celery_app.py's _init_worker.
+
+    Only checks the providers actually set to 'litellm_proxy' — llm_provider defaults to
+    'azure_openai' and embedding_provider/reranker_provider both default to 'local', so in
+    a deployment that never points any of the three at the proxy (e.g. a dev environment
+    with no proxy access), `wanted` ends up empty and this makes no network call at all.
+
+    Applies the same proxy-bypass fix `get_llm()` applies (`_ensure_litellm_proxy_bypassed`)
+    BEFORE making its own network call below — this function is called from `_init_worker`
+    at worker boot, strictly before any task (and therefore before any `get_llm()` call)
+    could possibly have run in that process, so it can't rely on `get_llm()` having already
+    set the env var. Without this, a worker behind a broken internal proxy would hang/fail
+    right here at startup — the worst-case version of the bug the fix exists to solve.
+    """
+    s = settings or get_settings()
+    _ensure_litellm_proxy_bypassed(s)
+    # [REVIEW-FIX] the litellm_proxy-specific checks below only ever ran for that one provider —
+    # azure_openai/openai (the documented default) had no reachability check anywhere. Runs
+    # regardless of whether `wanted` (below) ends up empty, since this is orthogonal to it.
+    if s.llm_provider != "litellm_proxy":
+        _verify_direct_chat_provider_reachable(s)
+    wanted: dict[str, str] = {}
+    if s.llm_provider == "litellm_proxy":
+        wanted["inference_model"] = s.inference_model
+    if s.embedding_provider == "litellm_proxy":
+        wanted["embedding_model"] = s.embedding_model
+    if s.reranker_provider == "litellm_proxy":
+        wanted["reranker_model"] = s.reranker_model
+    if not wanted:
+        return
+
+    import httpx
+
+    # Retries + a clear, wrapped error message here for the same reason every other LLM call
+    # in this codebase gets them (litellm.completion/embedding/rerank all pass num_retries) —
+    # this runs at worker startup, so a brief network blip (e.g. the proxy mid-rolling-deploy)
+    # must not hard-fail the whole worker the way an unretried single attempt would.
+    try:
+        with httpx.Client(transport=httpx.HTTPTransport(retries=s.llm_max_retries)) as client:
+            resp = client.get(f"{s.litellm_base_url}/v1/models",
+                            headers={"Authorization": f"Bearer {s.litellm_api_key}"},
+                            timeout=s.llm_timeout_seconds)
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(
+            f"litellm proxy at {s.litellm_base_url} was unreachable or rejected the request "
+            f"while verifying configured model(s) {sorted(wanted.values())}: {exc}") from exc
+
+    available = {m["id"] for m in resp.json()["data"]}
+    missing = {setting: model for setting, model in wanted.items() if model not in available}
+    if missing:
+        raise RuntimeError(
+            f"litellm proxy at {s.litellm_base_url} does not have the configured model(s) "
+            f"registered: {missing} — check {', '.join(missing)} against the proxy's own model list")
+
+    if s.embedding_provider == "litellm_proxy":
+        _verify_embedding_dimensions(s)
+
+    # Observability, not verification: log each wanted model's configured rate limit (if any)
+    # so a later rate-limit incident can be cross-checked against what was actually configured
+    # AT DEPLOY TIME, in this worker's own startup log — instead of relying on someone's memory
+    # of a config value that can silently drift. There's no `Settings` field for an "expected"
+    # rpm to assert against (none has ever been needed), so this never raises — a failure here
+    # only means the log line is missing, never that the worker fails to start.
+    try:
+        with httpx.Client(transport=httpx.HTTPTransport(retries=s.llm_max_retries)) as client:
+            info_resp = client.get(f"{s.litellm_base_url}/model/info",
+                                    headers={"Authorization": f"Bearer {s.litellm_api_key}"},
+                                    timeout=s.llm_timeout_seconds)
+            info_resp.raise_for_status()
+        by_name = {m.get("model_name"): m for m in info_resp.json().get("data", [])}
+        for model in wanted.values():
+            rpm = by_name.get(model, {}).get("litellm_params", {}).get("rpm")
+            log.info("llm.model_config", model=model, rpm=rpm)
+    except Exception:  # noqa: BLE001 — informational only, must never block worker boot
+        log.warning("llm.model_config_check_failed", exc_info=True)
+
+
+def _verify_direct_chat_provider_reachable(s: Settings) -> None:
+    """[REVIEW-FIX] verify_litellm_models above only checks providers actually set to
+    'litellm_proxy' — for the documented DEFAULT (llm_provider=azure_openai) or 'openai', there
+    was no boot-time (or any) reachability check at all. An expired Azure key or a decommissioned
+    deployment would boot the worker cleanly and only surface on a real user's first pipeline run.
+
+    Reuses LiteLLMClient.chat() itself (the exact same azure_openai/openai dispatch path a real
+    session uses — see _chat_kwargs) rather than re-implementing provider-specific reachability
+    logic, and discards the result; this is a real, minimal call, same "pay for one real call at
+    boot" tradeoff _verify_embedding_dimensions above already makes for the embedding path.
+    Deliberately a boot-time-only check, not also wired into the periodic self-check — unlike
+    check_litellm_proxy_health's free `/health/readiness` ping, there's no cheap non-billed
+    reachability probe for a direct Azure/OpenAI chat deployment; repeating a real completion
+    call every self_check_interval_seconds (five minutes, by default) forever would be a real,
+    ongoing cost for a boot-time-class problem.
+
+    [REVIEW-FIX] the message must contain the literal word "json" — when the operator has
+    LLM_JSON_MODE on, _chat_kwargs() adds response_format={"type": "json_object"} to EVERY
+    chat() call including this one, and OpenAI/Azure OpenAI's Chat Completions API rejects any
+    json_object request with a 400 unless "json" appears somewhere in the messages. A plain
+    "ping" satisfied that on litellm_proxy (which doesn't enforce it) but 400'd on every direct
+    azure_openai/openai boot once JSON mode was enabled — this wording is a no-op for reachability
+    but keeps the call valid under either json_mode setting."""
+    try:
+        LiteLLMClient(s).chat([{"role": "user", "content": 'Reply with any valid json, e.g. {"ok": true}.'}])
+    except Exception as exc:
+        raise RuntimeError(
+            f"{s.llm_provider} chat provider was unreachable or rejected a startup "
+            f"verification call: {exc}") from exc
+
+
+def _verify_embedding_dimensions(s: Settings) -> None:
+    """[Fix] `local_models.validate_local_models` already fails fast if the LOCAL embedding
+    model's real output dimension doesn't match `EMBEDDING_DIMENSIONS` — but that check is
+    gated on `embedding_provider == "local"` and never ran for `litellm_proxy`. That gap was a
+    real, live landmine: `EMBEDDING_DIMENSIONS` defaults to 1024 (sized for the local default
+    model), but a proxy-routed model like `qwen3-embedding-8b-mig` actually returns 4096-dim
+    vectors (confirmed via live testing). Nothing anywhere enforced this — vectors are stored
+    in Mongo as a schema-less JSON array (`embeddings.py`'s `_stage_for_write`), with no
+    fixed-width column or dimension check on read. The actual corruption mechanism:
+    `grounding.how_similar`'s `zip(a, b)` silently truncates to the shorter vector on a length
+    mismatch — no exception, no log line, just a numerically plausible but meaningless cosine
+    score feeding real threat-grounding decisions.
+
+    Fail-fast here mirrors `local_models.py`'s exact contract: costs one real embedding call
+    (not just a GET) at worker boot — same cadence/cost `validate_local_models` already pays
+    to load and warm the real local model when that path is active instead.
+    """
+    import litellm
+
+    with _llm_slot(s):
+        resp = litellm.embedding(
+            model=s.embedding_model, input=["dimension check"],
+            api_base=s.litellm_base_url, api_key=s.litellm_api_key,
+            timeout=s.llm_timeout_seconds, num_retries=s.llm_max_retries,
+        )
+    dim = len(resp["data"][0]["embedding"])
+    if dim != s.embedding_dimensions:
+        raise RuntimeError(
+            f"EMBEDDING_DIMENSIONS={s.embedding_dimensions} but litellm proxy model "
+            f"'{s.embedding_model}' actually returns {dim}-dimensional vectors — fix "
+            f"EMBEDDING_DIMENSIONS in .env before starting; a stale mismatch here would "
+            f"otherwise corrupt threat-grounding similarity scores silently (see "
+            f"grounding.how_similar)")
+
+
+def log_litellm_key_info(settings: Settings | None = None) -> None:
+    """Observability, same spirit as the model-config logging in `verify_litellm_models`
+    (called alongside it in `_init_worker`): logs what the litellm proxy says THIS deployment's
+    own API key is actually configured with (rate limit, budget, etc.), so `max_concurrent_llm_calls`
+    tuning is eventually checkable against the proxy's real ceiling instead of a guess.
+
+    The `/key/info` response shape isn't confirmed against a real proxy from this dev
+    environment (no live access) — parsed defensively below (`.get()` chains, never assumes a
+    nested path exists) so an unexpected shape degrades to "log the raw body" rather than a
+    crash. Never raises: this is a log line, not a gate — a failure here must never block a
+    worker from starting.
+    """
+    s = settings or get_settings()
+    # [REVIEW-FIX] includes llm_moderation_enabled, matching _ensure_litellm_proxy_bypassed's
+    # own gate below — moderation's key is the same litellm_api_key this logs, and a
+    # moderation-only deployment (no provider routed through the proxy) previously skipped
+    # this log line entirely, even though moderate() itself does reach the proxy.
+    if not (s.llm_provider == "litellm_proxy" or s.embedding_provider == "litellm_proxy"
+            or s.reranker_provider == "litellm_proxy" or s.llm_moderation_enabled):
+        return
+
+    # [REVIEW-FIX] this function's own httpx.Client() call never goes through get_llm() —
+    # same reasoning as verify_litellm_models/check_litellm_proxy_health: self-apply the fix
+    # rather than rely on call order (today it happens to run right after
+    # verify_litellm_models in _init_worker, which already applies it — but that's an
+    # accident of call order, not something this function should depend on).
+    _ensure_litellm_proxy_bypassed(s)
+    import httpx
+
+    try:
+        with httpx.Client(transport=httpx.HTTPTransport(retries=s.llm_max_retries)) as client:
+            resp = client.get(f"{s.litellm_base_url}/key/info",
+                            headers={"Authorization": f"Bearer {s.litellm_api_key}"},
+                            timeout=s.llm_timeout_seconds)
+            resp.raise_for_status()
+        body = resp.json()
+        info = body.get("info") if isinstance(body, dict) else None
+        if isinstance(info, dict):
+            log.info("llm.key_info", rpm_limit=info.get("rpm_limit"), tpm_limit=info.get("tpm_limit"),
+                    max_budget=info.get("max_budget"), spend=info.get("spend"))
+        else:  # [REVIEW-FIX] shape didn't match what was expected — logging the raw body here was
+            # itself a leak risk (an unconfirmed future litellm response shape could carry
+            # something more sensitive than rpm_limit/tpm_limit/max_budget/spend, with no
+            # redact() applied). Log only that the shape was unexpected, never the body itself.
+            log.warning("llm.key_info_unexpected_shape")
+    except Exception:  # noqa: BLE001 — informational only, must never block worker boot
+        log.warning("llm.key_info_check_failed", exc_info=True)
+
+
+def _ensure_litellm_proxy_bypassed(s: Settings) -> None:
+    """Jumpserver-confirmed bug, fixed here at its root: an internal HTTP_PROXY/HTTPS_PROXY
+    that httpx (which litellm/openai use internally) auto-routes through by default never
+    completes the CONNECT tunnel to the litellm proxy host, hanging every chat/embed/rerank
+    call until timeout. `litellm.completion()`/`embedding()`/`rerank()` don't expose a
+    `trust_env`/`http_client` override the way constructing an `httpx.Client` directly would
+    — so the fix has to work at the environment-variable layer instead: `NO_PROXY` is honored
+    by virtually every Python HTTP library, regardless of which one litellm uses internally
+    (today's httpx, or a future replacement).
+
+    Only runs when something is actually configured to reach the proxy — either one of the
+    three chat/embed/rerank providers, OR moderation (`moderate()`'s only backend IS the
+    proxy, independent of those three — [REVIEW-FIX] a deployment can enable moderation
+    without routing chat/embed/rerank through the proxy at all, and this gate must reflect
+    every real reason to reach it, not just the original three). Merges into any existing
+    `NO_PROXY`/`no_proxy` value rather than overwriting it, since an operator may already
+    have legitimate other entries there.
+    """
+    if not (s.llm_provider == "litellm_proxy" or s.embedding_provider == "litellm_proxy"
+            or s.reranker_provider == "litellm_proxy" or s.llm_moderation_enabled):
+        return
+    host = urlparse(s.litellm_base_url).hostname
+    if not host:
+        # urlparse only recognizes a netloc/hostname when the string starts with "//" — a
+        # scheme-less value (an operator pasting "host:port" instead of "https://host:port"
+        # into LITELLM_BASE_URL) parses with hostname=None otherwise. Retry with a "//" prefix
+        # before giving up, so this common misconfiguration doesn't silently skip the fix.
+        host = urlparse(f"//{s.litellm_base_url}").hostname
+    if not host:
+        log.warning("llm.proxy_bypass_no_hostname", litellm_base_url=s.litellm_base_url)
+        return
+    for var in ("NO_PROXY", "no_proxy"):
+        existing = [h for h in os.environ.get(var, "").split(",") if h]
+        if host not in existing:
+            os.environ[var] = ",".join([*existing, host])
 
 
 @lru_cache
@@ -425,6 +981,8 @@ def get_llm() -> LLMClient:
     `get_llm()` — from any pipeline stage, anywhere — just returns that same
     already-built instance instantly, instead of re-reading `Settings` and
     constructing a brand new client object every single time an AI call is
-    needed.
+    needed. That's also why the proxy-bypass env-var fix below only needs to
+    run here, once per process, rather than on every individual call.
     """
+    _ensure_litellm_proxy_bypassed(get_settings())
     return LiteLLMClient()

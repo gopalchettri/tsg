@@ -17,7 +17,7 @@ depends_on = None
 def upgrade() -> None:
     op.execute(
         "CREATE UNIQUE INDEX UX_ThreatType_NaturalKey "
-        "ON Threat_Type(ThreatTypeName, PrimaryThreatCategoryID, SectorID) "
+        "ON Threat_Type(ThreatTypeName, ThreatCategoryID, SectorID) "
         "WHERE IsActive = 1 AND IsDeleted = 0"
     )
     op.execute(

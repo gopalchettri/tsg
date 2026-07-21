@@ -92,7 +92,7 @@ def test_validate_scenario_warns_when_statement_ignores_threat():
         {"scenario_title": "t", "scenario_statement": "Vague trouble happens.",
          "business_impact": "b", "operational_impact": "o", "risk_statement": "r"},
         "Firmware Tampering", "Bootloader implant")
-    assert "scenario_statement does not reference the threat name/type" in v["errors"]
+    assert "scenario_statement does not reference the threat name/type (Bootloader implant)" in v["errors"]
 
 
 def test_validate_scenario_falls_back_to_type_when_name_missing():
@@ -100,6 +100,89 @@ def test_validate_scenario_falls_back_to_type_when_name_missing():
         {"scenario_title": "t", "scenario_statement": "Firmware Tampering hits the OTA channel.",
          "business_impact": "b", "operational_impact": "o", "risk_statement": "r"},
         "Firmware Tampering", None)
+    assert v["validation_status"] == "ok"
+
+
+def test_validate_scenario_ok_when_risk_statement_references_asset_and_critical_service():
+    v = validate_scenario(
+        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+         "business_impact": "b", "operational_impact": "o",
+         "risk_statement": "Bootloader implant on Substation Gateway 4 threatens Grid Balancing "
+                            "availability and safety."},
+        "Firmware Tampering", "Bootloader implant",
+        asset_name="Substation Gateway 4", critical_service=["Grid Balancing"])
+    assert v["validation_status"] == "ok"
+
+
+def test_validate_scenario_warns_when_risk_statement_missing_asset():
+    v = validate_scenario(
+        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+         "business_impact": "b", "operational_impact": "o",
+         "risk_statement": "This threatens Grid Balancing availability and safety."},
+        "Firmware Tampering", "Bootloader implant",
+        asset_name="Substation Gateway 4", critical_service=["Grid Balancing"])
+    assert "risk_statement does not reference the asset (Substation Gateway 4)" in v["errors"]
+
+
+def test_validate_scenario_warns_when_risk_statement_missing_critical_service():
+    v = validate_scenario(
+        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+         "business_impact": "b", "operational_impact": "o",
+         "risk_statement": "Bootloader implant on Substation Gateway 4 threatens operations."},
+        "Firmware Tampering", "Bootloader implant",
+        asset_name="Substation Gateway 4", critical_service=["Grid Balancing"])
+    assert "risk_statement does not reference the critical service (Grid Balancing)" in v["errors"]
+
+
+def test_validate_scenario_ok_when_risk_statement_references_any_one_of_multiple_services():
+    # An asset can link to more than one critical service (context.py::_load_asset) — the check
+    # must pass if the risk_statement mentions ANY one of them, not require all.
+    v = validate_scenario(
+        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+         "business_impact": "b", "operational_impact": "o",
+         "risk_statement": "Bootloader implant on Substation Gateway 4 threatens Grid Balancing "
+                            "availability and safety."},
+        "Firmware Tampering", "Bootloader implant",
+        asset_name="Substation Gateway 4", critical_service=["Grid Balancing", "Load Forecasting"])
+    assert v["validation_status"] == "ok"
+
+
+def test_validate_scenario_skips_critical_service_check_when_unset():
+    # not every asset has a critical_service configured — a blank one must never false-flag
+    v = validate_scenario(
+        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+         "business_impact": "b", "operational_impact": "o",
+         "risk_statement": "Bootloader implant on Substation Gateway 4 threatens operations."},
+        "Firmware Tampering", "Bootloader implant",
+        asset_name="Substation Gateway 4", critical_service=None)
+    assert v["validation_status"] == "ok"
+
+
+def test_validate_scenario_word_boundary_prevents_false_positive_substring_match():
+    # [REVIEW-FIX] a naive `needle in haystack` check let a short asset name silently "match"
+    # inside an unrelated word — "CAD" is a real fixture asset name in this codebase (Computer-
+    # Aided Dispatch) and is a literal substring of "cascade". Before the fix, this risk_statement
+    # (which never actually mentions the CAD asset) would have wrongly validated as ok.
+    v = validate_scenario(
+        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+         "business_impact": "b", "operational_impact": "o",
+         "risk_statement": "A ransomware infection could cascade into downstream dispatch "
+                            "failures across multiple counties."},
+        "Firmware Tampering", "Bootloader implant",
+        asset_name="CAD", critical_service=None)
+    assert "risk_statement does not reference the asset (CAD)" in v["errors"]
+
+
+def test_validate_scenario_ignores_whitespace_differences_in_asset_name():
+    # [REVIEW-FIX] a double space baked into the stored asset name (e.g. a copy-paste artifact
+    # in the asset inventory) must not false-flag a risk_statement that plainly references the
+    # same asset with normal single-spaced prose.
+    v = validate_scenario(
+        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+         "business_impact": "b", "operational_impact": "o",
+         "risk_statement": "Bootloader implant on Substation Gateway 4 threatens operations."},
+        "Firmware Tampering", "Bootloader implant",
+        asset_name="Substation  Gateway 4", critical_service=None)
     assert v["validation_status"] == "ok"
 
 

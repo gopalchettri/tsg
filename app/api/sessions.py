@@ -132,15 +132,21 @@ def create_session(
     tenant = get_settings().tenant_id
     sid = dal.guid()
     with db_session() as sess:
+        dal.assert_asset_owned_by_entity(sess, body.asset_id, body.entity_id)
         if idempotency_key:
             existing_id, conflict = dal.reserve_idempotency_key_or_get_existing(
                 sess, str(body.entity_id), idempotency_key, str(body.asset_id))
             if existing_id:  # `conflict` is only ever True alongside a found row
                 if conflict:
                     raise IdempotencyKeyConflict(existing_id)
-                return JSONResponse(status_code=200, content={"session_id": existing_id})
+                # [REVIEW-FIX] previously a hand-rolled {"session_id": existing_id} dict — same
+                # shape as CreateSessionResponse today, but drifts silently the moment that model
+                # ever grows a field, and the raw dict skips response_model serialization/OpenAPI
+                # documentation entirely. Routing through the model keeps this branch shape-locked
+                # to the same contract the fresh-create (202) path returns.
+                return JSONResponse(status_code=200, content=CreateSessionResponse(session_id=existing_id).model_dump())
 
-        dal.assert_capacity_available(sess)  # 503 before the more expensive gather_asset_details
+        dal.assert_capacity_available(sess, entity_id=body.entity_id)  # 503 before the more expensive gather_asset_details
 
         ctx = gather_asset_details(sess, asset_id=body.asset_id, entity_id=body.entity_id,
                             sector_id=body.sector_id, user_id=body.user_id,
@@ -183,7 +189,8 @@ def get_results(session_id: str, principal: Principal = Depends(get_principal)) 
                         m.Identified_Threat.GroundingStatus, m.Identified_Threat.ThreatCatalogueID])
         scenarios = get_current_rows(m.Threat_Scenario_Output,
                             [m.Threat_Scenario_Output.OutputID, m.Threat_Scenario_Output.SubsystemID,
-                            m.Threat_Scenario_Output.ScenarioJSON, m.Threat_Scenario_Output.Accepted])
+                            m.Threat_Scenario_Output.ScenarioJSON, m.Threat_Scenario_Output.Accepted,
+                            m.Threat_Scenario_Output.ValidationJSON])
         # add entity_id to the result for downstream consumers — the same value every row shares, so just pick one
         return SessionResults(
             session_id=sid, entity_id=entity_id,
@@ -191,10 +198,56 @@ def get_results(session_id: str, principal: Principal = Depends(get_principal)) 
                                 threat_type=t["ThreatType"], threat_name=t["ThreatName"],
                                 grounding_status=t["GroundingStatus"],
                                 threat_catalogue_id=t["ThreatCatalogueID"]) for t in threats],
-            scenarios=[ScenarioResult(output_id=s["OutputID"], supporting_system_id=s["SubsystemID"],
-                                    scenario=json.loads(s["ScenarioJSON"]) if s["ScenarioJSON"] else None,
-                                    accepted=bool(s["Accepted"])) for s in scenarios],
+            scenarios=[_scenario_result(s) for s in scenarios],
         )
+
+
+def _moderation_summary(validation_json: str | None) -> tuple[bool | None, list[str]]:
+    """[REVIEW-FIX] pulls the moderation flag out of a scenario's ValidationJSON (llm.moderate's
+    result, folded in by tasks.py::_moderation_report) for a reviewer to see. None for `flagged`
+    means moderation was never checked (off by default, or the service was unavailable) — kept
+    distinct from checked-and-clean (False) rather than collapsing both to one falsy value.
+    Defensive against a missing/malformed blob, same as every other best-effort JSON parse in
+    this codebase — a reviewer should never get a 500 over an unrelated field's shape."""
+    if not validation_json:
+        return None, []
+    try:
+        report = json.loads(validation_json)
+    except (json.JSONDecodeError, TypeError):
+        return None, []
+    moderation = report.get("moderation") if isinstance(report, dict) else None
+    if not isinstance(moderation, dict) or not moderation.get("checked"):
+        return None, []
+    return bool(moderation.get("flagged")), list(moderation.get("categories") or [])
+
+
+def _validation_summary(validation_json: str | None) -> tuple[str | None, list[str]]:
+    """Pulls validate_scenario's own structural/consistency report (missing fields, statement
+    not referencing the threat, risk_statement not referencing the asset/critical service) out of
+    a scenario's ValidationJSON for a reviewer to see — same reasoning, and same defensive
+    parsing, as _moderation_summary above: a warning-status scenario was previously written to
+    the DB but invisible to any human reviewer through this API. None for validation_status means
+    the field is missing/malformed, not that it was checked and clean (that's the string "ok")."""
+    if not validation_json:
+        return None, []
+    try:
+        report = json.loads(validation_json)
+    except (json.JSONDecodeError, TypeError):
+        return None, []
+    if not isinstance(report, dict):
+        return None, []
+    status = report.get("validation_status")
+    return (status if isinstance(status, str) else None), list(report.get("errors") or [])
+
+
+def _scenario_result(row: dict) -> ScenarioResult:
+    flagged, categories = _moderation_summary(row["ValidationJSON"])
+    validation_status, validation_errors = _validation_summary(row["ValidationJSON"])
+    return ScenarioResult(output_id=row["OutputID"], supporting_system_id=row["SubsystemID"],
+                        scenario=json.loads(row["ScenarioJSON"]) if row["ScenarioJSON"] else None,
+                        accepted=bool(row["Accepted"]),
+                        moderation_flagged=flagged, moderation_categories=categories,
+                        validation_status=validation_status, validation_errors=validation_errors)
 
 
 @router.post("/sessions/{session_id}/accept", response_model=AcceptResponse)
@@ -350,6 +403,7 @@ def get_accepted_scenarios(asset_id: int, entity: str,
     than a 404."""
     with db_session() as sess:
         principal.require_entity(entity)
+        dal.assert_asset_owned_by_entity(sess, asset_id, entity)
         scenario_session = dal.latest_completed_session(sess, entity, str(asset_id))
         # no completed session yet -> empty scenario list, not an error
         rows = dal.accepted_scenarios(sess, scenario_session["SessionID"]) if scenario_session else []

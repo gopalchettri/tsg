@@ -6,7 +6,7 @@ can be found in one place without wading through route logic.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -91,6 +91,20 @@ class ScenarioResult(BaseModel):
     supporting_system_id: int
     scenario: dict[str, Any] | None
     accepted: bool
+    # [REVIEW-FIX] previously ValidationJSON (where llm.moderate's result lands, via
+    # tasks.py::_moderation_report) was never selected here at all — a flagged scenario was
+    # written to the DB but invisible to any human reviewer through this API. None means
+    # moderation was never checked (off by default, or the moderation service was
+    # unavailable) — distinct from checked-and-clean (False).
+    moderation_flagged: bool | None = None
+    moderation_categories: list[str] = []
+    # [REVIEW-FIX] same gap as moderation above, for validate_scenario's own structural/
+    # consistency report (missing fields, statement not referencing the threat, risk_statement
+    # not referencing the asset/critical service) — also landed in ValidationJSON but was never
+    # selected here either, so a warning-status scenario looked identical to a clean one through
+    # this API. None means the field is missing/malformed, not "checked and clean" (that's "ok").
+    validation_status: str | None = None
+    validation_errors: list[str] = []
 
 
 class SessionResults(BaseModel):
@@ -137,3 +151,40 @@ class AcceptedScenariosResponse(BaseModel):
     session_id: str | None      # None - the asset has no completed session yet (scenarios == [])
     completed_at: datetime | None
     scenarios: list[AcceptedScenario]
+
+
+class EmbeddingActionBody(BaseModel):
+    """Shared request shape for all four admin embedding actions (app/api/admin.py).
+    `group=None` means "every group"; `names`, when given, scopes to just those items and
+    REQUIRES an explicit (non-null) `group` (a name alone doesn't say which table it's in)."""
+    group: Literal["threat_type", "threat_catalogue"] | None = None
+    names: list[str] | None = None
+
+
+class EmbeddingActionResponse(BaseModel):
+    """[REVIEW-FIX] create/update/recreate report ROW-count semantics (active master rows
+    processed); delete reports a DIFFERENT quantity (Mongo vectors actually deleted, which can
+    include stale docs from a retired model) — distinct field names instead of one ambiguous
+    shared key, so the same number never silently means two different things. Only the field
+    the calling route actually populates is non-null. Also the base shape `EmbeddingJobStatus`
+    below extends with `state`/`error` — the eventual RESULT of a queued action, not what a
+    route returns directly (see app/api/admin.py: actions now run via a Celery task)."""
+    rows_processed: dict[str, int | str] | None = None
+    vectors_deleted: dict[str, int | str] | None = None
+
+
+class EmbeddingJobAccepted(BaseModel):
+    """Returned immediately (202) when an admin embedding action is queued — poll
+    GET .../status/{job_id} for the eventual outcome."""
+    job_id: str
+
+
+class EmbeddingJobStatus(EmbeddingActionResponse):
+    """Polled result of a queued admin embedding action. `state` mirrors Celery's own
+    AsyncResult.state (PENDING/STARTED/SUCCESS/FAILURE/RETRY/...); rows_processed/
+    vectors_deleted (inherited) are populated only once `state == "SUCCESS"`, `error` only
+    once `state == "FAILURE"` (e.g. a genuine per-group lock conflict — EmbeddingBusy — surfaces
+    here now, not as an HTTP 409 on the original POST, since that request already returned
+    before the task ran)."""
+    state: str
+    error: str | None = None

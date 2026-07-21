@@ -22,16 +22,31 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.enums import GroundingStatus
+from app.core.logging import get_logger
 from app.db import models as m
 from app.pipeline import embeddings
 from app.pipeline.llm import LLMClient
+
+log = get_logger(__name__)
 
 # Gives each grounding band a rank so two statuses can be compared (see pick_worse_of_two).
 _BAND_ORDER = {GroundingStatus.grounded: 2, GroundingStatus.confirm: 1, GroundingStatus.flagged: 0}
 
 
 def how_similar(a: Sequence[float], b: Sequence[float]) -> float:
-    """Cosine similarity; 0.0 for a zero-magnitude vector instead of raising."""
+    """Cosine similarity; 0.0 for a zero-magnitude vector instead of raising.
+
+    [Fix] raises ValueError on a LENGTH mismatch rather than letting zip(a, b) silently
+    truncate to the shorter vector. A length mismatch is never legitimate input — it always
+    means a real embedding-dimension problem (e.g. a cached vector left over from before an
+    EMBEDDING_PROVIDER/EMBEDDING_DIMENSIONS change; llm.py's verify_litellm_models catches a
+    boot-time MISCONFIGURATION, but not a vector already sitting in the cache from before
+    that). Silently truncating would produce a numerically plausible but meaningless score
+    with no error anywhere — the caller (_shortlist_candidates) is what decides how broadly
+    a single bad vector should be allowed to fail, not this function.
+    """
+    if len(a) != len(b):
+        raise ValueError(f"how_similar received vectors of different lengths ({len(a)} vs {len(b)})")
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
@@ -109,7 +124,19 @@ def get_possible_types(sess: Session, category_id: int | None, sector_ids: list[
         visible_to_this_sector(m.Threat_Type.SectorID, sector_ids),
     )
     if category_id is not None:  # else fall back to searching all categories ([R6])
-        q = q.where(m.Threat_Type.PrimaryThreatCategoryID == category_id)
+        # [A2] Threat_Type.ThreatCategoryID is only a rough single default — an individual
+        # Threat_Catalogue row under a type can carry a DIFFERENT/additional STRIDE category
+        # via Threat_Catalogue_Category_Map (74/75 real curated threats do). Narrowing on the
+        # Type's default alone would wrongly drop a type whose real match is via one of its
+        # OTHER mapped categories, so a type counts as a candidate if EITHER matches.
+        mapped_type_ids = (
+            select(m.Threat_Catalogue.ThreatTypeID)
+            .join(m.Threat_Catalogue_Category_Map,
+                m.Threat_Catalogue_Category_Map.ThreatCatalogueID == m.Threat_Catalogue.ThreatCatalogueID)
+            .where(m.Threat_Catalogue_Category_Map.ThreatCategoryID == category_id)
+        )
+        q = q.where(or_(m.Threat_Type.ThreatCategoryID == category_id,
+                        m.Threat_Type.ThreatTypeID.in_(mapped_type_ids)))
     # ORDER BY makes the underlying row order deterministic (same reason find_category
     # above orders by ThreatCategoryID) so the stable sort below breaks same-specificity
     # ties the same way every time, instead of following SQL Server's arbitrary scan order.
@@ -160,9 +187,20 @@ def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs
     `semantic_match_threshold`, but falls back to the top-K anyway if nothing
     clears it, so a bad match still reaches label_match_from_score as
     `flagged` instead of silently returning nothing.
+    [Fix] a single dimension-mismatched cached vector (see how_similar's ValueError) is
+    skipped with a warning, not allowed to blow up scoring for every OTHER candidate — the
+    blast radius of one corrupted cache entry should be "this one candidate isn't considered
+    this time," not "the whole grounding lookup fails." If every candidate ends up skipped,
+    the caller's own `if not shortlist: return None, 0.0` already handles that gracefully.
     """
     # Score every candidate against the query by cosine similarity, best match first.
-    scored = sorted(((r, how_similar(qv, name_vecs[r[name_key]])) for r in rows), key=lambda rc: rc[1], reverse=True)
+    scored = []
+    for r in rows:
+        try:
+            scored.append((r, how_similar(qv, name_vecs[r[name_key]])))
+        except ValueError:
+            log.warning("grounding.dimension_mismatch_skipped", candidate=r.get(name_key))
+    scored.sort(key=lambda rc: rc[1], reverse=True)
     above = [rc for rc in scored if rc[1] >= s.semantic_match_threshold]
     # Prefer candidates that clear the similarity floor; if none do, fall back to the
     # top-K overall so we still return something (to be scored as "flagged" downstream).
@@ -330,4 +368,9 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
 if __name__ == "__main__":  # cosine self-check
     assert abs(how_similar([1, 0], [1, 0]) - 1.0) < 1e-9
     assert abs(how_similar([1, 0], [0, 1])) < 1e-9
+    try:
+        how_similar([1, 0, 0], [1, 0])  # [Fix] length mismatch must raise, never silently truncate
+        raise AssertionError("how_similar must raise ValueError on a length mismatch")
+    except ValueError:
+        pass
     print("grounding self-check ok")

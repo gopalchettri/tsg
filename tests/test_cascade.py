@@ -31,7 +31,7 @@ class _TwoThreatLLM(StubLLM):
     """Proposes TWO threats (both grounded via the seeded masters: type 10/catalogue
     20 and type 11/catalogue 21) so sibling-preservation tests have siblings."""
 
-    def chat(self, messages, *, model=None):
+    def chat(self, messages, *, model=None, temperature=None):
         sysc = messages[0]["content"].lower()
         if "stride threats" in sysc:
             out = [
@@ -73,6 +73,61 @@ def _output_ids(db, sid):
         .where(m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)
         .order_by(m.Threat_Scenario_Output.OutputID)
     ).scalars().all()
+
+
+class _SlotUnavailableLLM(StubLLM):
+    """Raises LLMSlotUnavailable from chat() — simulates a confirmed, sustained
+    over-capacity condition during scenario generation."""
+
+    def chat(self, messages, *, model=None, temperature=None):
+        from app.pipeline.llm import LLMSlotUnavailable
+        raise LLMSlotUnavailable("no free slot")
+
+
+def test_regen_llm_slot_unavailable_propagates_not_marked_error(db):
+    """[REVIEW-FIX] cascade.py's own catch-all must NOT swallow LLMSlotUnavailable into
+    _record_failure (a permanent per-subsystem ERROR) — it must propagate so Celery's
+    autoretry_for (celery_app.py) can retry the whole regeneration shortly, mirroring the
+    identical fix in tasks.py::_process_all_supporting_systems."""
+    from app.pipeline.llm import LLMSlotUnavailable
+
+    sid = _run_to_review(db, StubLLM())
+    session = dict(load_session(db, sid))
+    output_id = _output_ids(db, sid)[0]
+    _leave_review(db, sid)
+    epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
+    with pytest.raises(LLMSlotUnavailable):
+        cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [output_id], epoch,
+                                _SlotUnavailableLLM(), "77777777-7777-4777-8777-777777777777")
+    row = db.execute(
+        select(m.Subsystem_Stage_State.Status).where(
+            m.Subsystem_Stage_State.SessionID == sid,
+            m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+            m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS,
+        )
+    ).scalar()
+    assert row != StageStatus.ERROR  # a retryable condition, not a recorded failure
+
+
+def test_process_all_supporting_systems_llm_slot_unavailable_propagates_not_marked_error(db):
+    """[REVIEW-FIX] Same fix, main pipeline path: tasks.py::_process_all_supporting_systems's
+    per-subsystem catch-all must not swallow LLMSlotUnavailable into a permanent ERROR
+    either — this is the fresh-session path, mirrored by the regen test above."""
+    from app.pipeline.llm import LLMSlotUnavailable
+
+    session = _seed_session(db)
+    sid = session["SessionID"]
+    with pytest.raises(LLMSlotUnavailable):
+        _process_all_supporting_systems(db, sid, _SlotUnavailableLLM(),
+                                        "88888888-8888-4888-8888-888888888888")
+    row = db.execute(
+        select(m.Subsystem_Stage_State.Status).where(
+            m.Subsystem_Stage_State.SessionID == sid,
+            m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+            m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS,
+        )
+    ).scalar()
+    assert row != StageStatus.ERROR  # a retryable condition, not a recorded failure
 
 
 # --- state transitions ---
@@ -229,13 +284,88 @@ def test_regen_scenario_only_targets_one_output_siblings_untouched(db):
     assert active == 2  # sibling + the freshly regenerated one — still 2 total, none lost
 
 
+# --- [REVIEW-FIX] a targeted regen must never destroy a scenario it can't replace ---
+def test_write_scenarios_target_excluded_by_rescoring_leaves_old_scenario_untouched(db, monkeypatch):
+    """Raising scoping_score_threshold between the original run and a regen request (a
+    curator retuning Config_Threat_Rule weights has the same effect) must not supersede the
+    targeted threat's existing scenario with nothing to replace it — that was strictly worse
+    than the pre-cutoff behavior these settings were meant to improve on."""
+    from app.core.config import get_settings
+    from app.db.dal import RegenerateConflict
+
+    sid = _run_to_review(db, StubLLM())
+    session = dict(load_session(db, sid))
+    old_output = _output_ids(db, sid)[0]
+    threat_id = db.execute(
+        select(m.Scoped_Threat.ThreatID)
+        .select_from(m.Threat_Scenario_Output.__table__.join(
+            m.Scoped_Threat, m.Threat_Scenario_Output.ScopedThreatID == m.Scoped_Threat.ScopedThreatID))
+        .where(m.Threat_Scenario_Output.OutputID == old_output)
+    ).scalar()
+
+    epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,))
+    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,), epoch)
+    threats = dal.active_threats(db, sid, SUB["id"])
+    monkeypatch.setattr(get_settings(), "scoping_score_threshold", 71.0)  # this threat scores exactly 70
+
+    with pytest.raises(RegenerateConflict):
+        write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, threats, StubLLM(),
+                        "44444444-4444-4444-8444-444444444444", epoch=epoch, target_threat_ids={threat_id})
+
+    # destroyed-with-no-replacement is exactly the bug -- the old scenario must still be active
+    assert db.execute(select(m.Threat_Scenario_Output.Superseded)
+                    .where(m.Threat_Scenario_Output.OutputID == old_output)).scalar() == 0
+    status = db.execute(
+        select(m.Subsystem_Stage_State.Status).where(
+            m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+            m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS)
+    ).scalar()
+    assert status == StageStatus.AWAITING_DECISION  # returned to reviewable state, not left stuck RUNNING
+
+
+def test_regen_target_no_longer_selected_returns_to_review_without_losing_the_scenario(db, monkeypatch):
+    """Full cascade path: cascade.py already treats RegenerateConflict as a benign outcome
+    (its own pre-lock/post-lock stale-target re-check) -- this proves that holds for the new
+    rescoring-exclusion case too, end to end, with a sibling present to prove nothing else
+    was touched."""
+    from app.core.config import get_settings
+
+    sid = _run_to_review(db, _TwoThreatLLM())
+    session = dict(load_session(db, sid))
+    target, sibling = _output_ids(db, sid)
+    _leave_review(db, sid)
+    epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
+    monkeypatch.setattr(get_settings(), "scoping_score_threshold", 71.0)  # both threats score exactly 70
+
+    outcome = cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [target], epoch,
+                                    _TwoThreatLLM(), "55555555-5555-4555-8555-555555555555")
+    assert outcome == "review"  # no exception escapes -- a benign conflict, not a recorded failure
+
+    active = db.execute(select(func.count()).select_from(m.Threat_Scenario_Output).where(
+        m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)).scalar()
+    assert active == 2  # both scenarios still present -- nothing lost
+    for output_id in (target, sibling):
+        assert db.execute(select(m.Threat_Scenario_Output.Superseded)
+                        .where(m.Threat_Scenario_Output.OutputID == output_id)).scalar() == 0
+
+
 # --- prompt-quality fix: threat context threading survives the regen cascade ---
+def test_build_regen_audit_detail_redacts_user_note():
+    # [REVIEW-FIX] user_note is raw client free text persisted to the audit trail — must get
+    # the same redact() treatment every other free-text value in this codebase gets.
+    detail = json.loads(cascade._build_regen_audit_detail(
+        {"t1"}, ["t1"], 1, "contact me at a@b.com or key=abcdef1234567890"))
+    assert "a@b.com" not in detail["user_note"]
+    assert "abcdef1234567890" not in detail["user_note"]
+    assert "[REDACTED]" in detail["user_note"]
+
+
 def _spy_scenario_prompt(monkeypatch, captured):
     real_scenario_prompt = prompts.scenario_prompt
 
-    def _spy(asset_name, asset_context, sub, threat_type, threat_name, actors=None):
+    def _spy(asset_name, asset_context, sub, threat_type, threat_name, actors=None, **kw):
         captured.append((threat_type, threat_name))
-        return real_scenario_prompt(asset_name, asset_context, sub, threat_type, threat_name, actors=actors)
+        return real_scenario_prompt(asset_name, asset_context, sub, threat_type, threat_name, actors=actors, **kw)
 
     monkeypatch.setattr("app.pipeline.prompts.scenario_prompt", _spy)
 

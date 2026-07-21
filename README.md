@@ -7,7 +7,9 @@ matrix: [`../TSG_SDD_Remediation.md`](../TSG_SDD_Remediation.md).
 
 ## Status — Milestone 1 (vertical slice)
 End-to-end happy path: `create → profile → identify+ground → scenario → single
-review → accept`, **concurrency-correct from day one**. 121 tests green.
+review → accept`, **concurrency-correct from day one**. Run `pytest --collect-only -q`
+for the current test count — the number moves often enough that hardcoding it here
+just goes stale.
 
 ## Architecture
 Async queue-based load-leveling: FastAPI (REST + SSE) → Redis → Celery workers →
@@ -46,18 +48,29 @@ celery -A app.pipeline.celery_app.celery_app beat -l info   # reaper (M2 wires t
 Local models: `pip install -e ".[local]"` then `python scripts/smoke_local_models.py`
 verifies both model paths load and stay **concurrency-safe under gevent** (fires
 concurrent grounding calls; asserts the worker hub is not frozen by torch inference).
-Integration/load tests (filtered-index 409, GPU sizing) run against a dev TSG
-in CI — see the SDD verification plan.
+Integration/load tests (filtered-index 409, GPU sizing) against a real MSSQL/broker
+are currently run manually, not in CI — see the SDD verification plan for what that
+tier is meant to cover once it's wired up.
 
 ## Config
 All settings are env vars prefixed `TSG_` (see `app/core/config.py`); copy
 `.env.example` to `.env`. Nothing is hardcoded — thresholds, timeouts, pool sizes,
 JWT issuer/JWKS all come from the environment.
 
-**Swap models without code changes** via `.env` (three independent switches):
-- `LLM_PROVIDER` — inference/generation: `litellm_proxy` (default) · `azure_openai` (`AZURE_OPENAI_*`) · `openai`.
-- `EMBEDDING_PROVIDER` — `litellm_proxy` (default) · `local` (in-process, no network; `EMBEDDING_MODEL`=disk path, e.g. `multilingual-e5-large`). `SEMANTIC_MATCH_THRESHOLD` is the cosine floor.
-- `RERANKER_PROVIDER` — `litellm_proxy` (default) · `local` (`RERANKER_MODEL`=disk path, e.g. `bge-reranker-v2-m3`).
+**Swap models without code changes** via `.env` (three independent switches — see
+`.env.example` for a ready-to-use dev config, `.env.prod.example` for production):
+- `LLM_PROVIDER` — inference/generation: `azure_openai` (default, `AZURE_OPENAI_*`) · `openai` · `litellm_proxy`.
+- `EMBEDDING_PROVIDER` — `local` (default; in-process, no network; `EMBEDDING_MODEL`=disk path, e.g. `multilingual-e5-large`) · `litellm_proxy`. `SEMANTIC_MATCH_THRESHOLD` is the cosine floor; `EMBEDDING_DIMENSIONS` must match whichever model is actually configured (e.g. 1024 for local `multilingual-e5-large`, but a proxy-routed model can use a different width — a mismatch fails loud at worker boot).
+- `RERANKER_PROVIDER` — `local` (default; `RERANKER_MODEL`=disk path, e.g. `bge-reranker-v2-m3`) · `litellm_proxy`.
+
+Typical local dev: keep all three at their defaults (`azure_openai`/`local`/`local`) — no
+proxy access needed. Typical production: flip `EMBEDDING_PROVIDER`/`RERANKER_PROVIDER` (and
+optionally `LLM_PROVIDER`) to `litellm_proxy` and point `TSG_LITELLM_BASE_URL`/
+`TSG_LITELLM_API_KEY` at the real proxy — no code change either way.
+
+Optional safety features (off/unset by default, litellm_proxy only): `LLM_MODERATION_ENABLED`
+(flags generated scenario text via the proxy's moderation endpoint — soft-flag, never blocks),
+`LLM_GUARDRAILS` (proxy-side guardrail name(s) to run on every chat call).
 
 Local models need the extra: `pip install -e ".[local]"` (sentence-transformers).
 The real `AZURE_OPENAI_API_KEY` goes in `.env` only — never committed.

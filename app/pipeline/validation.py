@@ -12,6 +12,7 @@ plus a cheap keyword consistency proxy, no LLM-judge call.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from app.core.enums import ValidationStatus
@@ -76,6 +77,29 @@ def _result(errors: list[str]) -> dict[str, Any]:
     return {"validation_status": str(status), "errors": errors}
 
 
+def _references(needle: str, haystack: str) -> bool:
+    """Whether `needle` appears in `haystack` as a whole phrase, not just as raw characters
+    embedded inside an unrelated word. A naive `needle in haystack` check lets a short/common
+    needle silently "match" text that never actually mentions it — e.g. asset name "CAD" is a
+    substring of "cascade", so a risk_statement that never mentions the CAD asset at all but
+    happens to say "...could cascade into..." would wrongly pass. Confirmed live during review:
+    `'cad' in 'could cascade into downstream failures'` is True.
+
+    Normalizes whitespace on both sides first (an asset name stored with a double space
+    shouldn't false-flag prose that naturally renders it with a single space), then requires the
+    match not be immediately flanked by another letter/digit in the HAYSTACK. Deliberately NOT
+    `\\b` — `\\b` only fires at a word/non-word transition, so `\\bneedle\\b` breaks for a needle
+    that itself starts/ends with punctuation (e.g. an asset literally named "(TAAS)"): the `\\b`
+    right before "(" fails when the preceding haystack character is also non-word (a space).
+    Checking only the haystack's neighboring characters — regardless of the needle's own edge
+    character — doesn't have that gap."""
+    n = " ".join(needle.split()).lower()
+    if not n:
+        return False
+    h = " ".join(haystack.split()).lower()
+    return re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])", h) is not None
+
+
 def _normalize_str_list(raw: Any) -> list[str]:
     """A malformed assumptions/excluded_details field from the model (a bare
     string, null, or a list containing non-strings) must never reach the caller
@@ -91,23 +115,46 @@ def _normalize_str_list(raw: Any) -> list[str]:
     return []
 
 
-def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_name: str | None) -> dict[str, Any]:
+def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_name: str | None,
+                    asset_name: str | None = None, critical_service: list[str] | None = None) -> dict[str, Any]:
     """ sanity-checks the Stage-2 scenario — are all five
     required parts there, and does it actually talk about the threat it's
     supposed to be about?
 
     structural (all 5 narrative fields present, non-empty) + consistency
-    proxy (statement references the threat it narrates). Self-reported
-    `assumptions`/`excluded_details` pass through for the reviewer. Flags, never raises."""
+    proxy (statement references the threat it narrates; risk_statement references the asset
+    and critical service, per the prompt's own "threat + asset + critical service + impact"
+    formula). Self-reported `assumptions`/`excluded_details` pass through for the reviewer.
+    `asset_name`/`critical_service` default to None so existing callers that don't have them
+    handy keep working unchanged — the check simply doesn't run for them. Flags, never raises.
+
+    `critical_service` is a list (an asset can legitimately link to more than one service via
+    ctm_scan_entity_bu — see context.py::_load_asset) — the check passes if the risk_statement
+    references ANY one of them, not all: the model is writing about one specific threat, not
+    obligated to enumerate every service the asset happens to support.
+
+    Redaction is one-directional: prompts.py redacts inbound context before it reaches the
+    LLM, but this function does not scrub the LLM's OUTPUT — scenario/threat text returned
+    here is persisted and served to reviewers as-is. A model that echoes something sensitive
+    back (e.g. from context it was given) is not caught by validate_scenario or by any later
+    stage. Documented residual risk, not a gap this function is meant to close."""
     errors = _check_fields(
         scenario, ("scenario_title", "scenario_statement", "business_impact", "operational_impact",
                 "risk_statement"))
-    statement = str(scenario.get("scenario_statement") or "").lower()
-    needle = (threat_name or threat_type or "").lower()
+    statement = str(scenario.get("scenario_statement") or "")
+    needle = threat_name or threat_type or ""
     # Only compare when both sides actually have text — a blank statement/threat name
     # is already reported by _check_fields above, so don't double-flag it here.
-    if statement and needle and needle not in statement:
-        errors.append("scenario_statement does not reference the threat name/type")
+    if statement.strip() and needle.strip() and not _references(needle, statement):
+        errors.append(f"scenario_statement does not reference the threat name/type ({needle})")
+    risk_statement = str(scenario.get("risk_statement") or "")
+    # Same "only compare when both sides have text" guard as above — an empty risk_statement is
+    # already reported by _check_fields, and a blank critical_service is a real, allowed asset
+    # state (not every asset has one configured), not something to false-flag here.
+    if risk_statement.strip() and asset_name and not _references(asset_name, risk_statement):
+        errors.append(f"risk_statement does not reference the asset ({asset_name})")
+    if risk_statement.strip() and critical_service and not any(_references(cs, risk_statement) for cs in critical_service):
+        errors.append(f"risk_statement does not reference the critical service ({', '.join(critical_service)})")
     return {**_result(errors),
             "assumptions": _normalize_str_list(scenario.get("assumptions")),
             "excluded_details": _normalize_str_list(scenario.get("excluded_details"))}

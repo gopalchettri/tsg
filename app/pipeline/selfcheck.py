@@ -14,13 +14,13 @@ from __future__ import annotations
 
 from typing import cast
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import QueuePool
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.db import dal
+from app.db import dal, models as m
 from app.db.engine import get_engine
 
 log = get_logger(__name__)
@@ -63,7 +63,7 @@ def check_pool_utilization() -> str | None:
 def check_tempdb_version_store() -> str | None:
     """Warn once tempdb's RCSI version store (see app/db/invariants.py's RCSI
     checklist entry) grows past a configured size — the specific risk
-    scripts/production_setup.sql's RCSI section warns about: an unbounded version
+    scripts/TSG_Core.sql's RCSI section warns about: an unbounded version
     store can fill tempdb and take down the whole SQL Server instance, not just
     this app's database."""
     s = get_settings()
@@ -81,7 +81,7 @@ def check_tempdb_version_store() -> str | None:
 
 def check_tempdb_long_running_txn() -> str | None:
     """Warn once a read transaction has been open longer than a configured
-    threshold — exactly what scripts/production_setup.sql's RCSI section names as
+    threshold — exactly what scripts/TSG_Core.sql's RCSI section names as
     the OTHER thing (besides raw write volume) that lets the version store above
     keep growing instead of shrinking back down."""
     s = get_settings()
@@ -93,6 +93,158 @@ def check_tempdb_long_running_txn() -> str | None:
         log.warning("selfcheck.tempdb_long_running_txn", longest_seconds=longest,
                     threshold_seconds=s.tempdb_long_txn_warn_seconds)
         return "tempdb_long_running_txn"
+    return None
+
+
+def check_llm_slots() -> str | None:
+    """Warn once in-flight LLM calls (chat/embed/rerank, app.pipeline.llm._llm_slot) get close
+    to max_concurrent_llm_calls, so an operator has runway before real requests start hitting
+    LLMSlotUnavailable. Reads Redis, not the DB — zero-arg like the other non-DB checks below,
+    unlike check_active_sessions (which genuinely needs `sess`). Only wired into
+    run_self_checks when the limiter is actually enabled (max_concurrent_llm_calls > 0)."""
+    from app.pipeline.llm import current_llm_slot_count
+
+    s = get_settings()
+    if not s.max_concurrent_llm_calls:  # disabled — nothing to warn about (also guards a 0/0 ceiling)
+        return None
+    count = current_llm_slot_count()
+    ceiling = s.max_concurrent_llm_calls * s.llm_slots_warn_ratio
+    if count >= ceiling:
+        log.warning("selfcheck.llm_slots_high", count=count, limit=s.max_concurrent_llm_calls,
+                    ratio=s.llm_slots_warn_ratio)
+        return "llm_slots_high"
+    return None
+
+
+def check_litellm_proxy_health() -> str | None:
+    """Warn if the LiteLLM proxy is unreachable/unhealthy. Chat/completion has no
+    local/offline fallback (app.pipeline.llm's module docstring) — unlike embeddings/
+    reranking, which can run fully in-process — so a degraded proxy would otherwise stay
+    invisible here until a real pipeline run actually fails on it. Only registered (see
+    run_self_checks) when llm_provider itself is 'litellm_proxy' — deliberately NOT gated on
+    embedding_provider/reranker_provider too: those two have a real local fallback, so their
+    routing through the proxy isn't the fallback-less, must-be-reachable case this exists
+    for (and tests/conftest.py's `db` fixture sets both to 'litellm_proxy' purely to avoid
+    loading real local models, which would otherwise make this check fire in every test)."""
+    import httpx
+
+    from app.pipeline.llm import _ensure_litellm_proxy_bypassed
+
+    s = get_settings()
+    # This check's own httpx.Client() call never goes through get_llm() — applying the
+    # proxy-bypass fix here too (idempotent, in-memory only) rather than assuming some
+    # other code path already ran it first in this process (see llm.py's docstring on why
+    # verify_litellm_models needed this exact same explicit call at worker boot).
+    _ensure_litellm_proxy_bypassed(s)
+    try:
+        # Same retries=llm_max_retries as verify_litellm_models (llm.py) — a brief blip
+        # shouldn't itself be the thing that fires the warning; consistent with every other
+        # call to this proxy in the codebase getting the same retry budget.
+        with httpx.Client(transport=httpx.HTTPTransport(retries=s.llm_max_retries)) as client:
+            resp = client.get(f"{s.litellm_base_url}/health/readiness",
+                            headers={"Authorization": f"Bearer {s.litellm_api_key}"},
+                            timeout=s.llm_timeout_seconds)
+            resp.raise_for_status()
+    except httpx.HTTPError:
+        # Best-effort richer diagnostics on top of the plain pass/fail above — /health/readiness
+        # only says "up or down"; /health/readiness/details (real response shape unconfirmed
+        # from this dev environment, no live proxy access) may say WHY. Logged raw, no assumed
+        # field paths, so an unexpected shape just means less detail in the log, never a second
+        # failure mode — this whole block is strictly additive to the warning already below.
+        details: object = None
+        try:
+            with httpx.Client(transport=httpx.HTTPTransport(retries=s.llm_max_retries)) as client:
+                details_resp = client.get(f"{s.litellm_base_url}/health/readiness/details",
+                                        headers={"Authorization": f"Bearer {s.litellm_api_key}"},
+                                        timeout=s.llm_timeout_seconds)
+                details = details_resp.json()
+        except Exception:  # noqa: BLE001 — diagnostics only; the primary warning below still fires either way
+            pass
+        log.warning("selfcheck.litellm_proxy_unreachable", details=details, exc_info=True)
+        return "litellm_proxy_unreachable"
+    return None
+
+
+def check_dead_threat_rules(sess: Session) -> str | None:
+    """Warn once an active Config_Threat_Rule.RuleKey falls outside scoping's fixed
+    _RULE_KEY_FIELDS allowlist. _apply_rules doesn't error on an unknown key — it logs
+    and no-ops the rule (scoping.py §5.4 step 1) — so a curator adding or renaming a
+    RuleKey the code doesn't actually resolve would otherwise stay invisible until
+    someone notices a rule that never fires. This already happened once (scoping.py's
+    own comment: keys removed 2026-07-12 when their backing columns went away)."""
+    from app.pipeline.scoping import _RULE_KEY_FIELDS
+
+    ct = m.Config_Threat_Rule
+    active_keys = sess.execute(
+        select(ct.RuleKey).where(ct.IsActive == True, ct.IsDeleted == False).distinct()  # noqa: E712
+    ).scalars().all()
+    dead = sorted(set(active_keys) - _RULE_KEY_FIELDS.keys())
+    if dead:
+        log.warning("selfcheck.dead_threat_rules", rule_keys=dead)
+        return "dead_threat_rules"
+    return None
+
+
+def check_ctm_scan_category_names(sess: Session) -> str | None:
+    """Warn if the real platform ctm_scan_category.name values don't cover every asset_type
+    value the seeded Config_Threat_Rule tech_gate rules expect. scoping._matches does a
+    case-insensitive, WHITESPACE-STRIPPED TEXT compare between a subsystem's resolved asset_type
+    (context.py's ctm_scan_category.name lookup) and each rule's RuleValue (e.g. "Operational
+    Technology (OT)") — a spelling drift on the platform side makes that rule permanently no-op
+    (it never excludes anything again) with no error anywhere, silently weakening threat
+    filtering. This check mirrors that same strip+lower comparison exactly, or it would flag
+    false-positive "mismatches" for rules that actually work fine at runtime (e.g. a stray
+    trailing space in a platform-table name).
+
+    check_dead_threat_rules (above) can't catch this: that checks RuleKey names, not RuleValue
+    content. Nothing here is hardcoded — both sides are read live, so this never needs updating
+    when new asset_type rules are added."""
+    ct = m.Config_Threat_Rule
+    # RuleValue is nullable at the type level (Mapped[str | None]) even though the WHERE clause
+    # below already excludes NULL rows at the SQL level — mypy can't see through that runtime
+    # filter, so narrow it here too, the same "belt and suspenders" a `None` in expected would
+    # otherwise crash .strip() on. A blank/whitespace-only RuleValue is excluded on purpose: per
+    # scoping.py's own _apply_rules comment, "" is a real curator sentinel meaning "match
+    # subsystems with a blank asset_type" — not a category name to look up here at all.
+    expected = [v.strip() for v in sess.execute(
+        select(ct.RuleValue).where(
+            ct.RuleKey == "asset_type", ct.IsActive == True, ct.IsDeleted == False,  # noqa: E712
+            ct.RuleValue.is_not(None),
+        ).distinct()
+    ).scalars().all() if v is not None and v.strip()]
+    if not expected:
+        return None
+    cat = m.ctm_scan_category
+    real_names = {n.strip().lower() for n in sess.execute(select(cat.name)).scalars().all() if n and n.strip()}
+    missing = sorted({v for v in expected if v.lower() not in real_names})
+    if missing:
+        log.warning("selfcheck.ctm_scan_category_asset_type_mismatch", missing_values=missing)
+        return "ctm_scan_category_asset_type_mismatch"
+    return None
+
+
+def check_dead_context_fields(sess: Session) -> str | None:
+    """Warn if an active Context_Field_Config row names a FieldName/ContextGroup outside
+    prompts.py's hardcoded ceiling (_ASSET_CONTEXT_ALLOWED/_SUB_ALLOWED, or an unrecognized
+    ContextGroup value like a typo'd 'Asset' instead of 'asset'). prompts._resolve_allowed
+    doesn't error on this — it just silently excludes the unrecognized row from what reaches the
+    model (or, if every active row for a group is unrecognized, narrows that group to nothing) —
+    so a curator's typo would otherwise stay invisible until someone notices a field the AI
+    should be seeing but isn't. Same curator-editable-table-vs-hardcoded-allowlist drift class
+    check_dead_threat_rules already exists for Config_Threat_Rule."""
+    from app.pipeline.prompts import _ASSET_CONTEXT_ALLOWED, _SUB_ALLOWED
+
+    cfc = m.Context_Field_Config
+    rows = sess.execute(
+        select(cfc.ContextGroup, cfc.FieldName)
+        .where(cfc.IsActive == True, cfc.IsDeleted == False).distinct()  # noqa: E712
+    ).all()
+    ceilings = {"asset": _ASSET_CONTEXT_ALLOWED, "subsystem": _SUB_ALLOWED}
+    dead = sorted(f"{group}.{field}" for group, field in rows
+                if group not in ceilings or field not in ceilings[group])
+    if dead:
+        log.warning("selfcheck.dead_context_fields", fields=dead)
+        return "dead_context_fields"
     return None
 
 
@@ -109,7 +261,17 @@ def run_self_checks(sess: Session) -> list[str]:
     entirely against SQLite (the automated test suite's database), where they'd
     either error out or measure nothing meaningful.
     """
-    checks: list[tuple[str, object]] = [("active_sessions", lambda: check_active_sessions(sess))]
+    s = get_settings()
+    checks: list[tuple[str, object]] = [
+        ("active_sessions", lambda: check_active_sessions(sess)),
+        ("dead_threat_rules", lambda: check_dead_threat_rules(sess)),
+        ("ctm_scan_category_names", lambda: check_ctm_scan_category_names(sess)),
+        ("dead_context_fields", lambda: check_dead_context_fields(sess)),
+    ]
+    if s.max_concurrent_llm_calls:
+        checks.append(("llm_slots", lambda: check_llm_slots()))
+    if s.llm_provider == "litellm_proxy":
+        checks.append(("litellm_proxy_health", lambda: check_litellm_proxy_health()))
     if get_engine().dialect.name == "mssql":
         checks += [
             ("pool_utilization", lambda: check_pool_utilization()),

@@ -230,7 +230,7 @@ tokens, real database, real models.
   `TSG_SELF_CHECK_INTERVAL_SECONDS` (default 300s) and logs a `selfcheck.*` WARNING event for anything
   worth attention — `active_sessions_high` (nearing `TSG_MAX_ACTIVE_SESSIONS`), `pool_saturated`
   (database connection pool nearly fully checked-out), `tempdb_version_store_high` and
-  `tempdb_long_running_txn` (the RCSI tempdb-growth risk called out in `scripts/production_setup.sql` —
+  `tempdb_long_running_txn` (the RCSI tempdb-growth risk called out in `scripts/TSG_Core.sql` —
   the version store isn't just turned on and forgotten anymore). All five thresholds
   (`TSG_TEMPDB_VERSION_STORE_WARN_MB`, `TSG_TEMPDB_LONG_TXN_WARN_SECONDS`,
   `TSG_ACTIVE_SESSIONS_WARN_RATIO`, `TSG_POOL_UTILIZATION_WARN_RATIO`, and the interval itself) are

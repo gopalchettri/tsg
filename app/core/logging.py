@@ -45,8 +45,16 @@ def configure_logging(level: int | None = None) -> None:
 def get_logger(name: str = "tsg"):
     """Bound structlog logger for the given name — the one import every module in
     this service should use instead of `logging.getLogger` directly.
+
+    [REVIEW-FIX] `structlog.get_logger(name)` alone silently drops `name` — this codebase's
+    `PrintLoggerFactory` ignores the args passed to it (unlike `structlog.stdlib.LoggerFactory`,
+    which ties `name` to a real `logging.Logger`), so every log line looked identical regardless
+    of which module emitted it. `structlog.stdlib.add_logger_name` (the usual fix) is NOT the
+    answer here — it reads `logger.name` off the wrapped logger object, which `PrintLogger` does
+    not have, and crashes every log call with AttributeError (verified directly). Binding `name`
+    as a normal context value works with any logger factory and needs no processor-chain change.
     """
-    return structlog.get_logger(name)
+    return structlog.get_logger().bind(logger=name)
 
 
 # Configure eagerly at import time — logging correctness/speed must never depend on

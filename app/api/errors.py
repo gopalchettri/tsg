@@ -17,6 +17,9 @@ from app.db.dal import (
     RegenerateConflict, SessionConflict,
 )
 from app.pipeline.accept import AcceptConflict, MasterInactive
+from app.api.admin import AdminValidationError
+from app.pipeline.embeddings import EmbeddingBusy
+from app.pipeline.llm import LLMSlotUnavailable
 
 log = get_logger(__name__)
 
@@ -72,6 +75,16 @@ async def _handle_capacity_exceeded(_: Request, exc: CapacityExceeded):
                         "session creation is temporarily throttled"), headers={"Retry-After": retry_after})
 
 
+async def _handle_llm_slot_unavailable(_: Request, exc: LLMSlotUnavailable):
+    """Confirmed sustained over-capacity on the LLM-call concurrency limiter -> 503, same
+    shape as _handle_capacity_exceeded. Only reachable on a SYNCHRONOUS caller (the admin
+    embedding-refresh routes, §Part B) — the Celery/background path never surfaces this to an
+    HTTP response at all, since celery_app.py's autoretry_for catches it and retries first."""
+    retry_after = str(get_settings().capacity_retry_after_seconds)
+    return JSONResponse(status_code=503, content=_env("llm_slot_unavailable",
+                        "no free AI-call capacity right now, try again shortly"), headers={"Retry-After": retry_after})
+
+
 async def _handle_idempotency_conflict(_: Request, exc: IdempotencyKeyConflict):
     """Same Idempotency-Key reused with a different request body -> 409, returning the id of the session created by the original request."""
     return JSONResponse(status_code=409, content=_env(
@@ -87,6 +100,16 @@ async def _handle_regenerate_conflict(_: Request, exc: RegenerateConflict):
 async def _handle_cancel_conflict(_: Request, exc: CancelConflict):
     """Cancel was requested against a session that's already terminal -> 409."""
     return JSONResponse(status_code=409, content=_env("cancel_conflict", str(exc)))
+
+
+async def _handle_embedding_busy(_: Request, exc: EmbeddingBusy):
+    """A concurrent admin recreate/delete already holds this embedding group's lock -> 409."""
+    return JSONResponse(status_code=409, content=_env("embedding_busy", str(exc)))
+
+
+async def _handle_admin_validation_error(_: Request, exc: AdminValidationError):
+    """A structurally-valid but business-rule-invalid admin embedding request -> 422."""
+    return JSONResponse(status_code=422, content=_env("admin_validation_error", str(exc)))
 
 
 async def _handle_validation_error(_: Request, exc: RequestValidationError):
@@ -106,13 +129,24 @@ async def _handle_validation_error(_: Request, exc: RequestValidationError):
 
 
 async def _handle_unhandled_exception(request: Request, exc: Exception):
-    """Catch-all safety net -> 500; logs the full traceback always, but only echoes the exception message back to the client in local/dev to avoid leaking internals in production."""
-    log.error("unhandled_exception", path=str(request.url), exc_info=True)
+    """Catch-all safety net -> 500; logs the full traceback always, but only echoes the exception message back to the client in local/dev to avoid leaking internals in production.
+
+    [REVIEW-FIX] Starlette routes the bare-`Exception` handler through its outermost
+    ServerErrorMiddleware, which sits OUTSIDE RequestIDMiddleware — by the time this handler
+    runs, that middleware's `finally` has already cleared the request_id from contextvars
+    (correctly, to stop it leaking into the next request on the same worker). request_id is
+    read from request.state instead, which RequestIDMiddleware also stashed there before
+    contextvars ever got involved — the only channel that reliably survives this exact
+    unwind. Passed explicitly to log.error (not relied on via contextvars) and echoed on the
+    response header so a client-reported 500 can still be grepped straight to its crash log."""
+    request_id = getattr(request.state, "request_id", None)
+    log.error("unhandled_exception", path=str(request.url), request_id=request_id, exc_info=True)
     s = get_settings()
     # Show the real exception text only in local/dev; in other environments
     # (e.g. production) return a generic message so internals aren't exposed.
     detail = str(exc) if s.app_env in ("local", "dev") else "an unexpected error occurred"
-    return JSONResponse(status_code=500, content=_env("internal_error", detail))
+    headers = {"X-Request-Id": request_id} if request_id else None
+    return JSONResponse(status_code=500, content=_env("internal_error", detail), headers=headers)
 
 
 def register_error_handlers(app: FastAPI) -> None:
@@ -124,8 +158,11 @@ def register_error_handlers(app: FastAPI) -> None:
     app.exception_handler(MasterInactive)(_handle_master_inactive)
     app.exception_handler(NotFoundError)(_handle_not_found)
     app.exception_handler(CapacityExceeded)(_handle_capacity_exceeded)
+    app.exception_handler(LLMSlotUnavailable)(_handle_llm_slot_unavailable)
     app.exception_handler(IdempotencyKeyConflict)(_handle_idempotency_conflict)
     app.exception_handler(RegenerateConflict)(_handle_regenerate_conflict)
     app.exception_handler(CancelConflict)(_handle_cancel_conflict)
+    app.exception_handler(EmbeddingBusy)(_handle_embedding_busy)
+    app.exception_handler(AdminValidationError)(_handle_admin_validation_error)
     app.exception_handler(RequestValidationError)(_handle_validation_error)
     app.exception_handler(Exception)(_handle_unhandled_exception)

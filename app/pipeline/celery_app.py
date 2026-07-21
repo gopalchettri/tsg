@@ -36,8 +36,8 @@ from app.core.logging import configure_logging
 from app.db import dal
 from app.db.dal import guid
 from app.db.engine import db_session
-from app.pipeline import cascade
-from app.pipeline.llm import get_llm
+from app.pipeline import cascade, embeddings
+from app.pipeline.llm import LLMSlotUnavailable, get_llm
 from app.pipeline.reaper import clean_up_abandoned_sessions
 from app.pipeline.selfcheck import run_self_checks
 from app.pipeline.tasks import _process_all_supporting_systems
@@ -94,15 +94,27 @@ def _init_worker(**_):
     from app.core.config import assert_security_posture
     from app.db.engine import get_engine
     from app.db.invariants import verify_startup
+    import gevent
+
+    from app.pipeline.llm import log_litellm_key_info, verify_litellm_models
     from app.pipeline.local_models import validate_local_models
 
     configure_logging()
     assert_security_posture()          # fail-closed: same auth guard as the API
     verify_startup(get_engine())       # fail-fast: same DB invariant guard as the API
+    # [REVIEW-FIX] local embedding/reranker calls (local_models.py::_offload) run on gevent's
+    # native thread pool, sized independently of the -c/--concurrency worker setting above —
+    # was silently capped at gevent's own built-in default (10) with no way to see or change
+    # it. Set BEFORE validate_local_models warms the models below, so the real ceiling is in
+    # effect from the very first local-model call.
+    gevent.get_hub().threadpool.size = get_settings().local_model_threadpool_size
     validate_local_models(warm=True)   # fail-fast + warm the local models so the 1st request is fast
+    verify_litellm_models()            # fail-fast: same discipline, for whichever models route through the proxy
+    log_litellm_key_info()             # [REVIEW-FIX] was defined but never called — observability only, never raises
 
 
-@celery_app.task(bind=True, name="tsg.run_pipeline")
+@celery_app.task(bind=True, name="tsg.run_pipeline",
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def run_pipeline_task(self, session_id: str) -> None:
     """ this is the background job that runs the whole 2-stage
     AI pipeline for one session, kicked off right after a user creates it.
@@ -110,16 +122,25 @@ def run_pipeline_task(self, session_id: str) -> None:
     Entry point queued by the API on session creation; `self.request.id` becomes
     the run id `_process_all_supporting_systems` stamps into each claimed stage, so a worker-crash
     redelivery (`acks_late`) is distinguishable from a fresh run for the stage Compare-And-Swap (CAS)
+
+    `autoretry_for=(LLMSlotUnavailable,)`: a confirmed "no free LLM call slot" is temporary,
+    not a bug — Celery retries this SAME task id shortly (backoff), which resumes exactly like
+    a crash-redelivery does via claim_stage's existing CAS/resume logic. `max_retries=None`
+    because `Subsystem_Stage_State.AttemptCount`'s own poison-terminal cap (dal.claim_stage) is
+    the real ceiling here, not a second, independent Celery-level one.
     """
     with db_session() as sess:
         _process_all_supporting_systems(sess, session_id, get_llm(), self.request.id or guid())
 
 
-@celery_app.task(bind=True, name="tsg.regenerate")
+@celery_app.task(bind=True, name="tsg.regenerate",
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
                     target_ids: list[str] | list[int] | None, epoch: int, user_note: str | None = None) -> None:
     """ this is the background job that redoes one or more scenarios
     of a session when the user clicks "regenerate."
+
+    Same `autoretry_for=(LLMSlotUnavailable,)` reasoning as run_pipeline_task above.
 
     `target_ids` carries the full requested list across the Celery task boundary — plain
     JSON-serializable list, no broker change needed (plan item 0). `epoch` is reserved once
@@ -135,6 +156,46 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
         # convert the DB row into a plain dict before handing it to the cascade layer
         cascade.run_regeneration(sess, dict(session), subsystem_id, RegenGranularity(granularity),
                                 target_ids, epoch, get_llm(), self.request.id or guid(), user_note=user_note)
+
+
+@celery_app.task(name="tsg.admin_embedding_action",
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
+def admin_embedding_action_task(action: str, group: str | None, names: list[str] | None) -> dict:
+    """Background counterpart to app/api/admin.py's four embedding-cache routes: the API only
+    validates the request shape and queues this via .delay(), then the caller polls
+    GET .../status/{job_id} against Celery's own AsyncResult (backed by the already-configured
+    result backend) for the eventual outcome — same dispatch-then-poll shape as
+    run_pipeline_task/regenerate_task above, and the same `autoretry_for=(LLMSlotUnavailable,)`
+    reasoning: a confirmed "no free LLM call slot" is temporary, so Celery retries this exact
+    job rather than the caller ever seeing a hard failure for a transient capacity squeeze.
+
+    `create`/`update` are naturally idempotent on retry (they only embed what's missing).
+    `recreate` re-wipes+re-embeds every group in `group`'s scope from scratch on a retry, even
+    ones a partially-successful earlier attempt already finished — wasted work, not a
+    correctness bug, and the real threat library is "tens of entries" (embeddings.py), so this
+    is the same accepted, bounded cost as write_scenarios's own re-generation-on-retry note.
+    `# ponytail: accepted; revisit only if recreate is ever run against a much larger library.`
+    """
+    if action == "delete":
+        return {"vectors_deleted": embeddings._for_each_group(group, lambda g: embeddings.delete_group(g, names))}
+    llm = get_llm()
+    with db_session() as sess:
+        if action == "create":
+            # unlike its 3 siblings, create_items requires non-None group/names (it can't
+            # fan out over "every group" the way update/recreate/delete can) — the API layer
+            # (app/api/admin.py's create route) already enforces this before enqueueing, but
+            # this task is reachable outside that one HTTP route (Flower, tests, a future
+            # caller), so the guard belongs here too, not just at the one caller that happens
+            # to exist today.
+            if not group or not names:
+                raise ValueError("create requires both group and names")
+            return {"rows_processed": {group: embeddings.create_items(sess, llm, group, names)}}
+        if action == "update":
+            return {"rows_processed": embeddings._for_each_group(group, lambda g: embeddings.update_group(sess, llm, g))}
+        if action == "recreate":
+            return {"rows_processed": embeddings._for_each_group(
+                group, lambda g: embeddings.recreate_group(sess, llm, g, names))}
+    raise ValueError(f"unknown admin embedding action: {action!r}")
 
 
 @celery_app.task(name="tsg.reap")

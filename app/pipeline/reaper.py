@@ -158,7 +158,7 @@ def _find_abandoned_sessions(sess: Session, _now: datetime, proven_dead: set[str
     long-finished stage's lease is always NULL (cleared on completion), so it can never look
     abandoned just because a session happens to sit outside REVIEW for a while (e.g. the brief
     window between a regenerate request's CAS and its Celery task actually starting)."""
-    grace = _now - timedelta(seconds=get_settings().stage_lease_seconds)
+    grace = _now - timedelta(seconds=get_settings().reaper_stale_grace_seconds)
     ss = m.Subsystem_Stage_State
     # True if this session still has a row whose lease hasn't expired yet — i.e. some worker is still actively working on it.
     live_lease = (select(1).select_from(ss)

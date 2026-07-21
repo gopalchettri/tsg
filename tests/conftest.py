@@ -1,6 +1,7 @@
 """Test harness — runs the slice on SQLite (partial unique indexes + rowcount CAS
 behave like MSSQL for these tests). Integration/load tests that need real MSSQL
-features run against dev TSG in CI; here we validate the logic.
+features are currently verified manually against dev TSG, not in CI (no CI is
+configured in this repo yet) — this suite validates the logic only.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ _ALPHA = string.ascii_lowercase
 class StubLLM:
     """Deterministic, model-free client (SDD load-test 'fixed echo' idea)."""
 
-    def chat(self, messages, *, model=None):
+    def chat(self, messages, *, model=None, temperature=None):
         sysc = messages[0]["content"].lower()
         if "stride threats" in sysc:
             out = [{"category": "Tampering", "type": "Firmware Tampering",
@@ -64,7 +65,7 @@ def stub_llm():
 # below. It's also matched against the DB seed rows for tests that DO go through the API.
 DEFAULT_ASSET_CONTEXT = {
     "cii_asset_description": "CAD design and drafting platform",
-    "critical_service": "Design Service",
+    "critical_service": ["Design Service"],
     "data_handled": "Engineering drawings and specs",
 }
 DEFAULT_SUPPORTING_SYSTEM_ID = [1019]
@@ -88,22 +89,23 @@ def _create_schema_and_seed(engine) -> None:
         c.execute(text('CREATE UNIQUE INDEX "UX_Scenario_ActiveIdentity" ON "Threat_Scenario_Output"(SessionID, IdentityHash) WHERE Superseded = 0'))
         c.execute(text('CREATE UNIQUE INDEX "UX_Session_IdempotencyKey" ON "Scenario_Session"(EntityID, IdempotencyKey) WHERE IdempotencyKey IS NOT NULL'))
         # M2 — master-library natural-key UNIQUE (safe concurrent promotion, no duplicate masters).
-        c.execute(text('CREATE UNIQUE INDEX "UX_ThreatType_NaturalKey" ON "Threat_Type"(ThreatTypeName, PrimaryThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0'))
+        c.execute(text('CREATE UNIQUE INDEX "UX_ThreatType_NaturalKey" ON "Threat_Type"(ThreatTypeName, ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0'))
         c.execute(text('CREATE UNIQUE INDEX "UX_ThreatCatalogue_NaturalKey" ON "Threat_Catalogue"(ThreatTypeID, ThreatName, SectorID) WHERE IsActive = 1 AND IsDeleted = 0'))
         c.execute(text('CREATE UNIQUE INDEX "UX_ThreatActor_NaturalKey" ON "Threat_Actor"(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0'))
         # Context: entity 5 owns asset 100/200 with supporting system 1019.
-        c.execute(insert(m.group_table).values(id=5, name="Org A", code="A"))
-        c.execute(insert(m.group_table).values(id=6, name="Org B", code="B"))
         c.execute(insert(m.onboarding_services).values(id=500, name="Design Service"))
         # No group_id on the asset — the live ctm_scan_entity has no such column. Entity
-        # ownership comes solely from onboarding_service_entity below (asset→service→entity).
+        # ownership and the critical_service label both come from ctm_scan_entity_bu below
+        # (direct asset->entity/service link); tier1_critical_service_id is dead (unpopulated
+        # on every real asset) and unused by any code path — kept here only as inert legacy data.
         c.execute(insert(m.ctm_scan_entity).values(
             id=100, name="CAD", type="app", criticality=1, tier1_critical_service_id=500,
             description="CAD design and drafting platform", data_handled="Engineering drawings and specs"))
         c.execute(insert(m.ctm_scan_entity).values(
             id=200, name="EPCR", type="app", criticality=1, tier1_critical_service_id=500,
             description="CAD design and drafting platform", data_handled="Engineering drawings and specs"))
-        c.execute(insert(m.onboarding_service_entity).values(sector_id=1, service_id=500, group_id=5))  # asset→service→entity 5
+        c.execute(insert(m.ctm_scan_entity_bu).values(id=100, ctm_scan_entity_id=100, group_id=5, service_id=500))
+        c.execute(insert(m.ctm_scan_entity_bu).values(id=200, ctm_scan_entity_id=200, group_id=5, service_id=500))
         # option_value: option 1012 (Accessibility Channel) code 2 -> "Internal Network";
         # option 1015 (Hosting Environment) code 7 -> "Entity Data Centre".
         c.execute(insert(m.option).values(id=1012, option="Accessibility Channel"))
@@ -118,8 +120,8 @@ def _create_schema_and_seed(engine) -> None:
         c.execute(insert(m.ctm_scan_entity_supporting_system).values(ctm_scan_entity_id=200, onboarding_supporting_system_id=1019))
         # Masters: category Tampering → types 10/11 → catalogue 20/21; actor Hacker on type 10.
         c.execute(insert(m.Threat_Category).values(ThreatCategoryID=2, ThreatCategoryName="Tampering", ThreatCategoryCode="TAM", IsActive=True, IsDeleted=False))
-        c.execute(insert(m.Threat_Type).values(ThreatTypeID=10, ThreatTypeName="Firmware Tampering", PrimaryThreatCategoryID=2, IsActive=True, IsDeleted=False))
-        c.execute(insert(m.Threat_Type).values(ThreatTypeID=11, ThreatTypeName="Config Tampering", PrimaryThreatCategoryID=2, IsActive=True, IsDeleted=False))
+        c.execute(insert(m.Threat_Type).values(ThreatTypeID=10, ThreatTypeName="Firmware Tampering", ThreatCategoryID=2, IsActive=True, IsDeleted=False))
+        c.execute(insert(m.Threat_Type).values(ThreatTypeID=11, ThreatTypeName="Config Tampering", ThreatCategoryID=2, IsActive=True, IsDeleted=False))
         c.execute(insert(m.Threat_Catalogue).values(ThreatCatalogueID=20, ThreatTypeID=10, ThreatName="Bootloader implant", IsActive=True, IsDeleted=False))
         c.execute(insert(m.Threat_Catalogue).values(ThreatCatalogueID=21, ThreatTypeID=11, ThreatName="OTA poisoning", IsActive=True, IsDeleted=False))
         c.execute(insert(m.Threat_Actor).values(ThreatActorID=1, ThreatActorName="Hacker", IsCapable=1, IsActive=True, IsDeleted=False))

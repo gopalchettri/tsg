@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, MetaData, Numeric, TypeDecorator, Unicode, UnicodeText
+from sqlalchemy import Boolean, DateTime, Float, Integer, MetaData, TypeDecorator, Unicode, UnicodeText
 from sqlalchemy.dialects import mssql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -123,6 +123,7 @@ class Identified_Threat(Base):
     SessionID: Mapped[str] = mapped_column(GUID)
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
+    UserID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
     ThreatCategory: Mapped[str] = mapped_column(Unicode(200))
     ThreatType: Mapped[str] = mapped_column(Unicode(300))
@@ -143,6 +144,8 @@ class Scoped_Threat(Base):
     ScopedThreatID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
+    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
+    UserID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
     ThreatID: Mapped[str] = mapped_column(GUID)
     Score: Mapped[float] = mapped_column(Float)
@@ -160,6 +163,7 @@ class Threat_Scenario_Output(Base):
     SessionID: Mapped[str] = mapped_column(GUID)
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
+    UserID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
     ScopedThreatID: Mapped[str] = mapped_column(GUID)
     Status: Mapped[str] = mapped_column(Unicode(20))
@@ -168,7 +172,7 @@ class Threat_Scenario_Output(Base):
     AcceptedSubsetJSON: Mapped[str | None] = mapped_column(UnicodeText)
     Accepted: Mapped[int] = mapped_column(Integer, default=0)
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
-    IdentityHash: Mapped[str | None] = mapped_column(Unicode(64))     #sha256(SessionID|ScopedThreatID)
+    IdentityHash: Mapped[str | None] = mapped_column(Unicode(64))     #sha256(SessionID|SubsystemID|dedup_key) — dedup_key = cat:/type:/txt: (tasks._dedup_key); UX_Scenario_ActiveIdentity blocks a 2nd active row per key
     GenerationEpoch: Mapped[int] = mapped_column(Integer, default=1)
     ErrorMessage: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -192,9 +196,13 @@ class Threat_Type(Base):
     ThreatTypeName: Mapped[str] = mapped_column(Unicode(300))
     Description: Mapped[str | None] = mapped_column(UnicodeText)
     SectorID: Mapped[int | None] = mapped_column(Integer)
-    PrimaryThreatCategoryID: Mapped[int | None] = mapped_column(Integer)
+    ThreatCategoryID: Mapped[int | None] = mapped_column(Integer)
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Provenance: 'functional_team_excel' (curated) vs 'ai_auto_promoted' (R10) vs a future
+    # MITRE import. Column added by scripts/Threat_library.sql, not the
+    # CREATE TABLE this table otherwise gets — see test_schema_sync's _COLUMN_DEPLOYED_SEPARATELY.
+    Source: Mapped[str | None] = mapped_column(Unicode(50))
 
 
 class Threat_Catalogue(Base):
@@ -206,6 +214,8 @@ class Threat_Catalogue(Base):
     SectorID: Mapped[int | None] = mapped_column(Integer)
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    # See Threat_Type.Source above — same provenance tracking, same script adds it.
+    Source: Mapped[str | None] = mapped_column(Unicode(50))
 
 
 class Threat_Actor(Base):
@@ -223,6 +233,18 @@ class ThreatType_ThreatActor_Map(Base):
     ThreatActorID: Mapped[int] = mapped_column(Integer, primary_key=True)
 
 
+# [A2] Threat_Type.ThreatCategoryID is only a rough single default — real curated data
+# (75-threat functional-team Excel review) shows 74/75 individual Threat_Catalogue rows
+# carry a DIFFERENT/additional STRIDE category than their Type's default. This many-to-many
+# map is the authoritative per-threat category source; see grounding.get_possible_types.
+# Created by scripts/Threat_library.sql (run manually — see test_schema_sync's
+# _DEPLOYED_SEPARATELY, same pattern as Config_Threat_Rule).
+class Threat_Catalogue_Category_Map(Base):
+    __tablename__ = "Threat_Catalogue_Category_Map"
+    ThreatCatalogueID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+
 class Config_Threat_Rule(Base):
     __tablename__ = "Config_Threat_Rule"
     ThreatRuleID: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -235,6 +257,18 @@ class Config_Threat_Rule(Base):
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
     UpdateDate: Mapped[datetime | None] = mapped_column(DateTime)
     UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
+    IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Context_Field_Config(Base):
+    """Which asset/subsystem fields are currently turned on for the AI prompt (see
+    scripts/Threat_library.sql). This table can only narrow prompts.py's hardcoded
+    _ASSET_CONTEXT_ALLOWED/_SUB_ALLOWED ceiling — it can never add a field name outside it."""
+    __tablename__ = "Context_Field_Config"
+    ContextFieldConfigID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ContextGroup: Mapped[str] = mapped_column(Unicode(20))    # 'asset' | 'subsystem'
+    FieldName: Mapped[str] = mapped_column(Unicode(100))
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -305,41 +339,6 @@ class user_table(Base):
     username: Mapped[str] = mapped_column(Unicode(255))
     email: Mapped[str] = mapped_column(Unicode(255))
 
-class group_table(Base):  # "group" is a reserved word; SQLAlchemy quotes it
-    __tablename__ = "group"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    parent_id: Mapped[int | None] = mapped_column(Integer)  # self-ref FK to group.id; NULL = top-level group
-    country_id: Mapped[int | None] = mapped_column(Integer)  # FK to country reference table
-    name: Mapped[str] = mapped_column(Unicode(255))
-    code: Mapped[str] = mapped_column(Unicode(55))
-    manager_id: Mapped[int | None] = mapped_column(Integer) # FK to user.id; the group's manager (not the same as the entity's owner)
-    address1: Mapped[str | None] = mapped_column(Unicode(255))
-    address2: Mapped[str | None] = mapped_column(Unicode(255))
-    state: Mapped[str | None] = mapped_column(Unicode(55))
-    zip_code: Mapped[str | None] = mapped_column(Unicode(55))
-    creation_date: Mapped[datetime | None] = mapped_column(DateTime)
-    created_by: Mapped[str | None] = mapped_column(Unicode(55))
-    updated_by: Mapped[str | None] = mapped_column(Unicode(5))
-    date_updated: Mapped[datetime | None] = mapped_column(DateTime)
-    weightage: Mapped[float | None] = mapped_column(Numeric(10, 4, asdecimal=False))
-    type: Mapped[int | None] = mapped_column(Integer)  # FK to option_value.id
-    org_business_line: Mapped[str | None] = mapped_column(Unicode(10))
-    org_type: Mapped[str | None] = mapped_column(Unicode(10))
-    isAssessmentAllowed: Mapped[bool | None] = mapped_column(Boolean)
-    scoring_methodology: Mapped[str | None] = mapped_column(Unicode(10))
-    sequence: Mapped[int | None] = mapped_column(Integer)
-    status_id: Mapped[int | None] = mapped_column(Integer)  # FK to option_value.id
-    priority_id: Mapped[int | None] = mapped_column(Integer)  # FK to option_value.id
-    nature_of_involvement_id: Mapped[int | None] = mapped_column(Integer)  # FK to option_value.id
-    cascading_impact_id: Mapped[int | None] = mapped_column(Integer)  # FK to option_value.id
-    role_summary: Mapped[str | None] = mapped_column(Unicode(500))
-    candidate_justification: Mapped[str | None] = mapped_column(UnicodeText)
-    impact_on_tier1_services: Mapped[str | None] = mapped_column(UnicodeText)
-    is_non_substitutable: Mapped[bool | None] = mapped_column(Boolean)
-    recovery_coordination_role: Mapped[str | None] = mapped_column(Unicode(500))
-    key_dependencies: Mapped[str | None] = mapped_column(UnicodeText)
-    remarks: Mapped[str | None] = mapped_column(UnicodeText)
-
 class onboarding_sectors(Base):
     __tablename__ = "onboarding_sectors"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -362,9 +361,21 @@ class ctm_scan_entity(Base):
     owner_custodian: Mapped[str | None] = mapped_column(Unicode(200))
     target_rto_hours: Mapped[int | None] = mapped_column(Integer)
     target_rpo_hours: Mapped[int | None] = mapped_column(Integer)
-    tier1_critical_service_id: Mapped[int | None] = mapped_column(Integer)    
+    tier1_critical_service_id: Mapped[int | None] = mapped_column(Integer)
     data_handled: Mapped[str | None] = mapped_column(UnicodeText)  # types of data this asset processes/stores
-    # system_managed_by: Mapped[str | None] = mapped_column(Unicode(100))  # confirmed live: nvarchar(100), nullable, no FK — asset-level free text
+
+
+# The real, direct asset->entity link (per CII Onboarding DDD) — one row per asset per
+# owning business unit, so an asset can have more than one row. tier1_critical_service_id
+# above is NOT the ownership path: it's no longer populated on any current asset, and even
+# when it was, onboarding_service_entity below was only ever a service->entity mapping, one
+# indirection removed from the asset itself.
+class ctm_scan_entity_bu(Base):
+    __tablename__ = "ctm_scan_entity_bu"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ctm_scan_entity_id: Mapped[int] = mapped_column(Integer)  # FK to ctm_scan_entity.id
+    group_id: Mapped[int] = mapped_column(Integer)  # FK to group.id — the owning entity
+    service_id: Mapped[int | None] = mapped_column(Integer)  # FK to onboarding_services.id — an asset can link to more than one
 
 
 class onboarding_service_entity(Base):  # maps a service to its owning entity/group
@@ -385,12 +396,37 @@ class onboarding_supporting_systems(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str | None] = mapped_column(Unicode(300))
     asset_type: Mapped[int | None] = mapped_column(Integer)
-    technology_used: Mapped[str | None] = mapped_column(UnicodeText)    
+    min_no_of_transactions: Mapped[int | None] = mapped_column(Integer)
+    max_no_of_transactions: Mapped[int | None] = mapped_column(Integer)
+    accessability_channel: Mapped[int | None] = mapped_column(Integer)  # single option_value code (option code 'acc-channel')
+    technology_used: Mapped[str | None] = mapped_column(UnicodeText)
+    user_base_count: Mapped[int | None] = mapped_column(Integer)
     url: Mapped[str | None] = mapped_column(Unicode(500))
     vendor_name: Mapped[str | None] = mapped_column(Unicode(200))
+    maintenance_contract_exists: Mapped[bool | None] = mapped_column(Boolean)
+    hosting_location: Mapped[int | None] = mapped_column(Integer)  # single option_value code (option code 'hosting-location')
+    dr_location: Mapped[str | None] = mapped_column(Unicode(300))
+    network_connectivity_primary_dr: Mapped[int | None] = mapped_column(Integer)  # single option_value code (option code 'network-connectivity')
+    last_dr_test_date: Mapped[datetime | None] = mapped_column(DateTime)
+    backup_multi_site: Mapped[bool | None] = mapped_column(Boolean)
+    backup_retention_period_days: Mapped[int | None] = mapped_column(Integer)
+    backup_tested: Mapped[bool | None] = mapped_column(Boolean)
+    offsite_air_gapped_backup: Mapped[bool | None] = mapped_column(Boolean)
+    data_residency_restrictions: Mapped[bool | None] = mapped_column(Boolean)
+    data_residency_restriction_justification: Mapped[str | None] = mapped_column(UnicodeText)
+    document_drp_exists: Mapped[bool | None] = mapped_column(Boolean)
+    dr_drill_frequency: Mapped[int | None] = mapped_column(Integer)  # single option_value code (option code 'dr-drill')
     database_platforms: Mapped[str | None] = mapped_column(Unicode(300))
+    saas_backup_required: Mapped[bool | None] = mapped_column(Boolean)
+    saas_platform_list: Mapped[str | None] = mapped_column(UnicodeText)  # JSON array of option_value codes (option code 'saas-platforms')
+    public_cloud_platforms: Mapped[str | None] = mapped_column(UnicodeText)  # JSON array of option_value codes (option code 'pub-c-platforms')
+    rto_target_mins: Mapped[float | None] = mapped_column(Float)
+    rpo_target_mins: Mapped[float | None] = mapped_column(Float)
+    data_loss_incident_last_3_years: Mapped[bool | None] = mapped_column(Boolean)
     incident_description: Mapped[str | None] = mapped_column(UnicodeText)
-    system_managed_by: Mapped[str | None] = mapped_column(Unicode(100))
+    targeted_users: Mapped[str | None] = mapped_column(UnicodeText)  # JSON array of option_value codes, e.g. "[6]" — see option/option_value
+    managed_by: Mapped[int | None] = mapped_column(Integer)  # single option_value code (option code 'managed-by'), not free text
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)  # soft-delete flag — real queries filter WHERE is_deleted = 0
 
 # Read-only platform mirrors used by gather_asset_details (app/pipeline/context.py)
 # to resolve every session-creation context field authoritatively from the real DB.
