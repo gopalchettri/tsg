@@ -158,6 +158,24 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
                                 target_ids, epoch, get_llm(), self.request.id or guid(), user_note=user_note)
 
 
+@celery_app.task(bind=True, name="tsg.next_set",
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
+def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_epoch: int) -> None:
+    """Background job for "generate next set": add the next batch of unique, accumulating
+    scenarios for one subsystem. Same `autoretry_for=(LLMSlotUnavailable,)` and caller-reserved
+    `epoch` reasoning as regenerate_task above — a redelivery re-executes at the SAME SCENARIOS
+    epoch, so claim_stage's CAS no-ops a batch that already landed rather than double-generating.
+    `threats_epoch` is the additive-find_threats epoch, ALSO reserved once by the endpoint and held
+    fixed here, so a redelivery skips a second AI call once that stage is COMPLETE at it."""
+    with db_session() as sess:
+        session = dal.load_session(sess, session_id)
+        if session is None:
+            # session was deleted or never existed by the time this task ran — nothing to do
+            return
+        cascade.run_next_set(sess, dict(session), subsystem_id, epoch, threats_epoch,
+                            get_llm(), self.request.id or guid())
+
+
 @celery_app.task(name="tsg.admin_embedding_action",
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def admin_embedding_action_task(action: str, group: str | None, names: list[str] | None) -> dict:

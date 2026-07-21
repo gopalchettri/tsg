@@ -6,6 +6,7 @@ once, correctly.
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, cast
@@ -551,6 +552,45 @@ def finish_stage(
     return res.rowcount == 1
 
 
+def stage_epoch_at_least(
+    sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel, epoch: int,
+) -> bool:
+    """True iff this subsystem's `level` stage row is at GenerationEpoch >= `epoch`. Unlike a
+    COMPLETE-at-EXACTLY-`epoch` check, this also catches a row that has already
+    ADVANCED past `epoch` — the case a stale broker redelivery hits: its reserved epoch is BEHIND
+    the live epoch (the row was updated in place to a newer generation, so no row exists at the old
+    epoch to match an ==/COMPLETE guard). run_next_set gates the additive reset+find_threats on it
+    so a stale redelivery can't downgrade THREATS (old+2 -> old+1) and re-fire find_threats. Fresh
+    run: live < reserved -> False -> proceed; same-epoch or newer redelivery: >= -> True -> skip."""
+    live = sess.execute(
+        select(m.Subsystem_Stage_State.GenerationEpoch).where(
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == level,
+        )
+    ).scalar()
+    return live is not None and live >= epoch
+
+
+def stage_settled_at_epoch(
+    sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel, epoch: int,
+) -> bool:
+    """True iff this subsystem's `level` stage row is at `epoch` and already terminal-reviewable
+    (AWAITING_DECISION or COMPLETE). run_next_set / run_regeneration use it to tell an idempotent
+    redelivery of an already-landed batch (write_scenarios' claim_stage correctly no-op'd a row
+    already AWAITING_DECISION and returned []) apart from a genuine lost claim — the former must
+    fall through to decide_session_outcome, NOT raise + fire a spurious error SSE."""
+    return sess.execute(
+        select(1).select_from(m.Subsystem_Stage_State).where(
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == level,
+            m.Subsystem_Stage_State.GenerationEpoch == epoch,
+            m.Subsystem_Stage_State.Status.in_([StageStatus.AWAITING_DECISION, StageStatus.COMPLETE]),
+        )
+    ).first() is not None
+
+
 def stage_rows(sess: Session, session_id: str) -> list[RowMapping]:
     """Per-subsystem stage rows for the status board (§6.1), excluding `_LOCK`."""
     return list(
@@ -629,6 +669,11 @@ def reset_stage_for_regen(sess: Session, session_id: str, subsystem_id: int, lev
             m.Subsystem_Stage_State.SessionID == session_id,
             m.Subsystem_Stage_State.SubsystemID == subsystem_id,
             m.Subsystem_Stage_State.Level.in_(levels),
+            # Epoch fence (mirrors claim_stage/finish_stage): only ever move a row FORWARD. next_epoch
+            # is max+1, so a live endpoint reset always passes; the fence exists to make a STALE
+            # in-task reset (a redelivery whose reserved epoch is behind the live one) a no-op rather
+            # than let it downgrade the row backward and invert the epoch lineage.
+            m.Subsystem_Stage_State.GenerationEpoch < new_epoch,
         )
         .values(GenerationEpoch=new_epoch, Status=StageStatus.IDLE, AttemptCount=0,
             ErrorMessage=None, UpdatedAt=now())
@@ -660,6 +705,148 @@ def active_threats(sess: Session, session_id: str, subsystem_id: int) -> list[di
             )
         ).mappings()
     ]
+
+
+def has_active_scenarios(sess: Session, session_id: str) -> bool:
+    """True iff the session has any active (Superseded=0) Threat_Scenario_Output row. decide_session_
+    outcome uses it to keep a session whose stage ERROR'd but whose earlier accumulated batches left
+    salvageable scenarios in REVIEW instead of cancelling — a transient next-set/regen failure must
+    never destroy already-committed, reviewable work (mirrors the multi-subsystem partial-success
+    rule for the single-subsystem case)."""
+    return sess.execute(
+        select(1).select_from(m.Threat_Scenario_Output).where(
+            m.Threat_Scenario_Output.SessionID == session_id,
+            m.Threat_Scenario_Output.Superseded == 0,
+        )
+    ).first() is not None
+
+
+def revive_errored_scenarios_to_review(sess: Session, session_id: str) -> int:
+    """Restore the board invariant "session at REVIEW/AWAITING_DECISION => >=1 subsystem SCENARIOS
+    row at AWAITING_DECISION". decide_session_outcome's salvage branch (a stage ERROR'd but earlier
+    accumulated batches left active, reviewable scenarios) moves the SESSION row to REVIEW but leaves
+    the per-subsystem SCENARIOS stage row ERROR — so accept's good_subs (SCENARIOS @ AWAITING_DECISION)
+    comes back empty, mark_scenarios_accepted matches 0 rows, and the session completes having
+    accepted nothing (silent data loss). Flip the ERRORed SCENARIOS row (in place, at its current
+    epoch) of every subsystem that still has an active Threat_Scenario_Output back to
+    AWAITING_DECISION so accept sees it. Returns the number of subsystem rows revived."""
+    active_subs = (
+        select(m.Threat_Scenario_Output.SubsystemID)
+        .where(m.Threat_Scenario_Output.SessionID == session_id,
+            m.Threat_Scenario_Output.Superseded == 0)
+    )
+    res = execute_dml(
+        sess,
+        update(m.Subsystem_Stage_State)
+        .where(
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS,
+            m.Subsystem_Stage_State.Status == StageStatus.ERROR,
+            m.Subsystem_Stage_State.SubsystemID.in_(active_subs),
+        )
+        .values(Status=StageStatus.AWAITING_DECISION, ErrorMessage=None, LeaseExpiresAt=None, UpdatedAt=now())
+    )
+    return res.rowcount
+
+
+def subsystems_with_active_scenarios(sess: Session, session_id: str) -> set[int]:
+    """Every SubsystemID in this session that still owns an active (Superseded=0)
+    Threat_Scenario_Output row. accept_session compares this to good_subs so no subsystem's
+    accumulated scenarios are silently dropped when its stage-state row is out of sync."""
+    return set(sess.execute(
+        select(m.Threat_Scenario_Output.SubsystemID)
+        .where(m.Threat_Scenario_Output.SessionID == session_id,
+            m.Threat_Scenario_Output.Superseded == 0)
+    ).scalars())
+
+
+def _row_to_dedup_info(row) -> dict:
+    """Map an Identified_Threat row onto the small dict tasks._dedup_key folds — the ONE shape the
+    two dal identity callers rebuild from row columns."""
+    return {"catalogue_id": row["ThreatCatalogueID"], "threat_type_id": row["ThreatTypeID"],
+            "threat_type": row["ThreatType"], "threat_name": row["ThreatName"],
+            "threat_id": row["ThreatID"]}
+
+
+def identity_hash(session_id: str, subsystem_id: int, info: dict) -> str:
+    """The ONE catalogue-level IdentityHash fold: sha256(SessionID|SubsystemID|_dedup_key(info)).
+    Every producer/consumer of Threat_Scenario_Output.IdentityHash routes through here
+    (tasks.find_threats, tasks._build_scenario_output_row, next_unserved_unique_threats,
+    active_identified_threat_identities) so the app-level dedup and the UX_Scenario_ActiveIdentity
+    index can never disagree. tasks._dedup_key is the folding rule; lazy-imported so app.db.dal
+    (below app.pipeline) takes no load-time dependency on it (same trick reaper.py uses)."""
+    from app.pipeline.tasks import _dedup_key
+    return hashlib.sha256(f"{session_id}|{subsystem_id}|{_dedup_key(info)}".encode()).hexdigest()
+
+
+def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: int, n: int) -> list[str]:
+    """Up to `n` active ThreatIDs for this (session, subsystem) whose catalogue-level dedup
+    identity has NO active scenario yet — the pool the "generate next set" feature serves from
+    before it falls back to a fresh AI batch. Best-first order (Scoped_Threat.Score desc, then
+    ThreatID); a threat a fresh additive find_threats added but write_scenarios hasn't scored yet
+    has a NULL score and sorts last (LEFT JOIN), but is still eligible so the very next call can
+    serve it. Identity is folded EXACTLY like tasks._build_scenario_output_row's IdentityHash
+    (sha256(SessionID|SubsystemID|dedup_key)), so "already shown" == an active
+    Threat_Scenario_Output.IdentityHash. Two candidates sharing one identity in this same call
+    collapse to the first (best-ranked) so a single call never proposes an internal duplicate."""
+    active_hashes = set(sess.execute(
+        select(m.Threat_Scenario_Output.IdentityHash).where(
+            m.Threat_Scenario_Output.SessionID == session_id,
+            m.Threat_Scenario_Output.SubsystemID == subsystem_id,
+            m.Threat_Scenario_Output.Superseded == 0,
+        )
+    ).scalars())
+    it, st = m.Identified_Threat, m.Scoped_Threat
+    rows = sess.execute(
+        select(it.ThreatID, it.ThreatCatalogueID, it.ThreatTypeID, it.ThreatType, it.ThreatName, st.Score)
+        .select_from(it.__table__.join(
+            st.__table__,
+            and_(st.ThreatID == it.ThreatID, st.SessionID == session_id,
+                st.SubsystemID == subsystem_id, st.Superseded == 0),
+            isouter=True))
+        .where(it.SessionID == session_id, it.SubsystemID == subsystem_id, it.Superseded == 0,
+            # A threat with an ACTIVE Scoped_Threat that scoping REJECTED is only re-servable if it
+            # was demoted purely by the top-N cutoff — target-mode re-scoring (top_n disabled) will
+            # re-select it, so it's the legitimate "already-scored-but-unserved" pool this feature
+            # serves first. A tech_gate / below-threshold rejection is PERMANENT (re-scoring fails
+            # the same way), so re-serving it just churns a Selected=0 row and write_scenarios keeps
+            # refusing it — the "no new threats" wedge. Keep: no scoped row yet (a fresh additive
+            # find_threats threat), Selected=1, or a top-N-cutoff demote; drop the permanent zombies.
+            or_(st.ScopedThreatID.is_(None), st.Selected == 1, st.Reason.like("beyond top-%")))
+        # Score desc puts NULLs last on both SQLite and SQL Server (NULL sorts lowest); ThreatID
+        # is a deterministic tie-break, matching scoping's own score-desc/id-asc convention.
+        .order_by(st.Score.desc(), it.ThreatID)
+    ).mappings()
+    picked: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        identity = identity_hash(session_id, subsystem_id, _row_to_dedup_info(r))
+        if identity in active_hashes or identity in seen:
+            continue
+        seen.add(identity)
+        picked.append(r["ThreatID"])
+        if len(picked) >= n:
+            break
+    return picked
+
+
+def active_identified_threat_identities(sess: Session, session_id: str, subsystem_id: int) -> set[str]:
+    """The set of folded catalogue-level identities (sha256(SessionID|SubsystemID|_dedup_key)) of
+    this (session, subsystem)'s ACTIVE Identified_Threat rows. find_threats(supersede=False) uses it
+    to skip inserting an additive proposal whose identity already matches a live threat — otherwise a
+    coverage-aware round that re-proposes an already-present threat leaves a never-scored dead
+    Identified_Threat row (the write_scenarios IdentityHash index would still block a duplicate
+    scenario, but the leaked threat row lingers). Same folding rule as next_unserved_unique_threats."""
+    identities: set[str] = set()
+    for r in sess.execute(
+        select(m.Identified_Threat.ThreatID, m.Identified_Threat.ThreatCatalogueID,
+            m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName)
+        .where(m.Identified_Threat.SessionID == session_id,
+            m.Identified_Threat.SubsystemID == subsystem_id,
+            m.Identified_Threat.Superseded == 0)
+    ).mappings():
+        identities.add(identity_hash(session_id, subsystem_id, _row_to_dedup_info(r)))
+    return identities
 
 
 def active_threat_rules(sess: Session, threat_type_ids: list[int]) -> list[dict]:
@@ -823,6 +1010,30 @@ def active_scoped_threat_ids(sess: Session, session_id: str, subsystem_id: int, 
             m.Scoped_Threat.Superseded == 0,
         )
     ).scalars().all())
+
+
+def threats_with_active_scenario(sess: Session, session_id: str, subsystem_id: int, threat_ids) -> set[str]:
+    """The subset of `threat_ids` that already have an active (Superseded=0) Threat_Scenario_Output
+    (joined to it via Scoped_Threat.ScopedThreatID — the stable GUID link, resolved even if the
+    scoped row itself was later superseded). write_scenarios keys its next-set cleanup on this, NOT
+    on "has an active scoped row": a genuine REGEN target keeps its active scenario (leave it
+    untouched); a POOL ZOMBIE — a previously-served pool threat that rescored OUT after a mid-session
+    tech_gate/threshold tightening — still has its old active Selected=1/'beyond top-%' scoped row but
+    NO active scenario, so it lands in the marker set and gets superseded + re-marked Selected=0
+    instead of being re-served on every subsequent click."""
+    if not threat_ids:
+        return set()
+    st, out = m.Scoped_Threat, m.Threat_Scenario_Output
+    # Seek IX_ScenarioOutput_SessionSubActive: predicate `out` on the SAME (session, subsystem) as
+    # `st` so this never scans active scenarios from other sessions/tenants. Result-preserving — an
+    # output row always carries its scoped row's SessionID/SubsystemID.
+    return set(sess.execute(
+        select(st.ThreatID)
+        .select_from(st.__table__.join(out, out.ScopedThreatID == st.ScopedThreatID))
+        .where(st.SessionID == session_id, st.SubsystemID == subsystem_id,
+            st.ThreatID.in_(threat_ids),
+            out.SessionID == session_id, out.SubsystemID == subsystem_id, out.Superseded == 0)
+    ).scalars())
 
 
 def supersede_by_threats(sess: Session, table, session_id: str, subsystem_id: int, threat_ids) -> None:

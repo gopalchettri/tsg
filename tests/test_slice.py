@@ -1294,24 +1294,61 @@ def test_reaper_cancels_never_started_when_stale(db):
     _seed_session(db, asset_id=100)  # asset re-runnable
 
 
-# --- [R8] partial-REVIEW accept touches ONLY reviewed subsystems (#5 scenario scope, #6 masters scope) ---
-def test_partial_accept_scopes_to_reviewed_subsystems(db):
+# --- [R8]/[FIX L1] a subsystem that ERRORed but still owns active, accumulated scenarios is revived
+# into scope at accept — never silently dropped (the multi-subsystem partial-failure data-loss class) ---
+def test_multi_subsystem_errored_with_active_scenarios_all_accepted(db):
+    """A next-set/regen failure can leave subsystem A at ERROR while a healthy sibling B sits at
+    AWAITING_DECISION and BOTH still own active, reviewable scenarios. decide_session_outcome must
+    revive A's ERRORed SCENARIOS row (dal.revive_errored_scenarios_to_review) BEFORE the
+    AWAITING_DECISION branch so accept-all's good_subs covers it too — accepting BOTH, never a silent
+    0-for-A completion. Fails when FIX L1 Change 1 is reverted (A stays ERROR → out of good_subs →
+    Change 2 raises AcceptConflict, or A's scenario is silently dropped)."""
     session = _seed_session(db, subs=[SUB, SUB2])
     sid = session["SessionID"]
     for level, status in ((SubsystemLevel.THREATS, StageStatus.COMPLETE),
                           (SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION)):
-        _force_stage(db, sid, SUB["id"], level, status)           # SUB reviewed
+        _force_stage(db, sid, SUB["id"], level, status)           # B (SUB): healthy, awaiting review
     for level, status in ((SubsystemLevel.THREATS, StageStatus.COMPLETE),
                           (SubsystemLevel.SCENARIOS, StageStatus.ERROR)):
-        _force_stage(db, sid, SUB2["id"], level, status)          # SUB2 errored in scenarios
-    for ssid in (SUB["id"], SUB2["id"]):                           # both have a committed scenario row
-        # (SUB2's models a failed regen: its earlier-generation rows were never superseded
-        # because the regen worker died before dal.supersede ran, then the reaper set ERROR)
+        _force_stage(db, sid, SUB2["id"], level, status)          # A (SUB2): next-set failed → ERROR
+    for ssid in (SUB["id"], SUB2["id"]):                           # both still own an active scenario
         db.execute(insert(m.Threat_Scenario_Output).values(
             OutputID=str(uuid.uuid4()), SessionID=sid, TenantID="default", SubsystemID=ssid,
             ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete, ScenarioJSON="{}",
             Accepted=0, Superseded=0, IdentityHash=f"hash-{ssid}", GenerationEpoch=1, CreatedAt=now()))
-    # SUB2's committed grounded threat references type 11, which an admin then deactivates
+    decide_session_outcome(db, session)
+    assert load_session(db, sid)["CurrentStage"] == WorkflowStage.REVIEW
+    # A's ERRORed SCENARIOS row was revived so accept sees it (board invariant restored).
+    assert db.execute(select(m.Subsystem_Stage_State.Status).where(
+        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB2["id"],
+        m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS)).scalar() == StageStatus.AWAITING_DECISION
+    accept_session(db, sid, "5", "u1")
+    db.commit()
+    assert load_session(db, sid)["SessionStatus"] == SessionStatus.completed
+    scen = {r["SubsystemID"]: r["Accepted"] for r in db.execute(
+        select(m.Threat_Scenario_Output.SubsystemID, m.Threat_Scenario_Output.Accepted)
+        .where(m.Threat_Scenario_Output.SessionID == sid)).mappings()}
+    assert scen[SUB["id"]] == 1          # healthy sibling accepted
+    assert scen[SUB2["id"]] == 1         # errored subsystem's accumulated scenario ALSO accepted — NOT dropped
+
+
+# --- [R8] an errored subsystem with NO active scenarios stays out of good_subs, so its inactive
+# master never blocks accept of the healthy subsystem (the still-valid half of the old scope rule) ---
+def test_errored_subsystem_without_scenarios_master_does_not_block_accept(db):
+    session = _seed_session(db, subs=[SUB, SUB2])
+    sid = session["SessionID"]
+    for level, status in ((SubsystemLevel.THREATS, StageStatus.COMPLETE),
+                          (SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION)):
+        _force_stage(db, sid, SUB["id"], level, status)           # SUB reviewed, has an active scenario
+    for level, status in ((SubsystemLevel.THREATS, StageStatus.COMPLETE),
+                          (SubsystemLevel.SCENARIOS, StageStatus.ERROR)):
+        _force_stage(db, sid, SUB2["id"], level, status)          # SUB2 errored, NO active scenario
+    db.execute(insert(m.Threat_Scenario_Output).values(
+        OutputID=str(uuid.uuid4()), SessionID=sid, TenantID="default", SubsystemID=SUB["id"],
+        ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete, ScenarioJSON="{}",
+        Accepted=0, Superseded=0, IdentityHash="hash-good", GenerationEpoch=1, CreatedAt=now()))
+    # SUB2's committed grounded threat references type 11, which an admin then deactivates. With no
+    # active scenario, SUB2 is NOT revived (stays out of good_subs) so its inactive master can't block.
     db.execute(insert(m.Identified_Threat).values(
         ThreatID=str(uuid.uuid4()), SessionID=sid, TenantID="default", SubsystemID=SUB2["id"],
         ThreatCategory="Tampering", ThreatType="Config Tampering", ThreatName="x", ThreatActorsJSON="{}",
@@ -1320,14 +1357,13 @@ def test_partial_accept_scopes_to_reviewed_subsystems(db):
     db.execute(update(m.Threat_Type).where(m.Threat_Type.ThreatTypeID == 11).values(IsActive=False))
     decide_session_outcome(db, session)
     assert load_session(db, sid)["CurrentStage"] == WorkflowStage.REVIEW
-    accept_session(db, sid, "5", "u1")   # #6: NOT blocked by SUB2's inactive master (type 11 is only SUB2's)
+    accept_session(db, sid, "5", "u1")   # NOT blocked by SUB2's inactive master (SUB2 out of good_subs)
     db.commit()
     assert load_session(db, sid)["SessionStatus"] == SessionStatus.completed
     scen = {r["SubsystemID"]: r["Accepted"] for r in db.execute(
         select(m.Threat_Scenario_Output.SubsystemID, m.Threat_Scenario_Output.Accepted)
         .where(m.Threat_Scenario_Output.SessionID == sid)).mappings()}
-    assert scen[SUB["id"]] == 1          # reviewed subsystem's scenario accepted
-    assert scen[SUB2["id"]] == 0         # errored subsystem's leftover scenario NOT accepted (good_subs scope)
+    assert scen[SUB["id"]] == 1          # healthy subsystem accepted
 
 
 # --- accept re-validates masters are active ([R6]) ---

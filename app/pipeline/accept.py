@@ -99,6 +99,21 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
                 raise NotFoundError(
                     f"{requested - matched} of {requested} requested OutputID(s) in `subset` did "
                     f"not match an active, awaiting-decision scenario in session {session_id}")
+        else:
+            # [FIX L1 class-killer] accept-all must cover EVERY subsystem that still owns active,
+            # reviewable scenarios — not just the ones good_subs (SCENARIOS @ AWAITING_DECISION)
+            # happens to name. If a subsystem has active Threat_Scenario_Output rows but its stage
+            # row is out of sync (e.g. a next-set/regen failure left it ERROR), its accumulated
+            # scenarios would be silently dropped while the session completes. decide_session_outcome
+            # runs dal.revive_errored_scenarios_to_review before REVIEW to prevent exactly this, so
+            # this only fires on a genuinely inconsistent board — and raising is the safe direction:
+            # never silently drop a batch, never silently accept off a stale board. Subsumes the old
+            # matched==0 guard (zero matches with active scenarios ⇒ those subsystems are uncovered).
+            uncovered = dal.subsystems_with_active_scenarios(sess, session_id) - set(good_subs)
+            if uncovered:
+                raise AcceptConflict(
+                    f"accept-all leaves active scenarios in subsystem(s) {sorted(uncovered)} whose "
+                    f"SCENARIOS stage is not AWAITING_DECISION (subsystem stage state out of sync)")
 
         _add_flagged_threats_to_library(sess, scenario_session, good_subs, user_id)
 

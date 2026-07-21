@@ -116,7 +116,8 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], sub: dict[str
                     max_threats: int, categories: list[str] | None = None,
                     actor_examples: list[str] | None = None,
                     asset_active_fields: list[str] | None = None,
-                    sub_active_fields: list[str] | None = None) -> list[dict]:
+                    sub_active_fields: list[str] | None = None,
+                    exclude: list[str] | None = None) -> list[dict]:
     """ builds the question that asks the AI to suggest
     possible security threats for the supporting system, grounded in the
     UI-supplied asset/subsystem context — these are just suggestions, never the
@@ -140,9 +141,21 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], sub: dict[str
     matches against. Optional here (falls back to a hardcoded default) only so callers/tests
     that don't have a DB session handy — or a not-yet-seeded database — still get a
     working prompt instead of a broken one.
+
+    `exclude` is the coverage list for the "generate next set" additive round
+    (cascade.run_next_set): the threat names/types already proposed for this subsystem. When
+    non-empty, an extra instruction tells the model to propose only threats NOT already covered,
+    so a context-rich asset can reach many distinct threats instead of the model repeating the
+    obvious few. Each item is redacted like every other free-text value before the call. Left
+    None/empty (every first-run caller) leaves the base prompt byte-for-byte unchanged.
     """
     cats = categories or _FALLBACK_STRIDE_CATEGORIES
     actors_hint = ", ".join(actor_examples) if actor_examples else _FALLBACK_ACTOR_VOCABULARY_HINT
+    coverage = ""
+    if exclude:
+        coverage = (" Do NOT propose any threat already covered; propose only threats materially "
+                    "different from every item in this ALREADY-COVERED list: "
+                    + "; ".join(redact(e) or "" for e in exclude) + ".")
     return [
         {"role": "system", "content": "Propose STRIDE threats using ONLY these categories: "
         + ", ".join(cats) + f". Propose at most {max_threats} candidate threats total, "
@@ -153,7 +166,7 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], sub: dict[str
         "discarded; you decide nothing. No exploit instructions, payloads, or procedural attack "
         f"steps. For actors, use short generic role labels (for example: {actors_hint}) "
         "rather than invented group names or descriptive sentences — leave the list empty if no "
-        "specific actor is evident from the context. Output ONLY a JSON array of "
+        "specific actor is evident from the context." + coverage + " Output ONLY a JSON array of "
         "{category, type, name, actors:[]} — no markdown code fences, no text before or after it."},
         # asset_name is free text so it goes through redact() for secrets/PII; asset_context and
         # sub are structured dicts so they go through allowlist_context() to strip unlisted fields.

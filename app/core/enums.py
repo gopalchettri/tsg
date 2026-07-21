@@ -194,6 +194,8 @@ class SSEEventType(StrEnum):
     subsystem_started = "subsystem_started"            # the pipeline began work on this subsystem (fires BEFORE its stages run, not after)
     session_entered_review = "session_entered_review"  # every subsystem is done; the whole session now waits on the one human decision
     error = "error"                                    # a stage failed (carries subsystem_id) or the whole session died (omits it)
+    next_set_result = "next_set_result"                # advisory: one "generate next set" click landed (carries subsystem_id +
+                                                        # new_scenarios/no_new) so the UI can tell a fruitful click from a fruitless one
     heartbeat = "heartbeat"                             # periodic keep-alive so proxies don't drop an idle SSE connection
 
 

@@ -52,6 +52,13 @@ class RegenerateScenariosBody(BaseModel):
     user_note: str | None = None
 
 
+class NextSetBody(BaseModel):
+    """Body for "generate next set of scenarios" — add the next accumulating batch of unique
+    scenarios for one supporting system. Only the subsystem is needed: which threats to serve
+    (already-scored pool first, then a fresh AI batch) is decided server-side."""
+    supporting_system_id: int
+
+
 class SupportingSystemBoard(BaseModel):
     """One supporting system's row on the session status board: its per-stage statuses plus an overall status."""
     id: int

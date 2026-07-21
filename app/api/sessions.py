@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import Principal, get_principal
 from app.api.schemas import (
     AcceptBody, AcceptedScenario, AcceptedScenariosResponse, AcceptResponse, CancelResponse, CreateSessionBody,
-    CreateSessionResponse, RegenerateResponse, RegenerateScenariosBody, ScenarioResult, SessionBoard,
+    CreateSessionResponse, NextSetBody, RegenerateResponse, RegenerateScenariosBody, ScenarioResult, SessionBoard,
     SessionResults, ThreatResult,
 )
 from app.core.config import get_settings
@@ -31,7 +31,7 @@ from app.db.dal import EntityForbidden, IdempotencyKeyConflict, RegenerateConfli
 from app.db.engine import db_session
 from app.pipeline import cascade
 from app.pipeline.accept import accept_session
-from app.pipeline.celery_app import regenerate_task, run_pipeline_task
+from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
 from app.pipeline.context import gather_asset_details
 from app.pipeline.tasks import set_up_progress_tracking
 
@@ -332,6 +332,68 @@ def post_regenerate_scenarios(session_id: str, body: RegenerateScenariosBody,
     """Rebuild one or more scenarios' narratives only — siblings untouched (scenarios 1, 2)."""
     return _do_regenerate(session_id, principal, body.supporting_system_id, RegenGranularity.scenario,
                         body.output_ids, body.user_note)
+
+
+def enqueue_next_set(session_id: str, subsystem_id: int, epoch: int, threats_epoch: int) -> None:
+    """Indirection so tests can run the cascade synchronously instead of via a broker."""
+    next_set_task.delay(session_id, subsystem_id, epoch, threats_epoch)
+
+
+def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> RegenerateResponse:
+    """"Generate next set of scenarios": add the next accumulating batch of unique scenarios for
+    one subsystem. Same eligibility / lock / CAS guards as _do_regenerate — only allowed at the
+    REVIEW barrier, serialised against a concurrent regen/accept/next-set by the subsystem lock —
+    but takes no target ids: which threats to serve is decided server-side by cascade.run_next_set
+    (already-scored pool first, then a fresh coverage-aware AI batch)."""
+    with db_session() as sess:
+        scenario_session = get_authorized_session(sess, session_id, principal)
+        _assert_regen_eligible(scenario_session)
+        _assert_subsystem_in_session(scenario_session, subsystem_id, session_id)
+
+        # bail out if another regenerate/accept/next-set already holds this subsystem's mutex lock
+        lock_status = sess.execute(
+            select(m.Subsystem_Stage_State.Status).where(
+                m.Subsystem_Stage_State.SessionID == session_id,
+                m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+                m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK,
+            )
+        ).scalar()
+        if lock_status == StageStatus.RUNNING:
+            raise RegenerateConflict(f"subsystem {subsystem_id} is locked (regeneration/accept in progress)")
+        # conditional UPDATE (compare-and-swap): only succeeds while the session is still active
+        # and at REVIEW — rowcount != 1 means a concurrent request already moved it.
+        res: CursorResult = dal.execute_dml(
+            sess,
+            update(m.Scenario_Session)
+            .where(m.Scenario_Session.SessionID == session_id,
+                m.Scenario_Session.SessionStatus == SessionStatus.active,
+                m.Scenario_Session.CurrentStage == WorkflowStage.REVIEW)
+            .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING, UpdatedAt=now())
+        )
+        if res.rowcount != 1:
+            raise RegenerateConflict("another regeneration/accept won the race")
+
+        # Reserve the SCENARIOS epoch and reset that level (same as a scenario regen). ALSO reserve
+        # the THREATS epoch here — once — and thread it through so a redelivery/retry of the task
+        # re-uses it and run_next_set's idempotency guard can skip a second additive find_threats.
+        # Do NOT reset THREATS here: an IDLE THREATS row would make decide_session_outcome return
+        # None (wedge) if the task is slow or lost; run_next_set resets it (guarded) only if it
+        # actually needs the additive find_threats.
+        epoch = dal.next_epoch(sess, session_id, subsystem_id, cascade.NEXT_SET_LEVELS)
+        dal.reset_stage_for_regen(sess, session_id, subsystem_id, cascade.NEXT_SET_LEVELS, epoch)
+        threats_epoch = dal.next_epoch(sess, session_id, subsystem_id, (SubsystemLevel.THREATS,))
+
+    enqueue_next_set(session_id, subsystem_id, epoch, threats_epoch)
+    return RegenerateResponse(session_id=session_id, status="generating")
+
+
+@router.post("/sessions/{session_id}/scenarios/next-set", status_code=202, response_model=RegenerateResponse)
+def post_next_set_scenarios(session_id: str, body: NextSetBody,
+                            principal: Principal = Depends(get_principal)) -> RegenerateResponse:
+    """Generate the next set of scenarios — 5 more unique threat scenarios that accumulate onto the
+    existing ones for one supporting system, never superseding a prior batch. Returns 202 with
+    status "generating"; a round that finds nothing new is not an error (the reviewer can retry)."""
+    return _do_next_set(session_id, principal, body.supporting_system_id)
 
 
 @router.post("/sessions/{session_id}/cancel", response_model=CancelResponse)

@@ -180,13 +180,13 @@ def test_reaper_does_not_reenter_review_right_after_leaving_it(db):
     assert row["SessionStatus"] == "active"
 
 
-def test_reaper_eventually_reclaims_a_regen_that_never_actually_started(db, monkeypatch):
-    """Epoch reservation happens at the endpoint (before the task ever runs), so a
-    permanently-lost broker message (the task truly never executes) leaves the
-    reset SCENARIOS row stuck IDLE. The reaper's grace-period fallback still
-    reclaims it — safely CANCELLING the session (releasing the M4 lock) rather
-    than leaving it stuck forever, since the sole subsystem's scenario stage never
-    actually got redone and there is nothing left reviewable."""
+def test_reaper_salvages_a_regen_that_never_actually_started_to_review(db, monkeypatch):
+    """[FIX 4] Epoch reservation happens at the endpoint (before the task ever runs), so a
+    permanently-lost broker message (the task truly never executes) leaves the reset SCENARIOS
+    row stuck IDLE. The reaper's grace-period fallback reclaims it — but the sole subsystem's
+    ORIGINAL scenario is still active (the regen never superseded it), so the session is salvaged
+    back to REVIEW (lock released, a human can decide) rather than CANCELLED, which would have
+    destroyed committed reviewable work. Mirrors the multi-subsystem partial-success rule."""
     from app.core.config import get_settings
     monkeypatch.setattr(get_settings(), "stage_lease_seconds", 1)
     sid = _run_to_review(db, StubLLM())
@@ -198,8 +198,17 @@ def test_reaper_eventually_reclaims_a_regen_that_never_actually_started(db, monk
                .values(UpdatedAt=dal.now().replace(year=2000)))
     clean_up_abandoned_sessions(db)
     row = load_session(db, sid)
-    assert row["SessionStatus"] == "cancelled"  # safely reclaimed — M4 lock released, asset re-runnable
-    _seed_session(db, asset_id=100)
+    assert row["CurrentStage"] == WorkflowStage.REVIEW   # salvaged, NOT cancelled
+    assert row["SessionStatus"] == "active"
+    # the original scenario survived (nothing destroyed)
+    active = db.execute(select(func.count()).select_from(m.Threat_Scenario_Output).where(
+        m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)).scalar()
+    assert active == 1
+    # and the lock was released (not leaked) even though the session stays active for review
+    lock = db.execute(select(m.Subsystem_Stage_State.Status).where(
+        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+        m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK)).scalar()
+    assert lock == StageStatus.IDLE
 
 
 # --- epoch mechanics ---
