@@ -859,6 +859,27 @@ def supersede_by_scoped_threats(sess: Session, session_id: str, subsystem_id: in
     )
 
 
+def supersede_by_identity_hashes(sess: Session, session_id: str, subsystem_id: int, identity_hashes) -> None:
+    """Every active Threat_Scenario_Output row in this (session, subsystem) whose IdentityHash is
+    in the requested set — one UPDATE, not a loop. Used by `write_scenarios`' regen path to clear
+    any already-active row that folds to the same catalogue-level dedup key before inserting the
+    regenerated one, so the filtered `UX_Scenario_ActiveIdentity(SessionID, IdentityHash)` unique
+    index can't collide (regen skips `_select_unique_top_n`, so nothing else guarantees the folded
+    hashes are unique). Same shape as `supersede_by_scoped_threats` above."""
+    if not identity_hashes:
+        return
+    sess.execute(
+        update(m.Threat_Scenario_Output)
+        .where(
+            m.Threat_Scenario_Output.SessionID == session_id,
+            m.Threat_Scenario_Output.SubsystemID == subsystem_id,
+            m.Threat_Scenario_Output.IdentityHash.in_(identity_hashes),
+            m.Threat_Scenario_Output.Superseded == 0,
+        )
+        .values(Superseded=1)
+    )
+
+
 def insert_row(sess: Session, table, values: Mapping[str, Any]) -> None:
     """Generic single-row insert shared by callers writing a new active record
     (threat/scenario output) — no active-row or Superseded handling of its

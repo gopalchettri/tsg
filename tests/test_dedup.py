@@ -12,9 +12,11 @@ import json
 import uuid
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 
+from app.core.enums import GroundingStatus, ScenarioStatus, SubsystemLevel
+from app.db import dal
 from app.db import models as m
 from app.db.dal import now
 from app.pipeline.scoping import Scored
@@ -74,7 +76,19 @@ def test_dedup_key_precedence_and_null_name():
     assert _dedup_key({"catalogue_id": None, "threat_type_id": 10}) == "type:10"
     # ThreatType is NOT NULL, ThreatName is nullable — None must not crash, folds as ""
     assert _dedup_key({"threat_type": "Firmware Tampering", "threat_name": None}) == \
-        "txt:" + _normalize("Firmware Tampering\x1f")
+        "txt:" + _normalize("Firmware Tampering") + "|"
+
+
+def test_dedup_key_txt_fallback_does_not_over_collapse():
+    # empty type + null name → per-threat-unique via threat_id, NOT a shared bare "txt:" that
+    # collapses every distinct ungrounded proposal into one.
+    k1 = _dedup_key({"threat_type": "", "threat_name": None, "threat_id": "id-1"})
+    k2 = _dedup_key({"threat_type": "", "threat_name": None, "threat_id": "id-2"})
+    assert k1 == "txt:tid:id-1" and k2 == "txt:tid:id-2" and k1 != k2
+    # the delimiter must survive normalization: ('Firmware'/'Tampering') must NOT fold onto
+    # ('Firmware Tampering'/None) the way the old '\x1f'-joined key did (it stripped the separator).
+    assert _dedup_key({"threat_type": "Firmware", "threat_name": "Tampering"}) != \
+        _dedup_key({"threat_type": "Firmware Tampering", "threat_name": None})
 
 
 def test_normalize_folds_punctuation_case_and_whitespace():
@@ -146,6 +160,15 @@ def test_ungrounded_identical_normalized_text_merged(db):
     assert len(_scenarios(db, session["SessionID"])) == 1                      # same txt: key → collapsed
 
 
+def test_ungrounded_separator_boundary_not_over_collapsed(db):
+    # ('Novel Alpha'/'Rare Beta') vs ('Novel Alpha Rare'/'Beta') normalize-collide across the old
+    # '\x1f' separator but are distinct once the delimiter is applied AFTER normalization.
+    session = _run(db, _UngroundedLLM([
+        {"category": "Tampering", "type": "Novel Alpha", "name": "Rare Beta", "actors": []},
+        {"category": "Tampering", "type": "Novel Alpha Rare", "name": "Beta", "actors": []}]))
+    assert len(_scenarios(db, session["SessionID"])) == 2
+
+
 # --- structural backstop: SubsystemID + dedup_key folded into IdentityHash --
 def test_sibling_subsystems_same_catalogue_both_get_scenarios(db):
     # The same catalogue-20 threat in two sibling subsystems must NOT cross-suppress:
@@ -188,6 +211,94 @@ def test_targeted_regen_of_a_catalogue_duplicate_is_not_demoted(db):
     assert len(provs) == 1                                                     # regenerated, not withheld
 
 
+# --- regen ranker parity + folded-identity collision (Fixes 1 & 2) ----------
+def _seed_threat(db, sid, ss, *, threat_id, grounding_status, catalogue_id, type_id,
+                threat_type, threat_name, library_type=None, library_name=None):
+    """Insert one Identified_Threat directly so its score/catalogue is fully deterministic
+    (bypasses the grounding pipeline). Shape matches dal.active_threats' read-back."""
+    db.execute(insert(m.Identified_Threat).values(
+        ThreatID=threat_id, SessionID=sid, TenantID="default", SubsystemID=ss,
+        ThreatCategory="Tampering", ThreatType=threat_type, ThreatName=threat_name,
+        LibraryThreatType=library_type, LibraryThreatName=library_name,
+        ThreatTypeID=type_id, ThreatCatalogueID=catalogue_id,
+        GroundingStatus=grounding_status, GroundingScore=None, Superseded=0, CreatedAt=now()))
+
+
+def _active_winner_count(db, sid, threat_id):
+    return db.execute(
+        select(func.count()).select_from(m.Threat_Scenario_Output)
+        .join(m.Scoped_Threat, m.Threat_Scenario_Output.ScopedThreatID == m.Scoped_Threat.ScopedThreatID)
+        .where(m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0,
+            m.Scoped_Threat.ThreatID == threat_id)).scalar()
+
+
+def test_beyond_cutoff_unique_winner_is_regenerable(db, monkeypatch):
+    # Two cat-20 duplicates rank first (grounded, score 70); the cat-21 unique winner scores lower
+    # (confirm, 60) so it lands at raw rank 3 — beyond scoping_top_n=2 in the duplicate-inclusive
+    # ranking, yet a full run keeps it via free-the-slot. Regenerating it must NOT be re-excluded as
+    # 'beyond top-N' (that raised RegenerateConflict → the Regenerate control silently did nothing).
+    from app.core.config import get_settings
+    session = _seed_session(db)
+    sid, ss = session["SessionID"], SUB["id"]
+    dup1, dup2, winner = ("a0000000-0000-4000-8000-000000000001",
+                        "a0000000-0000-4000-8000-000000000002",
+                        "a0000000-0000-4000-8000-000000000003")
+    for tid in (dup1, dup2):
+        _seed_threat(db, sid, ss, threat_id=tid, grounding_status=str(GroundingStatus.grounded),
+                    catalogue_id=20, type_id=10, threat_type="Firmware Tampering", threat_name="Bootloader implant",
+                    library_type="Firmware Tampering", library_name="Bootloader implant")
+    _seed_threat(db, sid, ss, threat_id=winner, grounding_status=str(GroundingStatus.confirm),
+                catalogue_id=21, type_id=11, threat_type="Config Tampering", threat_name="OTA poisoning",
+                library_type="Config Tampering", library_name="OTA poisoning")
+    db.commit()
+    monkeypatch.setattr(get_settings(), "scoping_top_n", 2)
+
+    write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, dal.active_threats(db, sid, ss), StubLLM(), _TID)
+    db.commit()
+    assert len(_scenarios(db, sid)) == 2                                       # one per unique catalogue
+    assert _active_winner_count(db, sid, winner) == 1                          # winner active despite raw rank 3
+
+    epoch = dal.next_epoch(db, sid, ss, (SubsystemLevel.SCENARIOS,))
+    dal.reset_stage_for_regen(db, sid, ss, (SubsystemLevel.SCENARIOS,), epoch)
+    provs = write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, dal.active_threats(db, sid, ss),
+                            StubLLM(), _TID, epoch=epoch, target_threat_ids={winner})
+    assert len(provs) == 1                                                     # regenerated, not silently skipped
+    assert _active_winner_count(db, sid, winner) == 1
+
+
+def test_regen_two_same_catalogue_outputs_no_integrityerror(db):
+    # Legacy pre-dedup state: two active same-catalogue (cat 20) outputs with DISTINCT old-style
+    # IdentityHashes, so both are active. Regenerating both recomputes IdentityHash via the folded
+    # dedup_key → both collapse to sha256(sid|ss|cat:20). Without the regen-branch guard the two
+    # rows collide on UX_Scenario_ActiveIdentity in one bulk insert → IntegrityError.
+    session = _seed_session(db)
+    sid, ss = session["SessionID"], SUB["id"]
+    t1, t2 = "b0000000-0000-4000-8000-000000000001", "b0000000-0000-4000-8000-000000000002"
+    for i, tid in enumerate((t1, t2)):
+        _seed_threat(db, sid, ss, threat_id=tid, grounding_status=str(GroundingStatus.grounded),
+                    catalogue_id=20, type_id=10, threat_type="Firmware Tampering", threat_name="Bootloader implant",
+                    library_type="Firmware Tampering", library_name="Bootloader implant")
+        scoped_id = str(uuid.uuid4())
+        db.execute(insert(m.Scoped_Threat).values(
+            ScopedThreatID=scoped_id, SessionID=sid, TenantID="default", SubsystemID=ss, ThreatID=tid,
+            Score=70.0, ScopeRank=i + 1, Selected=1, Reason="grounding=grounded", Superseded=0, CreatedAt=now()))
+        db.execute(insert(m.Threat_Scenario_Output).values(
+            OutputID=str(uuid.uuid4()), SessionID=sid, TenantID="default", SubsystemID=ss, ScopedThreatID=scoped_id,
+            Status=str(ScenarioStatus.complete), ScenarioJSON="{}", Accepted=0, Superseded=0,
+            IdentityHash=f"legacy-{i}", GenerationEpoch=1, CreatedAt=now()))
+    db.commit()
+
+    epoch = dal.next_epoch(db, sid, ss, (SubsystemLevel.SCENARIOS,))
+    dal.reset_stage_for_regen(db, sid, ss, (SubsystemLevel.SCENARIOS,), epoch)
+    # would raise IntegrityError here without the regen-branch de-dup + identity-hash supersede
+    write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, dal.active_threats(db, sid, ss),
+                    StubLLM(), _TID, epoch=epoch, target_threat_ids={t1, t2})
+    db.commit()
+    active = _scenarios(db, sid)
+    assert len(active) == 1                                                    # exactly one active per key
+    assert active[0].IdentityHash == hashlib.sha256(f"{sid}|{ss}|cat:20".encode()).hexdigest()
+
+
 # --- config: scenario count bound to threat count ---------------------------
 def test_config_rejects_scenario_count_above_threat_count():
     from pydantic import ValidationError
@@ -197,3 +308,16 @@ def test_config_rejects_scenario_count_above_threat_count():
     with pytest.raises(ValidationError):
         Settings(scoping_top_n=20, max_threats_per_subsystem=12)
     Settings(scoping_top_n=12, max_threats_per_subsystem=12)                   # equal is allowed
+
+
+def test_thin_dedup_headroom_warns_without_raising():
+    # scoping_top_n=5 with only 6 candidates (< 5*1.25 = 6.25 headroom) must WARN, not raise —
+    # catalogue dedup can under-shoot scoping_top_n when the model repeats itself.
+    import structlog
+
+    from app.core.config import Settings
+
+    with structlog.testing.capture_logs() as logs:
+        s = Settings(scoping_top_n=5, max_threats_per_subsystem=6)
+    assert s.scoping_top_n == 5                                                # constructed, did NOT raise
+    assert any(e.get("event") == "config.thin_dedup_headroom" for e in logs)

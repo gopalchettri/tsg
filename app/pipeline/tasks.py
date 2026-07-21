@@ -153,7 +153,17 @@ def _dedup_key(info: dict) -> str:
     type_id = info.get("threat_type_id")
     if type_id is not None:
         return f"type:{type_id}"
-    return "txt:" + _normalize((info.get("threat_type") or "") + "\x1f" + (info.get("threat_name") or ""))
+    # Normalize each part independently, then join with a delimiter appended AFTER normalization
+    # so it survives (_normalize strips `[^\w\s]`, so an in-text separator would be eaten and
+    # 'Firmware'+'Tampering' would collide with 'Firmware Tampering'+None). When BOTH parts are
+    # empty, fall back to a per-threat-unique token so distinct ungrounded proposals don't all
+    # collapse onto a bare 'txt:' — threat_id is present in both the find_threats summary and
+    # active_threats, so full-run and regen still agree deterministically.
+    key_type = _normalize(info.get("threat_type") or "")
+    key_name = _normalize(info.get("threat_name") or "")
+    if not key_type and not key_name:
+        return "txt:tid:" + str(info.get("threat_id"))
+    return "txt:" + key_type + "|" + key_name
 
 
 def find_threats(sess: Session, scenario_session: dict, sub: dict, asset_context: dict, llm: LLMClient, task_id: str,
@@ -311,7 +321,7 @@ def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, s
     }
 
 
-def _select_unique_top_n(scoped: list[scoping.Scored], enriched: dict, top_n: int | None) -> None:
+def _select_unique_top_n(scoped: list[scoping.Scored], enriched: dict, top_n: int | None) -> int:
     """Catalogue-dedupe the already-ranked, threshold-passed threats down to a unique top-N,
     in place (Stage E). Walks in the ranker's own order (Score desc, ThreatID asc). A threat
     keeps its scenario only if its dedup key is unseen AND fewer than top_n uniques are already
@@ -319,20 +329,26 @@ def _select_unique_top_n(scoped: list[scoping.Scored], enriched: dict, top_n: in
     DISTINCT scenarios, not N-minus-the-dupes. A later duplicate is demoted (Selected=0, reason)
     but its row is kept for audit/provenance; only the scenario is withheld. Threats already
     excluded in scoring (tech_gate / score threshold) are left as-is — they never consumed a slot.
-    Full-run only: a targeted regen is never passed here (a regen target must not be blocked)."""
+    Full-run only: a targeted regen is never passed here (a regen target must not be blocked).
+
+    Returns how many threats were demoted as duplicates (not the top-N cutoff) — surfaced in the
+    scoping_complete audit / scenarios.deduped log so dedup activity is observable in aggregate."""
     seen: set[str] = set()
     kept = 0
+    deduped = 0
     for sc in scoped:
         if not sc.selected:
             continue  # already excluded by tech_gate / score threshold in score_threats
         key = _dedup_key(enriched.get(sc.threat_id, {}))
         if key in seen:
             sc.selected, sc.reason = False, "duplicate of higher-ranked threat"
+            deduped += 1
         elif top_n is not None and kept >= top_n:
             sc.selected, sc.reason = False, f"beyond top-{top_n} cutoff"
         else:
             seen.add(key)
             kept += 1
+    return deduped
 
 
 def write_scenarios(sess: Session, scenario_session: dict, sub: dict, asset_context: dict, threats: list[dict],
@@ -383,24 +399,28 @@ def write_scenarios(sess: Session, scenario_session: dict, sub: dict, asset_cont
     # Only distinct, known threat-type ids are needed to look up the scoring rules that apply.
     type_ids = sorted({t["threat_type_id"] for t in threats if t.get("threat_type_id") is not None})
     settings = get_settings()
-    # scoping_top_n is the SCENARIO count. On a full run it is enforced over UNIQUE threats by
-    # _select_unique_top_n below (Decision C), so score_threats gets top_n=None and stays the pure
+    # scoping_top_n is the SCENARIO count, enforced over UNIQUE threats by _select_unique_top_n
+    # below (Decision C, full run only), so score_threats ALWAYS gets top_n=None and stays the pure
     # deterministic ranker (base + grounding + rules, threshold filtering only — no dedup, no LLM).
-    # A targeted regen keeps score_threats' own top_n cutoff and skips dedup entirely. The clamp is
-    # belt-and-suspenders to config.py's startup validator, in case top_n is monkeypatched past the
-    # candidate ceiling at runtime.
+    # A targeted regen must rank on the SAME duplicate-inclusive order a full run used: a unique
+    # winner a full run kept via free-the-slot can sit beyond raw rank scoping_top_n, and a raw
+    # top-N cutoff on regen would wrongly re-exclude it ('beyond top-N') → RegenerateConflict →
+    # the Regenerate control silently no-ops. score_threshold/tech_gate still reject a target that
+    # genuinely dropped out, and a regen target is always a former unique winner (demoted duplicates
+    # never got an active output, so get_threat_id_to_redo can't select them). The clamp is belt-and-
+    # suspenders to config.py's startup validator, in case top_n is monkeypatched past the candidate
+    # ceiling at runtime — it feeds only the full-run _select_unique_top_n call, never score_threats.
     top_n = settings.scoping_top_n
     if top_n is not None:
         top_n = min(top_n, settings.max_threats_per_subsystem)
     scoped_all = scoping.score_threats(threats, subsystem=sub, rules=dal.active_threat_rules(sess, type_ids),
                                     score_threshold=settings.scoping_score_threshold,
-                                    top_n=None if target_threat_ids is None else top_n)
+                                    top_n=None)
     enriched = {t["threat_id"]: t for t in threats}
     # Dedup to a unique top-N BEFORE any scenario text is generated — full runs only. A targeted
     # regen must never be blocked or demoted by dedup (the reviewer explicitly asked to redo an
     # existing, already-unique scenario), so it is left out of this pass.
-    if target_threat_ids is None:
-        _select_unique_top_n(scoped_all, enriched, top_n)
+    deduped = _select_unique_top_n(scoped_all, enriched, top_n) if target_threat_ids is None else 0
     # Full run: score/keep every threat. Targeted regen: only the caller-specified subset.
     scoped = scoped_all if target_threat_ids is None else [sc for sc in scoped_all if sc.threat_id in target_threat_ids]
 
@@ -434,7 +454,8 @@ def write_scenarios(sess: Session, scenario_session: dict, sub: dict, asset_cont
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.SCENARIO_GENERATION, SubsystemID=ss,
                     EventType=AuditEventType.scoping_complete,
-                    DetailJSON=json.dumps({"scoped": len(scoped), "selected": len(provs)}))
+                    DetailJSON=json.dumps({"scoped": len(scoped), "selected": len(provs), "deduped": deduped}))
+    log.info("scenarios.deduped", session_id=sid, subsystem=ss, deduped=deduped, kept=len(provs))
 
     if target_threat_ids is not None and not generated_ids:
         # Every requested target was excluded by rescoring — nothing to regenerate, and nothing
@@ -472,6 +493,22 @@ def write_scenarios(sess: Session, scenario_session: dict, sub: dict, asset_cont
                                                     entity_id, user_id, _dedup_key(enriched.get(sc.threat_id, {}))))
     if scoped_rows:
         sess.execute(insert(m.Scoped_Threat), scoped_rows)
+    if target_threat_ids is not None and output_rows:
+        # Regen skips _select_unique_top_n, so two targets that fold to the SAME dedup_key build the
+        # SAME IdentityHash. Two ways that collides on UX_Scenario_ActiveIdentity: both in ONE bulk
+        # insert (a legacy pre-dedup session can hold two active same-catalogue outputs), or a later
+        # regen whose folded hash matches a prior regen's now-active folded row. Collapse to the
+        # first (highest-ranked — output_rows follow ranked order) and supersede any already-active
+        # row sharing one of these hashes, so exactly one active scenario per key survives.
+        seen_hashes: set[str] = set()
+        deduped_output_rows = []
+        for r in output_rows:
+            if r["IdentityHash"] in seen_hashes:
+                continue
+            seen_hashes.add(r["IdentityHash"])
+            deduped_output_rows.append(r)
+        output_rows = deduped_output_rows
+        dal.supersede_by_identity_hashes(sess, sid, ss, seen_hashes)
     if output_rows:
         sess.execute(insert(m.Threat_Scenario_Output), output_rows)
     if not dal.finish_stage(sess, sid, ss, SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION, epoch, task_id):

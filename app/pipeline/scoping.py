@@ -13,7 +13,7 @@ absent context field means the rule has NO effect and is logged (§5.4 step 1:
 never silently false). Every rule that fires is recorded in `Scored.factors` →
 `Scoped_Threat.FactorsJSON` (provenance, §11). The selection cutoff (score
 threshold / top-N) comes from config (§5.4 step 3), not constants — both now
-default ON (55.0 / 10, `Settings.scoping_score_threshold`/`scoping_top_n`); set
+default ON (55.0 / 5, `Settings.scoping_score_threshold`/`scoping_top_n`); set
 either to None there to go back to no cutoff. Same inputs → same ranking
 (acceptance: test_scoping_deterministic, test_tech_gate_excludes) — this
 governs ranking a FIXED list of already-identified threats, not whether the

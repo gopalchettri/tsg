@@ -150,7 +150,7 @@ def test_scoping_selection_cutoff():
 
 def test_scoping_default_cutoff_does_not_silently_drop_flagged_threats():
     """The real production defaults (Settings.scoping_score_threshold=55.0,
-    scoping_top_n=10 — no longer None/None) are what tasks.py::write_scenarios actually
+    scoping_top_n=5 — no longer None/None) are what tasks.py::write_scenarios actually
     passes to score_threats. Pairing a non-None threshold with the old flagged=0.0
     confidence weight would have scored flagged threats at exactly BASE_SCORE (50) —
     below the new 55 floor — silently excluding every novel/uncatalogued threat outright,
@@ -159,7 +159,7 @@ def test_scoping_default_cutoff_does_not_silently_drop_flagged_threats():
     from app.core.config import get_settings
 
     s = get_settings()
-    assert (s.scoping_score_threshold, s.scoping_top_n) == (55.0, 10)
+    assert (s.scoping_score_threshold, s.scoping_top_n) == (55.0, 5)
     threats = [{"threat_id": "g", "grounding_status": "grounded"},
                {"threat_id": "c", "grounding_status": "confirm"},
                {"threat_id": "f", "grounding_status": "flagged"}]
