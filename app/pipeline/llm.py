@@ -391,6 +391,14 @@ class LiteLLMClient:
         effective_temperature = temperature if temperature is not None else s.llm_temperature
         if effective_temperature is not None:
             common["temperature"] = effective_temperature
+        # Some deployments reject a pinned param the model doesn't allow — e.g. gpt-5 rejects
+        # temperature=0.0 (find_threats' threat_identification_temperature default) with
+        # litellm.UnsupportedParamsError "only 1 is supported", which would fail EVERY real
+        # threat-identification call. drop_params lets litellm drop a per-model-unsupported param
+        # instead of failing the call; deployments that DO accept the value keep it. The requested
+        # value is still recorded in Provenance.params below (what we asked for), consistent with
+        # the model-vs-model_version "requested vs served" distinction this file already draws.
+        common["drop_params"] = True
         if s.llm_reasoning_effort is not None:  # operator-pinned; unset by default (see config.py)
             common["reasoning_effort"] = s.llm_reasoning_effort
         if s.llm_provider == "azure_openai":

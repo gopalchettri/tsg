@@ -43,6 +43,18 @@ def test_chat_kwargs_proxy_default():
     assert "api_version" not in kw
 
 
+def test_chat_kwargs_drop_params_on():
+    # gpt-5 rejects temperature=0.0 (find_threats' threat_identification_temperature default) with
+    # UnsupportedParamsError; drop_params lets litellm drop a per-model-unsupported param instead of
+    # failing every real threat-identification call. Present on every provider, even with temp pinned.
+    for s in (Settings(llm_provider="azure_openai", azure_openai_deployment_name="gpt-5-mini",
+                       azure_openai_endpoint="https://x.azure.com/", azure_openai_api_key="secret",
+                       azure_openai_api_version="2024-12-01-preview"),
+              Settings(llm_provider="litellm_proxy", litellm_base_url="http://proxy:4000",
+                       inference_model="gpt-5")):
+        assert LiteLLMClient(s)._chat_kwargs(temperature=0.0)["drop_params"] is True
+
+
 def test_chat_kwargs_json_mode_off_by_default():
     # default OFF: the fallback provider (glm-5) may not support response_format,
     # and an unsupported param would fail every call deterministically
