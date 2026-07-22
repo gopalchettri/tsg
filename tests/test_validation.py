@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from app.pipeline.validation import (
-    LLMResponseParseError, _normalize_str_list, parse_json, validate_scenario,
+    LLMResponseParseError, _mentions, _normalize_str_list, parse_json, validate_scenario,
 )
 
 GARBAGE = "Sorry, I can't produce JSON right now {{{"
@@ -83,8 +83,20 @@ def test_validate_scenario_ok():
 def test_validate_scenario_warns_on_missing_fields():
     v = validate_scenario({"scenario_title": "t"}, "Firmware Tampering", "Bootloader implant")
     assert v["validation_status"] == "warning"
-    assert set(v["errors"]) == {"missing scenario_statement", "missing business_impact",
-                                "missing operational_impact", "missing risk_statement"}
+    # business_impact/operational_impact are NOT required — the scenario_prompt only produces
+    # scenario_title, scenario_statement, risk_statement.
+    assert set(v["errors"]) == {"missing scenario_statement", "missing risk_statement"}
+
+
+def test_validate_scenario_ok_with_only_three_produced_fields():
+    # The scenario_prompt returns exactly these three fields (no business_impact/operational_impact);
+    # that shape must validate ok, not warn about "missing" impact fields.
+    v = validate_scenario(
+        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+         "risk_statement": "Bootloader implant risks the asset."},
+        "Firmware Tampering", "Bootloader implant")
+    assert v["validation_status"] == "ok"
+    assert not [e for e in v["errors"] if e.startswith("missing ")]
 
 
 def test_validate_scenario_warns_when_statement_ignores_threat():
@@ -101,6 +113,46 @@ def test_validate_scenario_falls_back_to_type_when_name_missing():
          "business_impact": "b", "operational_impact": "o", "risk_statement": "r"},
         "Firmware Tampering", None)
     assert v["validation_status"] == "ok"
+
+
+def test_validate_scenario_ok_on_paraphrase_sharing_threat_tokens():
+    # The real regression: the strict whole-phrase check warned on 100% of on-topic scenarios
+    # because paraphrased prose never repeats the full formal threat name. Token overlap (~1/3)
+    # fixes it — this statement shares compromised/supply/chain with the threat name, so it's ok.
+    v = validate_scenario(
+        {"scenario_title": "t",
+         "scenario_statement": "A compromised vendor-supplied component lets a supply-chain "
+                               "attacker tamper with the hardware before it is deployed.",
+         "business_impact": "b", "operational_impact": "o", "risk_statement": "r"},
+        None, "Compromised OT supply chain or hardware")
+    assert v["validation_status"] == "ok"
+    assert not any("threat name/type" in e for e in v["errors"])
+
+
+def test_validate_scenario_warns_on_off_topic_statement_sharing_no_tokens():
+    # A statement about a completely unrelated threat shares ~no significant tokens → still warns.
+    v = validate_scenario(
+        {"scenario_title": "t",
+         "scenario_statement": "An office printer runs low on toner during business hours.",
+         "business_impact": "b", "operational_impact": "o", "risk_statement": "r"},
+        None, "Compromised OT supply chain or hardware")
+    assert "scenario_statement does not reference the threat name/type " \
+           "(Compromised OT supply chain or hardware)" in v["errors"]
+
+
+def test_mentions_token_overlap_cases():
+    # >=1/3 of the 4 significant tokens (compromised/supply/chain/hardware; "ot"<3, "or" stopword)
+    assert _mentions("Compromised OT supply chain or hardware",
+                     "compromised supply chain firmware") is True
+    # zero shared tokens → not a mention
+    assert _mentions("Compromised OT supply chain or hardware", "toner is low") is False
+    # all-stopword / no-significant-token needle → nothing to check, passes
+    assert _mentions("the and of to", "totally unrelated prose") is True
+    assert _mentions("", "anything") is True
+    # asset "Power Generation System (PGS)" vs a risk_statement lacking the "(PGS)" suffix → passes
+    # (3 of 4 tokens present); the old whole-phrase check false-warned here.
+    assert _mentions("Power Generation System (PGS)",
+                     "The Power Generation System is at risk.") is True
 
 
 def test_validate_scenario_ok_when_risk_statement_references_asset_and_critical_service():

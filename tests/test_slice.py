@@ -1040,6 +1040,37 @@ def test_happy_path_and_conflict_and_smoke(engine, monkeypatch):
     assert dup.status_code == 409 and dup.json()["details"]["active_session_id"]
 
 
+def test_results_returns_only_used_threats(engine):
+    # [REVIEW-FIX] GET /results must show EXACTLY the threats that produced a scenario — traced
+    # Identified_Threat -> Scoped_Threat -> active Threat_Scenario_Output — not merely Selected=1.
+    # (a) selected + scenario -> shown; (b) selected but scenario never generated -> hidden;
+    # (c) identified only, no scoped row -> hidden. Threat count then matches the scenario count.
+    from app.db.engine import db_session
+
+    with db_session() as sess:  # commits + closes on exit, so the client reads via a fresh connection
+        session = _seed_session(sess)
+        sid = session["SessionID"]
+        # (a) selected AND has an active scenario output -> returned
+        used = _seed_flagged_threat(sess, sid, SUB["id"], "Tampering", "Used Type", "Used Threat",
+                                    ["Hacker"], type_id=10, catalogue_id=20)
+        _seed_scenario_chain(sess, sid, SUB["id"], used)  # Selected=1 Scoped_Threat + 1 scenario
+        # (b) selected but its scenario failed to generate (scoped row, no output) -> NOT returned
+        no_scen = _seed_flagged_threat(sess, sid, SUB["id"], "Tampering", "NoScenario Type",
+                                       "NoScenario Threat", ["Hacker"], type_id=11, catalogue_id=21)
+        sess.execute(insert(m.Scoped_Threat).values(
+            ScopedThreatID=str(uuid.uuid4()), SessionID=sid, TenantID="default", EntityID="5",
+            UserID="u1", SubsystemID=SUB["id"], ThreatID=no_scen, Score=50, ScopeRank=2,
+            Selected=1, Superseded=0, CreatedAt=now()))
+        # (c) identified only, no scoped row at all -> NOT returned
+        _seed_flagged_threat(sess, sid, SUB["id"], "Tampering", "Orphan Type", "Orphan Threat",
+                             ["Hacker"], type_id=11, catalogue_id=21)
+
+    results = make_client({"5"}).get(f"/v1/sessions/{sid}/results").json()
+    assert len(results["scenarios"]) == 1
+    assert [t["threat_name"] for t in results["threats"]] == ["Used Threat"]  # only (a)
+    assert len(results["threats"]) == len(results["scenarios"])
+
+
 def test_moderation_summary_defensive_parsing():
     # [REVIEW-FIX] _moderation_summary must never let a malformed/missing ValidationJSON blob
     # (or a moderation sub-object with an unexpected shape) turn into a 500 for a reviewer

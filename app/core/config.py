@@ -166,13 +166,13 @@ class Settings(BaseSettings):
 
     # --- Threat proposal volume ---
     # Most candidate threats the AI can propose for one supporting system in a single call.
-    max_threats_per_subsystem: int = 15
+    max_threats_per_subsystem: int = 10
 
     # --- Threat-scoping selection cutoff ---
     # A threat scoring below this doesn't get a full scenario written for it.
     scoping_score_threshold: float | None = Field(55.0, ge=0.0, le=100.0)
     # Only the highest-scoring N unique threats get a scenario written. None = no limit.
-    # 5 scenarios from 15 candidates = 3x headroom, so catalogue-dedup reliably still hits 5.
+    # 5 scenarios from 10 candidates = 2x headroom, so catalogue-dedup reliably still hits 5.
     scoping_top_n: int | None = Field(5, ge=1)
 
     # --- Concurrency / capacity limits ---

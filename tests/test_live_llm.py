@@ -140,8 +140,9 @@ def test_live_coverage_aware_returns_new_threats():
 
 def test_live_scenario_generation_validates():
     """Real scenario-generation path: scenario_prompt -> chat() -> parse_json -> validate_scenario.
-    Asserts the 5 required narrative fields are present and the statement actually mentions the
-    threat it narrates. A distinctive, universally-known threat is used so the model reliably
+    Asserts the 3 required narrative fields (scenario_title, scenario_statement, risk_statement —
+    the fields scenario_prompt actually produces) are present and the statement actually mentions
+    the threat it narrates. A distinctive, universally-known threat is used so the model reliably
     echoes its name (validate_scenario's threat-reference proxy)."""
     threat_type = "Tampering"
     threat_name = "SQL Injection"

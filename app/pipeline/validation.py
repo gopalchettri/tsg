@@ -12,6 +12,7 @@ plus a cheap keyword consistency proxy, no LLM-judge call.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -100,6 +101,28 @@ def _references(needle: str, haystack: str) -> bool:
     return re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])", h) is not None
 
 
+# Common words that carry no topical signal — dropped before token overlap so a needle like
+# "Compromised OT supply chain or hardware" isn't "matched" just because the haystack also says "or".
+_STOPWORDS = frozenset({"the", "and", "or", "of", "to", "a", "an", "for", "with",
+                        "in", "on", "by", "at", "from", "that", "this"})
+
+
+def _mentions(needle: str, haystack: str) -> bool:
+    """Loosened consistency proxy: does `haystack` share at least ~1/3 (minimum 1) of `needle`'s
+    significant tokens? Replaces the old whole-phrase `_references(needle, haystack)` for the
+    scenario checks — paraphrased prose never repeats a full formal threat/asset name verbatim, so
+    the strict phrase check false-warned on 100% of on-topic scenarios. Significant tokens are
+    lowercased alphanumeric runs of length >= 3 that aren't common stopwords; an all-stopword/empty
+    needle has nothing meaningful to check and passes (True). Each token is matched with the existing
+    word-boundary `_references` so a short token still can't match inside an unrelated word."""
+    tokens = [t for t in re.findall(r"[a-z0-9]+", needle.lower())
+            if len(t) >= 3 and t not in _STOPWORDS]
+    if not tokens:
+        return True
+    hits = sum(1 for t in tokens if _references(t, haystack))
+    return hits >= max(1, math.ceil(len(tokens) / 3))
+
+
 def _normalize_str_list(raw: Any) -> list[str]:
     """A malformed assumptions/excluded_details field from the model (a bare
     string, null, or a list containing non-strings) must never reach the caller
@@ -117,14 +140,18 @@ def _normalize_str_list(raw: Any) -> list[str]:
 
 def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_name: str | None,
                     asset_name: str | None = None, critical_service: list[str] | None = None) -> dict[str, Any]:
-    """ sanity-checks the Stage-2 scenario — are all five
-    required parts there, and does it actually talk about the threat it's
-    supposed to be about?
+    """ sanity-checks the Stage-2 scenario — are the three
+    required parts (scenario_title, scenario_statement, risk_statement) there,
+    and does it actually talk about the threat it's supposed to be about?
 
-    structural (all 5 narrative fields present, non-empty) + consistency
+    structural (scenario_title, scenario_statement, risk_statement present,
+    non-empty — the three fields scenario_prompt actually produces) + consistency
     proxy (statement references the threat it narrates; risk_statement references the asset
     and critical service, per the prompt's own "threat + asset + critical service + impact"
-    formula). Self-reported `assumptions`/`excluded_details` pass through for the reviewer.
+    formula). The consistency proxy is now TOKEN OVERLAP (~1/3 of the name/type's significant
+    tokens appear, via `_mentions`), NOT whole-phrase containment — paraphrased on-topic prose
+    never repeats a full formal name verbatim, so the old phrase check warned on everything.
+    Self-reported `assumptions`/`excluded_details` pass through for the reviewer.
     `asset_name`/`critical_service` default to None so existing callers that don't have them
     handy keep working unchanged — the check simply doesn't run for them. Flags, never raises.
 
@@ -139,21 +166,20 @@ def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_
     back (e.g. from context it was given) is not caught by validate_scenario or by any later
     stage. Documented residual risk, not a gap this function is meant to close."""
     errors = _check_fields(
-        scenario, ("scenario_title", "scenario_statement", "business_impact", "operational_impact",
-                "risk_statement"))
+        scenario, ("scenario_title", "scenario_statement", "risk_statement"))
     statement = str(scenario.get("scenario_statement") or "")
     needle = threat_name or threat_type or ""
     # Only compare when both sides actually have text — a blank statement/threat name
     # is already reported by _check_fields above, so don't double-flag it here.
-    if statement.strip() and needle.strip() and not _references(needle, statement):
+    if statement.strip() and needle.strip() and not _mentions(needle, statement):
         errors.append(f"scenario_statement does not reference the threat name/type ({needle})")
     risk_statement = str(scenario.get("risk_statement") or "")
     # Same "only compare when both sides have text" guard as above — an empty risk_statement is
     # already reported by _check_fields, and a blank critical_service is a real, allowed asset
     # state (not every asset has one configured), not something to false-flag here.
-    if risk_statement.strip() and asset_name and not _references(asset_name, risk_statement):
+    if risk_statement.strip() and asset_name and not _mentions(asset_name, risk_statement):
         errors.append(f"risk_statement does not reference the asset ({asset_name})")
-    if risk_statement.strip() and critical_service and not any(_references(cs, risk_statement) for cs in critical_service):
+    if risk_statement.strip() and critical_service and not any(_mentions(cs, risk_statement) for cs in critical_service):
         errors.append(f"risk_statement does not reference the critical service ({', '.join(critical_service)})")
     return {**_result(errors),
             "assumptions": _normalize_str_list(scenario.get("assumptions")),

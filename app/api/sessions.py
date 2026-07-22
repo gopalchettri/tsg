@@ -10,7 +10,7 @@ import json
 
 from fastapi import APIRouter, Depends, Header
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
@@ -176,17 +176,28 @@ def get_results(session_id: str, principal: Principal = Depends(get_principal)) 
         scenario_session = get_authorized_session(sess, session_id, principal)
         sid = scenario_session["SessionID"]
         entity_id = scenario_session["EntityID"]
-        def get_current_rows(table, cols):
+        def get_current_rows(table, cols, *extra):
             """Selects the given columns for this session, excluding rows a prior
-            regeneration superseded — the shared filter for both result kinds below."""
+            regeneration superseded — the shared filter for both result kinds below.
+            `extra` predicates narrow further (the threats query passes an EXISTS so
+            only threats actually used for a scenario come back)."""
             return [dict(r) for r in sess.execute(
-                select(*cols).where(table.SessionID == sid, table.Superseded == 0)
+                select(*cols).where(table.SessionID == sid, table.Superseded == 0, *extra)
             ).mappings()]
 
+        st, out = m.Scoped_Threat, m.Threat_Scenario_Output
         threats = get_current_rows(m.Identified_Threat,
                         [m.Identified_Threat.ThreatID, m.Identified_Threat.SubsystemID,
                         m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName,
-                        m.Identified_Threat.GroundingStatus, m.Identified_Threat.ThreatCatalogueID])
+                        m.Identified_Threat.GroundingStatus, m.Identified_Threat.ThreatCatalogueID],
+                        # only threats that actually PRODUCED a scenario — trace Identified_Threat ->
+                        # Scoped_Threat -> active Threat_Scenario_Output (linked by ScopedThreatID). A
+                        # selected threat whose scenario failed to generate has no active output, so
+                        # it's correctly excluded (stricter than "was Selected=1").
+                        exists().where(st.ThreatID == m.Identified_Threat.ThreatID,
+                                    st.SessionID == sid, st.Superseded == 0,
+                                    out.ScopedThreatID == st.ScopedThreatID,
+                                    out.SessionID == sid, out.Superseded == 0))
         scenarios = get_current_rows(m.Threat_Scenario_Output,
                             [m.Threat_Scenario_Output.OutputID, m.Threat_Scenario_Output.SubsystemID,
                             m.Threat_Scenario_Output.ScenarioJSON, m.Threat_Scenario_Output.Accepted,

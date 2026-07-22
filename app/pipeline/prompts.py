@@ -193,27 +193,46 @@ def scenario_prompt(asset_name: str, asset_context: dict[str, Any], sub: dict[st
     grounded in who's actually behind the threat when that's known; an empty list is
     valid and means no specific actor was identified — the model must not invent one.
     """
+
+    if not threat_type or not threat_name:
+        # raise, don't assert — asserts get stripped under `python -O` and this is a real
+        # contract violation, not a debug-only sanity check
+        raise ValueError("scenario_prompt requires a verified threat_type and threat_name")
+
+    safe_actors = [redact(a) for a in (actors or []) if a]
+    # NOTE: route actor names through an allowlist-aware redactor, or skip general redaction
+    # for this field — a generic PII/NER redactor will very plausibly treat ATT&CK-style actor
+    # names as PERSON/ORG entities and mask them, silently defeating grounding.
+
+    if not safe_actors:
+        actor_clause = "No specific actor was identified for this threat — do not invent or assume one."
+    elif len(safe_actors) == 1:
+        actor_clause = "Ground the scenario in this actor's typical tactics, capabilities, and intent."
+    else:
+        actor_clause = ("Ground the scenario in what these actors share in tactics, capabilities, "
+                        "and intent — do not invent a single composite actor.")
+
+    system_content = (
+            "Write a threat scenario using ONLY the supplied context — do not invent assets, "
+            "technologies, or facts. No exploit instructions, payloads, tool commands, or "
+            "procedural attack steps — describe only the general nature of the compromise (for "
+            "example: unauthorized access, data tampering, service disruption) and its consequences. "
+            f"{actor_clause} "
+            "Return a JSON object matching the required schema. scenario_title, scenario_statement, "
+            "and risk_statement must each be a non-empty string. If context is too thin to state "
+            "something specific, a short sentence saying so plainly IS a valid, complete value for "
+            "that field — it satisfies the non-empty requirement; never invent specifics to make a "
+            "thin field look more complete. Keep scenario_statement and risk_statement to 1-3 "
+            "sentences each. risk_statement = the threat scenario, the asset, its critical service, "
+            "and the operational/security impact if the threat materializes. Exclude controls, risk scores, and "
+            "evidence — those come from elsewhere. Output ONLY the JSON object."
+        )
+
     return [
-        {"role": "system", "content": "Write a threat scenario using ONLY the supplied context — "
-        "do not invent assets, technologies, or facts; if the context is too thin for a field, say "
-        "so plainly rather than filling it in. No exploit instructions, payloads, tool commands, or "
-        "procedural attack steps. Describe the general nature of the compromise (for example: "
-        "unauthorized access, data tampering, service disruption) and its consequences, without "
-        "step-by-step exploitation detail. If threat_actors is non-empty, ground the scenario in "
-        "that actor's typical tactics/capabilities/intent; if it is empty, do not invent or assume "
-        "a specific actor. Return a JSON object with these REQUIRED, non-empty fields: "
-        "scenario_title, scenario_statement, business_impact, operational_impact, risk_statement — "
-        "state risk_statement as the threat scenario plus the asset plus its critical service plus "
-        "the operational and security impact if the threat materializes. Also include assumptions "
-        "and excluded_details (both may be empty arrays if nothing applies) — list anything assumed "
-        "in assumptions and anything deliberately left out in excluded_details. Exclude controls, "
-        "risk scores, evidence. Output ONLY that JSON object — no markdown code fences, no text "
-        "before or after it."},
-        # threat_type/threat_name/actors already came from the verified library match (see docstring
-        # above), but they're still redacted here — every free-text value gets redacted, no exceptions.
-        {"role": "user", "content": _CONTEXT_PREFIX + json.dumps(
-            {**_base_context(asset_name, asset_context, sub, asset_active_fields, sub_active_fields),
-            "threat_type": redact(threat_type), "threat_name": redact(threat_name),
-            "threat_actors": [redact(a) for a in (actors or [])]},
-            separators=_JSON_SEPARATORS)},
-    ]
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": _CONTEXT_PREFIX + json.dumps(
+                {**_base_context(asset_name, asset_context, sub, asset_active_fields, sub_active_fields),
+                "threat_type": redact(threat_type), "threat_name": redact(threat_name),
+                "threat_actors": safe_actors},
+                separators=_JSON_SEPARATORS)},
+        ]
