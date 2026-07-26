@@ -126,14 +126,19 @@ def _matches(value: Any, expected: str | None) -> bool:
     return str(value).strip().lower() == expected.strip().lower()
 
 
-def _apply_rules(threat: dict, subsystem: dict | None, rules_by_type: dict) -> tuple[float, bool, list[str], list[dict]]:
-    """In plain English: runs every relevant rule against one threat, and
-    works out its bonus score plus whether it should be excluded entirely.
+def _apply_rules(threat: dict, subsystems: list[dict] | None, rules_by_type: dict) -> tuple[float, bool, list[str], list[dict]]:
+    """In plain English: runs every relevant rule against one threat, checking the asset's
+    supporting systems, and works out its bonus score plus whether it should be excluded entirely.
 
-    Evaluate every rule for this threat's grounded type (§5.4 step 2). Returns
-    (score delta, selected, failed gate keys, fired factors). A threat with no
-    `threat_type_id` (ungrounded) has no type to key rules on — untouched."""
+    Evaluate every rule for this threat's grounded type (§5.4 step 2). The asset is threat-modeled
+    as a whole, so a subsystem-keyed rule (RuleKey → subsystem field) fires if ANY supporting
+    system matches it — a tech_gate passes when any supporting system satisfies it, and a
+    relevance_* weight is added once if any supporting system matches. Returns (score delta,
+    selected, failed gate keys, fired factors). A threat with no `threat_type_id` (ungrounded) has
+    no type to key rules on — untouched. `criticality` is the asset's own value (context.py copies
+    it onto every supporting system), so an any-match check reads it correctly."""
     delta, selected, gate_failures, factors = 0.0, True, [], []
+    subs = subsystems or []
     for rule in rules_by_type.get(threat.get("threat_type_id"), []):
         key = rule["RuleKey"]
         mapping = _RULE_KEY_FIELDS.get(key)
@@ -141,13 +146,20 @@ def _apply_rules(threat: dict, subsystem: dict | None, rules_by_type: dict) -> t
             log.warning("scoping.rule_key_unknown", rule_key=key)
             continue
         fld, default_expected = mapping
-        if subsystem is None or fld not in subsystem:  # absent context field → same no-effect rule
+        # value-presence, NOT key-presence: context.py always emits every rule-keyable key (with
+        # value None when unresolved), so `fld in s` would always be True and wrongly make a
+        # tech_gate keyed on an all-None field fail CLOSED (silently exclude the threat). `is not
+        # None` keeps a curator's explicit "" or 0 present-and-evaluated while treating an
+        # unresolved field as absent → the documented no-effect rule (never silently false, §5.4 step 1).
+        present = [s for s in subs if s.get(fld) is not None]
+        if not present:  # field unresolved (None)/absent on every supporting system → no-effect rule
             log.warning("scoping.rule_field_absent", rule_key=key, field=fld)
             continue
         # "" is a real curator value (match-empty), NOT "fall back to the default" — only
         # a true NULL RuleValue uses the allowlist entry's default expected value.
         rule_value = rule.get("RuleValue")
-        matched = _matches(subsystem.get(fld), rule_value if rule_value is not None else default_expected)
+        expected = rule_value if rule_value is not None else default_expected
+        matched = any(_matches(s.get(fld), expected) for s in present)  # fires if ANY supporting system matches
         family = rule["RuleType"]
         if family == ThreatRuleType.tech_gate:
             if not matched:
@@ -196,16 +208,18 @@ def _apply_selection_cutoffs(selected: bool, score: float, reason: str, kept: in
     return selected, reason, kept
 
 
-def score_threats(threats: list[dict[str, Any]], *, subsystem: dict | None = None,
+def score_threats(threats: list[dict[str, Any]], *, subsystems: list[dict] | None = None,
                 rules: list[dict] | None = None, score_threshold: float | None = None,
                 top_n: int | None = None) -> list[Scored]:
-    """In plain English: the main function here — takes the threats for one
-    subsystem, scores and ranks them, and decides which ones move forward to
+    """In plain English: the main function here — takes the asset's identified
+    threats, scores and ranks them, and decides which ones move forward to
     get a written scenario.
 
     Deterministic: same inputs → same ranking (acceptance: test_scoping_deterministic).
     Called with only `threats` (no rules, no cutoff) this is exactly the pre-R12
-    behavior: base + grounding weight, everything selected."""
+    behavior: base + grounding weight, everything selected. `subsystems` is the asset's
+    supporting-systems context — a subsystem-keyed rule fires if ANY of them matches
+    (see _apply_rules)."""
     # Bucket the curator's rules by threat type, so each threat below only gets
     # checked against the rules that actually apply to its type.
     rules_by_type: dict[int, list[dict]] = {}
@@ -217,7 +231,7 @@ def score_threats(threats: list[dict[str, Any]], *, subsystem: dict | None = Non
     evaluated = []
     for t in threats:
         score = BASE_SCORE + _CONFIDENCE_WEIGHT.get(GroundingStatus(t["grounding_status"]), 0.0)
-        delta, selected, gate_failures, factors = _apply_rules(t, subsystem, rules_by_type)
+        delta, selected, gate_failures, factors = _apply_rules(t, subsystems, rules_by_type)
         score += delta
         reason = _scoring_reason(gate_failures, t["grounding_status"])
         evaluated.append((t["threat_id"], score, selected, reason, factors))

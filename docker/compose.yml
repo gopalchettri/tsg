@@ -1,5 +1,6 @@
 # Local dev/test infra for the TSG vertical slice.
-# `docker compose -f docker/compose.yml up -d` then run Alembic + the app.
+# `docker compose -f docker/compose.yml up -d` then run the app (schema is
+# stood up separately from scripts/*.sql -- database-first, no migration tool).
 # GPU model-serving (TEI/vLLM) is not included — tests use a deterministic
 # litellm stub (fixed-latency echo); point TSG_LITELLM_BASE_URL at real serving
 # for integration against models.

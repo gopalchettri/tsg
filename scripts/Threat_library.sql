@@ -34,17 +34,23 @@ BEGIN
         ALTER TABLE Threat_Catalogue ADD Source nvarchar(50) NULL;
 END
 
--- Config_Threat_Rule (R12: scoping rules, SDD §5.4). ThreatRuleID is a plain
--- int PK, NOT IDENTITY — app never INSERTs into this table (dal.py only
--- SELECTs it), so curator-seeded scripts must supply ThreatRuleID
--- explicitly, same convention Seed_to_Threat_library.sql follows.
+-- Config_Threat_Rule (R12: scoping rules, SDD §5.4). ThreatRuleID is IDENTITY since
+-- the threat-library import (CLI + POST /v1/tsg/threat-library/import) auto-writes
+-- boost-only rules via dal.upsert_threat_rule — the DB assigns ids, exactly like the
+-- three master tables above. Seed starts at 22 so the hand-seeded rows 1-21 in
+-- Seed_to_Threat_library.sql keep their ids (that script INSERTs explicit ids and
+-- must run under SET IDENTITY_INSERT Config_Threat_Rule ON on a fresh install).
+-- UX_ConfigThreatRule_NaturalKey makes concurrent/redelivered auto-writes collapse to
+-- one row — without it a duplicate relevance_flag row would silently DOUBLE a threat's
+-- score boost (scoping._apply_rules sums fired weights additively).
+-- Existing DBs are converted by migration 0027_config_threat_rule_identity.
 
 IF OBJECT_ID('dbo.Config_Threat_Rule', 'U') IS NULL
 CREATE TABLE Config_Threat_Rule (
-    ThreatRuleID  int            NOT NULL CONSTRAINT PK_Config_Threat_Rule PRIMARY KEY,
+    ThreatRuleID  int            IDENTITY(22,1) NOT NULL CONSTRAINT PK_Config_Threat_Rule PRIMARY KEY,
     RuleType      nvarchar(50)   NOT NULL,               -- tech_gate | relevance_flag | relevance_context_value
     ThreatTypeID  int            NOT NULL,               -- app-enforced FK -> Threat_Type
-    RuleKey       nvarchar(200)  NOT NULL,               -- e.g. 'internet_facing' (scoping.py allowlist)
+    RuleKey       nvarchar(200)  NOT NULL,               -- e.g. 'asset_type' (scoping.py allowlist)
     RuleValue     nvarchar(450)  NULL,
     Metadata      nvarchar(max)  NULL,                   -- JSON, e.g. {"weight": 15}
     CreateDate    datetime2      NULL,
@@ -54,6 +60,12 @@ CREATE TABLE Config_Threat_Rule (
     IsActive      bit            NOT NULL,
     IsDeleted     bit            NOT NULL
 );
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ConfigThreatRule_NaturalKey'
+               AND object_id = OBJECT_ID('dbo.Config_Threat_Rule'))
+CREATE UNIQUE INDEX UX_ConfigThreatRule_NaturalKey
+    ON Config_Threat_Rule(ThreatTypeID, RuleType, RuleKey, RuleValue)
+    WHERE IsActive = 1 AND IsDeleted = 0;
 
 -- Context_Field_Config: which asset/subsystem fields are currently turned on for the AI prompt.
 -- A curator can switch a field off here without a deploy — but this table can only narrow which

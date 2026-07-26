@@ -73,5 +73,11 @@ def require_admin(x_admin_key: str = Header(default="", alias="X-Admin-Key")) ->
     the actual comparison so the check runs in constant time (no timing side-channel on how
     many leading characters of a guessed key happen to match)."""
     key = get_settings().admin_api_key
-    if not key or not secrets.compare_digest(x_admin_key, key):
+    # Compare as BYTES, not str: secrets.compare_digest raises TypeError on a non-ASCII str
+    # operand, so a header like `X-Admin-Key: café` turned a failed auth check into an unhandled
+    # 500 + traceback (unauthenticated, on all 5 admin routes) instead of a 401 — a log-flood
+    # vector and a config oracle (500 = key configured, 401 = not). The bytes overload has no
+    # ASCII restriction and keeps the constant-time property. Encoding also means a non-ASCII
+    # CONFIGURED key no longer bricks the gate for every caller.
+    if not key or not secrets.compare_digest(x_admin_key.encode("utf-8"), key.encode("utf-8")):
         raise AuthError("invalid or missing X-Admin-Key")

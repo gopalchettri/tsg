@@ -7,17 +7,19 @@ once, correctly.
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, cast
 
-from sqlalchemy import Executable, RowMapping, and_, func, insert, or_, select, update
+from sqlalchemy import Executable, RowMapping, and_, case, delete, func, insert, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.enums import SessionStatus, StageStatus, SubsystemLevel, WorkflowStage
+from app.core.enums import (ActorType, ScenarioStatus, SessionStatus, StageStatus, SubsystemLevel,
+                            WorkflowStage)
 from app.db import models as m
 
 
@@ -95,7 +97,15 @@ class RegenerateConflict(Exception):
     """Regenerate rejected: not at REVIEW, target lock held, a concurrent regen/accept won the
     race, or (tasks.py::write_scenarios) every requested target no longer clears the scoping
     cutoff on rescoring → 409. Distinct from AcceptConflict — a different action, so it needs
-    its own error_code."""
+    its own error_code.
+
+    `reason` is an optional machine-readable code (e.g. "session_completed") surfaced by the
+    HTTP handler as `details.reason` — same pattern as SessionConflict's `active_session_id`.
+    Raise sites without a stable cause just omit it."""
+
+    def __init__(self, message: str, reason: str | None = None):
+        super().__init__(message)
+        self.reason = reason
 
 
 class CancelConflict(Exception):
@@ -194,6 +204,23 @@ def create_session(sess: Session, values: Mapping[str, Any]) -> str:
             raise  # neither unique index fired — a real constraint fault, not a conflict
         raise SessionConflict(existing) from exc
     return values["SessionID"]
+
+
+def canonical_guid(value: str) -> str:
+    """The one canonical spelling of a client-supplied GUID: exactly what `guid()` mints and
+    what `models.GUID.result_processor` hands back from the DB (lowercase, dashed).
+
+    Why this must exist ONCE and be used everywhere a client id meets a DB-derived id:
+    `models.GUID` normalizes on BOTH bind and result, so SQL comparisons already treat
+    uppercase / dashless (`Guid.ToString("N")`) / braced / `urn:uuid:` spellings as equal — but
+    a PYTHON-side comparison (a set difference, a dict lookup, a `len(set(...))` count) does
+    not, and silently reports a matched row as missing. That mismatch is what produced the
+    false `regenerate_conflict` on a valid request, and a spurious 404 + full rollback on
+    accept. Normalizing at the boundary, in one place, is what keeps both sides comparable.
+
+    Raises ValueError on a malformed id, so callers can turn it into a 4xx instead of letting
+    it reach `GUID.bind_processor` and surface as a 500."""
+    return str(uuid.UUID(str(value).strip()))
 
 
 def _valid_guid(value: str) -> bool:
@@ -317,10 +344,24 @@ def assert_capacity_available(sess: Session, entity_id: str | None = None) -> No
     disabled) when `entity_id` is given — without this, any single entity with a valid JWT
     could create sessions in a loop and starve every other entity in the tenant of the entire
     global ceiling with no isolation between them."""
-    if count_active_sessions(sess) >= get_settings().max_active_sessions:
-        raise CapacityExceeded()
     per_entity_cap = get_settings().max_active_sessions_per_entity
-    if entity_id and per_entity_cap and count_active_sessions_for_entity(sess, entity_id) >= per_entity_cap:
+    if entity_id and per_entity_cap:
+        # One round trip for both counts (same filtered IX_Session_Active index) instead of two
+        # separate SELECT COUNT(*) calls — count_active_sessions()/count_active_sessions_for_entity()
+        # stay as-is for their other standalone callers (e.g. selfcheck.py).
+        total, entity_total = sess.execute(
+            select(
+                func.count(),
+                func.sum(case((m.Scenario_Session.EntityID == entity_id, 1), else_=0)),
+            ).select_from(m.Scenario_Session)
+            .where(m.Scenario_Session.SessionStatus == SessionStatus.active)
+        ).one()
+        if total >= get_settings().max_active_sessions:
+            raise CapacityExceeded()
+        if (entity_total or 0) >= per_entity_cap:
+            raise CapacityExceeded()
+        return
+    if count_active_sessions(sess) >= get_settings().max_active_sessions:
         raise CapacityExceeded()
 
 
@@ -405,6 +446,27 @@ def claim_stage(
         )
     )
     return res.rowcount == 1
+
+
+def stage_attempt_count(
+    sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel, epoch: int,
+) -> int:
+    """Read back the AttemptCount `claim_stage` just incremented for this stage row.
+    `1` means this is the very first successful claim of this epoch (a fresh run);
+    `>1` means a resumed/redelivered claim at the same epoch (`AttemptCount` resets to 0
+    on every `reset_stage_for_regen` and increments on EVERY successful claim, including
+    the mid-flight-resume branch). `write_scenarios` gates its once-per-epoch supersede
+    on this, so a Celery retry never re-supersedes rows the failed attempt already
+    committed. Deliberately a separate read, not a `claim_stage` return-value change —
+    that signature ripples through every claim call site for a value only one needs."""
+    return sess.execute(
+        select(m.Subsystem_Stage_State.AttemptCount).where(
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == level,
+            m.Subsystem_Stage_State.GenerationEpoch == epoch,
+        )
+    ).scalar() or 0
 
 
 def holds_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
@@ -552,21 +614,28 @@ def finish_stage(
     return res.rowcount == 1
 
 
-def stage_epoch_at_least(
+def stage_completed_at_epoch_or_newer(
     sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel, epoch: int,
 ) -> bool:
-    """True iff this subsystem's `level` stage row is at GenerationEpoch >= `epoch`. Unlike a
-    COMPLETE-at-EXACTLY-`epoch` check, this also catches a row that has already
-    ADVANCED past `epoch` — the case a stale broker redelivery hits: its reserved epoch is BEHIND
-    the live epoch (the row was updated in place to a newer generation, so no row exists at the old
-    epoch to match an ==/COMPLETE guard). run_next_set gates the additive reset+find_threats on it
-    so a stale redelivery can't downgrade THREATS (old+2 -> old+1) and re-fire find_threats. Fresh
-    run: live < reserved -> False -> proceed; same-epoch or newer redelivery: >= -> True -> skip."""
+    """True iff this subsystem's `level` stage row is COMPLETE at GenerationEpoch >= `epoch`.
+    run_next_set gates its additive reset+find_threats on this: skip re-running the additive only
+    when it has actually FINISHED (COMPLETE) at the reserved epoch — OR the row has already ADVANCED
+    to a NEWER epoch (a stale broker redelivery whose reserved epoch is BEHIND the live one;
+    re-entering is then a harmless no-op, since reset_stage_for_regen/claim_stage/finish_stage all
+    fence on the exact epoch and match nothing).
+
+    The COMPLETE requirement is the fix for a session-wedge bug: a status-agnostic epoch-only check
+    also returned True for a row left RUNNING at `epoch` by a prior attempt that FAILED before
+    finish_stage (e.g. an LLMSlotUnavailable capacity squeeze). The Celery retry then skipped the
+    additive block entirely, leaving THREATS stuck RUNNING so decide_session_outcome wedged the
+    session until the reaper. Requiring COMPLETE makes the retry re-enter: find_threats' claim_stage
+    resumes the RUNNING row it still owns (same task_id) and finish_stage drives THREATS terminal."""
     live = sess.execute(
         select(m.Subsystem_Stage_State.GenerationEpoch).where(
             m.Subsystem_Stage_State.SessionID == session_id,
             m.Subsystem_Stage_State.SubsystemID == subsystem_id,
             m.Subsystem_Stage_State.Level == level,
+            m.Subsystem_Stage_State.Status == StageStatus.COMPLETE,
         )
     ).scalar()
     return live is not None and live >= epoch
@@ -592,13 +661,18 @@ def stage_settled_at_epoch(
 
 
 def stage_rows(sess: Session, session_id: str) -> list[RowMapping]:
-    """Per-subsystem stage rows for the status board (§6.1), excluding `_LOCK`."""
+    """Per-subsystem stage rows for the status board (§6.1), excluding `_LOCK`.
+    `ErrorMessage` rides along so the board can surface a partial/failed run's client-safe
+    reason — in particular an AWAITING_DECISION row revived by the salvage path keeps its
+    message as the "this review set may be partial" marker (see
+    revive_errored_scenarios_to_review)."""
     return list(
         sess.execute(
             select(
                 m.Subsystem_Stage_State.SubsystemID,
                 m.Subsystem_Stage_State.Level,
                 m.Subsystem_Stage_State.Status,
+                m.Subsystem_Stage_State.ErrorMessage,
             ).where(
                 m.Subsystem_Stage_State.SessionID == session_id,
                 m.Subsystem_Stage_State.Level != SubsystemLevel.LOCK,
@@ -623,12 +697,12 @@ def subsystem_ids_at_level(
 def subsystem_has_pending_work(sess: Session, session_id: str, subsystem_id: int) -> bool:
     """True iff any non-_LOCK stage for this subsystem is IDLE or RUNNING — i.e.
     genuinely unstarted or resumable. False means every stage already reached a
-    terminal state (COMPLETE/AWAITING_DECISION/ERROR): a loop pass over this
-    subsystem is just walking past already-finished work (e.g. a Celery redelivery
-    resuming a LATER subsystem restarts `_process_all_supporting_systems`'s loop from index 0, passing
-    back through earlier subsystems that already completed in a prior, committed
-    attempt) — used to gate the one-time `subsystem_advanced` signal so a redelivery
-    doesn't re-announce a subsystem nothing is actually about to happen to."""
+    terminal state (COMPLETE/AWAITING_DECISION/ERROR): re-checking this asset unit is just
+    confirming already-finished work (e.g. a Celery redelivery re-invoking
+    `_process_all_supporting_systems` re-attempts the same single asset-level pass even though
+    a prior, committed attempt already finished it) — used to gate the one-time
+    `subsystem_advanced` signal so a redelivery doesn't re-announce work nothing is actually
+    about to happen to."""
     return sess.execute(
         select(1).where(
             m.Subsystem_Stage_State.SessionID == session_id,
@@ -717,6 +791,10 @@ def has_active_scenarios(sess: Session, session_id: str) -> bool:
         select(1).select_from(m.Threat_Scenario_Output).where(
             m.Threat_Scenario_Output.SessionID == session_id,
             m.Threat_Scenario_Output.Superseded == 0,
+            # complete only: a FAILURE CARD (Status=error, null scenario — see tasks.py's
+            # _build_error_output_row) is retryable, not reviewable; counting it here would
+            # salvage a session that has nothing to review.
+            m.Threat_Scenario_Output.Status == ScenarioStatus.complete,
         )
     ).first() is not None
 
@@ -729,11 +807,19 @@ def revive_errored_scenarios_to_review(sess: Session, session_id: str) -> int:
     comes back empty, mark_scenarios_accepted matches 0 rows, and the session completes having
     accepted nothing (silent data loss). Flip the ERRORed SCENARIOS row (in place, at its current
     epoch) of every subsystem that still has an active Threat_Scenario_Output back to
-    AWAITING_DECISION so accept sees it. Returns the number of subsystem rows revived."""
+    AWAITING_DECISION so accept sees it. Returns the number of subsystem rows revived.
+
+    `ErrorMessage` is deliberately PRESERVED (not cleared): a revived row means the run failed
+    mid-batch after committing some scenarios — the surviving message is the only durable marker
+    telling a reviewer (via the status board) that this review set may be PARTIAL, not a complete
+    run. Wiping it here made a truncated run indistinguishable from a finished one."""
     active_subs = (
         select(m.Threat_Scenario_Output.SubsystemID)
         .where(m.Threat_Scenario_Output.SessionID == session_id,
-            m.Threat_Scenario_Output.Superseded == 0)
+            m.Threat_Scenario_Output.Superseded == 0,
+            # complete only — a subsystem holding nothing but failure cards has nothing to
+            # review, so reviving its stage would break the very invariant this restores
+            m.Threat_Scenario_Output.Status == ScenarioStatus.complete)
     )
     res = execute_dml(
         sess,
@@ -744,7 +830,7 @@ def revive_errored_scenarios_to_review(sess: Session, session_id: str) -> int:
             m.Subsystem_Stage_State.Status == StageStatus.ERROR,
             m.Subsystem_Stage_State.SubsystemID.in_(active_subs),
         )
-        .values(Status=StageStatus.AWAITING_DECISION, ErrorMessage=None, LeaseExpiresAt=None, UpdatedAt=now())
+        .values(Status=StageStatus.AWAITING_DECISION, LeaseExpiresAt=None, UpdatedAt=now())
     )
     return res.rowcount
 
@@ -756,7 +842,10 @@ def subsystems_with_active_scenarios(sess: Session, session_id: str) -> set[int]
     return set(sess.execute(
         select(m.Threat_Scenario_Output.SubsystemID)
         .where(m.Threat_Scenario_Output.SessionID == session_id,
-            m.Threat_Scenario_Output.Superseded == 0)
+            m.Threat_Scenario_Output.Superseded == 0,
+            # complete only — accept-all's completeness check must not demand coverage of a
+            # subsystem whose only active rows are unreviewable failure cards
+            m.Threat_Scenario_Output.Status == ScenarioStatus.complete)
     ).scalars())
 
 
@@ -966,23 +1055,56 @@ def mark_scenarios_accepted(
     optionally narrowed to `subset` OutputIDs ([R8] partial accept — `subset=[]` means
     "accept none", distinct from `subset=None` meaning "accept all").
 
+    Also stamps `AcceptedSubsetJSON` with the exact `subset` list on every row this call
+    touches, but ONLY for a partial accept (`subset is not None`) — NULL on a full accept,
+    since "the whole session" isn't itself a subset selection; this keeps the column's meaning
+    precise ("non-NULL" = this row was part of an explicit partial pick) and mirrors, per row,
+    what `Scenario_Audit.DetailJSON` already records once for the decision as a whole
+    (`accept.accept_session`'s `DetailJSON=json.dumps({"subset": subset})`), so a reviewer can
+    see which explicit selection accepted a given row without a join. Was previously a dead
+    column — see TSG_Gap_Analysis.md §13.10.
+
     Returns the number of rows actually flipped. A `subset` id that doesn't match any
     row here (wrong session/subsystem, already superseded, or simply never existed)
     previously vanished silently — this return value is what lets the caller
     (`accept.accept_session`) tell "N requested, N matched" apart from "N requested,
     M<N matched" instead of reporting a clean accept either way."""
     where = [m.Threat_Scenario_Output.SessionID == session_id, m.Threat_Scenario_Output.Superseded == 0,
-            m.Threat_Scenario_Output.SubsystemID.in_(subsystem_ids)]
+            m.Threat_Scenario_Output.SubsystemID.in_(subsystem_ids),
+            # complete only: a FAILURE CARD (null scenario) must never be marked Accepted — it
+            # would flow to downstream consumers as an accepted scenario with no content. A
+            # subset explicitly naming one simply doesn't match, and the caller's existing
+            # requested-vs-matched check reports it as not-acceptable (404).
+            m.Threat_Scenario_Output.Status == ScenarioStatus.complete]
     # Narrow to specific OutputIDs only if the caller passed a subset; None means "accept all".
     if subset is not None:
         where.append(m.Threat_Scenario_Output.OutputID.in_(subset))
-    res = execute_dml(sess, update(m.Threat_Scenario_Output).where(*where).values(Accepted=1))
+    accepted_subset_json = json.dumps(subset) if subset is not None else None
+    res = execute_dml(sess, update(m.Threat_Scenario_Output).where(*where)
+                    .values(Accepted=1, AcceptedSubsetJSON=accepted_subset_json))
     return res.rowcount
 
 
 # ---------------------------------------------------------------------------
 # Generic write helpers
 # ---------------------------------------------------------------------------
+def _delete_control_maps_for_superseded(sess: Session, session_id: str) -> None:
+    """Invariant: a superseded output owns no control-map rows. Enforced HERE, at the moment
+    of superseding (every supersede path below calls this), so dead map rows can't accumulate —
+    a superseded scenario is unreachable through the API and its regenerated successor gets a
+    fresh mapping, so its old map rows are pure dead weight. Idempotent by construction
+    (deleting for already-superseded outputs again matches nothing)."""
+    superseded = select(m.Threat_Scenario_Output.OutputID).where(
+        m.Threat_Scenario_Output.SessionID == session_id,
+        m.Threat_Scenario_Output.Superseded == 1,
+    )
+    sess.execute(
+        delete(m.Threat_Scenario_Control_Map)
+        .where(m.Threat_Scenario_Control_Map.SessionID == session_id,
+               m.Threat_Scenario_Control_Map.OutputID.in_(superseded))
+    )
+
+
 def supersede(sess: Session, table, session_id: str, subsystem_id: int) -> None:
     """Mark the active rows of a (session, subsystem) as superseded (§5.8)."""
     sess.execute(
@@ -994,6 +1116,8 @@ def supersede(sess: Session, table, session_id: str, subsystem_id: int) -> None:
         )
         .values(Superseded=1)
     )
+    if table is m.Threat_Scenario_Output:
+        _delete_control_maps_for_superseded(sess, session_id)
 
 
 def active_scoped_threat_ids(sess: Session, session_id: str, subsystem_id: int, threat_ids) -> list[str]:
@@ -1032,7 +1156,11 @@ def threats_with_active_scenario(sess: Session, session_id: str, subsystem_id: i
         .select_from(st.__table__.join(out, out.ScopedThreatID == st.ScopedThreatID))
         .where(st.SessionID == session_id, st.SubsystemID == subsystem_id,
             st.ThreatID.in_(threat_ids),
-            out.SessionID == session_id, out.SubsystemID == subsystem_id, out.Superseded == 0)
+            out.SessionID == session_id, out.SubsystemID == subsystem_id, out.Superseded == 0,
+            # complete only: a threat whose only active row is a FAILURE CARD is NOT "done" —
+            # a resumed attempt must retry it (write_scenarios' already_done), and the next-set
+            # marker sweep must treat it like any other unserved threat
+            out.Status == ScenarioStatus.complete)
     ).scalars())
 
 
@@ -1068,6 +1196,7 @@ def supersede_by_scoped_threats(sess: Session, session_id: str, subsystem_id: in
         )
         .values(Superseded=1)
     )
+    _delete_control_maps_for_superseded(sess, session_id)
 
 
 def supersede_by_identity_hashes(sess: Session, session_id: str, subsystem_id: int, identity_hashes) -> None:
@@ -1089,6 +1218,7 @@ def supersede_by_identity_hashes(sess: Session, session_id: str, subsystem_id: i
         )
         .values(Superseded=1)
     )
+    _delete_control_maps_for_superseded(sess, session_id)
 
 
 def insert_row(sess: Session, table, values: Mapping[str, Any]) -> None:
@@ -1098,10 +1228,44 @@ def insert_row(sess: Session, table, values: Mapping[str, Any]) -> None:
     sess.execute(insert(table).values(**values))
 
 
-def append_audit(sess: Session, **cols: Any) -> None:
-    """Append-only audit write; CreatedAt defaulted."""
+def audit_row(sess: Session, **cols: Any) -> dict[str, Any]:
+    """One Scenario_Audit row with CreatedAt, ActorUserID and ActorType defaulted.
+
+    `ActorUserID` = WHO IS ACCOUNTABLE for this session, not "who typed the command". A caller
+    that knows the acting human passes it (session_started/cancel/accept); every other row —
+    grounding_summary, scoping_complete, generation_complete, entered_review, stage_error,
+    regeneration_completed — is written by a background worker minutes later with no human in
+    the call stack, and used to land NULL. An auditor then had to know to join
+    Scenario_Session.UserID to answer "who is answerable for this?", and a NULL read as missing
+    data rather than "not applicable".
+
+    `ActorType` answers the question the back-fill above destroys: once every row names a user,
+    "gopal accepted this" and "the pipeline did this, gopal is answerable" look identical. So it
+    is decided from whether the CALLER named a human, before the back-fill runs.
+
+    Defaulting HERE, not at the 13 call sites, is the point: a future audit write cannot forget
+    it. Costs one primary-key lookup per audited event (~6-10 per session) and only when the
+    caller supplied nothing.
+    # ponytail: per-write PK lookup; pass ActorUserID explicitly from an in-hand session dict
+    # if audit volume ever makes it measurable."""
     cols.setdefault("CreatedAt", now())
-    sess.execute(insert(m.Scenario_Audit).values(**cols))
+    # Order matters: after the back-fill below, ActorUserID is populated either way and "did a
+    # human do this?" is no longer answerable. setdefault so an explicit caller value still wins.
+    cols.setdefault("ActorType", ActorType.user if cols.get("ActorUserID") else ActorType.system)
+    if cols.get("ActorUserID") is None and cols.get("SessionID"):
+        cols["ActorUserID"] = sess.execute(
+            select(m.Scenario_Session.UserID)
+            .where(m.Scenario_Session.SessionID == cols["SessionID"])
+        ).scalar()
+    return cols
+
+
+def append_audit(sess: Session, **cols: Any) -> None:
+    """Append-only audit write for ONE row. Callers accumulating many rows for a single bulk
+    INSERT (accept.py's promotion loop) build them with `audit_row` instead and insert the list
+    themselves — same defaults, one round trip. Two insert paths, ONE place that decides what an
+    audit row means, so the bulk path cannot silently omit whatever this learns to default next."""
+    sess.execute(insert(m.Scenario_Audit).values(**audit_row(sess, **cols)))
 
 
 # ---------------------------------------------------------------------------
@@ -1112,18 +1276,25 @@ def append_audit(sess: Session, **cols: Any) -> None:
 # and the loser gets back the winner's id instead of a crash.
 # ---------------------------------------------------------------------------
 def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector_id: int | None,
-                    description: str | None = None) -> int:
+                    description: str | None = None, source: str = "ai_auto_promoted") -> int:
     """Insert-if-not-exists keyed by (ThreatTypeName, ThreatCategoryID, SectorID) —
     `UX_ThreatType_NaturalKey`. Returns the winning ThreatTypeID either way.
 
-    Only ever called from the R10 promotion path (accept.py), so `Source='ai_auto_promoted'`
-    is hardcoded rather than threaded through as a parameter — a curated/imported Type never
-    reaches this function, it's seeded directly by its own script instead."""
+    `source` records provenance: the R10 promotion path (accept.py) relies on the default
+    'ai_auto_promoted'; scripts/import_threat_libraries.py passes its per-library tag
+    ('pytm', 'mitre_attack', ...). On a natural-key collision the existing row wins and
+    keeps its original Source — provenance is first-writer, never overwritten."""
+    # Bound to ThreatTypeName's real column width (Unicode(300)) before it ever reaches the
+    # INSERT — an LLM-derived name that's too long raises a MSSQL truncation error (DataError),
+    # a different exception class than the IntegrityError this function already catches for the
+    # natural-key race, so an unbounded name would otherwise escape uncaught and abort the whole
+    # accept-session transaction.
+    name = name[:300]
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Type).values(
                 ThreatTypeName=name, ThreatCategoryID=category_id, SectorID=sector_id,
-                Description=description, IsActive=True, IsDeleted=False, Source="ai_auto_promoted"))
+                Description=description, IsActive=True, IsDeleted=False, Source=source))
         return inserted_pk(res)
     except IntegrityError:
         sector_pred = m.Threat_Type.SectorID.is_(None) if sector_id is None else m.Threat_Type.SectorID == sector_id
@@ -1139,18 +1310,20 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector
 
 
 def upsert_threat_catalogue(sess: Session, name: str, type_id: int, sector_id: int | None,
-                            description: str | None = None) -> int:
+                            description: str | None = None, source: str = "ai_auto_promoted") -> int:
     """Insert-if-not-exists keyed by (ThreatTypeID, ThreatName, SectorID) —
     `UX_ThreatCatalogue_NaturalKey`. Returns the winning ThreatCatalogueID either way.
 
-    Same Source-hardcoding rationale as upsert_threat_type above. Does NOT link the new
+    Same `source` provenance contract as upsert_threat_type above. Does NOT link the new
     row into Threat_Catalogue_Category_Map — call link_catalogue_category separately once
     you have a category id, same two-step shape as upsert_threat_type + link_type_actor."""
+    # See upsert_threat_type's identical comment — ThreatName's real column width is Unicode(500).
+    name = name[:500]
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Catalogue).values(
                 ThreatTypeID=type_id, ThreatName=name, SectorID=sector_id,
-                Description=description, IsActive=True, IsDeleted=False, Source="ai_auto_promoted"))
+                Description=description, IsActive=True, IsDeleted=False, Source=source))
         return inserted_pk(res)
     except IntegrityError:
         sector_pred = (m.Threat_Catalogue.SectorID.is_(None) if sector_id is None
@@ -1168,6 +1341,8 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int, sector_id: i
 def upsert_threat_actor(sess: Session, name: str) -> int:
     """Insert-if-not-exists keyed by (ThreatActorName) — `UX_ThreatActor_NaturalKey`
     (no sector on this table). Returns the winning ThreatActorID either way."""
+    # See upsert_threat_type's identical comment — ThreatActorName's real column width is Unicode(200).
+    name = name[:200]
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Actor).values(
@@ -1178,6 +1353,38 @@ def upsert_threat_actor(sess: Session, name: str) -> int:
             select(m.Threat_Actor.ThreatActorID).where(
                 m.Threat_Actor.ThreatActorName == name,
                 m.Threat_Actor.IsActive == True, m.Threat_Actor.IsDeleted == False)
+        ).scalar()
+        if winner is None:  # see upsert_threat_type — only a real duplicate may resolve here
+            raise
+        return winner
+
+
+def upsert_threat_rule(sess: Session, threat_type_id: int, rule_type: str, rule_key: str,
+                       rule_value: str, weight: float, source: str) -> int:
+    """Insert-if-not-exists keyed by (ThreatTypeID, RuleType, RuleKey, RuleValue) —
+    `UX_ConfigThreatRule_NaturalKey` (migration 0027). Returns the winning ThreatRuleID
+    either way — the same race-safe shape as upsert_threat_type above: the DB's IDENTITY
+    assigns the id (never MAX+1 in app code), and a concurrent import or a Celery
+    crash-redelivery re-writing the same rule collapses onto the existing row instead of
+    silently double-counting its weight (scoping._apply_rules sums fired weights).
+
+    `source` lands in CreatedBy (e.g. 'auto:mitre_attack_ics') so auto-written rows are
+    distinguishable from a curator's manual SQL inserts."""
+    try:
+        with sess.begin_nested():
+            res = execute_dml(sess, insert(m.Config_Threat_Rule).values(
+                RuleType=rule_type, ThreatTypeID=threat_type_id, RuleKey=rule_key,
+                RuleValue=rule_value, Metadata=json.dumps({"weight": weight}),
+                CreateDate=now(), CreatedBy=source, IsActive=True, IsDeleted=False))
+        return inserted_pk(res)
+    except IntegrityError:
+        winner = sess.execute(
+            select(m.Config_Threat_Rule.ThreatRuleID).where(
+                m.Config_Threat_Rule.ThreatTypeID == threat_type_id,
+                m.Config_Threat_Rule.RuleType == rule_type,
+                m.Config_Threat_Rule.RuleKey == rule_key,
+                m.Config_Threat_Rule.RuleValue == rule_value,
+                m.Config_Threat_Rule.IsActive == True, m.Config_Threat_Rule.IsDeleted == False)
         ).scalar()
         if winner is None:  # see upsert_threat_type — only a real duplicate may resolve here
             raise

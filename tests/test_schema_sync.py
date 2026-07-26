@@ -1,8 +1,9 @@
 """TSG_Core.sql <-> models.py sync guard.
 
 TSG_Core.sql is the one-stop production script — the ONLY thing that
-creates the baseline TSG tables (alembic 0001 is an empty stamp; the chain only
-alters forward). So every column models.py declares on a TSG-owned table must
+creates the baseline TSG tables. (Alembic was removed 2026-07-25; this project is
+database-first, so THIS test is now the only automated guard that a hand-built
+production DB isn't born missing a column.) So every column models.py declares on a TSG-owned table must
 appear in the script's CREATE TABLE block, or a production DB is born missing a
 column the app selects (`select(m.Identified_Threat)` names every declared
 column). Third recurrence of this gap class caught in this repo — AttemptCount
@@ -41,6 +42,9 @@ _DEPLOYED_SEPARATELY = {
     "Config_Threat_Rule": "Threat_library.sql",
     "Threat_Catalogue_Category_Map": "Threat_library.sql",
     "Context_Field_Config": "Threat_library.sql",
+    "Control_Standard": "Control_library.sql",
+    "Control_Library": "Control_library.sql",
+    "Control_Library_Standard_Map": "Control_library.sql",
 }
 
 # TSG-owned COLUMNS retrofitted onto a table that otherwise IS created here — narrower than

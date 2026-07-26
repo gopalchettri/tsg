@@ -22,20 +22,35 @@ def configure_logging(level: int | None = None) -> None:
         # No explicit level given, so convert the LOG_LEVEL setting (a string like
         # "DEBUG") into the numeric level the stdlib logging module expects.
         level = getattr(logging, get_settings().log_level)
-    # Plain "%(message)s" format: structlog's JSONRenderer below already builds the
-    # full formatted message, so stdlib logging shouldn't add its own prefix on top.
-    logging.basicConfig(format="%(message)s", level=level)
-    structlog.configure(
-        # Processors run top to bottom: merge context vars in, tag the log level,
-        # add a timestamp, render stack/exception info, then serialize to JSON last.
+    shared_processors: list[structlog.typing.Processor] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+    ]
+    # Bridge stdlib-originated records (uvicorn, sqlalchemy, pyodbc, redis-py, httpx, etc. — any
+    # library using plain logging.getLogger(), not structlog) into the SAME JSON pipeline
+    # structlog's own calls use below. structlog itself uses PrintLoggerFactory (bypasses stdlib
+    # logging entirely via a bare print()), so this handler only ever sees foreign/stdlib records —
+    # without it, those records only ever got logging.basicConfig's bare "%(message)s" formatter,
+    # with no timestamp/level/JSON envelope, invisible to any log pipeline expecting one JSON
+    # object per line (this module's own stated goal).
+    handler = logging.StreamHandler()
+    handler.setFormatter(structlog.stdlib.ProcessorFormatter(
         processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
             structlog.processors.format_exc_info,
             structlog.processors.JSONRenderer(),
         ],
+        foreign_pre_chain=shared_processors,
+    ))
+    root = logging.getLogger()
+    root.handlers = [handler]  # replace, not add — configure_logging is safely re-callable
+    root.setLevel(level)
+    structlog.configure(
+        # Processors run top to bottom: merge context vars in, tag the log level,
+        # add a timestamp, render stack/exception info, then serialize to JSON last.
+        processors=[*shared_processors, structlog.processors.format_exc_info, structlog.processors.JSONRenderer()],
         wrapper_class=structlog.make_filtering_bound_logger(level),
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,

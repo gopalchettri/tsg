@@ -266,6 +266,38 @@ class LLMClient(Protocol):
         """Relevance scores for `docs` against `query`, same length/order as `docs` 0-100 scale."""
         ...
 
+    def rerank_many(self, items: Sequence[tuple[str, Sequence[str]]],
+                    *, model: str | None = None) -> list[list[float] | None]:
+        """Many (query, docs) reranks at once — one batched local model dispatch, or
+        bounded-concurrent remote calls. Per item: the scores list, or None if that item's
+        rerank failed (logged); raises only when EVERY item failed (systemic)."""
+        ...
+
+
+def _litellm_key_header(s: Settings) -> dict[str, Any]:
+    """`{"extra_headers": {...}}` carrying the litellm key in an ALTERNATE header, or `{}`.
+
+    litellm authenticates with `Authorization: Bearer <key>`, which is correct against a bare
+    proxy. When the proxy sits behind a gateway that consumes or rewrites `Authorization`, that
+    header never reaches litellm and every call 401s — while the same key works when sent as
+    `x-litellm-api-key` (confirmed against the UAT proxy). Sending BOTH is safe: litellm reads
+    whichever arrives, and a bare proxy ignores the extra header.
+
+    Spread into the call kwargs so it is a no-op unless LITELLM_API_KEY_HEADER is configured."""
+    if not s.litellm_api_key_header:
+        return {}
+    return {"extra_headers": {s.litellm_api_key_header: s.litellm_api_key}}
+
+
+def _litellm_http_headers(s: Settings) -> dict[str, str]:
+    """Headers for this file's OWN httpx calls to the proxy (/v1/models, /model/info, /key/info)
+    — the same dual-header reasoning as _litellm_key_header above, which covers the litellm SDK
+    calls instead."""
+    headers = {"Authorization": f"Bearer {s.litellm_api_key}"}
+    if s.litellm_api_key_header:
+        headers[s.litellm_api_key_header] = s.litellm_api_key
+    return headers
+
 
 def _apply_embed_prefix(s: Settings, texts: list[str], kind: str) -> list[str]:
     """Some embedding models (the "e5" family) were TRAINED expecting a short
@@ -399,6 +431,11 @@ class LiteLLMClient:
         # value is still recorded in Provenance.params below (what we asked for), consistent with
         # the model-vs-model_version "requested vs served" distinction this file already draws.
         common["drop_params"] = True
+        # Declare non-streaming ON THE WIRE, every call. chat() parses a completed message; a
+        # proxy model entry that pins `"stream": true` in its litellm_params (glm-5's does) would
+        # otherwise decide the response shape server-side. Belt half of the fix — chat() also
+        # braces for a stream coming back anyway (see _ensure_completed_response).
+        common["stream"] = False
         if s.llm_reasoning_effort is not None:  # operator-pinned; unset by default (see config.py)
             common["reasoning_effort"] = s.llm_reasoning_effort
         if s.llm_provider == "azure_openai":
@@ -414,7 +451,7 @@ class LiteLLMClient:
             return kw
         # default: litellm proxy
         kw = {"model": model or s.inference_model, "api_base": s.litellm_base_url,
-            "api_key": s.litellm_api_key, **common}
+            "api_key": s.litellm_api_key, **_litellm_key_header(s), **common}
         # operator-pinned guardrail name(s), pre-registered on the proxy itself; unset by
         # default. Proxy-only — no azure_openai/openai equivalent, so this branch only.
         if s.llm_guardrails:
@@ -483,6 +520,15 @@ class LiteLLMClient:
         kwargs = self._chat_kwargs(model, temperature)
         with _llm_slot(self.s):
             resp = litellm.completion(messages=messages, **kwargs)
+            # Suspenders half of the stream fix (_chat_kwargs sends stream=False as the belt): if
+            # the server streamed anyway — a proxy model entry pinning `"stream": true` overrides
+            # what the client asked for — assemble the chunks into the completed response the
+            # parsing below expects. chat()'s contract must never depend on a server-side config
+            # knob. Inside the _llm_slot: the stream is still an in-flight LLM call until drained.
+            if isinstance(resp, litellm.CustomStreamWrapper):
+                resp = litellm.stream_chunk_builder(list(resp), messages=messages)
+                if resp is None:  # empty stream — fail loud, same posture as the parse guards
+                    raise RuntimeError("chat provider returned an empty stream")
         return resp["choices"][0]["message"]["content"], Provenance(
             model=kwargs["model"],
             # record the model the proxy ACTUALLY served (resp["model"] may be a dated
@@ -576,6 +622,7 @@ class LiteLLMClient:
             resp = litellm.embedding(
                 model=model, input=texts,
                 api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
+                **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
                 timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
             )
         # `data` MAY come back out of input order; sort by index so positional callers
@@ -629,6 +676,7 @@ class LiteLLMClient:
             resp = litellm.rerank(
                 model=model, query=query, documents=list(docs),
                 api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
+                **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
                 timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
             )
         by_index = {r["index"]: float(r["relevance_score"]) * 100.0 for r in resp["results"]}
@@ -638,6 +686,56 @@ class LiteLLMClient:
                 f"rerank returned {len(by_index)} scores for {len(docs)} docs "
                 f"(missing index(es): {missing})")
         return [by_index[i] for i in range(len(docs))]
+
+    def rerank_many(self, items, *, model=None):
+        """Many (query, docs) reranks in one go — see the LLMClient protocol stub.
+
+        LOCAL provider: cross-encoders score each (query, doc) pair independently, so ALL
+        items' pairs flatten into ONE local_models.rerank_pairs dispatch (score-identical to
+        per-item calls, minus 1-per-item model-dispatch overhead); a failure here is systemic
+        by construction (one call = every item), so it propagates.
+
+        REMOTE provider: rerank APIs take one query per request, so the win is concurrency,
+        not batching — a bounded thread pool (gevent patches these to greenlets on the
+        worker; plain threads in the API process — both fine for blocking HTTP) runs the
+        existing self.rerank per item, so retries/timeouts/slot handling are reused, not
+        reimplemented. rerank_concurrency is only a LOCAL politeness cap: each call still
+        acquires its own _llm_slot, so the Redis semaphore remains the global authority and
+        excess workers just wait there. Per-item failure (incl. LLMSlotUnavailable after the
+        slot wait timeout) -> None for that item + a warning, raising only if EVERY item
+        failed — one starved call must not wipe out a whole mapping run."""
+        items = list(items)
+        if not items:
+            return []
+        if self.s.reranker_provider == "local":
+            from app.pipeline import local_models
+
+            pairs = [(q, d) for q, docs in items for d in docs]
+            scores = local_models.rerank_pairs(pairs)
+            if len(scores) != len(pairs):  # same fail-loud posture as rerank() above
+                raise RuntimeError(f"rerank_pairs returned {len(scores)} scores for {len(pairs)} pairs")
+            out: list[list[float] | None] = []
+            pos = 0
+            for _, docs in items:
+                out.append(scores[pos:pos + len(docs)])
+                pos += len(docs)
+            return out
+        from concurrent.futures import ThreadPoolExecutor
+
+        results: list[list[float] | None] = [None] * len(items)
+        failures = 0
+        with ThreadPoolExecutor(max_workers=min(self.s.rerank_concurrency, len(items))) as pool:
+            futures = {pool.submit(self.rerank, q, docs, model=model): i
+                       for i, (q, docs) in enumerate(items)}
+        for fut, i in futures.items():  # pool exited -> all futures done; order restored via i
+            try:
+                results[i] = fut.result()
+            except Exception:  # noqa: BLE001 — per-item fail-open, see docstring
+                failures += 1
+                log.warning("rerank_many.item_failed", index=i, exc_info=True)
+        if failures == len(items):
+            raise RuntimeError(f"rerank_many: all {len(items)} rerank calls failed")
+        return results
 
 
 @dataclass
@@ -766,7 +864,7 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
     # azure_openai/openai (the documented default) had no reachability check anywhere. Runs
     # regardless of whether `wanted` (below) ends up empty, since this is orthogonal to it.
     if s.llm_provider != "litellm_proxy":
-        _verify_direct_chat_provider_reachable(s)
+        _verify_chat_provider_reachable(s)
     wanted: dict[str, str] = {}
     if s.llm_provider == "litellm_proxy":
         wanted["inference_model"] = s.inference_model
@@ -786,7 +884,7 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
     try:
         with httpx.Client(transport=httpx.HTTPTransport(retries=s.llm_max_retries)) as client:
             resp = client.get(f"{s.litellm_base_url}/v1/models",
-                            headers={"Authorization": f"Bearer {s.litellm_api_key}"},
+                            headers=_litellm_http_headers(s),
                             timeout=s.llm_timeout_seconds)
             resp.raise_for_status()
     except httpx.HTTPError as exc:
@@ -804,6 +902,16 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
     if s.embedding_provider == "litellm_proxy":
         _verify_embedding_dimensions(s)
 
+    if s.llm_provider == "litellm_proxy":
+        # Registration is NOT the same as "answers usably". /v1/models above proves the proxy
+        # LISTS the model; it cannot prove the model returns something chat() can parse. A proxy
+        # entry that pins `"stream": true` in its litellm_params (glm-5 does) hands back a
+        # streaming wrapper where chat() expects a completed message — registered, reachable, and
+        # broken on the first real pipeline run. Run one real completion here so that fails the
+        # DEPLOYMENT instead of a user's first session. Runs after the checks above so a missing
+        # model still reports the clearer "not registered" error first.
+        _verify_chat_provider_reachable(s)
+
     # Observability, not verification: log each wanted model's configured rate limit (if any)
     # so a later rate-limit incident can be cross-checked against what was actually configured
     # AT DEPLOY TIME, in this worker's own startup log — instead of relying on someone's memory
@@ -813,7 +921,7 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
     try:
         with httpx.Client(transport=httpx.HTTPTransport(retries=s.llm_max_retries)) as client:
             info_resp = client.get(f"{s.litellm_base_url}/model/info",
-                                    headers={"Authorization": f"Bearer {s.litellm_api_key}"},
+                                    headers=_litellm_http_headers(s),
                                     timeout=s.llm_timeout_seconds)
             info_resp.raise_for_status()
         by_name = {m.get("model_name"): m for m in info_resp.json().get("data", [])}
@@ -824,11 +932,16 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
         log.warning("llm.model_config_check_failed", exc_info=True)
 
 
-def _verify_direct_chat_provider_reachable(s: Settings) -> None:
-    """[REVIEW-FIX] verify_litellm_models above only checks providers actually set to
-    'litellm_proxy' — for the documented DEFAULT (llm_provider=azure_openai) or 'openai', there
-    was no boot-time (or any) reachability check at all. An expired Azure key or a decommissioned
-    deployment would boot the worker cleanly and only surface on a real user's first pipeline run.
+def _verify_chat_provider_reachable(s: Settings) -> None:
+    """One real chat completion at worker boot, for EVERY provider — azure_openai/openai (which
+    had no reachability check at all) and litellm_proxy alike.
+
+    [REVIEW-FIX] originally direct-providers-only, on the reasoning that the proxy path was
+    already covered by the /v1/models registration check. It isn't: registration proves the model
+    is LISTED, never that it answers something chat() can parse. A proxy entry pinning
+    `"stream": true` (glm-5's does) returns a streaming wrapper to a caller expecting a completed
+    message — registered, reachable, and broken on the first real pipeline run. An expired Azure
+    key or a decommissioned deployment is the same class of problem on the other path.
 
     Reuses LiteLLMClient.chat() itself (the exact same azure_openai/openai dispatch path a real
     session uses — see _chat_kwargs) rather than re-implementing provider-specific reachability
@@ -849,6 +962,13 @@ def _verify_direct_chat_provider_reachable(s: Settings) -> None:
     but keeps the call valid under either json_mode setting."""
     try:
         LiteLLMClient(s).chat([{"role": "user", "content": 'Reply with any valid json, e.g. {"ok": true}.'}])
+    except LLMSlotUnavailable:
+        # Must stay itself: celery_app._init_worker retries `except LLMSlotUnavailable` precisely so
+        # a coordinated restart/scale-out — many replicas booting at once under a configured
+        # max_concurrent_llm_calls cap — backs off instead of failing every worker. Wrapping it in
+        # RuntimeError here would make that boot-retry unreachable, turning the highest-contention
+        # moment the slot mechanism exists to survive into a fleet-wide boot failure.
+        raise
     except Exception as exc:
         raise RuntimeError(
             f"{s.llm_provider} chat provider was unreachable or rejected a startup "
@@ -878,6 +998,7 @@ def _verify_embedding_dimensions(s: Settings) -> None:
         resp = litellm.embedding(
             model=s.embedding_model, input=["dimension check"],
             api_base=s.litellm_base_url, api_key=s.litellm_api_key,
+            **_litellm_key_header(s),  # gateway-safe alternate auth header, when configured
             timeout=s.llm_timeout_seconds, num_retries=s.llm_max_retries,
         )
     dim = len(resp["data"][0]["embedding"])
@@ -922,7 +1043,7 @@ def log_litellm_key_info(settings: Settings | None = None) -> None:
     try:
         with httpx.Client(transport=httpx.HTTPTransport(retries=s.llm_max_retries)) as client:
             resp = client.get(f"{s.litellm_base_url}/key/info",
-                            headers={"Authorization": f"Bearer {s.litellm_api_key}"},
+                            headers=_litellm_http_headers(s),
                             timeout=s.llm_timeout_seconds)
             resp.raise_for_status()
         body = resp.json()

@@ -27,11 +27,11 @@ from gevent import monkey
 
 monkey.patch_all()
 
-import os
-import sys
-import time
+import os  # noqa: E402 -- everything below must import AFTER monkey.patch_all() above
+import sys  # noqa: E402
+import time  # noqa: E402
 
-import gevent
+import gevent  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 

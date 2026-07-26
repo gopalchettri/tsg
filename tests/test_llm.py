@@ -26,8 +26,8 @@ def _clear_moderation_client_cache():
 
 def test_chat_kwargs_azure():
     s = Settings(llm_provider="azure_openai", azure_openai_deployment_name="gpt-5-mini",
-                 azure_openai_endpoint="https://x.azure.com/", azure_openai_api_key="secret",
-                 azure_openai_api_version="2024-12-01-preview")
+                azure_openai_endpoint="https://x.azure.com/", azure_openai_api_key="secret",
+                azure_openai_api_version="2024-12-01-preview")
     kw = LiteLLMClient(s)._chat_kwargs()
     assert kw["model"] == "azure/gpt-5-mini"
     assert kw["api_base"] == "https://x.azure.com/"
@@ -48,10 +48,10 @@ def test_chat_kwargs_drop_params_on():
     # UnsupportedParamsError; drop_params lets litellm drop a per-model-unsupported param instead of
     # failing every real threat-identification call. Present on every provider, even with temp pinned.
     for s in (Settings(llm_provider="azure_openai", azure_openai_deployment_name="gpt-5-mini",
-                       azure_openai_endpoint="https://x.azure.com/", azure_openai_api_key="secret",
-                       azure_openai_api_version="2024-12-01-preview"),
-              Settings(llm_provider="litellm_proxy", litellm_base_url="http://proxy:4000",
-                       inference_model="gpt-5")):
+                    azure_openai_endpoint="https://x.azure.com/", azure_openai_api_key="secret",
+                    azure_openai_api_version="2024-12-01-preview"),
+            Settings(llm_provider="litellm_proxy", litellm_base_url="http://proxy:4000",
+                    inference_model="gpt-5")):
         assert LiteLLMClient(s)._chat_kwargs(temperature=0.0)["drop_params"] is True
 
 
@@ -144,7 +144,7 @@ def test_proxy_embed_reorders_by_index(monkeypatch):
 
     monkeypatch.setattr(litellm, "embedding", fake_embedding)
     s = Settings(embedding_provider="litellm_proxy", embedding_model="bge-m3",
-                 embedding_prefix_style="none")
+                embedding_prefix_style="none")
     out = LiteLLMClient(s).embed(["a", "b", "c"])
     assert out == [[0.0], [1.0], [2.0]]  # restored to input order despite reversed data
 
@@ -160,7 +160,7 @@ def test_chat_provenance_records_served_model_and_params(monkeypatch):
 
     monkeypatch.setattr(litellm, "completion", fake_completion)
     s = Settings(llm_provider="litellm_proxy", inference_model="glm-4.6",
-                 llm_timeout_seconds=30, llm_max_retries=2)
+                llm_timeout_seconds=30, llm_max_retries=2)
     text, prov = LiteLLMClient(s).chat([{"role": "user", "content": "hi"}])
     assert text == "ok"
     assert prov.model == "glm-4.6"                # what we requested
@@ -186,7 +186,7 @@ def test_rerank_and_embed_carry_r8_timeout_and_retries(monkeypatch):
     monkeypatch.setattr(litellm, "rerank", fake_rerank)
     monkeypatch.setattr(litellm, "embedding", fake_embedding)
     s = Settings(embedding_provider="litellm_proxy", reranker_provider="litellm_proxy",
-                 embedding_prefix_style="none", llm_timeout_seconds=42.0, llm_max_retries=4)
+                embedding_prefix_style="none", llm_timeout_seconds=42.0, llm_max_retries=4)
     client = LiteLLMClient(s)
     client.rerank("q", ["doc"])
     client.embed(["a"])
@@ -286,13 +286,13 @@ def test_validate_local_rejects_dimension_mismatch(monkeypatch, tmp_path):
     from app.pipeline.local_models import validate_local_models
 
     class _FakeEmbedder:
-        def get_sentence_embedding_dimension(self):
+        def get_embedding_dimension(self):
             return 768
 
     monkeypatch.setattr(local_models, "_embedder", lambda path: _FakeEmbedder())
     monkeypatch.setattr("importlib.util.find_spec", lambda name: object())  # pretend installed
     s = Settings(embedding_provider="local", embedding_model=str(tmp_path),
-                 embedding_prefix_style="e5", embedding_dimensions=1024)
+                embedding_prefix_style="e5", embedding_dimensions=1024)
     with pytest.raises(RuntimeError, match="EMBEDDING_DIMENSIONS"):
         validate_local_models(s, warm=True)
 
@@ -304,7 +304,7 @@ def test_validate_local_warm_requires_sentence_transformers(monkeypatch, tmp_pat
 
     monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
     s = Settings(embedding_provider="local", embedding_model=str(tmp_path),
-                 embedding_prefix_style="e5")
+                embedding_prefix_style="e5")
     with pytest.raises(RuntimeError, match="sentence-transformers"):
         validate_local_models(s, warm=True)
 
@@ -336,6 +336,39 @@ def test_security_posture_allows_dev():
     from app.core.config import Settings, assert_security_posture
 
     assert_security_posture(Settings(app_env="dev", auth_dev_mode=True))  # no raise
+
+
+def test_security_posture_blocks_missing_jwt_config_in_prod():
+    from app.core.config import Settings, assert_security_posture
+
+    s = Settings(app_env="prod", auth_dev_mode=False,
+                jwt_jwks_url="", jwt_issuer="", jwt_audience="")
+    with pytest.raises(RuntimeError, match="TSG_JWT_JWKS_URL, TSG_JWT_ISSUER, TSG_JWT_AUDIENCE"):
+        assert_security_posture(s)
+
+
+def test_security_posture_names_only_the_missing_jwt_setting():
+    from app.core.config import Settings, assert_security_posture
+
+    s = Settings(app_env="staging", auth_dev_mode=False, jwt_jwks_url="",
+                jwt_issuer="https://idp.example", jwt_audience="tsg-api")
+    with pytest.raises(RuntimeError, match=r"missing: TSG_JWT_JWKS_URL\. Refusing"):
+        assert_security_posture(s)
+
+
+def test_security_posture_prod_ok_with_full_jwt_config():
+    from app.core.config import Settings, assert_security_posture
+
+    assert_security_posture(Settings(  # no raise
+        app_env="prod", auth_dev_mode=False, jwt_jwks_url="https://idp.example/jwks",
+        jwt_issuer="https://idp.example", jwt_audience="tsg-api"))
+
+
+def test_security_posture_dev_does_not_require_jwt_config():
+    from app.core.config import Settings, assert_security_posture
+
+    assert_security_posture(  # no raise — the boot requirement is staging/prod only
+        Settings(app_env="dev", jwt_jwks_url="", jwt_issuer="", jwt_audience=""))
 
 
 class _FakeRedis:
@@ -664,6 +697,18 @@ class _FakeHttpClient:
         return self._result
 
 
+def _stub_chat_ok(monkeypatch):
+    """verify_litellm_models makes ONE real chat call for EVERY provider now — including
+    litellm_proxy, where /v1/models registration alone cannot prove the model answers something
+    chat() can parse (a proxy entry pinning stream:true is registered, reachable and unusable).
+    Tests that only exercise the registration/dimension/logging behaviour stub it with a canned
+    success so that call isn't what they trip over."""
+    import litellm
+
+    monkeypatch.setattr(litellm, "completion",
+                        lambda *, messages, **kwargs: {"choices": [{"message": {"content": "ok"}}], "model": "x"})
+
+
 def test_verify_litellm_models_noop_on_proxy_check_when_no_provider_uses_the_proxy(monkeypatch):
     # defaults: llm_provider=azure_openai, embedding/reranker_provider=local. The
     # litellm_proxy-specific /v1/models check makes no network call — but [REVIEW-FIX] a
@@ -718,21 +763,29 @@ def test_verify_litellm_models_direct_provider_check_survives_json_mode(monkeypa
     verify_litellm_models(Settings(azure_openai_deployment_name="d", llm_json_mode=True))
 
 
-def test_verify_litellm_models_direct_provider_check_skipped_for_litellm_proxy(monkeypatch):
-    # the direct-provider check is specific to azure_openai/openai — litellm_proxy already
-    # gets its own /v1/models-based check above, so this must not fire a second, redundant call.
+def test_verify_litellm_models_also_makes_a_real_chat_call_on_the_proxy_path(monkeypatch):
+    # [REVIEW-FIX] this previously asserted the OPPOSITE — that the chat check was skipped for
+    # litellm_proxy because /v1/models "already covers it". It does not: registration proves the
+    # model is LISTED, never that it answers something chat() can parse. A proxy entry pinning
+    # `"stream": true` (glm-5's does) is registered, reachable, and still breaks the first real
+    # pipeline run. One real completion at boot turns that into a failed deployment instead.
     import httpx
     import litellm
 
     from app.pipeline.llm import verify_litellm_models
 
     completion_calls = []
-    monkeypatch.setattr(litellm, "completion", lambda *, messages, **kwargs: completion_calls.append(1))
+
+    def counting_completion(*, messages, **kwargs):
+        completion_calls.append(1)
+        return {"choices": [{"message": {"content": "ok"}}], "model": "x"}
+
+    monkeypatch.setattr(litellm, "completion", counting_completion)
     monkeypatch.setattr(httpx, "Client",
                         lambda *a, **k: _FakeHttpClient(_FakeModelsResponse(["gpt-5"])))
     verify_litellm_models(Settings(llm_provider="litellm_proxy", inference_model="gpt-5",
                                 embedding_provider="local", reranker_provider="local"))
-    assert completion_calls == []
+    assert len(completion_calls) == 1
 
 
 def test_verify_litellm_models_passes_when_configured_model_is_registered(monkeypatch):
@@ -740,6 +793,7 @@ def test_verify_litellm_models_passes_when_configured_model_is_registered(monkey
 
     from app.pipeline.llm import verify_litellm_models
 
+    _stub_chat_ok(monkeypatch)
     monkeypatch.setattr(httpx, "Client",
                         lambda *a, **k: _FakeHttpClient(_FakeModelsResponse(["gpt-5", "other-model"])))
     # [Seamless flip] embedding_provider/reranker_provider pinned explicitly here — otherwise
@@ -775,6 +829,7 @@ def test_verify_litellm_models_only_checks_providers_actually_set_to_litellm_pro
 
     from app.pipeline.llm import verify_litellm_models
 
+    _stub_chat_ok(monkeypatch)
     monkeypatch.setattr(httpx, "Client", lambda *a, **k: _FakeHttpClient(_FakeModelsResponse(["gpt-5"])))
     # embedding_provider/reranker_provider pinned explicitly to "local" — otherwise they'd
     # now follow llm_provider=litellm_proxy too (see [Seamless flip]), defeating this test's
@@ -905,6 +960,7 @@ def test_verify_litellm_models_applies_proxy_bypass_before_its_own_network_call(
 
     from app.pipeline.llm import verify_litellm_models
 
+    _stub_chat_ok(monkeypatch)
     monkeypatch.delenv("NO_PROXY", raising=False)
     monkeypatch.setattr(httpx, "Client",
                         lambda *a, **k: _FakeHttpClient(_FakeModelsResponse(["gpt-5"])))
@@ -913,6 +969,38 @@ def test_verify_litellm_models_applies_proxy_bypass_before_its_own_network_call(
                 litellm_base_url="https://llmapi.example.com")
     verify_litellm_models(s)
     assert "llmapi.example.com" in os.environ["NO_PROXY"]
+
+
+def test_chat_sends_stream_false_and_assembles_a_streamed_response(monkeypatch):
+    """[stream fix] chat()'s contract must never depend on the server's stream config: it declares
+    stream=False on the wire, and if a proxy model entry pinning `"stream": true` (glm-5's does)
+    streams anyway, the chunks are assembled into the completed response instead of crashing."""
+    import litellm
+
+    from app.pipeline.llm import LiteLLMClient
+
+    captured = {}
+
+    class _FakeStream:
+        def __iter__(self):
+            return iter(["c1", "c2"])
+
+    def fake_completion(*, messages, **kw):
+        captured.update(kw)
+        return _FakeStream()
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    monkeypatch.setattr(litellm, "CustomStreamWrapper", _FakeStream)
+    monkeypatch.setattr(litellm, "stream_chunk_builder",
+                        lambda chunks, messages=None: {"choices": [{"message": {"content": "assembled"}}],
+                                                    "model": "glm-5"} if chunks == ["c1", "c2"] else None)
+
+    text, prov = LiteLLMClient(Settings(azure_openai_deployment_name="d")).chat(
+        [{"role": "user", "content": "hi"}])
+
+    assert captured["stream"] is False   # declared non-streaming on the wire, every call
+    assert text == "assembled"           # server streamed anyway → assembled, not crashed
+    assert prov.model_version == "glm-5"
 
 
 def test_embed_rejects_text_over_the_length_cap():
@@ -1075,6 +1163,7 @@ def test_verify_litellm_models_skips_embedding_dimension_check_when_not_proxy_ro
 
     from app.pipeline.llm import verify_litellm_models
 
+    _stub_chat_ok(monkeypatch)
     monkeypatch.setattr(litellm, "embedding",
                         lambda **kw: pytest.fail("must not check embedding dimensions for the local path"))
     # embedding_provider/reranker_provider pinned explicitly — otherwise they'd now follow
@@ -1096,6 +1185,7 @@ def test_verify_litellm_models_logs_model_config_rpm_without_raising(monkeypatch
 
     from app.pipeline.llm import verify_litellm_models
 
+    _stub_chat_ok(monkeypatch)
     monkeypatch.setattr(httpx, "Client", lambda *a, **k: _UrlRoutingFakeClient({
         "/v1/models": _FakeModelsResponse(["gpt-5"]),
         "/model/info": _FakeJsonResponse(
@@ -1113,6 +1203,7 @@ def test_verify_litellm_models_model_config_check_failure_does_not_raise(monkeyp
 
     from app.pipeline.llm import verify_litellm_models
 
+    _stub_chat_ok(monkeypatch)
     monkeypatch.setattr(httpx, "Client", lambda *a, **k: _UrlRoutingFakeClient({
         "/v1/models": _FakeModelsResponse(["gpt-5"]),
         "/model/info": httpx.ConnectError("connection refused"),
@@ -1367,7 +1458,7 @@ def test_chat_kwargs_guardrails_absent_by_default():
 
 def test_config_local_aliases():
     s = Settings(embedding_provider="local", embedding_model="/m/e5", embedding_dimensions=1024,
-                 semantic_match_threshold=0.6, reranker_provider="local", reranker_model="/m/bge")
+                semantic_match_threshold=0.6, reranker_provider="local", reranker_model="/m/bge")
     assert (s.embedding_provider, s.reranker_provider) == ("local", "local")
     assert (s.embedding_model, s.reranker_model) == ("/m/e5", "/m/bge")
     assert s.embedding_dimensions == 1024 and s.semantic_match_threshold == 0.6

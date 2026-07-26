@@ -20,9 +20,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY pyproject.toml alembic.ini ./
+COPY pyproject.toml ./
 COPY app ./app
-COPY migrations ./migrations
+# scripts/ carries the schema: database-first, TSG_Core.sql is the only thing that
+# creates the baseline tables (see scripts/readme.txt). No migration tool in the image.
 COPY scripts ./scripts
 RUN pip install -e ".[${EXTRAS}]"
 

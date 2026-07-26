@@ -109,14 +109,33 @@ _STOPWORDS = frozenset({"the", "and", "or", "of", "to", "a", "an", "for", "with"
 
 def _mentions(needle: str, haystack: str) -> bool:
     """Loosened consistency proxy: does `haystack` share at least ~1/3 (minimum 1) of `needle`'s
-    significant tokens? Replaces the old whole-phrase `_references(needle, haystack)` for the
+    significant word tokens? Replaces the old whole-phrase `_references(needle, haystack)` for the
     scenario checks — paraphrased prose never repeats a full formal threat/asset name verbatim, so
-    the strict phrase check false-warned on 100% of on-topic scenarios. Significant tokens are
-    lowercased alphanumeric runs of length >= 3 that aren't common stopwords; an all-stopword/empty
-    needle has nothing meaningful to check and passes (True). Each token is matched with the existing
-    word-boundary `_references` so a short token still can't match inside an unrelated word."""
-    tokens = [t for t in re.findall(r"[a-z0-9]+", needle.lower())
-            if len(t) >= 3 and t not in _STOPWORDS]
+    the strict phrase check false-warned on 100% of on-topic scenarios. Significant word tokens are
+    lowercased alphanumeric runs of length >= 3 that aren't common stopwords and aren't pure digits;
+    an all-stopword/empty needle has nothing meaningful to check and passes (True). Each token is
+    matched with the existing word-boundary `_references` so a short token still can't match inside
+    an unrelated word.
+
+    Two refinements on top of the plain proportional vote, both there to stop a same-shaped SIBLING
+    entity from passing as a match:
+    - A parenthetical/quoted short form in the needle (e.g. asset name "Power Generation System
+      (PGS)") is the entity's own official abbreviation — a haystack that names it ONLY by that
+      abbreviation ("...PGS operational data...") correctly identifies it and must not be diluted
+      into 1-of-4 equally-weighted tokens (which would fail the ceil(4/3)=2 threshold); checked
+      first and short-circuits to True on its own.
+    - Every purely-numeric token (a suffix like "Gateway 4" vs "Gateway 7", the single most common
+      way two sibling assets/subsystems otherwise share every word token) is REQUIRED to match
+      exactly, not just counted as one vote among many — dropping it the way stopwords are dropped
+      would let "Substation Gateway 4" and "Substation Gateway 7" read as the same entity."""
+    raw = re.findall(r"[a-z0-9]+", needle.lower())
+    short_form = re.search(r"[(\"']([a-z0-9]+)[)\"']", needle.lower())
+    if short_form and _references(short_form.group(1), haystack):
+        return True
+    digits = [t for t in raw if t.isdigit()]
+    if digits and not all(_references(d, haystack) for d in digits):
+        return False
+    tokens = [t for t in raw if len(t) >= 3 and t not in _STOPWORDS and not t.isdigit()]
     if not tokens:
         return True
     hits = sum(1 for t in tokens if _references(t, haystack))
@@ -146,9 +165,9 @@ def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_
 
     structural (scenario_title, scenario_statement, risk_statement present,
     non-empty — the three fields scenario_prompt actually produces) + consistency
-    proxy (statement references the threat it narrates; risk_statement references the asset
-    and critical service, per the prompt's own "threat + asset + critical service + impact"
-    formula). The consistency proxy is now TOKEN OVERLAP (~1/3 of the name/type's significant
+    proxy (statement references the threat it narrates; scenario_title AND scenario_statement
+    reference the asset, and risk_statement references the asset and critical service — the
+    document requires every field asset-centric, so all three are asset-checked). The consistency proxy is now TOKEN OVERLAP (~1/3 of the name/type's significant
     tokens appear, via `_mentions`), NOT whole-phrase containment — paraphrased on-topic prose
     never repeats a full formal name verbatim, so the old phrase check warned on everything.
     Self-reported `assumptions`/`excluded_details` pass through for the reviewer.
@@ -173,6 +192,15 @@ def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_
     # is already reported by _check_fields above, so don't double-flag it here.
     if statement.strip() and needle.strip() and not _mentions(needle, statement):
         errors.append(f"scenario_statement does not reference the threat name/type ({needle})")
+    # The document requires every field asset-centric "from beginning to end", not just the risk
+    # line — so scenario_title and scenario_statement are also checked for the asset (same
+    # warning-only token-overlap proxy as the risk_statement asset check below), guarded on both
+    # the field and asset_name having text exactly like that check.
+    title = str(scenario.get("scenario_title") or "")
+    if title.strip() and asset_name and not _mentions(asset_name, title):
+        errors.append(f"scenario_title does not reference the asset ({asset_name})")
+    if statement.strip() and asset_name and not _mentions(asset_name, statement):
+        errors.append(f"scenario_statement does not reference the asset ({asset_name})")
     risk_statement = str(scenario.get("risk_statement") or "")
     # Same "only compare when both sides have text" guard as above — an empty risk_statement is
     # already reported by _check_fields, and a blank critical_service is a real, allowed asset

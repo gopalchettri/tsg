@@ -30,7 +30,7 @@ class _FakeJobRedis:
 @pytest.fixture()
 def admin_client(monkeypatch):
     monkeypatch.setattr(get_settings(), "admin_api_key", _KEY)
-    from app.api import admin as admin_module
+    from app.api import admin_jobs
     from app.api.deps import Principal, get_principal
     from app.main import create_app
     from app.pipeline.celery_app import celery_app
@@ -40,10 +40,10 @@ def admin_client(monkeypatch):
     # every other endpoint uses) purely to attribute the audit log to a real user_id — override
     # it here exactly like conftest.make_client does for every other authenticated route.
     app.dependency_overrides[get_principal] = lambda: Principal(claims={"sub": "u1"}, entities=set())
-    # ONE shared fake instance: _enqueue's write and get_status's later check must see the
-    # same store, not two independent ones from a fresh instance per call.
+    # ONE shared fake instance: the marker write and get_status's later check must see the
+    # same store. Patched in admin_jobs (the markers' home since the import-API refactor).
     _fake_job_redis = _FakeJobRedis()
-    monkeypatch.setattr(admin_module, "_slot_redis", lambda: _fake_job_redis)
+    monkeypatch.setattr(admin_jobs, "_slot_redis", lambda: _fake_job_redis)
     # Runs each queued task in-process instead of via a real broker — same eager-mode pattern
     # test_celery_app.py already uses for run_pipeline_task/regenerate_task.
     # task_store_eager_result=True is required too: eager mode alone keeps the result only on
@@ -216,12 +216,12 @@ def test_update_returns_rows_processed_per_group(admin_client, monkeypatch):
     from app.pipeline import embeddings
 
     monkeypatch.setattr(embeddings, "update_group",
-                        lambda sess, llm, g: {"threat_type": 5, "threat_catalogue": 7}[g])
+                        lambda sess, llm, g: {"threat_type": 5, "threat_catalogue": 7, "control_library": 3}[g])
     r = _run(admin_client, "update", {})
     assert r.status_code == 200
     body = r.json()
     assert body["state"] == "SUCCESS"
-    assert body["rows_processed"] == {"threat_type": 5, "threat_catalogue": 7}
+    assert body["rows_processed"] == {"threat_type": 5, "threat_catalogue": 7, "control_library": 3}
     assert body["vectors_deleted"] is None
 
 
@@ -322,7 +322,7 @@ def test_delete_names_requires_explicit_group(admin_client):
 def test_delete_reports_vectors_deleted_not_rows_processed(admin_client, monkeypatch):
     from app.pipeline import embeddings
 
-    monkeypatch.setattr(embeddings, "delete_group", lambda g, names=None: 4)
+    monkeypatch.setattr(embeddings, "delete_group", lambda sess, g, names=None: 4)
     r = _run(admin_client, "delete", {"group": "threat_type"})
     assert r.status_code == 200
     body = r.json()
@@ -335,7 +335,7 @@ def test_delete_scopes_to_names_when_given(admin_client, monkeypatch):
 
     captured = {}
 
-    def fake_delete(group, names=None):
+    def fake_delete(sess, group, names=None):
         captured.update(group=group, names=names)
         return 1
 

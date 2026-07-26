@@ -12,18 +12,20 @@ dependencies = [
   "gevent>=24.2",           # Celery pool: I/O-bound LLM waits, high concurrency per box
   "sqlalchemy>=2.0",
   "pyodbc>=5.1",            # mssql+pyodbc, ODBC Driver 17 (SDD §14)
-  "alembic>=1.13",
   "pydantic>=2.7",
   "pydantic-settings>=2.3",
   "pyjwt[crypto]>=2.8",     # resource-server JWT validation only (SDD §10.1)
   "litellm>=1.40",
   "pymongo>=4.7",
   "structlog>=24.1",
+  "taxii2-client>=2.3",     # generic TAXII 2.1 pull (app/intel/taxii_client.py)
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.2", "httpx>=0.27", "ruff>=0.15", "mypy>=1.11"]
-local = ["sentence-transformers>=3.0"]   # local embedding + reranker (EMBEDDING/RERANKER_PROVIDER=local)
+# >=5.0, not >=3.0: local_models.py calls get_embedding_dimension(), which replaced
+# get_sentence_embedding_dimension() in 5.x (the old name still works but FutureWarns).
+local = ["sentence-transformers>=5.0"]   # local embedding + reranker (EMBEDDING/RERANKER_PROVIDER=local)
 prod = ["gunicorn>=22.0"]                # production process manager for the API (uvicorn workers)
 
 [build-system]
@@ -48,8 +50,10 @@ plugins = ["pydantic.mypy"]
 # verify calls into an untyped library. Ignoring here (once, centrally) instead of a
 # `# type: ignore` on every call site keeps the same intent from silently drifting out of sync
 # across app/pipeline/local_models.py, app/pipeline/celery_app.py, and app/api/admin.py.
+# taxii2-client is in the same boat, and is additionally an OPTIONAL, lazily-imported dependency
+# (app/intel/taxii_client.py imports it inside the function), so the miss is expected, not a bug.
 [[tool.mypy.overrides]]
-module = ["gevent.*", "celery.*"]
+module = ["gevent.*", "celery.*", "taxii2client.*"]
 ignore_missing_imports = true
 
 # Pins the linter that was already running here unconfigured (the stale .ruff_cache and the

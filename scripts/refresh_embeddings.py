@@ -40,6 +40,7 @@ def main() -> int:
     args = parser.parse_args()
 
     configure_logging()
+    embeddings.process_role = "cli"  # created_by provenance on any vectors this run computes
     llm = get_llm()
     action = embeddings.recreate_group if args.recreate else embeddings.update_group
 

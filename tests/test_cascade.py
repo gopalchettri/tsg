@@ -22,7 +22,7 @@ from app.db.dal import load_session
 from app.pipeline import cascade, prompts
 from app.pipeline.accept import AcceptConflict, accept_session
 from app.pipeline.reaper import clean_up_abandoned_sessions
-from app.pipeline.tasks import _process_all_supporting_systems, write_scenarios
+from app.pipeline.tasks import ASSET_UNIT_ID, _process_all_supporting_systems, write_scenarios
 from tests.conftest import DEFAULT_ASSET_CONTEXT, StubLLM
 from tests.test_slice import SUB, _seed_session
 
@@ -33,7 +33,7 @@ class _TwoThreatLLM(StubLLM):
 
     def chat(self, messages, *, model=None, temperature=None):
         sysc = messages[0]["content"].lower()
-        if "stride threats" in sysc:
+        if "json array" in sysc:
             out = [
                 {"category": "Tampering", "type": "Firmware Tampering", "name": "Bootloader implant",
                  "actors": ["Hacker"]},
@@ -95,14 +95,14 @@ def test_regen_llm_slot_unavailable_propagates_not_marked_error(db):
     session = dict(load_session(db, sid))
     output_id = _output_ids(db, sid)[0]
     _leave_review(db, sid)
-    epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
+    epoch = _reserve_epoch(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario)
     with pytest.raises(LLMSlotUnavailable):
-        cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [output_id], epoch,
+        cascade.run_regeneration(db, session, ASSET_UNIT_ID, RegenGranularity.scenario, [output_id], epoch,
                                 _SlotUnavailableLLM(), "77777777-7777-4777-8777-777777777777")
     row = db.execute(
         select(m.Subsystem_Stage_State.Status).where(
             m.Subsystem_Stage_State.SessionID == sid,
-            m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+            m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
             m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS,
         )
     ).scalar()
@@ -123,7 +123,7 @@ def test_process_all_supporting_systems_llm_slot_unavailable_propagates_not_mark
     row = db.execute(
         select(m.Subsystem_Stage_State.Status).where(
             m.Subsystem_Stage_State.SessionID == sid,
-            m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+            m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
             m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS,
         )
     ).scalar()
@@ -136,8 +136,8 @@ def test_regen_at_review_returns_to_review(db):
     session = dict(load_session(db, sid))
     output_id = _output_ids(db, sid)[0]
     _leave_review(db, sid)
-    epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
-    outcome = cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [output_id], epoch,
+    epoch = _reserve_epoch(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario)
+    outcome = cascade.run_regeneration(db, session, ASSET_UNIT_ID, RegenGranularity.scenario, [output_id], epoch,
                                        StubLLM(), "55555555-5555-4555-8555-555555555555")
     assert outcome == "review"
     assert load_session(db, sid)["CurrentStage"] == WorkflowStage.REVIEW
@@ -145,7 +145,7 @@ def test_regen_at_review_returns_to_review(db):
 
 def test_accept_rejected_during_regen(db):
     sid = _run_to_review(db, StubLLM())
-    dal.acquire_lock(db, sid, SUB["id"], "66666666-6666-4666-8666-666666666666")  # simulate a regen holding the lock
+    dal.acquire_lock(db, sid, ASSET_UNIT_ID, "66666666-6666-4666-8666-666666666666")  # simulate a regen holding the lock
     with pytest.raises(AcceptConflict):
         accept_session(db, sid, "5", "u1")
 
@@ -170,7 +170,7 @@ def test_reaper_does_not_reenter_review_right_after_leaving_it(db):
     # Simulate the endpoint's own leave-REVIEW + epoch-reservation, exactly as
     # post_regenerate does — the real Celery task just hasn't picked it up yet.
     _leave_review(db, sid, stage=WorkflowStage.SCENARIO_GENERATION)
-    _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
+    _reserve_epoch(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario)
     # The reaper must NOT treat "just left REVIEW a moment ago" as abandoned — with
     # leases correctly cleared on stage completion, dead_lease is false and the
     # grace-period (stage_lease_seconds) hasn't elapsed, so nothing should happen.
@@ -191,7 +191,7 @@ def test_reaper_salvages_a_regen_that_never_actually_started_to_review(db, monke
     monkeypatch.setattr(get_settings(), "stage_lease_seconds", 1)
     sid = _run_to_review(db, StubLLM())
     _leave_review(db, sid, stage=WorkflowStage.SCENARIO_GENERATION)
-    _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
+    _reserve_epoch(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario)
     # Backdate UpdatedAt past the (now tiny) grace window to simulate a task that
     # really did get lost (broker down, worker crash before ever starting).
     db.execute(update(m.Scenario_Session).where(m.Scenario_Session.SessionID == sid)
@@ -206,7 +206,7 @@ def test_reaper_salvages_a_regen_that_never_actually_started_to_review(db, monke
     assert active == 1
     # and the lock was released (not leaked) even though the session stays active for review
     lock = db.execute(select(m.Subsystem_Stage_State.Status).where(
-        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
         m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK)).scalar()
     assert lock == StageStatus.IDLE
 
@@ -217,8 +217,8 @@ def test_regen_creates_new_epoch_supersedes_old(db):
     session = dict(load_session(db, sid))
     old_output = _output_ids(db, sid)[0]
     _leave_review(db, sid)
-    epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
-    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [old_output], epoch, StubLLM(), "55555555-5555-4555-8555-555555555555")
+    epoch = _reserve_epoch(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario)
+    cascade.run_regeneration(db, session, ASSET_UNIT_ID, RegenGranularity.scenario, [old_output], epoch, StubLLM(), "55555555-5555-4555-8555-555555555555")
 
     assert db.execute(select(m.Threat_Scenario_Output.Superseded)
                       .where(m.Threat_Scenario_Output.OutputID == old_output)).scalar() == 1
@@ -240,16 +240,16 @@ def test_regen_idempotent_redelivery(db):
         .where(m.Threat_Scenario_Output.OutputID == old_output)
     ).scalar()
 
-    epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,))
-    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,), epoch)
-    threats = dal.active_threats(db, sid, SUB["id"])
+    epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, (SubsystemLevel.SCENARIOS,))
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, (SubsystemLevel.SCENARIOS,), epoch)
+    threats = dal.active_threats(db, sid, ASSET_UNIT_ID)
     tid = "44444444-4444-4444-8444-444444444444"  # same task_id both calls -- exercises redelivery
 
-    provs1 = write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, threats, StubLLM(), tid, epoch=epoch, target_threat_ids={threat_id})
+    provs1 = write_scenarios(db, session, [SUB], DEFAULT_ASSET_CONTEXT, threats, StubLLM(), tid, epoch=epoch, target_threat_ids={threat_id})
     assert len(provs1) == 1
     # Redelivery: SAME task_id, SAME epoch — the stage is now AWAITING_DECISION, not
     # claimable, so this is a true no-op (mirrors test_redelivered_stage_is_noop).
-    provs2 = write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, threats, StubLLM(), tid, epoch=epoch, target_threat_ids={threat_id})
+    provs2 = write_scenarios(db, session, [SUB], DEFAULT_ASSET_CONTEXT, threats, StubLLM(), tid, epoch=epoch, target_threat_ids={threat_id})
     assert provs2 == []
     active = db.execute(select(func.count()).select_from(m.Threat_Scenario_Output).where(
         m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)).scalar()
@@ -261,12 +261,12 @@ def test_regen_after_poison_exhaustion_not_permanently_blocked(db, monkeypatch):
     monkeypatch.setattr(get_settings(), "stage_max_attempts", 1)
     session = _seed_session(db)
     sid = session["SessionID"]
-    dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, 1, "77777777-7777-4777-8777-777777777777")
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, 1, "77777777-7777-4777-8777-777777777777") is False  # exhausted
+    dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.SCENARIOS, 1, "77777777-7777-4777-8777-777777777777")
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.SCENARIOS, 1, "77777777-7777-4777-8777-777777777777") is False  # exhausted
 
-    new_epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,))
-    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,), new_epoch)
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, new_epoch, "88888888-8888-4888-8888-888888888888") is True
+    new_epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, (SubsystemLevel.SCENARIOS,))
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, (SubsystemLevel.SCENARIOS,), new_epoch)
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.SCENARIOS, new_epoch, "88888888-8888-4888-8888-888888888888") is True
 
 
 # --- row-scoping (the real fix for the "regen wipes siblings" gap) ---
@@ -277,8 +277,8 @@ def test_regen_scenario_only_targets_one_output_siblings_untouched(db):
     assert len(outputs) == 2
     target, sibling = outputs[0], outputs[1]
     _leave_review(db, sid)
-    epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
-    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [target], epoch, _TwoThreatLLM(), "55555555-5555-4555-8555-555555555555")
+    epoch = _reserve_epoch(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario)
+    cascade.run_regeneration(db, session, ASSET_UNIT_ID, RegenGranularity.scenario, [target], epoch, _TwoThreatLLM(), "55555555-5555-4555-8555-555555555555")
 
     sibling_row = db.execute(select(m.Threat_Scenario_Output.Superseded)
                              .where(m.Threat_Scenario_Output.OutputID == sibling)).scalar()
@@ -312,13 +312,13 @@ def test_write_scenarios_target_excluded_by_rescoring_leaves_old_scenario_untouc
         .where(m.Threat_Scenario_Output.OutputID == old_output)
     ).scalar()
 
-    epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,))
-    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,), epoch)
-    threats = dal.active_threats(db, sid, SUB["id"])
+    epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, (SubsystemLevel.SCENARIOS,))
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, (SubsystemLevel.SCENARIOS,), epoch)
+    threats = dal.active_threats(db, sid, ASSET_UNIT_ID)
     monkeypatch.setattr(get_settings(), "scoping_score_threshold", 71.0)  # this threat scores exactly 70
 
     with pytest.raises(RegenerateConflict):
-        write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, threats, StubLLM(),
+        write_scenarios(db, session, [SUB], DEFAULT_ASSET_CONTEXT, threats, StubLLM(),
                         "44444444-4444-4444-8444-444444444444", epoch=epoch, target_threat_ids={threat_id})
 
     # destroyed-with-no-replacement is exactly the bug -- the old scenario must still be active
@@ -326,7 +326,7 @@ def test_write_scenarios_target_excluded_by_rescoring_leaves_old_scenario_untouc
                     .where(m.Threat_Scenario_Output.OutputID == old_output)).scalar() == 0
     status = db.execute(
         select(m.Subsystem_Stage_State.Status).where(
-            m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+            m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
             m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS)
     ).scalar()
     assert status == StageStatus.AWAITING_DECISION  # returned to reviewable state, not left stuck RUNNING
@@ -343,12 +343,17 @@ def test_regen_target_no_longer_selected_returns_to_review_without_losing_the_sc
     session = dict(load_session(db, sid))
     target, sibling = _output_ids(db, sid)
     _leave_review(db, sid)
-    epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
+    epoch = _reserve_epoch(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario)
     monkeypatch.setattr(get_settings(), "scoping_score_threshold", 71.0)  # both threats score exactly 70
+    published: list = []  # capture the advisory SSE (conftest's autouse fixture otherwise no-ops it)
+    monkeypatch.setattr("app.sse.bus.publish", lambda sid_, event: published.append(event))
 
-    outcome = cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [target], epoch,
+    outcome = cascade.run_regeneration(db, session, ASSET_UNIT_ID, RegenGranularity.scenario, [target], epoch,
                                     _TwoThreatLLM(), "55555555-5555-4555-8555-555555555555")
     assert outcome == "review"  # no exception escapes -- a benign conflict, not a recorded failure
+    # fruitless regen still announces itself: regen_result with an empty new_output_ids
+    regen_events = [e for e in published if str(e.get("type")) == "regen_result"]
+    assert len(regen_events) == 1 and regen_events[0]["new_output_ids"] == []
 
     active = db.execute(select(func.count()).select_from(m.Threat_Scenario_Output).where(
         m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)).scalar()
@@ -372,9 +377,9 @@ def test_build_regen_audit_detail_redacts_user_note():
 def _spy_scenario_prompt(monkeypatch, captured):
     real_scenario_prompt = prompts.scenario_prompt
 
-    def _spy(asset_name, asset_context, sub, threat_type, threat_name, actors=None, **kw):
+    def _spy(base_ctx, threat_type, threat_name, actors=None, **kw):
         captured.append((threat_type, threat_name))
-        return real_scenario_prompt(asset_name, asset_context, sub, threat_type, threat_name, actors=actors, **kw)
+        return real_scenario_prompt(base_ctx, threat_type, threat_name, actors=actors, **kw)
 
     monkeypatch.setattr("app.pipeline.prompts.scenario_prompt", _spy)
 
@@ -405,10 +410,10 @@ def test_regen_scenario_granularity_threads_target_threat_not_sibling(db, monkey
     assert expected_name != sibling_name  # the two threats really are distinguishable
 
     _leave_review(db, sid)
-    epoch = _reserve_epoch(db, sid, SUB["id"], RegenGranularity.scenario)
+    epoch = _reserve_epoch(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario)
     captured = []
     _spy_scenario_prompt(monkeypatch, captured)
-    cascade.run_regeneration(db, session, SUB["id"], RegenGranularity.scenario, [target], epoch, _TwoThreatLLM(), "55555555-5555-4555-8555-555555555555")
+    cascade.run_regeneration(db, session, ASSET_UNIT_ID, RegenGranularity.scenario, [target], epoch, _TwoThreatLLM(), "55555555-5555-4555-8555-555555555555")
 
     assert len(captured) == 1
     assert captured[0][1] == expected_name  # matches the TARGET, not the sibling

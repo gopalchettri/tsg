@@ -157,7 +157,8 @@ def test_mentions_token_overlap_cases():
 
 def test_validate_scenario_ok_when_risk_statement_references_asset_and_critical_service():
     v = validate_scenario(
-        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+        {"scenario_title": "Firmware tampering of Substation Gateway 4",
+         "scenario_statement": "A bootloader implant on Substation Gateway 4 persists in firmware.",
          "business_impact": "b", "operational_impact": "o",
          "risk_statement": "Bootloader implant on Substation Gateway 4 threatens Grid Balancing "
                             "availability and safety."},
@@ -186,11 +187,38 @@ def test_validate_scenario_warns_when_risk_statement_missing_critical_service():
     assert "risk_statement does not reference the critical service (Grid Balancing)" in v["errors"]
 
 
+def test_validate_scenario_warns_when_scenario_title_missing_asset():
+    # Round 2 added asset-reference checks for scenario_title/scenario_statement (previously only
+    # risk_statement was checked) — regression-guards the title check specifically, mirroring the
+    # risk_statement test above. Nothing previously asserted this check actually fires.
+    v = validate_scenario(
+        {"scenario_title": "Firmware tampering",
+         "scenario_statement": "A bootloader implant on Substation Gateway 4 persists in firmware.",
+         "business_impact": "b", "operational_impact": "o",
+         "risk_statement": "Bootloader implant on Substation Gateway 4 threatens operations."},
+        "Firmware Tampering", "Bootloader implant",
+        asset_name="Substation Gateway 4", critical_service=None)
+    assert "scenario_title does not reference the asset (Substation Gateway 4)" in v["errors"]
+
+
+def test_validate_scenario_warns_when_scenario_statement_missing_asset():
+    # Same Round-2 check, statement side — regression-guards it specifically.
+    v = validate_scenario(
+        {"scenario_title": "Firmware tampering of Substation Gateway 4",
+         "scenario_statement": "A bootloader implant persists in firmware.",
+         "business_impact": "b", "operational_impact": "o",
+         "risk_statement": "Bootloader implant on Substation Gateway 4 threatens operations."},
+        "Firmware Tampering", "Bootloader implant",
+        asset_name="Substation Gateway 4", critical_service=None)
+    assert "scenario_statement does not reference the asset (Substation Gateway 4)" in v["errors"]
+
+
 def test_validate_scenario_ok_when_risk_statement_references_any_one_of_multiple_services():
     # An asset can link to more than one critical service (context.py::_load_asset) — the check
     # must pass if the risk_statement mentions ANY one of them, not require all.
     v = validate_scenario(
-        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+        {"scenario_title": "Firmware tampering of Substation Gateway 4",
+         "scenario_statement": "A bootloader implant on Substation Gateway 4 persists in firmware.",
          "business_impact": "b", "operational_impact": "o",
          "risk_statement": "Bootloader implant on Substation Gateway 4 threatens Grid Balancing "
                             "availability and safety."},
@@ -202,7 +230,8 @@ def test_validate_scenario_ok_when_risk_statement_references_any_one_of_multiple
 def test_validate_scenario_skips_critical_service_check_when_unset():
     # not every asset has a critical_service configured — a blank one must never false-flag
     v = validate_scenario(
-        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+        {"scenario_title": "Firmware tampering of Substation Gateway 4",
+         "scenario_statement": "A bootloader implant on Substation Gateway 4 persists in firmware.",
          "business_impact": "b", "operational_impact": "o",
          "risk_statement": "Bootloader implant on Substation Gateway 4 threatens operations."},
         "Firmware Tampering", "Bootloader implant",
@@ -230,7 +259,8 @@ def test_validate_scenario_ignores_whitespace_differences_in_asset_name():
     # in the asset inventory) must not false-flag a risk_statement that plainly references the
     # same asset with normal single-spaced prose.
     v = validate_scenario(
-        {"scenario_title": "t", "scenario_statement": "A Bootloader implant persists in firmware.",
+        {"scenario_title": "Firmware tampering of Substation Gateway 4",
+         "scenario_statement": "A bootloader implant on Substation Gateway 4 persists in firmware.",
          "business_impact": "b", "operational_impact": "o",
          "risk_statement": "Bootloader implant on Substation Gateway 4 threatens operations."},
         "Firmware Tampering", "Bootloader implant",

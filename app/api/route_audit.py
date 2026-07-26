@@ -43,6 +43,13 @@ from app.db.invariants import StartupInvariantError
 
 _WEBSOCKET = "WEBSOCKET"  # synthetic method key — APIWebSocketRoute has no .methods
 
+# FastAPI's own auto-added docs/OpenAPI routes (default docs_url/openapi_url/redoc_url — main.py's
+# create_app() doesn't override any of them). These are plain Starlette Route objects added via
+# app.add_route(), not an included APIRouter, so _iter_audit_routes can't unwrap or classify them
+# like a real route — they're always public/unauthenticated by design and not authored by this
+# app, so they're allowlisted by path here instead of silently falling through unrecognized.
+_FRAMEWORK_ROUTE_PATHS = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+
 # ============================================================================
 # Every entity-scoped route (touches one entity's session/asset/scenario data)
 # must depend on `get_principal` — this is the mechanically-verifiable half of
@@ -82,6 +89,10 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     # All 5 above: admin-key gated (router-level Depends(require_admin) in admin.py),
     # shared cross-tenant threat-library data — not one entity's data, so the
     # per-entity JWT model doesn't apply (see admin.py's own module docstring).
+    ("POST", "/v1/tsg/threat-library/import"): require_admin,
+    ("GET", "/v1/tsg/threat-library/import/status/{job_id}"): require_admin,
+    # Same rationale as the embeddings routes above — admin-key gated
+    # (app/api/threat_library_import.py), shared cross-tenant library data.
 }
 
 
@@ -135,6 +146,19 @@ def _iter_audit_routes(app: FastAPI):
             yield from router.routes
         elif isinstance(entry, (APIRoute, APIWebSocketRoute)):
             yield entry
+        elif getattr(entry, "path", None) in _FRAMEWORK_ROUTE_PATHS:
+            continue  # FastAPI's own docs/openapi routes — see _FRAMEWORK_ROUTE_PATHS above
+        else:
+            # Fail closed instead of silently skipping: a route reaching app.routes some other
+            # way (e.g. a future app.add_route()/app.mount() for a REAL endpoint) must not bypass
+            # this audit just because it isn't an APIRoute/APIWebSocketRoute.
+            raise StartupInvariantError(
+                f"[R2] app.routes contains an entry _iter_audit_routes doesn't recognize "
+                f"(type={type(entry).__name__}, path={getattr(entry, 'path', '?')!r}) — add its "
+                "path to _FRAMEWORK_ROUTE_PATHS above if it's a known-safe framework route, or "
+                "register it as a real APIRoute/APIRouter so it can be triaged like every other "
+                "route instead."
+            )
 
 
 def assert_routes_authenticated(app: FastAPI) -> None:

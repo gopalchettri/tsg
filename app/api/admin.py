@@ -19,18 +19,19 @@ from __future__ import annotations
 from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, Request
 
+from app.api.admin_jobs import FAMILY_EMBEDDINGS, admin_job_exists, mark_admin_job
 from app.api.deps import Principal, get_principal, require_admin
 from app.api.schemas import EmbeddingActionBody, EmbeddingJobAccepted, EmbeddingJobStatus
-from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.dal import NotFoundError
 from app.pipeline.celery_app import admin_embedding_action_task, celery_app
-from app.pipeline.llm import _slot_redis
 
-router = APIRouter(prefix="/v1/tsg/threat-library/embeddings", dependencies=[Depends(require_admin)])
+router = APIRouter(
+    prefix="/v1/tsg/threat-library/embeddings",
+    tags=["Threat Library Admin"],
+    dependencies=[Depends(require_admin)],
+)
 log = get_logger(__name__)
-
-_JOB_KEY_PREFIX = "tsg:admin:job:"
 
 
 class AdminValidationError(Exception):
@@ -72,10 +73,7 @@ def _enqueue(action: str, body: EmbeddingActionBody) -> EmbeddingJobAccepted:
     same TTL the result backend itself already uses, so the marker and the result it gates
     expire together)."""
     task = admin_embedding_action_task.delay(action, body.group, body.names)
-    try:
-        _slot_redis().setex(f"{_JOB_KEY_PREFIX}{task.id}", get_settings().result_expires_seconds, "1")
-    except Exception:  # noqa: BLE001 — best-effort provenance marker, never blocks the queue
-        log.warning("admin.job_marker_write_failed", job_id=task.id, exc_info=True)
+    mark_admin_job(task.id, FAMILY_EMBEDDINGS)  # best-effort — see admin_jobs.mark_admin_job
     return EmbeddingJobAccepted(job_id=task.id)
 
 
@@ -144,7 +142,7 @@ def get_status(job_id: str, _principal: Principal = Depends(get_principal)) -> E
     block a real call), but this check guards AUTHORIZATION (which job a caller may read) — an
     unreachable Redis must deny by falling through to the generic 500 handler, not silently
     let every job_id through."""
-    if not _slot_redis().exists(f"{_JOB_KEY_PREFIX}{job_id}"):
+    if not admin_job_exists(job_id, FAMILY_EMBEDDINGS):
         raise NotFoundError(f"unknown or expired job_id: {job_id!r}")
     result = AsyncResult(job_id, app=celery_app)
     if result.state == "FAILURE":

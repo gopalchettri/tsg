@@ -1,23 +1,22 @@
 # Production-style run of the three TSG processes from one image.
 # Usage (from the tsg folder):
 #   docker build -t tsg:latest .            # add --build-arg EXTRAS=prod,local for in-process models
-#   docker compose -f docker/compose.prod.yml --env-file .env.prod up -d
+#   docker compose -f docker/compose.prod.yml --env-file .env.uat up -d
 #
-# MSSQL (TSG) is EXTERNAL — point TSG_DB_DSN in .env.prod at your real server.
-# [REVIEW-FIX] The api/worker `volumes:` blocks below are ACTIVE by default (local
-# in-process models, provider=local) — set EMBEDDING_MODEL_HOST/RERANKER_MODEL_HOST in
-# .env.prod to real host paths, and EMBEDDING_MODEL/RERANKER_MODEL to the matching
-# CONTAINER paths (/models/...). If instead you're running with
-# EMBEDDING_PROVIDER=litellm_proxy / RERANKER_PROVIDER=litellm_proxy (no local models
-# needed), DELETE both `volumes:` blocks below — `docker compose up` fails outright on an
-# unset EMBEDDING_MODEL_HOST/RERANKER_MODEL_HOST otherwise, since Compose can't interpolate
-# an empty value into a bind-mount host path.
+# MSSQL (TSG) is EXTERNAL — point TSG_DB_DSN in .env.uat at your real server.
+# The api/worker `volumes:` blocks below carry a DEFAULT host path, so they are inert for the
+# UAT/prod config (.env.uat runs EMBEDDING/RERANKER_PROVIDER=litellm_proxy — models live on the
+# GPU cluster, nothing local is read). They previously interpolated bare
+# ${EMBEDDING_MODEL_HOST}, which aborted `compose up` outright whenever those vars were unset —
+# i.e. on exactly the proxy-based deployment this file is used for. To run in-process models
+# instead, set EMBEDDING_MODEL_HOST/RERANKER_MODEL_HOST to real host directories and point
+# EMBEDDING_MODEL/RERANKER_MODEL at the CONTAINER paths (/models/...).
 services:
   api:
     image: tsg:latest
     command: ["gunicorn", "app.main:app", "-k", "uvicorn.workers.UvicornWorker",
               "-w", "4", "-b", "0.0.0.0:8000", "--timeout", "120"]
-    env_file: [../.env.prod]
+    env_file: [../.env.uat]   # UAT and production share one file (.env.prod.example documents it)
     ports: ["8000:8000"]
     depends_on:
       redis: { condition: service_healthy }
@@ -27,14 +26,18 @@ services:
       timeout: 5s
       retries: 5
     volumes:  # local models (default provider=local); host paths come from .env.prod
-      - "${EMBEDDING_MODEL_HOST}:/models/e5:ro"
-      - "${RERANKER_MODEL_HOST}:/models/reranker:ro"
+      # Defaults so an unset MODEL_HOST cannot abort `compose up`: this deployment runs
+      # EMBEDDING/RERANKER_PROVIDER=litellm_proxy (.env.uat), so no local model files are needed
+      # and nothing reads these paths. Set both vars in .env.uat to real host directories only if
+      # you switch a provider back to `local`.
+      - "${EMBEDDING_MODEL_HOST:-./docker}:/models/e5:ro"
+      - "${RERANKER_MODEL_HOST:-./docker}:/models/reranker:ro"
 
   worker:
     image: tsg:latest
     command: ["celery", "-A", "app.pipeline.celery_worker.celery_app", "worker",
               "-P", "gevent", "-c", "50", "-l", "info"]
-    env_file: [../.env.prod]
+    env_file: [../.env.uat]   # UAT and production share one file (.env.prod.example documents it)
     depends_on:
       redis: { condition: service_healthy }
     # Compose's 10s default (SIGTERM then SIGKILL) is far shorter than a single in-flight LLM
@@ -65,13 +68,17 @@ services:
       retries: 3
       start_period: 240s
     volumes:
-      - "${EMBEDDING_MODEL_HOST}:/models/e5:ro"
-      - "${RERANKER_MODEL_HOST}:/models/reranker:ro"
+      # Defaults so an unset MODEL_HOST cannot abort `compose up`: this deployment runs
+      # EMBEDDING/RERANKER_PROVIDER=litellm_proxy (.env.uat), so no local model files are needed
+      # and nothing reads these paths. Set both vars in .env.uat to real host directories only if
+      # you switch a provider back to `local`.
+      - "${EMBEDDING_MODEL_HOST:-./docker}:/models/e5:ro"
+      - "${RERANKER_MODEL_HOST:-./docker}:/models/reranker:ro"
 
   beat:
     image: tsg:latest
     command: ["celery", "-A", "app.pipeline.celery_app.celery_app", "beat", "-l", "info"]
-    env_file: [../.env.prod]
+    env_file: [../.env.uat]   # UAT and production share one file (.env.prod.example documents it)
     depends_on:
       redis: { condition: service_healthy }
     # [REVIEW-FIX] beat has no `inspect ping` equivalent, so this checks its own schedule

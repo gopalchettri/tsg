@@ -6,6 +6,9 @@ needs (database, Redis, and Mongo when it's in use) is reachable right now.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -14,7 +17,7 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.engine import get_engine
 
-router = APIRouter()
+router = APIRouter(tags=["Health"])
 logger = get_logger(__name__)
 
 
@@ -66,12 +69,18 @@ def _check_mongo() -> bool | None:
     try:
         import pymongo  # imported here so this module doesn't require pymongo at import time
 
-        pymongo.MongoClient(
+        # `with` closes the client (and its background topology-monitor thread) on every call —
+        # without it, a probe hit every few seconds for a pod's whole lifetime leaks a fresh
+        # client's threads/sockets forever, same anti-pattern embeddings.py's own cached
+        # @lru_cache MongoClient exists specifically to avoid.
+        client: pymongo.MongoClient[dict[str, Any]]
+        with pymongo.MongoClient(
             s.mongo_url,
             serverSelectionTimeoutMS=s.mongo_connect_timeout_ms,
             connectTimeoutMS=s.mongo_connect_timeout_ms,
             socketTimeoutMS=s.mongo_connect_timeout_ms,
-        ).admin.command("ping")
+        ) as client:
+            client.admin.command("ping")
         return True
     except Exception:  # noqa: BLE001 — report not-ready; log the detail SERVER-SIDE only
         logger.exception("readyz.mongo_unreachable")
@@ -86,7 +95,15 @@ def readyz():
     internal exception detail is ever returned to the caller — each check logs its own
     failure server-side (see the `readyz.*_unreachable` events above) before this
     function reduces it to a plain ok/error/skipped label."""
-    results = {"database": _check_database(), "redis": _check_redis(), "mongo": _check_mongo()}
+    # Run concurrently, not sequentially — each check is its own blocking network round trip
+    # with its own timeout; sequential execution would block for close to the SUM of the three
+    # timeouts during a multi-dependency outage instead of the MAX, right when fast probe
+    # turnaround matters most for the orchestrator to evict the pod from rotation.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        db_f = pool.submit(_check_database)
+        redis_f = pool.submit(_check_redis)
+        mongo_f = pool.submit(_check_mongo)
+        results = {"database": db_f.result(), "redis": redis_f.result(), "mongo": mongo_f.result()}
     checks = {name: ("skipped" if ok is None else "ok" if ok else "error") for name, ok in results.items()}
     failing = [name for name, ok in results.items() if ok is False]
     if failing:

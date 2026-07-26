@@ -37,24 +37,29 @@ doesn't create duplicates; the same key with a different payload is a loud confl
 rules: no double work, no overload, no duplicates.* (`app/db/dal.py`, unique index `UX_Session_ActiveAsset`)
 
 **Step 5 — Session saved, background job queued.** The session row and a progress-tracking row per
-supporting system per stage are committed first; only then is the Celery worker told to start. The
-caller immediately gets back a session id (`202`).
+stage (one THREATS row, one SCENARIOS row, one lock row — for the asset as a whole, not one set per
+supporting system) are committed first; only then is the Celery worker told to start. The caller
+immediately gets back a session id (`202`).
 
-### Phase 2: The AI pipeline (background, per supporting system)
+### Phase 2: The AI pipeline (background, per asset)
 
-**Step 6 — Lock the supporting system.** The worker takes an exclusive lock per supporting system,
-with a 5-minute lease. *Business rules: only one worker touches a system at a time; if a worker
-dies, the lease expires and the cleanup job reclaims it; a stage that fails 5 times is declared
-poisoned and stops retrying forever.* (`app/db/dal.py::acquire_lock` / `claim_stage`)
+**Step 6 — Lock the asset.** The worker takes one exclusive lock for the whole session, with a
+5-minute lease. The asset is the single unit of work — supporting systems are context, never
+independently locked or threat-modeled. *Business rules: only one worker touches a session at a
+time; if a worker dies, the lease expires and the cleanup job reclaims it; a stage that fails 5
+times is declared poisoned and stops retrying forever.* (`app/db/dal.py::acquire_lock` /
+`claim_stage`)
 
 **Step 7 — AI proposes threats.** The AI is shown: the asset context (description, critical
-service, sector, sub-sector, data handled), the supporting system's details (name, asset type,
-accessibility channel, managed-by, hosting environment, data residency, past incidents), and the
-six STRIDE category names. Everything sent passes an allowlist (only approved fields) and a
-secret/PII redaction pass. The AI returns a list of proposed threats. *Business rules: the AI sees
-only approved, scrubbed data; its output is treated as suggestions, never as final; every AI call
-is logged word-for-word (`Prompt_Log`) for audit.* (`app/pipeline/prompts.py::threats_prompt`,
-`app/core/security.py`)
+service, sector, sub-sector, data handled), every supporting system's details (name, asset type,
+accessibility channel, managed-by, hosting environment, data residency, past incidents) sent
+together as one list, and the six STRIDE category names. Everything sent passes an allowlist (only
+approved fields) and a secret/PII redaction pass. The AI returns a list of proposed threats, each an
+impact on the asset itself (e.g. "Unauthorized disclosure of Citizen Personal Information") — the
+supporting systems are never the subject of a threat, only background for judging which impacts are
+plausible. *Business rules: the AI sees only approved, scrubbed data; its output is treated as
+suggestions, never as final; every AI call is logged word-for-word (`Prompt_Log`) for audit.*
+(`app/pipeline/prompts.py::threats_prompt`, `app/core/security.py`)
 
 **Step 8 — Each proposal is checked against the threat library ("grounding").** Category by exact
 (case-insensitive) name match; threat type and name by meaning-similarity — a local embedding model
@@ -83,17 +88,19 @@ silently fixed and never blocking. Old versions are marked superseded, never del
 rules: official terminology wins; validation flags but doesn't block; full history is preserved.*
 (`app/pipeline/tasks.py::_generate_one_scenario`, `app/pipeline/validation.py`)
 
-**Step 11 — Wait for a human.** Each supporting system lands in `AWAITING_DECISION`. When no
-system is still running and at least one is ready, the session moves to `REVIEW`. If some systems
-failed but others succeeded, the good ones still reach review (partial success is preserved); only
-if everything failed is the session cancelled. *Business rule: exactly one human decision point,
+**Step 11 — Wait for a human.** The asset's scenario stage lands in `AWAITING_DECISION`, and once it
+is no longer running the session moves to `REVIEW`. If the pass errored out partway through, any
+scenarios it already committed are still salvaged into review (partial success is preserved); only
+if nothing was produced is the session cancelled. *Business rule: exactly one human decision point,
 at the end.* (`app/pipeline/tasks.py::decide_session_outcome`)
 
 ### Phase 3: After generation
 
-**Step 12 — Human reviews and accepts.** Accept (all scenarios, or a chosen subset) marks them
-accepted and completes the session. Before completing, the system re-checks every library entry
-used is still active. Then any accepted "flagged" threats — ones not in the library — are
+**Step 12 — Human reviews and accepts.** Accept takes a required `mode` (`"all"`, `"none"`, or
+`"subset"` with 1–50 `output_ids`) — there is no default, the caller must always choose explicitly —
+and marks the selected scenarios (none, for `"none"`) accepted and completes the session. Before
+completing, the system re-checks every library entry used is still active. Then any accepted
+"flagged" threats — ones not in the library — are
 automatically promoted into the shared threat library, including their validated actors, race-safely
 (natural-key unique indexes; two concurrent accepts can't create duplicates). *Business rules: the
 library grows only through human-accepted content; accept and regenerate are mutually exclusive.*

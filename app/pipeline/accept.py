@@ -24,7 +24,8 @@ from sqlalchemy import RowMapping, Table, bindparam, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.core.enums import (
-    AuditDecision, AuditEventType, CandidateStatus, GroundingStatus, StageStatus, SubsystemLevel, WorkflowStage,
+    ActorType, AuditDecision, AuditEventType, CandidateStatus, GroundingStatus, SessionStatus, StageStatus,
+    SubsystemLevel, WorkflowStage,
 )
 from app.core.logging import get_logger
 from app.db import dal
@@ -36,7 +37,15 @@ log = get_logger(__name__)
 
 
 class AcceptConflict(Exception):
-    """Accept attempted off the REVIEW barrier or against a held lock → 409 ([R5])."""
+    """Accept attempted off the REVIEW barrier or against a held lock → 409 ([R5]).
+
+    `reason` is an optional machine-readable code (e.g. "session_completed") surfaced by the
+    HTTP handler as `details.reason` — same pattern as dal.SessionConflict's
+    `active_session_id`. Raise sites without a stable cause just omit it."""
+
+    def __init__(self, message: str, reason: str | None = None):
+        super().__init__(message)
+        self.reason = reason
 
 
 class MasterInactive(Exception):
@@ -44,7 +53,7 @@ class MasterInactive(Exception):
 
 
 def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str | None,
-                subset: list[str] | None = None) -> None:
+                subset: list[str] | None = None) -> int:
     """Run the "Accept" action for a session in one transaction: lock the session's
     subsystems, re-check the master data is still valid, mark the chosen scenarios
     accepted, promote any newly-approved threats into the shared library, and mark
@@ -84,14 +93,30 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
 
         _ensure_threat_data_still_active(sess, session_id, good_subs)
 
+        if subset is not None:
+            # One canonical (lowercase, stripped) form BEFORE both uses below: Python's set()
+            # counts case-sensitively but MSSQL's default CI collation matches OutputID
+            # case-insensitively (and ignores trailing spaces), so without normalization the
+            # same GUID sent in two casings counts as 2 requested yet matches only 1 row — a
+            # spurious 404 on a legitimate request. dal.guid() stores lowercase, so lowercase
+            # is the canonical form; this also canonicalizes what AcceptedSubsetJSON and the
+            # audit DetailJSON record.
+            # dal.canonical_guid, not .strip().lower(): case+whitespace folding alone leaves the
+            # dashless (Guid.ToString("N")), braced and urn:uuid: spellings distinct, so the SAME
+            # id sent twice in two forms inflated `requested` past the row count `matched` below
+            # → spurious 404 and a full rollback of a legitimate accept. It also canonicalizes
+            # what AcceptedSubsetJSON / the audit DetailJSON persist, so those stay joinable to
+            # the OutputIDs the API actually returns.
+            subset = [dal.canonical_guid(s) for s in subset]
         # subset=None means "accept all"
         matched = dal.mark_scenarios_accepted(sess, session_id, good_subs, subset=subset)
         if subset is not None:
             # [REVIEW-FIX] a subset id that doesn't match any row here (wrong session/
             # subsystem, already superseded, or never existed) previously no-op'd
             # silently — the session still completed as if the accept fully succeeded.
-            # set() first: AcceptBody.subset allows duplicate ids (unlike its sibling
-            # RegenerateScenariosBody.output_ids), and a repeated id can only ever
+            # set() first: output_ids permits duplicate ids at the schema layer (as does its
+            # sibling RegenerateScenariosBody.output_ids, whose duplicates are deduped
+            # downstream in cascade.get_threat_id_to_redo), and a repeated id can only ever
             # match its row once, so counting raw len(subset) would false-flag a
             # legitimate duplicate-id request as a mismatch.
             requested = len(set(subset))
@@ -123,14 +148,28 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
         if not dal.complete_session(sess, session_id):
             raise AcceptConflict(f"session {session_id} is no longer active")
 
-        # A partial accept (only some scenarios chosen) is recorded differently from a full accept.
-        decision = AuditDecision.partial if subset is not None else AuditDecision.accept
-        # Two audit rows: one that scenarios were accepted, one for the review decision itself.
-        for event in (AuditEventType.scenarios_accepted, AuditEventType.review_decision):
+        # Three-way decision, mirroring the wire-level all/none/subset choice: no subset ->
+        # full accept; an explicit empty subset -> reject (accept nothing, but the session
+        # still completes — [R8]); a populated subset -> partial.
+        if subset is None:
+            decision = AuditDecision.accept
+        elif subset:
+            decision = AuditDecision.partial
+        else:
+            decision = AuditDecision.reject
+        # review_decision always; scenarios_accepted ONLY when something actually flipped —
+        # its documented meaning (enums.py: Threat_Scenario_Output flipped Accepted=1) must
+        # stay queryable at face value, and a reject (mode="none") flips nothing, so writing
+        # it there would make audit queries for accepted-content over-report.
+        events = ((AuditEventType.review_decision,) if decision == AuditDecision.reject
+                else (AuditEventType.scenarios_accepted, AuditEventType.review_decision))
+        for event in events:
             dal.append_audit(sess, AuditID=guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
                             EntityID=str(entity_id), EventType=event, Decision=decision, ActorUserID=user_id,
                             DetailJSON=json.dumps({"subset": subset}) if subset is not None else None)
-        log.info("session.accepted", session_id=session_id, decision=str(decision), user=user_id)
+        log.info("session.accepted", session_id=session_id, decision=str(decision),
+                accepted_count=matched, user=user_id)
+        return matched
     except Exception:
         # The lock acquisitions above are already committed (see comment there); everything
         # after them — validation, mark_scenarios_accepted, the promotion loop, complete_session,
@@ -151,13 +190,43 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             log.warning("accept.lock_release_failed", session_id=session_id)
 
 
+def review_gate_reason(scenario_session: RowMapping | dict) -> tuple[str, str] | None:
+    """Why this session cannot take a review action (accept/regenerate) right now, as a
+    (machine_reason, human_message) pair — or None if it is at the REVIEW barrier.
+
+    Branches on SessionStatus FIRST — the authoritative liveness signal — because
+    CurrentStage/StageStatus are progress history: complete_session deliberately never
+    rewrites StageStatus, so a completed session still reads AWAITING_DECISION, and echoing
+    that verbatim produced a self-contradictory message ("not at REVIEW ...
+    status=AWAITING_DECISION") that misled callers into retrying a final decision. Shared by
+    the accept gate (below) and sessions.py's regenerate/next-set gate so the two can never
+    drift apart again."""
+    if (scenario_session["CurrentStage"] == WorkflowStage.REVIEW
+            and scenario_session["StageStatus"] == StageStatus.AWAITING_DECISION):
+        return None
+    status = scenario_session["SessionStatus"]
+    if status == SessionStatus.completed:
+        return ("session_completed",
+                f"session already completed at {scenario_session['CompletedAt']} — the review "
+                f"decision is final; accepted scenarios are available via "
+                f"GET /v1/assets/{scenario_session['AssetID']}/accepted-scenarios, and a new "
+                f"session for this asset can run a fresh review")
+    if status == SessionStatus.cancelled:
+        return ("session_cancelled",
+                f"session was cancelled — start a new session for asset {scenario_session['AssetID']}")
+    return ("generation_in_progress",
+            f"session not at REVIEW yet (stage={scenario_session['CurrentStage']}, "
+            f"status={scenario_session['StageStatus']}) — generation still in progress")
+
+
 def _ensure_session_ready_to_accept(scenario_session: RowMapping) -> None:
     """Accept is only allowed while the session is sitting at the REVIEW step
     waiting on a human decision; anything else means it's not ready (or already handled).
     """
-    if scenario_session["CurrentStage"] != WorkflowStage.REVIEW or scenario_session["StageStatus"] != StageStatus.AWAITING_DECISION:
-        raise AcceptConflict(
-            f"session not at REVIEW (stage={scenario_session['CurrentStage']}, status={scenario_session['StageStatus']})")
+    gate = review_gate_reason(scenario_session)
+    if gate is not None:
+        reason, message = gate
+        raise AcceptConflict(message, reason=reason)
 
 
 def _ensure_threat_data_still_active(sess: Session, session_id: str, good_subs: list[int]) -> None:
@@ -166,19 +235,23 @@ def _ensure_threat_data_still_active(sess: Session, session_id: str, good_subs: 
     block the accept (raise MasterInactive) rather than accept against stale master data.
     """
     rows = sess.execute(
-        select(m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatCatalogueID,
-            m.Identified_Threat.GroundingStatus)
+        select(m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatCatalogueID)
         .where(
             m.Identified_Threat.SessionID == session_id,
             m.Identified_Threat.Superseded == 0,
             m.Identified_Threat.SubsystemID.in_(good_subs),
         )
     ).all()
-    # Collect the referenced type ids, and the catalogue ids that are NOT still "flagged"
-    # (a flagged catalogue id hasn't been promoted to the shared library yet, so there's
-    # nothing existing to validate for it).
-    type_ids = {t for t, _, _ in rows if t is not None}
-    cat_ids = {c for _, c, s in rows if c is not None and s != GroundingStatus.flagged}
+    # Collect every referenced type id and catalogue id. A non-null ThreatCatalogueID always
+    # means grounding matched a real, pre-existing Threat_Catalogue row (find_threat_in_library
+    # only ever sets it from an actual candidate row) — that holds regardless of the threat's
+    # overall GroundingStatus, since a confidently-typed threat can still end up "flagged"
+    # purely because its NAME match scored below grounding_confirm_threshold while a real
+    # catalogue candidate existed. So every non-null id genuinely needs re-validating, the same
+    # way type_ids already is below — gating this on GroundingStatus != flagged let a since-
+    # deactivated/deleted catalogue row slip past the check for exactly that sub-case.
+    type_ids = {t for t, _ in rows if t is not None}
+    cat_ids = {c for _, c in rows if c is not None}
 
     # Check Threat_Type ids are still active; any that dropped out of the "active" set
     # since Stage 2 blocks the whole accept.
@@ -365,6 +438,11 @@ def _add_flagged_threats_to_library(sess: Session, scenario_session: RowMapping,
     # pattern tasks.py already uses for Identified_Threat), keeping this still-open
     # transaction's lock hold time from scaling with the number of promotions.
     stamp = now()  # one instant for every row in this batch, not one now() call per row
+    # Resolved ONCE, not per row: dal.audit_row falls back to a PK lookup for the accountable
+    # user when the caller names nobody, which inside this loop would be one query per promoted
+    # threat. The session row is already in hand, so answer both questions here instead.
+    actor_id = user_id or scenario_session["UserID"]
+    actor_type = ActorType.user if user_id else ActorType.system
     update_rows: list[dict] = []
     audit_rows: list[dict] = []
     candidate_rows: list[dict] = []
@@ -379,11 +457,12 @@ def _add_flagged_threats_to_library(sess: Session, scenario_session: RowMapping,
             continue  # nothing promoted, re-pointed, or newly actor-linked — no false audit trail
 
         update_rows.append({"b_tid": row["ThreatID"], "ThreatTypeID": type_id, "ThreatCatalogueID": catalogue_id})
-        audit_rows.append({"AuditID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity,
-                        "EventType": AuditEventType.library_promoted, "ActorUserID": user_id,
-                        "ThreatTypeRefID": type_id, "CreatedAt": stamp,
-                        "DetailJSON": json.dumps({"threat_id": row["ThreatID"], "catalogue_id": catalogue_id,
-                                                "sector_id": sector_id, "actors": linked_actors})})
+        audit_rows.append(dal.audit_row(
+            sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=entity,
+            EventType=AuditEventType.library_promoted, ActorUserID=actor_id, ActorType=actor_type,
+            ThreatTypeRefID=type_id, CreatedAt=stamp,
+            DetailJSON=json.dumps({"threat_id": row["ThreatID"], "catalogue_id": catalogue_id,
+                                    "sector_id": sector_id, "actors": linked_actors})))
 
         # Also record a Threat_Candidate_Review row so this promotion shows up in the
         # normal candidate-review history/audit trail, already marked as accepted.
@@ -395,9 +474,11 @@ def _add_flagged_threats_to_library(sess: Session, scenario_session: RowMapping,
             "Status": CandidateStatus.accepted, "ThreatTypeID": type_id, "ThreatCatalogueID": catalogue_id,
             "ReviewedBy": user_id, "ReviewedAt": stamp, "CreatedAt": stamp,
         })
-        audit_rows.append({"AuditID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity,
-                        "EventType": AuditEventType.candidate_reconciled, "ActorUserID": user_id, "CreatedAt": stamp,
-                        "DetailJSON": json.dumps({"candidate_id": candidate_id, "threat_id": row["ThreatID"]})})
+        audit_rows.append(dal.audit_row(
+            sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=entity,
+            EventType=AuditEventType.candidate_reconciled, ActorUserID=actor_id, ActorType=actor_type,
+            CreatedAt=stamp,
+            DetailJSON=json.dumps({"candidate_id": candidate_id, "threat_id": row["ThreatID"]})))
         log.info("threat.promoted", session_id=sid, threat_id=row["ThreatID"],
                 type_id=type_id, catalogue_id=catalogue_id, sector_id=sector_id)
 

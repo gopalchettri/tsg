@@ -49,19 +49,91 @@ def test_422_uses_error_envelope(engine, monkeypatch):
     assert body["details"]["errors"]
 
 
-def test_accept_subset_is_bounded_without_losing_empty_semantics():
-    """`subset` feeds `OutputID.in_(subset)` unchunked, so it is bounded like its siblings —
-    but [R8]'s `[]` ("accept none") vs `None` ("accept all") distinction must survive the bound."""
+def test_accept_body_mode_is_required_and_exclusive_with_output_ids():
+    """AcceptBody's `mode` is required and mutually exclusive with `output_ids`' presence —
+    accept-all/none/subset are unambiguous choices at the JSON level, replacing the old
+    `subset` null-vs-omitted-vs-empty-list overload ([R8])."""
     import pytest
     from pydantic import ValidationError
 
     from app.api.schemas import _MAX_BATCH, AcceptBody
 
-    assert AcceptBody(subset=None).subset is None
-    assert AcceptBody(subset=[]).subset == []
-    assert len(AcceptBody(subset=["o"] * _MAX_BATCH).subset) == _MAX_BATCH
-    with pytest.raises(ValidationError):
-        AcceptBody(subset=["o"] * (_MAX_BATCH + 1))
+    # a real GUID: output_ids are now canonicalized at the boundary, so a placeholder like "o"
+    # is (correctly) a 422 rather than an accepted id — see test_output_ids_are_canonicalized.
+    oid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+    assert AcceptBody(mode="all").output_ids is None
+    assert AcceptBody(mode="none").output_ids is None
+    assert AcceptBody(mode="subset", output_ids=[oid]).output_ids == [oid]
+    assert len(AcceptBody(mode="subset", output_ids=[oid] * _MAX_BATCH).output_ids) == _MAX_BATCH
+
+    with pytest.raises(ValidationError):  # mode omitted — no default, must be explicit
+        AcceptBody()
+    with pytest.raises(ValidationError, match="required"):  # subset with no ids at all
+        AcceptBody(mode="subset")
+    with pytest.raises(ValidationError, match="required"):  # subset with an explicitly empty list
+        AcceptBody(mode="subset", output_ids=[])
+    with pytest.raises(ValidationError, match="must not be provided"):  # output_ids given but mode isn't subset
+        AcceptBody(mode="all", output_ids=[oid])
+    # an EMPTY list under mode="all" is still "provided" — the error must say REMOVE the field,
+    # not "add items" (which is why the length bounds live in the model validator, not the Field:
+    # a field-level min_length would fire first and skip the context-aware message entirely)
+    with pytest.raises(ValidationError, match="must not be provided"):
+        AcceptBody(mode="all", output_ids=[])
+    with pytest.raises(ValidationError, match="at most"):  # over the batch bound
+        AcceptBody(mode="subset", output_ids=[oid] * (_MAX_BATCH + 1))
+
+
+def test_output_ids_are_canonicalized_at_the_boundary():
+    """[canonicalization] models.GUID normalizes on bind AND result, so SQL matches any spelling
+    while a PYTHON-side comparison against a DB-derived id does not — that gap produced a false
+    `regenerate_conflict` on a valid regenerate and a spurious 404 + full rollback on accept.
+    Both bodies must therefore hand downstream code exactly one spelling, and reject malformed
+    ids as a 422 here rather than letting them reach GUID.bind_processor as a 500."""
+    import pytest
+    from pydantic import ValidationError
+
+    from app.api.schemas import AcceptBody, RegenerateScenariosBody
+
+    canonical = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    spellings = [canonical.upper(), canonical.replace("-", ""), "{" + canonical + "}",
+                f"  {canonical}  ", f"urn:uuid:{canonical}"]
+
+    for raw in spellings:
+        assert AcceptBody(mode="subset", output_ids=[raw]).output_ids == [canonical], raw
+        assert RegenerateScenariosBody(output_ids=[raw]).output_ids == [canonical], raw
+
+    # the same id in two spellings must collapse — counting them as 2 distinct ids is exactly
+    # what inflated accept's `requested` past `matched` and 404'd a legitimate request
+    both = AcceptBody(mode="subset", output_ids=[canonical.upper(), canonical.replace("-", "")])
+    assert set(both.output_ids) == {canonical}
+
+    for bad in ("o", "not-a-guid", ""):
+        with pytest.raises(ValidationError, match="not a valid GUID"):
+            RegenerateScenariosBody(output_ids=[bad])
+
+
+def test_oversized_output_ids_are_rejected_without_canonicalizing_every_item():
+    """[review-fix] AcceptBody's batch bound lives in the mode="after" model validator (to keep its
+    context-aware message), which pydantic runs AFTER field validators — so an oversized body used
+    to run the per-item uuid parse to completion before the 422, burning GIL-holding CPU on the
+    event loop. The canonicalizer must short-circuit above the bound."""
+    import pytest
+    from pydantic import ValidationError
+
+    from app.api import schemas
+    from app.api.schemas import _MAX_BATCH, AcceptBody
+
+    calls = []
+    real = schemas.canonical_guid
+    schemas.canonical_guid = lambda v: calls.append(v) or real(v)
+    try:
+        oversized = ["6ba7b810-9dad-11d1-80b4-00c04fd430c8"] * (_MAX_BATCH + 1)
+        with pytest.raises(ValidationError):
+            AcceptBody(mode="subset", output_ids=oversized)
+        assert calls == []  # rejected on size alone — not one id was parsed
+    finally:
+        schemas.canonical_guid = real
 
 
 def test_500_hides_internals_in_prod(engine, monkeypatch):

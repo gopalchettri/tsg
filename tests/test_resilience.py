@@ -21,6 +21,7 @@ from app.db import dal
 from app.db import models as m
 from app.db.dal import load_session, now
 from app.pipeline.reaper import clean_up_abandoned_sessions
+from app.pipeline.tasks import ASSET_UNIT_ID
 from tests.test_slice import SUB, _force_stage, _seed_session
 
 
@@ -28,7 +29,7 @@ def _attempt_count(sess, sid) -> int:
     return sess.execute(
         select(m.Subsystem_Stage_State.AttemptCount).where(
             m.Subsystem_Stage_State.SessionID == sid,
-            m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+            m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
             m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS,
         )
     ).scalar()
@@ -44,7 +45,7 @@ def test_poison_stage_stops_after_max_attempts(db, monkeypatch):
     # leave the stage RUNNING (never reaches _record_failure). The row never
     # leaves RUNNING; each "attempt" is the mid-flight-resume branch (same task_id)
     # re-claiming and refreshing the lease — the real poison loop.
-    results = [dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, tid) for _ in range(4)]
+    results = [dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, tid) for _ in range(4)]
 
     assert results == [True, True, True, False]
     assert _attempt_count(db, sid) == 3
@@ -55,11 +56,11 @@ def test_normal_retry_within_limit_succeeds(db):
     sid = session["SessionID"]
     tid = str(uuid.uuid4())
 
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, tid) is True
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, tid) is True
     # A transient hiccup: the SAME task resumes its own mid-flight claim (still RUNNING).
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, tid) is True
-    _force_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, StageStatus.COMPLETE)
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, tid) is False  # COMPLETE, not reclaimable
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, tid) is True
+    _force_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, StageStatus.COMPLETE)
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, tid) is False  # COMPLETE, not reclaimable
 
 
 def test_attempt_count_increments_atomically(db):
@@ -68,10 +69,10 @@ def test_attempt_count_increments_atomically(db):
     for i in range(1, 4):
         db.execute(update(m.Subsystem_Stage_State)
                    .where(m.Subsystem_Stage_State.SessionID == sid,
-                          m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+                          m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
                           m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS)
                    .values(Status=StageStatus.ERROR))
-        dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, str(uuid.uuid4()))
+        dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, str(uuid.uuid4()))
         assert _attempt_count(db, sid) == i
 
 
@@ -83,13 +84,13 @@ def test_reaper_sweeps_exhausted_stage_into_error(db, monkeypatch):
     # Exhaust the one allowed attempt, leaving the row RUNNING with an expired lease —
     # exactly the state a redelivery-looping poison session ends up in once claim_stage
     # finally refuses to re-claim it (the lease stops refreshing).
-    dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, str(uuid.uuid4()))
+    dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, str(uuid.uuid4()))
     db.execute(update(m.Subsystem_Stage_State)
                .where(m.Subsystem_Stage_State.SessionID == sid,
-                      m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+                      m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
                       m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS)
                .values(LeaseExpiresAt=now().replace(year=2000)))
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, str(uuid.uuid4())) is False  # exhausted
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, str(uuid.uuid4())) is False  # exhausted
 
     cancelled = clean_up_abandoned_sessions(db)  # the EXISTING reaper sweep — no new code needed
     assert sid in cancelled
@@ -103,7 +104,7 @@ def _status(sess, sid, level) -> str:
     return sess.execute(
         select(m.Subsystem_Stage_State.Status).where(
             m.Subsystem_Stage_State.SessionID == sid,
-            m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+            m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
             m.Subsystem_Stage_State.Level == level)).scalar()
 
 
@@ -112,7 +113,7 @@ def _expire_lease(sess, sid, level) -> None:
     (a slow LLM call, a GC pause, a frozen gevent hub) leaves it."""
     sess.execute(update(m.Subsystem_Stage_State)
                  .where(m.Subsystem_Stage_State.SessionID == sid,
-                        m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+                        m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
                         m.Subsystem_Stage_State.Level == level)
                  .values(LeaseExpiresAt=now().replace(year=2000)))
 
@@ -131,18 +132,18 @@ def test_release_lock_cannot_free_a_lock_the_reaper_reassigned(db):
     writers on one subsystem. Fenced on ActiveTaskID, A's release is a no-op."""
     sid = _seed_session(db)["SessionID"]
     _park_at_review(db, sid)
-    assert dal.acquire_lock(db, sid, SUB["id"], "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is True
+    assert dal.acquire_lock(db, sid, ASSET_UNIT_ID, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is True
 
     _expire_lease(db, sid, SubsystemLevel.LOCK)
     assert clean_up_abandoned_sessions(db) == []          # real reaper; step 3 skips REVIEW
     assert _status(db, sid, SubsystemLevel.LOCK) == StageStatus.IDLE   # A's lock was taken
 
-    assert dal.acquire_lock(db, sid, SUB["id"], "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb") is True      # B is the holder now
-    assert dal.release_lock(db, sid, SUB["id"], "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is False     # zombie A's `finally`
+    assert dal.acquire_lock(db, sid, ASSET_UNIT_ID, "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb") is True      # B is the holder now
+    assert dal.release_lock(db, sid, ASSET_UNIT_ID, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is False     # zombie A's `finally`
     assert _status(db, sid, SubsystemLevel.LOCK) == StageStatus.RUNNING
-    assert dal.acquire_lock(db, sid, SUB["id"], "cccccccc-3333-4333-8333-cccccccccccc") is False     # mutex still held by B
+    assert dal.acquire_lock(db, sid, ASSET_UNIT_ID, "cccccccc-3333-4333-8333-cccccccccccc") is False     # mutex still held by B
 
-    assert dal.release_lock(db, sid, SUB["id"], "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb") is True      # only the holder frees it
+    assert dal.release_lock(db, sid, ASSET_UNIT_ID, "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb") is True      # only the holder frees it
     assert _status(db, sid, SubsystemLevel.LOCK) == StageStatus.IDLE
 
 
@@ -152,17 +153,17 @@ def test_finish_stage_refuses_a_zombie_after_a_regen_bumped_the_epoch(db):
     task (the row is no longer IDLE/ERROR) and the subsystem serves its STALE scenarios as
     if they were the regenerated ones — silently, forever."""
     sid = _seed_session(db)["SessionID"]
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is True
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.SCENARIOS, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is True
 
-    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.SCENARIOS,), 2)
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, (SubsystemLevel.SCENARIOS,), 2)
 
-    assert dal.finish_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS,
+    assert dal.finish_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.SCENARIOS,
                             StageStatus.AWAITING_DECISION, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is False
     assert _status(db, sid, SubsystemLevel.SCENARIOS) == StageStatus.IDLE  # regen row untouched
 
     # ...and the generation that actually owns the row completes normally.
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS, 2, "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb") is True
-    assert dal.finish_stage(db, sid, SUB["id"], SubsystemLevel.SCENARIOS,
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.SCENARIOS, 2, "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb") is True
+    assert dal.finish_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.SCENARIOS,
                             StageStatus.AWAITING_DECISION, 2, "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb") is True
 
 
@@ -171,13 +172,13 @@ def test_finish_stage_refuses_a_zombie_the_reaper_already_errored(db):
     overwrite the ERROR the reaper wrote when its lease lapsed."""
     sid = _seed_session(db)["SessionID"]
     _park_at_review(db, sid)
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is True
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is True
 
     _expire_lease(db, sid, SubsystemLevel.THREATS)
     clean_up_abandoned_sessions(db)                                      # step 1: RUNNING+expired → ERROR
     assert _status(db, sid, SubsystemLevel.THREATS) == StageStatus.ERROR
 
-    assert dal.finish_stage(db, sid, SUB["id"], SubsystemLevel.THREATS,
+    assert dal.finish_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS,
                             StageStatus.COMPLETE, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is False
     assert _status(db, sid, SubsystemLevel.THREATS) == StageStatus.ERROR
 
@@ -190,20 +191,20 @@ def test_renew_lease_extends_the_live_holder_and_refuses_a_zombie(db):
     session = _seed_session(db)
     sid = session["SessionID"]
     tid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, tid) is True
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, tid) is True
     before = db.execute(select(m.Subsystem_Stage_State.LeaseExpiresAt).where(
-        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
         m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS)).scalar()
 
-    assert dal.renew_lease(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, tid) is True
+    assert dal.renew_lease(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, tid) is True
     after = db.execute(select(m.Subsystem_Stage_State.LeaseExpiresAt).where(
-        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
         m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS)).scalar()
     assert after >= before  # pushed forward, not reset backward or left untouched
 
-    _force_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, StageStatus.COMPLETE)
-    assert dal.renew_lease(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, tid) is False  # not RUNNING any more
-    assert dal.renew_lease(db, sid, SUB["id"], SubsystemLevel.THREATS, 1,
+    _force_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, StageStatus.COMPLETE)
+    assert dal.renew_lease(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, tid) is False  # not RUNNING any more
+    assert dal.renew_lease(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1,
                             "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb") is False  # never held it
 
 
@@ -218,7 +219,6 @@ def test_find_threats_renews_lease_once_per_grounding_iteration(db, monkeypatch)
     from tests.test_slice import _TwoThreatLLM
 
     session = _seed_session(db)
-    sid = session["SessionID"]
     tid = str(uuid.uuid4())
     real_renew = dal.renew_lease
     calls = []
@@ -228,7 +228,7 @@ def test_find_threats_renews_lease_once_per_grounding_iteration(db, monkeypatch)
         return real_renew(sess, session_id, subsystem_id, level, epoch, task_id)
 
     monkeypatch.setattr(dal, "renew_lease", _spy)
-    threats, _ = find_threats(db, session, SUB, DEFAULT_ASSET_CONTEXT, _TwoThreatLLM(), tid)
+    threats, _ = find_threats(db, session, [SUB], DEFAULT_ASSET_CONTEXT, _TwoThreatLLM(), tid)
     assert len(threats) == 2
     # 1 renewal before the threats-prompt LLM call (_ask_ai) + 1 per proposed threat (2) = 3
     assert len(calls) == 3
@@ -245,7 +245,7 @@ def test_write_scenarios_refuses_when_lock_was_lost(db):
     session = _seed_session(db)
     sid = session["SessionID"]
     tid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
-    assert dal.acquire_lock(db, sid, SUB["id"], tid) is True
+    assert dal.acquire_lock(db, sid, ASSET_UNIT_ID, tid) is True
     db.commit()
 
     _expire_lease(db, sid, SubsystemLevel.LOCK)  # simulate the stall: lease lapses while "still working"
@@ -253,7 +253,7 @@ def test_write_scenarios_refuses_when_lock_was_lost(db):
     assert _status(db, sid, SubsystemLevel.LOCK) == StageStatus.IDLE
     assert _status(db, sid, SubsystemLevel.SCENARIOS) == StageStatus.ERROR  # reaped, not just idle
 
-    result = write_scenarios(db, session, SUB, {}, [], None, tid, require_lock=True)
+    result = write_scenarios(db, session, [SUB], {}, [], None, tid, require_lock=True)
     assert result == []
     assert _status(db, sid, SubsystemLevel.SCENARIOS) == StageStatus.ERROR  # untouched by the zombie
 
@@ -261,12 +261,12 @@ def test_write_scenarios_refuses_when_lock_was_lost(db):
 def test_finish_stage_accepts_the_live_holder(db):
     """The fence rejects zombies, not the worker that legitimately still owns the claim."""
     sid = _seed_session(db)["SessionID"]
-    assert dal.claim_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is True
-    assert dal.finish_stage(db, sid, SUB["id"], SubsystemLevel.THREATS,
+    assert dal.claim_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is True
+    assert dal.finish_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS,
                             StageStatus.COMPLETE, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is True
     assert _status(db, sid, SubsystemLevel.THREATS) == StageStatus.COMPLETE
     # A terminal row carries no lease, or the reaper's dead_lease check fires on a finished stage.
-    assert dal.finish_stage(db, sid, SUB["id"], SubsystemLevel.THREATS,
+    assert dal.finish_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS,
                             StageStatus.COMPLETE, 1, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa") is False  # not RUNNING any more
 
 
@@ -316,7 +316,7 @@ def test_early_failure_before_first_claim_commit_does_not_undo_lock_acquisition(
     from tests.conftest import StubLLM
 
     sid = _seed_session(db)["SessionID"]
-    monkeypatch.setattr(_tasks, "_announce_starting_supporting_system",
+    monkeypatch.setattr(_tasks, "_announce_generation_started",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
 
     real_release_lock = dal.release_lock

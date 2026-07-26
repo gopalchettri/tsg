@@ -20,6 +20,7 @@ from app.pipeline.accept import AcceptConflict, MasterInactive
 from app.api.admin import AdminValidationError
 from app.pipeline.embeddings import EmbeddingBusy
 from app.pipeline.llm import LLMSlotUnavailable
+from app.pipeline.threat_library_import import ThreatLibraryImportError
 
 log = get_logger(__name__)
 
@@ -54,8 +55,11 @@ async def _handle_session_conflict(_: Request, exc: SessionConflict):
 
 
 async def _handle_accept_conflict(_: Request, exc: AcceptConflict):
-    """Session accept was attempted from a state that doesn't allow it -> 409."""
-    return JSONResponse(status_code=409, content=_env("accept_conflict", str(exc)))
+    """Session accept was attempted from a state that doesn't allow it -> 409. When the raise
+    site provided a machine-readable cause (the review gate does), it rides along as
+    `details.reason` so clients can branch without parsing the prose."""
+    extra = {"reason": exc.reason} if exc.reason is not None else {}
+    return JSONResponse(status_code=409, content=_env("accept_conflict", str(exc), **extra))
 
 
 async def _handle_master_inactive(_: Request, exc: MasterInactive):
@@ -93,8 +97,11 @@ async def _handle_idempotency_conflict(_: Request, exc: IdempotencyKeyConflict):
 
 
 async def _handle_regenerate_conflict(_: Request, exc: RegenerateConflict):
-    """Regenerate was requested while the session isn't in a regenerable state -> 409."""
-    return JSONResponse(status_code=409, content=_env("regenerate_conflict", str(exc)))
+    """Regenerate was requested while the session isn't in a regenerable state -> 409. When the
+    raise site provided a machine-readable cause (the review gate does), it rides along as
+    `details.reason` so clients can branch without parsing the prose."""
+    extra = {"reason": exc.reason} if exc.reason is not None else {}
+    return JSONResponse(status_code=409, content=_env("regenerate_conflict", str(exc), **extra))
 
 
 async def _handle_cancel_conflict(_: Request, exc: CancelConflict):
@@ -110,6 +117,13 @@ async def _handle_embedding_busy(_: Request, exc: EmbeddingBusy):
 async def _handle_admin_validation_error(_: Request, exc: AdminValidationError):
     """A structurally-valid but business-rule-invalid admin embedding request -> 422."""
     return JSONResponse(status_code=422, content=_env("admin_validation_error", str(exc)))
+
+
+async def _handle_threat_library_import_error(_: Request, exc: ThreatLibraryImportError):
+    """A structurally-valid but business-rule-invalid threat-library import request
+    (unknown source, bad via_taxii combo, oversized/unparseable/mismatched file
+    content) -> 422 — one error class, one status code (see app/api/threat_library_import.py)."""
+    return JSONResponse(status_code=422, content=_env("threat_library_import_error", str(exc)))
 
 
 async def _handle_validation_error(_: Request, exc: RequestValidationError):
@@ -164,5 +178,6 @@ def register_error_handlers(app: FastAPI) -> None:
     app.exception_handler(CancelConflict)(_handle_cancel_conflict)
     app.exception_handler(EmbeddingBusy)(_handle_embedding_busy)
     app.exception_handler(AdminValidationError)(_handle_admin_validation_error)
+    app.exception_handler(ThreatLibraryImportError)(_handle_threat_library_import_error)
     app.exception_handler(RequestValidationError)(_handle_validation_error)
     app.exception_handler(Exception)(_handle_unhandled_exception)

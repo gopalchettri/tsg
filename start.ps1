@@ -9,8 +9,8 @@
     The Celery worker, Celery beat, and Uvicorn each open in a new PowerShell window so
     their logs stay separate.
 
-    Migrations are NOT auto-applied -- this only checks (read-only, `alembic current`)
-    whether the DB is behind head and points you at .\alembic_upgrade_head.ps1 if so.
+    The schema is NOT touched at startup. This project is database-first: the tables
+    come from scripts/TSG_Core.sql, run by hand against the DB (see scripts/readme.txt).
 
     Flower is intentionally not started -- it is not a TSG dependency yet (see
     pyproject.toml / ROADMAP.md "Metrics/OpenTelemetry/Flower" = Pending).
@@ -134,63 +134,18 @@ if ($SkipDocker.IsPresent) {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Migration check -- READ-ONLY. Never auto-applies (schema changes stay a
-#    deliberate, separate step -- see .\alembic_upgrade_head.ps1).
+# 2. (removed) Migration check.
+#
+# This project is database-first: scripts/TSG_Core.sql is the ONLY thing that
+# creates the baseline schema (app/db/engine.py never calls metadata.create_all,
+# and tests/test_schema_sync.py guards TSG_Core.sql against models.py). Alembic
+# was a second, parallel owner of the same schema and has been removed -- it only
+# ever produced a false "DB revision is not at expected head" warning here,
+# because the .sql scripts build the tables but not alembic's own version-tracking
+# table, which alembic then read as "nothing has ever been applied".
+#
+# Nothing replaces this step: there is no migration state left to check.
 # ---------------------------------------------------------------------------
-
-$alembic = Join-Path $ProjectRoot '.venv\Scripts\alembic.exe'
-if (Test-Path $alembic) {
-    Write-Host "Checking DB migration state..." -ForegroundColor Cyan
-    # Read-only, best-effort: this check must never abort the whole start sequence
-    # (a DB that's briefly unreachable, or a driver issue, is not a reason to skip
-    # launching the rest of the stack) -- so failures degrade to a warning.
-    try {
-        # A revision-id line in this repo's own convention is a 4+ digit/hex token
-        # (0001..0022 today). Requiring a MINIMUM length + a trailing word boundary
-        # is deliberate, not cosmetic: a bare `^[0-9a-f]+` is case-insensitive by
-        # default in PowerShell, so an alembic failure banner like "FAILED: ..."
-        # itself matches (F/A are valid hex digits) -- Select-String then returns
-        # the WHOLE line, and splitting it yields the nonsense "expected head"
-        # value "FAILED:" instead of surfacing the real failure. Reproduced live.
-        $revisionPattern = '^[0-9a-f]{4,}\b'
-
-        $current = & $alembic -c (Join-Path $ProjectRoot 'alembic.ini') current
-        # Native .exe failures do NOT trip PowerShell's try/catch via $ErrorActionPreference
-        # (that only promotes non-terminating CMDLET errors) -- $LASTEXITCODE is the one
-        # authoritative signal, so check it explicitly rather than trusting output-text
-        # pattern-matching to notice a failure that never actually threw.
-        if ($LASTEXITCODE -ne 0) { throw "alembic current exited with code ${LASTEXITCODE}: $current" }
-        $currentLine = ($current | Select-String -Pattern $revisionPattern | Select-Object -First 1)
-
-        # Compare against the migration files' OWN resolved head, not a hardcoded literal --
-        # a hand-typed expected revision here has already gone stale twice (once per new
-        # migration file added), silently printing a false warning every run once outdated.
-        $headsOutput = & $alembic -c (Join-Path $ProjectRoot 'alembic.ini') heads
-        if ($LASTEXITCODE -ne 0) { throw "alembic heads exited with code ${LASTEXITCODE}: $headsOutput" }
-        $headLines = @($headsOutput | Select-String -Pattern $revisionPattern)
-
-        if ($headLines.Count -gt 1) {
-            # A branched migration history has more than one head; picking "the first
-            # one" silently would compare against an arbitrary branch instead of
-            # flagging that the history itself needs a human to resolve it.
-            Write-Warning "  Multiple migration heads detected ($($headLines.Count)) -- branched history, cannot determine a single expected head."
-            Write-Warning "  Run '.\.venv\Scripts\alembic heads' by hand to resolve."
-        } else {
-            $expectedHead = if ($headLines.Count -eq 1) { ($headLines[0].ToString() -split '\s+')[0] } else { $null }
-            if ($currentLine -and $expectedHead -and $currentLine.ToString().StartsWith($expectedHead)) {
-                Write-Host "  DB is at head ($expectedHead)." -ForegroundColor Green
-            } else {
-                Write-Warning "  DB revision is not at expected head ($expectedHead). Output: $current"
-                Write-Warning "  Run .\alembic_upgrade_head.ps1 before relying on the new code paths."
-            }
-        }
-    } catch {
-        Write-Warning "  Could not check migration state: $($_.Exception.Message)"
-        Write-Warning "  Continuing anyway -- run '.\.venv\Scripts\alembic current' by hand to check the DB."
-    }
-} else {
-    Write-Warning "alembic.exe not found in .venv -- skipping migration check."
-}
 
 # ---------------------------------------------------------------------------
 # Port pre-flight: free the uvicorn port if a previous run left it bound.
@@ -315,7 +270,13 @@ function Test-CeleryWorkerReady {
     }
 }
 
-$workerWaitSeconds = 60
+# 60s was too short and reported a false "NOT READY" against a perfectly healthy
+# worker, reproduced live: a cold boot here loads the gevent monkey-patch, pyodbc,
+# and the two LOCAL model paths in .env (multilingual-e5-large + bge-reranker-v2-m3),
+# which routinely runs past a minute. The probe is also expensive in its own right --
+# each call spawns a fresh celery.exe that re-imports the whole app tree (measured:
+# ~7s per attempt), so a 60s budget only ever bought ~7 attempts.
+$workerWaitSeconds = 180
 Write-Host "Waiting up to ${workerWaitSeconds}s for celery worker to register on the broker..." -ForegroundColor Cyan
 $workerReady = $false
 $started = Get-Date
@@ -327,11 +288,14 @@ while ((Get-Date) -lt $deadline) {
         Write-Host "Celery worker is ready (registered on broker after ${elapsed}s)." -ForegroundColor Green
         break
     }
-    Start-Sleep -Seconds 1
+    # ponytail: no Start-Sleep -- the ~7s cold import inside Test-CeleryWorkerReady
+    # already paces this loop; an extra second per iteration only bought fewer attempts.
 }
 if (-not $workerReady) {
-    Write-Warning "Celery worker did not respond to 'inspect ping' within ${workerWaitSeconds}s."
-    Write-Warning "Check the 'tsg-celery' window for the underlying error - common causes:"
+    Write-Warning "Celery worker not ready after ${workerWaitSeconds}s -- it may still be loading local models, or it may have failed."
+    Write-Warning "Confirm by hand before assuming failure:"
+    Write-Warning "  .\.venv\Scripts\celery -A app.pipeline.celery_app.celery_app inspect ping -t 5"
+    Write-Warning "If that still doesn't pong, check the 'tsg-celery' window - common causes:"
     Write-Warning "  - Database unreachable (TSG_DB_DSN in .env)"
     Write-Warning "  - Redis broker URL wrong - confirm TSG_REDIS_URL in .env"
     Write-Warning "  - Module import error in app/pipeline/celery_worker.py or celery_app.py"

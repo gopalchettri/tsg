@@ -23,7 +23,7 @@ app/db       engine, models (Core mirror of TSG), dal (isolation + CAS), invaria
 app/pipeline context, llm (litellm adapter), grounding (§8.4), scoping, tasks, accept, reaper
 app/api      deps (authz), sessions (routes), errors
 app/sse      bus (Redis pub/sub, [R4])
-migrations   Alembic: baseline-stamp then M1,M3–M8 + M2 (0010)
+scripts      TSG_Core.sql + Threat_library.sql + Control_library.sql (+ their Seed_to_*) — the schema (database-first, no migration tool)
 tests        M1 acceptance subset (runs on SQLite)
 ```
 
@@ -32,9 +32,13 @@ tests        M1 acceptance subset (runs on SQLite)
 python -m venv .venv && ./.venv/Scripts/pip install -e ".[dev]"
 docker compose -f docker/compose.yml up -d          # mssql, redis, mongo, litellm
 
-# database-first: mark the existing schema as baseline, then apply the slice guards
-alembic stamp 0001
-alembic upgrade head                                 # M1,M3,M4,M5,M6,M7,M8,M2
+# database-first: the schema comes from scripts/, not from a migration tool.
+# Run once against the target DB (safe to re-run — every CREATE TABLE is guarded):
+sqlcmd -S <server> -d <database> -i scripts/TSG_Core.sql
+sqlcmd -S <server> -d <database> -i scripts/Threat_library.sql
+sqlcmd -S <server> -d <database> -i scripts/Seed_to_Threat_library.sql
+sqlcmd -S <server> -d <database> -i scripts/Control_library.sql          # Step-4 control mapping
+sqlcmd -S <server> -d <database> -i scripts/Seed_to_Control_library.sql  # 30 standards, 1288 controls
 
 uvicorn app.main:app                                 # API (runs INV checks at boot)
 celery -A app.pipeline.celery_worker.celery_app worker -P gevent -l info

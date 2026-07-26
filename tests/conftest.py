@@ -21,7 +21,7 @@ class StubLLM:
 
     def chat(self, messages, *, model=None, temperature=None):
         sysc = messages[0]["content"].lower()
-        if "stride threats" in sysc:
+        if "json array" in sysc:
             out = [{"category": "Tampering", "type": "Firmware Tampering",
                     "name": "Bootloader implant", "actors": ["Hacker", "Nation-state"]}]
         else:
@@ -89,9 +89,16 @@ def _create_schema_and_seed(engine) -> None:
         c.execute(text('CREATE UNIQUE INDEX "UX_Scenario_ActiveIdentity" ON "Threat_Scenario_Output"(SessionID, IdentityHash) WHERE Superseded = 0'))
         c.execute(text('CREATE UNIQUE INDEX "UX_Session_IdempotencyKey" ON "Scenario_Session"(EntityID, IdempotencyKey) WHERE IdempotencyKey IS NOT NULL'))
         # M2 — master-library natural-key UNIQUE (safe concurrent promotion, no duplicate masters).
-        c.execute(text('CREATE UNIQUE INDEX "UX_ThreatType_NaturalKey" ON "Threat_Type"(ThreatTypeName, ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0'))
-        c.execute(text('CREATE UNIQUE INDEX "UX_ThreatCatalogue_NaturalKey" ON "Threat_Catalogue"(ThreatTypeID, ThreatName, SectorID) WHERE IsActive = 1 AND IsDeleted = 0'))
+        # COALESCE makes SQLite match MSSQL's unique-index NULL semantics (MSSQL treats
+        # NULL == NULL, SQLite treats NULLs as distinct) — without it, NULL-sector
+        # upserts (threat-library import, R10 promotion) silently duplicate under test
+        # while prod correctly rejects them.
+        c.execute(text('CREATE UNIQUE INDEX "UX_ThreatType_NaturalKey" ON "Threat_Type"(ThreatTypeName, COALESCE(ThreatCategoryID, -1), COALESCE(SectorID, -1)) WHERE IsActive = 1 AND IsDeleted = 0'))
+        c.execute(text('CREATE UNIQUE INDEX "UX_ThreatCatalogue_NaturalKey" ON "Threat_Catalogue"(ThreatTypeID, ThreatName, COALESCE(SectorID, -1)) WHERE IsActive = 1 AND IsDeleted = 0'))
         c.execute(text('CREATE UNIQUE INDEX "UX_ThreatActor_NaturalKey" ON "Threat_Actor"(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0'))
+        # Scoping-rule natural key (migration 0027) — makes dal.upsert_threat_rule's
+        # IntegrityError-on-duplicate path real under test, not vacuous.
+        c.execute(text('CREATE UNIQUE INDEX "UX_ConfigThreatRule_NaturalKey" ON "Config_Threat_Rule"(ThreatTypeID, RuleType, RuleKey, RuleValue) WHERE IsActive = 1 AND IsDeleted = 0'))
         # Context: entity 5 owns asset 100/200 with supporting system 1019.
         c.execute(insert(m.onboarding_services).values(id=500, name="Design Service"))
         # No group_id on the asset — the live ctm_scan_entity has no such column. Entity

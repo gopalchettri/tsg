@@ -90,7 +90,7 @@ def test_live_chat_proposes_parseable_threats():
     """Real model + our parser agree: threats_prompt -> chat() -> parse_json yields a non-empty
     list of well-formed {category, type, name, actors} threats."""
     llm = get_llm()
-    messages = prompts.threats_prompt(_ASSET_NAME, _ASSET_CONTEXT, _SUBSYSTEM, max_threats=6)
+    messages = prompts.threats_prompt(_ASSET_NAME, _ASSET_CONTEXT, [_SUBSYSTEM], max_threats=6)
     # No temperature override: some deployments (e.g. gpt-5 on Azure) only accept temperature=1,
     # and this test verifies parseability, not temperature handling — let the provider default.
     text, prov = llm.chat(messages)
@@ -121,7 +121,7 @@ def test_live_coverage_aware_returns_new_threats():
 
     llm = get_llm()
     messages = prompts.threats_prompt(
-        _ASSET_NAME, _ASSET_CONTEXT, _SUBSYSTEM, max_threats=6, exclude=already_covered)
+        _ASSET_NAME, _ASSET_CONTEXT, [_SUBSYSTEM], max_threats=6, exclude=already_covered)
     # Provider-default temperature (see test_live_chat_proposes_parseable_threats).
     text, _ = llm.chat(messages)
     threats = validation.parse_json(text, stage="threats", expected_type=list)
@@ -148,7 +148,8 @@ def test_live_scenario_generation_validates():
     threat_name = "SQL Injection"
 
     llm = get_llm()
-    messages = prompts.scenario_prompt(_ASSET_NAME, _ASSET_CONTEXT, _SUBSYSTEM, threat_type, threat_name)
+    base_ctx = prompts.build_base_context(_ASSET_NAME, _ASSET_CONTEXT, [_SUBSYSTEM])
+    messages = prompts.scenario_prompt(base_ctx, threat_type, threat_name)
     text, _ = llm.chat(messages)
     scenario = validation.parse_json(text, stage="scenario", expected_type=dict)
 

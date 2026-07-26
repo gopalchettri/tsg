@@ -18,7 +18,7 @@ from app.db.dal import load_session
 from app.pipeline import cascade, prompts
 from app.pipeline.accept import accept_session
 from app.pipeline.reaper import clean_up_abandoned_sessions
-from app.pipeline.tasks import _process_all_supporting_systems, decide_session_outcome, find_threats
+from app.pipeline.tasks import ASSET_UNIT_ID, _process_all_supporting_systems, decide_session_outcome, find_threats
 from tests.conftest import DEFAULT_ASSET_CONTEXT, StubLLM, make_client, session_body
 from tests.test_slice import MAX_THREATS, SUB, _TwoThreatLLM, _active_count, _force_stage, _seed_session
 
@@ -32,7 +32,7 @@ class _ManyThreatLLM(StubLLM):
         self.proposals = proposals
 
     def chat(self, messages, *, model=None, temperature=None):
-        if "stride threats" in messages[0]["content"].lower():
+        if "json array" in messages[0]["content"].lower():
             from app.pipeline.llm import Provenance
             return json.dumps(self.proposals), Provenance(model="stub")
         return super().chat(messages, model=model)
@@ -48,7 +48,7 @@ class _ScriptedThreatLLM(StubLLM):
         self.threat_calls = 0
 
     def chat(self, messages, *, model=None, temperature=None):
-        if "stride threats" in messages[0]["content"].lower():
+        if "json array" in messages[0]["content"].lower():
             from app.pipeline.llm import Provenance
             batch = self._batches[min(self.threat_calls, len(self._batches) - 1)]
             self.threat_calls += 1
@@ -83,10 +83,10 @@ def _next_set(db, session, llm, task_id):
     db.execute(update(m.Scenario_Session).where(m.Scenario_Session.SessionID == sid)
             .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING,
                     UpdatedAt=dal.now()))
-    epoch = dal.next_epoch(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS)
-    dal.reset_stage_for_regen(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS, epoch)
-    threats_epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.THREATS,))
-    return cascade.run_next_set(db, session, SUB["id"], epoch, threats_epoch, llm, task_id)
+    epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS)
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS, epoch)
+    threats_epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, (SubsystemLevel.THREATS,))
+    return cascade.run_next_set(db, session, ASSET_UNIT_ID, epoch, threats_epoch, llm, task_id)
 
 
 # --- accumulation: 5 → 10 → 15, unique, earlier batches stay active -----------
@@ -154,9 +154,9 @@ def test_additive_find_threats_leaves_prior_rows_active(db):
     scoped_before = _active_count(db, m.Scoped_Threat)
     scen_before = len(_active_scenarios(db, sid))
 
-    epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.THREATS,))
-    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.THREATS,), epoch)
-    find_threats(db, session, SUB, DEFAULT_ASSET_CONTEXT, _ManyThreatLLM(_threats(3, start=99)),
+    epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, (SubsystemLevel.THREATS,))
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, (SubsystemLevel.THREATS,), epoch)
+    find_threats(db, session, [SUB], DEFAULT_ASSET_CONTEXT, _ManyThreatLLM(_threats(3, start=99)),
                 "55555555-5555-4555-8555-555555555551", epoch=epoch, supersede=False)
     db.commit()
 
@@ -170,13 +170,13 @@ def test_additive_find_threats_leaves_prior_rows_active(db):
 
 # --- coverage-aware prompt: exclusion threaded in, base prompt unchanged -------
 def test_threats_prompt_coverage_exclusions_included_and_base_unchanged():
-    covered = prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, SUB, MAX_THREATS,
+    covered = prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, [SUB], MAX_THREATS,
                                     exclude=["Bootloader implant", "OTA poisoning"])[0]["content"]
     assert "Bootloader implant" in covered and "OTA poisoning" in covered
     assert "ALREADY-COVERED" in covered
-    base = prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, SUB, MAX_THREATS)[0]["content"]
+    base = prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, [SUB], MAX_THREATS)[0]["content"]
     assert "ALREADY-COVERED" not in base                     # base prompt unchanged without an exclusion list
-    assert base == prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, SUB, MAX_THREATS,
+    assert base == prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, [SUB], MAX_THREATS,
                                         exclude=[])[0]["content"]  # empty list == no exclusion
 
 
@@ -216,7 +216,7 @@ def test_next_set_endpoint_accumulates(engine, monkeypatch):
     client = make_client({"5"})
     sid = client.post("/v1/sessions", json=session_body(100)).json()["session_id"]
 
-    r = client.post(f"/v1/sessions/{sid}/scenarios/next-set", json={"supporting_system_id": SUB["id"]})
+    r = client.post(f"/v1/sessions/{sid}/scenarios/next-set", json={"supporting_system_id": ASSET_UNIT_ID})
     assert r.status_code == 202
     assert r.json()["status"] == "generating"
     with db_session() as s:
@@ -240,7 +240,7 @@ class _ParseFailAdditiveLLM(StubLLM):
         self.threat_calls = 0
 
     def chat(self, messages, *, model=None, temperature=None):
-        if "stride threats" in messages[0]["content"].lower():
+        if "json array" in messages[0]["content"].lower():
             from app.pipeline.llm import Provenance
             self.threat_calls += 1
             if self.threat_calls == 1:
@@ -267,7 +267,7 @@ def test_next_set_additive_find_threats_failure_reenters_review_not_cancelled(db
     assert row["SessionStatus"] == SessionStatus.active
     # the THREATS row was driven TERMINAL (COMPLETE), never left RUNNING (which would wedge)
     threats_status = db.execute(select(m.Subsystem_Stage_State.Status).where(
-        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
         m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS)).scalar()
     assert threats_status == StageStatus.COMPLETE
 
@@ -287,14 +287,14 @@ def test_next_set_redelivery_runs_additive_find_threats_once(db):
     db.execute(update(m.Scenario_Session).where(m.Scenario_Session.SessionID == sid)
             .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING,
                     UpdatedAt=dal.now()))
-    scen_epoch = dal.next_epoch(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS)
-    dal.reset_stage_for_regen(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS, scen_epoch)
-    threats_epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.THREATS,))
+    scen_epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS)
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS, scen_epoch)
+    threats_epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, (SubsystemLevel.THREATS,))
 
     # First (partial) delivery: only the additive find_threats runs at the reserved epoch, adding 3
     # new threats, then the worker "crashes" before write_scenarios (SCENARIOS still IDLE@scen_epoch).
-    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.THREATS,), threats_epoch)
-    find_threats(db, session, SUB, DEFAULT_ASSET_CONTEXT, llm, "deadbeef-0000-4000-8000-000000000000",
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, (SubsystemLevel.THREATS,), threats_epoch)
+    find_threats(db, session, [SUB], DEFAULT_ASSET_CONTEXT, llm, "deadbeef-0000-4000-8000-000000000000",
                 epoch=threats_epoch, supersede=False)
     db.commit()
     assert llm.threat_calls == 2
@@ -303,7 +303,7 @@ def test_next_set_redelivery_runs_additive_find_threats_once(db):
     # Redelivery at the SAME reserved epochs with the pool still < 5: THREATS is COMPLETE@threats_
     # epoch, so the additive find_threats must be SKIPPED — no 2nd AI call, no 2nd Identified_Threat
     # batch (without the guard, the 3rd scripted batch would fire and add 3 more threats).
-    cascade.run_next_set(db, session, SUB["id"], scen_epoch, threats_epoch, llm,
+    cascade.run_next_set(db, session, ASSET_UNIT_ID, scen_epoch, threats_epoch, llm,
                         "deadbeef-0000-4000-8000-000000000000")
     assert llm.threat_calls == 2                            # find_threats did NOT run again
     assert _active_identified(db, sid) == it_after_first    # no second Identified_Threat batch
@@ -327,7 +327,7 @@ def test_next_unserved_excludes_full_run_tech_gate_rejected(db):
     assert len(_active_scenarios(db, sid)) == 1        # only the type-11 scenario
     # the gated type-10 threat has a Selected=0 scoped row but no scenario — it must NOT be re-served
     # (a beyond-top-N Selected=0 threat stays servable — see test_next_set_drains_pool_then_generates_fresh)
-    assert dal.next_unserved_unique_threats(db, sid, SUB["id"], 5) == []
+    assert dal.next_unserved_unique_threats(db, sid, ASSET_UNIT_ID, 5) == []
 
 
 # --- FIX 3 Part 2: a FRESH mid-next-set tech_gate rejection is marked and not re-picked ---------
@@ -354,7 +354,7 @@ def test_next_set_fresh_tech_gate_target_marked_and_not_repicked(db):
         m.Scoped_Threat.Superseded == 0)).scalars())
     assert type10_ids and type10_ids <= sel0_ids       # marker persisted for the fresh gated threat
     # ... and Part 1's filter means it is never re-served on a repeat click
-    assert dal.next_unserved_unique_threats(db, sid, SUB["id"], 5) == []
+    assert dal.next_unserved_unique_threats(db, sid, ASSET_UNIT_ID, 5) == []
 
 
 # --- FIX 4: a single-subsystem next-set failure with salvageable scenarios goes to REVIEW -------
@@ -369,11 +369,11 @@ def test_reaper_salvages_single_subsystem_next_set_failure_to_review(db):
     db.execute(update(m.Scenario_Session).where(m.Scenario_Session.SessionID == sid)
             .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING,
                     UpdatedAt=dal.now()))
-    scen_epoch = dal.next_epoch(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS)
-    dal.reset_stage_for_regen(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS, scen_epoch)
+    scen_epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS)
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS, scen_epoch)
     db.execute(update(m.Subsystem_Stage_State)
             .where(m.Subsystem_Stage_State.SessionID == sid,
-                m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+                m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
                 m.Subsystem_Stage_State.Level.in_([SubsystemLevel.SCENARIOS, SubsystemLevel.LOCK]))
             .values(Status=StageStatus.RUNNING, ActiveTaskID="deadbeef-0000-4000-8000-000000000009",
                     LeaseExpiresAt=dal.now().replace(year=2000)))
@@ -390,7 +390,7 @@ def test_first_run_error_with_zero_scenarios_still_cancels(db):
     session = _seed_session(db)                          # fresh session, no scenarios committed
     sid = session["SessionID"]
     for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS):
-        _force_stage(db, sid, SUB["id"], level, StageStatus.ERROR)
+        _force_stage(db, sid, ASSET_UNIT_ID, level, StageStatus.ERROR)
     assert decide_session_outcome(db, session) == "cancelled"   # nothing to salvage → still cancels
     assert load_session(db, sid)["SessionStatus"] == SessionStatus.cancelled
 
@@ -412,13 +412,13 @@ def test_next_set_repeat_clicks_do_not_grow_identified_threats(db):
 # =============================================================================
 def _scen_status(sess, sid):
     return sess.execute(select(m.Subsystem_Stage_State.Status).where(
-        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
         m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS)).scalar()
 
 
 def _threats_epoch(sess, sid):
     return sess.execute(select(m.Subsystem_Stage_State.GenerationEpoch).where(
-        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
         m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS)).scalar()
 
 
@@ -439,7 +439,7 @@ def test_accept_after_salvage_marks_scenarios_accepted(db):
             .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING,
                     UpdatedAt=dal.now()))
     for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS):
-        _force_stage(db, sid, SUB["id"], level, StageStatus.ERROR, error="boom")
+        _force_stage(db, sid, ASSET_UNIT_ID, level, StageStatus.ERROR, error="boom")
     db.commit()
 
     assert decide_session_outcome(db, dict(load_session(db, sid))) == "review"
@@ -459,10 +459,10 @@ def test_reset_stage_for_regen_never_moves_epoch_backward(db):
     (mirrors claim_stage/finish_stage epoch fencing)."""
     session = _first_run(db, _ManyThreatLLM(_threats(5)))
     sid = session["SessionID"]
-    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.THREATS,), 9)   # forward: applies
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, (SubsystemLevel.THREATS,), 9)   # forward: applies
     db.commit()
     assert _threats_epoch(db, sid) == 9
-    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.THREATS,), 4)   # backward: no-op
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, (SubsystemLevel.THREATS,), 4)   # backward: no-op
     db.commit()
     assert _threats_epoch(db, sid) == 9                                           # NOT moved back to 4
 
@@ -480,8 +480,8 @@ def test_next_set_stale_redelivery_behind_live_epoch_no_downgrade(db):
 
     e0 = _threats_epoch(db, sid)
     # THREATS has since advanced two generations past e0 and settled COMPLETE (a later next-set ran).
-    dal.reset_stage_for_regen(db, sid, SUB["id"], (SubsystemLevel.THREATS,), e0 + 2)
-    _force_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, StageStatus.COMPLETE)
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, (SubsystemLevel.THREATS,), e0 + 2)
+    _force_stage(db, sid, ASSET_UNIT_ID, SubsystemLevel.THREATS, StageStatus.COMPLETE)
     db.commit()
 
     # A stale redelivery carrying threats_epoch = e0+1 (behind live e0+2); reserve+reset a fresh
@@ -489,17 +489,17 @@ def test_next_set_stale_redelivery_behind_live_epoch_no_downgrade(db):
     db.execute(update(m.Scenario_Session).where(m.Scenario_Session.SessionID == sid)
             .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING,
                     UpdatedAt=dal.now()))
-    scen_epoch = dal.next_epoch(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS)
-    dal.reset_stage_for_regen(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS, scen_epoch)
+    scen_epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS)
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS, scen_epoch)
     db.commit()
 
-    cascade.run_next_set(db, session, SUB["id"], scen_epoch, e0 + 1, llm,
+    cascade.run_next_set(db, session, ASSET_UNIT_ID, scen_epoch, e0 + 1, llm,
                         "deadbeef-0000-4000-8000-00000000000b")
 
     assert llm.threat_calls == 1                          # additive find_threats did NOT re-run
     assert _threats_epoch(db, sid) == e0 + 2              # THREATS not downgraded to e0+1
     assert db.execute(select(m.Subsystem_Stage_State.Status).where(
-        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == SUB["id"],
+        m.Subsystem_Stage_State.SessionID == sid, m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
         m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS)).scalar() == StageStatus.COMPLETE
 
 
@@ -525,7 +525,7 @@ def test_next_set_pool_zombie_rescored_out_is_superseded_and_not_reserved(db):
         m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.ScopedThreatID == sc10)
         .values(Superseded=1))
     db.commit()
-    assert t10 in dal.next_unserved_unique_threats(db, sid, SUB["id"], 5)   # zombie is servable
+    assert t10 in dal.next_unserved_unique_threats(db, sid, ASSET_UNIT_ID, 5)   # zombie is servable
 
     _seed_tech_gate_rule(db)                              # mid-session: type-10 now permanently gated
     outcome = _next_set(db, session, _TwoThreatLLM(), "fcfcfcfc-0000-4000-8000-00000000000c")
@@ -539,7 +539,7 @@ def test_next_set_pool_zombie_rescored_out_is_superseded_and_not_reserved(db):
         m.Scoped_Threat.SessionID == sid, m.Scoped_Threat.ThreatID == t10,
         m.Scoped_Threat.Selected == 0, m.Scoped_Threat.Superseded == 0)).scalar()
     assert marker is not None and "tech_gate" in marker
-    assert dal.next_unserved_unique_threats(db, sid, SUB["id"], 5) == []   # never re-served
+    assert dal.next_unserved_unique_threats(db, sid, ASSET_UNIT_ID, 5) == []   # never re-served
 
 
 # --- FIX D: a redelivery of an already-landed next-set is benign, not a spurious error -----------
@@ -558,17 +558,17 @@ def test_next_set_redelivery_after_success_no_error(db, monkeypatch):
     db.execute(update(m.Scenario_Session).where(m.Scenario_Session.SessionID == sid)
             .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING,
                     UpdatedAt=dal.now()))
-    scen_epoch = dal.next_epoch(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS)
-    dal.reset_stage_for_regen(db, sid, SUB["id"], cascade.NEXT_SET_LEVELS, scen_epoch)
-    threats_epoch = dal.next_epoch(db, sid, SUB["id"], (SubsystemLevel.THREATS,))
+    scen_epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS)
+    dal.reset_stage_for_regen(db, sid, ASSET_UNIT_ID, cascade.NEXT_SET_LEVELS, scen_epoch)
+    threats_epoch = dal.next_epoch(db, sid, ASSET_UNIT_ID, (SubsystemLevel.THREATS,))
     db.commit()
     task_id = "deadbeef-0000-4000-8000-00000000000d"
-    cascade.run_next_set(db, session, SUB["id"], scen_epoch, threats_epoch, llm, task_id)
+    cascade.run_next_set(db, session, ASSET_UNIT_ID, scen_epoch, threats_epoch, llm, task_id)
     assert len(_active_scenarios(db, sid)) == 10
     published.clear()
 
     # Redelivery at the SAME epochs + task_id: SCENARIOS is already AWAITING_DECISION@scen_epoch.
-    outcome = cascade.run_next_set(db, session, SUB["id"], scen_epoch, threats_epoch, llm, task_id)
+    outcome = cascade.run_next_set(db, session, ASSET_UNIT_ID, scen_epoch, threats_epoch, llm, task_id)
 
     assert outcome != "error"
     assert not any(str(e.get("type")) == "error" for e in published)   # NO spurious error SSE

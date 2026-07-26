@@ -12,17 +12,17 @@ redis>=5.0
 gevent>=24.2
 sqlalchemy>=2.0
 pyodbc>=5.1
-alembic>=1.13
 pydantic>=2.7
 pydantic-settings>=2.3
 pyjwt[crypto]>=2.8
 litellm>=1.40
 pymongo>=4.7
 structlog>=24.1
-sentence-transformers>=3.0
+taxii2-client>=2.3
+sentence-transformers>=5.0   # 5.x for get_embedding_dimension() — see local_models.py::_embedder
 
 # Optional extras (pyproject.toml's [project.optional-dependencies]) — install
 # with `pip install -e ".[dev]"` / ".[local]"` / ".[prod]"`, not via this file:
 #   dev:   pytest>=8.2, httpx>=0.27, ruff>=0.15, mypy>=1.11
-#   local: sentence-transformers>=3.0   (local embedding/reranker provider)
+#   local: sentence-transformers>=5.0   (local embedding/reranker provider)
 #   prod:  gunicorn>=22.0               (production process manager for the API)

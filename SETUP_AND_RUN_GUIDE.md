@@ -68,7 +68,7 @@ The image includes the ODBC Driver 17 (for SQL Server), gunicorn, and runs as a 
 Copy the template and fill in **real** values:
 
 ```bash
-cp .env.prod.example .env.prod   # Windows: Copy-Item .env.prod.example .env.prod
+cp .env.prod.example .env.uat   # Windows: Copy-Item .env.prod.example .env.uat
 ```
 
 Key settings to set (see the file for the full list):
@@ -100,8 +100,9 @@ Key settings to set (see the file for the full list):
 Run the migrations using the image (so the exact app version applies them):
 
 ```bash
-docker run --rm --env-file .env.prod tsg:latest alembic stamp 0001
-docker run --rm --env-file .env.prod tsg:latest alembic upgrade head
+# Database-first: the schema is stood up from scripts/*.sql, not a migration tool.
+# Run against the target DB from any machine with sqlcmd (safe to re-run):
+sqlcmd -S <server> -d <database> -i scripts/TSG_Core.sql
 ```
 
 Then, once, in SQL Server: `ALTER DATABASE TSG SET READ_COMMITTED_SNAPSHOT ON;`
@@ -116,7 +117,7 @@ Then, once, in SQL Server: `ALTER DATABASE TSG SET READ_COMMITTED_SNAPSHOT ON;`
 **Option A — Docker Compose (single host):**
 
 ```bash
-docker compose -f docker/compose.prod.yml --env-file .env.prod up -d
+docker compose -f docker/compose.prod.yml --env-file .env.uat up -d
 ```
 
 This starts **api** (gunicorn + 4 uvicorn workers), **worker** (Celery, gevent, 50 slots),
@@ -257,7 +258,7 @@ tokens, real database, real models.
 ## 11. Stop / roll back
 
 ```bash
-docker compose -f docker/compose.prod.yml --env-file .env.prod down
+docker compose -f docker/compose.prod.yml --env-file .env.uat down
 ```
 
 OpenShift: scale the Deployments to 0, or roll back to the previous image tag.
@@ -286,10 +287,9 @@ these hardening items (Milestones 2–4 in the plan):
 
 ```bash
 docker build -t tsg:latest .
-cp .env.prod.example .env.prod                                   # then fill in real values
-docker run --rm --env-file .env.prod tsg:latest alembic stamp 0001
-docker run --rm --env-file .env.prod tsg:latest alembic upgrade head
-docker compose -f docker/compose.prod.yml --env-file .env.prod up -d
+cp .env.prod.example .env.uat                                   # then fill in real values
+sqlcmd -S <server> -d <database> -i scripts/TSG_Core.sql          # schema, database-first
+docker compose -f docker/compose.prod.yml --env-file .env.uat up -d
 curl http://YOUR_HOST:8000/readyz                                # ready?
 TOKEN=... (Section 7)                                            # real JWT with entities claim
 # create → events → status → results → accept (Section 8)

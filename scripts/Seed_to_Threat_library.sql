@@ -2331,12 +2331,14 @@ IF NOT EXISTS (SELECT 1 FROM ThreatType_ThreatActor_Map m JOIN Threat_Type tt ON
 
 -- 7. Config_Threat_Rule (asset_type gate) -- only for the 21 asset-type-PURE Threat Types
 -- Skipped (mixed IT/OT, see header): AI Abuse, Credential Abuse, Malware/Ransomware, Service Disruption, Social Engineering, Supply Chain Compromise
--- ThreatRuleID is NOT IDENTITY (Threat_library.sql's own CREATE TABLE),
--- every INSERT must supply it explicitly. Threat_library.sql is a hard
--- prerequisite for this table's existence (nothing else creates it) but is now
--- schema-only (its own former 12-row legacy seed was removed -- see that script's
--- header for why), so this section is the table's only real seed data and can start
--- cleanly at 1.
+-- ThreatRuleID is IDENTITY(22,1) since the auto-import feature (Threat_library.sql's
+-- CREATE TABLE / migration 0027) -- these hand-curated rows keep their historical
+-- explicit ids 1-21, which now requires IDENTITY_INSERT for the duration of this
+-- section. Threat_library.sql is a hard prerequisite for this table's existence
+-- (nothing else creates it) but is schema-only (its own former 12-row legacy seed
+-- was removed -- see that script's header for why), so this section is the table's
+-- only hand-seeded data; auto-written rows (CreatedBy LIKE 'auto:%') start at 22.
+SET IDENTITY_INSERT Config_Threat_Rule ON;
 IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Cloud/IIoT Abuse' AND r.RuleKey = N'asset_type')
     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
     VALUES (1, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Cloud/IIoT Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
@@ -2400,6 +2402,7 @@ IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.Threa
 IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Wireless/Comms Abuse' AND r.RuleKey = N'asset_type')
     INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
     VALUES (21, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Wireless/Comms Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
+SET IDENTITY_INSERT Config_Threat_Rule OFF;
 
 -- Verify
 SELECT (SELECT COUNT(*) FROM Threat_Category) AS categories, (SELECT COUNT(*) FROM Threat_Type WHERE Source = N'functional_team_excel') AS types,

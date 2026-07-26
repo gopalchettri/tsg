@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Path, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import exists, select, update
 from sqlalchemy.engine import CursorResult
@@ -17,10 +17,11 @@ from sqlalchemy.orm import Session
 from app.api.deps import Principal, get_principal
 from app.api.schemas import (
     AcceptBody, AcceptedScenario, AcceptedScenariosResponse, AcceptResponse, CancelResponse, CreateSessionBody,
-    CreateSessionResponse, NextSetBody, RegenerateResponse, RegenerateScenariosBody, ScenarioResult, SessionBoard,
-    SessionResults, ThreatResult,
+    CreateSessionResponse, MappedControl, RegenerateResponse, RegenerateScenariosBody, ScenarioResult,
+    SessionBoard, SessionResults, ThreatResult,
 )
 from app.core.config import get_settings
+from app.core.logging import get_logger
 from app.core.enums import (
     AuditEventType, RegenGranularity, SessionMode, SessionStatus, SSEEventType, StageStatus, SubsystemLevel,
     SubsystemProgress, WorkflowStage,
@@ -30,12 +31,14 @@ from app.db import models as m
 from app.db.dal import EntityForbidden, IdempotencyKeyConflict, RegenerateConflict, now
 from app.db.engine import db_session
 from app.pipeline import cascade
-from app.pipeline.accept import accept_session
+from app.pipeline.accept import accept_session, review_gate_reason
 from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
 from app.pipeline.context import gather_asset_details
-from app.pipeline.tasks import set_up_progress_tracking
+from app.pipeline.tasks import ASSET_UNIT_ID, set_up_progress_tracking
 
-router = APIRouter(prefix="/v1")
+log = get_logger(__name__)
+
+router = APIRouter(prefix="/v1", tags=["Sessions"])
 
 
 def enqueue_pipeline(session_id: str) -> None:
@@ -65,23 +68,32 @@ def get_overall_status(threats: str, scenarios: str, session_status: str) -> Sub
 
 
 def build_board(sess: Session, scenario_session: dict) -> dict:
-    """The GET /sessions/{id} payload and the SSE reconnect-reconcile source."""
-    # map each subsystem id to its display name, from the session's stored subsystem list
-    names = {s["id"]: s["name"] for s in json.loads(scenario_session["SubsystemsJSON"])}
+    """The GET /sessions/{id} payload and the SSE reconnect-reconcile source.
+
+    Asset-centric: the pipeline tracks one unit of work per session (the asset), so the board has a
+    single entry keyed on ASSET_UNIT_ID and labelled with the asset name — not one entry per
+    supporting system. The `supporting_systems` response key is kept for response-shape stability."""
     pivot: dict[int, dict[str, str]] = {}
-    # pivot the flat per-subsystem-per-level stage rows into
-    # {subsystem_id: {"threats": status, "scenarios": status}}
+    stage_errors: dict[int, str] = {}
+    # pivot the flat per-level stage rows into {subsystem_id: {"threats": status, "scenarios": status}}
     for row in dal.stage_rows(sess, scenario_session["SessionID"]):
         pivot.setdefault(row["SubsystemID"], {})[str(row["Level"]).lower()] = str(row["Status"])
+        if row["ErrorMessage"]:
+            # Client-safe failure reason for this unit. Deliberately kept on an AWAITING_DECISION
+            # row the salvage path revived (dal.revive_errored_scenarios_to_review) — it is the
+            # marker that this review set came from a run that failed mid-batch and may be
+            # PARTIAL, so a reviewer can tell a truncated set from a complete one.
+            stage_errors[row["SubsystemID"]] = str(row["ErrorMessage"])
     supporting_systems = []
-    # build one board entry per subsystem, filling in the overall rollup status
+    # one asset-level board entry (the pipeline tracks the asset, not each supporting system)
     for ssid, stages in pivot.items():
         t = stages.get("threats", StageStatus.IDLE)
         sc = stages.get("scenarios", StageStatus.IDLE)
         supporting_systems.append({
-            "id": ssid, "name": names.get(ssid),
+            "id": ssid, "name": scenario_session["AssetName"],
             "stages": {"threats": t, "scenarios": sc},
             "overall": str(get_overall_status(t, sc, scenario_session["SessionStatus"])),
+            "error_message": stage_errors.get(ssid),
         })
     return {
         "session_id": scenario_session["SessionID"], "entity_id": scenario_session["EntityID"],
@@ -104,11 +116,15 @@ def get_authorized_session(sess: Session, session_id: str, principal: Principal)
 
 
 def _build_session_row(sid: str, tenant: str, body: CreateSessionBody, ctx: dict,
-                    idempotency_key: str | None) -> dict:
-    """Assembles the new Scenario_Session row from the request body and the gathered asset context."""
+                    idempotency_key: str | None, user_id: str | None) -> dict:
+    """Assembles the new Scenario_Session row from the request body and the gathered asset context.
+
+    `user_id` is passed in rather than read off `body`: it is the AUTHENTICATED principal, the
+    same source cancel/accept already audit against. It used to come from the request body —
+    unverified text a caller could set to any name, landing verbatim in the audit trail."""
     return {
         "SessionID": sid, "TenantID": tenant, "EntityID": str(body.entity_id),
-        "UserID": str(body.user_id) if body.user_id is not None else None,
+        "UserID": str(user_id) if user_id is not None else None,
         "AssetName": ctx["asset"]["name"], "AssetID": str(body.asset_id),
         "SessionStatus": SessionStatus.active, "CurrentStage": WorkflowStage.THREAT_IDENTIFICATION,
         "StageStatus": StageStatus.IDLE, "Mode": SessionMode.AUTO, "CurrentSubsystemIndex": 0,
@@ -123,7 +139,10 @@ def _build_session_row(sid: str, tenant: str, body: CreateSessionBody, ctx: dict
 @router.post("/sessions", status_code=202, response_model=CreateSessionResponse)
 def create_session(
     body: CreateSessionBody, principal: Principal = Depends(get_principal),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    # max_length matches IdempotencyKey nvarchar(200): unbounded, an over-long key is only
+    # caught by MSSQL truncation, which raises DataError — NOT the IntegrityError
+    # dal.create_session catches — so it escaped as a 500. Bound at the boundary → clean 422.
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
 ) -> CreateSessionResponse | JSONResponse:
     """Creates the session row plus initial stage state and kicks off the pipeline
     task; an `Idempotency-Key` short-circuits to the existing session on retry instead
@@ -148,13 +167,19 @@ def create_session(
 
         dal.assert_capacity_available(sess, entity_id=body.entity_id)  # 503 before the more expensive gather_asset_details
 
+        # ONE source for "who did this": the authenticated principal, exactly what the cancel and
+        # accept paths already audit. Previously this came from body.user_id — unverified client
+        # text, so a caller could POST "user_id": "ceo" and the audit trail recorded ceo. The
+        # column then meant "verified identity" on some rows and "whatever was typed" on others,
+        # which makes it trustworthy for neither.
         ctx = gather_asset_details(sess, asset_id=body.asset_id, entity_id=body.entity_id,
-                            sector_id=body.sector_id, user_id=body.user_id,
+                            sector_id=body.sector_id, user_id=principal.user_id,
                             supporting_system_ids=body.supporting_system_id)
-        dal.create_session(sess, _build_session_row(sid, tenant, body, ctx, idempotency_key))
-        set_up_progress_tracking(sess, sid, tenant, str(body.entity_id), ctx["subsystems"])
+        dal.create_session(sess, _build_session_row(sid, tenant, body, ctx, idempotency_key,
+                                                    principal.user_id))
+        set_up_progress_tracking(sess, sid, tenant, str(body.entity_id))
         dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant, EntityID=str(body.entity_id),
-                        EventType=AuditEventType.session_started, ActorUserID=body.user_id)
+                        EventType=AuditEventType.session_started, ActorUserID=principal.user_id)
     enqueue_pipeline(sid)
     return CreateSessionResponse(session_id=sid)
 
@@ -201,7 +226,8 @@ def get_results(session_id: str, principal: Principal = Depends(get_principal)) 
         scenarios = get_current_rows(m.Threat_Scenario_Output,
                             [m.Threat_Scenario_Output.OutputID, m.Threat_Scenario_Output.SubsystemID,
                             m.Threat_Scenario_Output.ScenarioJSON, m.Threat_Scenario_Output.Accepted,
-                            m.Threat_Scenario_Output.ValidationJSON])
+                            m.Threat_Scenario_Output.ValidationJSON, m.Threat_Scenario_Output.GenerationEpoch])
+        controls = _controls_by_output(sess, [s["OutputID"] for s in scenarios])
         # add entity_id to the result for downstream consumers — the same value every row shares, so just pick one
         return SessionResults(
             session_id=sid, entity_id=entity_id,
@@ -209,7 +235,7 @@ def get_results(session_id: str, principal: Principal = Depends(get_principal)) 
                                 threat_type=t["ThreatType"], threat_name=t["ThreatName"],
                                 grounding_status=t["GroundingStatus"],
                                 threat_catalogue_id=t["ThreatCatalogueID"]) for t in threats],
-            scenarios=[_scenario_result(s) for s in scenarios],
+            scenarios=[_scenario_result(s, controls.get(s["OutputID"])) for s in scenarios],
         )
 
 
@@ -251,14 +277,85 @@ def _validation_summary(validation_json: str | None) -> tuple[str | None, list[s
     return (status if isinstance(status, str) else None), list(report.get("errors") or [])
 
 
-def _scenario_result(row: dict) -> ScenarioResult:
+def _safe_scenario_json(scenario_json: str | None) -> dict | None:
+    """Parses a Threat_Scenario_Output row's ScenarioJSON, same defensive-parsing discipline as
+    _moderation_summary/_validation_summary above: a single corrupted/malformed row must never
+    500 the whole results view and hide every OTHER threat/scenario in the session."""
+    if not scenario_json:
+        return None
+    try:
+        return json.loads(scenario_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _controls_by_output(sess: Session, output_ids: list[str]) -> dict[str, list[MappedControl]]:
+    """Step-4 mapped controls for a page of scenarios, grouped per OutputID, best rank first.
+    The Control_Library join filters to active rows — a control deactivated AFTER mapping must
+    not keep surfacing. Standards ride along as names (Map → Control_Standard, active only)."""
+    if not output_ids:
+        return {}
+    cmap, lib = m.Threat_Scenario_Control_Map, m.Control_Library
+    try:
+        return _query_controls(sess, output_ids, cmap, lib)
+    except Exception:  # noqa: BLE001 — controls are enrichment: a DB where Control_library.sql
+        # hasn't run yet (app deployed before the SQL scripts) must degrade results to
+        # controls=[] with a loud log, not 500 the session's core read endpoints.
+        sess.rollback()  # leave the session clean for the caller's remaining work/commit
+        log.warning("controls.read_failed", exc_info=True)
+        return {}
+
+
+def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str, list[MappedControl]]:
+    rows = sess.execute(
+        select(cmap.OutputID, cmap.MapRank, cmap.Score, cmap.SuggestedControl,
+               lib.ControlLibraryID, lib.ControlCode, lib.Domain, lib.ControlName)
+        .join(lib, lib.ControlLibraryID == cmap.ControlLibraryID)
+        .where(cmap.OutputID.in_(output_ids),
+               lib.IsActive == True, lib.IsDeleted == False)  # noqa: E712
+        .order_by(cmap.OutputID, cmap.MapRank)
+    ).mappings().all()
+    std_names: dict[int, list[str]] = {}
+    if rows:
+        smap, std = m.Control_Library_Standard_Map, m.Control_Standard
+        for cid, name in sess.execute(
+            select(smap.ControlLibraryID, std.StandardName)
+            .join(std, std.StandardID == smap.StandardID)
+            .where(smap.ControlLibraryID.in_({r["ControlLibraryID"] for r in rows}),
+                   std.IsActive == True, std.IsDeleted == False)  # noqa: E712
+            .order_by(std.StandardName)
+        ):
+            std_names.setdefault(cid, []).append(name)
+    out: dict[str, list[MappedControl]] = {}
+    for r in rows:
+        out.setdefault(r["OutputID"], []).append(MappedControl(
+            control_library_id=r["ControlLibraryID"], control_code=r["ControlCode"],
+            domain=r["Domain"], control_name=r["ControlName"], rank=r["MapRank"],
+            score=r["Score"], suggested_control=r["SuggestedControl"],
+            standards=std_names.get(r["ControlLibraryID"], [])))
+    return out
+
+
+def _scenario_result(row: dict, controls: list[MappedControl] | None = None) -> ScenarioResult:
     flagged, categories = _moderation_summary(row["ValidationJSON"])
     validation_status, validation_errors = _validation_summary(row["ValidationJSON"])
     return ScenarioResult(output_id=row["OutputID"], supporting_system_id=row["SubsystemID"],
-                        scenario=json.loads(row["ScenarioJSON"]) if row["ScenarioJSON"] else None,
+                        scenario=_safe_scenario_json(row["ScenarioJSON"]),
                         accepted=bool(row["Accepted"]),
                         moderation_flagged=flagged, moderation_categories=categories,
-                        validation_status=validation_status, validation_errors=validation_errors)
+                        validation_status=validation_status, validation_errors=validation_errors,
+                        generation_epoch=row["GenerationEpoch"],
+                        controls=controls or [])
+
+
+def _subset_from_accept_body(body: AcceptBody) -> list[str] | None:
+    """Translate the wire-level mode/output_ids pair into accept_session's existing
+    `subset` contract: None = accept all, [] = accept none, a populated list = that subset."""
+    if body.mode == "all":
+        return None
+    if body.mode == "none":
+        return []
+    return body.output_ids  # mode == "subset"; validator guarantees a non-empty list
 
 
 @router.post("/sessions/{session_id}/accept", response_model=AcceptResponse)
@@ -268,8 +365,9 @@ def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depend
     HTTP wrapper."""
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
-        accept_session(sess, session_id, scenario_session["EntityID"], principal.user_id, subset=body.subset)
-    return AcceptResponse(session_id=session_id, status=str(SessionStatus.completed))
+        matched = accept_session(sess, session_id, scenario_session["EntityID"], principal.user_id,
+                                subset=_subset_from_accept_body(body))
+    return AcceptResponse(session_id=session_id, status=str(SessionStatus.completed), accepted_count=matched)
 
 
 def enqueue_regeneration(session_id: str, subsystem_id: int, granularity: RegenGranularity,
@@ -280,18 +378,10 @@ def enqueue_regeneration(session_id: str, subsystem_id: int, granularity: RegenG
 
 def _assert_regen_eligible(scenario_session: dict) -> None:
     """Regeneration is only allowed while the session is parked at REVIEW waiting on a human decision."""
-    if (scenario_session["CurrentStage"] != WorkflowStage.REVIEW
-            or scenario_session["StageStatus"] != StageStatus.AWAITING_DECISION):
-        raise RegenerateConflict(
-            f"session not at REVIEW (stage={scenario_session['CurrentStage']}, "
-            f"status={scenario_session['StageStatus']})")
-
-
-def _assert_subsystem_in_session(scenario_session: dict, subsystem_id: int, session_id: str) -> None:
-    """Make sure the requested subsystem actually belongs to this session."""
-    subsystems = json.loads(scenario_session["SubsystemsJSON"])
-    if not any(s["id"] == subsystem_id for s in subsystems):
-        raise dal.NotFoundError(f"subsystem {subsystem_id} not in session {session_id}")
+    gate = review_gate_reason(scenario_session)
+    if gate is not None:
+        reason, message = gate
+        raise RegenerateConflict(message, reason=reason)
 
 
 def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, granularity: RegenGranularity,
@@ -302,7 +392,6 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
         _assert_regen_eligible(scenario_session)
-        _assert_subsystem_in_session(scenario_session, subsystem_id, session_id)
 
         cascade.get_threat_id_to_redo(sess, session_id, subsystem_id, granularity, target_ids)
 
@@ -340,8 +429,10 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
 @router.post("/sessions/{session_id}/regenerate/scenarios", status_code=202, response_model=RegenerateResponse)
 def post_regenerate_scenarios(session_id: str, body: RegenerateScenariosBody,
                             principal: Principal = Depends(get_principal)) -> RegenerateResponse:
-    """Rebuild one or more scenarios' narratives only — siblings untouched (scenarios 1, 2)."""
-    return _do_regenerate(session_id, principal, body.supporting_system_id, RegenGranularity.scenario,
+    """Rebuild one or more scenarios' narratives only — siblings untouched (scenarios 1, 2). Scoped
+    to the session's asset (`session_id` in the URL is the sole identifier); `output_ids` alone
+    picks which scenarios to redo."""
+    return _do_regenerate(session_id, principal, ASSET_UNIT_ID, RegenGranularity.scenario,
                         body.output_ids, body.user_note)
 
 
@@ -359,7 +450,6 @@ def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> Re
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
         _assert_regen_eligible(scenario_session)
-        _assert_subsystem_in_session(scenario_session, subsystem_id, session_id)
 
         # bail out if another regenerate/accept/next-set already holds this subsystem's mutex lock
         lock_status = sess.execute(
@@ -399,12 +489,13 @@ def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> Re
 
 
 @router.post("/sessions/{session_id}/scenarios/next-set", status_code=202, response_model=RegenerateResponse)
-def post_next_set_scenarios(session_id: str, body: NextSetBody,
-                            principal: Principal = Depends(get_principal)) -> RegenerateResponse:
+def post_next_set_scenarios(session_id: str, principal: Principal = Depends(get_principal)) -> RegenerateResponse:
     """Generate the next set of scenarios — 5 more unique threat scenarios that accumulate onto the
-    existing ones for one supporting system, never superseding a prior batch. Returns 202 with
-    status "generating"; a round that finds nothing new is not an error (the reviewer can retry)."""
-    return _do_next_set(session_id, principal, body.supporting_system_id)
+    existing ones for the session's asset, never superseding a prior batch. No request body: the
+    asset is fully identified by `session_id` in the URL (a session is always exactly one asset).
+    Returns 202 with status "generating"; a round that finds nothing new is not an error (the
+    reviewer can retry)."""
+    return _do_next_set(session_id, principal, ASSET_UNIT_ID)
 
 
 @router.post("/sessions/{session_id}/cancel", response_model=CancelResponse)
@@ -447,20 +538,31 @@ async def session_events(session_id: str, principal: Principal = Depends(get_pri
     from app.sse import bus
 
     board = await run_in_threadpool(_load_events_board, session_id, principal)
+    # Everything below keys off the BOARD's session id, never the raw path param. The row was
+    # loaded via GUID.bind_processor (which matches any spelling) and returned via
+    # GUID.result_processor (canonical lowercase) — but every publisher (tasks.py's
+    # _send_live_update/_record_failure/_send_to_review/..., cascade.py's next_set/regen result)
+    # derives its channel from that same canonical row value, and Redis pub/sub channel names are
+    # byte-exact. Subscribing on an uppercase (or dashless/braced) path param therefore opens a
+    # stream that authorizes, reconciles, then silently receives NOTHING but heartbeats forever.
+    # Reusing the canonical id here also keeps `heartbeat.session_id` equal to
+    # `reconcile.session_id`, instead of one connection reporting two different ids.
+    canonical_session_id = board["session_id"]
 
     async def stream_events():
         """The event generator EventSourceResponse iterates; captures `board` from the
         enclosing scope so the reconcile snapshot reflects the DB state at connect time."""
         # [R4] reconcile from the DB first, then stream live deltas (no replay log).
         yield {"event": "reconcile", "data": json.dumps(board)}
-        async for ev in bus.subscribe(session_id):
+        async for ev in bus.subscribe(canonical_session_id):
             yield {"event": ev.get("type", "message"), "data": json.dumps(ev)}
 
     def _heartbeat() -> ServerSentEvent:
         """Builds the periodic heartbeat SSE event; passed to EventSourceResponse as
         `ping_message_factory` rather than called directly."""
         return ServerSentEvent(
-            data=json.dumps({"type": str(SSEEventType.heartbeat), "session_id": session_id, "ts": now().isoformat()}),
+            data=json.dumps({"type": str(SSEEventType.heartbeat), "session_id": canonical_session_id,
+                            "ts": now().isoformat()}),
             event=str(SSEEventType.heartbeat),
         )
 
@@ -469,7 +571,7 @@ async def session_events(session_id: str, principal: Principal = Depends(get_pri
 
 
 @router.get("/assets/{asset_id}/accepted-scenarios", response_model=AcceptedScenariosResponse)
-def get_accepted_scenarios(asset_id: int, entity: str,
+def get_accepted_scenarios(asset_id: int = Path(ge=1), entity: str = Query(...),
                         principal: Principal = Depends(get_principal)) -> AcceptedScenariosResponse:
     """Returns the accepted scenarios from the most recently completed session for this
     asset. If the asset has no completed session yet, returns an empty result rather
@@ -480,16 +582,18 @@ def get_accepted_scenarios(asset_id: int, entity: str,
         scenario_session = dal.latest_completed_session(sess, entity, str(asset_id))
         # no completed session yet -> empty scenario list, not an error
         rows = dal.accepted_scenarios(sess, scenario_session["SessionID"]) if scenario_session else []
+        controls = _controls_by_output(sess, [r["OutputID"] for r in rows])
         return AcceptedScenariosResponse(
             asset_id=asset_id, entity_id=entity,
             session_id=scenario_session["SessionID"] if scenario_session else None,
             completed_at=scenario_session["CompletedAt"] if scenario_session else None,
             scenarios=[AcceptedScenario(
                 output_id=r["OutputID"], supporting_system_id=r["SubsystemID"],
-                threat_type_id=r["ThreatTypeID"], threat_catalogue_id=r["ThreatCatalogueID"],               
+                threat_type_id=r["ThreatTypeID"], threat_catalogue_id=r["ThreatCatalogueID"],
                 # prefer the curated catalogue name/type; fall back to the freeform one if not linked to the library
                 threat_type=r["LibraryThreatType"] or r["ThreatType"],
                 threat_name=r["LibraryThreatName"] or r["ThreatName"],
-                scenario=json.loads(r["ScenarioJSON"]) if r["ScenarioJSON"] else None,
+                scenario=_safe_scenario_json(r["ScenarioJSON"]),
+                controls=controls.get(r["OutputID"], []),
             ) for r in rows],
         )

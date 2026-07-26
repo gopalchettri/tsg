@@ -22,7 +22,8 @@ from app.db.dal import now
 from app.pipeline.scoping import Scored
 from app.pipeline.tasks import _dedup_key, _normalize, _select_unique_top_n, find_threats, write_scenarios
 from tests.conftest import DEFAULT_ASSET_CONTEXT, StubLLM
-from tests.test_slice import SUB, SUB2, _active_count, _seed_session
+from app.pipeline.tasks import ASSET_UNIT_ID
+from tests.test_slice import SUB, _active_count, _seed_session
 
 _TID = "33333333-3333-4333-8333-333333333333"
 
@@ -33,7 +34,7 @@ class _DupCatalogueLLM(StubLLM):
     catalogue-level duplicate the whole feature exists to collapse."""
 
     def chat(self, messages, *, model=None, temperature=None):
-        if "stride threats" in messages[0]["content"].lower():
+        if "json array" in messages[0]["content"].lower():
             from app.pipeline.llm import Provenance
             out = [{"category": "Tampering", "type": "Firmware Tampering", "name": "Bootloader implant",
                     "actors": ["Hacker"]}] * 2
@@ -49,7 +50,7 @@ class _UngroundedLLM(StubLLM):
         self._proposals = proposals
 
     def chat(self, messages, *, model=None, temperature=None):
-        if "stride threats" in messages[0]["content"].lower():
+        if "json array" in messages[0]["content"].lower():
             from app.pipeline.llm import Provenance
             return json.dumps(self._proposals), Provenance(model="stub")
         return super().chat(messages, model=model)
@@ -62,10 +63,10 @@ def _scenarios(db, sid):
 
 
 def _run(db, llm, sub=SUB, session=None):
-    session = session or _seed_session(db, subs=[sub] if sub is SUB else [SUB, SUB2])
-    threats, _ = find_threats(db, session, sub, DEFAULT_ASSET_CONTEXT, llm, _TID)
+    session = session or _seed_session(db, subs=[sub])
+    threats, _ = find_threats(db, session, [sub], DEFAULT_ASSET_CONTEXT, llm, _TID)
     db.commit()
-    write_scenarios(db, session, sub, DEFAULT_ASSET_CONTEXT, threats, llm, _TID)
+    write_scenarios(db, session, [sub], DEFAULT_ASSET_CONTEXT, threats, llm, _TID)
     db.commit()
     return session
 
@@ -169,20 +170,10 @@ def test_ungrounded_separator_boundary_not_over_collapsed(db):
     assert len(_scenarios(db, session["SessionID"])) == 2
 
 
-# --- structural backstop: SubsystemID + dedup_key folded into IdentityHash --
-def test_sibling_subsystems_same_catalogue_both_get_scenarios(db):
-    # The same catalogue-20 threat in two sibling subsystems must NOT cross-suppress:
-    # SubsystemID is folded into IdentityHash, so the (SessionID, IdentityHash) unique
-    # index sees two distinct hashes, not a collision.
-    session = _seed_session(db, subs=[SUB, SUB2])
-    for sub in (SUB, SUB2):
-        _run(db, StubLLM(), sub=sub, session=session)
-    rows = _scenarios(db, session["SessionID"])
-    assert len(rows) == 2
-    assert {r.SubsystemID for r in rows} == {SUB["id"], SUB2["id"]}
-    assert rows[0].IdentityHash != rows[1].IdentityHash
-
-
+# --- structural backstop: dedup_key folded into IdentityHash on the asset unit ----
+# ponytail: no more "sibling subsystems" cross-suppression test — SubsystemID is now a
+# fixed sentinel (ASSET_UNIT_ID) on every row (see tasks.py's asset-centric comment), so
+# there is only ever one dedup scope per session, not one per supporting system.
 def test_double_active_scenario_with_same_folded_identity_is_rejected(db):
     session = _seed_session(db)
     sid = session["SessionID"]
@@ -203,10 +194,10 @@ def test_targeted_regen_of_a_catalogue_duplicate_is_not_demoted(db):
     # would demote as a duplicate) must still generate — dedup runs only when
     # target_threat_ids is None.
     session = _seed_session(db)
-    threats, _ = find_threats(db, session, SUB, DEFAULT_ASSET_CONTEXT, _DupCatalogueLLM(), _TID)
+    threats, _ = find_threats(db, session, [SUB], DEFAULT_ASSET_CONTEXT, _DupCatalogueLLM(), _TID)
     db.commit()
     target = threats[1]["threat_id"]
-    provs = write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, threats, _DupCatalogueLLM(), _TID,
+    provs = write_scenarios(db, session, [SUB], DEFAULT_ASSET_CONTEXT, threats, _DupCatalogueLLM(), _TID,
                             target_threat_ids={target})
     assert len(provs) == 1                                                     # regenerated, not withheld
 
@@ -239,7 +230,7 @@ def test_beyond_cutoff_unique_winner_is_regenerable(db, monkeypatch):
     # 'beyond top-N' (that raised RegenerateConflict → the Regenerate control silently did nothing).
     from app.core.config import get_settings
     session = _seed_session(db)
-    sid, ss = session["SessionID"], SUB["id"]
+    sid, ss = session["SessionID"], ASSET_UNIT_ID
     dup1, dup2, winner = ("a0000000-0000-4000-8000-000000000001",
                         "a0000000-0000-4000-8000-000000000002",
                         "a0000000-0000-4000-8000-000000000003")
@@ -253,14 +244,14 @@ def test_beyond_cutoff_unique_winner_is_regenerable(db, monkeypatch):
     db.commit()
     monkeypatch.setattr(get_settings(), "scoping_top_n", 2)
 
-    write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, dal.active_threats(db, sid, ss), StubLLM(), _TID)
+    write_scenarios(db, session, [SUB], DEFAULT_ASSET_CONTEXT, dal.active_threats(db, sid, ss), StubLLM(), _TID)
     db.commit()
     assert len(_scenarios(db, sid)) == 2                                       # one per unique catalogue
     assert _active_winner_count(db, sid, winner) == 1                          # winner active despite raw rank 3
 
     epoch = dal.next_epoch(db, sid, ss, (SubsystemLevel.SCENARIOS,))
     dal.reset_stage_for_regen(db, sid, ss, (SubsystemLevel.SCENARIOS,), epoch)
-    provs = write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, dal.active_threats(db, sid, ss),
+    provs = write_scenarios(db, session, [SUB], DEFAULT_ASSET_CONTEXT, dal.active_threats(db, sid, ss),
                             StubLLM(), _TID, epoch=epoch, target_threat_ids={winner})
     assert len(provs) == 1                                                     # regenerated, not silently skipped
     assert _active_winner_count(db, sid, winner) == 1
@@ -272,7 +263,7 @@ def test_regen_two_same_catalogue_outputs_no_integrityerror(db):
     # dedup_key → both collapse to sha256(sid|ss|cat:20). Without the regen-branch guard the two
     # rows collide on UX_Scenario_ActiveIdentity in one bulk insert → IntegrityError.
     session = _seed_session(db)
-    sid, ss = session["SessionID"], SUB["id"]
+    sid, ss = session["SessionID"], ASSET_UNIT_ID
     t1, t2 = "b0000000-0000-4000-8000-000000000001", "b0000000-0000-4000-8000-000000000002"
     for i, tid in enumerate((t1, t2)):
         _seed_threat(db, sid, ss, threat_id=tid, grounding_status=str(GroundingStatus.grounded),
@@ -291,7 +282,7 @@ def test_regen_two_same_catalogue_outputs_no_integrityerror(db):
     epoch = dal.next_epoch(db, sid, ss, (SubsystemLevel.SCENARIOS,))
     dal.reset_stage_for_regen(db, sid, ss, (SubsystemLevel.SCENARIOS,), epoch)
     # would raise IntegrityError here without the regen-branch de-dup + identity-hash supersede
-    write_scenarios(db, session, SUB, DEFAULT_ASSET_CONTEXT, dal.active_threats(db, sid, ss),
+    write_scenarios(db, session, [SUB], DEFAULT_ASSET_CONTEXT, dal.active_threats(db, sid, ss),
                     StubLLM(), _TID, epoch=epoch, target_threat_ids={t1, t2})
     db.commit()
     active = _scenarios(db, sid)
@@ -306,8 +297,8 @@ def test_config_rejects_scenario_count_above_threat_count():
     from app.core.config import Settings
 
     with pytest.raises(ValidationError):
-        Settings(scoping_top_n=20, max_threats_per_subsystem=12)
-    Settings(scoping_top_n=12, max_threats_per_subsystem=12)                   # equal is allowed
+        Settings(scoping_top_n=20, max_threats_per_asset=12)
+    Settings(scoping_top_n=12, max_threats_per_asset=12)                       # equal is allowed
 
 
 def test_thin_dedup_headroom_warns_without_raising():
@@ -318,6 +309,6 @@ def test_thin_dedup_headroom_warns_without_raising():
     from app.core.config import Settings
 
     with structlog.testing.capture_logs() as logs:
-        s = Settings(scoping_top_n=5, max_threats_per_subsystem=6)
+        s = Settings(scoping_top_n=5, max_threats_per_asset=6)
     assert s.scoping_top_n == 5                                                # constructed, did NOT raise
     assert any(e.get("event") == "config.thin_dedup_headroom" for e in logs)

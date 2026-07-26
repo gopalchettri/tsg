@@ -4,6 +4,8 @@ that Celery genuinely retries on it; a typo'd/omitted decorator would have silen
 "retries automatically" into "crashes the task," undetected by anything else in the suite."""
 from __future__ import annotations
 
+import pytest
+
 from app.pipeline import celery_app
 from app.pipeline.llm import LLMSlotUnavailable
 
@@ -20,6 +22,39 @@ def test_init_worker_calls_log_litellm_key_info(monkeypatch):
     monkeypatch.setattr("app.pipeline.llm.log_litellm_key_info", lambda: calls.append(1))
     celery_app._init_worker()
     assert calls == [1]
+
+
+def test_init_worker_rejects_prefork_pool(monkeypatch):
+    # The worker_pool="gevent" setting was removed (it tripped Celery's W_POOL_SETTING warning),
+    # so a bare `celery worker` now resolves to prefork — which FORKS a process celery_worker.py
+    # has already monkey-patched, giving every child a broken hub. That must fail loudly, and
+    # -P solo must still be allowed (it never forks; .vscode/launch.json debugs with it).
+    monkeypatch.setattr("app.core.config.assert_security_posture", lambda: None)
+    monkeypatch.setattr("app.db.invariants.verify_startup", lambda engine: None)
+    monkeypatch.setattr("app.pipeline.local_models.validate_local_models", lambda **kw: None)
+    monkeypatch.setattr("app.pipeline.llm.verify_litellm_models", lambda: None)
+    monkeypatch.setattr("app.pipeline.llm.log_litellm_key_info", lambda: None)
+
+    class _Pool:
+        pass
+
+    class _Sender:
+        pool_cls = _Pool
+
+    _Pool.__module__ = "celery.concurrency.prefork"
+    with pytest.raises(RuntimeError, match="prefork"):
+        celery_app._init_worker(sender=_Sender)
+    # Deliberately NOT looping over gevent/solo to assert "does not raise": past the guard,
+    # _init_worker runs the real boot — verify_litellm_models plus resolve_thresholds(
+    # allow_calibration=True), i.e. minutes of billed Azure paraphrase calls per invocation.
+    # test_init_worker_calls_log_litellm_key_info above already drives that path once with
+    # sender=None, which is the same non-prefork branch this guard permits.
+
+
+def test_no_green_worker_pool_setting():
+    # celery/worker/components.py warns whenever conf.worker_pool is in {eventlet, gevent} —
+    # regardless of -P — so the key must stay absent for a clean boot log.
+    assert celery_app.celery_app.conf.worker_pool not in {"gevent", "eventlet"}
 
 
 def test_run_pipeline_task_autoretry_wiring():

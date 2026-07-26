@@ -67,7 +67,10 @@ def _embedder(path: str):
 
     log.info("local.embedder.loading", path=path)
     model = SentenceTransformer(path)
-    log.info("local.embedder.loaded", path=path, dim=model.get_sentence_embedding_dimension())
+    # get_embedding_dimension, not get_sentence_embedding_dimension: the latter is a deprecated
+    # alias in sentence-transformers 5.x that emits a FutureWarning on every worker boot. Hence
+    # the >=5.0 floor on the [local] extra.
+    log.info("local.embedder.loaded", path=path, dim=model.get_embedding_dimension())
     return model
 
 
@@ -108,15 +111,26 @@ def embed(texts: Sequence[str]) -> list[list[float]]:
 
 
 def rerank(query: str, docs: Sequence[str]) -> list[float]:
-    """ scores how relevant each document is to the query,
+    """One query against its docs — thin wrapper over rerank_pairs below."""
+    if not docs:  # ponytail: no candidates → no model load, aligns with []-in-[]-out
+        return []
+    return rerank_pairs([(query, d) for d in docs])
+
+
+def rerank_pairs(pairs: Sequence[tuple[str, str]]) -> list[float]:
+    """ scores how relevant each document is to its paired query,
     using the local model.
 
     Score (query, doc) pairs → 0-100. bge-reranker (num_labels==1) already applies
     sigmoid in `predict`, so its output is a [0,1] probability — scale x 100 and clamp
-    (do NOT sigmoid again). Re-calibrate the 60/75 bands per §8.4 if the model changes."""
-    if not docs:  # ponytail: no candidates → no model load, aligns with []-in-[]-out
+    (do NOT sigmoid again). Re-calibrate the 60/75 bands per §8.4 if the model changes.
+
+    Takes explicit pairs (not one query + docs) so a caller with MANY queries can score
+    them all in ONE model dispatch — cross-encoders score each pair independently, so
+    batching across queries is score-identical, and predict() mini-batches internally,
+    so a large batch is one dispatch, not one oversized tensor (llm.rerank_many)."""
+    if not pairs:
         return []
-    pairs = [(query, d) for d in docs]
 
     def _run():
         """The actual model lookup + torch forward pass, closed over `pairs` so
@@ -183,7 +197,7 @@ def validate_local_models(settings: Settings | None = None, *, warm: bool) -> No
     if warm and local_used:
         _require_sentence_transformers_installed()
         if s.embedding_provider == "local":
-            dim = _embedder(s.embedding_model).get_sentence_embedding_dimension()
+            dim = _embedder(s.embedding_model).get_embedding_dimension()
             if dim != s.embedding_dimensions:
                 raise RuntimeError(f"EMBEDDING_DIMENSIONS={s.embedding_dimensions} but model reports {dim}")
         if s.reranker_provider == "local":

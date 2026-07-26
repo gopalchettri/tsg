@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Seed_to_Control_library — real data from the functional team's
 -- Control_Library.xlsx (generated 2026-07-19). 30 standards, 1288 controls,
--- 6105 threat-to-standard links.
+-- 6105 control-to-standard links.
 --
 -- Idempotency is TABLE-LEVEL, not per-row: a one-time bulk load, so each
 -- block only inserts if its target table is currently empty. Safe to

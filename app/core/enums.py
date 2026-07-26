@@ -92,9 +92,20 @@ class ScenarioStatus(StrEnum):
     confuse with the similarly-named StageStatus (the *stage's* status); unrelated columns
     on different tables."""
     complete = "complete"  # the scenario narrative was generated and persisted
-    error = "error"        # defined for the column's shape; today a scenario-generation failure
-                            # instead routes the whole SCENARIOS stage to StageStatus.ERROR (no
-                            # per-scenario-row error state is currently written by the pipeline)
+    error = "error"        # FAILURE CARD: a full-run threat whose generation failed keeps a row
+                            # (null scenario + ErrorMessage) so /regenerate/scenarios can retry it
+                            # individually (tasks._build_error_output_row). Excluded from accept/
+                            # salvage/resume by the ScenarioStatus.complete filters in dal.py.
+
+
+class ActorType(StrEnum):
+    """`Scenario_Audit.ActorType` — WHO PERFORMED the event, kept separate from ActorUserID's
+    "who is ACCOUNTABLE for it". Both are needed: every audit row names the accountable session
+    owner, but most rows are written by a background worker minutes later with no human present,
+    so `ActorUserID` alone could not distinguish "gopal did this" from "gopal is answerable for
+    what the pipeline did". NULL on rows written before this column existed."""
+    user = "user"      # a human performed it: session_started, session_cancelled, the accept family
+    system = "system"  # a worker/the pipeline performed it; ActorUserID names who is answerable
 
 
 class CandidateStatus(StrEnum):
@@ -124,10 +135,13 @@ class AuditEventType(StrEnum):
     auto_run_enqueued = "auto_run_enqueued"             # defined, but no code writes it today — reserved, no current producer
     grounding_summary = "grounding_summary"             # written once per subsystem after Stage 1 (THREATS); DetailJSON carries the threat count
     scoping_complete = "scoping_complete"               # written once per subsystem after Stage 2 scoring; DetailJSON carries scoped/selected counts
+    controls_mapped = "controls_mapped"                 # written once per write_scenarios run after Step-4 control mapping (control_mapping.map_controls);
+                                                        # DetailJSON carries outputs/mapped/dropped/fallback counts
     generation_complete = "generation_complete"         # written once per subsystem after both stages finish; DetailJSON carries full LLM provenance
     entered_review = "entered_review"                   # written once per session when every subsystem reaches the review barrier
     review_decision = "review_decision"                 # the human's verdict at the single review gate (accept/partial)
-    scenarios_accepted = "scenarios_accepted"           # Stage-2 outputs (Threat_Scenario_Output) flipped Accepted=1
+    scenarios_accepted = "scenarios_accepted"           # Stage-2 outputs (Threat_Scenario_Output) flipped Accepted=1 —
+                                                        # deliberately NOT written on a mode="none" reject (nothing flipped)
     regeneration_completed = "regeneration_completed"   # one regenerate request finished its stage re-runs
     threat_regrounded = "threat_regrounded"             # a threat was re-matched to the library during threat-granularity regen —
                                                         # defined, but no code path writes this today (only `scenario` regen is
@@ -146,12 +160,13 @@ class AuditEventType(StrEnum):
 
 class AuditDecision(StrEnum):
     """`Scenario_Audit.Decision` — the human verdict recorded alongside a `review_decision`
-    event. Only `accept`/`partial` are currently written (`accept.py::accept_session`'s
-    `decision = partial if subset is not None else accept`); `reject`/`regenerate` are
-    defined for the column's full vocabulary but have no current writer."""
+    event. `accept`/`partial`/`reject` are all written by `accept.py::accept_session` based
+    on its `subset` param: None -> accept, a populated list -> partial, an explicit empty
+    list ([R8] "accept none", reachable on the wire via `AcceptBody(mode="none")`) -> reject.
+    `regenerate` is defined for the column's full vocabulary but has no current writer."""
     accept = "accept"            # "accept all" — subset was None
-    partial = "partial"          # only a subset of subsystems accepted (AcceptBody.subset), not the whole session
-    reject = "reject"            # defined; no code path writes this today
+    partial = "partial"          # only some scenarios accepted (AcceptBody mode="subset"), not the whole session
+    reject = "reject"            # "accept none" — subset was an explicit empty list (AcceptBody mode="none")
     regenerate = "regenerate"    # defined; no code path writes this today (regeneration is audited via `regeneration_completed`/`threat_regrounded` instead)
 
 
@@ -196,6 +211,9 @@ class SSEEventType(StrEnum):
     error = "error"                                    # a stage failed (carries subsystem_id) or the whole session died (omits it)
     next_set_result = "next_set_result"                # advisory: one "generate next set" click landed (carries subsystem_id +
                                                         # new_scenarios/no_new) so the UI can tell a fruitful click from a fruitless one
+    regen_result = "regen_result"                       # advisory: one regenerate click landed (carries subsystem_id +
+                                                        # requested_output_ids/new_output_ids) so the UI can highlight exactly which
+                                                        # scenarios were replaced; new_output_ids=[] means every target rescored out
     heartbeat = "heartbeat"                             # periodic keep-alive so proxies don't drop an idle SSE connection
 
 

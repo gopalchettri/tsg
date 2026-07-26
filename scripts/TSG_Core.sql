@@ -163,7 +163,25 @@ CREATE TABLE Threat_Scenario_Output (
     IdentityHash         nvarchar(64)  NULL,
     GenerationEpoch      int           NOT NULL,
     ErrorMessage         nvarchar(max) NULL,
-    CreatedAt            datetime2     NULL
+    CreatedAt            datetime2     NULL,
+    ControlsMappedAt     datetime2     NULL   -- Step-4 attempt stamp: NULL = not yet tried; set even when zero controls matched (control_mapping.map_controls)
+);
+
+-- Existing databases created before the Step-4 attempt stamp: add the column in place.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ControlsMappedAt') IS NULL
+    ALTER TABLE Threat_Scenario_Output ADD ControlsMappedAt datetime2 NULL;
+
+IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NULL
+CREATE TABLE Threat_Scenario_Control_Map (
+    OutputID          uniqueidentifier NOT NULL,
+    ControlLibraryID  int           NOT NULL,
+    SessionID         uniqueidentifier NOT NULL,
+    MapRank           int           NOT NULL,   -- 1 = best match for this scenario
+    Score             float         NULL,       -- raw rerank 0-100
+    SuggestedControl  nvarchar(500) NULL,       -- the LLM's free-text suggestion this grounded from (NULL on scenario-text fallback)
+    CreatedAt         datetime2     NULL,
+    CONSTRAINT PK_Threat_Scenario_Control_Map PRIMARY KEY (OutputID, ControlLibraryID)
 );
 
 IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NULL
@@ -178,7 +196,8 @@ CREATE TABLE Scenario_Audit (
     Decision         nvarchar(30)  NULL,
     Granularity      nvarchar(20)  NULL,
     ThreatTypeRefID  int           NULL,
-    ActorUserID      nvarchar(200) NULL,
+    ActorUserID      nvarchar(200) NULL,   -- who is ACCOUNTABLE (back-filled to the session owner)
+    ActorType        nvarchar(20)  NULL,   -- who PERFORMED it: 'user' | 'system'  (migration 0028)
     DetailJSON       nvarchar(max) NULL,
     CreatedAt        datetime2     NOT NULL
 );
@@ -376,7 +395,7 @@ SELECT 'RCSI' AS what, CAST(is_read_committed_snapshot_on AS int) AS ok FROM sys
 UNION ALL
 SELECT TABLE_NAME, 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME IN (
     'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Scoped_Threat',
-    'Threat_Scenario_Output','Scenario_Audit','Prompt_Log','Threat_Candidate_Review',
+    'Threat_Scenario_Output','Threat_Scenario_Control_Map','Scenario_Audit','Prompt_Log','Threat_Candidate_Review',
     'Threat_Category','Threat_Type','Threat_Catalogue','Threat_Actor','ThreatType_ThreatActor_Map')
 UNION ALL
 SELECT TABLE_NAME + '.' + COLUMN_NAME, 1 FROM INFORMATION_SCHEMA.COLUMNS

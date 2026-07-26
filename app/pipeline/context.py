@@ -223,6 +223,12 @@ def _decode_codes(raw: str | None) -> list[int]:
         return []
 
 
+def _fold_code(code: str) -> str:
+    """Casefold an option-group code so a Python dict lookup agrees with the case-insensitive
+    SQL match that produced the row. Used on BOTH sides of every option_ids lookup below."""
+    return str(code).strip().lower()
+
+
 def _load_multiselect_lookup(
     sess: Session, ss_rows: dict[int, Mapping[str, Any]],
 ) -> dict[str, dict[int, str]]:
@@ -233,29 +239,34 @@ def _load_multiselect_lookup(
     needed_cols = [c for c in _MULTISELECT_OPTION_CODES if any(row.get(c) for row in ss_rows.values())]
     if not needed_cols:
         return {}
+    # Key on the CASEFOLDED code: the SQL `in_` above matches under MSSQL's case-insensitive
+    # collation, but this dict lookup is case-sensitive — so an `option.code` seeded in a
+    # different casing than the _MULTISELECT_OPTION_CODES constant returned a row that then
+    # failed the `not in option_ids` check below, silently dropping all five columns from the
+    # LLM prompt with no error anywhere. Both sides are folded so the two agree.
     option_ids = {
-        r["code"]: r["id"] for r in sess.execute(
+        str(r["code"]).strip().lower(): r["id"] for r in sess.execute(
             select(m.option.code, m.option.id)
             .where(m.option.code.in_([_MULTISELECT_OPTION_CODES[c] for c in needed_cols]))
         ).mappings()
     }
     codes_by_col: dict[str, set[int]] = {}
     for col in needed_cols:
-        if _MULTISELECT_OPTION_CODES[col] not in option_ids:  # option group not seeded — leave unresolved
+        if _fold_code(_MULTISELECT_OPTION_CODES[col]) not in option_ids:  # option group not seeded — leave unresolved
             continue
         codes = {code for row in ss_rows.values() for code in _decode_codes(row.get(col))}
         if codes:
             codes_by_col[col] = codes
     if not codes_by_col:
         return {}
-    relevant_option_ids = {option_ids[_MULTISELECT_OPTION_CODES[col]] for col in codes_by_col}
+    relevant_option_ids = {option_ids[_fold_code(_MULTISELECT_OPTION_CODES[col])] for col in codes_by_col}
     names_by_option: dict[int, dict[int, str]] = {}
     for r in sess.execute(
         select(m.option_value.option_id, m.option_value.value, m.option_value.name)
         .where(m.option_value.option_id.in_(relevant_option_ids))
     ).mappings():
         names_by_option.setdefault(r["option_id"], {})[r["value"]] = r["name"]
-    return {col: names_by_option.get(option_ids[_MULTISELECT_OPTION_CODES[col]], {}) for col in codes_by_col}
+    return {col: names_by_option.get(option_ids[_fold_code(_MULTISELECT_OPTION_CODES[col])], {}) for col in codes_by_col}
 
 
 def _resolve_multiselect(raw: str | None, lookup: dict[int, str]) -> list[str] | None:
@@ -276,23 +287,23 @@ def _load_singleselect_lookup(
     needed_cols = [c for c in _SINGLESELECT_OPTION_CODES if any(row.get(c) is not None for row in ss_rows.values())]
     if not needed_cols:
         return {}
-    option_ids = {
-        r["code"]: r["id"] for r in sess.execute(
+    option_ids = {  # casefolded keys — same SQL-CI vs Python-CS mismatch as the multiselect twin
+        _fold_code(r["code"]): r["id"] for r in sess.execute(
             select(m.option.code, m.option.id)
             .where(m.option.code.in_([_SINGLESELECT_OPTION_CODES[c] for c in needed_cols]))
         ).mappings()
     }
-    resolvable_cols = [c for c in needed_cols if _SINGLESELECT_OPTION_CODES[c] in option_ids]  # option group not seeded — leave unresolved
+    resolvable_cols = [c for c in needed_cols if _fold_code(_SINGLESELECT_OPTION_CODES[c]) in option_ids]  # option group not seeded — leave unresolved
     if not resolvable_cols:
         return {}
-    relevant_option_ids = {option_ids[_SINGLESELECT_OPTION_CODES[c]] for c in resolvable_cols}
+    relevant_option_ids = {option_ids[_fold_code(_SINGLESELECT_OPTION_CODES[c])] for c in resolvable_cols}
     names_by_option: dict[int, dict[int, str]] = {}
     for r in sess.execute(
         select(m.option_value.option_id, m.option_value.value, m.option_value.name)
         .where(m.option_value.option_id.in_(relevant_option_ids))
     ).mappings():
         names_by_option.setdefault(r["option_id"], {})[r["value"]] = r["name"]
-    return {c: names_by_option.get(option_ids[_SINGLESELECT_OPTION_CODES[c]], {}) for c in resolvable_cols}
+    return {c: names_by_option.get(option_ids[_fold_code(_SINGLESELECT_OPTION_CODES[c])], {}) for c in resolvable_cols}
 
 
 def _resolve_singleselect(raw: int | None, lookup: dict[int, str]) -> str | None:

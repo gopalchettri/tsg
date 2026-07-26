@@ -116,6 +116,13 @@ class Subsystem_Stage_State(Base):
 
 # ---------------------------------------------------------------------------
 # Pipeline outputs (entity resolved via the session; carry TenantID+SubsystemID)
+#
+# `UserID` on all three tables below is PROVENANCE, inherited from Scenario_Session.UserID — it
+# is the accountable session owner, NEVER the author. Every row here is produced by a background
+# worker from LLM output; no human writes one. That is why they take no ActorType companion the
+# way Scenario_Audit does: the column would read 'system' on 100% of rows and carry no
+# information. Scenario_Audit needs it precisely because it is the ONE table where human-written
+# and worker-written rows share a column.
 # ---------------------------------------------------------------------------
 class Identified_Threat(Base):
     __tablename__ = "Identified_Threat"
@@ -176,6 +183,24 @@ class Threat_Scenario_Output(Base):
     GenerationEpoch: Mapped[int] = mapped_column(Integer, default=1)
     ErrorMessage: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    # Step-4 attempt stamp (control_mapping.map_controls): NULL = mapping not yet attempted for
+    # this output; set on every attempt EVEN when zero controls matched, so an output is never
+    # re-scanned/re-reranked on later runs. Regen mints a new OutputID (stamp NULL) naturally.
+    ControlsMappedAt: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class Threat_Scenario_Control_Map(Base):
+    """Step 4: which Control_Library rows mitigate one generated scenario (control_mapping.map_controls).
+    No Superseded/epoch columns — visibility follows the parent Threat_Scenario_Output row,
+    same posture as Scoped_Threat. Composite PK doubles as the dedup guard."""
+    __tablename__ = "Threat_Scenario_Control_Map"
+    OutputID: Mapped[str] = mapped_column(GUID, primary_key=True)
+    ControlLibraryID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    SessionID: Mapped[str] = mapped_column(GUID)
+    MapRank: Mapped[int] = mapped_column(Integer)             # 1 = best match
+    Score: Mapped[float | None] = mapped_column(Float)        # raw rerank 0-100
+    SuggestedControl: Mapped[str | None] = mapped_column(Unicode(500))  # LLM's free-text suggestion; NULL on scenario-text fallback
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 # ---------------------------------------------------------------------------
 # Threat library masters (seeded; read now, promote later)
@@ -231,6 +256,48 @@ class ThreatType_ThreatActor_Map(Base):
     __tablename__ = "ThreatType_ThreatActor_Map"
     ThreatTypeID: Mapped[int] = mapped_column(Integer, primary_key=True)
     ThreatActorID: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+
+# ---------------------------------------------------------------------------
+# Control library masters (seeded from functional-team Control_Library.xlsx).
+# Created by scripts/Control_library.sql (run manually — see test_schema_sync's
+# _DEPLOYED_SEPARATELY, same pattern as Config_Threat_Rule). Read-only to the app:
+# grounding.ground_control retrieves candidates; sessions.py joins standards into
+# the results payload. IDENTITY PKs — never inserted by app code.
+# ---------------------------------------------------------------------------
+class Control_Standard(Base):
+    __tablename__ = "Control_Standard"
+    StandardID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    StandardName: Mapped[str] = mapped_column(Unicode(200))
+    CreateDate: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(55))
+    UpdateDate: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(55))
+    IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
+    IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Control_Library(Base):
+    __tablename__ = "Control_Library"
+    ControlLibraryID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ControlCode: Mapped[str] = mapped_column(Unicode(20))     # 'CII-CID-001'..'CII-CID-1288', unique
+    ITOT: Mapped[str] = mapped_column(Unicode(10))            # 'IT' | 'OT' — grounding's tolerant asset_type pre-filter
+    Domain: Mapped[str] = mapped_column(Unicode(200))         # un-normalized vocabulary (96 distinct values) — report as-is, never join on it
+    ControlName: Mapped[str] = mapped_column(Unicode(500))
+    ControlDescription: Mapped[str] = mapped_column(UnicodeText)
+    SampleEvidence: Mapped[str | None] = mapped_column(UnicodeText)
+    CreateDate: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(55))
+    UpdateDate: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(55))
+    IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
+    IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Control_Library_Standard_Map(Base):
+    __tablename__ = "Control_Library_Standard_Map"
+    ControlLibraryID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    StandardID: Mapped[int] = mapped_column(Integer, primary_key=True)
 
 
 # [A2] Threat_Type.ThreatCategoryID is only a rough single default — real curated data
@@ -300,6 +367,8 @@ class Prompt_Log(Base):
     SessionID: Mapped[str] = mapped_column(GUID)
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
+    # Provenance, same as the pipeline-output tables above: the accountable session owner, never
+    # the author — a row exists only because a worker called an LLM. No ActorType needed.
     UserID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
     Stage: Mapped[str] = mapped_column(Unicode(20))           # 'threats' | 'scenario'
@@ -320,13 +389,38 @@ class Scenario_Audit(Base):
     SessionID: Mapped[str] = mapped_column(GUID)
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
+    # WorkflowStage this event belongs to. NULL on events that are not a stage transition
+    # (session_started, subsystem_advanced) and on stage_error, which cannot know which of the
+    # in-flight work levels failed.
     Stage: Mapped[str | None] = mapped_column(Unicode(32))
+    # NOT a plain foreign key — read the values before treating one as a broken reference:
+    #   0    = THE ASSET ITSELF (tasks.ASSET_UNIT_ID). This pipeline is asset-centric: supporting
+    #          systems are context inside ONE analysis, never separate units of work, so almost
+    #          every worker-written row carries 0. Real supporting-system ids are DB keys >= 1,
+    #          so 0 can never collide with one.
+    #   NULL = genuinely session-wide, belonging to no unit of work (session_started,
+    #          entered_review, session_cancelled, and the accept-family rows).
+    #   >= 1 = a specific supporting system. Not produced by the current asset-centric pipeline;
+    #          retained because historical rows may hold it.
     SubsystemID: Mapped[int | None] = mapped_column(Integer)
     EventType: Mapped[str] = mapped_column(Unicode(40))
+    # accept only — AuditDecision accept/reject/partial. NULL on every other event: nothing else
+    # represents a human decision.
     Decision: Mapped[str | None] = mapped_column(Unicode(30))
-    Granularity: Mapped[str | None] = mapped_column(Unicode(20))
-    ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)
+    Granularity: Mapped[str | None] = mapped_column(Unicode(20))  # regeneration_completed only
+    ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)  # library_promoted only
+    # WHO IS ACCOUNTABLE for this session — not "who typed the command". Human actions
+    # (session_started/cancel/accept) record the authenticated principal; worker-written rows are
+    # back-filled from Scenario_Session.UserID by dal.append_audit, so an auditor never has to
+    # join to answer "who is answerable for this event".
     ActorUserID: Mapped[str | None] = mapped_column(Unicode(200))
+    # WHO PERFORMED the event, which ActorUserID above deliberately does NOT answer. Because
+    # worker rows are back-filled with the session owner, `ActorUserID = gopal` alone cannot
+    # distinguish "gopal clicked accept" from "the pipeline ran and gopal is answerable for it".
+    # enums.ActorType: user = a human did it; system = a worker did it. NULL only on rows written
+    # before migration 0028 — never back-filled, because rewriting an append-only ledger would
+    # falsify records that were true when written.
+    ActorType: Mapped[str | None] = mapped_column(Unicode(20))
     DetailJSON: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime] = mapped_column(DateTime)
 

@@ -196,11 +196,52 @@ def test_update_group_embeds_every_active_row(db, mem_store):
     assert set(stub.calls[0]) == {"Firmware Tampering", "Config Tampering"}
 
 
-def test_create_items_embeds_only_the_named_items(mem_store):
+def test_create_items_embeds_only_the_named_items(db, mem_store):
     stub = _Stub()
-    count = embeddings.create_items(None, stub, "threat_catalogue", ["New Threat"])
+    # names are now resolved against the ACTIVE master rows (see the canonicalization test
+    # below), so this must name a real seeded catalogue row rather than an arbitrary string
+    count = embeddings.create_items(db, stub, "threat_catalogue", ["Bootloader implant"])
     assert count == 1
-    assert stub.calls == [["New Threat"]]
+    assert stub.calls == [["Bootloader implant"]]
+
+
+def test_resolve_names_returns_every_stored_spelling_not_just_the_first():
+    """[review-fix] The Mongo unique key is sha256(...|text), so two spellings of one name coexist
+    as separate docs — exactly the duplicate the pre-fix create_items produced. Collapsing the fold
+    index to one spelling deleted one doc and left the other live while reporting success, i.e. it
+    re-created the silent-success symptom inside the fix itself."""
+    stored = ["Denial of Service", "denial of service", "Firmware Tampering"]
+    resolved, unmatched = embeddings._resolve_names(stored, ["DENIAL OF SERVICE"])
+    assert sorted(resolved) == ["Denial of Service", "denial of service"]  # BOTH, not one
+    assert unmatched == []
+
+
+def test_group_lock_ttl_is_an_int_redis_rejects_floats():
+    """[review-fix] redis-py raises DataError on a float for SET ex= / EXPIRE, so a float TTL made
+    _group_lock raise on every acquire, hit its own fail-open handler, and never serialize anything
+    — the per-group mutex was inert against a real Redis (the test fake tolerates floats)."""
+    assert isinstance(embeddings._GROUP_LOCK_TTL_SECONDS, int)
+
+
+def test_named_admin_actions_resolve_case_insensitively_and_reject_unknown_names(db, mem_store):
+    """[canonicalization] The names come from MSSQL NVARCHAR columns (case- AND trailing-space-
+    insensitive) but were used as byte-exact Mongo keys / cache-key text. So a name that looks
+    identical in every UI matched nothing: create embedded an orphan vector under a key grounding
+    never looks up, and delete/recreate removed nothing — all three reporting SUCCESS. Resolve to
+    the master spelling, and make a genuinely unknown name an explicit failure."""
+    import pytest
+
+    stub = _Stub()
+    # differently-cased + space-padded spelling of the seeded "Bootloader implant"
+    count = embeddings.create_items(db, stub, "threat_catalogue", ["  bootloader IMPLANT "])
+    assert count == 1
+    assert stub.calls == [["Bootloader implant"]]  # embedded under the MASTER spelling, not the caller's
+
+    # a name matching no master row must fail loudly instead of reporting a success count
+    with pytest.raises(embeddings.UnknownEmbeddingNames, match="No Such Threat"):
+        embeddings.create_items(db, stub, "threat_catalogue", ["No Such Threat"])
+    with pytest.raises(embeddings.UnknownEmbeddingNames, match="No Such Threat"):
+        embeddings.recreate_group(db, stub, "threat_catalogue", names=["No Such Threat"])
 
 
 def test_recreate_group_clears_cache_then_reembeds(db, mem_store):
@@ -225,11 +266,56 @@ def test_delete_group_clears_cache_without_reembedding(db, mem_store):
     embeddings.get_vectors(stub, ["Firmware Tampering"], model_id=model_id, group="threat_type")
     assert stub.calls == [["Firmware Tampering"]]
 
-    embeddings.delete_group("threat_type")
+    embeddings.delete_group(db, "threat_type")
     assert stub.calls == [["Firmware Tampering"]]  # delete_group never embeds
 
     embeddings.get_vectors(stub, ["Firmware Tampering"], model_id=model_id, group="threat_type")
     assert len(stub.calls) == 2  # cache was actually cleared — this had to recompute
+
+
+class _FakeMongoCol:
+    """Just enough of a pymongo collection for delete_cached: distinct() + delete_many()."""
+
+    def __init__(self, texts):
+        self.texts = list(texts)
+
+    def distinct(self, field, query):
+        return list(self.texts)
+
+    def delete_many(self, query):
+        wanted = query.get("text", {}).get("$in") if "text" in query else None
+        hit = [t for t in self.texts if wanted is None or t in wanted]
+        self.texts = [t for t in self.texts if t not in hit]
+
+        class _R:
+            deleted_count = len(hit)
+        return _R()
+
+
+def test_delete_of_already_clean_master_name_is_idempotent(db, mem_store, monkeypatch):
+    """[fix 12] A name with no cached vector but a REAL active master row is 'already clean' —
+    deleting it (again) must succeed with 0, not error. An operator's cleanup script may
+    legitimately run twice; only genuine typos deserve a failure."""
+    monkeypatch.setattr(embeddings, "_store_if_healthy", lambda: _FakeMongoCol([]))
+    assert embeddings.delete_group(db, "threat_catalogue", names=["  bootloader IMPLANT "]) == 0
+    assert embeddings.delete_group(db, "threat_catalogue", names=["Bootloader implant"]) == 0  # repeatable
+
+
+def test_delete_of_totally_unknown_name_still_fails_loudly(db, mem_store, monkeypatch):
+    """[fix 12] Unknown to BOTH the vector store and the masters = a typo. The loud failure that
+    replaced the silent no-op-with-SUCCESS must survive the idempotency fix."""
+    monkeypatch.setattr(embeddings, "_store_if_healthy", lambda: _FakeMongoCol([]))
+    with pytest.raises(embeddings.UnknownEmbeddingNames, match="No Such Threat"):
+        embeddings.delete_group(db, "threat_catalogue", names=["No Such Threat"])
+
+
+def test_delete_of_orphan_vector_without_master_row_still_works(db, mem_store, monkeypatch):
+    """[fix 12] A vector can outlive its master row; clearing exactly that orphan is a legitimate
+    delete and must not require a master row to exist."""
+    fake = _FakeMongoCol(["Ghost Threat"])
+    monkeypatch.setattr(embeddings, "_store_if_healthy", lambda: fake)
+    assert embeddings.delete_group(db, "threat_catalogue", names=["ghost threat"]) == 1
+    assert fake.texts == []  # the stored spelling was the one deleted
 
 
 class _FakeLockRedis:
