@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import time
 
-from celery import Celery  # type: ignore[import-untyped]
+from celery import Celery, current_task  # type: ignore[import-untyped]
 from celery.signals import worker_init, worker_process_init  # type: ignore[import-untyped]
 
 from app.core.config import get_settings
@@ -304,18 +304,43 @@ def reap_task() -> list[str]:
 
 
 @celery_app.task(name="tsg.intel_refresh")
-def intel_refresh_task() -> dict[str, int]:
+def intel_refresh_task() -> dict[str, str]:
     """ runs automatically on a schedule (see `intel_refresh_interval_seconds`
     in config, gated by `intel_enabled`) to pull the open threat-intel feeds —
     CISA KEV, CISA ICS advisories, OTX, URLhaus, configured TAXII servers — into
     the Mongo `threat_intel` cache that scenario generation reads for enrichment.
 
-    Per-feed counts are returned for the beat log; a feed that failed reports -1.
-    refresh_all is fail-soft per feed and fail-open on Mongo, so this task never
-    raises for an ordinary outage — a down feed is a warning, not an incident."""
-    from app.intel.fetchers import refresh_all  # local import, mirrors admin-task style
+    DISPATCHER, not a worker: it spawns one `tsg.intel_refresh_feed` job per enabled
+    feed and returns {feed: job_id}. Fanning out (rather than looping the feeds inside
+    one task, as this did originally) is what buys per-feed isolation — a slow or broken
+    feed can no longer delay the others, each retries on its own, and each records its
+    own outcome — which is exactly what the per-feed status API reports."""
+    from app.intel.fetchers import enabled_feed_names  # local import, mirrors admin-task style
 
-    return refresh_all()
+    jobs = {feed: intel_refresh_feed_task.delay(feed).id for feed in enabled_feed_names()}
+    log.info("intel.refresh_dispatched", feeds=list(jobs))
+    return jobs
+
+
+@celery_app.task(
+    name="tsg.intel_refresh_feed",
+    autoretry_for=(Exception,),
+    retry_backoff=True,          # 1s, 2s, 4s … so a transient 5xx recovers on its own
+    retry_backoff_max=300,
+    retry_jitter=True,           # spread retries so five feeds can't sync into a thundering herd
+    max_retries=3,
+)
+def intel_refresh_feed_task(feed: str) -> int:
+    """Refresh exactly ONE intel feed; returns the item count.
+
+    Deliberately allowed to RAISE (unlike most tasks here): the retry policy above is the
+    point — a transient network failure re-pulls this one feed instead of waiting a full
+    day or re-downloading every other feed with it. `refresh_one` records the failure to
+    the feed's status doc BEFORE re-raising, so the outcome survives even if every retry
+    is exhausted and the Celery result later expires."""
+    from app.intel.fetchers import refresh_one
+
+    return refresh_one(feed)
 
 
 @celery_app.task(name="tsg.self_check")
@@ -359,10 +384,21 @@ def import_threat_library_task(source: str, file_content: str | None, via_taxii:
     from app.api.admin_jobs import FAMILY_EMBEDDINGS, mark_admin_job  # local import, mirrors admin-task style
     from app.pipeline import threat_library_import
 
-    with db_session() as sess:
-        stats = threat_library_import.run_import(
-            sess, source, file_content=file_content, via_taxii=via_taxii,
-            max_actors=max_actors, dry_run=dry_run)
+    # current_task.request.id ties the history row to the job the status route polls;
+    # None when called directly (tests/CLI), which the column allows.
+    job_id = getattr(getattr(current_task, "request", None), "id", None)
+    run_id = threat_library_import.record_import_started(source, dry_run=dry_run, job_id=job_id)
+    try:
+        with db_session() as sess:
+            stats = threat_library_import.run_import(
+                sess, source, file_content=file_content, via_taxii=via_taxii,
+                max_actors=max_actors, dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001 — record the failure, then let Celery mark FAILURE
+        # Own transaction, outside the rolled-back import session: a failed import that left
+        # no trace is exactly the case an operator most needs to see.
+        threat_library_import.record_import_finished(run_id, error=f"{type(exc).__name__}: {exc}")
+        raise
+    threat_library_import.record_import_finished(run_id, stats=stats)
     # Strictly after the with-block: the import's transaction has committed.
     if not dry_run and source != "misp_actors":
         # The import is ALREADY COMMITTED at this point, so a failure dispatching the follow-up

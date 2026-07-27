@@ -162,12 +162,16 @@ def import_client(engine, monkeypatch):
 
 
 def _post_import(client, body, key=_KEY):
+    """The source is the addressed RESOURCE now, so it comes out of the body and into the
+    path — tests keep passing it in `body` for readability and it is lifted here."""
     headers = {"X-Admin-Key": key} if key is not None else {}
-    return client.post("/v1/tsg/threat-library/import", json=body, headers=headers)
+    body = dict(body)
+    source = body.pop("source", "attack_ics")
+    return client.post(f"/v1/tsg/threat-library/sources/{source}/import", json=body, headers=headers)
 
 
 def _import_status(client, job_id):
-    return client.get(f"/v1/tsg/threat-library/import/status/{job_id}", headers={"X-Admin-Key": _KEY})
+    return client.get(f"/v1/tsg/threat-library/imports/{job_id}", headers={"X-Admin-Key": _KEY})
 
 
 def test_api_dry_run_happy_path(import_client):
@@ -199,7 +203,7 @@ def test_api_validation_matrix(import_client, monkeypatch):
     def code(body):
         return _post_import(import_client, body).status_code
 
-    assert code({"source": "nope"}) == 422
+    assert code({"source": "nope"}) == 404  # unknown source = missing RESOURCE, not a bad body field
     assert code({"source": "attack", "file_content": "{}", "via_taxii": True}) == 422
     assert code({"source": "pytm", "via_taxii": True}) == 422
     assert code({"source": "pytm", "file_content": "{nope"}) == 422

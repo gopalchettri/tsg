@@ -89,8 +89,12 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     # All 5 above: admin-key gated (router-level Depends(require_admin) in admin.py),
     # shared cross-tenant threat-library data — not one entity's data, so the
     # per-entity JWT model doesn't apply (see admin.py's own module docstring).
-    ("POST", "/v1/tsg/threat-library/import"): require_admin,
-    ("GET", "/v1/tsg/threat-library/import/status/{job_id}"): require_admin,
+    ("GET", "/v1/tsg/threat-library/sources"): require_admin,
+    ("POST", "/v1/tsg/threat-library/sources/{source}/import"): require_admin,
+    ("GET", "/v1/tsg/threat-library/imports/{job_id}"): require_admin,
+    ("GET", "/v1/tsg/threat-intel/feeds"): require_admin,
+    ("POST", "/v1/tsg/threat-intel/feeds/refresh"): require_admin,
+    ("POST", "/v1/tsg/threat-intel/feeds/{feed}/refresh"): require_admin,
     # Same rationale as the embeddings routes above — admin-key gated
     # (app/api/threat_library_import.py), shared cross-tenant library data.
 }

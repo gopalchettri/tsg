@@ -554,12 +554,12 @@ class ThreatLibraryImportBody(BaseModel):
     deliberately not multipart: the uploaded "file" is itself JSON text, so
     `file_content` carries it with no extra upload machinery."""
     model_config = ConfigDict(
-        json_schema_extra={"example": {"source": "attack_ics", "dry_run": True}}
+        json_schema_extra={"example": {"dry_run": True}}
     )
 
-    source: str = Field(description=(
-        "Which library to import: pytm, threat_composer, capec, attack, attack_ics, "
-        "emb3d, or misp_actors."))
+    # `source` is NOT a body field: it is the addressed resource in the path
+    # (POST /v1/tsg/threat-library/sources/{source}/import), so an unknown library is a
+    # 404 on that resource rather than a 422 on a body value.
     dry_run: bool = Field(default=False, description=(
         "Preview only — parse and report what WOULD be imported; nothing is written."))
     via_taxii: bool = Field(default=False, description=(
@@ -570,6 +570,83 @@ class ThreatLibraryImportBody(BaseModel):
     file_content: str | None = Field(default=None, description=(
         "The library file's JSON text, supplied directly instead of downloading. "
         "Size-capped by settings.threat_library_import_max_upload_mb."))
+
+
+class SourceInventoryItem(BaseModel):
+    """One threat-library source's current state — the per-source row of
+    GET /v1/tsg/threat-library/sources. `loaded=false` with a null `last_run` means the
+    source was never imported; `loaded=false` with a failed `last_run` means it was tried
+    and did not succeed. Those are different problems, so they read differently."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "source": "attack_ics", "source_tag": "mitre_attack_ics", "loaded": True,
+                "type_count": 12, "threat_count": 95, "actor_count": None,
+                "last_run": {"status": "success", "dry_run": False,
+                             "started_at": "2026-07-27T09:14:00Z",
+                             "finished_at": "2026-07-27T09:16:12Z", "error": None,
+                             "types_imported": 12, "threats_imported": 95, "actors_upserted": None},
+            }
+        }
+    )
+
+    source: str = Field(description="API source name, e.g. 'attack_ics' — the value used in the import URL.")
+    source_tag: str | None = Field(description="Provenance tag stamped on this source's imported rows (Threat_Type.Source).")
+    loaded: bool = Field(description="True when this source has contributed rows to the library.")
+    type_count: int = Field(description="Threat_Type (family) rows attributed to this source.")
+    threat_count: int = Field(description="Threat_Catalogue (exact threat) rows attributed to this source.")
+    actor_count: int | None = Field(default=None, description="Threat_Actor rows — misp_actors only; null for every other source.")
+    last_run: dict[str, Any] | None = Field(default=None, description="Most recent import attempt for this source, or null if never attempted.")
+
+
+class SourcesInventoryResponse(BaseModel):
+    """Every known source, imported or not — so 'pending' is visible rather than absent."""
+    sources: list[SourceInventoryItem]
+
+
+class IntelFeedStatus(BaseModel):
+    """One live-intel feed's operational state (GET /v1/tsg/threat-intel/feeds).
+
+    Reports three distinguishable conditions that used to look identical: `enabled=false`
+    (switched off), `enabled=true` with no `last_success_at` (never ran), and a populated
+    `last_error` (ran and failed). A `last_success_at` with `item_count` unchanged is also
+    normal — some feeds are incremental and legitimately fetch nothing new."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "feed": "cisa_kev", "enabled": True, "item_count": 1653,
+                "kinds": {"cve": 1653}, "prompted": True,
+                "last_fetched_at": "2026-07-27T03:00:00Z",
+                "last_attempt_at": "2026-07-27T03:00:00Z",
+                "last_success_at": "2026-07-27T03:00:00Z", "last_error": None,
+            }
+        }
+    )
+
+    feed: str = Field(description="Feed name, e.g. 'cisa_kev' — the value used in the refresh URL.")
+    enabled: bool = Field(description="Whether this feed is switched on by configuration right now.")
+    item_count: int = Field(description="Cached items currently held for this feed.")
+    kinds: dict[str, int] = Field(default_factory=dict, description="Cached item counts by kind (cve, ics_advisory, pulse, ioc_url).")
+    prompted: bool = Field(description="Whether this feed's items can reach the LLM. IOC feeds are cached but never prompted.")
+    last_fetched_at: datetime | None = Field(default=None, description="Newest fetched_at across this feed's cached items.")
+    last_attempt_at: datetime | None = Field(default=None, description="When a refresh of this feed last ran, successful or not.")
+    last_success_at: datetime | None = Field(default=None, description="When this feed last refreshed successfully.")
+    last_error: str | None = Field(default=None, description="Error from the last attempt, or null if it succeeded.")
+
+
+class IntelFeedsResponse(BaseModel):
+    """Every known feed, enabled or not."""
+    feeds: list[IntelFeedStatus]
+
+
+class IntelRefreshAccepted(BaseModel):
+    """Queued refresh jobs. The all-feeds route fans out, so `jobs` carries one entry per
+    feed dispatched — a single feed's refresh returns exactly one."""
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"jobs": {"cisa_kev": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}}}
+    )
+
+    jobs: dict[str, str] = Field(description="feed name -> Celery job id for the refresh queued for it.")
 
 
 class ThreatLibraryImportAccepted(BaseModel):

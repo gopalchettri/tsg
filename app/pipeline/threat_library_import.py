@@ -18,12 +18,15 @@ import json
 import re
 import urllib.request
 
-from sqlalchemy import func, select
+from typing import Any
+
+from sqlalchemy import func, insert, select, update
 
 from app.core.enums import ThreatRuleType
 from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
+from app.db.dal import guid, now
 
 log = get_logger(__name__)
 
@@ -357,6 +360,70 @@ def source_count(sess, tag: str) -> int:
     return sess.execute(
         select(func.count()).select_from(m.Threat_Catalogue).where(m.Threat_Catalogue.Source == tag)
     ).scalar() or 0
+
+
+def record_import_started(source: str, *, dry_run: bool, job_id: str | None,
+                          started_by: str | None = None) -> str:
+    """Open a `running` row for this import and return its RunID.
+
+    Its OWN session, deliberately separate from the import's: the row must survive the
+    import's transaction rolling back, otherwise a failed import leaves no trace at all —
+    which is the single case an operator most needs to see. Best-effort: history is
+    bookkeeping and must never be the reason an import fails to start."""
+    from app.db.engine import db_session
+
+    run_id = guid()
+    try:
+        with db_session() as sess:
+            sess.execute(insert(m.Threat_Library_Import_Run).values(
+                RunID=run_id, Source=source, SourceTag=SOURCE_TAGS.get(source),
+                DryRun=dry_run, Status="running", JobID=job_id, StartedBy=started_by,
+                StartedAt=now()))
+    except Exception:  # noqa: BLE001
+        log.warning("import.history_start_failed", source=source, exc_info=True)
+    return run_id
+
+
+def record_import_finished(run_id: str, *, stats: dict | None = None, error: str | None = None) -> None:
+    """Close the run row as `success` (with the counts run_import returned) or `failed`.
+    Same own-session, best-effort contract as record_import_started above."""
+    from app.db.engine import db_session
+
+    stats = stats or {}
+    values: dict[str, Any] = {
+        "Status": "failed" if error else "success",
+        "FinishedAt": now(),
+        "ErrorMessage": str(error)[:4000] if error else None,
+    }
+    if not error:
+        values.update(
+            TypesImported=stats.get("types"), ThreatsImported=stats.get("threats"),
+            ActorsUpserted=stats.get("actors_upserted"), SkippedCount=stats.get("skipped_count"),
+            OtRules=len(stats.get("ot_rules") or []))
+    try:
+        with db_session() as sess:
+            sess.execute(update(m.Threat_Library_Import_Run)
+                         .where(m.Threat_Library_Import_Run.RunID == run_id)
+                         .values(**values))
+    except Exception:  # noqa: BLE001
+        log.warning("import.history_finish_failed", run_id=run_id, exc_info=True)
+
+
+def latest_runs_by_source(sess) -> dict[str, dict[str, Any]]:
+    """The most recent run per source — the `last_run` block of the inventory API.
+    One query for every source, not one per source."""
+    r = m.Threat_Library_Import_Run
+    newest = (select(r.Source, func.max(r.StartedAt).label("started"))
+              .group_by(r.Source).subquery())
+    rows = sess.execute(
+        select(r).join(newest, (r.Source == newest.c.Source) & (r.StartedAt == newest.c.started))
+    ).scalars().all()
+    return {row.Source: {
+        "status": row.Status, "dry_run": bool(row.DryRun), "started_at": row.StartedAt,
+        "finished_at": row.FinishedAt, "error": row.ErrorMessage,
+        "types_imported": row.TypesImported, "threats_imported": row.ThreatsImported,
+        "actors_upserted": row.ActorsUpserted,
+    } for row in rows}
 
 
 def import_records(sess, records: list[dict], tag: str) -> dict:

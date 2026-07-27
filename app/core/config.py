@@ -524,8 +524,8 @@ def assert_security_posture(settings: Settings | None = None) -> None:
         # but an unset JWKS URL only surfaces as every request 401-ing on a key fetch of "".
         # Fail at boot instead, naming exactly which env vars are missing.
         missing = [env for env, value in (("TSG_JWT_JWKS_URL", s.jwt_jwks_url),
-                                          ("TSG_JWT_ISSUER", s.jwt_issuer),
-                                          ("TSG_JWT_AUDIENCE", s.jwt_audience)) if not value]
+                                        ("TSG_JWT_ISSUER", s.jwt_issuer),
+                                        ("TSG_JWT_AUDIENCE", s.jwt_audience)) if not value]
         if missing:
             raise RuntimeError(
                 f"APP_ENV={s.app_env} requires JWT verification to be fully configured; "

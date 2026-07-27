@@ -189,6 +189,31 @@ class Threat_Scenario_Output(Base):
     ControlsMappedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
+class Threat_Library_Import_Run(Base):
+    """One row per threat-library import attempt (celery_app.import_threat_library_task).
+
+    Exists so "which sources are imported, when, and did any fail?" survives the Celery
+    result expiring — the inventory API (GET /v1/tsg/threat-library/sources) joins the
+    latest run per source onto the row counts. The terminal row is committed in its own
+    transaction so a FAILED import still leaves a record."""
+    __tablename__ = "Threat_Library_Import_Run"
+    RunID: Mapped[str] = mapped_column(GUID, primary_key=True)
+    Source: Mapped[str] = mapped_column(Unicode(50))              # API source name
+    SourceTag: Mapped[str | None] = mapped_column(Unicode(50))    # provenance tag on the imported rows
+    DryRun: Mapped[bool] = mapped_column(Boolean, default=False)
+    Status: Mapped[str] = mapped_column(Unicode(20))              # running | success | failed
+    JobID: Mapped[str | None] = mapped_column(Unicode(100))
+    StartedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    StartedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    FinishedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    TypesImported: Mapped[int | None] = mapped_column(Integer)
+    ThreatsImported: Mapped[int | None] = mapped_column(Integer)
+    ActorsUpserted: Mapped[int | None] = mapped_column(Integer)
+    OtRules: Mapped[int | None] = mapped_column(Integer)
+    SkippedCount: Mapped[int | None] = mapped_column(Integer)
+    ErrorMessage: Mapped[str | None] = mapped_column(UnicodeText)
+
+
 class Threat_Scenario_Control_Map(Base):
     """Step 4: which Control_Library rows mitigate one generated scenario (control_mapping.map_controls).
     No Superseded/epoch columns — visibility follows the parent Threat_Scenario_Output row,

@@ -172,6 +172,25 @@ IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ControlsMappedAt') IS NULL
     ALTER TABLE Threat_Scenario_Output ADD ControlsMappedAt datetime2 NULL;
 
+IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NULL
+CREATE TABLE Threat_Library_Import_Run (
+    RunID            uniqueidentifier NOT NULL CONSTRAINT PK_Threat_Library_Import_Run PRIMARY KEY,
+    Source           nvarchar(50)  NOT NULL,   -- API source name: attack | attack_ics | capec | emb3d | pytm | threat_composer | misp_actors
+    SourceTag        nvarchar(50)  NULL,       -- provenance tag stamped on the imported rows (Threat_Type.Source)
+    DryRun           bit           NOT NULL,
+    Status           nvarchar(20)  NOT NULL,   -- running | success | failed
+    JobID            nvarchar(100) NULL,       -- Celery task id, for correlating with the import status route
+    StartedBy        nvarchar(200) NULL,
+    StartedAt        datetime2     NULL,
+    FinishedAt       datetime2     NULL,
+    TypesImported    int           NULL,
+    ThreatsImported  int           NULL,
+    ActorsUpserted   int           NULL,
+    OtRules          int           NULL,
+    SkippedCount     int           NULL,
+    ErrorMessage     nvarchar(max) NULL
+);
+
 IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NULL
 CREATE TABLE Threat_Scenario_Control_Map (
     OutputID          uniqueidentifier NOT NULL,
@@ -197,7 +216,7 @@ CREATE TABLE Scenario_Audit (
     Granularity      nvarchar(20)  NULL,
     ThreatTypeRefID  int           NULL,
     ActorUserID      nvarchar(200) NULL,   -- who is ACCOUNTABLE (back-filled to the session owner)
-    ActorType        nvarchar(20)  NULL,   -- who PERFORMED it: 'user' | 'system'  (migration 0028)
+    ActorType        nvarchar(20)  NULL,   -- who PERFORMED it: 'user' | 'system' (see enums.ActorType)
     DetailJSON       nvarchar(max) NULL,
     CreatedAt        datetime2     NOT NULL
 );
@@ -395,7 +414,7 @@ SELECT 'RCSI' AS what, CAST(is_read_committed_snapshot_on AS int) AS ok FROM sys
 UNION ALL
 SELECT TABLE_NAME, 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME IN (
     'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Scoped_Threat',
-    'Threat_Scenario_Output','Threat_Scenario_Control_Map','Scenario_Audit','Prompt_Log','Threat_Candidate_Review',
+    'Threat_Scenario_Output','Threat_Scenario_Control_Map','Threat_Library_Import_Run','Scenario_Audit','Prompt_Log','Threat_Candidate_Review',
     'Threat_Category','Threat_Type','Threat_Catalogue','Threat_Actor','ThreatType_ThreatActor_Map')
 UNION ALL
 SELECT TABLE_NAME + '.' + COLUMN_NAME, 1 FROM INFORMATION_SCHEMA.COLUMNS

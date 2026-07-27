@@ -21,6 +21,7 @@ log = get_logger(__name__)
 _JOB_KEY_PREFIX = "tsg:admin:job:"
 FAMILY_EMBEDDINGS = "emb"
 FAMILY_IMPORT = "import"
+FAMILY_INTEL = "intel"   # per-feed threat-intel refresh jobs (app/api/threat_intel.py)
 
 
 def _key(job_id: str, family: str) -> str:

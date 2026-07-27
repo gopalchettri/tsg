@@ -17,6 +17,7 @@ from app.api.errors import register_error_handlers
 from app.api.health import router as health_router
 from app.api.route_audit import assert_routes_authenticated
 from app.api.sessions import router as sessions_router
+from app.api.threat_intel import router as threat_intel_router
 from app.api.threat_library_import import router as threat_library_import_router
 from app.core.middleware import BodySizeLimitMiddleware, RequestIDMiddleware
 
@@ -84,6 +85,7 @@ def create_app() -> FastAPI:
     app.include_router(sessions_router)
     app.include_router(admin_router)
     app.include_router(threat_library_import_router)
+    app.include_router(threat_intel_router)
     # [R2 remainder] fail-closed: refuse to boot if any route is missing its entity-scoping
     # dependency, or was never triaged at all — see app/api/route_audit.py. Audits `app`
     # itself (not a hand-maintained router list) so a future router can't ship unaudited.

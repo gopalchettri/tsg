@@ -37,6 +37,15 @@ _breaker_open_until = 0.0
 # for analysts/future use but stay out of the LLM context.
 PROMPT_KINDS = ("cve", "ics_advisory", "pulse")
 
+# Every feed this module knows how to fetch, in report order. The status API reports ALL
+# of them — not just the enabled ones — so "switched off" is visibly different from
+# "enabled but never ran". Keep in step with _enabled_fetchers below.
+ALL_FEEDS = ("cisa_kev", "cisa_ics", "otx", "urlhaus", "taxii")
+
+# Feeds whose items can reach the LLM (they emit PROMPT_KINDS). urlhaus is the deliberate
+# exception: cached for analysts, never prompted — raw IOCs are noise in a narrative scenario.
+PROMPTED_FEEDS = ("cisa_kev", "cisa_ics", "otx", "taxii")
+
 
 @lru_cache
 def _intel_store():
@@ -84,7 +93,7 @@ def _get(url: str, headers: dict[str, str] | None = None, timeout: int = 120) ->
 
 
 def _doc(source: str, kind: str, external_id: str, title: str, *, description: str = "",
-         url: str = "", tags: list[str] | None = None, raw: Any = None) -> dict:
+        url: str = "", tags: list[str] | None = None, raw: Any = None) -> dict:
     return {
         "source": source, "kind": kind, "external_id": str(external_id)[:200],
         "title": (title or "")[:500], "description": (description or "")[:2000],
@@ -213,34 +222,128 @@ def _enabled_fetchers(s) -> list[tuple[str, Any]]:
     return out
 
 
-def refresh_all() -> dict[str, int]:
-    """Fetch every enabled feed and upsert into Mongo. Fail-soft per feed:
-    a dead feed logs and reports -1, the rest still complete."""
+def enabled_feed_names() -> list[str]:
+    """Names of the feeds switched on right now — the fan-out list the dispatcher task
+    spawns one job per (celery_app.intel_refresh_task) and the status API reports on."""
+    return [name for name, _ in _enabled_fetchers(get_settings())]
+
+
+def _record_feed_status(col, feed: str, *, items: int | None = None, error: str | None = None) -> None:
+    """One status doc per feed in `intel_feed_status`, so an outcome OUTLIVES the Celery
+    result that reported it. Without this, a feed that failed at 03:00 is indistinguishable
+    from one that was never switched on — the exact blind spot the status API exists to close.
+    Best-effort: bookkeeping must never fail the refresh it is describing."""
+    now = datetime.now(timezone.utc)
+    update: dict[str, Any] = {"last_attempt_at": now, "last_error": error}
+    if error is None:
+        update["last_success_at"] = now
+        update["item_count"] = items
+    try:
+        col.database["intel_feed_status"].update_one(
+            {"feed": feed}, {"$set": update, "$setOnInsert": {"feed": feed}}, upsert=True)
+    except Exception:  # noqa: BLE001 — status bookkeeping is never worth failing a refresh over
+        log.warning("intel.status_record_failed", feed=feed, exc_info=True)
+
+
+def refresh_one(feed: str) -> int:
+    """Fetch ONE feed and upsert it into Mongo; returns the item count.
+
+    The unit the per-feed Celery task wraps (celery_app.intel_refresh_feed_task), so one
+    slow or broken feed can neither delay nor fail the others, and can be retried on its
+    own instead of re-pulling everything. Raises on fetch/parse failure — the caller's
+    retry policy decides what to do — but always records the outcome first.
+
+    Note some feeds are deliberately INCREMENTAL (fetch_ics_advisories skips advisories
+    already cached), so a count of 0 on an up-to-date cache is success, not a silent
+    failure — read `last_success_at` from the status doc, not the count, to judge health."""
     from pymongo import ReplaceOne
 
     s = get_settings()
+    fetcher = dict(_enabled_fetchers(s)).get(feed)
+    if fetcher is None:
+        raise ValueError(f"unknown or disabled intel feed: {feed!r}")
+    col = _store_if_healthy()
+    if col is None:
+        raise RuntimeError("intel refresh skipped: Mongo unavailable")
+    try:
+        docs = fetcher(s)
+        now = datetime.now(timezone.utc)
+        for d in docs:
+            d["fetched_at"] = now
+        if docs:
+            col.bulk_write([
+                ReplaceOne({"source": d["source"], "external_id": d["external_id"]}, d, upsert=True)
+                for d in docs
+            ], ordered=False)
+    except Exception as exc:  # noqa: BLE001 — record, then re-raise for the retry policy
+        _record_feed_status(col, feed, error=f"{type(exc).__name__}: {exc}"[:500])
+        log.warning("intel.feed_failed", feed=feed, exc_info=True)
+        raise
+    _record_feed_status(col, feed, items=len(docs))
+    log.info("intel.feed_refreshed", feed=feed, items=len(docs))
+    return len(docs)
+
+
+def refresh_all() -> dict[str, int]:
+    """Every enabled feed, in-process and sequential — the CLI/back-compat path.
+
+    Production refreshes go through the fan-out instead (one Celery task per feed, see
+    celery_app.intel_refresh_task), which gets parallelism, per-feed retry and per-feed
+    isolation this loop cannot offer. Kept fail-soft (a dead feed reports -1 and the rest
+    still run) so a direct caller kicking every feed by hand behaves as it always did."""
     col = _store_if_healthy()
     if col is None:
         log.warning("intel.refresh_skipped_mongo_down")
         return {}
     results: dict[str, int] = {}
-    now = datetime.now(timezone.utc)
-    for name, fetcher in _enabled_fetchers(s):
+    for name in enabled_feed_names():
         try:
-            docs = fetcher(s)
-            for d in docs:
-                d["fetched_at"] = now
-            if docs:
-                col.bulk_write([
-                    ReplaceOne({"source": d["source"], "external_id": d["external_id"]}, d, upsert=True)
-                    for d in docs
-                ], ordered=False)
-            results[name] = len(docs)
-            log.info("intel.feed_refreshed", feed=name, items=len(docs))
+            results[name] = refresh_one(name)
         except Exception:  # noqa: BLE001 — fail-soft: next feed still runs
             results[name] = -1
-            log.warning("intel.feed_failed", feed=name, exc_info=True)
     return results
+
+
+def feed_status() -> list[dict[str, Any]]:
+    """Per-feed operational state for the status API: enabled flag, cached item count and
+    freshness (aggregated from the intel docs themselves) merged with the last attempt /
+    success / error recorded by `_record_feed_status`.
+
+    Every KNOWN feed is reported, enabled or not, so "switched off", "never run" and "ran
+    and failed" read as three different states instead of one indistinguishable silence."""
+    enabled = set(enabled_feed_names())
+    col = _store_if_healthy()
+    by_source: dict[str, dict[str, Any]] = {}
+    status_docs: dict[str, dict[str, Any]] = {}
+    if col is not None:
+        try:
+            for r in col.aggregate([{"$group": {
+                    "_id": {"s": "$source", "k": "$kind"},
+                    "n": {"$sum": 1}, "last": {"$max": "$fetched_at"}}}]):
+                cur = by_source.setdefault(r["_id"]["s"], {"item_count": 0, "kinds": {}, "last_fetched_at": None})
+                cur["item_count"] += r["n"]
+                cur["kinds"][r["_id"]["k"]] = r["n"]
+                if r["last"] and (cur["last_fetched_at"] is None or r["last"] > cur["last_fetched_at"]):
+                    cur["last_fetched_at"] = r["last"]
+            status_docs = {d["feed"]: d for d in col.database["intel_feed_status"].find({}, {"_id": 0})}
+        except Exception:  # noqa: BLE001 — reporting degrades, never raises
+            log.warning("intel.status_read_failed", exc_info=True)
+    out = []
+    for feed in ALL_FEEDS:
+        agg = by_source.get(feed, {})
+        st = status_docs.get(feed, {})
+        out.append({
+            "feed": feed,
+            "enabled": feed in enabled,
+            "item_count": agg.get("item_count", 0),
+            "kinds": agg.get("kinds", {}),
+            "last_fetched_at": agg.get("last_fetched_at"),
+            "last_attempt_at": st.get("last_attempt_at"),
+            "last_success_at": st.get("last_success_at"),
+            "last_error": st.get("last_error"),
+            "prompted": feed in PROMPTED_FEEDS,
+        })
+    return out
 
 
 def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",), limit: int = 5) -> list[dict]:
