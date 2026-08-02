@@ -1,19 +1,12 @@
-""" runs the AI models that don't need the internet — they
-live directly on this machine's disk and do their thinking right here.
+"""Local, in-process embedding + reranker models (no network) — `multilingual-e5-large` and
+`bge-reranker-v2-m3`.
 
-Local, in-process embedding + reranker models (no network) — lists
-`multilingual-e5-large` and `bge-reranker-v2-m3` as local models.
+Models load once from disk (cached). `sentence-transformers` is an OPTIONAL dependency
+(`pip install -e ".[local]"`), imported lazily so the proxy path and tests never require torch.
 
-Models load once from disk (cached). `sentence-transformers` is an OPTIONAL
-dependency (`pip install -e ".[local]"`), imported lazily so the proxy path and
-tests never require torch.
-
-Torch forward passes are CPU/GPU-bound with no yield point, so running them on a
-gevent greenlet would freeze the whole worker hub (all concurrent sessions). They
-are therefore offloaded to a real OS thread: torch releases the GIL during the
-forward pass, and gevent's patched `future.result()` yields the hub while it runs.
-e5 query:/passage: prefixing is applied upstream in `llm.embed` (provider-agnostic),
-not here.
+Torch forward passes are CPU/GPU-bound with no yield point, so they are offloaded to a real OS
+thread (see `_offload`). e5 query:/passage: prefixing is applied upstream in `llm.embed`
+(provider-agnostic), not here.
 """
 from __future__ import annotations
 
@@ -29,17 +22,12 @@ log = get_logger(__name__)
 
 
 def _offload(fn: Callable):
-    """ runs a slow AI calculation on a separate real thread
-    so it doesn't freeze the rest of the worker while it's thinking.
+    """Run a CPU-bound model call without freezing a cooperative scheduler.
 
-    Run a CPU-bound model call without freezing a cooperative scheduler.
-
-    Under gevent (patched `threading`), a normal ThreadPoolExecutor would run its
-    workers as GREENLETS — so torch would still block the hub. The correct offload
-    is gevent's NATIVE threadpool (real OS threads): the greenlet yields while a real
-    thread runs the forward pass (torch releases the GIL), so the hub keeps ticking.
-    Outside gevent (prefork worker / sync / tests) there's no shared hub to protect,
-    so run inline.
+    Under gevent (patched `threading`), a normal ThreadPoolExecutor runs its workers as
+    GREENLETS — torch would still block the hub, stalling every concurrent session. gevent's
+    NATIVE threadpool uses real OS threads: the greenlet yields while torch (which releases the
+    GIL) runs. Outside gevent there's no shared hub to protect, so run inline.
     """
     patched = False
     try:  # scope: ONLY the gevent-availability probe — never the work below
@@ -57,12 +45,8 @@ def _offload(fn: Callable):
 
 @lru_cache(maxsize=get_settings().local_model_cache_size)
 def _embedder(path: str):
-    """ loads the local text-to-vector model from disk (once),
-    and remembers it so it's never reloaded on every call.
-
-    Load (and cache) the SentenceTransformer at `path` — `lru_cache` keyed on the
-    path string means switching `EMBEDDING_MODEL` at runtime gets its own cache slot
-    instead of silently reusing a stale model."""
+    """Load (and cache) the SentenceTransformer at `path` — `lru_cache` keyed on the path string
+    means switching `EMBEDDING_MODEL` at runtime gets its own slot instead of a stale model."""
     from sentence_transformers import SentenceTransformer
 
     log.info("local.embedder.loading", path=path)
@@ -76,11 +60,7 @@ def _embedder(path: str):
 
 @lru_cache(maxsize=get_settings().local_model_cache_size)
 def _reranker(path: str):
-    """ loads the local relevance-scoring model from disk
-    (once), same idea as `_embedder` above.
-
-    Load (and cache) the CrossEncoder at `path`, mirroring `_embedder`'s
-    per-path `lru_cache` slot for `RERANKER_MODEL`."""
+    """Load (and cache) the CrossEncoder at `path`, mirroring `_embedder`'s per-path slot."""
     from sentence_transformers import CrossEncoder
 
     log.info("local.reranker.loading", path=path)
@@ -90,19 +70,14 @@ def _reranker(path: str):
 
 
 def embed(texts: Sequence[str]) -> list[list[float]]:
-    """ turns a batch of text into vectors, using the local model.
-
-    Encode already-prefixed texts on a worker thread (keeps the gevent hub alive).
-    The (cached, usually-instant) model lookup runs inside `_run` too, not before
-    it — a cache-miss disk load is exactly the non-yielding work `_offload` exists
-    to protect the hub from, so it must never run on the calling greenlet either."""
+    """Encode already-prefixed texts on a worker thread. The model lookup runs inside `_run`,
+    not before it — a cache-miss disk load is exactly the non-yielding work `_offload` exists to
+    keep off the calling greenlet."""
     texts = list(texts)
     if not texts:  # ponytail: empty batch → no model load, no threadpool hop, []-in-[]-out
         return []
 
     def _run():
-        """The actual model lookup + torch forward pass, closed over `texts` so
-        `_offload` can run it as a zero-arg callable on the native threadpool."""
         model = _embedder(get_settings().embedding_model)
         vectors = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
         return [v.tolist() for v in vectors]
@@ -118,31 +93,24 @@ def rerank(query: str, docs: Sequence[str]) -> list[float]:
 
 
 def rerank_pairs(pairs: Sequence[tuple[str, str]]) -> list[float]:
-    """ scores how relevant each document is to its paired query,
-    using the local model.
+    """Score (query, doc) pairs → 0-100. bge-reranker (num_labels==1) already applies sigmoid in
+    `predict`, so its output is a [0,1] probability — scale x100 and clamp, do NOT sigmoid again.
+    Re-calibrate the 60/75 bands per §8.4 if the model changes.
 
-    Score (query, doc) pairs → 0-100. bge-reranker (num_labels==1) already applies
-    sigmoid in `predict`, so its output is a [0,1] probability — scale x 100 and clamp
-    (do NOT sigmoid again). Re-calibrate the 60/75 bands per §8.4 if the model changes.
-
-    Takes explicit pairs (not one query + docs) so a caller with MANY queries can score
-    them all in ONE model dispatch — cross-encoders score each pair independently, so
-    batching across queries is score-identical, and predict() mini-batches internally,
-    so a large batch is one dispatch, not one oversized tensor (llm.rerank_many)."""
+    Takes explicit pairs (not one query + docs) so a caller with MANY queries can score them all
+    in ONE dispatch — cross-encoders score each pair independently, so batching across queries is
+    score-identical, and predict() mini-batches internally (llm.rerank_many)."""
     if not pairs:
         return []
 
     def _run():
-        """The actual model lookup + torch forward pass, closed over `pairs` so
-        `_offload` can run it as a zero-arg callable on the native threadpool."""
         model = _reranker(get_settings().reranker_model)
         scores = [float(x) for x in model.predict(pairs)]
         out_of_range = [x for x in scores if x < -0.05 or x > 1.05]
         if out_of_range:
-            # RERANKER_MODEL is operator-configurable; this transform assumes a sigmoid-
-            # bounded [0,1] output (bge-reranker's num_labels==1 predict()). A model that
-            # doesn't sigmoid internally would otherwise clamp silently to 0/100 and destroy
-            # relative ranking with no error anywhere downstream — surface it instead.
+            # RERANKER_MODEL is operator-configurable and this transform assumes a sigmoid-bounded
+            # [0,1] output. A model that doesn't sigmoid internally would clamp silently to 0/100
+            # and destroy relative ranking with no error anywhere downstream — surface it.
             log.warning("local.reranker.score_out_of_expected_range",
                         model=get_settings().reranker_model, sample=out_of_range[:5])
         return [max(0.0, min(100.0, 100.0 * x)) for x in scores]
@@ -157,8 +125,8 @@ def _require_path_exists(setting_name: str, path: str) -> None:
 
 
 def _check_embedding_prefix_style(model_path: str, prefix_style: str) -> None:
-    """e5 prefix scheme is unambiguous: reject EMBEDDING_PREFIX_STYLE=auto when the
-    model name can't be used to infer it, so query:/passage: prefixes aren't silently dropped."""
+    """Reject EMBEDDING_PREFIX_STYLE=auto when the model name can't be used to infer the scheme,
+    so query:/passage: prefixes aren't silently dropped."""
     if prefix_style == "auto" and "e5" not in model_path.lower():
         raise RuntimeError(
             f"EMBEDDING_PREFIX_STYLE=auto cannot infer the prefix scheme from '{model_path}'. "
@@ -174,15 +142,11 @@ def _require_sentence_transformers_installed() -> None:
 
 
 def validate_local_models(settings: Settings | None = None, *, warm: bool) -> None:
-    """ checks at startup that the local AI models are
-    actually present and set up correctly, so a mistake is caught right away
-    instead of causing a confusing crash later, deep in the pipeline.
-
-    Fail fast at startup when a 'local' provider is misconfigured — a missing
-    path, missing `sentence-transformers`, or a dimension mismatch surfaces here
-    instead of crashing deep in the pipeline. `warm=True` (workers) also loads the
-    models so the first request doesn't pay the load; `warm=False` (API) only checks
-    the path exists (the API doesn't ground, so it needn't hold the model in RAM)."""
+    """Fail fast at startup when a 'local' provider is misconfigured — a missing path, missing
+    `sentence-transformers`, or a dimension mismatch surfaces here instead of crashing deep in
+    the pipeline. `warm=True` (workers) also loads the models so the first request doesn't pay
+    the load; `warm=False` (API) only checks the path exists — the API doesn't ground, so it
+    needn't hold the model in RAM."""
     s = settings or get_settings()
     local_used = s.embedding_provider == "local" or s.reranker_provider == "local"
 

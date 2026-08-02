@@ -60,7 +60,7 @@ def list_feeds(_principal: Principal = Depends(get_principal)) -> IntelFeedsResp
 
 @router.post("/feeds/refresh", response_model=IntelRefreshAccepted, status_code=202)
 def refresh_all_feeds(request: Request,
-                      principal: Principal = Depends(get_principal)) -> IntelRefreshAccepted:
+                    principal: Principal = Depends(get_principal)) -> IntelRefreshAccepted:
     """Refresh every ENABLED feed now, without waiting for the daily schedule.
 
     Fans out to one job per feed rather than one job doing all of them, so a slow or
@@ -76,7 +76,7 @@ def refresh_all_feeds(request: Request,
 
 @router.post("/feeds/{feed}/refresh", response_model=IntelRefreshAccepted, status_code=202)
 def refresh_feed(feed: str, request: Request,
-                 principal: Principal = Depends(get_principal)) -> IntelRefreshAccepted:
+                principal: Principal = Depends(get_principal)) -> IntelRefreshAccepted:
     """Refresh ONE feed — the targeted retry after a failure, instead of re-pulling
     everything. Unknown feed → 404 (it is the addressed resource); a known but disabled
     feed → 404 as well, with a message naming it as disabled, since there is nothing to

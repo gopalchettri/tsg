@@ -141,7 +141,7 @@ def test_500_hides_internals_in_prod(engine, monkeypatch):
     from app.core.config import get_settings
     get_settings.cache_clear()
     try:
-        monkeypatch.setattr("app.db.dal.load_session", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        monkeypatch.setattr("app.db.dal.load_session_board", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         r = _make_client_no_raise({"5"}).get("/v1/sessions/anything")
         assert r.status_code == 500
         body = r.json()
@@ -156,7 +156,7 @@ def test_500_shows_internals_in_dev(engine, monkeypatch):
     from app.core.config import get_settings
     get_settings.cache_clear()
     try:
-        monkeypatch.setattr("app.db.dal.load_session", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        monkeypatch.setattr("app.db.dal.load_session_board", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         r = _make_client_no_raise({"5"}).get("/v1/sessions/anything")
         assert r.status_code == 500
         assert "boom" in r.json()["message"]

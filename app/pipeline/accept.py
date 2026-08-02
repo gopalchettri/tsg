@@ -48,6 +48,42 @@ class AcceptConflict(Exception):
         self.reason = reason
 
 
+#: How many offending ids to name in the human-readable message. `details.unacceptable` always
+#: carries every one — this only stops a 50-id request producing an unreadable sentence.
+_NAMED_IN_MESSAGE = 3
+
+#: Sentence fragments, so "<id> <text>" reads as plain English. No internal vocabulary:
+#: "OutputID", "subset" and "superseded" mean nothing to whoever is reading the response.
+_REASON_TEXT = {
+    "superseded": "is an older version that a regeneration replaced",
+    "failure_card": "failed to generate, so it has no content to accept",
+    "subsystem_not_awaiting_decision": "is not ready for review yet",
+    "unknown": "is not a scenario in this session",
+}
+
+
+def _unacceptable_subset(sess: Session, session_id: str, subset: list[str],
+                        good_subs: list[int], *, requested: int, matched: int) -> NotFoundError:
+    """Build the partial-accept 404, naming each id that cannot be accepted and why.
+
+    Returns rather than raises so the call site still reads as `raise ...` — the diagnosis is a
+    one-off read on a request that is already failing, not control flow."""
+    reasons = dal.unacceptable_subset_reasons(sess, session_id, subset, good_subs)
+    named = list(reasons)[:_NAMED_IN_MESSAGE]
+    # Outcome FIRST — "nothing was accepted" is the fact the reader acts on, and burying it
+    # mid-sentence invited "so did the other two go through?". Then what is wrong, then the one
+    # thing to do. No `subset`/OutputID jargon, and no second aside competing with the action.
+    shown = "; ".join(f"{oid} {_REASON_TEXT.get(reasons[oid], reasons[oid])}" for oid in named)
+    more = f"; and {len(reasons) - len(named)} more" if len(reasons) > len(named) else ""
+    return NotFoundError(
+        f"Nothing was accepted. {requested - matched} of the {requested} scenarios you selected "
+        f"cannot be accepted: {shown}{more}. Get the current scenario ids from "
+        f"GET /v1/sessions/{session_id}/results and try again.",
+        details={"requested": requested, "matched": matched,
+                "unacceptable": [{"output_id": oid, "reason": r} for oid, r in reasons.items()]},
+    )
+
+
 class MasterInactive(Exception):
     """A grounded master id was deactivated since Stage 2 → block accept ([R6])."""
 
@@ -121,9 +157,8 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             # legitimate duplicate-id request as a mismatch.
             requested = len(set(subset))
             if matched != requested:
-                raise NotFoundError(
-                    f"{requested - matched} of {requested} requested OutputID(s) in `subset` did "
-                    f"not match an active, awaiting-decision scenario in session {session_id}")
+                raise _unacceptable_subset(sess, session_id, subset, good_subs,
+                                        requested=requested, matched=matched)
         else:
             # [FIX L1 class-killer] accept-all must cover EVERY subsystem that still owns active,
             # reviewable scenarios — not just the ones good_subs (SCENARIOS @ AWAITING_DECISION)
@@ -209,8 +244,8 @@ def review_gate_reason(scenario_session: RowMapping | dict) -> tuple[str, str] |
         return ("session_completed",
                 f"session already completed at {scenario_session['CompletedAt']} — the review "
                 f"decision is final; accepted scenarios are available via "
-                f"GET /v1/assets/{scenario_session['AssetID']}/accepted-scenarios, and a new "
-                f"session for this asset can run a fresh review")
+                f"GET /v1/sessions/{scenario_session['SessionID']}/accepted-scenarios, "
+                f"and a new session for this asset can run a fresh review")
     if status == SessionStatus.cancelled:
         return ("session_cancelled",
                 f"session was cancelled — start a new session for asset {scenario_session['AssetID']}")
@@ -286,10 +321,14 @@ def _pick_sector_for_promotion(scenario_session: RowMapping) -> int | None:
     return None           # no sector context at all → global
 
 
-def _link_actors_to_threat_type(sess: Session, type_id: int, actors: list[str], resolved: dict) -> list[str]:
+def _link_actors_to_threat_type(sess: Session, type_id: int, actors: list[str], resolved: dict,
+                                created_by: str | None = None) -> list[str]:
     """Make sure each actor name is a real Threat_Actor row and is linked to this threat
     type, creating whichever rows/links don't exist yet. Returns the actor names that
     got a brand-new link (used for audit logging), not ones that were already linked.
+
+    `created_by` is the accountable user for this accept — the same value the audit rows
+    carry, so a row promoted into the shared library names whoever caused it to exist.
     """
     newly_linked: list[str] = []
     # `resolved` is a shared memo (actor name -> id, and (type,actor) -> "already linked")
@@ -298,7 +337,7 @@ def _link_actors_to_threat_type(sess: Session, type_id: int, actors: list[str], 
         actor_key = ("actor", actor_name)
         actor_id = resolved.get(actor_key)
         if actor_id is None:
-            actor_id = dal.upsert_threat_actor(sess, actor_name)
+            actor_id = dal.upsert_threat_actor(sess, actor_name, created_by=created_by)
             resolved[actor_key] = actor_id
         link_key = ("link", type_id, actor_id)
         if link_key not in resolved:
@@ -325,7 +364,8 @@ def _extract_actor_names_per_threat(rows: Sequence[RowMapping]) -> tuple[dict[in
 
 
 def _find_or_create_type_and_catalogue(
-    sess: Session, row: RowMapping, sector_id: int | None, resolved: dict
+    sess: Session, row: RowMapping, sector_id: int | None, resolved: dict,
+    created_by: str | None = None,
 ) -> tuple[int, int | None]:
     """Work out (or create) the Threat_Type and Threat_Catalogue ids this flagged threat
     should end up pointing at: reuse the high-confidence type match recorded at Stage 2
@@ -353,7 +393,8 @@ def _find_or_create_type_and_catalogue(
         key = ("type", row["ThreatCategory"], row["ThreatType"])
         type_id = resolved.get(key)
         if type_id is None:
-            type_id = dal.upsert_threat_type(sess, row["ThreatType"], _category_id(), sector_id)
+            type_id = dal.upsert_threat_type(sess, row["ThreatType"], _category_id(), sector_id,
+                                             created_by=created_by)
             resolved[key] = type_id
 
     catalogue_id = row["ThreatCatalogueID"]
@@ -361,7 +402,8 @@ def _find_or_create_type_and_catalogue(
         ckey = ("cat", type_id, row["ThreatName"])
         catalogue_id = resolved.get(ckey)
         if catalogue_id is None:
-            catalogue_id = dal.upsert_threat_catalogue(sess, row["ThreatName"], type_id, sector_id)
+            catalogue_id = dal.upsert_threat_catalogue(sess, row["ThreatName"], type_id, sector_id,
+                                                       created_by=created_by)
             resolved[ckey] = catalogue_id
             category_id = _category_id()
             if category_id is not None:  # [R6] None means "couldn't resolve" — nothing to link
@@ -447,10 +489,14 @@ def _add_flagged_threats_to_library(sess: Session, scenario_session: RowMapping,
     audit_rows: list[dict] = []
     candidate_rows: list[dict] = []
     for row in rows:
-        type_id, catalogue_id = _find_or_create_type_and_catalogue(sess, row, sector_id, resolved)
+        # actor_id above is the accountable USER for this accept (not a Threat_Actor id) — the same
+        # value the audit rows carry, so a library row promoted here names who caused it to exist.
+        type_id, catalogue_id = _find_or_create_type_and_catalogue(sess, row, sector_id, resolved,
+                                                                   created_by=actor_id)
 
         actors = parsed_actors[row["ThreatID"]]
-        linked_actors = _link_actors_to_threat_type(sess, type_id, actors, resolved)  # names NEWLY linked this accept
+        linked_actors = _link_actors_to_threat_type(sess, type_id, actors, resolved,
+                                                    created_by=actor_id)  # names NEWLY linked this accept
 
         if (type_id == row["ThreatTypeID"] and catalogue_id == row["ThreatCatalogueID"]
                 and not linked_actors):

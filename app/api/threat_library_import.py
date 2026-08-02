@@ -75,14 +75,20 @@ def _validate(source: str, body: ThreatLibraryImportBody) -> None:
         check_source_shape(source, data)
 
 
-def _enqueue(source: str, body: ThreatLibraryImportBody) -> ThreatLibraryImportAccepted:
+def _enqueue(source: str, body: ThreatLibraryImportBody,
+            started_by: str | None = None) -> ThreatLibraryImportAccepted:
     """Indirection so tests can run the import synchronously — same pattern as admin.py's
     _enqueue. file_content rides the broker as a plain string, bounded by the size cap
     checked in _validate.
+
+    `started_by` is the only reason the caller's identity survives the hop into the worker: a
+    Celery task has no request context, so anything not put on the message is unrecoverable
+    there. It fills Threat_Library_Import_Run.StartedBy (NULL on every historical row, because
+    this argument did not exist) and CreatedBy on the rows the import creates.
     # ponytail: capped string through Redis; move to a shared blob store + a reference
     # argument if much larger bundles are ever needed."""
     task = import_threat_library_task.delay(source, body.file_content, body.via_taxii,
-                                            body.max_actors, body.dry_run)
+                                            body.max_actors, body.dry_run, started_by)
     mark_admin_job(task.id, FAMILY_IMPORT)  # best-effort — see admin_jobs.mark_admin_job
     return ThreatLibraryImportAccepted(job_id=task.id)
 
@@ -95,15 +101,21 @@ def list_sources(_principal: Principal = Depends(get_principal)) -> SourcesInven
     EVERY known source is returned, imported or not, so a pending source is visibly
     `loaded=false` rather than simply absent (an absent row is indistinguishable from a
     source nobody knows about). Counts come from the `Source` column stamped on every
-    imported row — two GROUP BY queries for the whole library, not one per source — and
+    imported row — three GROUP BY queries for the whole library, not one per source — and
     `last_run` from the import history, which is what makes "never attempted" and
     "attempted and failed" different states."""
     with db_session() as sess:
-        types = dict(sess.execute(
-            select(m.Threat_Type.Source, func.count()).group_by(m.Threat_Type.Source)).all())
-        threats = dict(sess.execute(
-            select(m.Threat_Catalogue.Source, func.count()).group_by(m.Threat_Catalogue.Source)).all())
-        actors = sess.execute(select(func.count()).select_from(m.Threat_Actor)).scalar() or 0
+        types: dict[str | None, int] = {src: cnt for src, cnt in sess.execute(
+            select(m.Threat_Type.Source, func.count()).group_by(m.Threat_Type.Source))}
+        threats: dict[str | None, int] = {src: cnt for src, cnt in sess.execute(
+            select(m.Threat_Catalogue.Source, func.count()).group_by(m.Threat_Catalogue.Source))}
+        # Per-source, exactly like the two above. This was an unfiltered COUNT(*) over the whole
+        # table reported as misp_actors' import count — Threat_Actor had no Source column, so the
+        # 13 seeded actors and every AI-promoted one were attributed to a MISP import that never
+        # created them. Rows written before Source existed have NULL and correctly count for
+        # nothing here.
+        actors: dict[str | None, int] = {src: cnt for src, cnt in sess.execute(
+            select(m.Threat_Actor.Source, func.count()).group_by(m.Threat_Actor.Source))}
         runs = latest_runs_by_source(sess)
     items = []
     for source in sorted(URLS):
@@ -111,7 +123,7 @@ def list_sources(_principal: Principal = Depends(get_principal)) -> SourcesInven
         type_count, threat_count = types.get(tag, 0), threats.get(tag, 0)
         # misp_actors writes actors, not catalogue rows — its "loaded" signal is the run
         # history plus the actor table, since it contributes nothing to the two counts above.
-        actor_count = actors if source == "misp_actors" else None
+        actor_count = actors.get(tag, 0) if source == "misp_actors" else None
         last = runs.get(source)
         loaded = bool(type_count or threat_count) or (
             source == "misp_actors" and bool(last and last["status"] == "success" and not last["dry_run"]))
@@ -132,7 +144,7 @@ def start_import(source: str, body: ThreatLibraryImportBody, request: Request,
     handler stays single — adding an eighth source remains a SOURCE_URLS entry, not a
     new route."""
     _validate(source, body)
-    accepted = _enqueue(source, body)
+    accepted = _enqueue(source, body, principal.user_id)
     # Audit AFTER the broker confirmed the job (admin.py's _audit ordering rationale).
     # has_file only — never the content itself.
     log.warning("admin.threat_library_import", action="import", source=source,

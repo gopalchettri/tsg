@@ -86,10 +86,24 @@ def _store_if_healthy():
     return col
 
 
+_MAX_FETCH_BYTES = 25 * 1024 * 1024  # generous vs the real feeds (KEV ≈ 2 MB, ICS pages ≪ 1 MB)
+
+
 def _get(url: str, headers: dict[str, str] | None = None, timeout: int = 120) -> bytes:
+    """Fetch one feed URL, bounded in BOTH directions.
+
+    `timeout` is urllib's per-socket-operation timeout, not a deadline for the whole transfer: a
+    server that trickles a byte before each timeout window never trips it, so an unbounded
+    `resp.read()` could stream indefinitely into worker memory. Reading one byte past the cap and
+    failing on it turns "hostile or broken upstream" into an ordinary feed error that
+    `refresh_one` records against that one feed, rather than an OOM that takes the worker with it.
+    The total-duration half of the bound is the task's `soft_time_limit` (see celery_app.py)."""
     req = urllib.request.Request(url, headers={"User-Agent": "TSG-intel/1.0", **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — config-pinned https URLs
-        return resp.read()
+        body = resp.read(_MAX_FETCH_BYTES + 1)
+    if len(body) > _MAX_FETCH_BYTES:
+        raise ValueError(f"feed response exceeded {_MAX_FETCH_BYTES} bytes: {url}")
+    return body
 
 
 def _doc(source: str, kind: str, external_id: str, title: str, *, description: str = "",

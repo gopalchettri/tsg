@@ -1,0 +1,32 @@
+# Non-secret configuration shared by api/worker/beat (envFrom in the Deployments).
+# Secrets (TSG_DB_DSN, TSG_REDIS_URL, TSG_LITELLM_API_KEY, TSG_ADMIN_API_KEY, discrete
+# DB_* creds for the schema task) live in the `tsg-secrets` Secret, created out-of-band —
+# see deploy/README.md. envFrom lists the Secret AFTER this ConfigMap, so on duplicate
+# keys the Secret wins.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tsg-config
+data:
+  APP_ENV: dev
+  LOG_LEVEL: INFO
+  # Proxy path for everything model-related: slim image, no local model files.
+  LLM_PROVIDER: litellm_proxy
+  EMBEDDING_PROVIDER: litellm_proxy
+  RERANKER_PROVIDER: litellm_proxy
+  TSG_LITELLM_BASE_URL: "https://llmapi.example.internal"
+  EMBEDDING_MODEL: "text-embedding-3-large"
+  RERANKER_MODEL: "bge-reranker-v2-m3"
+  # Code default is "mongo" — without this, /readyz checks Mongo and every pod goes NotReady.
+  EMBEDDING_STORE: memory
+  # Connection budget: each api pod = 4 gunicorn workers x (POOL+OVERFLOW) = 40 MSSQL
+  # connections. Code defaults (50/10) would blow the server cap on the first scale-up.
+  TSG_DB_POOL_SIZE: "5"
+  TSG_DB_MAX_OVERFLOW: "5"
+  # Redis-backed global semaphore guarding the model cluster; set BEFORE scaling workers.
+  TSG_MAX_CONCURRENT_LLM_CALLS: "10"
+  # JWT resource-server auth. Fail-closed: with APP_ENV=staging|prod the app refuses to
+  # boot if any of these is empty — overlays MUST override them with real IdP values.
+  TSG_JWT_ISSUER: ""
+  TSG_JWT_AUDIENCE: ""
+  TSG_JWT_JWKS_URL: ""

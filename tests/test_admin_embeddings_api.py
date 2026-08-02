@@ -322,7 +322,7 @@ def test_delete_names_requires_explicit_group(admin_client):
 def test_delete_reports_vectors_deleted_not_rows_processed(admin_client, monkeypatch):
     from app.pipeline import embeddings
 
-    monkeypatch.setattr(embeddings, "delete_group", lambda sess, g, names=None: 4)
+    monkeypatch.setattr(embeddings, "delete_group", lambda sess, g, names=None, strict=True: 4)
     r = _run(admin_client, "delete", {"group": "threat_type"})
     assert r.status_code == 200
     body = r.json()
@@ -335,14 +335,17 @@ def test_delete_scopes_to_names_when_given(admin_client, monkeypatch):
 
     captured = {}
 
-    def fake_delete(sess, group, names=None):
-        captured.update(group=group, names=names)
+    def fake_delete(sess, group, names=None, strict=True):
+        captured.update(group=group, names=names, strict=strict)
         return 1
 
     monkeypatch.setattr(embeddings, "delete_group", fake_delete)
     r = _run(admin_client, "delete", {"group": "threat_catalogue", "names": ["Bootloader implant"]})
     assert r.status_code == 200
-    assert captured == {"group": "threat_catalogue", "names": ["Bootloader implant"]}
+    # strict=True is the ADMIN route's contract and must stay that way: a name typed by a human
+    # can be a typo, and silently deleting nothing while reporting SUCCESS is the bug that
+    # strictness exists to prevent. Only the machine-driven caller (library_crud) opts out.
+    assert captured == {"group": "threat_catalogue", "names": ["Bootloader implant"], "strict": True}
 
 
 # --- audit trail identity ---

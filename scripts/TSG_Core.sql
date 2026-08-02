@@ -102,8 +102,14 @@ CREATE TABLE Subsystem_Stage_State (
     HeartbeatAt      datetime2     NULL,
     AttemptCount     int           NOT NULL CONSTRAINT DF_SSS_AttemptCount DEFAULT 0,
     ErrorMessage     nvarchar(max) NULL,
-    UpdatedAt        datetime2     NOT NULL
+    UpdatedAt        datetime2     NOT NULL,
+    CreatedAt datetime2 NULL CONSTRAINT DF_StageState_CreatedAt DEFAULT SYSUTCDATETIME()
 );
+
+-- Existing databases created before the CreatedAt stamp (2026-07-30): add it in place.
+IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Subsystem_Stage_State', 'CreatedAt') IS NULL
+    ALTER TABLE Subsystem_Stage_State ADD CreatedAt datetime2 NULL CONSTRAINT DF_StageState_CreatedAt DEFAULT SYSUTCDATETIME();
 
 IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NULL
 CREATE TABLE Identified_Threat (
@@ -161,6 +167,8 @@ CREATE TABLE Threat_Scenario_Output (
     Accepted             int           NOT NULL,
     Superseded           int           NOT NULL,
     IdentityHash         nvarchar(64)  NULL,
+    ScenarioNumber       int           NOT NULL CONSTRAINT DF_ScenarioOutput_ScenarioNumber DEFAULT 1,  -- which of the threat's coexisting scenarios: 1 = original, 2+ = "generate next set" alternates (2026-07-29, see readme.txt)
+    ReplacesOutputID     uniqueidentifier NULL,   -- the OutputID this row REPLACED (regeneration / error-card retry); NULL for first-run, next-set and variant rows. Backward-linked, so following it yields the full revision chain. Deliberately NOT indexed: nothing filters or joins on it (2026-07-30, see readme.txt)
     GenerationEpoch      int           NOT NULL,
     ErrorMessage         nvarchar(max) NULL,
     CreatedAt            datetime2     NULL,
@@ -171,6 +179,20 @@ CREATE TABLE Threat_Scenario_Output (
 IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ControlsMappedAt') IS NULL
     ALTER TABLE Threat_Scenario_Output ADD ControlsMappedAt datetime2 NULL;
+
+-- Existing databases created before scenario variants (2026-07-29): add the column in place.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ScenarioNumber') IS NULL
+    ALTER TABLE Threat_Scenario_Output ADD ScenarioNumber int NOT NULL CONSTRAINT DF_ScenarioOutput_ScenarioNumber DEFAULT 1;
+
+-- Existing databases created before regeneration lineage (2026-07-30): add the column in place.
+-- Nullable, so no DEFAULT and no table rewrite. On a database that predates the column, rows
+-- regenerated earlier stay NULL and read as originals. No backfill ships: the link is derivable
+-- from (IdentityHash, ScenarioNumber) ordered by GenerationEpoch should a pre-2026-07-30 database
+-- ever need it, but that is a one-shot script's job -- TSG_Core.sql never touches row data.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ReplacesOutputID') IS NULL
+    ALTER TABLE Threat_Scenario_Output ADD ReplacesOutputID uniqueidentifier NULL;
 
 IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NULL
 CREATE TABLE Threat_Library_Import_Run (
@@ -264,6 +286,15 @@ CREATE TABLE Threat_Candidate_Review (
 -- set, app never inserts it).
 -- ============================================================
 
+-- Audit quartet on all four masters (CreatedAt/CreatedBy/UpdatedAt/UpdatedBy): all NULL and
+-- DEFAULT-less on purpose. Seed_to_Threat_library.sql inserts with explicit column lists, so a
+-- NOT NULL column without a default would break every one of its ~120 statements; NULL also reads
+-- honestly as "row predates the audit columns" rather than a fabricated timestamp. CreatedBy /
+-- UpdatedBy hold the caller's user id (Principal.user_id / JWT sub) — the same identity
+-- Scenario_Audit.ActorUserID records — or an 'auto:<source>' / 'cli:<user>' literal when a
+-- background import had no logged-in caller. Updated* are written ONLY by the CRUD endpoints
+-- (app/api/threat_library_crud.py): the importer and promote-on-accept upserts deliberately leave
+-- an existing row untouched, because provenance is first-writer (dal.upsert_threat_type).
 IF OBJECT_ID('dbo.Threat_Category', 'U') IS NULL
 CREATE TABLE Threat_Category (
     ThreatCategoryID    int            NOT NULL CONSTRAINT PK_Threat_Category PRIMARY KEY,
@@ -271,7 +302,11 @@ CREATE TABLE Threat_Category (
     ThreatCategoryCode  nvarchar(20)   NULL,
     SecurityObjective   nvarchar(200)  NULL,
     IsActive            bit            NOT NULL,
-    IsDeleted           bit            NOT NULL
+    IsDeleted           bit            NOT NULL,
+    CreatedAt           datetime2      NULL,
+    CreatedBy           nvarchar(200)  NULL,
+    UpdatedAt           datetime2      NULL,
+    UpdatedBy           nvarchar(200)  NULL
 );
 
 IF OBJECT_ID('dbo.Threat_Type', 'U') IS NULL
@@ -282,7 +317,11 @@ CREATE TABLE Threat_Type (
     SectorID                 int            NULL,
     ThreatCategoryID  int            NULL,
     IsActive                 bit            NOT NULL,
-    IsDeleted                bit            NOT NULL
+    IsDeleted                bit            NOT NULL,
+    CreatedAt                datetime2      NULL,
+    CreatedBy                nvarchar(200)  NULL,
+    UpdatedAt                datetime2      NULL,
+    UpdatedBy                nvarchar(200)  NULL
 );
 
 IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NULL
@@ -293,24 +332,62 @@ CREATE TABLE Threat_Catalogue (
     Description        nvarchar(max)  NULL,
     SectorID           int            NULL,
     IsActive           bit            NOT NULL,
-    IsDeleted          bit            NOT NULL
+    IsDeleted          bit            NOT NULL,
+    CreatedAt          datetime2      NULL,
+    CreatedBy          nvarchar(200)  NULL,
+    UpdatedAt          datetime2      NULL,
+    UpdatedBy          nvarchar(200)  NULL
 );
 
+-- Source mirrors Threat_Type.Source/Threat_Catalogue.Source (which Threat_library.sql bolts on) so
+-- an imported actor is distinguishable from an AI-promoted or hand-curated one. Declared in this
+-- CREATE block rather than as an ALTER over there because the column is new — that keeps it out of
+-- test_schema_sync's _COLUMN_DEPLOYED_SEPARATELY allowlist.
 IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NULL
 CREATE TABLE Threat_Actor (
     ThreatActorID    int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Actor PRIMARY KEY,
     ThreatActorName  nvarchar(200)  NOT NULL,
     IsCapable        int            NOT NULL,
     IsActive         bit            NOT NULL,
-    IsDeleted        bit            NOT NULL
+    IsDeleted        bit            NOT NULL,
+    Source           nvarchar(50)   NULL,
+    CreatedAt        datetime2      NULL,
+    CreatedBy        nvarchar(200)  NULL,
+    UpdatedAt        datetime2      NULL,
+    UpdatedBy        nvarchar(200)  NULL
 );
+
+-- Existing databases: every CREATE above is IF OBJECT_ID(...) IS NULL guarded, so it is a no-op
+-- once the table exists and the new columns would never arrive. Same in-place pattern as
+-- Threat_Scenario_Output.ControlsMappedAt in Section 1. Guarded on one column per table — the four
+-- are always added together, so the first one's absence proves none of them are there.
+IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Actor', 'Source') IS NULL
+    ALTER TABLE Threat_Actor ADD Source nvarchar(50) NULL;
+
+IF OBJECT_ID('dbo.Threat_Category', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Category', 'CreatedAt') IS NULL
+    ALTER TABLE Threat_Category ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
+
+IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Type', 'CreatedAt') IS NULL
+    ALTER TABLE Threat_Type ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
+
+IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Catalogue', 'CreatedAt') IS NULL
+    ALTER TABLE Threat_Catalogue ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
+
+IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Actor', 'CreatedAt') IS NULL
+    ALTER TABLE Threat_Actor ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
 
 IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NULL
 CREATE TABLE ThreatType_ThreatActor_Map (
     ThreatTypeID   int NOT NULL,
     ThreatActorID  int NOT NULL,
+    CreatedAt datetime2 NULL CONSTRAINT DF_TypeActorMap_CreatedAt DEFAULT SYSUTCDATETIME(),
     CONSTRAINT PK_ThreatType_ThreatActor_Map PRIMARY KEY (ThreatTypeID, ThreatActorID)
 );
+
+-- Existing databases created before the CreatedAt stamp (2026-07-30): add it in place.
+IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.ThreatType_ThreatActor_Map', 'CreatedAt') IS NULL
+    ALTER TABLE ThreatType_ThreatActor_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_TypeActorMap_CreatedAt DEFAULT SYSUTCDATETIME();
 
 -- Config_Threat_Rule and Threat_Catalogue_Category_Map live in
 -- scripts/Threat_library.sql instead — see that file.
@@ -335,14 +412,44 @@ CREATE NONCLUSTERED INDEX IX_Session_Active ON Scenario_Session(SessionStatus) W
 -- IdentityHash = sha256(SessionID|SubsystemID|dedup_key), dedup_key = cat:/type:/txt: (tasks._dedup_key).
 -- SubsystemID is folded into the hash (this index has no subsystem column), so this one active
 -- scenario per (session, subsystem, catalogue-level threat) — sibling subsystems don't collide.
+-- One active row per (identity, ScenarioNumber) — coexisting scenario numbers are legal
+-- (scenario variants, 2026-07-29), a second row at the SAME number still collides
+-- (double-click race guard). Drop the older two-column form first so an existing
+-- database gets the widened index on re-run.
+IF EXISTS (SELECT 1 FROM sys.indexes i
+           WHERE i.name = 'UX_Scenario_ActiveIdentity' AND i.object_id = OBJECT_ID('dbo.Threat_Scenario_Output')
+           AND NOT EXISTS (SELECT 1 FROM sys.index_columns ic
+                           JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                           WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
+                           AND c.name = 'ScenarioNumber'))
+    DROP INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output;
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveIdentity' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
-CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output(SessionID, IdentityHash) WHERE Superseded = 0;
+CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output(SessionID, IdentityHash, ScenarioNumber) WHERE Superseded = 0;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
 CREATE INDEX IX_PromptLog_Session ON Prompt_Log(SessionID, SubsystemID);
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_SubsystemStageState_SessionSubLevel' AND object_id = OBJECT_ID('dbo.Subsystem_Stage_State'))
-CREATE INDEX IX_SubsystemStageState_SessionSubLevel ON Subsystem_Stage_State(SessionID, SubsystemID, Level);
+-- 2026-07-30: promoted from a NON-unique IX_ to a UNIQUE UX_. (SessionID, SubsystemID, Level) is
+-- the row's real identity — the surrogate StateID PK is never queried by anything, while all ~25
+-- access sites in dal.py / reaper.py / sessions.py key on this triple. The entire lock and
+-- epoch-CAS design (claim_stage, finish_stage, renew_lease, acquire_lock/release_lock) asserts
+-- exactly-one-row by testing `rowcount == 1` in Python; a duplicate row would make a CAS silently
+-- match two rows and put two workers on one subsystem. Safe to enforce: the sole insert is
+-- tasks.set_up_progress_tracking, called once per session from the create endpoint (itself
+-- guarded by UX_Session_IdempotencyKey / UX_Session_ActiveAsset), writing exactly one row per
+-- level. Idempotent: the first run drops the old IX_ and creates the UX_; later runs no-op.
+-- CREATE FIRST, DROP SECOND. The CREATE UNIQUE can legitimately fail (a database holding
+-- duplicate (SessionID, SubsystemID, Level) rows rejects it), and dropping first would then leave
+-- the table with NEITHER index while the script still reports success — and invariants.py now
+-- makes the UX_ name boot-blocking, so the API and every worker would refuse to start. In this
+-- order a failed CREATE leaves the old index in place and the app boots on the previous code.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_SubsystemStageState_SessionSubLevel' AND object_id = OBJECT_ID('dbo.Subsystem_Stage_State'))
+CREATE UNIQUE INDEX UX_SubsystemStageState_SessionSubLevel ON Subsystem_Stage_State(SessionID, SubsystemID, Level);
+GO
+
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_SubsystemStageState_SessionSubLevel' AND object_id = OBJECT_ID('dbo.Subsystem_Stage_State'))
+    AND EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_SubsystemStageState_SessionSubLevel' AND object_id = OBJECT_ID('dbo.Subsystem_Stage_State'))
+    DROP INDEX IX_SubsystemStageState_SessionSubLevel ON Subsystem_Stage_State;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Session_CompletedByAsset' AND object_id = OBJECT_ID('dbo.Scenario_Session'))
 CREATE INDEX IX_Session_CompletedByAsset ON Scenario_Session(EntityID, AssetID, CompletedAt DESC) WHERE SessionStatus = 'completed';
@@ -357,6 +464,12 @@ CREATE INDEX IX_ScopedThreat_SessionSubActive ON Scoped_Threat(SessionID, Subsys
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioOutput_SessionSubActive' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
 CREATE INDEX IX_ScenarioOutput_SessionSubActive ON Threat_Scenario_Output(SessionID, SubsystemID) WHERE Superseded = 0;
 
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Session_EntityUser' AND object_id = OBJECT_ID('dbo.Scenario_Session'))
+CREATE INDEX IX_Session_EntityUser ON Scenario_Session(EntityID, UserID) INCLUDE (SessionStatus);
+-- GET /v1/users/{user_id}/scenarios and /v1/entities/{entity_id}/scenarios hot path.
+-- UNfiltered on purpose: those routes query all three session statuses, so the existing
+-- filtered EntityID indexes (active/completed only) can't serve them.
+
 -- ============================================================
 -- SECTION 4 — Natural-key guard indexes on the threat-library masters
 -- ============================================================
@@ -369,6 +482,16 @@ CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatType
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
 CREATE UNIQUE INDEX UX_ThreatActor_NaturalKey ON Threat_Actor(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0;
+
+-- Threat_Category was the ONLY CRUD-writable master without one (2026-07-30). The shared CRUD
+-- create/update path turns a clash into a 409 purely by catching the IntegrityError this index
+-- raises (app/api/library_crud.py) — with no index there is no error, so a duplicate name was
+-- accepted silently, and the two consumers then disagreed about which id it means:
+-- grounding.find_category orders by ThreatCategoryID and takes the LOWEST, while the library
+-- importer builds its own name->id map. Same filtered shape as its three siblings above, so a
+-- soft-deleted category frees its name for reuse.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCategory_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Category'))
+CREATE UNIQUE INDEX UX_ThreatCategory_NaturalKey ON Threat_Category(ThreatCategoryName) WHERE IsActive = 1 AND IsDeleted = 0;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatType_Category_Active' AND object_id = OBJECT_ID('dbo.Threat_Type'))
 CREATE INDEX IX_ThreatType_Category_Active ON Threat_Type(ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;

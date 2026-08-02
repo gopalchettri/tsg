@@ -19,8 +19,24 @@ IF OBJECT_ID('dbo.Threat_Catalogue_Category_Map', 'U') IS NULL
 CREATE TABLE Threat_Catalogue_Category_Map (
     ThreatCatalogueID INT NOT NULL,
     ThreatCategoryID  INT NOT NULL,
-    CONSTRAINT PK_Threat_Catalogue_Category_Map PRIMARY KEY (ThreatCatalogueID, ThreatCategoryID)
+    -- PK leads on ThreatCategoryID (2026-07-30, was ThreatCatalogueID-first). A composite PK is
+    -- also the clustered index, so only its LEADING column can be seeked, and the one query that
+    -- FILTERS this table — grounding.get_possible_types()'s mapped_type_ids subquery — filters on
+    -- ThreatCategoryID and merely joins on ThreatCatalogueID. Leading on the catalogue id meant
+    -- that filter could never seek. Uniqueness enforced is identical either way, and the other
+    -- consumer (dal.link_catalogue_category's existence check) supplies BOTH columns so it seeks
+    -- regardless. Honest scale note: 346 seeded rows, so the old scan cost a couple of pages —
+    -- this is correctness of intent, not a measurable win. Deliberately NOT given a guarded
+    -- in-place migration: rebuilding a clustered PK is real churn for zero measured gain, and a
+    -- database recreated from these scripts gets the right order for free.
+    CreatedAt datetime2 NULL CONSTRAINT DF_CatCategoryMap_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_Threat_Catalogue_Category_Map PRIMARY KEY (ThreatCategoryID, ThreatCatalogueID)
 );
+
+-- Existing databases created before the CreatedAt stamp (2026-07-30): add it in place.
+IF OBJECT_ID('dbo.Threat_Catalogue_Category_Map', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Catalogue_Category_Map', 'CreatedAt') IS NULL
+    ALTER TABLE Threat_Catalogue_Category_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_CatCategoryMap_CreatedAt DEFAULT SYSUTCDATETIME();
 
 IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL
 BEGIN
@@ -35,7 +51,7 @@ BEGIN
 END
 
 -- Config_Threat_Rule (R12: scoping rules, SDD §5.4). ThreatRuleID is IDENTITY since
--- the threat-library import (CLI + POST /v1/tsg/threat-library/import) auto-writes
+-- the threat-library import (CLI + POST /v1/tsg/threat-library/sources/{source}/import) auto-writes
 -- boost-only rules via dal.upsert_threat_rule — the DB assigns ids, exactly like the
 -- three master tables above. Seed starts at 22 so the hand-seeded rows 1-21 in
 -- Seed_to_Threat_library.sql keep their ids (that script INSERTs explicit ids and
@@ -80,8 +96,14 @@ CREATE TABLE Context_Field_Config (
     FieldName             nvarchar(100)  NOT NULL,
     IsActive              bit            NOT NULL,
     IsDeleted             bit            NOT NULL,
+    CreatedAt datetime2 NULL CONSTRAINT DF_ContextFieldConfig_CreatedAt DEFAULT SYSUTCDATETIME(),
     CONSTRAINT UQ_Context_Field_Config UNIQUE (ContextGroup, FieldName)
 );
+
+-- Existing databases created before the CreatedAt stamp (2026-07-30): add it in place.
+IF OBJECT_ID('dbo.Context_Field_Config', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Context_Field_Config', 'CreatedAt') IS NULL
+    ALTER TABLE Context_Field_Config ADD CreatedAt datetime2 NULL CONSTRAINT DF_ContextFieldConfig_CreatedAt DEFAULT SYSUTCDATETIME();
 
 -- Seed: every field currently sent to the AI, all turned on. A curator can flip IsActive to 0
 -- for any row to stop sending that field, without touching code.

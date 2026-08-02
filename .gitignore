@@ -11,3 +11,8 @@ __pycache__/
 .mypy_cache/
 *.egg-info/
 celerybeat-schedule.*
+
+# Ad hoc connectivity/permission test scripts - test_db_connectivity.py has
+# real MSSQL/Redis/MongoDB/Neo4j passwords hardcoded, never commit it.
+scripts/test_db_connectivity.py
+scripts/redis_acl_check.py

@@ -125,24 +125,55 @@ def test_next_set_drains_pool_then_generates_fresh(db):
     assert llm.threat_calls == 2                             # pool drained → one fresh coverage-aware find_threats
 
 
-# --- never blocked: a repeat-only fresh batch supersedes nothing and can retry -
-def test_next_set_repeat_only_returns_no_new_and_supersedes_nothing(db):
+# --- variant fallback: a repeat-only fresh batch fills scenario #2 slots instead of dead-ending -
+def test_next_set_repeat_only_generates_variants_then_honest_no_new_at_cap(db, monkeypatch):
+    """The old dead end ("pool empty + AI repeats itself → no_new, count flat") now falls back to
+    VARIANTS: one alternate scenario per already-covered threat, at ScenarioNumber=2, up to the
+    max_scenarios_per_threat cap (default 2). Only when every threat is AT the cap does the click
+    produce the honest no_new outcome — with its reason/message so the user learns why."""
+    published: list = []
+    monkeypatch.setattr("app.sse.bus.publish", lambda sid_, event: published.append(event))
+
     llm = _ManyThreatLLM(_threats(5))                        # first run serves all 5 → empty pool
     session = _first_run(db, llm)
     sid = session["SessionID"]
     before = {r.OutputID for r in _active_scenarios(db, sid)}
     assert len(before) == 5
 
-    # pool empty; the fresh AI batch only repeats the SAME 5 already-served threats
+    # pool empty; the fresh AI batch only repeats the SAME 5 already-served threats → variants
     outcome = _next_set(db, session, llm, "44444444-4444-4444-8444-444444444441")
-    assert outcome == "no_new_threats_this_round"
-    assert {r.OutputID for r in _active_scenarios(db, sid)} == before   # nothing superseded, nothing added
-    assert load_session(db, sid)["CurrentStage"] == WorkflowStage.REVIEW  # reviewable, not hard-stopped
+    assert outcome == "review"                               # productive click, session reviewable
+    active = _active_scenarios(db, sid)
+    assert len(active) == 10                                 # 5 originals + 5 variants
+    assert before <= {r.OutputID for r in active}            # nothing superseded — accumulation holds
+    numbers = {r.OutputID: r.ScenarioNumber for r in db.execute(select(
+        m.Threat_Scenario_Output.OutputID, m.Threat_Scenario_Output.ScenarioNumber).where(
+        m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0))}
+    assert sorted(numbers.values()).count(2) == 5            # each threat gained exactly one #2
+    assert load_session(db, sid)["CurrentStage"] == WorkflowStage.REVIEW
 
-    # a subsequent call still works — never blocked, still benign
+    events = [e for e in published if str(e.get("type")) == "next_set_result"]
+    assert len(events) == 1
+    assert events[0]["no_new"] is False
+    assert events[0]["new_scenarios"] == 5
+    assert events[0]["new_variants"] == 5                    # variant growth never blurred with new-threat growth
+    audit_detail = json.loads(db.execute(select(m.Scenario_Audit.DetailJSON).where(
+        m.Scenario_Audit.SessionID == sid, m.Scenario_Audit.EventType == AuditEventType.generation_complete,
+    ).order_by(m.Scenario_Audit.CreatedAt.desc())).scalars().first())
+    assert audit_detail["variants_generated"] == 5
+    published.clear()
+
+    # every threat now AT the cap (2) → the honest no_new outcome, with reason + plain message
     outcome2 = _next_set(db, session, llm, "44444444-4444-4444-8444-444444444442")
     assert outcome2 == "no_new_threats_this_round"
-    assert {r.OutputID for r in _active_scenarios(db, sid)} == before
+    assert len(_active_scenarios(db, sid)) == 10             # count flat, nothing superseded
+    events2 = [e for e in published if str(e.get("type")) == "next_set_result"]
+    assert len(events2) == 1
+    assert events2[0]["reason"] == "no_new_threats_found"
+    assert events2[0]["message"] == (
+        "There's nothing new to add. We've already created a scenario for every "
+        "threat we know about for this asset.")
+    assert events2[0]["detail"]  # developer-facing text present, never shown to the end user
 
 
 # --- additive find_threats leaves every prior row active ----------------------
@@ -219,6 +250,7 @@ def test_next_set_endpoint_accumulates(engine, monkeypatch):
     r = client.post(f"/v1/sessions/{sid}/scenarios/next-set", json={"supporting_system_id": ASSET_UNIT_ID})
     assert r.status_code == 202
     assert r.json()["status"] == "generating"
+    assert r.json()["user_id"] == "u1"
     with db_session() as s:
         assert len(_active_scenarios(s, sid)) == 10          # 5 from the run + 5 from the next set
 
@@ -257,11 +289,15 @@ def test_next_set_additive_find_threats_failure_reenters_review_not_cancelled(db
     before = {r.OutputID for r in _active_scenarios(db, sid)}
     assert len(before) == 5
 
-    # pool empty → the additive find_threats runs and raises LLMResponseParseError
+    # pool empty → the additive find_threats runs and raises LLMResponseParseError; the downgraded
+    # failure now routes into the VARIANT fallback (scenario calls still work on this stub), which
+    # is exactly the point: a transient additive breakage costs nothing and the click stays useful.
     outcome = _next_set(db, session, llm, "f1f1f1f1-1111-4111-8111-111111111111")
     assert llm.threat_calls == 2                       # the additive call did fire
-    assert outcome == "no_new_threats_this_round"      # routed to the benign outcome, not a failure
-    assert {r.OutputID for r in _active_scenarios(db, sid)} == before  # prior scenarios untouched
+    assert outcome == "review"                         # benign + productive, never a failure
+    active_ids = {r.OutputID for r in _active_scenarios(db, sid)}
+    assert before <= active_ids                        # prior scenarios untouched
+    assert len(active_ids) == 10                       # ...and each threat gained its variant
     row = load_session(db, sid)
     assert row["CurrentStage"] == WorkflowStage.REVIEW        # re-entered REVIEW, NOT cancelled
     assert row["SessionStatus"] == SessionStatus.active
@@ -307,7 +343,9 @@ def test_next_set_redelivery_runs_additive_find_threats_once(db):
                         "deadbeef-0000-4000-8000-000000000000")
     assert llm.threat_calls == 2                            # find_threats did NOT run again
     assert _active_identified(db, sid) == it_after_first    # no second Identified_Threat batch
-    assert len(_active_scenarios(db, sid)) == 8             # 5 accumulated + 3 newly served
+    # 5 accumulated + 3 newly served + 2 variants: the pool held only 3 of the configured 5, and
+    # the shortfall top-up fills the remaining slots with alternate takes on covered threats.
+    assert len(_active_scenarios(db, sid)) == 10
 
 
 # --- FIX 3 Part 1: a full-run tech_gate-rejected (Selected=0) threat is never re-served ---------
@@ -331,7 +369,10 @@ def test_next_unserved_excludes_full_run_tech_gate_rejected(db):
 
 
 # --- FIX 3 Part 2: a FRESH mid-next-set tech_gate rejection is marked and not re-picked ---------
-def test_next_set_fresh_tech_gate_target_marked_and_not_repicked(db):
+def test_next_set_fresh_tech_gate_target_marked_and_not_repicked(db, monkeypatch):
+    published: list = []
+    monkeypatch.setattr("app.sse.bus.publish", lambda sid_, event: published.append(event))
+
     _seed_tech_gate_rule(db)
     # first run serves a type-11 threat; the additive next-set batch proposes a type-10 (gated) one.
     llm = _ScriptedThreatLLM([
@@ -344,6 +385,14 @@ def test_next_set_fresh_tech_gate_target_marked_and_not_repicked(db):
 
     outcome = _next_set(db, session, llm, "f3f3f3f3-3333-4333-8333-333333333333")
     assert outcome == "no_new_threats_this_round"      # the fresh type-10 target rescored out (gated)
+    # unlike an empty-pool-from-the-start round, a candidate WAS found and rejected -- distinct
+    # reason code from test_next_set_repeat_only_returns_no_new_and_supersedes_nothing above
+    events = [e for e in published if str(e.get("type")) == "next_set_result"]
+    assert len(events) == 1
+    assert events[0]["reason"] == "new_threat_did_not_qualify"
+    assert events[0]["message"] == (
+        "We found something new, but it didn't meet our criteria for this "
+        "asset, so we didn't create a scenario for it.")
 
     # Part 2: the gated fresh type-10 threat now has an active Selected=0 Scoped_Threat marker ...
     type10_ids = set(db.execute(select(m.Identified_Threat.ThreatID).where(

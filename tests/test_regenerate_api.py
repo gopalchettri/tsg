@@ -9,8 +9,8 @@ from app.core.enums import AuditEventType, RegenGranularity
 from app.db import models as m
 from app.db.dal import load_session
 from app.pipeline import cascade
-from app.pipeline.tasks import ASSET_UNIT_ID
-from tests.conftest import StubLLM, make_client
+from app.pipeline.tasks import ASSET_UNIT_ID, _process_all_supporting_systems
+from tests.conftest import StubLLM, make_client, session_body
 from tests.test_cascade import _leave_review, _output_ids, _reserve_epoch, _run_to_review
 from tests.test_slice import SUB
 
@@ -123,6 +123,48 @@ def test_regenerate_accepts_non_canonical_output_id_spellings(db):
         assert outcome == "review", spelling(output_id)
         assert db.execute(select(m.Threat_Scenario_Output.Superseded)
                         .where(m.Threat_Scenario_Output.OutputID == output_id)).scalar() == 1
+
+
+def test_regenerate_stale_output_id_409_carries_reason_and_message(monkeypatch, engine):
+    """End-to-end HTTP regression for a real-world report: a client regenerated a scenario, then
+    retried with the SAME (now-superseded) output_id and got a 409 with no way to tell "stale id"
+    from any other regenerate_conflict. get_threat_id_to_redo's raise (cascade.py) now carries
+    reason="output_not_found_or_superseded", and errors.py's handler surfaces it plus a
+    developer-facing `detail` and an end-user-facing `message` in the same JSON body — no SSE or
+    polling needed, since this conflict is caught synchronously, before the 202 would have gone out."""
+    from app.db.engine import db_session
+
+    def sync_pipeline(session_id):
+        with db_session() as s:
+            _process_all_supporting_systems(s, session_id, StubLLM(), "11111111-1111-4111-8111-111111111111")
+
+    def sync_regen(session_id, subsystem_id, granularity, target_ids, epoch, user_note):
+        with db_session() as s:
+            cascade.run_regeneration(s, dict(load_session(s, session_id)), subsystem_id, granularity,
+                                    target_ids, epoch, StubLLM(),
+                                    "22222222-2222-4222-8222-222222222222", user_note=user_note)
+
+    monkeypatch.setattr("app.api.sessions.enqueue_pipeline", sync_pipeline)
+    monkeypatch.setattr("app.api.sessions.enqueue_regeneration", sync_regen)
+    client = make_client({"5"})
+
+    sid = client.post("/v1/sessions", json=session_body(100)).json()["session_id"]
+    output_id = client.get(f"/v1/sessions/{sid}/results").json()["scenarios"][0]["output_id"]
+
+    first = client.post(f"/v1/sessions/{sid}/regenerate/scenarios", json={"output_ids": [output_id]})
+    assert first.status_code == 202  # succeeds and supersedes output_id
+
+    # retry with the now-stale id -- exactly the reported scenario
+    retry = client.post(f"/v1/sessions/{sid}/regenerate/scenarios", json={"output_ids": [output_id]})
+    assert retry.status_code == 409
+    body = retry.json()
+    assert output_id.lower() in body["message"].lower()
+    assert body["details"]["reason"] == "output_not_found_or_superseded"
+    assert body["details"]["message"] == (
+        "One or more of the scenarios you tried to regenerate have already been "
+        "updated or no longer exist — refresh the results and try again with the "
+        "current list.")
+    assert body["details"]["detail"]  # developer-facing text present, never shown to the end user
 
 
 def test_regenerate_malformed_output_id_is_a_conflict_not_a_crash(db):

@@ -280,25 +280,30 @@ def test_live_end_to_end_threats_scenarios_next_set(db, monkeypatch):
         assert not missing, f"scenario missing required field(s): {missing}"
 
     first_ids = {r.OutputID for r in first}
-    first_hashes = {r.IdentityHash for r in first}
-    assert len(first_hashes) == len(first), "duplicate IdentityHash within the first batch"
+    # Uniqueness is per (IdentityHash, ScenarioNumber) since scenario variants (2026-07-29):
+    # a threat's #1 and #2 legitimately SHARE an IdentityHash — the pair is the collision key
+    # (mirrors the widened UX_Scenario_ActiveIdentity index).
+    first_keys = {(r.IdentityHash, r.ScenarioNumber) for r in first}
+    assert len(first_keys) == len(first), "duplicate (IdentityHash, ScenarioNumber) within the first batch"
 
     # ---- "generate next set": real additive path, must accumulate + stay unique ----
+    # With the variant fallback, "nothing genuinely new" now yields alternate takes on covered
+    # threats (ScenarioNumber=2) instead of a dead end — either growth mode must accumulate.
     session = dict(load_session(db, sid))  # fresh dict carrying the updated login asset context
     outcome = _next_set(db, session, llm, "b2b2b2b2-2222-4222-8222-222222222222")
 
     after = _active_scenarios(db, sid)
     after_ids = {r.OutputID for r in after}
-    after_hashes = {r.IdentityHash for r in after}
+    after_keys = {(r.IdentityHash, r.ScenarioNumber) for r in after}
     added = len(after) - len(first)
 
     assert first_ids <= after_ids, "next-set superseded/dropped a prior scenario (must accumulate)"
-    assert len(after_hashes) == len(after), "duplicate IdentityHash among active scenarios after next-set"
+    assert len(after_keys) == len(after), "duplicate (IdentityHash, ScenarioNumber) among active scenarios after next-set"
     if outcome == "no_new_threats_this_round":
         assert added == 0, "reported no_new but the active scenario count changed"
     else:
         assert added >= 1, "next-set neither added scenarios nor reported no_new_threats_this_round"
-        assert len(after_hashes - first_hashes) == added, "new scenarios are not unique vs the first batch"
+        assert len(after_keys - first_keys) == added, "new scenarios are not unique vs the first batch"
     assert load_session(db, sid)["CurrentStage"] == WorkflowStage.REVIEW
 
     # ---- surface the REAL model's actual output so a human can judge quality, not just green.

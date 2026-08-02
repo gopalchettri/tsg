@@ -1,9 +1,9 @@
-"""Enumerations — the single source of truth for every literal stored in the DB. 
-Rule: application code, query builders, and serializers
-reference an enum **member**, never a bare string literal. Each member's *value*
-is the exact string in the existing `TSG` schema (casing verbatim, mixed by
-column). `StrEnum` members are `str` subclasses, so they bind directly as SQL
-parameters and compare equal to the stored text.
+"""Enumerations — the single source of truth for every literal stored in the DB.
+
+Application code, query builders and serializers reference a member, never a bare
+string. Each member's *value* is the exact string in the `TSG` schema (casing
+verbatim, mixed by column). `StrEnum` members are `str`, so they bind directly as
+SQL parameters and compare equal to the stored text.
 """
 from __future__ import annotations
 
@@ -20,20 +20,19 @@ class SessionStatus(StrEnum):
 
 
 class SessionMode(StrEnum):
-    """The pipeline's run mode. Only one is built."""
     AUTO = "AUTO"   # the only mode implemented: both stages run back-to-back per subsystem,
-                    # stopping only at the single REVIEW gate. A future step-by-step MANUAL
-                    # mode is reserved but has no code path today.
+                    # stopping only at the single REVIEW gate. A MANUAL mode is reserved,
+                    # with no code path today.
 
 
 class WorkflowStage(StrEnum):
     """THREAT_IDENTIFICATION through APPROVED are ordered forward steps of the pipeline.
     CANCELLED is not a step — it's a terminal exit from any of them."""
     THREAT_IDENTIFICATION = "THREAT_IDENTIFICATION"  # Stage 1: AI proposes STRIDE threats, each grounded against the library
-    SCENARIO_GENERATION = "SCENARIO_GENERATION"      # Stage 2: AI narrates one scenario per selected threat; ends at AWAITING_DECISION
-    REVIEW = "REVIEW"                                # every subsystem reached its review barrier; session waits on the one human decision
-    APPROVED = "APPROVED"                            # the human accepted (all or partial) — terminal, pairs with SessionStatus.completed
-    CANCELLED = "CANCELLED"                          # terminal exit from any stage above — user cancel, fatal error, or reaper
+    SCENARIO_GENERATION = "SCENARIO_GENERATION"      # Stage 2: one scenario per selected threat; ends at AWAITING_DECISION
+    REVIEW = "REVIEW"                                # every subsystem reached its review barrier; waiting on the one human decision
+    APPROVED = "APPROVED"                            # accepted (all or partial) — terminal, pairs with SessionStatus.completed
+    CANCELLED = "CANCELLED"                          # terminal exit from any stage above
 
 
 class StageStatus(StrEnum):
@@ -41,133 +40,106 @@ class StageStatus(StrEnum):
     IDLE = "IDLE"                          # not yet claimed by any worker — the default/reset state
     RUNNING = "RUNNING"                    # a worker holds this claim right now (ActiveTaskID + LeaseExpiresAt set)
     AWAITING_DECISION = "AWAITING_DECISION"  # SCENARIOS level only — deliberately NOT COMPLETE; this state IS the review barrier
-    COMPLETE = "COMPLETE"                  # stage finished successfully; a Celery redelivery treats this as a no-op, never re-runs it
-    ERROR = "ERROR"                        # stage failed (or was reaped); re-claimable up to stage_max_attempts, then poison-terminal
+    COMPLETE = "COMPLETE"                  # finished; a Celery redelivery treats this as a no-op, never re-runs it
+    ERROR = "ERROR"                        # failed (or was reaped); re-claimable up to stage_max_attempts, then poison-terminal
     CANCELLED = "CANCELLED"   # Scenario_Session-level only — never written to a
                             # Subsystem_Stage_State row; per-stage history survives a cancel
 
 
-#  labels which of a subsystem's work stages (or its lock row) one
-# Subsystem_Stage_State row represents.
 class SubsystemLevel(StrEnum):
-    """One work cell within a subsystem — NOT a one-to-one mirror of `WorkflowStage`:
-    only 2 of its 3 real-work members correspond (with different names: THREATS vs
-    THREAT_IDENTIFICATION, SCENARIOS vs SCENARIO_GENERATION), `LOCK` has no
-    `WorkflowStage` counterpart at all, and `WorkflowStage`'s REVIEW/APPROVED/CANCELLED
-    have no `SubsystemLevel` counterpart. Different enum on a different column
-    (`Subsystem_Stage_State.Level` vs `Scenario_Session.CurrentStage`); never conflate
-    the two, a mistake this codebase's own docs warn against repeatedly."""
+    """One work cell within a subsystem — NOT a mirror of `WorkflowStage`: different enum on a
+    different column (`Subsystem_Stage_State.Level` vs `Scenario_Session.CurrentStage`), only two
+    members correspond, and under different names. Never conflate the two."""
     THREATS = "THREATS"      # this subsystem's Stage-1 row — mirrors WorkflowStage.THREAT_IDENTIFICATION
     SCENARIOS = "SCENARIOS"  # this subsystem's Stage-2 row — mirrors WorkflowStage.SCENARIO_GENERATION
     LOCK = "_LOCK"          # member named LOCK; DB value is the literal "_LOCK". A per-subsystem
-                            # mutex sentinel row (acquired/released as a CAS lock) — not a fourth
-                            # real work stage, which is why code filters `Level != LOCK` so often.
+                            # mutex sentinel row (CAS lock), not a work stage — hence the
+                            # `Level != LOCK` filter on every stage query.
 
 
-#  how confidently an AI-suggested threat matches a known threat type
-# in the library — grounded (strong match), confirm (maybe), or flagged (no good match).
 class GroundingStatus(StrEnum):
     """`Identified_Threat.GroundingStatus` — how confidently an AI-proposed threat matched
-    an existing library master (SDD §8.4 two-band reranker score, default thresholds 75/60)."""
+    an existing library master (two-band reranker score, default thresholds 75/60)."""
     grounded = "grounded"   # >=75 — confident match; ThreatTypeID/ThreatCatalogueID set to the matched master
-    confirm = "confirm"     # 60-75 — plausible match, same master ids set, lower-confidence band than grounded
-    flagged = "flagged"     # <60 — no confident match; the ONLY status eligible for library promotion on accept ([R10])
+    confirm = "confirm"     # 60-75 — plausible match, same master ids set, lower-confidence band
+    flagged = "flagged"     # <60 — no confident match; the ONLY status eligible for library promotion on accept
 
 
-#  what kind of scoping rule this is — a pass/fail gate, or one of two
-# ways to add points toward a threat's relevance score.
 class ThreatRuleType(StrEnum):
-    """`Config_Threat_Rule.RuleType` — the three scoping rule families.
-    `tech_gate` is a hard include/exclude (a failed gate forces `Selected=0`); the two
-    relevance families are additive weights on `Score`. Any other value in the column is
-    ignored by the engine (logged, no effect) — same never-silently-false rule as an
-    unknown RuleKey."""
+    """`Config_Threat_Rule.RuleType`. `tech_gate` is a hard include/exclude (a failed gate forces
+    `Selected=0`); the other two are additive weights on `Score`. Any other value in the column is
+    ignored by the engine (logged, no effect) — same never-silently-false rule as an unknown RuleKey."""
     tech_gate = "tech_gate"                              # pass/fail gate — failing it excludes the threat outright
-    relevance_flag = "relevance_flag"                    # adds/subtracts score points based on a yes/no flag
-    relevance_context_value = "relevance_context_value"  # adds/subtracts score points based on a specific context value
+    relevance_flag = "relevance_flag"                    # score points from a yes/no flag
+    relevance_context_value = "relevance_context_value"  # score points from a specific context value
 
 
 class ScenarioStatus(StrEnum):
-    """`Threat_Scenario_Output.Status` — one generated scenario row's own outcome. Easy to
-    confuse with the similarly-named StageStatus (the *stage's* status); unrelated columns
-    on different tables."""
+    """`Threat_Scenario_Output.Status` — one generated scenario row's own outcome. Not
+    StageStatus (the *stage's* status); unrelated columns on different tables."""
     complete = "complete"  # the scenario narrative was generated and persisted
     error = "error"        # FAILURE CARD: a full-run threat whose generation failed keeps a row
                             # (null scenario + ErrorMessage) so /regenerate/scenarios can retry it
-                            # individually (tasks._build_error_output_row). Excluded from accept/
-                            # salvage/resume by the ScenarioStatus.complete filters in dal.py.
+                            # individually. Excluded from accept/salvage/resume by the
+                            # ScenarioStatus.complete filters in dal.py.
 
 
 class ActorType(StrEnum):
     """`Scenario_Audit.ActorType` — WHO PERFORMED the event, kept separate from ActorUserID's
-    "who is ACCOUNTABLE for it". Both are needed: every audit row names the accountable session
-    owner, but most rows are written by a background worker minutes later with no human present,
-    so `ActorUserID` alone could not distinguish "gopal did this" from "gopal is answerable for
-    what the pipeline did". NULL on rows written before this column existed."""
+    "who is ACCOUNTABLE". Worker rows are back-filled with the session owner, so ActorUserID
+    alone cannot distinguish "gopal did this" from "gopal is answerable for what the pipeline
+    did". NULL on rows written before this column existed."""
     user = "user"      # a human performed it: session_started, session_cancelled, the accept family
     system = "system"  # a worker/the pipeline performed it; ActorUserID names who is answerable
 
 
 class CandidateStatus(StrEnum):
-    """`Threat_Candidate_Review.Status` — backs the curator/candidate-promotion workflow.
-    Ahead of its consumer: that workflow is a later milestone, not built in this M1 slice."""
-    pending = "pending"    # meant as "awaiting curator review", but no code path writes this today either —
-                            # accept.py inserts every row directly as `accepted` (an audit ledger of promotions,
-                            # not an actual review queue yet); reserved for R11's curator gate
-    accepted = "accepted"  # the ONLY value the app currently writes — set the moment accept.py promotes the row ([R10])
-    rejected = "rejected"  # defined for the curator workflow; no code path writes this yet (R11, not built)
+    """`Threat_Candidate_Review.Status` — ahead of its consumer; the curator workflow is a
+    later milestone."""
+    pending = "pending"    # no writer: accept.py inserts every row directly as `accepted`
+    accepted = "accepted"  # the ONLY value the app currently writes — set when accept.py promotes the row
+    rejected = "rejected"  # no writer yet (curator workflow)
 
 
 class ValidationStatus(StrEnum):
-    """Deterministic output-validation result. These checks FLAG,
-    never block — a parse failure is a stage ERROR upstream and never reaches them,
-    so no `error` member exists (it would have no producer)."""
-    ok = "ok"            # the structural/consistency checks found nothing to flag
+    """Deterministic output-validation result. These checks FLAG, never block — a parse failure
+    is a stage ERROR upstream and never reaches them, so no `error` member exists."""
+    ok = "ok"            # nothing to flag
     warning = "warning"  # at least one check flagged something — recorded for the reviewer, never blocks accept
 
 
-#  the fixed list of event names that can appear in the session's audit trail.
 class AuditEventType(StrEnum):
-    """`Scenario_Audit.EventType` — the append-only trail of everything that happens to a
-    session. Every member below is written from exactly one place; where noted, a member
-    is defined but has no current producer (reserved for a later milestone)."""
-    session_started = "session_started"                # written once, in POST /sessions, right after the pipeline's stage rows are seeded
-    auto_run_enqueued = "auto_run_enqueued"             # defined, but no code writes it today — reserved, no current producer
-    grounding_summary = "grounding_summary"             # written once per subsystem after Stage 1 (THREATS); DetailJSON carries the threat count
-    scoping_complete = "scoping_complete"               # written once per subsystem after Stage 2 scoring; DetailJSON carries scoped/selected counts
-    controls_mapped = "controls_mapped"                 # written once per write_scenarios run after Step-4 control mapping (control_mapping.map_controls);
+    """`Scenario_Audit.EventType` — the append-only trail. Every member is written from exactly
+    one place; some are defined with no current producer (reserved for a later milestone)."""
+    session_started = "session_started"                # POST /sessions, right after the stage rows are seeded
+    auto_run_enqueued = "auto_run_enqueued"             # reserved — no current producer
+    grounding_summary = "grounding_summary"             # once per subsystem after Stage 1; DetailJSON carries the threat count
+    scoping_complete = "scoping_complete"               # once per subsystem after Stage 2 scoring; DetailJSON carries scoped/selected counts
+    controls_mapped = "controls_mapped"                 # once per write_scenarios run after Step-4 control mapping;
                                                         # DetailJSON carries outputs/mapped/dropped/fallback counts
-    generation_complete = "generation_complete"         # written once per subsystem after both stages finish; DetailJSON carries full LLM provenance
-    entered_review = "entered_review"                   # written once per session when every subsystem reaches the review barrier
-    review_decision = "review_decision"                 # the human's verdict at the single review gate (accept/partial)
-    scenarios_accepted = "scenarios_accepted"           # Stage-2 outputs (Threat_Scenario_Output) flipped Accepted=1 —
-                                                        # deliberately NOT written on a mode="none" reject (nothing flipped)
+    generation_complete = "generation_complete"         # once per subsystem after both stages; DetailJSON carries LLM provenance
+    entered_review = "entered_review"                   # once per session when every subsystem reaches the review barrier
+    review_decision = "review_decision"                 # the human's verdict at the single review gate
+    scenarios_accepted = "scenarios_accepted"           # Stage-2 outputs flipped Accepted=1 — deliberately NOT
+                                                        # written on a mode="none" reject (nothing flipped)
     regeneration_completed = "regeneration_completed"   # one regenerate request finished its stage re-runs
-    threat_regrounded = "threat_regrounded"             # a threat was re-matched to the library during threat-granularity regen —
-                                                        # defined, but no code path writes this today (only `scenario` regen is
-                                                        # implemented, see RegenGranularity); reserved, no current producer
-    subsystem_advanced = "subsystem_advanced"           # written once per subsystem at the START of its work, not on completion
-                                                        # (its SSE sibling was renamed to `subsystem_started` for the same reason;
-                                                        # this audit value keeps its own name — it was never part of that rename)
-    auto_fanout_review = "auto_fanout_review"           # defined, but no code writes it today — reserved, no current producer
-    library_promoted = "library_promoted"               # written on accept, once per NEW master (Type/Catalogue/Actor) created from a flagged threat ([R10])
-    candidate_reconciled = "candidate_reconciled"       # written on accept, once per Threat_Candidate_Review row closed as accepted ([R10])
-    session_cancelled = "session_cancelled"             # written by the explicit cancel route, or by `_mark_session_failed`'s
-                                                        # total-failure path (shared by the live pipeline's own end-of-loop
-                                                        # check AND the reaper's sweep) — either way, releases the M4 lock (`[R1]`)
-    stage_error = "stage_error"                         # a stage failed after retries (production error capture)
+    threat_regrounded = "threat_regrounded"             # reserved — only `scenario` regen is implemented
+    subsystem_advanced = "subsystem_advanced"           # written at the START of a subsystem's work, not on completion
+    auto_fanout_review = "auto_fanout_review"           # reserved — no current producer
+    library_promoted = "library_promoted"               # on accept, once per NEW master created from a flagged threat
+    candidate_reconciled = "candidate_reconciled"       # on accept, once per Threat_Candidate_Review row closed as accepted
+    session_cancelled = "session_cancelled"             # explicit cancel route, or `_mark_session_failed`'s total-failure
+                                                        # path (live pipeline + reaper) — either way releases the M4 lock
+    stage_error = "stage_error"                         # a stage failed after retries
 
 
 class AuditDecision(StrEnum):
-    """`Scenario_Audit.Decision` — the human verdict recorded alongside a `review_decision`
-    event. `accept`/`partial`/`reject` are all written by `accept.py::accept_session` based
-    on its `subset` param: None -> accept, a populated list -> partial, an explicit empty
-    list ([R8] "accept none", reachable on the wire via `AcceptBody(mode="none")`) -> reject.
-    `regenerate` is defined for the column's full vocabulary but has no current writer."""
+    """`Scenario_Audit.Decision` — written by `accept.py::accept_session` from its `subset` param:
+    None -> accept, a populated list -> partial, an explicit empty list -> reject."""
     accept = "accept"            # "accept all" — subset was None
-    partial = "partial"          # only some scenarios accepted (AcceptBody mode="subset"), not the whole session
-    reject = "reject"            # "accept none" — subset was an explicit empty list (AcceptBody mode="none")
-    regenerate = "regenerate"    # defined; no code path writes this today (regeneration is audited via `regeneration_completed`/`threat_regrounded` instead)
+    partial = "partial"          # AcceptBody mode="subset"
+    reject = "reject"            # "accept none" — AcceptBody mode="none"
+    regenerate = "regenerate"    # no writer (regeneration is audited via regeneration_completed)
 
 
 class RegenGranularity(StrEnum):
@@ -176,44 +148,39 @@ class RegenGranularity(StrEnum):
     scenario = "scenario"                  # rebuild one or more scenarios' narratives only
 
 
-#  a computed summary of how one subsystem is doing overall, for display
-# only — it is never stored in the DB, just worked out fresh each time it's requested.
 class SubsystemProgress(StrEnum):
-    """Fully derived (`get_overall_status()` in app/api/sessions.py) — never a stored column. The
-    status board's `overall` field is built fresh on every read, not persisted.
-    Evaluated top-to-bottom, first match wins: any stage ERROR -> error; the session
-    itself completed (accepted) -> complete; the session itself cancelled -> cancelled;
-    SCENARIOS = AWAITING_DECISION -> awaiting_review; both IDLE -> pending; otherwise -> in_progress."""
+    """Fully derived (`get_overall_status()` in app/api/sessions.py) — never a stored column.
+    Evaluated top-to-bottom, first match wins: any stage ERROR -> error; session completed
+    -> complete; session cancelled -> cancelled; SCENARIOS = AWAITING_DECISION ->
+    awaiting_review; both IDLE -> pending; otherwise -> in_progress."""
     pending = "pending"                # nothing started yet — both stage rows are IDLE
-    in_progress = "in_progress"        # the fallback/default rollup — some stage work is underway
-    awaiting_review = "awaiting_review"  # SCENARIOS reached AWAITING_DECISION — this subsystem's part of the review barrier
-    complete = "complete"              # the session itself was accepted (SessionStatus.completed) — accept_session()
-                                        # never rewrites Subsystem_Stage_State, so this is derived from session
-                                        # status, not from a stored per-stage COMPLETE (SCENARIOS never reaches it)
+    in_progress = "in_progress"        # the fallback rollup — some stage work is underway
+    awaiting_review = "awaiting_review"  # SCENARIOS reached AWAITING_DECISION
+    complete = "complete"              # derived from SessionStatus.completed — accept_session() never
+                                        # rewrites Subsystem_Stage_State, so SCENARIOS never reaches COMPLETE
     error = "error"                    # either stage is StageStatus.ERROR — takes priority over every other rollup
-    cancelled = "cancelled"            # the session itself was cancelled while this subsystem had no more specific outcome
+    cancelled = "cancelled"            # the session was cancelled with no more specific outcome here
 
 
-#  the event names sent to the browser over the live server-sent-events
-# (SSE) stream, so the UI can update as the pipeline progresses.
 class SSEEventType(StrEnum):
-    """Three real scopes, not two — `stage_started`/`stage_completed` are scoped to one
-    SubsystemLevel cell (carry subsystem_id + stage); `subsystem_started` is scoped to one
-    subsystem, all its stages (carries subsystem_id, no stage); `session_entered_review` and
-    `heartbeat` are genuinely session-wide (no subsystem_id ever). `error` is DUAL-scope by
-    design: it carries subsystem_id when one stage failed, and omits it when the whole
-    session died (all subsystems errored) — the same subsystem_id-presence convention
-    `stage_started`/`stage_completed` already rely on to disambiguate, not a special case."""
+    """Three scopes, not two: `stage_started`/`stage_completed` are one SubsystemLevel cell
+    (subsystem_id + stage); `subsystem_started` is one subsystem (subsystem_id, no stage);
+    `session_entered_review`/`heartbeat` are session-wide (never a subsystem_id). `error` is
+    DUAL-scope by design — subsystem_id present when one stage failed, omitted when the whole
+    session died — reusing the same presence convention, not a special case."""
     stage_started = "stage_started"                    # one (subsystem, stage) cell began running
-    stage_completed = "stage_completed"                # that same cell finished (success — a failure routes to `error` instead)
-    subsystem_started = "subsystem_started"            # the pipeline began work on this subsystem (fires BEFORE its stages run, not after)
-    session_entered_review = "session_entered_review"  # every subsystem is done; the whole session now waits on the one human decision
-    error = "error"                                    # a stage failed (carries subsystem_id) or the whole session died (omits it)
-    next_set_result = "next_set_result"                # advisory: one "generate next set" click landed (carries subsystem_id +
-                                                        # new_scenarios/no_new) so the UI can tell a fruitful click from a fruitless one
-    regen_result = "regen_result"                       # advisory: one regenerate click landed (carries subsystem_id +
-                                                        # requested_output_ids/new_output_ids) so the UI can highlight exactly which
-                                                        # scenarios were replaced; new_output_ids=[] means every target rescored out
+    stage_completed = "stage_completed"                # that same cell finished (a failure routes to `error` instead)
+    subsystem_started = "subsystem_started"            # fires BEFORE this subsystem's stages run, not after
+    session_entered_review = "session_entered_review"  # every subsystem is done; waiting on the one human decision
+    error = "error"                                    # a stage failed (carries subsystem_id) or the session died (omits it)
+    next_set_result = "next_set_result"                # advisory: one "generate next set" click landed (subsystem_id +
+                                                        # new_scenarios/no_new, plus reason/detail/message when no_new —
+                                                        # reason is a stable code, detail is log-facing, message is the
+                                                        # end-user sentence; see cascade.py::_REASON_INFO)
+    regen_result = "regen_result"                       # advisory: one regenerate click landed (subsystem_id +
+                                                        # requested_output_ids/new_output_ids, same reason/detail/message
+                                                        # shape, though reason is None for the target-went-stale race).
+                                                        # new_output_ids=[] means every target rescored out (or that race)
     heartbeat = "heartbeat"                             # periodic keep-alive so proxies don't drop an idle SSE connection
 
 

@@ -72,6 +72,15 @@ proxy access needed. Typical production: flip `EMBEDDING_PROVIDER`/`RERANKER_PRO
 optionally `LLM_PROVIDER`) to `litellm_proxy` and point `TSG_LITELLM_BASE_URL`/
 `TSG_LITELLM_API_KEY` at the real proxy — no code change either way.
 
+**UAT/production capacity tuning** (see the matching block in `.env.example`): set
+`TSG_LLM_TIMEOUT_SECONDS=600` — the 90s default suits direct Azure, but the proxy's
+self-hosted models queue under concurrent load (proxy allows 1800s; a live probe measured 36s
+for one uncontended call). Leave `TSG_STAGE_LEASE_SECONDS` unset so the reaper's lease
+auto-derives from the timeout (`timeout × (retries+1) × 2`); an explicitly-set lease below the
+safe floor refuses to boot. A provider rate limit that outlives litellm's retries (kimi-k2.5
+has a platform-wide `rpm=192` shared across all teams; glm-5 has none) is treated as
+temporary capacity — the task retries with backoff instead of failing the session.
+
 Optional safety features (off/unset by default, litellm_proxy only): `LLM_MODERATION_ENABLED`
 (flags generated scenario text via the proxy's moderation endpoint — soft-flag, never blocks),
 `LLM_GUARDRAILS` (proxy-side guardrail name(s) to run on every chat call).
