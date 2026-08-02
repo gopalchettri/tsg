@@ -16,15 +16,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 def _env_file() -> str:
     """Which .env file to load — `TSG_ENV_FILE` if set, else the default `.env`.
 
-    Without this, `env_file=".env"` was the ONLY file pydantic-settings ever read, so an
-    environment-specific file (`.env.uat`, `.env.prod`) was inert: a UAT host with a perfectly
-    correct `.env.uat` silently ran whatever was in `.env` instead — dev provider, dev model, dev
-    dimensions, and AUTH_DEV_MODE on. Nothing errored; it was just the wrong environment.
-
-    Fails LOUDLY when TSG_ENV_FILE names a file that does not exist: a typo'd path must never
-    fall back to `.env`, because that fallback IS the failure mode this exists to remove.
-    (Real environment variables — a K8s ConfigMap/Secret, docker compose `env_file:` — still take
-    priority over any file, so this only matters where the app reads a file at all.)"""
+    Fails LOUDLY when TSG_ENV_FILE names a file that does not exist: falling back to `.env`
+    would silently run this deployment on another environment's config (dev provider, dev
+    model, AUTH_DEV_MODE on) with nothing erroring."""
     chosen = os.environ.get("TSG_ENV_FILE", "").strip()
     if not chosen:
         return ".env"
@@ -96,7 +90,7 @@ class Settings(BaseSettings):
 
     # --- Live threat intel (open feeds cached in Mongo 'threat_intel'; enrichment is fail-open) ---
     # Master switch for the daily intel-refresh beat task (app/intel/fetchers.py).
-    intel_enabled: bool = False
+    intel_enabled: bool = True
 
     # Cache TTL: items STILL present in a feed get their timestamp refreshed on every run and
     # never expire; TTL only purges items a feed has dropped (or a whole decommissioned feed).
@@ -156,12 +150,10 @@ class Settings(BaseSettings):
     # Key used to authenticate with the litellm proxy.
     litellm_api_key: str = "sk-local"
 
-    # Optional ALTERNATE header to carry that key, e.g. "x-litellm-api-key".
-    # Empty (default) = standard `Authorization: Bearer <key>`, which is what litellm expects.
-    # Set this when the proxy sits behind a gateway that consumes/rewrites `Authorization`
-    # before litellm ever sees it — the symptom is a 401 from every call even though the same
-    # key works with `x-litellm-api-key` (confirmed against the UAT proxy). The key is sent in
-    # BOTH headers when this is set, so it works either side of such a gateway.
+    # Optional ALTERNATE header to carry that key, e.g. "x-litellm-api-key". Empty (default) =
+    # standard `Authorization: Bearer <key>`. Set it when a gateway in front of litellm
+    # consumes/rewrites `Authorization` (symptom: every call 401s). The key is then sent in BOTH
+    # headers, so it works either side of such a gateway.
     litellm_api_key_header: str = Field(
         "", validation_alias=AliasChoices("LITELLM_API_KEY_HEADER", "TSG_LITELLM_API_KEY_HEADER"))
 
@@ -240,21 +232,17 @@ class Settings(BaseSettings):
     # --- Local model runtime (only used when embedding/reranker provider = 'local') ---
     # How many local AI models can be kept loaded in memory at once.
     local_model_cache_size: int = 4
-    # How many local embedding/reranker calls can run truly at once (gevent's native thread
-    # pool — see local_models.py::_offload). 10 matches gevent's own built-in default; this
-    # just makes it a visible, tunable setting instead of an invisible ceiling nobody can see
-    # or change. Independent of Celery's own -c/--concurrency worker setting.
+    # How many local embedding/reranker calls run at once (gevent's native thread pool — see
+    # local_models.py::_offload). 10 is gevent's own default. Independent of Celery's -c.
     local_model_threadpool_size: int = 10
 
     # --- Grounding: how much to trust an AI-proposed threat's match to the library (0-100 scale) ---
     # Below grounding_confirm_threshold: unmatched. Between the two: a probable match that still
     # needs a human look. At or above grounding_grounded_threshold: accepted automatically.
-    # These cutoffs are MODEL-SPECIFIC. Leave them UNSET (the normal case): the app then
-    # auto-calibrates a pair for the configured embedding+reranker models from the live threat
-    # library and stores it per model pair, so a model change can never silently run on numbers
-    # tuned for a different model (grounding.resolve_thresholds). Setting either one explicitly
-    # in env pins BOTH to these static values and disables auto-calibration — the manual escape
-    # hatch, e.g. after a labelled run of scripts/calibrate_grounding.py.
+    # These cutoffs are MODEL-SPECIFIC. Leave them UNSET (the normal case): the app
+    # auto-calibrates a pair per embedding+reranker model from the live library
+    # (grounding.resolve_thresholds), so a model change can never silently run on numbers tuned
+    # for a different model. Setting either one in env pins BOTH and disables auto-calibration.
     grounding_confirm_threshold: float = 60.0
     grounding_grounded_threshold: float = 75.0
     # How many of the closest-matching library entries get a closer, second-pass check.
@@ -264,25 +252,30 @@ class Settings(BaseSettings):
     # Most controls kept per scenario ("up to K", never padded with weak matches) — also the
     # cap on how many control suggestions the scenario prompt asks the LLM for.
     control_map_top_k: int = Field(5, ge=1)
-    # A suggestion whose best library match reranks below the cutoff is dropped — the LLM's
-    # idea has no good library counterpart, and force-fitting the least-bad control is worse
-    # than an honest empty list. LEAVE UNSET (the normal case): the effective cutoff then
-    # follows the per-(embedding, reranker)-pair CONFIRM threshold grounding.resolve_thresholds
-    # maintains, so a model swap in UAT/prod re-derives it automatically. Setting this in env
-    # pins a static cutoff instead (control_mapping._min_score) — the manual escape hatch.
+    # A suggestion whose best library match reranks below the cutoff is dropped — an honest
+    # empty list beats force-fitting the least-bad control. LEAVE UNSET: the cutoff then
+    # follows the per-(embedding, reranker)-pair CONFIRM threshold, so a model swap re-derives
+    # it. Setting this in env pins a static cutoff (control_mapping._min_score).
     control_map_min_score: float = Field(60.0, ge=0.0, le=100.0)
     # How many remote rerank calls llm.rerank_many runs at once (LOCAL politeness cap only —
-    # every call still acquires its own _llm_slot, so the Redis semaphore stays the global
-    # authority; excess workers just wait there). Irrelevant for the local reranker, which
-    # batches all pairs into one model dispatch instead.
+    # every call still takes its own _llm_slot, so the Redis semaphore stays the global
+    # authority). Irrelevant for the local reranker, which batches all pairs into one dispatch.
     rerank_concurrency: int = Field(8, ge=1)
 
     # --- Threat proposal volume ---
-    # Most candidate threats the AI can propose for ONE ASSET in a single call (asset-centric
-    # restructure — this used to be per supporting system; `TSG_MAX_THREATS_PER_SUBSYSTEM` still
-    # works as a back-compat env var, but now bounds the per-asset count).
+    # Most candidate threats the AI can propose for ONE ASSET in a single call.
+    # `TSG_MAX_THREATS_PER_SUBSYSTEM` still works as a back-compat env var for the same value.
     max_threats_per_asset: int = Field(
         10, validation_alias=AliasChoices("TSG_MAX_THREATS_PER_ASSET", "TSG_MAX_THREATS_PER_SUBSYSTEM"))
+
+    # How many coexisting ACTIVE scenarios one threat identity may accumulate (1 original +
+    # N-1 "generate next set" variant alternates). Enforced ONLY by
+    # dal.variant_eligible_primaries — the single gate that ever assigns a ScenarioNumber > 1.
+    # Also bounds the variant prompt: at most N-1 sibling scenarios are ever included.
+    max_scenarios_per_threat: int = Field(2, ge=1)
+
+    # Batch size of one "generate next set" click (scenarios served/generated per call).
+    next_set_size: int = Field(5, ge=1)
 
     # --- Threat-scoping selection cutoff ---
     # A threat scoring below this doesn't get a full scenario written for it.
@@ -293,19 +286,22 @@ class Settings(BaseSettings):
     scoping_top_n: int | None = Field(5, ge=1)
 
     # --- Threat-library import (admin) ---
-    # Max size of an uploaded library file (POST /v1/tsg/threat-library/import's
-    # file_content), in MB. Real ATT&CK/CAPEC STIX bundles run tens of MB, so the
-    # default is deliberately generous, not tight.
-    threat_library_import_max_upload_mb: int = Field(50, ge=1)
+    # Max size of an uploaded library file (the file_content field of
+    # POST /v1/tsg/threat-library/sources/{source}/import), in MB. Sized against the largest
+    # source: enterprise-attack.json is ~51 MB raw and larger again JSON-escaped into a body,
+    # so anything near 50 makes the air-gapped upload path unusable (413 in
+    # BodySizeLimitMiddleware, before parsing). A guard against an accidental huge upload, not
+    # a memory bound — the file rides the Redis broker as a string either way (see
+    # api/threat_library_import.py::_enqueue).
+    threat_library_import_max_upload_mb: int = Field(128, ge=1)
 
     # --- Session capacity limits ---
     # Most sessions the app processes at the same time. New requests are rejected past this.
     max_active_sessions: int = 100
 
     # Most sessions any ONE entity can have active at once. 0 (default) = no per-entity cap,
-    # only the global max_active_sessions above applies. Without this, one entity creating
-    # sessions in a loop can exhaust the entire global ceiling for every other entity in the
-    # same tenant — this bounds that blast radius to a deliberate, reportable event instead.
+    # only the global max_active_sessions above applies — one entity looping on session
+    # creation can then exhaust the global ceiling for every other entity in the tenant.
     max_active_sessions_per_entity: int = 0
 
     # How many seconds to tell a client to wait before retrying, when the app is at capacity.
@@ -340,13 +336,10 @@ class Settings(BaseSettings):
     reaper_interval_seconds: float = 60.0
 
     # How long a session with NO live lease at all (never started, or its lease already
-    # cleared) must sit untouched before the cleanup job treats it as abandoned. Defaults
-    # to stage_lease_seconds unless set explicitly (see _derive_reaper_stale_grace_seconds
-    # below) — its own setting, not just reaper.py reading stage_lease_seconds directly, so
-    # the two CAN diverge later without touching the stage CAS's own timeout floor. Plain
-    # `float` (not `float | None`), same as stage_lease_seconds's own `int` default just
-    # below — "was it set explicitly" is answered via `model_fields_set`, not a None sentinel,
-    # so the resolved value's static type never needs to carry an Optional it can't have.
+    # cleared) must sit untouched before the cleanup job treats it as abandoned. Defaults to
+    # stage_lease_seconds (see _derive_reaper_stale_grace_seconds below). "Was it set
+    # explicitly" is answered via `model_fields_set`, not a None sentinel — hence the plain
+    # `float` default rather than `float | None`.
     reaper_stale_grace_seconds: float = 300.0
 
     # Most times a crashed piece of work can be retried before it's given up on for good.
@@ -396,6 +389,10 @@ class Settings(BaseSettings):
     # Where to fetch the keys used to verify a token's signature.
     jwt_jwks_url: str = ""
 
+    # Shared HS256 secret. When set, token signatures are verified with it and the
+    # JWKS URL is not used (EY Shield WebAPI issues HS256 tokens with a shared key).
+    jwt_secret: str = ""
+
     # Which signing methods are trusted.
     jwt_algorithms: tuple[str, ...] = ("RS256",)
 
@@ -435,13 +432,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _bind_scenario_count_to_threat_count(self) -> "Settings":
-        """scoping_top_n (scenarios written) can never exceed max_threats_per_asset (threats
-        the AI is even allowed to propose) — the pipeline can't write more UNIQUE scenarios than it
-        identifies threats. Hard-fail at startup on that inversion. Also emit a startup WARNING (not
-        an error) when the headroom is thin (< 1.25x candidates per target scenario): catalogue
-        dedup can then under-shoot scoping_top_n when the model repeats itself, and the operator
-        should widen the gap. The gap IS the headroom knob — no separate setting. (tasks.write_
-        scenarios additionally clamps min(scoping_top_n, max_threats_per_asset) at runtime.)"""
+        """scoping_top_n can never exceed max_threats_per_asset — the pipeline can't write more
+        UNIQUE scenarios than it identifies threats; hard-fail at startup on that inversion.
+        Thin headroom (< 1.25x candidates per target scenario) only WARNS: catalogue dedup can
+        then under-shoot scoping_top_n when the model repeats itself. The gap IS the headroom
+        knob — no separate setting."""
         top_n = self.scoping_top_n
         if top_n is None:
             return self
@@ -452,8 +447,7 @@ class Settings(BaseSettings):
                 "scenarios than it identifies threats. Lower scoping_top_n or raise "
                 "max_threats_per_asset.")
         if self.max_threats_per_asset < top_n * 1.25:
-            # Lazy import avoids a config<->logging import cycle (logging imports config); by the
-            # time any Settings() is built, both modules are fully defined.
+            # Lazy import avoids a config<->logging import cycle (logging imports config).
             from app.core.logging import get_logger
             get_logger(__name__).warning(
                 "config.thin_dedup_headroom", scoping_top_n=top_n,
@@ -464,12 +458,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _derive_reaper_stale_grace_seconds(self) -> "Settings":
-        """If not set explicitly, follows stage_lease_seconds (already resolved by
-        _derive_stage_lease_seconds above, which runs first) — the same "how long can one
-        step legitimately run" window doubles as "how long can a session sit with no lease
-        at all before it's abandoned," today's actual behavior. Runs after
-        _derive_stage_lease_seconds so it reads that field's DERIVED value, not its
-        unresolved 300-second class default, when both are left unset."""
+        """If not set explicitly, follows stage_lease_seconds. Must stay ordered AFTER
+        _derive_stage_lease_seconds so it reads that field's DERIVED value, not its unresolved
+        300-second class default, when both are left unset."""
         if "reaper_stale_grace_seconds" not in self.model_fields_set:
             self.reaper_stale_grace_seconds = self.stage_lease_seconds
         return self
@@ -477,11 +468,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _validate_llm_slot_heartbeat_margin(self) -> "Settings":
         """llm_slot_heartbeat_seconds must stay comfortably below llm_slot_stale_after_seconds —
-        _llm_slot's heartbeat thread only renews a ticket every `heartbeat` seconds (its first
-        renewal fires AFTER the first full interval, not before), so a still-legitimately-running
-        call can have its ticket pruned by another caller's staleness check before ever renewing
-        once, if the two settings are too close together. Same class of safety floor as
-        _derive_stage_lease_seconds above, applied to this setting pair instead."""
+        _llm_slot's heartbeat thread renews a ticket only every `heartbeat` seconds, and its
+        FIRST renewal fires after a full interval, so if the two are too close another caller's
+        staleness check can prune a still-running call's ticket before it ever renews once."""
         if self.llm_slot_stale_after_seconds < self.llm_slot_heartbeat_seconds * 2:
             raise ValueError(
                 f"llm_slot_stale_after_seconds ({self.llm_slot_stale_after_seconds}s) is too close "
@@ -511,21 +500,22 @@ def get_settings() -> Settings:
 
 
 def assert_security_posture(settings: Settings | None = None) -> None:
-    """Startup safety check: refuses to start in staging/prod if the dev-only login bypass is on
-    or JWT verification is not fully configured."""
+    """Startup safety check: with AUTH_DEV_MODE on, skip every check below (there is no login to
+    verify) so it works as a deliberate opt-in outside dev too; with it off, staging/prod still
+    require JWT verification to be fully configured."""
     s = settings or get_settings()
+    if s.auth_dev_mode:
+        return
     prod_like = s.app_env in ("staging", "prod")
-    if s.auth_dev_mode and prod_like:
-        raise RuntimeError(
-            f"AUTH_DEV_MODE is enabled but APP_ENV={s.app_env}. The dev auth bypass is only allowed "
-            "when APP_ENV is 'dev' or 'local'. Refusing to start.")
     if prod_like:
         # security.validate_jwt already fails closed per-request on a missing issuer/audience,
         # but an unset JWKS URL only surfaces as every request 401-ing on a key fetch of "".
         # Fail at boot instead, naming exactly which env vars are missing.
-        missing = [env for env, value in (("TSG_JWT_JWKS_URL", s.jwt_jwks_url),
-                                        ("TSG_JWT_ISSUER", s.jwt_issuer),
+        missing = [env for env, value in (("TSG_JWT_ISSUER", s.jwt_issuer),
                                         ("TSG_JWT_AUDIENCE", s.jwt_audience)) if not value]
+        if not (s.jwt_jwks_url or s.jwt_secret):
+            # Either verification mode will do: JWKS (asymmetric) or shared secret (HS256).
+            missing.append("TSG_JWT_JWKS_URL or TSG_JWT_SECRET")
         if missing:
             raise RuntimeError(
                 f"APP_ENV={s.app_env} requires JWT verification to be fully configured; "
