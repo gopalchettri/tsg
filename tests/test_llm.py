@@ -324,12 +324,13 @@ def test_auth_dev_mode(monkeypatch):
         get_settings.cache_clear()
 
 
-def test_security_posture_blocks_dev_auth_in_prod():
+def test_security_posture_allows_dev_auth_in_prod():
+    # AUTH_DEV_MODE is a deliberate opt-in outside dev too (jump server, OpenShift UAT/prod) —
+    # it must skip the JWT-completeness check below it as well, not just the old boot refusal.
     from app.core.config import Settings, assert_security_posture
 
     s = Settings(app_env="prod", auth_dev_mode=True)
-    with pytest.raises(RuntimeError, match="AUTH_DEV_MODE"):
-        assert_security_posture(s)
+    assert_security_posture(s)  # no raise, even with every JWT field left at its empty default
 
 
 def test_security_posture_allows_dev():

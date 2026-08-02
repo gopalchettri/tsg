@@ -49,7 +49,7 @@ def get_principal(
     app/api/errors.py — the same contract every other domain exception in this
     API already follows."""
     if get_settings().auth_dev_mode:  # DEV ONLY — no JWT; entities from a header
-        _log.warning("AUTH_DEV_MODE is ON — JWT validation is BYPASSED (dev/local only)")
+        _log.warning("AUTH_DEV_MODE is ON — JWT validation is BYPASSED")
         return Principal(
             claims={"sub": x_dev_user or "dev"},
             # Split the comma-separated dev header into entity IDs, trimming whitespace and dropping empty entries

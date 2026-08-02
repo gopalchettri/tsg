@@ -511,14 +511,13 @@ def get_settings() -> Settings:
 
 
 def assert_security_posture(settings: Settings | None = None) -> None:
-    """Startup safety check: refuses to start in staging/prod if the dev-only login bypass is on
-    or JWT verification is not fully configured."""
+    """Startup safety check: with AUTH_DEV_MODE on, skip every check below (there is no login to
+    verify) so it works as a deliberate opt-in outside dev too; with it off, staging/prod still
+    require JWT verification to be fully configured."""
     s = settings or get_settings()
+    if s.auth_dev_mode:
+        return
     prod_like = s.app_env in ("staging", "prod")
-    if s.auth_dev_mode and prod_like:
-        raise RuntimeError(
-            f"AUTH_DEV_MODE is enabled but APP_ENV={s.app_env}. The dev auth bypass is only allowed "
-            "when APP_ENV is 'dev' or 'local'. Refusing to start.")
     if prod_like:
         # security.validate_jwt already fails closed per-request on a missing issuer/audience,
         # but an unset JWKS URL only surfaces as every request 401-ing on a key fetch of "".

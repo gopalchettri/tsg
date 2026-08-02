@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
     configure_logging()
     assert_security_posture()  # fail-closed: refuse to boot with auth disabled in prod
     if get_settings().auth_dev_mode:
-        get_logger().warning("AUTH_DEV_MODE is ON — authentication is bypassed. Dev/local only.")
+        get_logger().warning("AUTH_DEV_MODE is ON — authentication is bypassed.")
     verify_startup(get_engine())  # fail-fast if a required DB guard is missing
     validate_local_models(warm=False)  # fail-fast on a bad local-model path (API doesn't hold the model)
     yield
