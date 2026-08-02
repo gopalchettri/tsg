@@ -16,6 +16,7 @@ from app.db.dal import (
     CancelConflict, CapacityExceeded, EntityForbidden, IdempotencyKeyConflict, NotFoundError,
     RegenerateConflict, SessionConflict,
 )
+from app.pipeline import cascade
 from app.pipeline.accept import AcceptConflict, MasterInactive
 from app.api.admin import AdminValidationError
 from app.pipeline.embeddings import EmbeddingBusy
@@ -26,10 +27,8 @@ log = get_logger(__name__)
 
 
 def _env(code: str, message: str, **details) -> dict:
-    """Build the error envelope every handler below returns, so every 4xx/5xx body has the same `{error_code, message, details?}` shape regardless of which exception raised it."""
+    """The envelope every handler below returns, so every 4xx/5xx body has the same shape."""
     body: dict[str, Any] = {"error_code": code, "message": message}
-    # Only add the "details" key when there's actually extra data to show,
-    # so simple errors don't get an empty details field in the response.
     if details:
         body["details"] = details
     return body
@@ -45,6 +44,18 @@ async def _handle_forbidden(_: Request, exc: EntityForbidden):
     return JSONResponse(status_code=403, content=_env("forbidden", str(exc)))
 
 
+async def _handle_library_conflict(_: Request, exc):  # exc: library_crud.LibraryConflict
+    """Threat-library CRUD write would violate a master's natural-key index -> 409.
+
+    Carries the colliding row's id so a client can PATCH the existing row instead of retrying a
+    create that can never succeed. Best-effort null: the indexes cover a triple, and a
+    category/sector-only clash isn't findable by name alone."""
+    return JSONResponse(
+        status_code=409,
+        content=_env("library_conflict", str(exc), existing_id=exc.existing_id),
+    )
+
+
 async def _handle_session_conflict(_: Request, exc: SessionConflict):
     """Asset already has an active session -> 409, with the existing session id so the client can redirect to it instead of retrying blind."""
     return JSONResponse(
@@ -55,9 +66,8 @@ async def _handle_session_conflict(_: Request, exc: SessionConflict):
 
 
 async def _handle_accept_conflict(_: Request, exc: AcceptConflict):
-    """Session accept was attempted from a state that doesn't allow it -> 409. When the raise
-    site provided a machine-readable cause (the review gate does), it rides along as
-    `details.reason` so clients can branch without parsing the prose."""
+    """Session accept was attempted from a state that doesn't allow it -> 409. A machine-readable
+    cause, when the raise site gave one, rides along as `details.reason`."""
     extra = {"reason": exc.reason} if exc.reason is not None else {}
     return JSONResponse(status_code=409, content=_env("accept_conflict", str(exc), **extra))
 
@@ -68,8 +78,15 @@ async def _handle_master_inactive(_: Request, exc: MasterInactive):
 
 
 async def _handle_not_found(_: Request, exc: NotFoundError):
-    """Requested entity doesn't exist (or isn't visible to this caller) -> 404."""
-    return JSONResponse(status_code=404, content=_env("not_found", str(exc)))
+    """Requested entity doesn't exist (or isn't visible to this caller) -> 404, with whatever
+    machine-readable payload the raise site attached as `details` (accept's partial-subset 404
+    names each unacceptable OutputID and why). getattr, not exc.details: NotFoundError is raised
+    from ~a dozen sites and may still arrive as a bare Exception subclass instance."""
+    details = getattr(exc, "details", None)
+    body = _env("not_found", str(exc))
+    if details:
+        body["details"] = details
+    return JSONResponse(status_code=404, content=body)
 
 
 async def _handle_capacity_exceeded(_: Request, exc: CapacityExceeded):
@@ -80,10 +97,9 @@ async def _handle_capacity_exceeded(_: Request, exc: CapacityExceeded):
 
 
 async def _handle_llm_slot_unavailable(_: Request, exc: LLMSlotUnavailable):
-    """Confirmed sustained over-capacity on the LLM-call concurrency limiter -> 503, same
-    shape as _handle_capacity_exceeded. Only reachable on a SYNCHRONOUS caller (the admin
-    embedding-refresh routes, §Part B) — the Celery/background path never surfaces this to an
-    HTTP response at all, since celery_app.py's autoretry_for catches it and retries first."""
+    """Confirmed sustained over-capacity on the LLM-call concurrency limiter -> 503, same shape
+    as _handle_capacity_exceeded. Only reachable from a SYNCHRONOUS caller — the Celery path
+    never surfaces this, since celery_app.py's autoretry_for catches it first."""
     retry_after = str(get_settings().capacity_retry_after_seconds)
     return JSONResponse(status_code=503, content=_env("llm_slot_unavailable",
                         "no free AI-call capacity right now, try again shortly"), headers={"Retry-After": retry_after})
@@ -97,11 +113,19 @@ async def _handle_idempotency_conflict(_: Request, exc: IdempotencyKeyConflict):
 
 
 async def _handle_regenerate_conflict(_: Request, exc: RegenerateConflict):
-    """Regenerate was requested while the session isn't in a regenerable state -> 409. When the
-    raise site provided a machine-readable cause (the review gate does), it rides along as
-    `details.reason` so clients can branch without parsing the prose."""
-    extra = {"reason": exc.reason} if exc.reason is not None else {}
-    return JSONResponse(status_code=409, content=_env("regenerate_conflict", str(exc), **extra))
+    """Regenerate was requested while the session isn't in a regenerable state -> 409, with
+    `details.reason` when the raise site gave one. A reason cascade._REASON_INFO recognizes also
+    gets `details.detail` (log-facing) and `details.message` (safe to show the end user) — same
+    shape as the matching SSE events. Reasons with no entry there are unaffected.
+
+    Built by hand rather than via _env's **details splat: _reason_info's own "message" key would
+    collide with _env's positional `message` parameter."""
+    details: dict[str, Any] = {"reason": exc.reason} if exc.reason is not None else {}
+    details.update({k: v for k, v in cascade._reason_info(exc.reason).items() if v is not None})
+    body = _env("regenerate_conflict", str(exc))
+    if details:
+        body["details"] = details
+    return JSONResponse(status_code=409, content=body)
 
 
 async def _handle_cancel_conflict(_: Request, exc: CancelConflict):
@@ -127,37 +151,27 @@ async def _handle_threat_library_import_error(_: Request, exc: ThreatLibraryImpo
 
 
 async def _handle_validation_error(_: Request, exc: RequestValidationError):
-    """FastAPI/Pydantic request validation failure -> 422, wrapped in the [R9] envelope instead of FastAPI's default shape so error responses stay consistent across the API.
+    """FastAPI/Pydantic request validation failure -> 422 in the [R9] envelope.
 
-    `exc.errors()` can embed a raw exception instance under `ctx.error` whenever a
-    custom `@field_validator` raises `ValueError` — not JSON-serializable, so
-    `errors=exc.errors()` raw would 500 instead of 422 on exactly the custom-validator
-    errors this handler exists to report. Dropping `ctx` (the message text already
-    repeats its content in `msg`) fixes this for every current AND future
-    field_validator, not just one call site."""
-    # In plain terms: copy each validation error but drop its "ctx" field,
-    # because "ctx" can hold a raw Python exception object that JSON can't encode.
+    `ctx` is dropped: `exc.errors()` embeds a raw exception instance under `ctx.error` whenever a
+    custom `@field_validator` raises ValueError — not JSON-serializable, so passing errors
+    through raw 500s on exactly the custom-validator errors this handler exists to report. `msg`
+    already repeats the content."""
     errors = [{k: v for k, v in e.items() if k != "ctx"} for e in exc.errors()]
     return JSONResponse(status_code=422, content=_env("validation_error", "request validation failed",
                                                     errors=errors))
 
 
 async def _handle_unhandled_exception(request: Request, exc: Exception):
-    """Catch-all safety net -> 500; logs the full traceback always, but only echoes the exception message back to the client in local/dev to avoid leaking internals in production.
+    """Catch-all -> 500; always logs the traceback, echoes the exception text only in local/dev.
 
-    [REVIEW-FIX] Starlette routes the bare-`Exception` handler through its outermost
-    ServerErrorMiddleware, which sits OUTSIDE RequestIDMiddleware — by the time this handler
-    runs, that middleware's `finally` has already cleared the request_id from contextvars
-    (correctly, to stop it leaking into the next request on the same worker). request_id is
-    read from request.state instead, which RequestIDMiddleware also stashed there before
-    contextvars ever got involved — the only channel that reliably survives this exact
-    unwind. Passed explicitly to log.error (not relied on via contextvars) and echoed on the
-    response header so a client-reported 500 can still be grepped straight to its crash log."""
+    request_id comes from `request.state`, not contextvars: Starlette routes the bare-`Exception`
+    handler through ServerErrorMiddleware, which sits OUTSIDE RequestIDMiddleware, whose
+    `finally` has already cleared the contextvar by the time this runs. Echoed on the response
+    header so a client-reported 500 can be grepped straight to its crash log."""
     request_id = getattr(request.state, "request_id", None)
     log.error("unhandled_exception", path=str(request.url), request_id=request_id, exc_info=True)
     s = get_settings()
-    # Show the real exception text only in local/dev; in other environments
-    # (e.g. production) return a generic message so internals aren't exposed.
     detail = str(exc) if s.app_env in ("local", "dev") else "an unexpected error occurred"
     headers = {"X-Request-Id": request_id} if request_id else None
     return JSONResponse(status_code=500, content=_env("internal_error", detail), headers=headers)
@@ -179,5 +193,9 @@ def register_error_handlers(app: FastAPI) -> None:
     app.exception_handler(EmbeddingBusy)(_handle_embedding_busy)
     app.exception_handler(AdminValidationError)(_handle_admin_validation_error)
     app.exception_handler(ThreatLibraryImportError)(_handle_threat_library_import_error)
+    # Imported here, not at module scope: library_crud imports admin.py, which would make
+    # an errors.py -> crud -> admin -> errors cycle at import time.
+    from app.api.library_crud import LibraryConflict
+    app.exception_handler(LibraryConflict)(_handle_library_conflict)
     app.exception_handler(RequestValidationError)(_handle_validation_error)
     app.exception_handler(Exception)(_handle_unhandled_exception)

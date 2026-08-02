@@ -21,7 +21,8 @@ from app.db import dal
 from app.db import models as m
 from app.db.dal import SessionConflict, load_session, now
 from app.pipeline import grounding, prompts, scoping
-from app.pipeline.accept import AcceptConflict, MasterInactive, _pick_sector_for_promotion, accept_session
+from app.pipeline.accept import (
+    _REASON_TEXT, AcceptConflict, MasterInactive, _pick_sector_for_promotion, accept_session)
 from app.pipeline.reaper import clean_up_abandoned_sessions
 from app.pipeline.tasks import (
     ASSET_UNIT_ID, decide_session_outcome, _process_all_supporting_systems, set_up_progress_tracking, find_threats,
@@ -1119,14 +1120,25 @@ def test_happy_path_and_conflict_and_smoke(engine, monkeypatch):
     monkeypatch.setattr("app.api.sessions.enqueue_pipeline", sync)
     client = make_client({"5"})
 
-    sid = client.post("/v1/sessions", json=session_body(100)).json()["session_id"]
+    created = client.post("/v1/sessions", json=session_body(100)).json()
+    sid = created["session_id"]
+    assert created["user_id"] == "u1"  # the authenticated caller, echoed back as the new owner
     board = client.get(f"/v1/sessions/{sid}").json()
-    assert board["supporting_systems"][0]["overall"] == "awaiting_review"
+    assert board["progress"]["overall"] == "awaiting_review"
+    assert board["asset_id"] == 100 and board["asset_name"]
+    assert board["user_id"] == "u1"
 
     results = client.get(f"/v1/sessions/{sid}/results").json()
+    assert results["user_id"] == "u1"
     assert len(results["scenarios"]) == 1
+    # the scenario's threat_id must resolve to a real entry in threats[] — the whole reason this
+    # field was added: a client can now pair a scenario to its threat directly, not by title-guessing.
+    assert results["scenarios"][0]["threat_id"] == results["threats"][0]["threat_id"]
+    assert "supporting_system_id" not in results["scenarios"][0] and "supporting_system_id" not in results["threats"][0]
+    assert results["asset_id"] == 100 and results["asset_name"]
     # [REVIEW-FIX] moderation is off by default — the field must still round-trip through the
     # whole stack (DB → ScenarioResult → JSON) as None, not silently absent from the response.
+    assert results["scenarios"][0]["moderation_checked"] is False
     assert results["scenarios"][0]["moderation_flagged"] is None
     assert results["scenarios"][0]["moderation_categories"] == []
     # [REVIEW-FIX] validate_scenario's own report must round-trip the same way — StubLLM's canned
@@ -1136,11 +1148,22 @@ def test_happy_path_and_conflict_and_smoke(engine, monkeypatch):
     assert "risk_statement does not reference the asset (CAD)" in results["scenarios"][0]["validation_errors"]
     # generation_epoch must round-trip: an initial full run always writes epoch 1 (tasks._EPOCH).
     assert results["scenarios"][0]["generation_epoch"] == 1
+    # Step-4 controls are delivered NESTED, replacing the LLM's raw {name, why} suggestions — there
+    # is no sibling top-level `controls` key any more.
+    assert "controls" not in results["scenarios"][0]
+    assert results["scenarios"][0]["scenario"]["controls"] == []
+    # ...and controls_mapped is what makes that empty list readable. This slice seeds no
+    # Control_Library, so map_controls bailed at `controls.no_candidates` BEFORE stamping
+    # ControlsMappedAt — deliberately, so these outputs are still picked up once the library is
+    # seeded. That third state ("not attempted: library unseeded") must report false, exactly like
+    # "not attempted: stage still running", and never the true that would claim a real library gap.
+    assert results["scenarios"][0]["controls_mapped"] is False
 
     accepted = client.post(f"/v1/sessions/{sid}/accept", json={"mode": "all"})
     assert accepted.status_code == 200 and accepted.json()["status"] == "completed"
     # the response reports how many scenarios were actually flipped — same count /results showed
     assert accepted.json()["accepted_count"] == 1
+    assert accepted.json()["user_id"] == "u1"
 
     # accept is one-shot: re-accepting the completed session must 409 with a self-explanatory
     # reason (human message + machine details.reason), not the old stale-field jargon
@@ -1148,6 +1171,7 @@ def test_happy_path_and_conflict_and_smoke(engine, monkeypatch):
     assert again.status_code == 409
     assert "already completed" in again.json()["message"]
     assert again.json()["details"]["reason"] == "session_completed"
+
     # regenerate shares the same gate — same clear reason for a finished session
     regen = client.post(f"/v1/sessions/{sid}/regenerate/scenarios",
                         json={"output_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]})
@@ -1160,6 +1184,39 @@ def test_happy_path_and_conflict_and_smoke(engine, monkeypatch):
     assert r200.status_code == 202
     dup = client.post("/v1/sessions", json=session_body(200))
     assert dup.status_code == 409 and dup.json()["details"]["active_session_id"]
+
+
+def test_results_never_drops_a_scenario_with_broken_threat_linkage(engine, monkeypatch):
+    """This schema has no enforced foreign keys (SDD Sec7.7) — Threat_Scenario_Output.ScopedThreatID
+    isn't DB-guaranteed to resolve to a real Scoped_Threat/Identified_Threat chain. get_results'
+    scenarios query must LEFT-join through that chain for threat_id, not INNER-join: an INNER join
+    would silently drop a scenario with broken linkage from this list, while accept's mode=all
+    would still sweep it in regardless (mark_scenarios_accepted has no such join) — a scenario a
+    human reviewer never saw becoming "accepted" and exposed downstream would violate the whole
+    human-in-the-loop point of this API. This is the regression guard for that specific failure mode."""
+    def sync(session_id):
+        from app.db.engine import db_session
+        with db_session() as s:
+            _process_all_supporting_systems(s, session_id, StubLLM(), "11111111-1111-4111-8111-111111111111")
+
+    monkeypatch.setattr("app.api.sessions.enqueue_pipeline", sync)
+    client = make_client({"5"})
+    sid = client.post("/v1/sessions", json=session_body(100)).json()["session_id"]
+
+    # Plant a scenario whose ScopedThreatID points at nothing real — the "no enforced FK" case.
+    from app.db.engine import db_session
+    orphan_id = str(uuid.uuid4())
+    with db_session() as s:
+        s.execute(insert(m.Threat_Scenario_Output).values(
+            OutputID=orphan_id, SessionID=sid, SubsystemID=ASSET_UNIT_ID,
+            ScopedThreatID=str(uuid.uuid4()),  # dangling — no matching Scoped_Threat row
+            Status="complete", ScenarioJSON=json.dumps({"scenario_title": "orphan"})))
+        s.commit()
+
+    results = client.get(f"/v1/sessions/{sid}/results").json()
+    orphan = next(r for r in results["scenarios"] if r["output_id"] == orphan_id)
+    assert orphan["threat_id"] is None  # linkage missing -> null field, not a dropped row
+    assert len(results["scenarios"]) == 2  # the real scenario PLUS the orphan — neither one lost
 
 
 # --- wire-level coverage for the OTHER two accept modes: the mode→subset translation
@@ -1235,16 +1292,16 @@ def test_moderation_summary_defensive_parsing():
     # asking about an unrelated field.
     from app.api.sessions import _moderation_summary
 
-    assert _moderation_summary(None) == (None, [])
-    assert _moderation_summary("") == (None, [])
-    assert _moderation_summary("not json") == (None, [])
-    assert _moderation_summary(json.dumps({"other_field": 1})) == (None, [])  # no "moderation" key at all
-    assert _moderation_summary(json.dumps({"moderation": "not a dict"})) == (None, [])
-    assert _moderation_summary(json.dumps({"moderation": {"checked": False}})) == (None, [])  # never checked
+    assert _moderation_summary(None) == (False, None, [])
+    assert _moderation_summary("") == (False, None, [])
+    assert _moderation_summary("not json") == (False, None, [])
+    assert _moderation_summary(json.dumps({"other_field": 1})) == (False, None, [])  # no "moderation" key at all
+    assert _moderation_summary(json.dumps({"moderation": "not a dict"})) == (False, None, [])
+    assert _moderation_summary(json.dumps({"moderation": {"checked": False}})) == (False, None, [])  # never checked
     assert _moderation_summary(json.dumps(
-        {"moderation": {"checked": True, "flagged": False, "categories": []}})) == (False, [])
+        {"moderation": {"checked": True, "flagged": False, "categories": []}})) == (True, False, [])
     assert _moderation_summary(json.dumps(
-        {"moderation": {"checked": True, "flagged": True, "categories": ["violence"]}})) == (True, ["violence"])
+        {"moderation": {"checked": True, "flagged": True, "categories": ["violence"]}})) == (True, True, ["violence"])
 
 
 def test_validation_summary_defensive_parsing():
@@ -1276,18 +1333,19 @@ def test_cancel_from_review_shows_cancelled_everywhere(engine, monkeypatch):
 
     sid = client.post("/v1/sessions", json=session_body(100)).json()["session_id"]
     board = client.get(f"/v1/sessions/{sid}").json()
-    assert board["session_status"] == "active" and board["supporting_systems"][0]["overall"] == "awaiting_review"
+    assert board["session_status"] == "active" and board["progress"]["overall"] == "awaiting_review"
 
     cancelled = client.post(f"/v1/sessions/{sid}/cancel")
     assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["user_id"] == "u1"
 
     board = client.get(f"/v1/sessions/{sid}").json()
     assert board["session_status"] == "cancelled"
     assert board["current_stage"] == "CANCELLED"
     assert board["stage_status"] == "CANCELLED"
-    assert board["supporting_systems"][0]["overall"] == "cancelled"
+    assert board["progress"]["overall"] == "cancelled"
     # the real per-stage history survives — cancelling never overwrites how far it got
-    assert board["supporting_systems"][0]["stages"]["scenarios"] == "AWAITING_DECISION"
+    assert board["progress"]["scenarios"] == "AWAITING_DECISION"
 
 
 # --- [R8] resume: a COMPLETE stage's persisted output is reloaded so the next stage
@@ -1545,6 +1603,87 @@ def _review_ready(db, sid, ssid, status=StageStatus.AWAITING_DECISION):
         _force_stage(db, sid, ssid, level, s)
 
 
+# --- partial accept 404 names WHICH ids failed and WHY -----------------------------------
+# Reported from a live call: three ids, one rejected, and the body said only "1 of 3" — the
+# offender took three hand-written SQL queries to find. The count alone does not scale.
+def _accept_ready_session(db):
+    session = _seed_session(db)
+    sid = session["SessionID"]
+    _review_ready(db, sid, ASSET_UNIT_ID)
+    good = _seed_scenario_chain(db, sid, ASSET_UNIT_ID, _seed_flagged_threat(
+        db, sid, ASSET_UNIT_ID, "Tampering", "Good Type", "Good Entry", []))
+    decide_session_outcome(db, session)
+    return sid, good
+
+
+def _accept_404(db, sid, subset):
+    with pytest.raises(dal.NotFoundError) as exc:
+        accept_session(db, sid, "5", "u1", subset=subset)
+    return exc.value
+
+
+def test_partial_accept_404_names_a_superseded_id(db):
+    sid, good = _accept_ready_session(db)
+    stale = _seed_scenario_chain(db, sid, ASSET_UNIT_ID, _seed_flagged_threat(
+        db, sid, ASSET_UNIT_ID, "Tampering", "Stale Type", "Stale Entry", []))
+    db.execute(update(m.Threat_Scenario_Output)
+            .where(m.Threat_Scenario_Output.OutputID == stale).values(Superseded=1))
+
+    err = _accept_404(db, sid, [good, stale])
+    assert err.details["unacceptable"] == [{"output_id": stale, "reason": "superseded"}]
+    assert err.details["requested"] == 2 and err.details["matched"] == 1
+    assert stale in str(err) and good not in str(err)   # names the offender, not the innocent
+
+    # atomicity: the one id that DID match must not be left accepted behind a 404
+    db.rollback()
+    assert db.execute(select(m.Threat_Scenario_Output.Accepted).where(
+        m.Threat_Scenario_Output.OutputID == good)).scalar() == 0
+
+
+def test_partial_accept_404_distinguishes_failure_card_from_unknown(db):
+    sid, good = _accept_ready_session(db)
+    dud = _seed_scenario_chain(db, sid, ASSET_UNIT_ID, _seed_flagged_threat(
+        db, sid, ASSET_UNIT_ID, "Tampering", "Dud Type", "Dud Entry", []))
+    db.execute(update(m.Threat_Scenario_Output)      # a failure card: exists, but has no content
+            .where(m.Threat_Scenario_Output.OutputID == dud)
+            .values(Status=ScenarioStatus.error, ScenarioJSON=None))
+    ghost = str(uuid.uuid4())
+
+    err = _accept_404(db, sid, [good, dud, ghost])
+    assert {u["output_id"]: u["reason"] for u in err.details["unacceptable"]} == {
+        dud: "failure_card", ghost: "unknown"}
+    assert err.details["requested"] == 3 and err.details["matched"] == 1
+
+
+def test_partial_accept_404_does_not_confirm_another_sessions_row_exists(db):
+    """TENANT BOUNDARY: the diagnostic must not turn a guessed OutputID into an existence
+    oracle. A real row in someone else's session reads exactly like one that never existed."""
+    sid, good = _accept_ready_session(db)
+    other = _seed_session(db, asset_id=101, entity="9", sid=str(uuid.uuid4()))
+    foreign = _seed_scenario_chain(db, other["SessionID"], ASSET_UNIT_ID, _seed_flagged_threat(
+        db, other["SessionID"], ASSET_UNIT_ID, "Tampering", "Foreign Type", "Foreign Entry", []))
+
+    err = _accept_404(db, sid, [good, foreign])
+    assert err.details["unacceptable"] == [{"output_id": foreign, "reason": "unknown"}]
+    # Assert on the REASON wording, not the bare word "superseded" — that appears in the
+    # advice sentence every one of these 404s carries, which is boilerplate and leaks nothing.
+    assert _REASON_TEXT["unknown"] in str(err)
+    assert _REASON_TEXT["superseded"] not in str(err)
+
+
+def test_full_subset_accept_runs_no_diagnostic_query(db):
+    """The classifier is a FAILURE-path read. A clean accept must not pay for it."""
+    sid, good = _accept_ready_session(db)
+    calls = []
+    real = dal.unacceptable_subset_reasons
+    dal.unacceptable_subset_reasons = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+    try:
+        assert accept_session(db, sid, "5", "u1", subset=[good]) == 1
+    finally:
+        dal.unacceptable_subset_reasons = real
+    assert calls == []
+
+
 def test_accept_promotes_flagged_threat_and_actor(db):
     session = _seed_session(db)
     sid = session["SessionID"]
@@ -1565,6 +1704,13 @@ def test_accept_promotes_flagged_threat_and_actor(db):
         m.Threat_Catalogue.ThreatTypeID == new_type["ThreatTypeID"])).mappings().first()
     assert new_cat is not None
     assert new_cat["Source"] == "ai_auto_promoted"
+    # Promotion knows the accepting user (accept_session's user_id) and must record it — the
+    # value was already in scope for the audit rows and simply wasn't reaching the library write,
+    # leaving rows the AI created with no accountable human at all.
+    assert new_type["CreatedBy"] == "u1" and new_type["CreatedAt"] is not None
+    assert new_cat["CreatedBy"] == "u1" and new_cat["CreatedAt"] is not None
+    # An accept CREATES library rows; it never edits one, so the edit stamp stays clear.
+    assert new_type["UpdatedBy"] is None and new_cat["UpdatedBy"] is None
     # [A2]/production-grade fix: promotion also links the new catalogue entry into
     # Threat_Catalogue_Category_Map, not just its Type's single rough default.
     link = db.execute(select(m.Threat_Catalogue_Category_Map.__table__).where(
@@ -1750,7 +1896,7 @@ def test_accept_subset_with_unknown_output_id_is_rejected(db):
     t = _seed_flagged_threat(db, sid, ASSET_UNIT_ID, "Tampering", "Some Type", "Some Entry", [])
     out = _seed_scenario_chain(db, sid, ASSET_UNIT_ID, t)
     decide_session_outcome(db, session)
-    with pytest.raises(dal.NotFoundError, match="did not match"):
+    with pytest.raises(dal.NotFoundError, match="cannot be accepted"):
         # `out` is real; the second id is well-formed but belongs to no row — a mismatch
         # (1 matched, 2 requested) must fail the whole accept, not silently accept just the
         # real one. A malformed id (not a valid GUID) is a 422 at the schema layer already,
@@ -2155,7 +2301,7 @@ def test_prompts_carry_generation_constraints_and_safety_rules():
     assert prompts.PROMPT_VERSION == "1.3"
 
 
-# --- [R13] downstream consumer contract: GET /v1/assets/{id}/accepted-scenarios ---
+# --- [R13] downstream consumer contract: GET /v1/sessions/{session_id}/accepted-scenarios ---
 def test_downstream_returns_only_accepted(engine, monkeypatch):
     """SDD-named acceptance: the downstream endpoint returns ONLY Accepted=1 AND
     Superseded=0 rows, each carrying the joinable ids (SDD §9, [R13])."""
@@ -2184,8 +2330,9 @@ def test_downstream_returns_only_accepted(engine, monkeypatch):
                 Accepted=accepted, Superseded=superseded))
         s.commit()
 
-    body = client.get("/v1/assets/100/accepted-scenarios?entity=5").json()
+    body = client.get(f"/v1/sessions/{sid}/accepted-scenarios").json()
     assert body["asset_id"] == 100 and body["session_id"] == sid and body["completed_at"]
+    assert body["user_id"] == "u1"
     assert len(body["scenarios"]) == 1  # only the genuinely accepted, non-superseded row
     row = body["scenarios"][0]
     assert row["output_id"] not in (rejected_id, superseded_id)
@@ -2195,44 +2342,64 @@ def test_downstream_returns_only_accepted(engine, monkeypatch):
     assert row["scenario"] is not None and row["threat_name"]
 
 
-def test_downstream_scoped_to_entity(engine):
-    """[R2] the downstream route 403s when the claimed entity isn't in the caller's
-    authorized set (require_entity)."""
-    # claimed entity not in the caller's authorized set → require_entity reject
-    assert make_client({"999"}).get("/v1/assets/100/accepted-scenarios?entity=5").status_code == 403
+def test_downstream_rejects_other_entitys_session(engine, monkeypatch):
+    """[R2] the downstream route 403s when the session's own EntityID isn't in the caller's
+    authorized set — same object-level authz as every other single-session route
+    (get_authorized_session), mirrors test_idor_denied."""
+    monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
+    sid = make_client({"5"}).post("/v1/sessions", json=session_body(100)).json()["session_id"]
+    assert make_client({"999"}).get(f"/v1/sessions/{sid}/accepted-scenarios").status_code == 403
 
 
-def test_downstream_rejects_asset_not_owned_by_claimed_entity(engine):
-    """[R2] a caller authorized for their OWN entity can't read another entity's asset by
-    claiming their own entity alongside someone else's asset_id — require_entity alone
-    only checks the claimed entity is theirs; assert_asset_owned_by_entity (dal.py) checks
-    asset 100 actually belongs to that entity (fixture: service 500 -> entity 5)."""
-    assert make_client({"999"}).get("/v1/assets/100/accepted-scenarios?entity=999").status_code == 403
+def test_downstream_rejects_unknown_session(engine):
+    """A syntactically-fine but nonexistent session_id must 404."""
+    bogus_sid = str(uuid.uuid4())
+    resp = make_client({"5"}).get(f"/v1/sessions/{bogus_sid}/accepted-scenarios")
+    assert resp.status_code == 404
 
 
-def test_downstream_empty_when_no_completed_session(engine):
-    """A valid asset with no completed session yet → 200 + empty list (downstream-friendly),
-    with session_id null so consumers can tell 'nothing accepted yet' from 'empty set'."""
-    body = make_client({"5"}).get("/v1/assets/100/accepted-scenarios?entity=5").json()
-    assert body["session_id"] is None and body["completed_at"] is None
+def test_downstream_empty_before_session_completes(engine, monkeypatch):
+    """A real session that hasn't completed yet (nothing accepted) → 200 + empty list,
+    completed_at null — the graceful-empty case still holds, just scoped to a real session
+    instead of 'no session at all'."""
+    monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
+    client = make_client({"5"})
+    sid = client.post("/v1/sessions", json=session_body(100)).json()["session_id"]
+    body = client.get(f"/v1/sessions/{sid}/accepted-scenarios").json()
+    assert body["session_id"] == sid and body["completed_at"] is None
     assert body["scenarios"] == []
 
 
-def test_latest_completed_session_tiebreak_deterministic(db):
-    """Two sessions completing in the same clock tick → ONE deterministic 'current'
-    pick (CompletedAt desc, SessionID asc tie-break), never query-plan-dependent."""
-    from app.db import dal
+def test_accepted_scenarios_never_drops_a_row_with_broken_threat_linkage(engine, monkeypatch):
+    """Same fix, same reasoning as test_results_never_drops_a_scenario_with_broken_threat_linkage:
+    this schema has no enforced foreign keys (SDD Sec7.7), and mark_scenarios_accepted has no
+    join at all — an accept already flipped Accepted=1 on a row unconditionally, independent of
+    whether ScopedThreatID resolves. dal.accepted_scenarios must LEFT-join, not INNER-join, or an
+    already-accepted row with broken linkage would silently vanish from this downstream contract
+    while accept's own accepted_count still counted it."""
+    def sync(session_id):
+        from app.db.engine import db_session
+        with db_session() as s:
+            _process_all_supporting_systems(s, session_id, StubLLM(), "11111111-1111-4111-8111-111111111111")
 
-    ts = dal.now()
-    # "b-session"/"a-session" 'til this test needed real GUID-typed SessionIDs -- these two
-    # UUIDs are chosen so the first sorts after the second as a string, same as b > a did.
-    b_sid, a_sid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    for sid in (b_sid, a_sid):  # inserted b FIRST — insertion order must not matter
-        db.execute(insert(m.Scenario_Session).values(
-            SessionID=sid, TenantID="t1", EntityID="5", AssetName="CAD",
-            AssetID="777", SessionStatus="completed", CurrentStage="APPROVED",
-            StageStatus="COMPLETE", Mode="AUTO", SubsystemsJSON="[]",
-            CompletedAt=ts, CreatedAt=ts, UpdatedAt=ts))
-    db.commit()
-    picks = {dal.latest_completed_session(db, "5", "777")["SessionID"] for _ in range(3)}
-    assert picks == {a_sid}  # the SessionID-asc winner, every single call
+    monkeypatch.setattr("app.api.sessions.enqueue_pipeline", sync)
+    client = make_client({"5"})
+    sid = client.post("/v1/sessions", json=session_body(100)).json()["session_id"]
+
+    # Plant an ALREADY-ACCEPTED scenario whose ScopedThreatID points at nothing real.
+    from app.db.engine import db_session
+    orphan_id = str(uuid.uuid4())
+    with db_session() as s:
+        s.execute(insert(m.Threat_Scenario_Output).values(
+            OutputID=orphan_id, SessionID=sid, SubsystemID=ASSET_UNIT_ID,
+            ScopedThreatID=str(uuid.uuid4()),  # dangling — no matching Scoped_Threat row
+            Status="complete", ScenarioJSON=json.dumps({"scenario_title": "orphan"}),
+            Accepted=1, Superseded=0))
+        s.commit()
+
+    assert client.post(f"/v1/sessions/{sid}/accept", json={"mode": "all"}).status_code == 200
+    body = client.get(f"/v1/sessions/{sid}/accepted-scenarios").json()
+    orphan = next(r for r in body["scenarios"] if r["output_id"] == orphan_id)
+    assert orphan["threat_type"] is None and orphan["threat_name"] is None
+    assert orphan["threat_type_id"] is None and orphan["threat_catalogue_id"] is None
+    assert len(body["scenarios"]) == 2  # the real scenario PLUS the orphan — neither one lost

@@ -98,3 +98,58 @@ def test_separately_deployed_columns_covered_in_their_own_script():
         sql = (_SCRIPTS_DIR / sql_filename).read_text(encoding="utf-8")
         assert re.search(rf"ALTER TABLE {table_name} ADD {col_name}\b", sql), \
             f"{sql_filename} does not add {table_name}.{col_name}"
+
+
+def test_autoincrement_inference_matches_the_ddl():
+    """SQLAlchemy's inferred autoincrement column must match an actual IDENTITY in the DDL.
+
+    SQLAlchemy treats a lone integer PK as the autoincrement column unless told otherwise. On
+    MSSQL that inference is not cosmetic: an INSERT that supplies the column makes the dialect
+    emit `SET IDENTITY_INSERT <table> ON`, which SQL Server rejects with Msg 8106 on a table that
+    has no identity column — surfacing as a raw 500 (a ProgrammingError, so not even the
+    IntegrityError the CRUD layer converts to a 409).
+
+    Nothing else can catch this: the whole suite runs on SQLite, whose dialect has no
+    IDENTITY_INSERT logic at all, so the endpoint returns 201 in CI and 500 in production. That is
+    exactly how Threat_Category shipped broken (its PK is a plain caller-supplied int, and the
+    DDL comment "app never inserts it" stopped being true when the CRUD create endpoint landed).
+    Assert the model and the DDL agree instead of trusting a comment.
+    """
+    sql = "\n".join((_SCRIPTS_DIR / f).read_text(encoding="utf-8")
+                    for f in [*_SQL_FILES, *sorted(set(_DEPLOYED_SEPARATELY.values()))])
+    mismatched = []
+    for table in m.metadata.tables.values():
+        if table.name in _PLATFORM:
+            continue
+        col = table._autoincrement_column
+        if col is None:
+            continue                      # explicit autoincrement=False, or a non-int/composite PK
+        block = re.search(rf"CREATE TABLE {table.name} \((.*?)^\);", sql, re.S | re.M)
+        if block is None:
+            continue                      # covered by the table-coverage tests above
+        declared = re.search(rf"^\s*{col.name}\s+.*IDENTITY", block.group(1), re.M | re.I)
+        if not declared:
+            mismatched.append(f"{table.name}.{col.name}")
+    assert not mismatched, (
+        "models.py infers these as autoincrement but the DDL has no IDENTITY — they will emit "
+        f"SET IDENTITY_INSERT and fail on MSSQL. Add autoincrement=False: {mismatched}")
+
+
+def test_every_boot_required_index_has_a_create_statement():
+    """invariants.REQUIRED_INDEXES is boot-BLOCKING: a name listed there but never created by the
+    install scripts means the API and every Celery worker refuse to start, in production only.
+
+    Nothing else catches that. The index checks in invariants.py run on the mssql dialect alone,
+    so the SQLite suite skips them entirely, and tests/test_invariants.py builds its fixtures FROM
+    REQUIRED_INDEXES — it can only prove the comparison logic works, never that the DDL agrees.
+    This is the index-side twin of the column coverage test above.
+    """
+    from app.db.invariants import REQUIRED_INDEXES
+
+    sql = "\n".join((_SCRIPTS_DIR / f).read_text(encoding="utf-8")
+                    for f in ["TSG_Core.sql", "Threat_library.sql", "Control_library.sql"])
+    missing = [name for name, _table, _cols in REQUIRED_INDEXES
+            if not re.search(rf"CREATE\s+UNIQUE\s+INDEX\s+{name}\b", sql, re.I)]
+    assert not missing, (
+        "boot-required indexes with no CREATE in the install scripts — the app would refuse to "
+        f"start against a freshly built database: {missing}")

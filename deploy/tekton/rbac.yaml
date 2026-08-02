@@ -1,0 +1,24 @@
+# RBAC for the pipeline: the `pipeline` SA only builds/tests/commits now (ArgoCD owns applying
+# manifests — see deploy/argocd/rbac.yaml — so it gets no `edit` access to the app namespaces),
+# and the app namespaces' `tsg` SA pulls the image from the CI namespace's internal registry.
+# Apply once:  oc apply -f deploy/tekton/rbac.yaml
+# Image built/pushed into ai-threatgen-ci; app pods (SA `tsg`) pull it cross-namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tsg-image-pullers
+  namespace: ai-threatgen-ci
+subjects:
+  - kind: ServiceAccount
+    name: tsg
+    namespace: ai-threatgen-dev
+  - kind: ServiceAccount
+    name: tsg
+    namespace: ai-threatgen-uat
+  - kind: ServiceAccount
+    name: tsg
+    namespace: ai-threatgen-prod
+roleRef:
+  kind: ClusterRole
+  name: system:image-puller
+  apiGroup: rbac.authorization.k8s.io

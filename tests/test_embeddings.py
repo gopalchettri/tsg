@@ -309,6 +309,19 @@ def test_delete_of_totally_unknown_name_still_fails_loudly(db, mem_store, monkey
         embeddings.delete_group(db, "threat_catalogue", names=["No Such Threat"])
 
 
+def test_non_strict_delete_tolerates_a_name_that_is_no_longer_a_master_row(db, mem_store, monkeypatch):
+    """The library CRUD API retires a vector AFTER renaming or soft-deleting its row, so the old
+    text is by then neither a cached vector (if the group was never embedded) nor an ACTIVE
+    master row — indistinguishable from a typo, and the strict path raised. That turned a
+    curator's successful edit into a FAILED job on /embeddings/status.
+
+    strict=False is the contract for machine-derived names: delete it if it is there, say nothing
+    if it isn't. The typo check above still guards the human-facing admin route."""
+    monkeypatch.setattr(embeddings, "_store_if_healthy", lambda: _FakeMongoCol([]))
+    assert embeddings.delete_group(db, "threat_catalogue",
+                                   names=["A Name Nothing Knows About"], strict=False) == 0
+
+
 def test_delete_of_orphan_vector_without_master_row_still_works(db, mem_store, monkeypatch):
     """[fix 12] A vector can outlive its master row; clearing exactly that orphan is a legitimate
     delete and must not require a master row to exist."""

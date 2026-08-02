@@ -1,0 +1,24 @@
+# Manual build+tag-commit for uat/prod (ArgoCD then needs a manual sync — see deploy/README.md).
+#   oc create -f deploy/tekton/pipelinerun-example.yaml -n ai-threatgen-ci
+# or with tkn:
+#   tkn pipeline start tsg-pipeline -n ai-threatgen-ci -p env=uat -w name=source,volumeClaimTemplateFile=...
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: tsg-uat-
+spec:
+  pipelineRef:
+    name: tsg-pipeline
+  params:
+    - name: env
+      value: uat  # change to prod for a production deploy
+    - name: git-revision
+      value: tsg-without-profile-decomposition
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi

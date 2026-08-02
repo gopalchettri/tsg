@@ -1,34 +1,13 @@
-"""[R2 remainder] Boot-time route audit — a bouncer for the API surface itself,
-the same idea as app/db/invariants.py but for routes instead of database schema.
+"""Boot-time route audit — the routing counterpart to app/db/invariants.py.
 
-WHY THIS EXISTS: `Depends(get_principal)` authenticates the caller and
-`principal.require_entity(...)` (or the equivalent inline check in
-sessions.py::get_authorized_session) confirms they actually own the specific
-entity-scoped resource being touched. Both mechanisms already work correctly on
-every route today — but nothing stops a FUTURE route from being added without
-either one. Concretely: someone adds `GET /v1/sessions/{id}/export` six months
-from now, copies most of an existing handler, forgets `Depends(get_principal)`
-entirely. The app compiles, boots, and serves traffic fine — there is no crash,
-no log line, nothing to notice — until a caller from an unrelated entity simply
-requests another tenant's session id and gets back their data. This module turns
-that "silently ships unsafe" failure mode into a boot-time crash instead: every
-route must be explicitly triaged into one of two buckets below before the app
-is allowed to start.
+Every route on the app must be explicitly triaged into one of the two registries below, or
+`create_app()` raises. This turns "a new route ships with no auth dependency wired in at all"
+from a silent IDOR into a boot-time crash.
 
-WHAT THIS CANNOT DO: this only proves a route *declares* the right FastAPI
-dependency — it can't verify a route's body actually enforces the RIGHT entity
-id (that's exactly what `get_authorized_session`/`require_entity` do at
-request time, not something a static boot check can verify without full body
-analysis). Closing "route has no auth wired in at all" — the actual failure
-mode in the example above — is the achievable, valuable half of this problem,
-and it's what `get_principal`'s absence signals.
-
-[REVIEW-FIX] the first version of this file matched dependencies by their
-`__name__` string, not by identity — a same-named decoy function (or a wrapper
-dependency that nests the real one one level deeper) could silently bypass or
-false-positive the whole check. This version imports the real `get_principal`/
-`require_admin` and compares actual callable identity, walking the FULL nested
-dependency tree (not just the route's own direct `Depends(...)`).
+It only proves a route *declares* the right dependency; whether the body enforces the RIGHT
+entity id is `get_authorized_session`/`require_entity`'s job at request time. Dependencies are
+compared by callable IDENTITY, not `__name__`, and the whole nested dependency tree is walked —
+a same-named decoy or a wrapper one level deeper must not satisfy the check.
 """
 from __future__ import annotations
 
@@ -43,19 +22,13 @@ from app.db.invariants import StartupInvariantError
 
 _WEBSOCKET = "WEBSOCKET"  # synthetic method key — APIWebSocketRoute has no .methods
 
-# FastAPI's own auto-added docs/OpenAPI routes (default docs_url/openapi_url/redoc_url — main.py's
-# create_app() doesn't override any of them). These are plain Starlette Route objects added via
-# app.add_route(), not an included APIRouter, so _iter_audit_routes can't unwrap or classify them
-# like a real route — they're always public/unauthenticated by design and not authored by this
-# app, so they're allowlisted by path here instead of silently falling through unrecognized.
+# FastAPI's own auto-added docs/OpenAPI routes. These are plain Starlette Routes added via
+# app.add_route(), not an included APIRouter, so _iter_audit_routes cannot classify them like a
+# real route — allowlisted by path rather than silently falling through unrecognized.
 _FRAMEWORK_ROUTE_PATHS = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 
-# ============================================================================
-# Every entity-scoped route (touches one entity's session/asset/scenario data)
-# must depend on `get_principal` — this is the mechanically-verifiable half of
-# "the caller was authenticated before this route did anything." (method, path)
-# exactly as FastAPI resolves them, prefix included.
-# ============================================================================
+# Every entity-scoped route (touches one entity's session/asset/scenario data) must depend on
+# `get_principal`. (method, path) exactly as FastAPI resolves them, prefix included.
 _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     ("POST", "/v1/sessions"),
     ("GET", "/v1/sessions/{session_id}"),
@@ -65,19 +38,15 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     ("POST", "/v1/sessions/{session_id}/scenarios/next-set"),
     ("POST", "/v1/sessions/{session_id}/cancel"),
     ("GET", "/v1/sessions/{session_id}/events"),
-    ("GET", "/v1/assets/{asset_id}/accepted-scenarios"),
+    ("GET", "/v1/sessions/{session_id}/accepted-scenarios"),
+    ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}"),
+    ("GET", "/v1/users/{user_id}/scenarios"),
+    ("GET", "/v1/entities/{entity_id}/scenarios"),
 }
 
-# ============================================================================
-# Routes deliberately outside the entity model, each with the reason and (if
-# any) the actual dependency CALLABLE whose presence keeps that reason true —
-# not its name, its identity, so a same-named decoy can't satisfy this either.
-# `None` means the route legitimately has no auth dependency at all (the
-# platform health checks). A named dependency is re-checked every boot too —
-# if someone later edits admin.py and drops `require_admin`, the exemption
-# itself is now a lie, so this fails closed instead of quietly waving the
-# route through.
-# ============================================================================
+# Routes deliberately outside the entity model, each mapped to the dependency CALLABLE whose
+# presence keeps the exemption true (`None` = legitimately no auth at all). Re-checked every
+# boot: if someone drops `require_admin`, the exemption is now a lie and this fails closed.
 _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("GET", "/healthz"): None,  # platform health check, no caller identity involved
     ("GET", "/readyz"): None,  # platform health check, no caller identity involved
@@ -86,29 +55,53 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("POST", "/v1/tsg/threat-library/embeddings/recreate"): require_admin,
     ("POST", "/v1/tsg/threat-library/embeddings/delete"): require_admin,
     ("GET", "/v1/tsg/threat-library/embeddings/status/{job_id}"): require_admin,
-    # All 5 above: admin-key gated (router-level Depends(require_admin) in admin.py),
-    # shared cross-tenant threat-library data — not one entity's data, so the
-    # per-entity JWT model doesn't apply (see admin.py's own module docstring).
+    # All 5 above: admin-key gated (router-level Depends(require_admin) in admin.py), shared
+    # cross-tenant threat-library data — not one entity's data, so the per-entity JWT model
+    # doesn't apply. Same rationale for every require_admin entry below.
     ("GET", "/v1/tsg/threat-library/sources"): require_admin,
     ("POST", "/v1/tsg/threat-library/sources/{source}/import"): require_admin,
     ("GET", "/v1/tsg/threat-library/imports/{job_id}"): require_admin,
     ("GET", "/v1/tsg/threat-intel/feeds"): require_admin,
     ("POST", "/v1/tsg/threat-intel/feeds/refresh"): require_admin,
     ("POST", "/v1/tsg/threat-intel/feeds/{feed}/refresh"): require_admin,
-    # Same rationale as the embeddings routes above — admin-key gated
-    # (app/api/threat_library_import.py), shared cross-tenant library data.
+    # Threat-library master CRUD (routers in app/api/threat_library_crud.py; shared impl in library_crud.py). One entry PER VERB; a missing one
+    # fails the boot, not a request.
+    ("GET", "/v1/tsg/threat-library/threat-categories"): require_admin,
+    ("POST", "/v1/tsg/threat-library/threat-categories"): require_admin,
+    ("PATCH", "/v1/tsg/threat-library/threat-categories/{threat_category_id}"): require_admin,
+    ("DELETE", "/v1/tsg/threat-library/threat-categories/{threat_category_id}"): require_admin,
+    ("GET", "/v1/tsg/threat-library/threat-types"): require_admin,
+    ("POST", "/v1/tsg/threat-library/threat-types"): require_admin,
+    ("PATCH", "/v1/tsg/threat-library/threat-types/{threat_type_id}"): require_admin,
+    ("DELETE", "/v1/tsg/threat-library/threat-types/{threat_type_id}"): require_admin,
+    ("GET", "/v1/tsg/threat-library/threat-catalogue"): require_admin,
+    ("POST", "/v1/tsg/threat-library/threat-catalogue"): require_admin,
+    ("PATCH", "/v1/tsg/threat-library/threat-catalogue/{threat_catalogue_id}"): require_admin,
+    ("DELETE", "/v1/tsg/threat-library/threat-catalogue/{threat_catalogue_id}"): require_admin,
+    ("GET", "/v1/tsg/threat-library/threat-actors"): require_admin,
+    ("POST", "/v1/tsg/threat-library/threat-actors"): require_admin,
+    ("PATCH", "/v1/tsg/threat-library/threat-actors/{threat_actor_id}"): require_admin,
+    ("DELETE", "/v1/tsg/threat-library/threat-actors/{threat_actor_id}"): require_admin,
+    # Control-library master CRUD (routers in app/api/control_library_crud.py; shared impl in library_crud.py). The last two are the
+    # control<->standard link.
+    ("GET", "/v1/tsg/control-library/standards"): require_admin,
+    ("POST", "/v1/tsg/control-library/standards"): require_admin,
+    ("PATCH", "/v1/tsg/control-library/standards/{standard_id}"): require_admin,
+    ("DELETE", "/v1/tsg/control-library/standards/{standard_id}"): require_admin,
+    ("GET", "/v1/tsg/control-library/controls"): require_admin,
+    ("POST", "/v1/tsg/control-library/controls"): require_admin,
+    ("PATCH", "/v1/tsg/control-library/controls/{control_id}"): require_admin,
+    ("DELETE", "/v1/tsg/control-library/controls/{control_id}"): require_admin,
+    ("POST", "/v1/tsg/control-library/controls/{control_id}/standards/{standard_id}"): require_admin,
+    ("DELETE", "/v1/tsg/control-library/controls/{control_id}/standards/{standard_id}"): require_admin,
 }
 
 
 def _assert_registries_disjoint(
     entity_scoped: set[tuple[str, str]], exempt: dict[tuple[str, str], Callable[..., object] | None]
 ) -> None:
-    """[REVIEW-FIX] nothing previously stopped the same (method, path) key from being listed
-    in BOTH registries — the exempt branch checks first and `continue`s unconditionally on a
-    match, so a route accidentally added to `_EXEMPT_ROUTES` while still sitting in
-    `_ENTITY_SCOPED_ROUTES` would silently skip the get_principal check it needs. Fails at
-    import time, before any route is even inspected, the same "catch a registry mistake
-    immediately" contract every other invariant in this file already keeps."""
+    """A key in BOTH registries would silently skip its get_principal check — the exempt branch
+    matches first and `continue`s. Fails at import time, before any route is inspected."""
     collision = entity_scoped & exempt.keys()
     if collision:
         raise StartupInvariantError(
@@ -121,12 +114,9 @@ _assert_registries_disjoint(_ENTITY_SCOPED_ROUTES, _EXEMPT_ROUTES)
 
 
 def _all_dependency_calls(dependant: Dependant) -> set[Callable[..., object]]:
-    """[REVIEW-FIX] `dependant.dependencies` is only the route's own DIRECTLY-declared
-    `Depends(...)` — it does not recurse into a dependency's own nested `Depends(...)`. A
-    route authenticated via a wrapper (e.g. one function that itself depends on
-    `get_principal`) would otherwise look unauthenticated to this check. Recurses the whole
-    tree and returns the actual callable objects (not their names) so identity comparison
-    works regardless of how deep the real dependency sits."""
+    """Every callable in the route's dependency tree. `dependant.dependencies` holds only the
+    route's DIRECTLY-declared `Depends(...)`, so a route authenticated via a wrapper would look
+    unauthenticated without this recursion. Returns callables, not names, for identity checks."""
     calls: set[Callable[..., object]] = set()
     for dep in dependant.dependencies:
         if dep.call is not None:  # a sub-dependant can carry sub-dependencies with no callable of its own
@@ -136,14 +126,10 @@ def _all_dependency_calls(dependant: Dependant) -> set[Callable[..., object]]:
 
 
 def _iter_audit_routes(app: FastAPI):
-    """[REVIEW-FIX] previously took a hand-maintained router list, kept in sync with
-    `app.include_router(...)` purely by convention — a future router registered on `app` but
-    never added to that list would ship completely unaudited. Walks the real, live `app`
-    object instead, so there is exactly one source of truth. FastAPI (0.139, installed here)
-    wraps each included router in a private `_IncludedRouter`, exposing the original
-    `APIRouter` via `.original_router` — unwrapped here; a plain `APIRoute`/
-    `APIWebSocketRoute` found directly on `app.routes` is also handled, so this keeps working
-    if a future FastAPI version flattens routes the older, simpler way instead."""
+    """Walks the live `app` object — one source of truth, so a router registered but forgotten
+    elsewhere can't ship unaudited. FastAPI (0.139) wraps each included router in a private
+    `_IncludedRouter` exposing the original via `.original_router`; a plain `APIRoute`/
+    `APIWebSocketRoute` sitting directly on `app.routes` is handled too."""
     for entry in app.routes:
         router = getattr(entry, "original_router", None)
         if router is not None:
@@ -153,9 +139,8 @@ def _iter_audit_routes(app: FastAPI):
         elif getattr(entry, "path", None) in _FRAMEWORK_ROUTE_PATHS:
             continue  # FastAPI's own docs/openapi routes — see _FRAMEWORK_ROUTE_PATHS above
         else:
-            # Fail closed instead of silently skipping: a route reaching app.routes some other
-            # way (e.g. a future app.add_route()/app.mount() for a REAL endpoint) must not bypass
-            # this audit just because it isn't an APIRoute/APIWebSocketRoute.
+            # Fail closed: a route reaching app.routes some other way (a future
+            # app.add_route()/app.mount() for a REAL endpoint) must not bypass this audit.
             raise StartupInvariantError(
                 f"[R2] app.routes contains an entry _iter_audit_routes doesn't recognize "
                 f"(type={type(entry).__name__}, path={getattr(entry, 'path', '?')!r}) — add its "
@@ -166,20 +151,14 @@ def _iter_audit_routes(app: FastAPI):
 
 
 def assert_routes_authenticated(app: FastAPI) -> None:
-    """Runs at every `create_app()` call (see main.py) — no DB engine involved, this is pure
-    in-process introspection of the app's own registered routes.
+    """Runs at every `create_app()` (see main.py) — pure in-process introspection, no DB.
 
-    For every route on `app`: it must appear in exactly one of the two registries above.
-    Missing from both -> `StartupInvariantError` naming the unclassified route, so a
-    newly-added route can never silently ship without someone explicitly deciding which
-    bucket it belongs in. Classified entity-scoped -> must depend on the real `get_principal`
-    (by identity, anywhere in its dependency tree). Classified exempt with a named dependency
-    -> must still depend on it, by the same identity check.
+    Every route must appear in exactly one registry. Missing from both -> StartupInvariantError.
+    Entity-scoped -> must depend on the real `get_principal` by identity, anywhere in its
+    dependency tree. Exempt with a named dependency -> same identity check against that one.
 
-    [REVIEW-FIX] also audits `APIWebSocketRoute`s, not just plain HTTP `APIRoute`s — the
-    original isinstance filter silently exempted an entire route class rather than failing
-    closed on an unrecognized one. No websocket route exists in this app today, so this only
-    matters the day one is added — exactly the "future route" scenario this module exists for.
+    `APIWebSocketRoute`s are audited too: none exist today, so this only matters the day one is
+    added — exactly the "future route" case this module exists for.
     """
     for route in _iter_audit_routes(app):
         dep_calls = _all_dependency_calls(route.dependant)

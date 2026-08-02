@@ -17,7 +17,10 @@ from app.api.errors import register_error_handlers
 from app.api.health import router as health_router
 from app.api.route_audit import assert_routes_authenticated
 from app.api.sessions import router as sessions_router
+from app.api.sessions import scenarios_router
 from app.api.threat_intel import router as threat_intel_router
+from app.api.threat_library_crud import router as threat_library_crud_router
+from app.api.control_library_crud import router as control_library_crud_router
 from app.api.threat_library_import import router as threat_library_import_router
 from app.core.middleware import BodySizeLimitMiddleware, RequestIDMiddleware
 
@@ -66,10 +69,81 @@ def create_app() -> FastAPI:
                 ),
             },
             {
+                "name": "Scenarios",
+                "description": (
+                    "Cross-session scenario reads: list everything one user created, list "
+                    "everything under one entity, or fetch a single scenario by id. Results "
+                    "are always restricted to the caller's authorized entities."
+                ),
+            },
+            {
+                "name": "Controls Admin",
+                "description": (
+                    "Curate the 1,288-control library: create/update/delete controls, and link/"
+                    "unlink them to the standards they satisfy (which is what fills "
+                    "`standards[]` on a scenario's mapped controls). Requires the admin key. "
+                    "Deletes are soft, except unlinking a control from a standard."
+                ),
+            },
+            {
+                "name": "Standards Admin",
+                "description": (
+                    "Curate the named standards controls are linked to (ISO, NIST, DESC ISR, "
+                    "...). Requires the admin key. Deletes are soft."
+                ),
+            },
+            {
+                "name": "Threat Categories Admin",
+                "description": (
+                    "Curate the STRIDE threat categories. This table's PK is caller-supplied, "
+                    "not auto-generated. Requires the admin key. Deletes are soft — library ids "
+                    "are referenced by completed sessions."
+                ),
+            },
+            {
+                "name": "Threat Types Admin",
+                "description": (
+                    "Curate threat families (types). Renaming re-embeds the row for AI "
+                    "matching. Requires the admin key. Deletes are soft."
+                ),
+            },
+            {
+                "name": "Threat Catalogue Admin",
+                "description": (
+                    "Curate exact threats under a threat-type family — creating one 404s if the "
+                    "parent family doesn't exist. Renaming re-embeds the row. Requires the admin "
+                    "key. Deletes are soft."
+                ),
+            },
+            {
+                "name": "Threat Actors Admin",
+                "description": (
+                    "Curate threat actors. Actors are not embedded, so no refresh job is ever "
+                    "returned for them. Requires the admin key. Deletes are soft."
+                ),
+            },
+            {
+                "name": "Embeddings Admin",
+                "description": (
+                    "Manage the shared embedding cache used by both the threat and control "
+                    "libraries for AI matching: create/update/recreate/delete vectors, and poll "
+                    "job status. Requires the admin key."
+                ),
+            },
+            {
                 "name": "Threat Library Admin",
                 "description": (
-                    "Manage the threat-library embedding cache (create/update/recreate/delete "
-                    "vectors, poll job status). Requires the admin key."
+                    "Bulk-import open-source threat libraries (MITRE ATT&CK/ATT&CK ICS, MISP "
+                    "actors, ...): list known sources, trigger an import, and poll its job "
+                    "status. Requires the admin key. For editing individual rows by hand, see "
+                    "the Threat Categories/Types/Catalogue/Actors Admin groups instead."
+                ),
+            },
+            {
+                "name": "Threat Intel Admin",
+                "description": (
+                    "Refresh live threat-intel feeds (CISA KEV/ICS, OTX, URLhaus, ...) that "
+                    "feed the threats-prompt hint. Requires the admin key."
                 ),
             },
         ],
@@ -83,8 +157,11 @@ def create_app() -> FastAPI:
     register_error_handlers(app)
     app.include_router(health_router)
     app.include_router(sessions_router)
+    app.include_router(scenarios_router)
     app.include_router(admin_router)
     app.include_router(threat_library_import_router)
+    app.include_router(threat_library_crud_router)
+    app.include_router(control_library_crud_router)
     app.include_router(threat_intel_router)
     # [R2 remainder] fail-closed: refuse to boot if any route is missing its entity-scoping
     # dependency, or was never triaged at all — see app/api/route_audit.py. Audits `app`

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tsg-config
+data:
+  # "staging" triggers the fail-closed boot check: AUTH_DEV_MODE must be off and all three
+  # JWT values must be non-empty, or every pod CrashLoops by design.
+  APP_ENV: staging
+  # FILL IN once the IdP is chosen — empty values will (correctly) refuse to boot.
+  TSG_JWT_ISSUER: "https://idp.example.internal/realms/desc"
+  TSG_JWT_AUDIENCE: "tsg"
+  TSG_JWT_JWKS_URL: "https://idp.example.internal/realms/desc/protocol/openid-connect/certs"

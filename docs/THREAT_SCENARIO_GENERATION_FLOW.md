@@ -117,8 +117,9 @@ at REVIEW are never touched — a human taking their time is not "abandoned."
 (`app/pipeline/reaper.py`)
 
 **Step 15 — Downstream consumption.** Other systems fetch results from
-`GET /v1/assets/{asset_id}/accepted-scenarios`, which returns only *accepted*, *non-superseded*
-scenarios from the *latest completed* session — one clean version of the truth per asset.
+`GET /v1/sessions/{session_id}/accepted-scenarios` (as of 2026-07-27 — `session_id` is the sole
+identifier, no `asset_id`/`entity` inputs), which returns only *accepted*, *non-superseded*
+scenarios for that session.
 
 ---
 

@@ -1,14 +1,11 @@
-"""Provenance markers for admin-family background jobs — the shared half of the
-dispatch-then-poll pattern admin.py pioneered (its docstrings are the canonical
-rationale). Every admin job family (embeddings maintenance, threat-library import)
-marks the job ids IT queued; each family's status route answers ONLY for its own
-family's ids, so no status route can ever surface another task type's result (the
-`**`-a-non-dict crash / cross-tenant leak admin.py's get_status docstring describes).
+"""Provenance markers for admin-family background jobs (see admin.py for the full rationale).
 
-DEPENDENCY-LIGHT ON PURPOSE (redis + settings + logging only, no FastAPI, no Celery):
-the tsg.import_threat_library worker task also marks the embeddings follow-up job it
-dispatches, so this module must be importable from app/pipeline/celery_app.py without
-creating an api<->pipeline import cycle.
+Every admin job family marks the job ids IT queued; each family's status route answers ONLY for
+its own family's ids, so no status route can surface another task type's result.
+
+DEPENDENCY-LIGHT ON PURPOSE (redis + settings + logging only, no FastAPI, no Celery): the
+tsg.import_threat_library worker task also marks the follow-up job it dispatches, so this must
+be importable from app/pipeline/celery_app.py without an api<->pipeline import cycle.
 """
 from __future__ import annotations
 
@@ -43,9 +40,8 @@ def admin_job_exists(job_id: str, family: str) -> bool:
     AUTHORIZATION (which job a caller may read), so a Redis error must propagate and
     deny via the generic 500 handler, never silently let every job_id through.
 
-    The embeddings family also honors the pre-family marker shape (bare
-    `tsg:admin:job:<id>`) so jobs queued just before this deploy stay pollable through
-    their TTL window — delete the fallback when convenient."""
+    The embeddings fallback honors the pre-family marker shape (bare `tsg:admin:job:<id>`) so
+    jobs queued before families existed stay pollable through their TTL — safe to delete."""
     r = _slot_redis()
     if r.exists(_key(job_id, family)):
         return True

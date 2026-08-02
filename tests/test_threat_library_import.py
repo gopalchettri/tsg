@@ -111,6 +111,39 @@ def test_run_import_misp_actors_shape(db):
         m.Threat_Actor.ThreatActorName == "APT Test")).scalar() is not None
 
 
+def test_import_stamps_provenance_and_who_ran_it(db):
+    """Every imported row must answer WHERE it came from and WHO caused it. `started_by` is the
+    API caller; with no caller it falls back to 'auto:<tag>' rather than leaving CreatedBy null."""
+    data = json.dumps(_PYTM_TAMPER)  # INP01 — a prefix the adapter actually recognizes
+    run_import(db, "pytm", file_content=data, started_by="gopal")
+    row = db.execute(select(m.Threat_Type).where(m.Threat_Type.Source == "pytm")).scalars().first()
+    assert row.CreatedBy == "gopal" and row.CreatedAt is not None
+    assert row.UpdatedAt is None and row.UpdatedBy is None  # an import is not an edit
+
+    actors = {"values": [{"value": "APT Test", "meta": {"sectors": ["critical infrastructure"]}}]}
+    run_import(db, "misp_actors", file_content=json.dumps(actors))
+    actor = db.execute(select(m.Threat_Actor).where(
+        m.Threat_Actor.ThreatActorName == "APT Test")).scalar_one()
+    # 'misp_galaxy' was a dead SOURCE_TAGS entry until Threat_Actor gained a Source column.
+    assert actor.Source == "misp_galaxy" and actor.CreatedBy == "auto:misp_galaxy"
+
+
+def test_reimport_never_restamps_an_existing_row(db):
+    """Provenance is first-writer. A re-import re-asserts rows rather than editing them, so it
+    must not rewrite who originally added one — nor touch Updated*, which would make an
+    unattended job look like a curator's edit."""
+    data = json.dumps(_PYTM_TAMPER)
+    run_import(db, "pytm", file_content=data, started_by="first-user")
+    before = db.execute(select(m.Threat_Type).where(m.Threat_Type.Source == "pytm")).scalars().first()
+    original_by, original_at = before.CreatedBy, before.CreatedAt
+
+    run_import(db, "pytm", file_content=data, started_by="second-user")
+    db.expire_all()
+    after = db.execute(select(m.Threat_Type).where(m.Threat_Type.Source == "pytm")).scalars().first()
+    assert after.CreatedBy == original_by and after.CreatedAt == original_at
+    assert after.UpdatedBy is None and after.UpdatedAt is None
+
+
 # ---------------------------------------------------------------- DAL primitive
 def test_upsert_threat_rule_idempotent_on_duplicate_natural_key(db):
     a = dal.upsert_threat_rule(db, 10, "relevance_flag", "asset_type", "OT", 10.0, "auto:test")

@@ -1,20 +1,10 @@
-"""SQLAlchemy 2.0 typed ORM table definitions — database-first mirror of the existing
-`EYShield DB`. These are NOT used to create tables; they
-describe the real columns so we can query/bind against them. Types are portable
-(Unicode→NVARCHAR on MSSQL, TEXT on SQLite; GUID→UNIQUEIDENTIFIER on MSSQL,
-Unicode(36) on SQLite) so pure-logic unit tests can run on SQLite while
-integration runs on MSSQL.
+"""SQLAlchemy 2.0 typed ORM table definitions — a database-first mirror of the live schema.
+NOT used to create tables; they describe the real columns so we can query/bind against them.
+Types are portable (Unicode→NVARCHAR/TEXT, GUID→UNIQUEIDENTIFIER/Unicode(36)) so pure-logic
+unit tests run on SQLite while integration runs on MSSQL.
 
-Columns reflect the baseline schema **plus the slice migrations** applied in M1
-(match-by-id cols), NOT NULL keys),  (lease cols),  (AttemptCount,
-IdempotencyKey). Columns from later migrations are added with their milestone.
-
-Declarative `Mapped[T]`/`mapped_column()` style (not plain Core `Table()`) so every
-`m.Table.Column` access is statically typed — `m.Table.Column` replaces the old
-`m.Table.c.Column`; call sites drop the `.c` accessor. Each class's `__table__` is
-still a plain Core `Table` (accessible via `.__table__`) for the handful of call
-sites that need a whole-row Core-style select (`select(m.Table.__table__)`) instead
-of an ORM entity load — see dal.py's `load_session`/`get_session`/`latest_completed_session`.
+Each class's `__table__` is still a plain Core `Table`, for the few call sites needing a
+whole-row Core select (`select(m.Table.__table__)`) instead of an ORM entity load.
 """
 from __future__ import annotations
 
@@ -37,38 +27,27 @@ class GUID(TypeDecorator):
     cache_ok = True
 
     def load_dialect_impl(self, dialect):
-        """Pick the real database column type for a GUID: MSSQL's native
-        UNIQUEIDENTIFIER type, or a plain 36-character string on any other
-        database (e.g. SQLite)."""
         if dialect.name == "mssql":
             return dialect.type_descriptor(mssql.UNIQUEIDENTIFIER())
         return dialect.type_descriptor(Unicode(36))
 
     def bind_processor(self, dialect):
-        """Return a function that converts a Python value into the string form
-        to send to the database when writing a GUID column."""
         def process(value):
             if value is None:
                 return None
             if isinstance(value, uuid.UUID):
                 return str(value)
-            # Value isn't already a UUID object (e.g. it's a plain string) —
-            # round-trip it through uuid.UUID() to validate and normalize its
-            # format before storing it as a string.
+            # Round-trip a plain string through uuid.UUID() to validate and normalize it.
             return str(uuid.UUID(str(value)))
         return process
 
     def result_processor(self, dialect, coltype):
-        """Return a function that converts a raw value read back from the
-        database into the string form the rest of the app expects for a GUID
-        column."""
         def process(value):
             if value is None:
                 return None
             if isinstance(value, uuid.UUID):
                 return str(value)
-            # Normalize whatever the driver returned (e.g. a raw string) into
-            # a canonical UUID string.
+            # Normalize whatever the driver returned into a canonical UUID string.
             return str(uuid.UUID(str(value)))
         return process
 
@@ -113,16 +92,16 @@ class Subsystem_Stage_State(Base):
     AttemptCount: Mapped[int] = mapped_column(Integer, default=0)
     ErrorMessage: Mapped[str | None] = mapped_column(UnicodeText)
     UpdatedAt: Mapped[datetime] = mapped_column(DateTime)
+    # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 # ---------------------------------------------------------------------------
 # Pipeline outputs (entity resolved via the session; carry TenantID+SubsystemID)
 #
-# `UserID` on all three tables below is PROVENANCE, inherited from Scenario_Session.UserID — it
-# is the accountable session owner, NEVER the author. Every row here is produced by a background
-# worker from LLM output; no human writes one. That is why they take no ActorType companion the
-# way Scenario_Audit does: the column would read 'system' on 100% of rows and carry no
-# information. Scenario_Audit needs it precisely because it is the ONE table where human-written
-# and worker-written rows share a column.
+# `UserID` here is PROVENANCE inherited from Scenario_Session.UserID — the accountable session
+# owner, never the author: every row is worker-written from LLM output. Hence no ActorType
+# companion; it would read 'system' on 100% of rows. Scenario_Audit needs one because it is the
+# only table where human- and worker-written rows share a column.
 # ---------------------------------------------------------------------------
 class Identified_Threat(Base):
     __tablename__ = "Identified_Threat"
@@ -179,7 +158,15 @@ class Threat_Scenario_Output(Base):
     AcceptedSubsetJSON: Mapped[str | None] = mapped_column(UnicodeText)
     Accepted: Mapped[int] = mapped_column(Integer, default=0)
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
-    IdentityHash: Mapped[str | None] = mapped_column(Unicode(64))     #sha256(SessionID|SubsystemID|dedup_key) — dedup_key = cat:/type:/txt: (tasks._dedup_key); UX_Scenario_ActiveIdentity blocks a 2nd active row per key
+    IdentityHash: Mapped[str | None] = mapped_column(Unicode(64))     #sha256(SessionID|SubsystemID|dedup_key) — dedup_key = cat:/type:/txt: (tasks._dedup_key); UX_Scenario_ActiveIdentity blocks a 2nd active row per (key, ScenarioNumber)
+    # Which of the threat's coexisting scenarios this is: 1 = the original, 2+ = alternates
+    # ("generate next set" variant fallback). Cap enforced ONLY by dal.variant_eligible_primaries
+    # against settings.max_scenarios_per_threat — no other code path assigns a number.
+    ScenarioNumber: Mapped[int] = mapped_column(Integer, default=1)
+    # The OutputID this row replaced; NULL for first-run, next-set and variant rows. Backward-
+    # linked, so following it yields the revision chain. Stamped from what the supersede actually
+    # retired, never the requested target — the two are keyed differently. Not indexed by design.
+    ReplacesOutputID: Mapped[str | None] = mapped_column(GUID, nullable=True)
     GenerationEpoch: Mapped[int] = mapped_column(Integer, default=1)
     ErrorMessage: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -190,12 +177,9 @@ class Threat_Scenario_Output(Base):
 
 
 class Threat_Library_Import_Run(Base):
-    """One row per threat-library import attempt (celery_app.import_threat_library_task).
-
-    Exists so "which sources are imported, when, and did any fail?" survives the Celery
-    result expiring — the inventory API (GET /v1/tsg/threat-library/sources) joins the
-    latest run per source onto the row counts. The terminal row is committed in its own
-    transaction so a FAILED import still leaves a record."""
+    """One row per threat-library import attempt (celery_app.import_threat_library_task), so
+    "which sources imported, when, and did any fail?" survives the Celery result expiring. The
+    terminal row is committed in its own transaction so a FAILED import still leaves a record."""
     __tablename__ = "Threat_Library_Import_Run"
     RunID: Mapped[str] = mapped_column(GUID, primary_key=True)
     Source: Mapped[str] = mapped_column(Unicode(50))              # API source name
@@ -228,16 +212,32 @@ class Threat_Scenario_Control_Map(Base):
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 # ---------------------------------------------------------------------------
-# Threat library masters (seeded; read now, promote later)
+# Threat library masters (seeded; imported, promoted on accept, or curated via
+# app/api/library_crud.py)
+#
+# All four carry the same audit quartet:
+#   CreatedAt/CreatedBy — every insert path. CreatedBy holds the caller's user id, or an
+#                         'auto:<source>' / 'cli:<user>' literal when there was no logged-in caller.
+#   UpdatedAt/UpdatedBy — CRUD update/delete ONLY. Importer and promote-on-accept upserts leave an
+#                         existing row untouched (provenance is first-writer — dal.upsert_threat_type),
+#                         so a re-import never restamps a row a curator has since edited.
+# A soft delete IS an update (IsDeleted=1 plus the Updated* stamp) — hence no DeletedBy column.
 # ---------------------------------------------------------------------------
 class Threat_Category(Base):
     __tablename__ = "Threat_Category"
-    ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # autoincrement=False is load-bearing: this PK is a plain caller-supplied int, not IDENTITY.
+    # Without it SQLAlchemy infers autoincrement and MSSQL emits SET IDENTITY_INSERT, which SQL
+    # Server rejects (Msg 8106) -> 500 on every create. SQLite has no such logic, so CI can't see it.
+    ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     ThreatCategoryName: Mapped[str] = mapped_column(Unicode(200))
     ThreatCategoryCode: Mapped[str | None] = mapped_column(Unicode(20))
     SecurityObjective: Mapped[str | None] = mapped_column(Unicode(200))
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
 
 
 class Threat_Type(Base):
@@ -249,10 +249,15 @@ class Threat_Type(Base):
     ThreatCategoryID: Mapped[int | None] = mapped_column(Integer)
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Provenance: 'functional_team_excel' (curated) vs 'ai_auto_promoted' (R10) vs a future
-    # MITRE import. Column added by scripts/Threat_library.sql, not the
-    # CREATE TABLE this table otherwise gets — see test_schema_sync's _COLUMN_DEPLOYED_SEPARATELY.
+    # Provenance: 'functional_team_excel' (curated) | 'ai_auto_promoted' | an import tag
+    # (threat_library_import.SOURCE_TAGS) | 'manual' (CRUD API). Added by
+    # scripts/Threat_library.sql, not this table's CREATE — see test_schema_sync's
+    # _COLUMN_DEPLOYED_SEPARATELY.
     Source: Mapped[str | None] = mapped_column(Unicode(50))
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
 
 
 class Threat_Catalogue(Base):
@@ -266,6 +271,10 @@ class Threat_Catalogue(Base):
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
     # See Threat_Type.Source above — same provenance tracking, same script adds it.
     Source: Mapped[str | None] = mapped_column(Unicode(50))
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
 
 
 class Threat_Actor(Base):
@@ -275,29 +284,37 @@ class Threat_Actor(Base):
     IsCapable: Mapped[int] = mapped_column(Integer, default=1)
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Same provenance vocabulary as Threat_Type.Source, but declared in TSG_Core.sql's CREATE
+    # block — so unlike the other two it needs no _COLUMN_DEPLOYED_SEPARATELY entry.
+    Source: Mapped[str | None] = mapped_column(Unicode(50))
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
 
 
 class ThreatType_ThreatActor_Map(Base):
     __tablename__ = "ThreatType_ThreatActor_Map"
     ThreatTypeID: Mapped[int] = mapped_column(Integer, primary_key=True)
     ThreatActorID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 # ---------------------------------------------------------------------------
-# Control library masters (seeded from functional-team Control_Library.xlsx).
-# Created by scripts/Control_library.sql (run manually — see test_schema_sync's
-# _DEPLOYED_SEPARATELY, same pattern as Config_Threat_Rule). Read-only to the app:
-# grounding.ground_control retrieves candidates; sessions.py joins standards into
-# the results payload. IDENTITY PKs — never inserted by app code.
-# ---------------------------------------------------------------------------
+# Control library masters (seeded from functional-team Control_Library.xlsx). Created by
+# scripts/Control_library.sql (run manually — see test_schema_sync's _DEPLOYED_SEPARATELY,
+# same pattern as Config_Threat_Rule). IDENTITY PKs — never inserted by app code. Same audit
+# quartet as the threat masters, stamped only by app/api/control_library_crud.py.
 class Control_Standard(Base):
     __tablename__ = "Control_Standard"
     StandardID: Mapped[int] = mapped_column(Integer, primary_key=True)
     StandardName: Mapped[str] = mapped_column(Unicode(200))
-    CreateDate: Mapped[datetime | None] = mapped_column(DateTime)
-    CreatedBy: Mapped[str | None] = mapped_column(Unicode(55))
-    UpdateDate: Mapped[datetime | None] = mapped_column(DateTime)
-    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(55))
+    Source: Mapped[str | None] = mapped_column(Unicode(50))
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -311,10 +328,11 @@ class Control_Library(Base):
     ControlName: Mapped[str] = mapped_column(Unicode(500))
     ControlDescription: Mapped[str] = mapped_column(UnicodeText)
     SampleEvidence: Mapped[str | None] = mapped_column(UnicodeText)
-    CreateDate: Mapped[datetime | None] = mapped_column(DateTime)
-    CreatedBy: Mapped[str | None] = mapped_column(Unicode(55))
-    UpdateDate: Mapped[datetime | None] = mapped_column(DateTime)
-    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(55))
+    Source: Mapped[str | None] = mapped_column(Unicode(50))
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -323,18 +341,20 @@ class Control_Library_Standard_Map(Base):
     __tablename__ = "Control_Library_Standard_Map"
     ControlLibraryID: Mapped[int] = mapped_column(Integer, primary_key=True)
     StandardID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
-# [A2] Threat_Type.ThreatCategoryID is only a rough single default — real curated data
-# (75-threat functional-team Excel review) shows 74/75 individual Threat_Catalogue rows
-# carry a DIFFERENT/additional STRIDE category than their Type's default. This many-to-many
-# map is the authoritative per-threat category source; see grounding.get_possible_types.
-# Created by scripts/Threat_library.sql (run manually — see test_schema_sync's
-# _DEPLOYED_SEPARATELY, same pattern as Config_Threat_Rule).
+# The authoritative per-threat category source (see grounding.get_possible_types):
+# Threat_Type.ThreatCategoryID is only a rough default — 74 of 75 curated Threat_Catalogue rows
+# carry a different/additional STRIDE category than their Type's. Created by
+# scripts/Threat_library.sql (run manually — see test_schema_sync's _DEPLOYED_SEPARATELY).
 class Threat_Catalogue_Category_Map(Base):
     __tablename__ = "Threat_Catalogue_Category_Map"
     ThreatCatalogueID: Mapped[int] = mapped_column(Integer, primary_key=True)
     ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class Config_Threat_Rule(Base):
@@ -363,10 +383,11 @@ class Context_Field_Config(Base):
     FieldName: Mapped[str] = mapped_column(Unicode(100))
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
-# TSG-owned (not seeded like the masters above): one row per threat promoted
-# into the library on accept. An audit ledger of promotion
-# events, not a pending-review queue
+# TSG-owned (not seeded like the masters above): one row per threat promoted into the library
+# on accept. An audit ledger of promotion events, not a pending-review queue.
 class Threat_Candidate_Review(Base):
     __tablename__ = "Threat_Candidate_Review"
     CandidateID: Mapped[str] = mapped_column(GUID, primary_key=True)
@@ -383,18 +404,15 @@ class Threat_Candidate_Review(Base):
     ReviewedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedAt: Mapped[datetime] = mapped_column(DateTime)
 
-# One row per LLM call (the exact prompt + raw response, success or
-# failure). The dev/ops diagnostic record for parse failures: raw model output is
-# NEVER put in ErrorMessage/audit/SSE (client-visible), only here (internal DB).
+# One row per LLM call (exact prompt + raw response, success or failure). Raw model output is
+# NEVER put in ErrorMessage/audit/SSE (all client-visible) — only here.
 class Prompt_Log(Base):
     __tablename__ = "Prompt_Log"
     LogID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
-    # Provenance, same as the pipeline-output tables above: the accountable session owner, never
-    # the author — a row exists only because a worker called an LLM. No ActorType needed.
-    UserID: Mapped[str | None] = mapped_column(Unicode(200))
+    UserID: Mapped[str | None] = mapped_column(Unicode(200))  # provenance — see pipeline outputs above
     SubsystemID: Mapped[int] = mapped_column(Integer)
     Stage: Mapped[str] = mapped_column(Unicode(20))           # 'threats' | 'scenario'
     PromptVersion: Mapped[str] = mapped_column(Unicode(20))
@@ -418,33 +436,23 @@ class Scenario_Audit(Base):
     # (session_started, subsystem_advanced) and on stage_error, which cannot know which of the
     # in-flight work levels failed.
     Stage: Mapped[str | None] = mapped_column(Unicode(32))
-    # NOT a plain foreign key — read the values before treating one as a broken reference:
-    #   0    = THE ASSET ITSELF (tasks.ASSET_UNIT_ID). This pipeline is asset-centric: supporting
-    #          systems are context inside ONE analysis, never separate units of work, so almost
-    #          every worker-written row carries 0. Real supporting-system ids are DB keys >= 1,
-    #          so 0 can never collide with one.
-    #   NULL = genuinely session-wide, belonging to no unit of work (session_started,
-    #          entered_review, session_cancelled, and the accept-family rows).
-    #   >= 1 = a specific supporting system. Not produced by the current asset-centric pipeline;
-    #          retained because historical rows may hold it.
+    # NOT a plain foreign key — three distinct meanings, none of them a broken reference:
+    #   0    = THE ASSET ITSELF (tasks.ASSET_UNIT_ID). The pipeline is asset-centric, so almost
+    #          every worker-written row carries 0; real supporting-system ids are >= 1.
+    #   NULL = session-wide, belonging to no unit of work (session_started, entered_review,
+    #          session_cancelled, the accept family).
+    #   >= 1 = a specific supporting system. Historical rows only.
     SubsystemID: Mapped[int | None] = mapped_column(Integer)
     EventType: Mapped[str] = mapped_column(Unicode(40))
-    # accept only — AuditDecision accept/reject/partial. NULL on every other event: nothing else
-    # represents a human decision.
-    Decision: Mapped[str | None] = mapped_column(Unicode(30))
+    Decision: Mapped[str | None] = mapped_column(Unicode(30))  # accept only — AuditDecision; NULL elsewhere
     Granularity: Mapped[str | None] = mapped_column(Unicode(20))  # regeneration_completed only
     ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)  # library_promoted only
-    # WHO IS ACCOUNTABLE for this session — not "who typed the command". Human actions
-    # (session_started/cancel/accept) record the authenticated principal; worker-written rows are
-    # back-filled from Scenario_Session.UserID by dal.append_audit, so an auditor never has to
-    # join to answer "who is answerable for this event".
+    # WHO IS ACCOUNTABLE, not who typed the command: human actions record the authenticated
+    # principal, worker rows are back-filled from Scenario_Session.UserID by dal.append_audit.
     ActorUserID: Mapped[str | None] = mapped_column(Unicode(200))
-    # WHO PERFORMED the event, which ActorUserID above deliberately does NOT answer. Because
-    # worker rows are back-filled with the session owner, `ActorUserID = gopal` alone cannot
-    # distinguish "gopal clicked accept" from "the pipeline ran and gopal is answerable for it".
-    # enums.ActorType: user = a human did it; system = a worker did it. NULL only on rows written
-    # before migration 0028 — never back-filled, because rewriting an append-only ledger would
-    # falsify records that were true when written.
+    # WHO PERFORMED it, which ActorUserID above deliberately cannot answer once worker rows are
+    # back-filled with the session owner. NULL on rows predating the column — never back-filled,
+    # since rewriting an append-only ledger would falsify records that were true when written.
     ActorType: Mapped[str | None] = mapped_column(Unicode(20))
     DetailJSON: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime] = mapped_column(DateTime)
@@ -484,11 +492,10 @@ class ctm_scan_entity(Base):
     data_handled: Mapped[str | None] = mapped_column(UnicodeText)  # types of data this asset processes/stores
 
 
-# The real, direct asset->entity link (per CII Onboarding DDD) — one row per asset per
-# owning business unit, so an asset can have more than one row. tier1_critical_service_id
-# above is NOT the ownership path: it's no longer populated on any current asset, and even
-# when it was, onboarding_service_entity below was only ever a service->entity mapping, one
-# indirection removed from the asset itself.
+# The real, direct asset->entity link — one row per asset per owning business unit, so an asset
+# can have more than one row. tier1_critical_service_id above is NOT the ownership path: it is
+# unpopulated on current assets, and onboarding_service_entity below only ever mapped
+# service->entity, one indirection removed from the asset.
 class ctm_scan_entity_bu(Base):
     __tablename__ = "ctm_scan_entity_bu"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -503,7 +510,7 @@ class onboarding_service_entity(Base):  # maps a service to its owning entity/gr
     service_id: Mapped[int] = mapped_column(Integer, primary_key=True) # FK to onboarding_services.id
     group_id: Mapped[int] = mapped_column(Integer, primary_key=True) # FK to group.id
 
-# asset and onboarding_supporting_systems junction table (many-to-many). The "supporting system" is a platform-owned
+# asset <-> onboarding_supporting_systems junction (many-to-many)
 class ctm_scan_entity_supporting_system(Base):
     __tablename__ = "ctm_scan_entity_supporting_system"
     ctm_scan_entity_id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -557,8 +564,8 @@ class onboarding_services(Base):
     sector_id: Mapped[int | None] = mapped_column(Integer)  # FK to onboarding_sectors.id
 
 
-# "option" is a plain word but shares a name pattern with option_value below — the curator's
-# named option GROUP (e.g. "Accessibility Channel", id 1012; "Hosting Environment", id 1015).
+# The curator's named option GROUP (e.g. "Accessibility Channel", id 1012); option_value below
+# holds its members.
 class option(Base):
     __tablename__ = "option"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -574,8 +581,8 @@ class option_value(Base):
     option_id: Mapped[int | None] = mapped_column(Integer)
     description: Mapped[str | None] = mapped_column(Unicode(255))
 
-# asset_type FK target — 7 curator-seeded rows (real ids 1-6, 1004); onboarding_supporting_systems.asset_type
-# -> ctm_scan_category.id via FK_OnboardingSupportingSystem_CTMScanCategory (confirmed live).
+# asset_type FK target — 7 curator-seeded rows (ids 1-6, 1004);
+# onboarding_supporting_systems.asset_type -> ctm_scan_category.id.
 class ctm_scan_category(Base):
     __tablename__ = "ctm_scan_category"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

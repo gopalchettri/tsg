@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, update
 from sqlalchemy.orm import Session
 
 from app.core.enums import (
@@ -24,38 +25,69 @@ log = get_logger(__name__)
 
 _EPOCH = 1
 _WORK_LEVELS = (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS)
-_SCENARIO_TEXT_FIELDS = ("scenario_title", "scenario_statement", "business_impact",
-                        "operational_impact", "risk_statement")
+_SCENARIO_TEXT_FIELDS = ("scenario_title", "scenario_statement", "risk_statement")
 
-# Asset-centric pipeline: the ASSET is the unit of work, not each supporting system (supporting
-# systems are context that explain the asset's attack surface). The session is already 1:1 with
-# the asset (UX_Session_ActiveAsset enforces one active session per asset), so we key the single
-# THREATS/SCENARIOS/_LOCK triple — and every Identified_Threat/Scoped_Threat/Threat_Scenario_Output
-# row, and the identity-hash dedup fold — on this sentinel SubsystemID. Real supporting-system ids
-# are DB PKs (>=1), so 0 can never collide with one.
+# The ASSET is the unit of work, not each supporting system. Sentinel SubsystemID for the single
+# THREATS/SCENARIOS/_LOCK triple and every row keyed on it; real supporting-system ids are DB PKs
+# (>=1), so 0 can never collide with one.
 # ponytail: sentinel over a schema migration — the SessionID already IS the asset key; revisit only
 # if a session ever needs to span more than one asset (UX_Session_ActiveAsset says it can't).
 ASSET_UNIT_ID = 0
+
+# difflib ratio at/above which a scenario is flagged "very similar" to a sibling of the SAME
+# threat. Advisory only — the scenario is kept, the warning rides the validation report.
+# ponytail: difflib is a cheap textual proxy for "meaningfully different", not semantic
+# understanding — a false flag costs one ignorable warning; revisit only if it proves noisy.
+_SIBLING_SIMILARITY_RATIO = 0.85
+
+
+class RegenTarget(NamedTuple):
+    """ONE regeneration work item — the exact scenario ROW being replaced, never a bare ThreatID.
+    With multiple coexisting scenarios per threat (ScenarioNumber), "regenerate this threat" is
+    ambiguous by construction: two active rows share the ThreatID."""
+    output_id: str
+    threat_id: str
+    scoped_threat_id: str
+    scenario_number: int
+    identity_hash: str | None
+
+
+def _flag_sibling_similarity(report: dict, scenario: dict, sibling_texts: list[tuple[int, str]]) -> None:
+    """Warn (into the normal validation report) when the new scenario_statement is very similar to
+    an ACTIVE sibling of the same threat. Advisory: the scenario is ALWAYS kept."""
+    statement = str(scenario.get("scenario_statement") or "")
+    if not statement.strip():
+        return
+    for number, sibling_statement in sibling_texts:
+        if not sibling_statement.strip():
+            continue
+        if difflib.SequenceMatcher(None, statement, sibling_statement).ratio() >= _SIBLING_SIMILARITY_RATIO:
+            report["errors"] = list(report.get("errors") or [])
+            report["errors"].append(
+                f"scenario is very similar to this threat's other scenario (scenario #{number})")
+            report["validation_status"] = "warning"
+            return
 
 
 def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_session: dict,
             subsystem_id: int, stage: str, level: SubsystemLevel, epoch: int, task_id: str,
             expected_type: type, temperature: float | None = None) -> tuple[Any, Provenance | None]:
     """Send a prompt to the LLM, log the raw request/response to Prompt_Log, and parse the
-    reply into the expected type. If parsing fails, the failed attempt is still logged before
-    the error is re-raised.
+    reply into the expected type. A failed parse is still logged before the error is re-raised.
 
-    Renews the stage's lease right before the call: claim_stage sets LeaseExpiresAt once, but
-    a stage can make several of these calls in a row (write_scenarios, one per selected
-    threat) — without renewal, a still-alive worker deep in that loop can have its own lease
-    expire under entirely normal per-call latency and get reaped out from under it. Best-
-    effort: if the lease was already lost, the caller's own finish_stage fencing at the end
-    catches it exactly as it always has — this only lowers how often that path is reached
-    under normal operation, it doesn't add a new failure mode.
-    """
-    if not dal.renew_lease(sess, scenario_session["SessionID"], subsystem_id, level, epoch, task_id):
-        log.warning("stage.lease_renewal_failed", session_id=scenario_session["SessionID"],
+    Renews BOTH the stage lease and the subsystem `_LOCK` lease first: claim_stage/acquire_lock
+    stamp them once, but a stage makes one of these calls per selected threat, so a still-alive
+    worker deep in that loop would otherwise expire its own lease and be reaped. Best-effort —
+    an already-lost lease is still caught by the caller's finish_stage fencing. Renewing at this
+    one choke point means no caller can reintroduce the gap."""
+    sid = scenario_session["SessionID"]
+    if not dal.renew_lease(sess, sid, subsystem_id, level, epoch, task_id):
+        log.warning("stage.lease_renewal_failed", session_id=sid,
                     subsystem=subsystem_id, level=str(level))
+    if not dal.renew_lock_lease(sess, sid, subsystem_id, task_id):
+        # Normal on the full-run path, which holds no _LOCK; release_lock's fencing still
+        # catches an actual theft on the locked paths.
+        log.debug("lock.lease_renewal_skipped", session_id=sid, subsystem=subsystem_id)
     sess.commit()
     text, prov = llm.chat(messages, temperature=temperature)
     if prov is not None:
@@ -99,14 +131,12 @@ def _send_live_update(session_id: str, sse_type: SSEEventType, subsystem_id: int
 
 
 def set_up_progress_tracking(sess: Session, session_id: str, tenant_id: str, entity_id: str) -> None:
-    """Create the initial 'IDLE' progress rows for the asset unit — one THREATS row, one SCENARIOS
-    row, and one _LOCK row, all keyed on ASSET_UNIT_ID. The pipeline threat-models the asset as a
-    whole (supporting systems are context), so there is exactly one unit of work per session, not
-    one per supporting system."""
+    """Create the initial 'IDLE' progress rows for the asset unit — one THREATS, one SCENARIOS and
+    one _LOCK row, all keyed on ASSET_UNIT_ID (exactly one unit of work per session)."""
     rows = [{
         "StateID": guid(), "SessionID": session_id, "TenantID": tenant_id, "EntityID": str(entity_id),
         "SubsystemID": ASSET_UNIT_ID, "Level": level, "Status": StageStatus.IDLE,
-        "GenerationEpoch": _EPOCH, "UpdatedAt": now(),
+        "GenerationEpoch": _EPOCH, "UpdatedAt": now(), "CreatedAt": now(),
     } for level in (*_WORK_LEVELS, SubsystemLevel.LOCK)]
     sess.execute(insert(m.Subsystem_Stage_State), rows)
 
@@ -139,9 +169,9 @@ def _build_threat_records(tid: str, sid: str, tenant: str, ss: int, ptype: str |
         "threat_id": tid, "grounding_status": str(gr.status),
         "threat_type": ptype, "threat_name": pname,
         "library_threat_type": gr.library_type, "library_threat_name": gr.library_name,
-        "threat_type_id": gr.type_id,  # the real threat type this was matched to, needed later so the scoring step knows what kind of threat this is
-        "catalogue_id": gr.catalogue_id,  # finer-grained than type_id — the per-(session,subsystem) dedup key (write_scenarios/_dedup_key)
-        "actors": gr.actors,  # carried through to scenario generation so the write-up can be grounded in who's behind the threat
+        "threat_type_id": gr.type_id,
+        "catalogue_id": gr.catalogue_id,  # finer-grained than type_id — the dedup key (_dedup_key)
+        "actors": gr.actors,
     }
     return row, summary
 
@@ -155,21 +185,19 @@ def _normalize(s: str) -> str:
 def _dedup_key(info: dict) -> str:
     """Catalogue-level dedup key for one threat, scoped per (session, subsystem) by the caller.
     Prefer the finest real library id; fall back to normalized text for a novel/ungrounded
-    proposal. ThreatType is NOT NULL; ThreatName is nullable → treat None as "". This is the folding
-    rule dal.identity_hash wraps — every IdentityHash producer/consumer routes through that one
-    helper, so the app-level dedup and the DB unique index always block the SAME pair."""
+    proposal. This is the folding rule dal.identity_hash wraps — every IdentityHash producer and
+    consumer routes through that helper, so app-level dedup and the DB unique index block the
+    SAME pair."""
     catalogue_id = info.get("catalogue_id")
     if catalogue_id is not None:
         return f"cat:{catalogue_id}"
     type_id = info.get("threat_type_id")
     if type_id is not None:
         return f"type:{type_id}"
-    # Normalize each part independently, then join with a delimiter appended AFTER normalization
-    # so it survives (_normalize strips `[^\w\s]`, so an in-text separator would be eaten and
-    # 'Firmware'+'Tampering' would collide with 'Firmware Tampering'+None). When BOTH parts are
-    # empty, fall back to a per-threat-unique token so distinct ungrounded proposals don't all
-    # collapse onto a bare 'txt:' — threat_id is present in both the find_threats summary and
-    # active_threats, so full-run and regen still agree deterministically.
+    # Join the delimiter AFTER normalizing each part: _normalize strips `[^\w\s]`, so an in-text
+    # separator would be eaten and 'Firmware'+'Tampering' would collide with 'Firmware Tampering'
+    # +None. Both parts empty → a per-threat-unique token, so distinct ungrounded proposals don't
+    # all collapse onto a bare 'txt:'.
     key_type = _normalize(info.get("threat_type") or "")
     key_name = _normalize(info.get("threat_name") or "")
     if not key_type and not key_name:
@@ -183,35 +211,23 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                 asset_active_fields: list[str] | None = None,
                 sub_active_fields: list[str] | None = None,
                 supersede: bool = True, exclude: list[str] | None = None) -> tuple[list[dict], Provenance | None]:
-    """Run the THREATS stage for the asset: ask the AI for candidate threats (supporting systems as context), match
-    ("ground") each one against the threat library, save them to the database, and report
-    the stage as complete. Returns an empty list if another worker already claimed this
-    stage or the claim is lost partway through.
+    """Run the THREATS stage for the asset: ask the AI for candidate threats (supporting systems as
+    context), ground each against the threat library, save them, and complete the stage. Returns
+    an empty list if another worker already claimed this stage or the claim is lost partway.
 
-    `supersede=True` (default, the first-run behaviour) wipes the prior run's active threats
-    before inserting this run's. `supersede=False` is the additive "generate next set" mode
-    (cascade.run_next_set): earlier threats stay active and returned, and a fresh epoch keeps
-    the new batch's stage claim distinct — the accumulation invariant depends on NOT superseding
-    here. `exclude` is the coverage list threaded into the prompt (already-proposed threat
-    names/types) so an additive round asks the model for threats it hasn't covered yet.
+    `supersede=True` (first-run) wipes the prior run's active threats first. `supersede=False` is
+    the additive "generate next set" mode (cascade.run_next_set): earlier threats stay active and
+    returned — the accumulation invariant depends on NOT superseding here. `exclude` is the
+    already-proposed coverage list threaded into the prompt.
 
-    `categories`/`actor_examples` are the live Threat_Category/Threat_Actor names — read live so
-    the prompt's vocabulary never drifts from what grounding.py actually matches against (see
-    prompts.threats_prompt()'s own fallback note). `asset_active_fields`/`sub_active_fields` are
-    the curator-toggled Context_Field_Config field names (dal.active_context_fields), same
-    once-per-session reasoning. _process_all_supporting_systems reads all four ONCE per session
-    (same reasoning as its own asset_context) and passes them down here, since they're global
-    config that can't change mid-run — don't re-query per subsystem. Left optional (None →
-    queried here) only so a direct caller without a pre-fetched value still works."""
+    `categories`/`actor_examples`/`asset_active_fields`/`sub_active_fields` are global config the
+    caller reads ONCE per session and passes down (they can't change mid-run); None means "query
+    them here", for a direct caller without pre-fetched values."""
     sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
     if not dal.claim_stage(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
         return [], None
     sess.commit()
     _send_live_update(sid, SSEEventType.stage_started, ss, SubsystemLevel.THREATS, StageStatus.RUNNING, epoch)
-    # Resolve both groups in ONE round-trip when a caller (e.g. cascade.run_next_set's additive
-    # round) doesn't pass them — same reasoning/pattern write_scenarios already uses below: two
-    # independent dal.active_context_fields() calls would be two avoidable SELECTs for the exact
-    # same "both groups needed at once" case dal.active_context_fields_by_group() exists for.
     if asset_active_fields is None or sub_active_fields is None:
         resolved = dal.active_context_fields_by_group(sess)  # one round-trip for both groups
         if asset_active_fields is None:
@@ -228,15 +244,12 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                                 exclude=exclude),
                                 scenario_session=scenario_session, subsystem_id=ss, stage="threats",
                                 level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
-                                # very likely (not guaranteed — see TSG_SDD.md §9.1b) to repeat the
-                                # same proposed threats for identical asset/subsystem inputs
                                 temperature=get_settings().threat_identification_temperature)
     if supersede:
         dal.supersede(sess, m.Identified_Threat, sid, ss)
-    # Additive round (supersede=False): a coverage-aware prompt still occasionally re-proposes a
-    # threat already present, which would leak a never-scored dead Identified_Threat row every call.
-    # Skip any proposal whose folded catalogue-level identity already matches an active threat (or an
-    # earlier proposal in THIS batch). Empty set on a full run → no dedup, unchanged behavior.
+    # Additive round (supersede=False): a coverage-aware prompt still occasionally re-proposes an
+    # already-active threat, leaking a never-scored dead Identified_Threat row. Skip any proposal
+    # whose folded identity matches an active threat or an earlier proposal in THIS batch.
     existing_identities = dal.active_identified_threat_identities(sess, sid, ss) if not supersede else set()
     threats: list[dict] = []
     rows: list[dict] = []
@@ -245,19 +258,15 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # One batched embed for every proposal's type/name text, instead of one round trip per
     # proposal inside the loop below. All the texts are already known here.
     grounding.prime_query_embeddings(llm, proposals, grounding_cache)
-    # For each threat the AI proposed: pull out its fields, try to match it to a known
-    # threat-library entry, then build the row for a new Identified_Threat record.
     for p in proposals:
-        # Same renewal _ask_ai does before its own LLM call: this loop can run one grounding
-        # match (embedding/rerank) per proposed threat — up to max_threats_per_asset — with
-        # no LLM call of its own to renew the lease in between, so a long loop could otherwise
-        # outlive it under normal per-iteration latency alone.
+        # This loop runs one grounding match per proposal with no LLM call in between to renew the
+        # lease via _ask_ai, so a long loop could otherwise outlive its own lease and be reaped.
         if not dal.renew_lease(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
             log.warning("stage.lease_renewal_failed", session_id=sid, subsystem=ss, level=str(SubsystemLevel.THREATS))
         sess.commit()
         ptype = _safe_text(p.get("type"), "")
         pcat = _safe_text(p.get("category"), "")
-        pname = _safe_text(p.get("name"), None)  # it's okay for the threat's name to be left blank in the database, so we allow that here
+        pname = _safe_text(p.get("name"), None)  # ThreatName is nullable
         gr = grounding.find_threat_in_library(sess, llm, p, sector_ids=sector_ids, cache=grounding_cache)
         tid = guid()
         row, summary = _build_threat_records(tid, sid, tenant, ss, ptype, pcat, pname, gr,
@@ -280,8 +289,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                     EventType=AuditEventType.grounding_summary,
                     DetailJSON=json.dumps({"count": len(threats)}))
     # Commit before announcing: a client reacting to stage_completed by immediately reading
-    # results must never race the write it's reading (same discipline as the stage_started
-    # commit above — this event just wasn't covered by it, since it fires after more work).
+    # /results must never race the write it's reading.
     sess.commit()
     _send_live_update(sid, SSEEventType.stage_completed, ss, SubsystemLevel.THREATS, StageStatus.COMPLETE, epoch)
     log.info("stage.complete", session_id=sid, subsystem=ss, stage="THREATS", count=len(threats))
@@ -292,31 +300,24 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
 
 def _moderation_report(scenario: dict) -> dict:
     """Optional content-moderation check (llm.moderate — off by default, LLM_MODERATION_ENABLED)
-    against this scenario's narrative text fields, joined into one string (one moderation call
-    per scenario, same cardinality as the one chat() call that wrote it). Reshaped into a small
-    dict so it rides alongside validate_scenario's own report inside the same ValidationJSON
-    blob a reviewer already looks at — never a new table/column, and never a reason to reject
-    the scenario (moderate() is advisory only — see its own docstring in llm.py)."""
+    over this scenario's reviewer-visible text, in ONE call. Advisory only: the result rides
+    inside ValidationJSON and never rejects the scenario."""
     text = " ".join(str(scenario.get(f) or "") for f in _SCENARIO_TEXT_FIELDS)
-    # controls suggestions (prompt v1.3) are model-generated text shown to reviewers too —
-    # same moderation surface as the narrative fields, same single call.
+    # controls suggestions are model-generated text shown to reviewers too — same surface.
     text = " ".join([text] + [f"{c.get('name') or ''} {c.get('why') or ''}".strip()
-                              for c in (scenario.get("controls") or []) if isinstance(c, dict)])
+                            for c in (scenario.get("controls") or []) if isinstance(c, dict)])
     r = moderate(text)
     return {"checked": r.checked, "flagged": r.flagged, "categories": r.categories, "error": r.error}
 
 
-#: OT threat types get ICS advisories first; the importer names OT types with these prefixes
-#: (scripts/import_threat_libraries.py) — "ICS ATT&CK – ...", "ICS Threat ...", "Embedded Device – ...".
+#: OT threat types get ICS advisories first; the importer names OT types with these prefixes.
 _OT_TYPE_PREFIXES = ("ICS", "Embedded Device")
 
 
 def _fetch_intel(threat_type: str | None, threat_name: str | None) -> list[dict] | None:
-    """Current threat-intel items for one verified threat, or None. Fully fail-open and
-    opt-in (TSG_INTEL_ENABLED): any error, disabled flag, or empty result returns None so
-    scenario generation is byte-for-byte unchanged from the pre-intel behaviour.
-
-    OT threats prefer live ICS advisories; everything else prefers exploited CVEs."""
+    """Current threat-intel items for one verified threat, or None. Fail-open and opt-in
+    (TSG_INTEL_ENABLED): any error, disabled flag, or empty result returns None and generation
+    proceeds unchanged. OT threats prefer ICS advisories; everything else prefers exploited CVEs."""
     if not get_settings().intel_enabled:
         return None
     try:
@@ -333,28 +334,38 @@ def _fetch_intel(threat_type: str | None, threat_name: str | None) -> list[dict]
 
 
 def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict, asset_context: dict, sc,
-                    enriched: dict, llm: LLMClient, task_id: str, epoch: int) -> tuple[dict, dict, Provenance | None]:
+                    enriched: dict, llm: LLMClient, task_id: str, epoch: int,
+                    sibling_texts: list[tuple[int, str]] | None = None) -> tuple[dict, dict, Provenance | None]:
     """Ask the AI to write a scenario for a single scoped threat, then validate the result
     against the threat's expected type/name.
 
-    `base_ctx` is the sanitized asset + supporting-systems prompt context, built ONCE per batch by
-    write_scenarios (identical for every threat) and reused here — see prompts.build_base_context.
-    `asset_context` is still passed raw (not the redacted base_ctx) because validate_scenario needs
-    the un-redacted critical_service for its consistency check."""
+    `base_ctx` is the sanitized prompt context, built ONCE per batch by the caller. `asset_context`
+    is still passed RAW because validate_scenario needs the un-redacted critical_service.
+
+    `sibling_texts` — (ScenarioNumber, scenario_statement) of the threat's OTHER active scenarios,
+    batch-fetched by the caller (never a per-scenario SELECT here). Non-empty → the variant prompt
+    steers away from each sibling and the result is similarity-flagged (advisory, never a retry).
+    Sibling-awareness lives HERE, the one function every scenario write routes through."""
     info = enriched.get(sc.threat_id, {})
     threat_type = info.get("library_threat_type") or info.get("threat_type")
     threat_name = info.get("library_threat_name") or info.get("threat_name")
     actors = info.get("actors") or []
     intel_items = _fetch_intel(threat_type, threat_name)
-    scenario, prov = _ask_ai(sess, llm,
-                            prompts.scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
-                                                    intel_items=intel_items),
+    if sibling_texts:
+        messages = prompts.variant_scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
+                                                intel_items=intel_items, existing=sibling_texts)
+    else:
+        messages = prompts.scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
+                                        intel_items=intel_items)
+    scenario, prov = _ask_ai(sess, llm, messages,
                             scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID, stage="scenario",
                             level=SubsystemLevel.SCENARIOS, epoch=epoch, task_id=task_id, expected_type=dict)
     report = validation.validate_scenario(
         scenario, threat_type, threat_name,
         asset_name=scenario_session["AssetName"], critical_service=asset_context.get("critical_service"))
     report["moderation"] = _moderation_report(scenario)
+    if sibling_texts:
+        _flag_sibling_similarity(report, scenario, sibling_texts)
     return scenario, report, prov
 
 
@@ -366,62 +377,62 @@ def _build_scoped_threat_row(scoped_id: str, sid: str, tenant: str, ss: int, sc:
         "UserID": user_id, "SubsystemID": ss,
         "ThreatID": sc.threat_id, "Score": sc.score, "ScopeRank": sc.rank,
         "Selected": 1 if sc.selected else 0, "Reason": sc.reason,
-        "FactorsJSON": json.dumps(sc.factors) if sc.factors else None,  # a record of exactly which scoring rules affected this threat's score, kept for transparency
+        "FactorsJSON": json.dumps(sc.factors) if sc.factors else None,
         "Superseded": 0, "CreatedAt": now(),
     }
 
 
 def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, scenario: dict, report: dict,
-                            epoch: int, entity_id: str | None, user_id: str | None, info: dict) -> dict:
+                            epoch: int, entity_id: str | None, user_id: str | None, info: dict,
+                            scenario_number: int = 1, replaces_output_id: str | None = None) -> dict:
     """Build the Threat_Scenario_Output DB row for one generated scenario. Pure dict-building —
     no I/O."""
-    # dal.identity_hash folds in the SAME catalogue-level identity (_dedup_key(info)) the selection
-    # pass uses, so the filtered unique index UX_Scenario_ActiveIdentity(SessionID, IdentityHash)
-    # WHERE Superseded=0 physically blocks a second active scenario for the same threat even under a
-    # crash/retry. SubsystemID is inside the fold (the index has no subsystem column) or sibling
-    # subsystems sharing a catalogue/type would cross-suppress.
+    # The filtered unique index UX_Scenario_ActiveIdentity(SessionID, IdentityHash, ScenarioNumber)
+    # WHERE Superseded=0 blocks a second active scenario for the same (threat, number) even under a
+    # crash/retry. SubsystemID must stay INSIDE the fold (the index has no subsystem column) or
+    # sibling subsystems sharing a catalogue/type would cross-suppress.
     identity = dal.identity_hash(sid, ss, info)
     return {
         "OutputID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
         "SubsystemID": ss,
         "ScopedThreatID": scoped_id, "Status": ScenarioStatus.complete,
         "ScenarioJSON": json.dumps(scenario),
-        "ValidationJSON": json.dumps(report),  # a note recording whether this scenario passed its automatic sanity checks
+        "ValidationJSON": json.dumps(report),
         "Accepted": 0, "Superseded": 0,
-        "IdentityHash": identity, "GenerationEpoch": epoch, "ErrorMessage": None, "CreatedAt": now(),
+        "IdentityHash": identity, "ScenarioNumber": scenario_number,
+        # Always present (None = replaced nothing) so executemany sees a uniform key set.
+        "ReplacesOutputID": replaces_output_id,
+        "GenerationEpoch": epoch, "ErrorMessage": None, "CreatedAt": now(),
     }
 
 
 def _build_error_output_row(scoped_id: str, sid: str, tenant: str, ss: int, client_msg: str,
-                            epoch: int, entity_id: str | None, user_id: str | None, info: dict) -> dict:
+                            epoch: int, entity_id: str | None, user_id: str | None, info: dict,
+                            scenario_number: int = 1, replaces_output_id: str | None = None) -> dict:
     """FAILURE CARD for a full-run threat whose scenario generation failed: same linkage and
     IdentityHash as a real row — so /regenerate/scenarios can target it (THE retry path) and a
-    later success supersedes it — but Status=error and a null scenario, which keeps it out of
-    accept/salvage/resume (the ScenarioStatus.complete filters in dal.py) and renders through
-    the API as the already-documented "scenario: null / generation failed" shape."""
+    later success supersedes it — but Status=error keeps it out of accept/salvage/resume (the
+    ScenarioStatus.complete filters in dal.py)."""
     return {
         "OutputID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
         "SubsystemID": ss,
         "ScopedThreatID": scoped_id, "Status": ScenarioStatus.error,
         "ScenarioJSON": None, "ValidationJSON": None,
         "Accepted": 0, "Superseded": 0,
-        "IdentityHash": dal.identity_hash(sid, ss, info), "GenerationEpoch": epoch,
+        "IdentityHash": dal.identity_hash(sid, ss, info), "ScenarioNumber": scenario_number,
+        # Points at the card it replaced, so the chain survives a failure.
+        "ReplacesOutputID": replaces_output_id,
+        "GenerationEpoch": epoch,
         "ErrorMessage": client_msg, "CreatedAt": now(),
     }
 
 
 def _select_unique_top_n(scoped: list[scoping.Scored], enriched: dict, top_n: int | None) -> int:
-    """Catalogue-dedupe the already-ranked, threshold-passed threats down to a unique top-N,
-    in place (Stage E). Walks in the ranker's own order (Score desc, ThreatID asc). A threat
-    keeps its scenario only if its dedup key is unseen AND fewer than top_n uniques are already
-    kept — Decision C, "free the slot": the count is over UNIQUE threats, so the reviewer gets N
-    DISTINCT scenarios, not N-minus-the-dupes. A later duplicate is demoted (Selected=0, reason)
-    but its row is kept for audit/provenance; only the scenario is withheld. Threats already
-    excluded in scoring (tech_gate / score threshold) are left as-is — they never consumed a slot.
-    Full-run only: a targeted regen is never passed here (a regen target must not be blocked).
-
-    Returns how many threats were demoted as duplicates (not the top-N cutoff) — surfaced in the
-    scoping_complete audit / scenarios.deduped log so dedup activity is observable in aggregate."""
+    """Catalogue-dedupe the already-ranked, threshold-passed threats down to a unique top-N, in
+    place, walking the ranker's own order. The count is over UNIQUE threats ("free the slot"), so
+    the reviewer gets N DISTINCT scenarios rather than N-minus-the-dupes. A duplicate is demoted
+    (Selected=0) but its row survives for audit. FULL RUN ONLY — a regen target must never be
+    blocked here. Returns how many were demoted as duplicates (not by the top-N cutoff)."""
     seen: set[str] = set()
     kept = 0
     deduped = 0
@@ -443,19 +454,13 @@ def _select_unique_top_n(scoped: list[scoping.Scored], enriched: dict, top_n: in
 def _mark_next_set_targets_rescored_out(sess: Session, sid: str, ss: int, pairs: list, excluded_ids: set[str],
                                     tenant: str, entity_id: str | None, user_id: str | None) -> None:
     """Persist a fresh Selected=0 scoped marker for every NEXT-SET target that rescored out with NO
-    active scenario, so next_unserved_unique_threats' Selected=1/NULL/top-N filter stops re-serving it.
-    Two kinds land here: a fresh threat (no prior scoped row), OR a POOL ZOMBIE (a previously-served
-    pool threat whose old Selected=1/'beyond top-%' scoped row rescored out after a mid-session
-    tech_gate/threshold tightening).
+    active scenario, so next_unserved_unique_threats stops re-serving it.
 
     Gate on "no active SCENARIO", NOT "no prior active scoped row": a genuine REGEN target keeps its
-    active scenario so it stays OUT of this set (regen invariant); a pool zombie has none, so keying on
-    the scoped row alone would wrongly spare it and it got re-served on every click. A zombie still
-    carries its stale active Scoped_Threat row, so supersede it FIRST, then insert the fresh Selected=0
-    marker (its Reason is the current PERMANENT tech_gate/threshold, not 'beyond top-%') — both are
-    required: superseding alone leaves no active scoped row and next_unserved re-serves it via its
-    `ScopedThreatID IS NULL` branch. A fresh target is unaffected by the supersede and just gets its
-    marker; regen targets never reach here (they keep an active scenario)."""
+    active scenario so it stays out of this set, while a pool zombie (a previously-served threat
+    whose Selected=1 row rescored out) has none — keying on the scoped row alone would spare the
+    zombie and re-serve it on every click. Supersede FIRST, then insert the marker: superseding
+    alone leaves no active scoped row and next_unserved re-serves it via `ScopedThreatID IS NULL`."""
     excluded_needing_marker = (excluded_ids - dal.threats_with_active_scenario(sess, sid, ss, excluded_ids)
                             if excluded_ids else set())
     if not excluded_needing_marker:
@@ -463,34 +468,27 @@ def _mark_next_set_targets_rescored_out(sess: Session, sid: str, ss: int, pairs:
     dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, excluded_needing_marker)
     sess.execute(insert(m.Scoped_Threat), [
         _build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)
-        for sc, scoped_id in pairs if sc.threat_id in excluded_needing_marker])
+        for sc, scoped_id, _t in pairs if sc.threat_id in excluded_needing_marker])
 
 
 def _begin_full_run_attempt(sess: Session, sid: str, ss: int, tenant: str,
                             entity_id: str | None, user_id: str | None,
                             pairs: list, epoch: int) -> set[str]:
-    """A full run persists INCREMENTALLY — each threat's rows are committed the moment its
-    scenario is generated, so a mid-batch failure (an LLMSlotUnavailable capacity squeeze that
-    Celery retries at the SAME epoch/task_id, or any other exception) never throws away
-    scenarios that already succeeded. This helper does the once-per-epoch setup and returns the
-    resume-skip set: threat_ids that already own an active scenario from a prior attempt of
-    THIS epoch and must not be re-generated.
+    """Once-per-epoch setup for a full run (which persists INCREMENTALLY, so a mid-batch failure
+    never discards scenarios that already succeeded). Returns the resume-skip set: threat_ids that
+    already own an active scenario from a prior attempt of THIS epoch.
 
-    The setup must run EXACTLY once per epoch: dal.supersede has no epoch memory, so re-running
-    it on a resumed claim would flip this epoch's own just-committed rows back to Superseded=1
-    and regenerate them anyway — AttemptCount==1 is the "first successful claim of this epoch"
-    signal (dal.stage_attempt_count).
+    The setup must run EXACTLY once per epoch: dal.supersede has no epoch memory, so re-running it
+    on a resumed claim would flip this epoch's own just-committed rows back to Superseded=1 and
+    regenerate them. AttemptCount==1 is the "first successful claim of this epoch" signal.
 
-    Full runs only ever execute at the initial epoch (run_pipeline_task hardcodes it; regen/
-    next-set always take the targeted branch) — the skipped-supersede-on-resume logic is only
-    safe because there is never a PRIOR generation to clear at that first epoch, so the guard
-    below turns that load-bearing assumption from accidental into enforced.
+    Skipping the supersede on resume is only safe because a full run never runs at anything but
+    the initial epoch (there is no PRIOR generation to clear); the guard below enforces that.
 
-    # ponytail: a crash AFTER claim-commit but BEFORE this setup's commit loses the not-selected
-    # Scoped_Threat rows for this run (the resume skips the attempt==1 block). Accepted ceiling:
-    # the only load-bearing effect is a permanently-gated threat being re-served ONCE by "generate
-    # next set", which re-scores and re-marks it Selected=0 — self-healing; the rest is write-only
-    # scoring-audit metadata. Make this block idempotent instead if that one wasted slot ever matters.
+    # ponytail: a crash after claim-commit but before this setup's commit loses this run's
+    # not-selected Scoped_Threat rows. Ceiling: a gated threat gets re-served ONCE by "generate
+    # next set", which re-marks it Selected=0 (self-healing); the rest is write-only audit
+    # metadata. Make this block idempotent if that one wasted slot ever matters.
     """
     if epoch != _EPOCH:
         raise ValueError(
@@ -500,103 +498,271 @@ def _begin_full_run_attempt(sess: Session, sid: str, ss: int, tenant: str,
     if attempt == 1:
         dal.supersede(sess, m.Scoped_Threat, sid, ss)
         dal.supersede(sess, m.Threat_Scenario_Output, sid, ss)
-        # Not-selected threats' scoring metadata involves no LLM call — persist it up front,
-        # once, so a resume never re-inserts it.
+        # Not-selected threats involve no LLM call — persist their scoring metadata once, up
+        # front, so a resume never re-inserts it.
         not_selected = [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)
-                        for sc, scoped_id in pairs if not sc.selected]
+                        for sc, scoped_id, _t in pairs if not sc.selected]
         if not_selected:
             sess.execute(insert(m.Scoped_Threat), not_selected)
         sess.commit()
-        # Fresh attempt: the supersede above just cleared every active output for (sid, ss), so
-        # the resume-skip set is empty by construction — skip the guaranteed-empty SELECT.
-        return set()
-    # Resume: a threat already owning an active scenario got it from a prior attempt of THIS
-    # epoch (the attempt==1 supersede cleared every older generation first, and the
-    # _LOCK/claim_stage CAS means no other epoch can be concurrently active).
+        return set()  # the supersede above cleared every active output — skip the empty SELECT
+    # Resume: a threat owning an active scenario got it from a prior attempt of THIS epoch (the
+    # attempt==1 supersede cleared older generations, and the _LOCK/claim_stage CAS means no
+    # other epoch can be concurrently active).
     return dal.threats_with_active_scenario(
-        sess, sid, ss, {sc.threat_id for sc, _ in pairs if sc.selected})
+        sess, sid, ss, {sc.threat_id for sc, _scoped_id, _t in pairs if sc.selected})
 
 
 def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
                             entity_id: str | None, user_id: str | None,
                             pairs: list, scenarios: dict, enriched: dict,
-                            target_threat_ids: set[str], epoch: int, task_id: str) -> bool:
+                            epoch: int, task_id: str, *, regen_mode: bool) -> bool:
     """The persistence/reconciliation tail of a TARGETED regen/next-set `write_scenarios` call
-    (a full run persists incrementally inside write_scenarios' own loop and never comes here):
+    (a full run persists incrementally in write_scenarios' own loop and never comes here):
     compute which targets actually got a fresh scenario, persist rescored-out markers, raise
-    `RegenerateConflict` when every target rescored out, supersede exactly the right prior
-    rows, and bulk-insert the new ones. Returns False only on the claim-lost path (caller
-    returns []); raises `RegenerateConflict` through.
+    `RegenerateConflict` when every target rescored out, supersede exactly the right prior rows,
+    and bulk-insert the new ones. Returns False only on the claim-lost path.
 
-    [REVIEW-FIX] A targeted regen must never supersede a threat's prior active rows unless a
-    fresh scenario actually replaced them — rescoring can legitimately re-exclude a specific
-    target (a curator's Config_Threat_Rule weight or the scoping_score_threshold/scoping_top_n
-    cutoff changed since the scenario was first written); destroying the old row with nothing
-    to show for it, then reporting a misleading "claim lost" failure, was strictly worse than
-    the pre-existing "just ranked low" behavior these cutoffs were meant to fix."""
-    generated_ids = {sc.threat_id for sc, scoped_id in pairs if scoped_id in scenarios}
-    excluded_ids = target_threat_ids - generated_ids
+    `pairs` are (Scored, new scoped guid, RegenTarget | None) triples. `regen_mode=True` =
+    regeneration (every pair carries a RegenTarget — replace exactly that row, at its own
+    ScenarioNumber, retiring ONLY its own Scoped_Threat row so a sibling's scoring row survives);
+    False = next-set fresh threats (target=None, first scenario, threat-scoped supersede).
+
+    NEVER supersede a threat's prior active rows unless a fresh scenario actually replaced them:
+    rescoring can legitimately re-exclude a target (a rule weight or cutoff changed since the
+    scenario was written), and destroying the old row with nothing to show for it is data loss."""
+    generated_ids = {sc.threat_id for sc, scoped_id, _t in pairs if scoped_id in scenarios}
+    all_target_ids = {sc.threat_id for sc, _scoped_id, _t in pairs}
+    excluded_ids = all_target_ids - generated_ids
     if excluded_ids:
         log.warning("regen.target_no_longer_selected", session_id=sid, subsystem=ss,
                     threat_ids=sorted(excluded_ids))
 
-    # Persist the Selected=0 markers for next-set targets that rescored out — BEFORE the all-excluded
-    # RegenerateConflict early-return below, so both that path and the partial-excluded path record
-    # them exactly once (they never collide with the supersede/regen handling further down).
-    _mark_next_set_targets_rescored_out(sess, sid, ss, pairs, excluded_ids, tenant, entity_id, user_id)
+    # Before the all-excluded early-return below, so both paths record the markers exactly once.
+    # NEXT-SET ONLY: `excluded_ids` also covers "generation raised", and in regen mode the sweep's
+    # only real effect would be superseding the Scoped_Threat of an error-card target whose retry
+    # failed — reading a transient LLM failure as a permanent scoping decision.
+    if not regen_mode:
+        _mark_next_set_targets_rescored_out(sess, sid, ss, pairs, excluded_ids, tenant, entity_id, user_id)
 
     if not generated_ids:
-        # Every requested target was excluded by rescoring — nothing to regenerate, and nothing
-        # was mutated above. Return the stage to its normal reviewable state (same transition as
-        # the success path below) and report this exactly like get_threat_id_to_redo's own
-        # pre-lock/post-lock re-check does: a benign conflict (cascade.py's `except
-        # RegenerateConflict`), never a pipeline failure.
+        # Every requested target was excluded by rescoring — nothing regenerated, nothing mutated.
+        # Return the stage to its reviewable state and report a benign conflict (cascade.py's
+        # `except RegenerateConflict`), never a pipeline failure.
         if not dal.finish_stage(sess, sid, ss, SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION, epoch, task_id):
             sess.rollback()
             log.warning("stage.claim_lost", session_id=sid, subsystem=ss, stage="SCENARIOS", epoch=epoch)
             return False
         sess.commit()
+        if not pairs:
+            # Empty candidate pool from the start — a different cause from a scoping-cutoff
+            # exclusion, which the caller-facing reason code must distinguish.
+            raise dal.RegenerateConflict(
+                "no unserved threats remain for this asset", reason="no_new_threats_found")
         raise dal.RegenerateConflict(
-            f"threat(s) no longer meet the scoping cutoff and cannot be regenerated: {sorted(excluded_ids)}")
+            f"threat(s) no longer meet the scoping cutoff and cannot be regenerated: {sorted(excluded_ids)}",
+            reason="new_threat_did_not_qualify")
 
-    # Mark prior rows as superseded before inserting the new ones — only the threats that
-    # actually got a fresh scenario this pass.
-    old_scoped_ids = dal.active_scoped_threat_ids(sess, sid, ss, generated_ids)
-    dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, generated_ids)
-    dal.supersede_by_scoped_threats(sess, sid, ss, old_scoped_ids)
+    # Supersede only what a fresh scenario actually replaces this pass.
+    generated_pairs = [(sc, scoped_id, t) for sc, scoped_id, t in pairs if scoped_id in scenarios]
+    if regen_mode:
+        # Row-scoped, never threat-wide: a sibling scenario (other ScenarioNumber, same ThreatID)
+        # keeps its own scoring row.
+        dal.supersede_scoped_rows(sess, [t.scoped_threat_id for _sc, _scoped_id, t in generated_pairs])
+    else:
+        old_scoped_ids = dal.active_scoped_threat_ids(sess, sid, ss, generated_ids)
+        dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, generated_ids)
+        dal.supersede_by_scoped_threats(sess, sid, ss, old_scoped_ids)
     scoped_rows = []
     output_rows = []
-    for sc, scoped_id in pairs:
+    for sc, scoped_id, target in pairs:
         if sc.threat_id in excluded_ids:
             continue  # excluded by rescoring — its prior active rows were left untouched above
-                      # (a fresh no-prior-scoped target already got its Selected=0 marker above)
+                    # (a fresh no-prior-scoped target already got its Selected=0 marker above)
+        if regen_mode and scoped_id not in scenarios:
+            # A target whose generation FAILED replaces nothing — its old scenario and scoped row
+            # stay active, so don't insert a dangling fresh scoped row for it either.
+            continue
         scoped_rows.append(_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id))
         if scoped_id not in scenarios:
             continue
         scenario, report = scenarios[scoped_id]
+        number = target.scenario_number if target is not None else 1
         output_rows.append(_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
-                                                    entity_id, user_id, enriched.get(sc.threat_id, {})))
+                                                    entity_id, user_id, enriched.get(sc.threat_id, {}),
+                                                    scenario_number=number))
     if scoped_rows:
         sess.execute(insert(m.Scoped_Threat), scoped_rows)
     if output_rows:
-        # Regen skips _select_unique_top_n, so two targets that fold to the SAME dedup_key build the
-        # SAME IdentityHash. Two ways that collides on UX_Scenario_ActiveIdentity: both in ONE bulk
-        # insert (a legacy pre-dedup session can hold two active same-catalogue outputs), or a later
-        # regen whose folded hash matches a prior regen's now-active folded row. Collapse to the
-        # first (highest-ranked — output_rows follow ranked order) and supersede any already-active
-        # row sharing one of these hashes, so exactly one active scenario per key survives.
-        seen_hashes: set[str] = set()
+        # Regen skips _select_unique_top_n, so two targets folding to the same dedup_key build the
+        # SAME IdentityHash and collide on UX_Scenario_ActiveIdentity — either within this bulk
+        # insert or against an already-active row. Collapse to the first (highest-ranked) per
+        # (hash, ScenarioNumber) so exactly one active scenario per (identity, number) survives.
+        seen_keys: set[tuple[str, int]] = set()
         deduped_output_rows = []
         for r in output_rows:
-            if r["IdentityHash"] in seen_hashes:
+            key = (r["IdentityHash"], r["ScenarioNumber"])
+            if key in seen_keys:
                 continue
-            seen_hashes.add(r["IdentityHash"])
+            seen_keys.add(key)
             deduped_output_rows.append(r)
         output_rows = deduped_output_rows
-        dal.supersede_by_identity_hashes(sess, sid, ss, seen_hashes)
+        by_number: dict[int, set[str]] = {}
+        for h, number in seen_keys:
+            by_number.setdefault(number, set()).add(h)
+        # Stamp from what the supersede ACTUALLY retired, not the requested target: retirement is
+        # keyed on (IdentityHash, ScenarioNumber), and the dedup collapse above can retire a row
+        # whose target never reaches output_rows.
+        retired: dict[tuple[str, int], str] = {}
+        for number, hashes in by_number.items():
+            for h, old_id in dal.supersede_by_identity_hashes(
+                    sess, sid, ss, hashes, scenario_number=number).items():
+                retired[(h, number)] = old_id
+        for r in output_rows:
+            r["ReplacesOutputID"] = retired.get((r["IdentityHash"], r["ScenarioNumber"]))
     if output_rows:
         sess.execute(insert(m.Threat_Scenario_Output), output_rows)
     return True
+
+
+def _build_work_items(sess: Session, sid: str, ss: int, scoped_all: list[scoping.Scored],
+                    target_threat_ids: set[str] | None,
+                    regen_targets: dict[str, RegenTarget] | None,
+                    ) -> tuple[list[tuple], int, dict[str, list[tuple[str, int, str]]]]:
+    """Build one write_scenarios call's batch. Returns:
+    - `pairs`: (Scored, new scoped guid, RegenTarget | None) work items. Full run / next-set carry
+    target=None (a first scenario, number 1). Regen mode builds one item PER TARGET ROW in rank
+    order, each replacement inheriting its own ScenarioNumber.
+    - `scoped_threat_count`: distinct THREATS considered, for the caller's audit record —
+    deliberately NOT len(pairs), which double-counts a threat whose two scenarios are both
+    regenerated in one call.
+    - `siblings_by_hash`: IdentityHash -> [(OutputID, ScenarioNumber, statement)] of each regen
+    target's OTHER active scenarios, batch-fetched ONCE (anti-N+1). Empty for fresh/full modes.
+    """
+    pairs: list[tuple[scoping.Scored, str, RegenTarget | None]]  # third slot None outside regen mode
+    if regen_targets is not None:
+        by_threat_targets: dict[str, list[RegenTarget]] = {}
+        for t in regen_targets.values():
+            by_threat_targets.setdefault(t.threat_id, []).append(t)
+        pairs = [(sc, guid(), t)
+                for sc in scoped_all if sc.threat_id in by_threat_targets
+                for t in sorted(by_threat_targets[sc.threat_id], key=lambda t: t.scenario_number)]
+    elif target_threat_ids is not None:
+        pairs = [(sc, guid(), None) for sc in scoped_all if sc.threat_id in target_threat_ids]
+    else:
+        pairs = [(sc, guid(), None) for sc in scoped_all]
+    scoped_threat_count = len({sc.threat_id for sc, _scoped_id, _t in pairs})
+
+    siblings_by_hash: dict[str, list[tuple[str, int, str]]] = {}
+    if regen_targets is not None:
+        for r in dal.active_scenarios_by_identity(
+                sess, sid, ss, {t.identity_hash for t in regen_targets.values() if t.identity_hash}):
+            try:
+                statement = str((json.loads(r.ScenarioJSON) or {}).get("scenario_statement") or "")
+            except (TypeError, ValueError):
+                statement = ""
+            siblings_by_hash.setdefault(r.IdentityHash, []).append((r.OutputID, r.ScenarioNumber, statement))
+    return pairs, scoped_threat_count, siblings_by_hash
+
+
+class _ScenarioBatch(NamedTuple):
+    """Everything resolved ONCE per write_scenarios call, before any scenario text is generated."""
+    base_ctx: dict
+    enriched: dict
+    deduped: int
+    pairs: list
+    scoped_count: int
+    siblings_by_hash: dict
+
+
+def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: dict,
+                            subsystems: list[dict], asset_context: dict, threats: list[dict],
+                            asset_active_fields: list[str] | None, sub_active_fields: list[str] | None,
+                            target_threat_ids: set[str] | None,
+                            regen_targets: dict[str, RegenTarget] | None,
+                            targeted: bool) -> _ScenarioBatch:
+    """Resolve the whole batch's shared inputs in ONE place: active context fields, the base
+    prompt context, scoring, dedup, and the work items. Every one of these is per-CALL, not
+    per-threat — resolving them inside the generation loop would be the N+1 this codebase has
+    already been bitten by, and would also let a curator's mid-batch edit change the field set
+    between two threats of the same run."""
+    if asset_active_fields is None or sub_active_fields is None:
+        resolved = dal.active_context_fields_by_group(sess)  # one round-trip for both groups
+        if asset_active_fields is None:
+            asset_active_fields = resolved["asset"]
+        if sub_active_fields is None:
+            sub_active_fields = resolved["subsystem"]
+    base_ctx = prompts.build_base_context(scenario_session["AssetName"], asset_context, subsystems,
+                                        asset_active_fields, sub_active_fields)
+
+    settings = get_settings()
+    type_ids = sorted({t["threat_type_id"] for t in threats if t.get("threat_type_id") is not None})
+    # score_threats ALWAYS gets top_n=None: scoping_top_n counts UNIQUE threats and is enforced by
+    # _select_unique_top_n (full run only). A raw rank cutoff here would wrongly exclude a regen
+    # target a full run kept via free-the-slot from beyond raw rank N → RegenerateConflict → the
+    # Regenerate control silently no-ops. score_threshold/tech_gate still reject a genuine dropout.
+    # The clamp below feeds only _select_unique_top_n, never score_threats.
+    top_n = settings.scoping_top_n
+    if top_n is not None:
+        top_n = min(top_n, settings.max_threats_per_asset)
+    scoped_all = scoping.score_threats(threats, subsystems=subsystems,
+                                    rules=dal.active_threat_rules(sess, type_ids),
+                                    score_threshold=settings.scoping_score_threshold, top_n=None)
+    enriched = {t["threat_id"]: t for t in threats}
+    # Dedup BEFORE any scenario text is generated — full runs only; a targeted regen must never be
+    # blocked or demoted by dedup (the reviewer asked to redo an already-unique scenario).
+    deduped = _select_unique_top_n(scoped_all, enriched, top_n) if not targeted else 0
+    pairs, scoped_count, siblings_by_hash = _build_work_items(
+        sess, sid, ss, scoped_all, target_threat_ids, regen_targets)
+    return _ScenarioBatch(base_ctx, enriched, deduped, pairs, scoped_count, siblings_by_hash)
+
+
+def _retire_prior_card(sess: Session, sid: str, ss: int, info: dict) -> str | None:
+    """Supersede whatever active row this identity already has at ScenarioNumber 1, returning its
+    OutputID for the replacement to point at. Both full-run writers need it: error rows are
+    excluded from `already_done` precisely so a retry lands here, and inserting over a live card
+    would violate UX_Scenario_ActiveIdentity. No-op (returns None) when no card exists."""
+    identity = dal.identity_hash(sid, ss, info)
+    return dal.supersede_by_identity_hashes(sess, sid, ss, {identity}, scenario_number=1).get(identity)
+
+
+def _persist_full_run_failure(sess: Session, sid: str, ss: int, tenant: str, entity_id: str | None,
+                            user_id: str | None, sc, scoped_id: str, info: dict,
+                            client_msg: str, epoch: int) -> None:
+    """FULL RUN ONLY: persist a failure card so the failure stays retryable — with no row at all
+    it is invisible to /regenerate/scenarios, which targets OutputIDs. Status=error keeps it out
+    of accept/salvage/resume, and get_threat_id_to_redo deliberately does NOT filter it: that IS
+    the retry path.
+
+    Targeted modes insert nothing instead of calling this — the threat's previous scenario is
+    still active under the same IdentityHash (inserting would collide) and is already retryable."""
+    retired_card = _retire_prior_card(sess, sid, ss, info)
+    # Also retire the prior Scoped_Threat row: superseding only the output leaves the earlier
+    # card's scoped row active, so a resumed attempt accumulates a second active scoped row per
+    # retry, duplicating the threat in every "active scoped" read.
+    dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, {sc.threat_id})
+    sess.execute(insert(m.Scoped_Threat),
+                [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
+    sess.execute(insert(m.Threat_Scenario_Output),
+                [_build_error_output_row(scoped_id, sid, tenant, ss, client_msg, epoch,
+                                        entity_id, user_id, info, replaces_output_id=retired_card)])
+    sess.commit()
+
+
+def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, entity_id: str | None,
+                            user_id: str | None, sc, scoped_id: str, info: dict,
+                            scenario: dict, report: dict, epoch: int) -> None:
+    """FULL RUN ONLY: commit THIS threat's rows before the next threat's LLM call — explicitly,
+    not as an incidental side effect of _ask_ai's own pre-call commit, which could regress if that
+    timing ever changed. The targeted paths buffer instead and write once in
+    _reconcile_targeted_regen."""
+    retired_card = _retire_prior_card(sess, sid, ss, info)
+    sess.execute(insert(m.Scoped_Threat),
+                [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
+    sess.execute(insert(m.Threat_Scenario_Output),
+                [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
+                                            entity_id, user_id, info, replaces_output_id=retired_card)])
+    sess.commit()
 
 
 def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, threats: list[dict],
@@ -605,34 +771,28 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
                 asset_active_fields: list[str] | None = None,
                 sub_active_fields: list[str] | None = None,
                 *, require_lock: bool = False,
+                regen_targets: dict[str, RegenTarget] | None = None,
                 on_before_commit: Callable[[list[Provenance | None]], None] | None = None) -> list[Provenance | None]:
     """Run the SCENARIOS stage for the asset: score/rank the given threats, generate a
-    scenario for each selected one, and save everything to the database. If
-    `target_threat_ids` is given, only those threats are (re)scored and (re)generated instead
-    of the whole set — used when regenerating just a subset. Returns an empty list if another
+    scenario for each selected one, and save everything to the database. Two targeted modes:
+    `regen_targets` (regeneration — one work item PER EXISTING ROW, each replacement inheriting
+    its target's ScenarioNumber; the only way to express "redo a scenario") or
+    `target_threat_ids` (next-set — threats getting their FIRST scenario, always number 1).
+    Mutually exclusive; both None = the initial full run. Returns an empty list if another
     worker already claimed this stage or the claim is lost partway through.
 
     `on_before_commit` runs INSIDE this function's final transaction, immediately before the
-    commit that makes the batch durable — the hook for a caller that must record something
-    atomically with the work itself (cascade.py's regeneration_completed / next-set
-    generation_complete audit rows). Writing that audit AFTER write_scenarios returned meant two
-    separate transactions: if the second one failed, the work was already committed but the
-    caller's generic handler still routed it through _record_failure, stamping a stage_error
-    audit row and an error SSE onto a regeneration that had actually succeeded. Sharing one
-    transaction removes the window entirely — both land or neither does — and a hook that raises
-    now correctly rolls the work back, so the failure the caller then reports is TRUE.
+    commit that makes the batch durable, for a caller that must record something atomically with
+    the work (cascade.py's regeneration_completed / generation_complete audit rows). Both land or
+    neither does, and a hook that raises correctly rolls the work back.
 
-    `require_lock=True` (passed by every real production caller — tasks.py's own driver and both
-    of cascade.py's regen/next-set paths, never by a direct unit test) additionally refuses to even attempt the claim
-    unless the caller still holds this subsystem's `_LOCK`. Without it: a worker whose prior
-    stage stalled past its lease has its THREATS row ERROR'd and its `_LOCK` reclaimed+released
-    by the reaper — which also ERROR-marks this SCENARIOS row (still IDLE, never touched) as
-    part of finalizing the now-abandoned session (reaper.py's `_close_out_one_abandoned_
-    session`). `claim_stage`'s plain IDLE/ERROR branch doesn't know the caller lost the mutex,
-    so the same zombie task_id can claim THIS row moments later and silently finish a stage on
-    a session the reaper already closed out. `claim_stage` itself intentionally has no `_LOCK`
-    check (many tests exercise it standalone) — this is the one call site that actually needs
-    the mutex re-verified before resuming multi-step work under a possibly-stale identity."""
+    `require_lock=True` (every production caller; never a direct unit test) refuses to even
+    attempt the claim unless the caller still holds this subsystem's `_LOCK`. Without it, a
+    worker whose prior stage stalled past its lease — reaped, `_LOCK` reclaimed, this still-IDLE
+    SCENARIOS row ERROR-marked as part of closing out the session — could re-claim THIS row under
+    the same zombie task_id and silently finish a stage on a session the reaper already closed
+    out. `claim_stage` deliberately has no `_LOCK` check of its own (tests exercise it
+    standalone); this is the one call site that needs the mutex re-verified."""
     sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
     entity_id, user_id = scenario_session["EntityID"], scenario_session.get("UserID")
     if require_lock and not dal.holds_lock(sess, sid, ss, task_id):
@@ -640,148 +800,79 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
         return []
     if not dal.claim_stage(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id):
         return []
-    sess.commit()  # makes the "now RUNNING" flip durable before we announce it below — same reason explained in find_threats above (the pre-AI-call commit is `_ask_ai`'s own job now)
+    sess.commit()  # make the "now RUNNING" flip durable before announcing it
     _send_live_update(sid, SSEEventType.stage_started, ss, SubsystemLevel.SCENARIOS, StageStatus.RUNNING, epoch)
 
-    # Resolve ONCE per call, not once per selected threat below — a caller that doesn't pass
-    # these (e.g. cascade.py's regen path) previously left _generate_one_scenario to re-query
-    # Context_Field_Config on every single threat in the loop, an N+1 that scaled with batch
-    # size (up to _MAX_BATCH targeted threats per regen call). Also makes every threat in THIS
-    # call use the exact same field set, instead of each one racing a curator's mid-batch edit.
-    if asset_active_fields is None or sub_active_fields is None:
-        resolved = dal.active_context_fields_by_group(sess)  # one round-trip for both groups
-        if asset_active_fields is None:
-            asset_active_fields = resolved["asset"]
-        if sub_active_fields is None:
-            sub_active_fields = resolved["subsystem"]
-
-    # Build the sanitized asset + supporting-systems prompt context ONCE for the whole batch — it's
-    # identical for every scenario (only the per-threat fields vary), so re-running the
-    # allowlist+redact pass per selected threat below would be pure redundant work.
-    base_ctx = prompts.build_base_context(scenario_session["AssetName"], asset_context, subsystems,
-                                        asset_active_fields, sub_active_fields)
-
-    # Only distinct, known threat-type ids are needed to look up the scoring rules that apply.
-    type_ids = sorted({t["threat_type_id"] for t in threats if t.get("threat_type_id") is not None})
-    settings = get_settings()
-    # scoping_top_n is the SCENARIO count, enforced over UNIQUE threats by _select_unique_top_n
-    # below (Decision C, full run only), so score_threats ALWAYS gets top_n=None and stays the pure
-    # deterministic ranker (base + grounding + rules, threshold filtering only — no dedup, no LLM).
-    # A targeted regen must rank on the SAME duplicate-inclusive order a full run used: a unique
-    # winner a full run kept via free-the-slot can sit beyond raw rank scoping_top_n, and a raw
-    # top-N cutoff on regen would wrongly re-exclude it ('beyond top-N') → RegenerateConflict →
-    # the Regenerate control silently no-ops. score_threshold/tech_gate still reject a target that
-    # genuinely dropped out, and a regen target is always a former unique winner (demoted duplicates
-    # never got an active output, so get_threat_id_to_redo can't select them). The clamp is belt-and-
-    # suspenders to config.py's startup validator, in case top_n is monkeypatched past the candidate
-    # ceiling at runtime — it feeds only the full-run _select_unique_top_n call, never score_threats.
-    top_n = settings.scoping_top_n
-    if top_n is not None:
-        top_n = min(top_n, settings.max_threats_per_asset)
-    scoped_all = scoping.score_threats(threats, subsystems=subsystems, rules=dal.active_threat_rules(sess, type_ids),
-                                    score_threshold=settings.scoping_score_threshold,
-                                    top_n=None)
-    enriched = {t["threat_id"]: t for t in threats}
-    # Dedup to a unique top-N BEFORE any scenario text is generated — full runs only. A targeted
-    # regen must never be blocked or demoted by dedup (the reviewer explicitly asked to redo an
-    # existing, already-unique scenario), so it is left out of this pass.
-    deduped = _select_unique_top_n(scoped_all, enriched, top_n) if target_threat_ids is None else 0
-    # Full run: score/keep every threat. Targeted regen: only the caller-specified subset.
-    scoped = scoped_all if target_threat_ids is None else [sc for sc in scoped_all if sc.threat_id in target_threat_ids]
-
-    pairs = [(sc, guid()) for sc in scoped]  # assign each scoped threat its DB id up front, before generating scenarios
+    targeted = target_threat_ids is not None or regen_targets is not None
+    batch = _prepare_scenario_batch(sess, sid, ss, scenario_session, subsystems, asset_context, threats,
+                                    asset_active_fields, sub_active_fields,
+                                    target_threat_ids, regen_targets, targeted)
+    base_ctx, enriched, deduped = batch.base_ctx, batch.enriched, batch.deduped
+    pairs, scoped_threat_count, siblings_by_hash = batch.pairs, batch.scoped_count, batch.siblings_by_hash
 
     provs: list[Provenance | None] = []
     scenarios: dict[str, tuple[dict, dict]] = {}  # scoped_id -> (scenario, validation report) — regen branch only
     already_done: set[str] = set()
-    if target_threat_ids is None:
+    if not targeted:
         already_done = _begin_full_run_attempt(sess, sid, ss, tenant, entity_id, user_id, pairs, epoch)
-    # Only threats that scoring marked as "selected" get an actual AI-written scenario; the rest
-    # were recorded above (full run) or land via _reconcile_targeted_regen below (targeted regen).
     failures: list[str] = []       # client-safe reasons, for the stage's ErrorMessage
     first_failure: Exception | None = None
-    for sc, scoped_id in pairs:
+    for sc, scoped_id, target in pairs:
         if not sc.selected or sc.threat_id in already_done:
             continue
+        # Siblings = the same identity's other active scenarios, excluding the row being replaced.
+        sibling_texts = None
+        if target is not None and target.identity_hash:
+            sibling_texts = [(number, statement)
+                            for output_id, number, statement in siblings_by_hash.get(target.identity_hash, [])
+                            if output_id != target.output_id] or None
         try:
-            scenario, report, prov = _generate_one_scenario(sess, scenario_session, base_ctx, asset_context, sc, enriched, llm, task_id, epoch)
+            scenario, report, prov = _generate_one_scenario(sess, scenario_session, base_ctx, asset_context, sc,
+                                                            enriched, llm, task_id, epoch,
+                                                            sibling_texts=sibling_texts)
         except LLMSlotUnavailable:
             # NOT per-item: a capacity squeeze is transient and applies to the whole hop. Celery's
             # autoretry_for re-runs it shortly; swallowing it here would freeze a temporary
             # shortage into a permanently short batch.
             raise
         except Exception as exc:  # noqa: BLE001 — one threat's failure must not discard its siblings
-            # A targeted regen/next-set buffers every scenario until the end (see `scenarios`
-            # below), so letting one parse failure propagate threw away every sibling that had
-            # already been generated and paid for. Record it, keep going; the survivors are
-            # persisted and the stage carries the partial-failure message.
+            # Targeted modes buffer every scenario until the end, so propagating here would throw
+            # away siblings already generated and paid for. Record and keep going.
             sess.rollback()  # _ask_ai commits mid-flight; never continue the loop on a dirty session
             first_failure = first_failure or exc
             client_msg = _failure_client_message(exc)
             failures.append(f"{enriched.get(sc.threat_id, {}).get('threat_name') or sc.threat_id}: {client_msg}")
             log.warning("scenario.generation_failed", session_id=sid, subsystem=ss,
                         threat_id=sc.threat_id, error=repr(exc))
-            if target_threat_ids is None:
-                # Retryability: with no row at all, the failure was invisible to
-                # /regenerate/scenarios (which targets OutputIDs) — the only recovery was
-                # regenerating threats that already worked. Persist a FAILURE CARD instead:
-                # Status=error, null scenario (the shape ScenarioResult.scenario already
-                # documents), the client-safe reason, and a real IdentityHash so a later
-                # successful regen supersedes it. Status=error keeps it invisible to
-                # accept/salvage/resume (see the ScenarioStatus.complete filters in dal.py);
-                # get_threat_id_to_redo deliberately does NOT filter it — that IS the retry path.
-                # Targeted regen/next-set failures insert nothing: the threat's previous scenario
-                # is still active under the same IdentityHash (inserting would collide with
-                # UX_Scenario_ActiveIdentity) and is already individually retryable.
-                info = enriched.get(sc.threat_id, {})
-                # supersede any error card a PRIOR failed attempt left active for this identity —
-                # without this, the resumed attempt's fresh card violates UX_Scenario_ActiveIdentity
-                dal.supersede_by_identity_hashes(sess, sid, ss, {dal.identity_hash(sid, ss, info)})
-                # ...and the prior attempt's Scoped_Threat row for this SAME threat. Superseding
-                # only the output left the earlier card's scoped row active, so a resumed attempt
-                # accumulated a second active scoped row per retry — duplicating this threat in
-                # every "active scoped" read (next-set pool, dedup markers) with no index to stop it.
-                dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, {sc.threat_id})
-                sess.execute(insert(m.Scoped_Threat),
-                            [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
-                sess.execute(insert(m.Threat_Scenario_Output),
-                            [_build_error_output_row(scoped_id, sid, tenant, ss, client_msg, epoch,
-                                                    entity_id, user_id, info)])
-                sess.commit()
+            if not targeted:
+                _persist_full_run_failure(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
+                                        enriched.get(sc.threat_id, {}), client_msg, epoch)
             continue
         provs.append(prov)
-        if target_threat_ids is None:
-            # Commit THIS threat's rows before the next threat's LLM call is even attempted —
-            # explicitly, not via _ask_ai's own pre-call commit as an incidental side effect
-            # (that coupling could silently regress if _ask_ai's commit timing ever changed).
-            # First supersede any FAILURE CARD a prior attempt left active for this identity
-            # (Status=error rows are excluded from `already_done`, precisely so the retry lands
-            # here) — inserting the fresh row over a live card would violate
-            # UX_Scenario_ActiveIdentity. No-op when no card exists.
-            dal.supersede_by_identity_hashes(
-                sess, sid, ss, {dal.identity_hash(sid, ss, enriched.get(sc.threat_id, {}))})
-            sess.execute(insert(m.Scoped_Threat),
-                        [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
-            sess.execute(insert(m.Threat_Scenario_Output),
-                        [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
-                                                    entity_id, user_id, enriched.get(sc.threat_id, {}))])
-            sess.commit()
+        if not targeted:
+            # Re-verify the claim BEFORE committing. finish_stage's fencing at the end is enough
+            # for the targeted paths (buffered, rolled back there), but this branch commits each
+            # threat as it goes, so by then the rollback has nothing left to undo — a reaped worker
+            # would keep committing fresh scenarios into a session a human is already reviewing.
+            if not dal.renew_lease(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id):
+                sess.rollback()
+                log.warning("stage.claim_lost_midbatch", session_id=sid, subsystem=ss,
+                            stage="SCENARIOS", epoch=epoch, committed=len(provs) - 1)
+                break
+            _persist_full_run_scenario(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
+                                    enriched.get(sc.threat_id, {}), scenario, report, epoch)
         else:
             scenarios[scoped_id] = (scenario, report)
 
     if failures and not provs and not already_done and first_failure is not None:
         # EVERY selected threat failed AND nothing survives from an earlier attempt — only then is
-        # there nothing to review, so this is a real stage failure. Re-raise the first cause so the
-        # caller records THAT message, instead of falling through to _reconcile_targeted_regen's
-        # "no longer meet the scoping cutoff" conflict, which would describe a rescoring outcome
-        # that never happened.
+        # there nothing to review. Re-raise the first cause so the caller records THAT message,
+        # not _reconcile_targeted_regen's "no longer meet the scoping cutoff" conflict, which would
+        # describe a rescoring outcome that never happened.
         #
-        # `not already_done` is load-bearing: `provs` holds only THIS attempt's generations (see the
-        # ponytail note below), and a resumed attempt deliberately skips threats that already own an
-        # active scenario. Without it, a retry whose REMAINING threats all fail would raise despite
-        # committed, reviewable output — flipping the stage to ERROR and firing an error SSE for a
-        # run that produced scenarios, purely because the failures landed in attempt 2 instead of
-        # attempt 1. `already_done` is always empty on the targeted-regen path.
+        # `not already_done` is load-bearing: `provs` holds only THIS attempt's generations, so
+        # without it a resumed attempt whose remaining threats all fail would flip the stage to
+        # ERROR despite committed, reviewable output. Always empty on the targeted path.
         raise first_failure
 
     # ponytail: after a resumed attempt, provs holds only THIS attempt's generations, so the
@@ -789,51 +880,156 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.SCENARIO_GENERATION, SubsystemID=ss,
                     EventType=AuditEventType.scoping_complete,
-                    DetailJSON=json.dumps({"scoped": len(scoped), "selected": len(provs), "deduped": deduped}))
+                    DetailJSON=json.dumps({"scoped": scoped_threat_count, "selected": len(provs), "deduped": deduped}))
     log.info("scenarios.deduped", session_id=sid, subsystem=ss, deduped=deduped, kept=len(provs))
 
-    if target_threat_ids is not None and not _reconcile_targeted_regen(
+    if targeted and not _reconcile_targeted_regen(
             sess, sid, ss, tenant, entity_id, user_id,
-            pairs, scenarios, enriched, target_threat_ids, epoch, task_id):
+            pairs, scenarios, enriched, epoch, task_id,
+            regen_mode=regen_targets is not None):
         return []
     # A partial batch still goes to REVIEW (the survivors are worth reviewing) but carries the
-    # reason on the stage row. That is exactly what SupportingSystemBoard.error_message is
-    # documented for: "Non-null on an awaiting_review board entry means the run failed mid-batch
-    # after generating some scenarios — the review set may be PARTIAL, not a complete run."
+    # reason on the stage row — that is what SessionProgress.error_message means on an
+    # awaiting_review board: the review set may be PARTIAL.
     partial_error = (f"{len(failures)} of {len(failures) + len(provs)} scenario(s) failed to "
                     f"generate: {'; '.join(failures)}") if failures else None
-    # Step 4: map controls for every active output not yet attempted (this run's AND any
-    # earlier attempt's). Before finish_stage so the map rows commit atomically with the batch.
-    control_mapping.map_controls(sess, scenario_session, asset_context, subsystems, llm,
-                                 ASSET_UNIT_ID, task_id, epoch)
+    # Before finish_stage, so the control-map rows commit atomically with the batch.
+    _finalize_scenario_batch(sess, scenario_session, asset_context, subsystems, llm, task_id, epoch)
     if not dal.finish_stage(sess, sid, ss, SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION,
                             epoch, task_id, error=partial_error):
         sess.rollback()
         log.warning("stage.claim_lost", session_id=sid, subsystem=ss, stage="SCENARIOS", epoch=epoch)
         return []
-    # Last thing before the commit, so whatever the caller stages here is part of the SAME
-    # transaction as the scenarios above (see on_before_commit in the docstring). Deliberately
-    # unguarded: if it raises, the commit never happens and the whole batch rolls back — that is
-    # the atomicity this hook exists to provide, not a bug to swallow.
+    # Deliberately unguarded: if it raises, the commit never happens and the whole batch rolls
+    # back — that is the atomicity this hook exists to provide, not a bug to swallow.
     if on_before_commit is not None:
-        on_before_commit(provs)  # provs: what this call actually generated, for the caller's record
-    # Commit before announcing: a client reacting to stage_completed by immediately reading
-    # results (GET /sessions/{id}/results) must never race the write it's reading.
-    sess.commit()
+        on_before_commit(provs)
+    sess.commit()  # commit before announcing
     _send_live_update(sid, SSEEventType.stage_completed, ss, SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION, epoch)
     log.info("stage.complete", session_id=sid, subsystem=ss, stage="SCENARIOS", scenarios=len(provs))
     return provs
 
 
+def _finalize_scenario_batch(sess: Session, scenario_session: dict, asset_context: dict,
+                            subsystems: list[dict], llm: LLMClient, task_id: str, epoch: int) -> None:
+    """The mandatory tail of EVERY scenario-writing path — Step-4 control mapping for every active
+    output not yet attempted (map_controls is data-driven off ControlsMappedAt, so one call covers
+    whatever the caller just inserted). A data-state test ("no active scenario permanently without
+    a controls attempt") catches any future writer that skips this."""
+    control_mapping.map_controls(sess, scenario_session, asset_context, subsystems, llm,
+                                ASSET_UNIT_ID, task_id, epoch)
+
+
+def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id: int,
+                            subsystems: list[dict], asset_context: dict, llm: LLMClient,
+                            task_id: str, epoch: int, max_variants: int,
+                            exclude_threat_ids: set[str] | None = None) -> int:
+    """"Generate next set"'s variant fallback: when no genuinely NEW threat exists, write one
+    ADDITIONAL, deliberately-different scenario for up to `max_variants` already-covered threats
+    (best score first), each at the identity's next free ScenarioNumber. Returns how many were
+    actually created. Exactly one chat call per variant.
+
+    `exclude_threat_ids` is for a caller topping up a PARTIAL batch: the primaries it just
+    committed are active, complete and highest-scored, so without it they would sort to the front
+    of the eligibility list and get a scenario #2 for the #1 that click just wrote.
+
+    Deliberately NOT a pipeline stage: the SCENARIOS stage is already terminal by the time this
+    runs, so there is no claim/epoch dance — a plain side write under the caller's subsystem lock.
+
+    Failure semantics (each deliberate):
+    - insert+commit PER VARIANT, so a mid-batch crash keeps the variants already paid for;
+    - a failed generation is skip-and-log: NO error card (it would squat on the scenario number
+    and block the retry forever) and no _record_failure (erroring an already-terminal stage
+    misreports a finished stage). The threat stays eligible; the next click is the retry;
+    - LLMSlotUnavailable STOPS the batch and returns the honest count — it never raises;
+    - a concurrent double-click racing to the same (identity, number) loses on
+    UX_Scenario_ActiveIdentity and is skipped as the benign race it is."""
+    from sqlalchemy.exc import IntegrityError
+
+    sid, ss, tenant = scenario_session["SessionID"], subsystem_id, scenario_session["TenantID"]
+    entity_id, user_id = scenario_session["EntityID"], scenario_session.get("UserID")
+    eligible = dal.variant_eligible_primaries(
+        sess, sid, ss, max_variants, get_settings().max_scenarios_per_threat,
+        exclude_threat_ids=exclude_threat_ids)
+    if not eligible:
+        return 0
+    threats = dal.active_threats(sess, sid, ss)
+    enriched = {t["threat_id"]: t for t in threats}
+    resolved = dal.active_context_fields_by_group(sess)
+    base_ctx = prompts.build_base_context(scenario_session["AssetName"], asset_context, subsystems,
+                                        resolved["asset"], resolved["subsystem"])
+    # Batched sibling fetch — one SELECT for the whole batch, never per variant (anti-N+1).
+    siblings_by_hash: dict[str, list[tuple[int, str]]] = {}
+    for r in dal.active_scenarios_by_identity(sess, sid, ss, {e["identity_hash"] for e in eligible}):
+        try:
+            statement = str((json.loads(r.ScenarioJSON) or {}).get("scenario_statement") or "")
+        except (TypeError, ValueError):
+            statement = ""
+        siblings_by_hash.setdefault(r.IdentityHash, []).append((r.ScenarioNumber, statement))
+
+    created = 0
+    for item in eligible:
+        info = enriched.get(item["threat_id"])
+        if not info:
+            continue  # threat superseded between the eligibility read and now — benign, skip
+        try:
+            factors = json.loads(item["factors_json"]) if item["factors_json"] else []
+        except (TypeError, ValueError):
+            factors = []
+        sc = scoping.Scored(threat_id=item["threat_id"], score=item["score"] or 0.0,
+                            rank=item["scope_rank"] or 0, selected=True,
+                            reason=item["reason"] or "", factors=factors)
+        try:
+            scenario, report, prov = _generate_one_scenario(
+                sess, scenario_session, base_ctx, asset_context, sc, enriched, llm, task_id, epoch,
+                sibling_texts=siblings_by_hash.get(item["identity_hash"]) or None)
+        except LLMSlotUnavailable:
+            # STOP the batch, don't raise: the sole caller (cascade._top_up_with_variants) must
+            # never raise, so nothing here can trigger a Celery retry — raising would only destroy
+            # `created`, the count of variants already committed above. Remaining threats stay
+            # eligible and the user's next click is the retry.
+            sess.rollback()
+            log.warning("variant.slots_exhausted", session_id=sid, subsystem=ss,
+                        created=created, remaining=len(eligible) - created)
+            break
+        except Exception as exc:  # noqa: BLE001 — one variant's failure must not discard its siblings
+            sess.rollback()
+            log.warning("variant.generation_failed", session_id=sid, subsystem=ss,
+                        threat_id=item["threat_id"], error=repr(exc))
+            continue
+        scoped_id = guid()
+        try:
+            sess.execute(insert(m.Scoped_Threat),
+                        [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
+            sess.execute(insert(m.Threat_Scenario_Output),
+                        [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
+                                                    entity_id, user_id, info,
+                                                    scenario_number=item["next_number"])])
+            sess.commit()  # per-variant durability — a later failure never rolls this one back
+        except IntegrityError:
+            sess.rollback()  # a concurrent click already filled this (identity, number) — benign race
+            log.info("variant.race_lost", session_id=sid, subsystem=ss, threat_id=item["threat_id"],
+                    scenario_number=item["next_number"])
+            continue
+        created += 1
+    if created:
+        # Step-4 mapping can fail AFTER the variants are durable. Losing it costs unmapped controls
+        # (map_controls re-picks them up); letting it escape would report 0 for work on disk.
+        try:
+            _finalize_scenario_batch(sess, scenario_session, asset_context, subsystems, llm, task_id, epoch)
+            sess.commit()
+        except Exception as exc:  # noqa: BLE001 — see above; the variants are already committed
+            sess.rollback()
+            log.warning("variant.finalize_failed", session_id=sid, subsystem=ss,
+                        created=created, error=repr(exc))
+    return created
+
+
 def _failure_client_message(exc: Exception) -> str:
-    """[REVIEW-FIX] a guardrail block (proxy-side, via LLM_GUARDRAILS — llm.py's
-    `_chat_kwargs`) previously produced the identical opaque "stage processing failed"
-    message as any other random failure, with nothing anywhere (audit record, SSE event, DB
-    ErrorMessage) indicating a guardrail specifically fired rather than a network blip, a
-    parse error, or a real bug. litellm raises `RejectedRequestError` (a `BadRequestError`
-    subclass) specifically for this case — imported locally, not at module top, so this file
-    doesn't require `litellm` installed just to define this function (same "optional
-    dependency for stub-only test runs" reasoning as every local `import litellm` in llm.py)."""
+    """Client-safe reason for a stage failure. A proxy-side guardrail block gets its own message
+    (litellm raises `RejectedRequestError` for exactly that) so it isn't indistinguishable from a
+    network blip or a real bug. litellm is imported locally, not at module top, so this module
+    stays importable without it — same reasoning as every local `import litellm` in llm.py."""
     if isinstance(exc, validation.LLMResponseParseError):
         return repr(exc)
     try:
@@ -848,7 +1044,7 @@ def _failure_client_message(exc: Exception) -> str:
 def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, exc: Exception, epoch: int = _EPOCH) -> None:
     """Handle a stage that raised an exception: roll back its half-done work, mark the
     subsystem's stages as ERROR, write an audit record, and notify the UI via SSE."""
-    sess.rollback()  # undo any half-finished changes from the step that just failed, including its "in progress" marker, so nothing incomplete gets left behind
+    sess.rollback()  # undo the failed step's half-finished work, including its "in progress" marker
     sid = scenario_session["SessionID"]
     client_msg = _failure_client_message(exc)
     sess.execute(
@@ -863,7 +1059,7 @@ def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, ex
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"], EntityID=scenario_session["EntityID"],
                     SubsystemID=subsystem_id, EventType=AuditEventType.stage_error,
                     DetailJSON=json.dumps({"error": client_msg, "subsystem_id": subsystem_id}))
-    sess.commit()  # commit before announcing — same discipline as every other publish in this file
+    sess.commit()  # commit before announcing
     bus.publish(sid, {"type": str(SSEEventType.error), "session_id": sid, "subsystem_id": subsystem_id,
                     "message": client_msg, "ts": now().isoformat()})
     log.error("stage.error", session_id=sid, subsystem=subsystem_id, error=repr(exc))  # full detail: server-side only
@@ -876,23 +1072,19 @@ def decide_session_outcome(sess: Session, scenario_session: dict) -> str | None:
     statuses = [str(r["Status"]) for r in dal.stage_rows(sess, sid)]
     if not statuses or any(s in (StageStatus.IDLE, StageStatus.RUNNING) for s in statuses):
         return None  # nothing seeded yet, or work still in flight
-    # Salvage BEFORE the AWAITING_DECISION branch (not inside a later ERROR branch): in a
-    # multi-subsystem session a healthy sibling at AWAITING_DECISION would otherwise short-circuit
-    # straight to review while an errored subsystem that STILL owns active, accumulated scenarios
-    # stays ERROR — excluded from accept's good_subs (SCENARIOS @ AWAITING_DECISION) and silently
-    # dropped (data loss). revive only flips ERROR SCENARIOS rows that still own an active
-    # Threat_Scenario_Output, so it is an idempotent no-op when there is nothing to salvage — and
-    # leaves an errored subsystem that never committed a scenario untouched, so the pure-ERROR path
-    # below still cancels + releases the lock. Re-read the board so the revived rows are seen here.
+    # Salvage BEFORE the AWAITING_DECISION branch: a healthy sibling at AWAITING_DECISION would
+    # otherwise short-circuit to review while an errored subsystem that STILL owns active
+    # scenarios stays ERROR — excluded from accept's good_subs and silently dropped (data loss).
+    # revive only flips ERROR SCENARIOS rows that still own an active output, so it no-ops when
+    # there is nothing to salvage and the pure-ERROR path below still cancels. Re-read the board.
     if dal.has_active_scenarios(sess, sid):
         dal.revive_errored_scenarios_to_review(sess, sid)
         statuses = [str(r["Status"]) for r in dal.stage_rows(sess, sid)]
     if any(s == StageStatus.AWAITING_DECISION for s in statuses):
         return "review" if _send_to_review(sess, scenario_session) else None
     if any(s == StageStatus.ERROR for s in statuses):
-        # Every stage terminal, none reviewable, >=1 ERROR, and the salvage above found nothing
-        # active to revive → a genuine total failure (e.g. a first run that errored before
-        # committing any scenario). Cancel and release the lock.
+        # Every stage terminal, none reviewable, and the salvage above found nothing to revive →
+        # a genuine total failure. Cancel and release the lock.
         return "cancelled" if _mark_session_failed(sess, scenario_session) else None
     log.warning("finalize.no_terminal_state", session_id=sid, statuses=statuses)
     return None
@@ -911,7 +1103,7 @@ def _send_to_review(sess: Session, scenario_session: dict) -> bool:
         .values(CurrentStage=WorkflowStage.REVIEW, StageStatus=StageStatus.AWAITING_DECISION, UpdatedAt=now())
     )
     if res.rowcount != 1:
-        return False  # someone else already moved this session into review a moment ago, or it's no longer active — either way, there's nothing more for this attempt to do
+        return False  # already moved into review, or no longer active — nothing left to do
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
                     EntityID=scenario_session["EntityID"], Stage=WorkflowStage.REVIEW, EventType=AuditEventType.entered_review)
     sess.commit()
@@ -971,41 +1163,33 @@ def _summarize_generation(sub_id: int, prov_i: Provenance | None, scen_provs: li
 
 
 def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClient, task_id: str) -> None:
-    """Top-level driver for one session: take the asset unit's lock, run the THREATS and
-    SCENARIOS stages once for the whole asset (supporting systems are read-only context, not
-    separately processed), record the outcome (success or failure), then decide what happens
-    to the session as a whole."""
+    """Top-level driver for one session: take the asset unit's lock, run THREATS then SCENARIOS
+    once for the whole asset (supporting systems are read-only context), record the outcome, then
+    decide what happens to the session as a whole."""
     row = dal.load_session(sess, session_id)
     if row is None:
         return
     scenario_session = dict(row)
     if scenario_session["CurrentStage"] == WorkflowStage.REVIEW:
-        # A task message redelivered long after the reaper already drove this session to
-        # REVIEW (SessionStatus stays 'active' there — see enums.py — so acquire_lock's
-        # session-active gate alone doesn't catch this; Redis's broker visibility_timeout
-        # defaults to ~3600s, far longer than this app's own stage_lease_seconds=300, so a
-        # worker killed mid-task can have its orphaned message resurface well after a human
-        # has started (or finished) reviewing). Regeneration is the only thing allowed to
-        # touch a REVIEW session — it goes through cascade.py, never through here.
+        # A task message redelivered after the session already reached REVIEW. SessionStatus stays
+        # 'active' there, so acquire_lock's session-active gate alone doesn't catch it, and the
+        # broker's visibility_timeout (~3600s) far outlives stage_lease_seconds. Regeneration is
+        # the only thing allowed to touch a REVIEW session, and it goes through cascade.py.
         log.warning("pipeline.refused_review_session", session_id=session_id, task_id=task_id)
         return
     subsystems = json.loads(scenario_session["SubsystemsJSON"])
-    asset_context = json.loads(scenario_session.get("AssetContextJSON") or "{}")  # parsed ONCE per session, not per-subsystem
+    asset_context = json.loads(scenario_session.get("AssetContextJSON") or "{}")
     log.info("pipeline.start", session_id=session_id, subsystems=len(subsystems), task_id=task_id)
-    # Asset-centric: the asset is the SINGLE unit of work (supporting systems are context), so there
-    # is no per-subsystem loop — one lock, one THREATS pass, one SCENARIOS pass, all keyed on
-    # ASSET_UNIT_ID. Another worker already holding the lock means this session is in flight
-    # elsewhere; fall straight through to decide_session_outcome.
+    # One lock, one THREATS pass, one SCENARIOS pass, all keyed on ASSET_UNIT_ID. Another worker
+    # holding the lock means this session is in flight elsewhere; fall through to
+    # decide_session_outcome.
     if dal.acquire_lock(sess, session_id, ASSET_UNIT_ID, task_id):
         sess.commit()  # make the lock durable BEFORE any other work — an exception below routes
                         # through _record_failure's rollback, which would otherwise undo an
                         # uncommitted acquire_lock and make the finally's release spuriously fail.
         try:
-            # Read ONCE per session, not per-subsystem — global config (Threat_Category/Threat_Actor,
-            # Context_Field_Config) that can't change mid-run, same reasoning as asset_context above.
-            # Deferred until after the lock is won: a call that loses the acquire_lock race (or hits
-            # an already-terminal session) below must not pay these 3 avoidable SELECTs for results
-            # it would just discard.
+            # Global config that can't change mid-run — read ONCE per session, and only after the
+            # lock is won so a lost race doesn't pay for results it would discard.
             categories = dal.active_category_names(sess)
             actor_examples = dal.active_actor_names(sess)
             active_fields = dal.active_context_fields_by_group(sess)  # one round-trip for both groups
@@ -1017,23 +1201,18 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
                                         asset_active_fields=asset_active_fields, sub_active_fields=sub_active_fields)
             sess.commit()
             threats_stage_done = True
-            if not threats:  # already done before (idempotent no-op), or truly none — re-read the DB to be sure
+            if not threats:  # already done before (idempotent no-op), or truly none — re-read to be sure
                 threats = dal.active_threats(sess, session_id, ASSET_UNIT_ID)
-                # Still empty is ambiguous: THREATS may have genuinely completed with zero AI-proposed
-                # threats, OR find_threats lost its claim to a poison-terminal row (AttemptCount
-                # exhausted after repeated LLMSlotUnavailable retries hit the same still-RUNNING row)
-                # that never actually finished. Only the former may let SCENARIOS proceed — otherwise
-                # SCENARIOS would be marked AWAITING_DECISION with zero scenarios and the session would
-                # falsely reach REVIEW instead of being left for the reaper to correctly carry the
-                # still-stuck THREATS row to ERROR (and the session on to cancelled).
+                # Still empty is ambiguous: THREATS genuinely completed with zero proposals, OR
+                # find_threats lost its claim to a still-RUNNING row that never finished. Only the
+                # former may let SCENARIOS proceed — otherwise the session falsely reaches REVIEW
+                # with zero scenarios instead of being left for the reaper to carry to ERROR.
                 threats_stage_done = bool(threats) or dal.stage_completed_at_epoch_or_newer(
                     sess, session_id, ASSET_UNIT_ID, SubsystemLevel.THREATS, _EPOCH)
             if threats_stage_done:
                 scen_provs = write_scenarios(sess, scenario_session, subsystems, asset_context, threats, llm, task_id,
                                             asset_active_fields=asset_active_fields, sub_active_fields=sub_active_fields,
                                             require_lock=True)
-                # Save a record of exactly which AI calls produced the asset's results, all together
-                # in one entry in the permanent history log.
                 dal.append_audit(sess, AuditID=guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
                                 EntityID=scenario_session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,
                                 SubsystemID=ASSET_UNIT_ID, EventType=AuditEventType.generation_complete,
@@ -1042,12 +1221,11 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
             else:
                 log.warning("pipeline.threats_not_complete_skipping_scenarios", session_id=session_id, task_id=task_id)
         except LLMSlotUnavailable:
-            # Temporary "system was busy" condition, not a bug — must NOT be recorded as a permanent
-            # ERROR. Re-raise past _record_failure so it reaches Celery's autoretry_for
-            # (celery_app.py), which retries the whole task shortly and resumes via the same
-            # claim_stage crash-redelivery CAS/resume logic.
+            # Transient "system was busy", not a bug — must NOT be recorded as a permanent ERROR.
+            # Re-raise past _record_failure so Celery's autoretry_for retries the whole task and
+            # resumes via claim_stage's crash-redelivery CAS.
             raise
-        except Exception as exc:  # noqa: BLE001 — catch any problem so it gets recorded properly, never let it silently disappear
+        except Exception as exc:  # noqa: BLE001 — every failure must be recorded, never lost
             _record_failure(sess, scenario_session, ASSET_UNIT_ID, exc)
             sess.commit()
         finally:
@@ -1055,10 +1233,8 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
                 log.warning("asset.lock_lost", session_id=session_id, task_id=task_id)
             sess.commit()
     else:
-        # Lock held by another worker (genuine contention), OR the session is no longer
-        # SessionStatus.active (already cancelled/completed) — dal.acquire_lock's CAS covers both;
-        # the status is included so an operator can tell the two apart in logs instead of both
-        # printing an identical "asset.locked" line.
+        # acquire_lock's CAS covers two cases: genuine contention, or a session that is no longer
+        # active. The logged status is what tells an operator which one happened.
         log.warning("asset.locked", session_id=session_id, session_status=scenario_session["SessionStatus"])
 
     decide_session_outcome(sess, scenario_session)

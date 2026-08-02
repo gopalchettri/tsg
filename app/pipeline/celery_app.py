@@ -1,29 +1,17 @@
-""" this file connects the web server to the background workers
-through a job queue (Celery) — it does NOT do any AI work itself, it just says
-"here's a job, go run it" and "here's how to check for crashed sessions."
+"""Celery transport wiring — kept separate from the pipeline work.
 
-Celery transport wiring — kept separate from the pipeline work.
+`acks_late` + `reject_on_worker_lost` mean a worker crash redelivers the task; the stage CAS
+makes that safe (finished stages skip, mid-flight resume), and the reaper recovers a session
+whose worker died so the lock never leaks.
 
-`acks_late` + `reject_on_worker_lost` mean a worker crash redelivers the task; the
-stage Compare-And-Swap (CAS) makes that safe (finished stages skip, mid-flight resume). The
-reaper recovers a session whose worker died so the lock never leaks.
+`reject_on_worker_lost` is effectively inert under the gevent pool: it relies on a supervising
+process detecting a killed *child*, and a SIGKILL of the single gevent process takes down the
+Consumer and every greenlet at once. The Redis broker's `visibility_timeout` below — not that
+flag — is the real redelivery mechanism when a worker is killed outright.
 
-`reject_on_worker_lost`'s own requeue signal is effectively inert under `worker_pool="gevent"`
-(set below): it relies on a supervising process detecting a killed *child* — the prefork
-model this app does NOT use. A SIGKILL of the single gevent worker process takes down the
-Consumer, connection, and every in-flight greenlet at once, leaving nothing alive to
-reject/requeue anything. Redelivery for THIS deployment's actual pool type depends entirely
-on the Redis broker's own `visibility_timeout` below — that, not this flag, is the real
-recovery mechanism when a worker is killed outright rather than raising inside a task.
-
-This module does NOT monkey-patch gevent, even though the worker runs a gevent pool
-(celery_worker.py) — it is also imported directly by the FastAPI app (for
-run_pipeline_task.delay()/regenerate_task.delay()) and by celery beat, both of
-which run on asyncio, not gevent. gevent's monkey-patch rewrites select/socket at
-the process level; doing that inside an asyncio process corrupts its own I/O loop —
-reproduced live as every POST /v1/sessions hanging forever once patching briefly
-lived here. celery_worker.py is the real, patch-first entrypoint for celery worker;
-this module stays patch-free and safe for every process that imports it.
+This module must NEVER monkey-patch gevent: it is imported by the FastAPI app and by celery
+beat, both on asyncio, and patching select/socket inside an asyncio process hangs every request.
+celery_worker.py is the patch-first entrypoint for `celery worker`.
 """
 from __future__ import annotations
 
@@ -56,26 +44,14 @@ celery_app.conf.update(
     result_expires=_s.result_expires_seconds,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
-    # NO worker_pool="gevent" here, deliberately: celery/worker/components.py warns
-    # (W_POOL_SETTING) on every boot when a green pool comes from the SETTING rather than -P,
-    # because the setting resolves too late for a monkey-patch to be applied early enough. We
-    # patch at import time in celery_worker.py and pass -P gevent on every launch path
-    # (start.ps1, docker/compose.prod.yml, both run-books, README), so the setting was pure
-    # noise. Its one real job — making a bare `celery worker` pick gevent rather than prefork
-    # (celery/bin/worker.py falls back to conf.worker_pool only when -P is absent) — is now
-    # covered by the prefork fail-fast in _init_worker below.
+    # NO worker_pool="gevent" here, deliberately: the setting resolves too late for a
+    # monkey-patch and celery warns (W_POOL_SETTING) on every boot. -P gevent is passed on every
+    # launch path, and the prefork fail-fast in _init_worker covers a bare `celery worker`.
 
-    # Redis/Kombu's own default (~3600s) was previously left implicit — made explicit here so
-    # it's a deliberate, documented, easily-tunable value instead of an invisible library
-    # default. This bounds how long a message from a genuinely killed worker sits unredelivered
-    # (see the docstring above); it's a reasoned starting point, not derived from real session-
-    # duration data (a run can process up to 50 subsystems sequentially — see schemas.py's
-    # _MAX_BATCH — so there's no tight, safe lower bound without knowing this deployment's real
-    # P99 session duration). Setting it too short risks Celery redelivering a still-legitimately-
-    # running task (wasteful, though claim_stage's CAS prevents actual double-work); too long
-    # leaves an orphaned message idle longer. _process_all_supporting_systems' own REVIEW-stage
-    # guard is the real safety net against a late redelivery mutating a session a human is
-    # already reviewing — this timeout only bounds how long that guard might need to matter for.
+    # How long a message from a genuinely killed worker sits unredelivered. A reasoned starting
+    # point, not derived from real P99 session duration (a run can process up to 50 subsystems
+    # sequentially). Too short redelivers a still-running task (wasteful; claim_stage's CAS
+    # prevents actual double-work), too long leaves an orphaned message idle.
     broker_transport_options={"visibility_timeout": 3600},
     beat_schedule={                    # the reaper must run on a schedule in production
         "reap-stuck-sessions": {"task": "tsg.reap", "schedule": _s.reaper_interval_seconds},
@@ -90,24 +66,17 @@ celery_app.conf.update(
 @worker_init.connect        # fires exactly once per worker process, for EVERY pool type
 @worker_process_init.connect  # fires per forked child under prefork specifically 
 def _init_worker(sender=None, **_):
-    """ runs once, right when a worker process starts up, to
-    double-check its settings are safe and to pre-load the AI models so the
-    very first real request doesn't have to wait for that loading.
+    """Per-worker-process startup: verify posture/DB invariants and warm the models.
 
-    `worker_process_init` is prefork-only (fires per forked child) — it NEVER
-    fires under the gevent pool (`-P gevent`), which is what this service
-    actually runs. Without `worker_init` (fires once for any pool, before
-    the pool even starts), a gevent worker would silently skip the fail-closed
-    security-posture guard and the fail-fast local-model check entirely — the same
-    root cause `configure_logging`'s own eager-import-time fix addresses for logging.
+    BOTH signals are needed. `worker_process_init` is prefork-only and NEVER fires under the
+    gevent pool this service actually runs, so without `worker_init` a gevent worker silently
+    skips the fail-closed security guard and the fail-fast local-model check.
 
-    verify_startup is included here too, not just in the API's startup hook (main.py)
-    — a worker can be deployed as its own process, independently of the API, and
-    would otherwise never check that the database it's about to run CAS writes and
-    stage locking against actually has the required indexes/columns/RCSI setting."""
-    # imported here (not at the top of the file) so this worker-only setup code only
-    # loads when a worker process actually starts, not whenever any other process
-    # (e.g. the FastAPI app) merely imports this module
+    verify_startup runs here as well as in the API's startup hook because a worker can be
+    deployed independently and would otherwise never check that the database it runs CAS writes
+    against has the required indexes/columns/RCSI setting."""
+    # worker-only setup: imported here so merely importing this module (e.g. from FastAPI)
+    # doesn't drag it in
     from app.core.config import assert_security_posture
     from app.db.engine import get_engine
     from app.db.invariants import verify_startup
@@ -117,14 +86,11 @@ def _init_worker(sender=None, **_):
     from app.pipeline.local_models import validate_local_models
 
     configure_logging()
-    # Provenance for new embedding-cache docs (embeddings._l2_write created_by). Set here, not
-    # at module import — this module is also imported by the FastAPI app, which must stay "api".
+    # Set here, not at module import — the FastAPI app imports this module and must stay "api".
     embeddings.process_role = "worker"
     # Fail-fast on prefork, the one pool that FORKS: celery_worker.py monkey-patches gevent at
-    # import time, so forking after that hands every child a hub inherited from the parent —
-    # silent, intermittent hangs rather than a clean error. Only prefork is rejected, not
-    # "anything but gevent": -P solo is a legitimate single-process debug path (.vscode/
-    # launch.json) and never forks. sender is None only when a test calls this directly.
+    # import time, so forking after that hands every child an inherited hub — silent,
+    # intermittent hangs rather than a clean error. -P solo never forks and stays allowed.
     pool = getattr(getattr(sender, "pool_cls", None), "__module__", "")
     if pool.endswith("prefork"):
         raise RuntimeError(
@@ -134,19 +100,14 @@ def _init_worker(sender=None, **_):
         )
     assert_security_posture()          # fail-closed: same auth guard as the API
     verify_startup(get_engine())       # fail-fast: same DB invariant guard as the API
-    # [REVIEW-FIX] local embedding/reranker calls (local_models.py::_offload) run on gevent's
-    # native thread pool, sized independently of the -c/--concurrency worker setting above —
-    # was silently capped at gevent's own built-in default (10) with no way to see or change
-    # it. Set BEFORE validate_local_models warms the models below, so the real ceiling is in
-    # effect from the very first local-model call.
+    # local_models.py::_offload runs on gevent's native thread pool, sized independently of
+    # -c/--concurrency and otherwise capped at gevent's own default of 10. Set BEFORE
+    # validate_local_models warms the models, so the ceiling holds from the first call.
     gevent.get_hub().threadpool.size = get_settings().local_model_threadpool_size
     validate_local_models(warm=True)   # fail-fast + warm the local models so the 1st request is fast
-    # verify_litellm_models's own chat()/embed() call goes through the SAME _llm_slot concurrency
-    # limiter every real task call does — but this signal handler isn't a @celery_app.task, so
-    # Celery's autoretry_for never applies here. Several worker replicas booting at once under a
-    # configured max_concurrent_llm_calls cap could otherwise raise LLMSlotUnavailable straight out
-    # of worker startup instead of transparently retrying, exactly during the highest-contention
-    # moment (a coordinated restart/scale-out) the slot mechanism is meant to survive gracefully.
+    # verify_litellm_models goes through the same _llm_slot limiter as a real task, but this
+    # signal handler is not a @celery_app.task, so autoretry_for never applies — several replicas
+    # booting at once would raise LLMSlotUnavailable straight out of worker startup.
     for attempt in range(_LLM_VERIFY_MAX_ATTEMPTS):
         try:
             verify_litellm_models()    # fail-fast: same discipline, for whichever models route through the proxy
@@ -155,17 +116,12 @@ def _init_worker(sender=None, **_):
             if attempt == _LLM_VERIFY_MAX_ATTEMPTS - 1:
                 raise
             time.sleep(_LLM_VERIFY_RETRY_BACKOFF_SECONDS * (attempt + 1))
-    log_litellm_key_info()             # [REVIEW-FIX] was defined but never called — observability only, never raises
+    log_litellm_key_info()             # observability only, never raises
     # Warm the per-model-pair grounding thresholds OUTSIDE any stage lease: the first resolution
-    # for a new embedding+reranker pair auto-calibrates (a bounded paraphrase+scoring pass) — at
-    # boot that is a one-time deploy cost; deferred to the first pipeline run it would burn lease
-    # time inside find_threats. Best-effort: on any failure workers resolve lazily later and, at
-    # worst, fall back to the static defaults with a warning (grounding.resolve_thresholds).
-    # allow_calibration=True ONLY here: this is the one place the expensive pass may run, so it
-    # can never execute inside a leased pipeline stage. Same bounded LLMSlotUnavailable retry as
-    # verify_litellm_models above — a coordinated restart under max_concurrent_llm_calls is
-    # exactly when the paraphrase calls contend, and giving up there would leave this worker on
-    # static thresholds for its whole life.
+    # for a new embedding+reranker pair auto-calibrates (a bounded paraphrase+scoring pass), which
+    # at boot is a one-time deploy cost but inside find_threats would burn lease time.
+    # allow_calibration=True ONLY here, so the expensive pass can never run in a leased stage.
+    # Best-effort: on failure workers resolve lazily later, at worst on the static defaults.
     from app.pipeline.grounding import resolve_thresholds
     for attempt in range(_LLM_VERIFY_MAX_ATTEMPTS):
         try:
@@ -187,18 +143,13 @@ def _init_worker(sender=None, **_):
 @celery_app.task(bind=True, name="tsg.run_pipeline",
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def run_pipeline_task(self, session_id: str) -> None:
-    """ this is the background job that runs the whole 2-stage
-    AI pipeline for one session, kicked off right after a user creates it.
+    """Runs the whole pipeline for one session; queued by the API on session creation.
+    `self.request.id` becomes the run id stamped into each claimed stage, so an acks_late
+    redelivery is distinguishable from a fresh run for the stage CAS.
 
-    Entry point queued by the API on session creation; `self.request.id` becomes
-    the run id `_process_all_supporting_systems` stamps into each claimed stage, so a worker-crash
-    redelivery (`acks_late`) is distinguishable from a fresh run for the stage Compare-And-Swap (CAS)
-
-    `autoretry_for=(LLMSlotUnavailable,)`: a confirmed "no free LLM call slot" is temporary,
-    not a bug — Celery retries this SAME task id shortly (backoff), which resumes exactly like
-    a crash-redelivery does via claim_stage's existing CAS/resume logic. `max_retries=None`
-    because `Subsystem_Stage_State.AttemptCount`'s own poison-terminal cap (dal.claim_stage) is
-    the real ceiling here, not a second, independent Celery-level one.
+    `autoretry_for=(LLMSlotUnavailable,)`: a confirmed "no free LLM call slot" is temporary, and
+    the retry resumes exactly like a crash-redelivery via claim_stage's CAS. `max_retries=None`
+    because Subsystem_Stage_State.AttemptCount's poison-terminal cap is the real ceiling.
     """
     with db_session() as sess:
         _process_all_supporting_systems(sess, session_id, get_llm(), self.request.id or guid())
@@ -208,23 +159,14 @@ def run_pipeline_task(self, session_id: str) -> None:
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
                     target_ids: list[str] | list[int] | None, epoch: int, user_note: str | None = None) -> None:
-    """ this is the background job that redoes one or more scenarios
-    of a session when the user clicks "regenerate."
-
-    Same `autoretry_for=(LLMSlotUnavailable,)` reasoning as run_pipeline_task above.
-
-    `target_ids` carries the full requested list across the Celery task boundary — plain
-    JSON-serializable list, no broker change needed (plan item 0). `epoch` is reserved once
-    by the API endpoint's session-level CAS (not minted here) — a Celery redelivery of this
-    exact task re-executes at the SAME epoch, so `claim_stage`'s CAS correctly no-ops once a
-    level is already terminal, instead of destructively re-running the whole hop under a
-    freshly-minted epoch."""
+    """Redoes one or more scenarios of a session. Same `autoretry_for` reasoning as
+    run_pipeline_task above. `epoch` is reserved once by the API endpoint's session-level CAS,
+    never minted here, so a redelivery re-executes at the SAME epoch and claim_stage's CAS no-ops
+    an already-terminal level instead of destructively re-running the hop."""
     with db_session() as sess:
         session = dal.load_session(sess, session_id)
         if session is None:
-            # session was deleted or never existed by the time this task ran — nothing to regenerate
-            return
-        # convert the DB row into a plain dict before handing it to the cascade layer
+            return  # deleted or never existed by the time this task ran
         cascade.run_regeneration(sess, dict(session), subsystem_id, RegenGranularity(granularity),
                                 target_ids, epoch, get_llm(), self.request.id or guid(), user_note=user_note)
 
@@ -232,54 +174,42 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
 @celery_app.task(bind=True, name="tsg.next_set",
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_epoch: int) -> None:
-    """Background job for "generate next set": add the next batch of unique, accumulating
-    scenarios for one subsystem. Same `autoretry_for=(LLMSlotUnavailable,)` and caller-reserved
-    `epoch` reasoning as regenerate_task above — a redelivery re-executes at the SAME SCENARIOS
-    epoch, so claim_stage's CAS no-ops a batch that already landed rather than double-generating.
-    `threats_epoch` is the additive-find_threats epoch, ALSO reserved once by the endpoint and held
-    fixed here, so a redelivery skips a second AI call once that stage is COMPLETE at it."""
+    """Adds the next batch of unique, accumulating scenarios for one subsystem. Same `autoretry_for`
+    and caller-reserved `epoch` reasoning as regenerate_task above. `threats_epoch` is the
+    additive-find_threats epoch, ALSO reserved once by the endpoint and held fixed here, so a
+    redelivery skips a second AI call once that stage is COMPLETE at it."""
     with db_session() as sess:
         session = dal.load_session(sess, session_id)
         if session is None:
-            # session was deleted or never existed by the time this task ran — nothing to do
-            return
+            return  # deleted or never existed by the time this task ran
         cascade.run_next_set(sess, dict(session), subsystem_id, epoch, threats_epoch,
                             get_llm(), self.request.id or guid())
 
 
 @celery_app.task(name="tsg.admin_embedding_action",
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
-def admin_embedding_action_task(action: str, group: str | None, names: list[str] | None) -> dict:
-    """Background counterpart to app/api/admin.py's four embedding-cache routes: the API only
-    validates the request shape and queues this via .delay(), then the caller polls
-    GET .../status/{job_id} against Celery's own AsyncResult (backed by the already-configured
-    result backend) for the eventual outcome — same dispatch-then-poll shape as
-    run_pipeline_task/regenerate_task above, and the same `autoretry_for=(LLMSlotUnavailable,)`
-    reasoning: a confirmed "no free LLM call slot" is temporary, so Celery retries this exact
-    job rather than the caller ever seeing a hard failure for a transient capacity squeeze.
+def admin_embedding_action_task(action: str, group: str | None, names: list[str] | None,
+                                strict: bool = True) -> dict:
+    """Background counterpart to app/api/admin.py's four embedding-cache routes; the caller polls
+    GET .../status/{job_id}. Same `autoretry_for` reasoning as the tasks above.
 
-    `create`/`update` are naturally idempotent on retry (they only embed what's missing).
-    `recreate` re-wipes+re-embeds every group in `group`'s scope from scratch on a retry, even
-    ones a partially-successful earlier attempt already finished — wasted work, not a
-    correctness bug, and the real threat library is "tens of entries" (embeddings.py), so this
-    is the same accepted, bounded cost as write_scenarios's own re-generation-on-retry note.
-    `# ponytail: accepted; revisit only if recreate is ever run against a much larger library.`
+    `create`/`update` are idempotent on retry (they only embed what's missing). `recreate`
+    re-wipes and re-embeds every group in scope from scratch, even ones an earlier partial
+    attempt finished — wasted work, not a correctness bug.
+    ponytail: accepted; revisit only if recreate is ever run against a much larger library.
     """
     if action == "delete":
-        # sess: delete's strict check resolves no-vector names against the ACTIVE master rows,
-        # so "already clean" repeats succeed idempotently while true typos still fail loudly.
+        # `strict` stays ON for the admin route (a typed name CAN be a typo) and is turned OFF by
+        # library_crud.py, whose names come from a row it just renamed or soft-deleted — no longer
+        # ACTIVE, so strict made every such edit report FAILURE for a delete with nothing to do.
         with db_session() as sess:
             return {"vectors_deleted": embeddings._for_each_group(
-                group, lambda g: embeddings.delete_group(sess, g, names))}
+                group, lambda g: embeddings.delete_group(sess, g, names, strict=strict))}
     llm = get_llm()
     with db_session() as sess:
         if action == "create":
-            # unlike its 3 siblings, create_items requires non-None group/names (it can't
-            # fan out over "every group" the way update/recreate/delete can) — the API layer
-            # (app/api/admin.py's create route) already enforces this before enqueueing, but
-            # this task is reachable outside that one HTTP route (Flower, tests, a future
-            # caller), so the guard belongs here too, not just at the one caller that happens
-            # to exist today.
+            # create_items can't fan out over "every group" like its siblings. The API route
+            # enforces this too, but the task is reachable outside it (Flower, tests).
             if not group or not names:
                 raise ValueError("create requires both group and names")
             return {"rows_processed": {group: embeddings.create_items(sess, llm, group, names)}}
@@ -293,32 +223,28 @@ def admin_embedding_action_task(action: str, group: str | None, names: list[str]
 
 @celery_app.task(name="tsg.reap")
 def reap_task() -> list[str]:
-    """ runs automatically on a schedule (see `reaper_interval_seconds`
-    in config) to find sessions whose worker crashed, and cleans them up so they
-    don't stay stuck forever.
-
-    Periodic stuck-job reaper; scheduled by `beat_schedule` above — run `celery beat` alongside the worker.
-    `clean_up_abandoned_sessions()` already logs the cancelled set (`reaper.cancelled`) for every caller, so there's no second log here."""
+    """Periodic stuck-job reaper; scheduled by `beat_schedule` above — run `celery beat` alongside
+    the worker. clean_up_abandoned_sessions() already logs the cancelled set."""
     with db_session() as sess:
         return clean_up_abandoned_sessions(sess)
 
 
 @celery_app.task(name="tsg.intel_refresh")
 def intel_refresh_task() -> dict[str, str]:
-    """ runs automatically on a schedule (see `intel_refresh_interval_seconds`
-    in config, gated by `intel_enabled`) to pull the open threat-intel feeds —
-    CISA KEV, CISA ICS advisories, OTX, URLhaus, configured TAXII servers — into
-    the Mongo `threat_intel` cache that scenario generation reads for enrichment.
+    """Scheduled pull of the open threat-intel feeds into the Mongo `threat_intel` cache that
+    scenario generation reads for enrichment. Gated by `intel_enabled`.
 
-    DISPATCHER, not a worker: it spawns one `tsg.intel_refresh_feed` job per enabled
-    feed and returns {feed: job_id}. Fanning out (rather than looping the feeds inside
-    one task, as this did originally) is what buys per-feed isolation — a slow or broken
-    feed can no longer delay the others, each retries on its own, and each records its
-    own outcome — which is exactly what the per-feed status API reports."""
+    DISPATCHER, not a worker: spawns one `tsg.intel_refresh_feed` job per enabled feed and returns
+    {feed: job_id}. Fanning out is what buys per-feed isolation — a slow or broken feed can't
+    delay the others, and each records its own outcome for the per-feed status API."""
     from app.intel.fetchers import enabled_feed_names  # local import, mirrors admin-task style
 
+    # This module has no module-level logger; a bare `log` raises NameError on every scheduled run
+    # AFTER the jobs are dispatched, so the feeds refresh but the dispatcher always ends FAILURE.
+    from app.core.logging import get_logger
+
     jobs = {feed: intel_refresh_feed_task.delay(feed).id for feed in enabled_feed_names()}
-    log.info("intel.refresh_dispatched", feeds=list(jobs))
+    get_logger(__name__).info("intel.refresh_dispatched", feeds=list(jobs))
     return jobs
 
 
@@ -329,15 +255,19 @@ def intel_refresh_task() -> dict[str, str]:
     retry_backoff_max=300,
     retry_jitter=True,           # spread retries so five feeds can't sync into a thundering herd
     max_retries=3,
+    # Bounded so ONE execution can never outlive the `visibility_timeout` (3600s) above. Unlike
+    # the pipeline tasks this has no CAS fence: a redelivered copy just re-fetches and re-upserts,
+    # so two (then three, hourly) copies of one slow feed run concurrently. Real risk because
+    # fetch_ics_advisories issues up to 200 SEQUENTIAL requests with only per-socket timeouts.
+    soft_time_limit=600,         # raises SoftTimeLimitExceeded — refresh_one records it per feed
+    time_limit=660,              # hard backstop if a fetch ignores the soft signal
 )
 def intel_refresh_feed_task(feed: str) -> int:
     """Refresh exactly ONE intel feed; returns the item count.
 
-    Deliberately allowed to RAISE (unlike most tasks here): the retry policy above is the
-    point — a transient network failure re-pulls this one feed instead of waiting a full
-    day or re-downloading every other feed with it. `refresh_one` records the failure to
-    the feed's status doc BEFORE re-raising, so the outcome survives even if every retry
-    is exhausted and the Celery result later expires."""
+    Deliberately allowed to RAISE (unlike most tasks here) — the retry policy above is the point.
+    `refresh_one` records the failure to the feed's status doc BEFORE re-raising, so the outcome
+    survives even if every retry is exhausted and the Celery result later expires."""
     from app.intel.fetchers import refresh_one
 
     return refresh_one(feed)
@@ -345,70 +275,55 @@ def intel_refresh_feed_task(feed: str) -> int:
 
 @celery_app.task(name="tsg.self_check")
 def self_check_task() -> list[str]:
-    """ runs automatically on a schedule (see `self_check_interval_seconds`
-    in config) to look for early warning signs of trouble — tempdb growth, a
-    connection pool getting full, the active-session count approaching its ceiling
-    — and log a warning for whichever ones it finds, so an operator's log-stack
-    alert rules can catch them before they become an actual outage.
-
-    Periodic operational self-check; scheduled by `beat_schedule` above — run `celery beat`
-    alongside the worker, same as the reaper. `run_self_checks()` already logs
-    (`selfcheck.*`) for every check that fires, so there's no second log here."""
+    """Periodic operational self-check (tempdb growth, pool saturation, active-session ceiling);
+    scheduled by `beat_schedule` above. run_self_checks() already logs every check that fires."""
     with db_session() as sess:
         return run_self_checks(sess)
 
 
 @celery_app.task(name="tsg.import_threat_library")
 def import_threat_library_task(source: str, file_content: str | None, via_taxii: bool,
-                            max_actors: int, dry_run: bool) -> dict:
-    """Background counterpart to app/api/threat_library_import.py — runs the same
-    run_import the CLI script drives, then (real runs only) dispatches the existing
-    embeddings-refresh task so the newly imported rows become matchable by grounding
-    without anyone remembering scripts/refresh_embeddings.py.
+                            max_actors: int, dry_run: bool, started_by: str | None = None) -> dict:
+    """Background counterpart to app/api/threat_library_import.py: runs the same run_import the
+    CLI script drives, then (real runs only) dispatches the embeddings refresh so newly imported
+    rows become matchable by grounding.
 
-    ORDERING IS LOAD-BEARING: the import commits inside its OWN db_session block FIRST;
-    the embeddings dispatch happens strictly AFTER that block exits (commit done), so the
-    embeddings task's fresh session is guaranteed to see the new rows — dispatching from
-    inside the block could read an uncommitted snapshot and silently miss them, which is
-    exactly the "forgot to refresh embeddings" gap this task exists to close. It is a
-    SEPARATE job (not an in-transaction call) so a late embeddings failure can never roll
-    back a fully-successful import; it also keeps its own LLMSlotUnavailable autoretry.
-    This task itself makes NO LLM calls, so it carries no autoretry_for — validation
-    failures land as a clean FAILURE state (ThreatLibraryImportError, never SystemExit),
-    and a crash-redelivery is safe end to end: every write path is a natural-key upsert
-    (upsert_threat_type/_catalogue/_actor/_rule).
+    ORDERING IS LOAD-BEARING: the import commits inside its OWN db_session block FIRST, and the
+    embeddings dispatch happens strictly after that block exits, or the embeddings task's fresh
+    session reads a snapshot without the new rows. It is a SEPARATE job so a late embeddings
+    failure can never roll back a successful import. This task makes no LLM calls, so it carries
+    no autoretry_for; a crash-redelivery is safe because every write path is a natural-key upsert.
 
-    # ponytail: file_content rides the Redis broker as a plain (size-capped) string —
-    # move to a shared blob store + a reference argument if much larger bundles are
-    # ever needed."""
+    ponytail: file_content rides the Redis broker as a plain (size-capped) string — move to a
+    shared blob store + a reference argument if much larger bundles are ever needed."""
     from app.api.admin_jobs import FAMILY_EMBEDDINGS, mark_admin_job  # local import, mirrors admin-task style
     from app.pipeline import threat_library_import
 
-    # current_task.request.id ties the history row to the job the status route polls;
-    # None when called directly (tests/CLI), which the column allows.
+    # ties the history row to the job the status route polls; None when called directly
     job_id = getattr(getattr(current_task, "request", None), "id", None)
-    run_id = threat_library_import.record_import_started(source, dry_run=dry_run, job_id=job_id)
+    # started_by lands in Threat_Library_Import_Run.StartedBy AND CreatedBy on every row this run
+    # creates; run_import falls back to 'auto:<tag>' when there is no caller.
+    run_id = threat_library_import.record_import_started(source, dry_run=dry_run, job_id=job_id,
+                                                        started_by=started_by)
     try:
         with db_session() as sess:
             stats = threat_library_import.run_import(
                 sess, source, file_content=file_content, via_taxii=via_taxii,
-                max_actors=max_actors, dry_run=dry_run)
+                max_actors=max_actors, dry_run=dry_run, started_by=started_by)
     except Exception as exc:  # noqa: BLE001 — record the failure, then let Celery mark FAILURE
-        # Own transaction, outside the rolled-back import session: a failed import that left
-        # no trace is exactly the case an operator most needs to see.
+        # Own transaction, outside the rolled-back import session: a failed import that left no
+        # trace is the case an operator most needs to see.
         threat_library_import.record_import_finished(run_id, error=f"{type(exc).__name__}: {exc}")
         raise
     threat_library_import.record_import_finished(run_id, stats=stats)
-    # Strictly after the with-block: the import's transaction has committed.
     if not dry_run and source != "misp_actors":
-        # The import is ALREADY COMMITTED at this point, so a failure dispatching the follow-up
-        # embeddings refresh must not mark the whole job FAILURE — that would report a fully
-        # applied import as failed (and invite a redundant re-run) over a transient broker blip.
-        # Degrade instead: report the import truthfully and say the refresh needs running.
+        # The import is ALREADY COMMITTED here, so a failed dispatch must not mark the job
+        # FAILURE — that reports an applied import as failed and invites a redundant re-run over
+        # a transient broker blip. Degrade instead: say the refresh still needs running.
         try:
             embed_job = admin_embedding_action_task.delay("update", None, None)
-            # Without the marker the returned id would 404 on /embeddings/status —
-            # the marker is that route's authorization check (admin_jobs.py).
+            # Without the marker the returned id 404s on /embeddings/status — the marker is that
+            # route's authorization check.
             mark_admin_job(embed_job.id, FAMILY_EMBEDDINGS)
             stats["embeddings_job_id"] = embed_job.id
         except Exception:  # noqa: BLE001 — the committed import is the job's real outcome

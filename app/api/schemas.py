@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import JsonDict
 
 from app.db.dal import canonical_guid
 
@@ -162,59 +163,57 @@ class RegenerateScenariosBody(BaseModel):
     _canonicalize_output_ids = field_validator("output_ids")(_canonical_output_ids)
 
 
-class SupportingSystemBoard(BaseModel):
-    """One supporting system's row on the session status board: its per-stage statuses plus an overall status."""
+class SessionProgress(BaseModel):
+    """The session's asset-level progress: per-stage statuses plus a derived overall status. One
+    flat object, not a list — the pipeline tracks the asset as a single unit of work (see
+    sessions.py::build_board), so there is never more than one of these per session."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "id": 101,
-                "name": "SCADA Historian",
-                "stages": {"THREAT_IDENTIFICATION": "COMPLETE", "SCENARIO_GENERATION": "AWAITING_DECISION"},
-                "overall": "awaiting_review",
+                "threats": "COMPLETE", "scenarios": "AWAITING_DECISION",
+                "overall": "awaiting_review", "error_message": None,
             }
         }
     )
 
-    id: int = Field(description="Supporting system's primary key.")
-    name: str | None = Field(description="Supporting system's display name.")
-    stages: dict[str, str] = Field(
-        description="Per-stage status for this system, keyed by stage name (e.g. THREAT_IDENTIFICATION, SCENARIO_GENERATION)."
-    )
+    threats: str = Field(description="THREATS stage status: IDLE, RUNNING, AWAITING_DECISION, COMPLETE, ERROR, or CANCELLED.")
+    scenarios: str = Field(description="SCENARIOS stage status: IDLE, RUNNING, AWAITING_DECISION, COMPLETE, ERROR, or CANCELLED.")
     overall: str = Field(description="Computed overall status: pending, in_progress, awaiting_review, complete, error, or cancelled.")
     error_message: str | None = Field(
         default=None,
         description=(
-            "Client-safe failure reason for this unit's most recent stage error, if any. "
-            "Non-null on an awaiting_review board entry means the run failed mid-batch after "
-            "generating some scenarios — the review set may be PARTIAL, not a complete run."
+            "Client-safe failure reason for the most recent stage error, if any. Non-null "
+            "on an awaiting_review board means the run failed mid-batch after generating "
+            "some scenarios — the review set may be PARTIAL, not a complete run."
         ),
     )
 
 
 class SessionBoard(BaseModel):
-    """Full status board for a session: session-level info plus one row per supporting system."""
+    """Full status board for a session: session-level info plus the asset's progress."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
                 "entity_id": "ENT-001",
+                "asset_id": 12345, "asset_name": "SCADA Historian",
+                "user_id": "qa-user",
                 "session_status": "active",
                 "current_stage": "SCENARIO_GENERATION",
                 "stage_status": "AWAITING_DECISION",
-                "supporting_systems": [
-                    {
-                        "id": 101,
-                        "name": "SCADA Historian",
-                        "stages": {"THREAT_IDENTIFICATION": "COMPLETE", "SCENARIO_GENERATION": "AWAITING_DECISION"},
-                        "overall": "awaiting_review",
-                    }
-                ],
+                "progress": {
+                    "threats": "COMPLETE", "scenarios": "AWAITING_DECISION",
+                    "overall": "awaiting_review", "error_message": None,
+                },
             }
         }
     )
 
     session_id: str = Field(description="Session's unique id (GUID).")
     entity_id: str = Field(description="Tenant/business-unit code the session belongs to.")
+    asset_id: int = Field(description="Primary key of the asset this session belongs to.")
+    asset_name: str = Field(description="Display name of the asset this session belongs to.")
+    user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     session_status: str = Field(description="Lifecycle status: active, completed, or cancelled.")
     current_stage: str = Field(
         description="Current workflow stage: THREAT_IDENTIFICATION, SCENARIO_GENERATION, REVIEW, APPROVED, or CANCELLED."
@@ -222,23 +221,28 @@ class SessionBoard(BaseModel):
     stage_status: str = Field(
         description="Status of the current stage: IDLE, RUNNING, AWAITING_DECISION, COMPLETE, ERROR, or CANCELLED."
     )
-    supporting_systems: list[SupportingSystemBoard] = Field(description="One status row per supporting system in this session.")
+    progress: SessionProgress = Field(description="The session's asset-level progress.")
 
 
 class CreateSessionResponse(BaseModel):
     """Response returned after a new session is created."""
-    model_config = ConfigDict(json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6"}})
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user"}}
+    )
 
     session_id: str = Field(description="Id of the newly created session. Use it to poll status, fetch results, or stream events.")
+    user_id: str | None = Field(
+        description="The session's owning user (the authenticated caller who created it). "
+                    "Null only if the principal had no identity to record."
+    )
 
 
 class ThreatResult(BaseModel):
-    """One threat identified for a supporting system, as returned to the client."""
+    """One threat identified for the session's asset, as returned to the client."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "threat_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
-                "supporting_system_id": 101,
                 "threat_type": "Spoofing",
                 "threat_name": "Unauthorized RTU firmware update",
                 "grounding_status": "grounded",
@@ -247,8 +251,7 @@ class ThreatResult(BaseModel):
         }
     )
 
-    threat_id: str = Field(description="Identified threat's unique id (GUID).")
-    supporting_system_id: int = Field(description="Supporting system this threat applies to.")
+    threat_id: str = Field(description="Identified threat's unique id (GUID). Matches the threat_id on the scenario(s) generated from it.")
     threat_type: str = Field(description="STRIDE threat category, e.g. Spoofing, Tampering, Denial of Service.")
     threat_name: str | None = Field(description="Human-readable threat name.")
     grounding_status: str = Field(
@@ -262,26 +265,63 @@ class ThreatResult(BaseModel):
     )
 
 
+#: One `scenario.controls` entry, for the OpenAPI examples below.
+_MAPPED_CONTROL_EXAMPLE: JsonDict = {
+    "control_library_id": 201,
+    "control_code": "CII-CID-201",
+    "domain": "Identification & Authentication",
+    "control_name": "Multi-Factor Authentication",
+    "rank": 1,
+    "score": 93.0,
+    "suggested_control": "Multi-factor authentication for privileged accounts",
+    "suggested_why": "Mitigates the risk of credential theft being used to reach the asset.",
+    "standards": ["NIST SP 800-53 Rev. 5", "ISO 27001:2022"],
+}
+
+#: The scenario narrative exactly as the pipeline produces it (prompts.py::scenario_prompt): these
+#: are the LLM's own keys, passed through verbatim by sessions.py::_safe_scenario_json, with
+#: `controls` swapped for the grounded library matches. ONE constant shared by every example that
+#: shows a scenario — the four hand-copied literals this replaces had all drifted to a
+#: `title`/`narrative` shape the API has never actually returned.
+_SCENARIO_EXAMPLE: JsonDict = {
+    "scenario_title": "Remote Terminal Unit (RTU) — Unauthorized firmware push",
+    "scenario_statement": (
+        "An attacker with OT network access pushes unsigned firmware to the RTU, "
+        "compromising the integrity of its control logic."
+    ),
+    "risk_statement": (
+        "The RTU provides the Substation Control critical service; corrupted firmware "
+        "could cause a sustained outage."
+    ),
+    "controls": [_MAPPED_CONTROL_EXAMPLE],
+    # Two suggestions, only the first of which grounded — the second has no counterpart in
+    # `controls` above, which is exactly the library-gap signal this field exists to show.
+    "suggested_controls": [
+        {"name": "Multi-factor authentication for privileged accounts",
+         "why": "Mitigates the risk of credential theft being used to reach the asset."},
+        {"name": "Vendor firmware attestation at the RTU boot loader",
+         "why": "Blocks unsigned images from ever loading on the device."},
+    ],
+    # unmatched_suggestions precomputes exactly this diff: the one suggestion above with no
+    # counterpart in `controls`.
+    "unmatched_suggestions": [
+        {"name": "Vendor firmware attestation at the RTU boot loader",
+         "why": "Blocks unsigned images from ever loading on the device."},
+    ],
+}
+
+
 class MappedControl(BaseModel):
     """One Control_Library row mapped to a scenario by Step-4 control mapping
     (control_mapping.map_controls): the LLM suggested a mitigating control in free text and grounding
-    matched it to this real library control. Ordered by rank (1 = best). An empty `controls`
-    list on a scenario means nothing in the library matched well enough — a library-gap
-    signal, not an error."""
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "control_library_id": 201,
-                "control_code": "CII-CID-201",
-                "domain": "Identification & Authentication",
-                "control_name": "Multi-Factor Authentication",
-                "rank": 1,
-                "score": 93.0,
-                "suggested_control": "Multi-factor authentication for privileged accounts",
-                "standards": ["NIST SP 800-53 Rev. 5", "ISO 27001:2022"],
-            }
-        }
-    )
+    matched it to this real library control. Ordered by rank (1 = best).
+
+    Delivered nested, as `scenario.controls` — it REPLACES the LLM's raw `{name, why}` suggestions
+    there (sessions.py::_scenario_with_controls), so a scenario carries one control list, not two.
+    Each entry keeps the suggestion it grounded from in `suggested_control`/`suggested_why`.
+    An empty `scenario.controls` means nothing in the library matched well enough — a library-gap
+    signal, not an error, but only once `controls_mapped` is true (see ScenarioResult)."""
+    model_config = ConfigDict(json_schema_extra={"example": _MAPPED_CONTROL_EXAMPLE})
 
     control_library_id: int = Field(description="Control_Library primary key.")
     control_code: str = Field(description="Stable control code, e.g. 'CII-CID-201'.")
@@ -291,37 +331,108 @@ class MappedControl(BaseModel):
     score: float | None = Field(description="Raw rerank confidence 0-100 at mapping time.")
     suggested_control: str | None = Field(
         description="The LLM's original free-text suggestion this control grounded from; null when the mapping fell back to the scenario text.")
+    # The map row stores only the suggestion's NAME (control_mapping.collect_control_queries keeps
+    # `name[:500]`), so the LLM's rationale is recovered at read time from the scenario's own raw
+    # suggestions — which is why it also works for sessions mapped before this field existed.
+    # Defaults to None so _query_controls can keep building MappedControl straight from DB rows.
+    suggested_why: str | None = Field(
+        default=None,
+        description="The LLM's one-line rationale for the suggestion this control grounded from; null when the mapping fell back to the scenario text.")
     standards: list[str] = Field(default_factory=list, description="Referred standard names for this control.")
 
 
-class ScenarioResult(BaseModel):
-    """One generated scenario for a supporting system, plus whether it has been accepted."""
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "output_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-                "supporting_system_id": 101,
-                "scenario": {
-                    "title": "Unauthorized Firmware Push",
-                    "narrative": "An attacker with network access pushes unsigned firmware to the RTU, disrupting control.",
-                    "risk_statement": "Could cause a sustained outage of the historian service.",
-                },
-                "accepted": False,
-                "moderation_flagged": False,
-                "moderation_categories": [],
-                "validation_status": "ok",
-                "validation_errors": [],
-                "generation_epoch": 1,
-            }
-        }
+class SuggestedControl(BaseModel):
+    """One raw control suggestion exactly as the LLM wrote it (prompt v1.3), before grounding.
+
+    Reported ALONGSIDE the grounded `controls` rather than replaced by them, for two reasons. A
+    suggestion that matched no library control appears only here — that difference IS the
+    library-gap signal, and it was previously invisible. And between a scenario being written and
+    Step-4 running (a tail step of the same stage, so minutes later), this is the only control
+    content that exists at all; blanking it made a normal in-progress read look like the model
+    had proposed nothing."""
+    name: str = Field(description="The control the LLM named, in its own words.")
+    why: str | None = Field(default=None, description="The LLM's one-line rationale for it.")
+
+
+class ScenarioNarrative(BaseModel):
+    """The LLM's scenario JSON passed through verbatim, with `controls` replaced by the Step-4
+    grounded library matches (sessions.py::_scenario_with_controls).
+
+    `extra="allow"` is the point: scenario_title/scenario_statement/risk_statement — and anything
+    else a future prompt adds — ride through unvalidated and unmodified, exactly as the bare dict
+    this replaced did. Deliberately so: these are model-authored strings, and validating text the
+    code doesn't control just converts an odd LLM response into a 500. ONLY `controls` is declared,
+    which is what keeps MappedControl in the OpenAPI components so its fields are generated rather
+    than hand-copied into a prose description (a hand-copied one is exactly how the smoke guides
+    ended up documenting `title`/`narrative`, keys the API has never returned)."""
+    model_config = ConfigDict(extra="allow", json_schema_extra={"example": _SCENARIO_EXAMPLE})
+
+    controls: list[MappedControl] = Field(
+        default_factory=list,
+        description=(
+            "Step-4 mitigating controls mapped from the control library, best first. Empty means "
+            "nothing matched well enough — but only once `controls_mapped` is true; see there."
+        ),
+    )
+    suggested_controls: list[SuggestedControl] = Field(
+        default_factory=list,
+        description=(
+            "The LLM's own control suggestions, present from the moment the scenario is written "
+            "and independent of mapping state. Compare against `controls`: a suggestion here with "
+            "no entry there naming it in `suggested_control` found no good library counterpart — "
+            "a gap in the control library. Empty for pre-v1.3 scenarios, which produced none."
+        ),
+    )
+    unmatched_suggestions: list[SuggestedControl] | None = Field(
+        default=None,
+        description=(
+            "The subset of suggested_controls with no counterpart in controls — the library-gap "
+            "signal precomputed for you, instead of diffing the two lists yourself. Null (not an "
+            "empty list) when control mapping hasn't been attempted yet — see controls_mapped on "
+            "the enclosing result; suggested_controls itself is still populated either way."
+        ),
     )
 
+
+#: Shared by ScenarioResult and by the SessionResults example that embeds one.
+_SCENARIO_RESULT_EXAMPLE: JsonDict = {
+    "output_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "threat_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
+    "scenario": _SCENARIO_EXAMPLE,
+    "accepted": False,
+    "moderation_checked": False,
+    "moderation_flagged": None,
+    "moderation_categories": [],
+    "validation_status": "ok",
+    "validation_errors": [],
+    "generation_epoch": 1,
+    "scenario_number": 1,
+    "controls_mapped": True,
+    "replaced_scenarios": [],
+}
+
+
+class ScenarioResult(BaseModel):
+    """One generated scenario for the session's asset, plus whether it has been accepted."""
+    model_config = ConfigDict(json_schema_extra={"example": _SCENARIO_RESULT_EXAMPLE})
+
     output_id: str = Field(description="Generated scenario's unique id (GUID). Used to accept/regenerate this scenario.")
-    supporting_system_id: int = Field(description="Supporting system this scenario applies to.")
-    scenario: dict[str, Any] | None = Field(
-        description="Generated scenario narrative (title, description, risk statement). Null if generation failed."
+    threat_id: str | None = Field(
+        description="Id of the threat this scenario was generated from. Matches a threat_id in the "
+                    "session's threats list. Null only if the underlying threat/scoping link is "
+                    "missing (this schema has no enforced foreign keys) — the scenario itself is "
+                    "still shown, never dropped, so it remains visible for review and accept."
+    )
+    scenario: ScenarioNarrative | None = Field(
+        description=(
+            "Generated scenario narrative — scenario_title, scenario_statement, risk_statement, "
+            "plus the Step-4 `controls` mapped from the control library. Null if generation failed."
+        )
     )
     accepted: bool = Field(description="Whether a human reviewer has accepted this scenario.")
+    moderation_checked: bool = Field(
+        description="Whether content moderation actually ran for this scenario. False means moderation_flagged is meaningless (never checked, not checked-and-clean) — off by default, or the moderation service was unavailable.",
+    )
     # [REVIEW-FIX] previously ValidationJSON (where llm.moderate's result lands, via
     # tasks.py::_moderation_report) was never selected here at all — a flagged scenario was
     # written to the DB but invisible to any human reviewer through this API. None means
@@ -329,7 +440,7 @@ class ScenarioResult(BaseModel):
     # unavailable) — distinct from checked-and-clean (False).
     moderation_flagged: bool | None = Field(
         default=None,
-        description="true if flagged by content moderation, false if checked and clean, null if moderation was never run.",
+        description="true if flagged by content moderation, false if checked and clean, null if moderation was never run (see moderation_checked).",
     )
     moderation_categories: list[str] = Field(
         default=[], description="Moderation categories that were flagged, e.g. violence. Empty unless moderation_flagged is true."
@@ -356,9 +467,51 @@ class ScenarioResult(BaseModel):
             "clients use this to spot fresh scenarios without diffing output ids."
         ),
     )
-    controls: list[MappedControl] = Field(
-        default_factory=list,
-        description="Step-4 mapped mitigating controls from the control library, best first. Empty = no library control matched well enough.",
+    scenario_number: int = Field(
+        default=1,
+        description=(
+            "Which of its threat's coexisting scenarios this is: 1 = the original, 2+ = alternate "
+            "takes added by 'generate next set' when no brand-new threat could be found (capped by "
+            "the max_scenarios_per_threat setting, default 2). Group cards by threat_id and label "
+            "them with this number ('Scenario 1 of 2'); without it, two scenarios of one threat "
+            "look like unrelated entries."
+        ),
+    )
+    # Step-4 mapping is a TAIL step of scenario generation (tasks.py::write_scenarios runs it once,
+    # after every scenario in the batch is written), but scenario rows land incrementally — so a
+    # caller polling /results mid-stage sees scenarios whose controls simply aren't computed yet.
+    # Without this flag that state is indistinguishable from "mapped, nothing matched", and the
+    # smoke guide's "an empty controls list is normal" then reads as reassurance in BOTH cases.
+    # Mirrors Threat_Scenario_Output.ControlsMappedAt, so false ALSO covers the unseeded-library
+    # case: control_mapping bails at `controls.no_candidates` without stamping, deliberately, so
+    # those outputs are picked up by a later run once Seed_to_Control_library.sql has been applied.
+    controls_mapped: bool = Field(
+        description=(
+            "Whether Step-4 control mapping has been attempted for this scenario. true with an "
+            "empty `scenario.controls` = mapping ran and nothing in the library matched, a genuine "
+            "library-gap signal. false = not attempted, for one of two reasons: SCENARIO_GENERATION "
+            "is still running (mapping is its tail step, so controls appear once the session's "
+            "status reaches REVIEW), or the control library was empty/unreachable when the stage "
+            "ran — check the worker log for `controls.no_candidates` and confirm the control "
+            "library is seeded."
+        ),
+    )
+    # Declared LAST on purpose: Pydantic serializes in declaration order, and a nested array of
+    # whole scenarios ahead of the scalars would bury generation_epoch/scenario_number/
+    # controls_mapped under it. Self-referential — the only recursive model in this schema —
+    # which resolves as a forward ref because of `from __future__ import annotations` above.
+    replaced_scenarios: list[ScenarioResult] = Field(
+        default=[],
+        description=(
+            "The older versions this scenario replaced, NEWEST FIRST: [0] is the version it "
+            "directly replaced, then that one's predecessor, back to the first generation. "
+            "Returned ONLY when the request passes ?include_replaced=true; otherwise always "
+            "empty, so the default response is unchanged. Each entry carries its full scenario "
+            "text and the controls it had mapped, so a reviewer can compare against the version "
+            "that superseded it. The list is FLAT — the whole history is here and these entries' "
+            "own `replaced_scenarios` are always empty, so never recurse. len() is how many "
+            "times this scenario has been regenerated: 2 entries means it is version 3."
+        ),
     )
 
 
@@ -369,50 +522,44 @@ class SessionResults(BaseModel):
             "example": {
                 "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
                 "entity_id": "ENT-001",
+                "asset_id": 12345,
+                "asset_name": "SCADA Historian",
+                "user_id": "qa-user",
                 "threats": [
                     {
                         "threat_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
-                        "supporting_system_id": 101,
                         "threat_type": "Spoofing",
                         "threat_name": "Unauthorized RTU firmware update",
                         "grounding_status": "grounded",
                         "threat_catalogue_id": 42,
                     }
                 ],
-                "scenarios": [
-                    {
-                        "output_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-                        "supporting_system_id": 101,
-                        "scenario": {
-                            "title": "Unauthorized Firmware Push",
-                            "narrative": "An attacker with network access pushes unsigned firmware to the RTU, disrupting control.",
-                            "risk_statement": "Could cause a sustained outage of the historian service.",
-                        },
-                        "accepted": False,
-                        "moderation_flagged": False,
-                        "moderation_categories": [],
-                        "validation_status": "ok",
-                        "validation_errors": [],
-                        "generation_epoch": 1,
-                    }
-                ],
+                "scenarios": [_SCENARIO_RESULT_EXAMPLE],
             }
         }
     )
 
     session_id: str = Field(description="Session's unique id (GUID).")
     entity_id: str = Field(description="Tenant/business-unit code the session belongs to.")
+    asset_id: int = Field(description="Primary key of the asset this session belongs to.")
+    asset_name: str = Field(description="Display name of the asset this session belongs to.")
+    user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     threats: list[ThreatResult] = Field(description="All threats identified so far for this session.")
-    scenarios: list[ScenarioResult] = Field(description="All scenarios generated so far for this session.")
+    scenarios: list[ScenarioResult] = Field(
+        description="All scenarios generated so far for this session. Versions that regeneration "
+                    "replaced are nested inside the scenario that replaced them, in its "
+                    "`replaced_scenarios`, and only when ?include_replaced=true."
+    )
 
 
 class AcceptResponse(BaseModel):
     """Response confirming an accept request was processed."""
     model_config = ConfigDict(
-        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "status": "completed", "accepted_count": 3}}
+        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "status": "completed", "accepted_count": 3}}
     )
 
     session_id: str = Field(description="Session's unique id (GUID).")
+    user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     status: str = Field(description="Result of the accept request. Always 'completed' on success.")
     accepted_count: int = Field(description="Number of scenarios actually marked accepted by this request (0 for mode='none').")
 
@@ -420,10 +567,11 @@ class AcceptResponse(BaseModel):
 class RegenerateResponse(BaseModel):
     """Response confirming a regenerate request was processed."""
     model_config = ConfigDict(
-        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "status": "regenerating"}}
+        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "status": "regenerating"}}
     )
 
     session_id: str = Field(description="Session's unique id (GUID).")
+    user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     status: str = Field(
         description="Result of the request: 'regenerating' for a scenario regenerate request, 'generating' for a next-set request."
     )
@@ -432,32 +580,29 @@ class RegenerateResponse(BaseModel):
 class CancelResponse(BaseModel):
     """Response confirming a session was cancelled."""
     model_config = ConfigDict(
-        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "status": "cancelled"}}
+        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "status": "cancelled"}}
     )
 
     session_id: str = Field(description="Session's unique id (GUID).")
+    user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     status: str = Field(description="Always 'cancelled' on success.")
+
+
+#: Shared by AcceptedScenario and by the AcceptedScenariosResponse example that embeds one.
+_ACCEPTED_SCENARIO_EXAMPLE: JsonDict = {
+    "output_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "supporting_system_id": 101,
+    "threat_type_id": 3,
+    "threat_catalogue_id": 42,
+    "threat_type": "Spoofing",
+    "threat_name": "Unauthorized RTU firmware update",
+    "scenario": _SCENARIO_EXAMPLE,
+}
 
 
 class AcceptedScenario(BaseModel):
     """One accepted scenario row — joinable on ids."""
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "output_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-                "supporting_system_id": 101,
-                "threat_type_id": 3,
-                "threat_catalogue_id": 42,
-                "threat_type": "Spoofing",
-                "threat_name": "Unauthorized RTU firmware update",
-                "scenario": {
-                    "title": "Unauthorized Firmware Push",
-                    "narrative": "An attacker with network access pushes unsigned firmware to the RTU, disrupting control.",
-                    "risk_statement": "Could cause a sustained outage of the historian service.",
-                },
-            }
-        }
-    )
+    model_config = ConfigDict(json_schema_extra={"example": _ACCEPTED_SCENARIO_EXAMPLE})
 
     output_id: str = Field(description="Accepted scenario's unique id (GUID).")
     supporting_system_id: int = Field(description="Supporting system this scenario applies to.")
@@ -469,48 +614,78 @@ class AcceptedScenario(BaseModel):
     )
     threat_type: str | None = Field(description="STRIDE threat category the scenario was generated from.")
     threat_name: str | None = Field(description="Human-readable name of the threat the scenario was generated from.")
-    scenario: dict | None = Field(description="Accepted scenario narrative (title, description, risk statement).")
-    controls: list[MappedControl] = Field(
-        default_factory=list,
-        description="Step-4 mapped mitigating controls from the control library, best first. Empty = no library control matched well enough.",
+    scenario: ScenarioNarrative | None = Field(
+        description=(
+            "Accepted scenario narrative — scenario_title, scenario_statement, risk_statement, plus "
+            "the Step-4 `controls` mapped from the control library. Identical shape to "
+            "ScenarioResult.scenario."
+        )
     )
 
 
 class AcceptedScenariosResponse(BaseModel):
-    """All scenarios ever accepted for an asset, across sessions, plus the latest completed session (if any)."""
+    """The accepted, non-superseded scenarios for one session, identified solely by the
+    session_id in the URL path. asset_id and entity_id are read off that session (not
+    separate inputs) and returned here so a caller with only a session_id can still learn
+    which asset/entity it belongs to."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "asset_id": 12345,
                 "entity_id": "ENT-001",
+                "user_id": "qa-user",
                 "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
                 "completed_at": "2026-07-20T14:32:11.123Z",
-                "scenarios": [
-                    {
-                        "output_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-                        "supporting_system_id": 101,
-                        "threat_type_id": 3,
-                        "threat_catalogue_id": 42,
-                        "threat_type": "Spoofing",
-                        "threat_name": "Unauthorized RTU firmware update",
-                        "scenario": {
-                            "title": "Unauthorized Firmware Push",
-                            "narrative": "An attacker with network access pushes unsigned firmware to the RTU, disrupting control.",
-                            "risk_statement": "Could cause a sustained outage of the historian service.",
-                        },
-                    }
-                ],
+                "scenarios": [_ACCEPTED_SCENARIO_EXAMPLE],
             }
         }
     )
 
-    asset_id: int = Field(description="Primary key of the asset these scenarios belong to.")
-    entity_id: str = Field(description="Tenant/business-unit code the asset belongs to.")
-    session_id: str | None = Field(
-        description="Latest completed session's id, or null if the asset has no completed session yet (scenarios == [])."
+    asset_id: int = Field(description="Primary key of the asset this session belongs to.")
+    entity_id: str = Field(description="Tenant/business-unit code this session belongs to.")
+    user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
+    session_id: str = Field(description="The session id from the URL path (echoed back).")
+    completed_at: datetime | None = Field(
+        description="UTC timestamp the session was completed. Null if the session hasn't completed yet "
+                    "(scenarios == [] in that case, since acceptance only happens at completion)."
     )
-    completed_at: datetime | None = Field(description="UTC timestamp the latest session was completed. Null if none.")
-    scenarios: list[AcceptedScenario] = Field(description="All scenarios ever accepted for this asset, across sessions.")
+    scenarios: list[AcceptedScenario] = Field(description="Accepted, non-superseded scenarios for this session.")
+
+
+#: ScenarioListItem's example — the shared AcceptedScenario example plus the cross-session
+#: context fields (built by spreading, never hand-copied — see the comment on _SCENARIO_EXAMPLE).
+_SCENARIO_LIST_ITEM_EXAMPLE: JsonDict = {
+    **_ACCEPTED_SCENARIO_EXAMPLE,
+    "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "entity_id": "ENT-001",
+    "user_id": "qa-user",
+    "session_status": "completed",
+    "scenario_number": 1,
+    "accepted": True,
+    "superseded": False,
+    "created_at": "2026-07-20T14:32:11.123Z",
+}
+
+
+class ScenarioListItem(AcceptedScenario):
+    """One scenario row with its session context — the cross-session reads
+    (GET /v1/users/{user_id}/scenarios, GET /v1/entities/{entity_id}/scenarios,
+    GET /v1/sessions/{session_id}/scenarios/{output_id}) all return this shape."""
+    model_config = ConfigDict(json_schema_extra={"example": _SCENARIO_LIST_ITEM_EXAMPLE})
+
+    session_id: str = Field(description="Owning session's unique id (GUID).")
+    entity_id: str = Field(description="Tenant/business-unit code the owning session belongs to.")
+    user_id: str | None = Field(
+        description="The session's owning user (who created it). Null only if the principal had no identity to record."
+    )
+    session_status: str = Field(description="Owning session's status: active | completed | cancelled.")
+    scenario_number: int = Field(description="1 = original scenario, 2+ = coexisting 'next set' alternates.")
+    accepted: bool = Field(description="True once the user accepted this scenario.")
+    superseded: bool = Field(
+        description="True if a regeneration replaced this row. Only reachable in lists with "
+                    "include_superseded=true, or on a direct fetch by output_id."
+    )
+    created_at: datetime | None = Field(description="UTC timestamp the scenario row was created.")
 
 
 class EmbeddingActionBody(BaseModel):
@@ -549,10 +724,16 @@ class EmbeddingActionResponse(BaseModel):
 
 
 class ThreatLibraryImportBody(BaseModel):
-    """Request for POST /v1/tsg/threat-library/import — trigger one threat-library
-    import (the same job scripts/import_threat_libraries.py runs). Plain JSON body,
-    deliberately not multipart: the uploaded "file" is itself JSON text, so
-    `file_content` carries it with no extra upload machinery."""
+    """Request for POST /v1/tsg/threat-library/sources/{source}/import — trigger one
+    threat-library import (the same job scripts/import_threat_libraries.py runs). Plain
+    JSON body, deliberately not multipart: the uploaded "file" is itself JSON text, so
+    `file_content` carries it with no extra upload machinery.
+
+    EVERY field below is optional, and `{}` is a valid body — it means "really import the
+    source named in the path, downloading it from upstream". Two fields apply to SOME
+    SOURCES ONLY: `via_taxii` to attack/attack_ics, `max_actors` to misp_actors. Those
+    rules are enforced BEFORE dispatch, so a wrong combination returns 422 and never
+    reaches the queue."""
     model_config = ConfigDict(
         json_schema_extra={"example": {"dry_run": True}}
     )
@@ -568,8 +749,10 @@ class ThreatLibraryImportBody(BaseModel):
     max_actors: int = Field(default=40, ge=1, description=(
         "misp_actors only: cap on imported actors (they feed the threats-prompt hint)."))
     file_content: str | None = Field(default=None, description=(
-        "The library file's JSON text, supplied directly instead of downloading. "
-        "Size-capped by settings.threat_library_import_max_upload_mb."))
+        "ANY SOURCE. The library file's JSON text, supplied directly instead of downloading. "
+        "Size-capped by settings.threat_library_import_max_upload_mb (422 if over). Must be "
+        "valid JSON of the shape this source's adapter expects (422 otherwise). Mutually "
+        "exclusive with via_taxii."))
 
 
 class SourceInventoryItem(BaseModel):
@@ -585,7 +768,8 @@ class SourceInventoryItem(BaseModel):
                 "last_run": {"status": "success", "dry_run": False,
                              "started_at": "2026-07-27T09:14:00Z",
                              "finished_at": "2026-07-27T09:16:12Z", "error": None,
-                             "types_imported": 12, "threats_imported": 95, "actors_upserted": None},
+                             "types_imported": 12, "threats_imported": 95, "actors_upserted": None,
+                             "started_by": "qa-tester"},
             }
         }
     )
@@ -595,8 +779,25 @@ class SourceInventoryItem(BaseModel):
     loaded: bool = Field(description="True when this source has contributed rows to the library.")
     type_count: int = Field(description="Threat_Type (family) rows attributed to this source.")
     threat_count: int = Field(description="Threat_Catalogue (exact threat) rows attributed to this source.")
-    actor_count: int | None = Field(default=None, description="Threat_Actor rows — misp_actors only; null for every other source.")
-    last_run: dict[str, Any] | None = Field(default=None, description="Most recent import attempt for this source, or null if never attempted.")
+    actor_count: int | None = Field(
+        default=None,
+        description=(
+            "Threat_Actor rows stamped with this source — misp_actors only; null for every other "
+            "source. Counts only actors whose Source matches: rows created before Threat_Actor "
+            "gained that column (seeded actors, anything promoted on accept) have Source=NULL and "
+            "are excluded. Until 2026-07-27 this was an unfiltered count of the whole table, so it "
+            "over-reported."
+        ),
+    )
+    last_run: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Most recent import attempt for this source, or null if never attempted. Keys: status, "
+            "dry_run, started_at, finished_at, error, types_imported, threats_imported, "
+            "actors_upserted, started_by (the user who triggered it — null for CLI-driven runs and "
+            "for any run recorded before the API forwarded its caller to the worker)."
+        ),
+    )
 
 
 class SourcesInventoryResponse(BaseModel):
@@ -651,10 +852,12 @@ class IntelRefreshAccepted(BaseModel):
 
 class ThreatLibraryImportAccepted(BaseModel):
     """Returned immediately (202) when an import is queued — poll
-    GET .../import/status/{job_id} for the eventual outcome."""
+    GET /v1/tsg/threat-library/imports/{job_id} for the eventual outcome."""
     model_config = ConfigDict(json_schema_extra={"example": {"job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}})
 
-    job_id: str = Field(description="Celery task id for the queued import. Poll GET status/{job_id}.")
+    job_id: str = Field(description=(
+        "Celery task id for the queued import. Poll GET /v1/tsg/threat-library/imports/{job_id} — "
+        "NOT the embeddings status route, which is a different job family and 404s on this id."))
 
 
 class ImportJobStatus(BaseModel):
@@ -670,10 +873,10 @@ class ImportJobStatus(BaseModel):
             "example": {
                 "state": "SUCCESS",
                 "result": {"source": "attack_ics", "dry_run": False, "types": 11, "threats": 83,
-                           "new_category_links": 96, "before_count": 0, "after_count": 83,
-                           "ot_rules": [{"threat_type_id": 87, "threat_type_name": "ICS ATT&CK – Impact",
-                                         "rule_key": "asset_type", "threat_rule_id": 22}],
-                           "skipped_count": 4, "skipped": [], "embeddings_job_id": "6ba7b810-..."},
+                        "new_category_links": 96, "before_count": 0, "after_count": 83,
+                        "ot_rules": [{"threat_type_id": 87, "threat_type_name": "ICS ATT&CK - Impact",
+                                        "rule_key": "asset_type", "threat_rule_id": 22}],
+                        "skipped_count": 4, "skipped": [], "embeddings_job_id": "6ba7b810-..."},
                 "error": None,
             }
         }
@@ -714,3 +917,266 @@ class EmbeddingJobStatus(EmbeddingActionResponse):
         description="Job's current state, mirrors Celery's AsyncResult.state: PENDING, STARTED, SUCCESS, FAILURE, or RETRY."
     )
     error: str | None = Field(default=None, description="Error message when state is FAILURE. Null otherwise.")
+
+
+# ---------------------------------------------------------------------------
+# Threat-library master CRUD (app/api/library_crud.py)
+#
+# Three models per table — Create, Update (every field optional), Row (the response). They do
+# not collapse into one generic pair: the four tables genuinely differ (a category has a
+# SecurityObjective, an actor has IsCapable, a catalogue row has a parent type), and one loose
+# model would accept fields the target table has no column for.
+#
+# Update models: every field defaults to None and the handler sends only what was actually set,
+# so an omitted field keeps its current value instead of being nulled. An empty body is rejected
+# — far more likely a mistake than a request to stamp UpdatedBy and change nothing.
+# ---------------------------------------------------------------------------
+class LibraryRowAudit(BaseModel):
+    """Provenance every master row carries. `source` records WHERE the row came from
+    ('functional_team_excel' seed, an import tag, 'ai_auto_promoted', 'manual' via this API);
+    created_by/updated_by record WHO, as the caller's user id.
+
+    `updated_at`/`updated_by` stay null until someone edits the row through this API — the
+    importer and promote-on-accept paths deliberately leave existing rows untouched. A soft
+    delete IS an edit, so on a deleted row `updated_by` is whoever deleted it."""
+    is_active: bool = Field(description="Curator's enable/disable flag. Inactive rows are excluded from AI matching.")
+    is_deleted: bool = Field(description="Soft-delete flag. Deleted rows are hidden from the list endpoints and from grounding.")
+    source: str | None = Field(default=None, description="Provenance tag. Null on rows created before the column existed.")
+    created_at: datetime | None = Field(default=None, description="UTC insert time. Null on rows predating the audit columns.")
+    created_by: str | None = Field(default=None, description="User id that created the row, or an 'auto:<source>'/'cli:<user>' literal for background imports.")
+    updated_at: datetime | None = Field(default=None, description="UTC time of the last edit through this API. Null if never edited.")
+    updated_by: str | None = Field(default=None, description="User id of the last edit, including a soft delete. Null if never edited.")
+    # Declared on the shared row model rather than in a separate write-response wrapper so a
+    # client parses one shape whether it listed the row or just wrote it. Always null on GET.
+    embeddings_job_id: str | None = Field(
+        default=None,
+        description=(
+            "Set only on create/update/delete of a threat type or catalogue entry whose NAME "
+            "changed — poll it on GET /v1/tsg/threat-library/embeddings/status/{job_id} to know "
+            "when the AI can match the new text. Null when nothing needed re-embedding (a "
+            "description-only edit, or an actor/category, which back no embedding group), and "
+            "null with a logged warning if the queue was unreachable — the row is still saved, "
+            "and the fix is to run POST /v1/tsg/threat-library/embeddings/update."
+        ),
+    )
+
+
+class ThreatCategoryCreate(BaseModel):
+    """New Threat_Category row. `threat_category_id` is REQUIRED and caller-supplied because
+    this table's PK is a plain int, not IDENTITY (TSG_Core.sql section 2) — the STRIDE set is
+    fixed and externally numbered. Deriving MAX+1 server-side would race two concurrent creates
+    onto the same id, so the caller owns the choice."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "threat_category_id": 7, "threat_category_name": "Elevation of Privilege",
+        "threat_category_code": "EOP", "security_objective": "Authorization"}})
+
+    threat_category_id: int = Field(ge=1, description="Primary key. Required — this table's PK is not auto-generated.")
+    threat_category_name: str = Field(min_length=1, max_length=200, description="Display name, e.g. 'Elevation of Privilege'.")
+    threat_category_code: str | None = Field(default=None, max_length=20, description="Short code, e.g. 'EOP'.")
+    security_objective: str | None = Field(default=None, max_length=200, description="CIA objective this category maps to.")
+    is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
+
+
+class ThreatCategoryUpdate(BaseModel):
+    """Partial update — send only what changes. At least one field is required."""
+    model_config = ConfigDict(json_schema_extra={"example": {"security_objective": "Authorization"}})
+
+    threat_category_name: str | None = Field(default=None, min_length=1, max_length=200)
+    threat_category_code: str | None = Field(default=None, max_length=20)
+    security_objective: str | None = Field(default=None, max_length=200)
+    is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a name clash.")
+
+
+class ThreatCategoryRow(LibraryRowAudit):
+    """One Threat_Category row as returned by the CRUD endpoints."""
+    threat_category_id: int = Field(description="Primary key.")
+    threat_category_name: str = Field(description="Display name.")
+    threat_category_code: str | None = Field(default=None, description="Short code.")
+    security_objective: str | None = Field(default=None, description="CIA objective.")
+
+
+class ThreatTypeCreate(BaseModel):
+    """New Threat_Type row (a threat FAMILY). Unique on (name, category, sector) among live
+    rows, so the same name under a different category or sector is allowed — and a name freed
+    by a soft delete can be reused."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "threat_type_name": "Credential Abuse", "description": "Attacks that misuse valid credentials.",
+        "threat_category_id": 4}})
+
+    threat_type_name: str = Field(min_length=1, max_length=300, description="Family name. Also the text the AI matches against — keep it descriptive.")
+    description: str | None = Field(default=None, description="Free text. Not embedded; only the name is matched.")
+    sector_id: int | None = Field(default=None, ge=1, description="Scope to one sector, or null for every sector.")
+    threat_category_id: int | None = Field(default=None, ge=1, description="Owning STRIDE category. Must reference a live Threat_Category row.")
+    is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
+
+
+class ThreatTypeUpdate(BaseModel):
+    """Partial update — send only what changes. At least one field is required.
+
+    Renaming re-embeds this row for AI matching — see the endpoint's `embeddings_job_id`."""
+    model_config = ConfigDict(json_schema_extra={"example": {"threat_type_name": "Credential Abuse & Session Theft"}})
+
+    threat_type_name: str | None = Field(default=None, min_length=1, max_length=300)
+    description: str | None = Field(default=None)
+    sector_id: int | None = Field(default=None, ge=1)
+    threat_category_id: int | None = Field(default=None, ge=1)
+    is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a natural-key clash.")
+
+
+class ThreatTypeRow(LibraryRowAudit):
+    """One Threat_Type row as returned by the CRUD endpoints."""
+    threat_type_id: int = Field(description="Primary key.")
+    threat_type_name: str = Field(description="Family name.")
+    description: str | None = Field(default=None)
+    sector_id: int | None = Field(default=None)
+    threat_category_id: int | None = Field(default=None)
+
+
+class ThreatCatalogueCreate(BaseModel):
+    """New Threat_Catalogue row (one EXACT threat under a family). Unique on
+    (threat_type_id, name, sector) among live rows."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "threat_type_id": 12, "threat_name": "Credential phishing and MFA session theft",
+        "description": "Adversary-in-the-middle phishing that replays the session cookie."}})
+
+    threat_type_id: int = Field(ge=1, description="Owning family. Must reference a live Threat_Type row.")
+    threat_name: str = Field(min_length=1, max_length=500, description="Exact threat name. Also the text the AI matches against.")
+    description: str | None = Field(default=None, description="Free text. Not embedded; only the name is matched.")
+    sector_id: int | None = Field(default=None, ge=1, description="Scope to one sector, or null for every sector.")
+    is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
+
+
+class ThreatCatalogueUpdate(BaseModel):
+    """Partial update — send only what changes. At least one field is required.
+
+    Renaming re-embeds this row for AI matching — see the endpoint's `embeddings_job_id`."""
+    model_config = ConfigDict(json_schema_extra={"example": {"description": "Updated wording."}})
+
+    threat_type_id: int | None = Field(default=None, ge=1)
+    threat_name: str | None = Field(default=None, min_length=1, max_length=500)
+    description: str | None = Field(default=None)
+    sector_id: int | None = Field(default=None, ge=1)
+    is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a natural-key clash.")
+
+
+class ThreatCatalogueRow(LibraryRowAudit):
+    """One Threat_Catalogue row as returned by the CRUD endpoints."""
+    threat_catalogue_id: int = Field(description="Primary key.")
+    threat_type_id: int = Field(description="Owning family.")
+    threat_name: str = Field(description="Exact threat name.")
+    description: str | None = Field(default=None)
+    sector_id: int | None = Field(default=None)
+
+
+class ThreatActorCreate(BaseModel):
+    """New Threat_Actor row. Unique on name alone among live rows — actors are global, with no
+    sector or category dimension."""
+    model_config = ConfigDict(json_schema_extra={"example": {"threat_actor_name": "Hacktivist", "is_capable": 1}})
+
+    threat_actor_name: str = Field(min_length=1, max_length=200, description="Actor name, e.g. 'Nation State'.")
+    is_capable: int = Field(default=1, description="Capability weight fed to the threats-prompt hint.")
+    is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
+
+
+class ThreatActorUpdate(BaseModel):
+    """Partial update — send only what changes. At least one field is required."""
+    model_config = ConfigDict(json_schema_extra={"example": {"is_capable": 0}})
+
+    threat_actor_name: str | None = Field(default=None, min_length=1, max_length=200)
+    is_capable: int | None = Field(default=None)
+    is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a name clash.")
+
+
+class ThreatActorRow(LibraryRowAudit):
+    """One Threat_Actor row as returned by the CRUD endpoints."""
+    threat_actor_id: int = Field(description="Primary key.")
+    threat_actor_name: str = Field(description="Actor name.")
+    is_capable: int = Field(description="Capability weight.")
+
+
+# --- Control library (/v1/tsg/control-library) -------------------------------------------
+# Same three-model-per-table shape as the threat masters above. The one behavioural difference
+# worth knowing: a control's embedded text is `control_name + ": " + control_description`, so
+# editing EITHER re-embeds the row — unlike the threat tables, where only the name counts.
+class ControlStandardCreate(BaseModel):
+    """New Control_Standard row (a named standard, e.g. 'NIST SP 800-53 Rev. 5'). Unique on name
+    among live rows."""
+    model_config = ConfigDict(json_schema_extra={"example": {"standard_name": "NIST SP 800-53 Rev. 5"}})
+
+    standard_name: str = Field(min_length=1, max_length=200, description="Standard's full name as it should be reported.")
+    is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
+
+
+class ControlStandardUpdate(BaseModel):
+    """Partial update — send only what changes. At least one field is required."""
+    model_config = ConfigDict(json_schema_extra={"example": {"standard_name": "ISO 27001:2022", "is_active": True}})
+
+    standard_name: str | None = Field(default=None, min_length=1, max_length=200)
+    is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a name clash.")
+
+
+class ControlStandardRow(LibraryRowAudit):
+    """One Control_Standard row as returned by the CRUD endpoints."""
+    standard_id: int = Field(description="Primary key.")
+    standard_name: str = Field(description="Standard's full name.")
+
+
+class ControlCreate(BaseModel):
+    """New Control_Library row. Unique on `control_code` among live rows — the code, not the
+    name, is the natural key, because two controls can legitimately share a name across domains."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "control_code": "CII-CID-1289", "itot": "IT", "domain": "Identification & Authentication",
+        "control_name": "Phishing-Resistant MFA",
+        "control_description": "Mechanisms exist to require phishing-resistant multi-factor authentication for privileged accounts.",
+        "sample_evidence": "Screenshot of the MFA policy showing FIDO2 enforcement."}})
+
+    control_code: str = Field(min_length=1, max_length=20, description="Stable code, e.g. 'CII-CID-1289'. The natural key.")
+    itot: str = Field(min_length=1, max_length=10, description="'IT' or 'OT' — drives grounding's asset-type pre-filter.")
+    domain: str = Field(min_length=1, max_length=200, description="Control domain, reported as-is (free vocabulary, never joined on).")
+    control_name: str = Field(min_length=1, max_length=500, description="Official control name. Part of the text the AI matches against.")
+    control_description: str = Field(min_length=1, description="Full control text. ALSO part of the matched text — editing it re-embeds the row.")
+    sample_evidence: str | None = Field(default=None, description="Example evidence an assessor would accept. Not embedded.")
+    is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
+
+
+class ControlUpdate(BaseModel):
+    """Partial update — send only what changes. At least one field is required.
+
+    Changing `control_name` OR `control_description` re-embeds the control (see the endpoint's
+    `embeddings_job_id`); the other fields do not."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "control_code": "CII-CID-1289", "itot": "IT", "domain": "Identification & Authentication",
+        "control_name": "Phishing-Resistant MFA", "control_description": "Updated control text.",
+        "sample_evidence": "Screenshot of the MFA policy.", "is_active": True}})
+
+    control_code: str | None = Field(default=None, min_length=1, max_length=20)
+    itot: str | None = Field(default=None, min_length=1, max_length=10)
+    domain: str | None = Field(default=None, min_length=1, max_length=200)
+    control_name: str | None = Field(default=None, min_length=1, max_length=500)
+    control_description: str | None = Field(default=None, min_length=1)
+    sample_evidence: str | None = Field(default=None)
+    is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a code clash.")
+
+
+class ControlRow(LibraryRowAudit):
+    """One Control_Library row as returned by the CRUD endpoints."""
+    control_library_id: int = Field(description="Primary key.")
+    control_code: str = Field(description="Stable control code.")
+    itot: str = Field(description="'IT' or 'OT'.")
+    domain: str = Field(description="Control domain.")
+    control_name: str = Field(description="Official control name.")
+    control_description: str = Field(description="Full control text.")
+    sample_evidence: str | None = Field(default=None, description="Example evidence.")
+
+
+class ControlStandardsResponse(BaseModel):
+    """The standards currently linked to one control — what fills `standards[]` on a scenario's
+    mapped controls. Returned by the attach/detach endpoints so the caller sees the result of
+    the change without a second call."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "control_library_id": 201, "standard_ids": [1, 4],
+        "standards": ["ISO 27001:2022", "NIST SP 800-53 Rev. 5"]}})
+
+    control_library_id: int = Field(description="The control these standards belong to.")
+    standard_ids: list[int] = Field(description="Linked Control_Standard primary keys.")
+    standards: list[str] = Field(description="Their names, alphabetically — the same list a scenario's control shows.")

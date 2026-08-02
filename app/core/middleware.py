@@ -1,19 +1,9 @@
-""" gives every incoming web request a traceable ID and a
-one-line record of what happened — so a slow or silently-failed request can
-be found in the logs afterward, instead of leaving no trail at all.
+"""Gives every incoming request a traceable ID and a one-line record of what happened.
 
-[REVIEW-FIX] this app previously had zero HTTP-level logging (only exceptions were
-logged, with no request ID) and structlog's own contextvars processor (logging.py)
-was wired in but nothing ever called bind_contextvars — inert scaffolding. This
-closes both gaps in one small ASGI middleware, kept in its own file rather than
-growing main.py.
-
-[REVIEW-FIX] request_id is ALSO stashed on request.state (not just contextvars): Starlette
-pulls the catch-all `Exception` handler out onto its outermost ServerErrorMiddleware, which
-wraps this middleware — so on an unhandled exception, the `finally` below clears contextvars
-during unwind, before that outer handler (app/api/errors.py::_handle_unhandled_exception) ever
-runs. request.state survives that unwind (it's the same Request object, not a contextvar), so
-the handler reads request_id from there instead of trusting contextvars to still be bound.
+request_id is stashed on request.state as well as contextvars: Starlette's catch-all
+`Exception` handler lives on the outermost ServerErrorMiddleware, which wraps this one, so the
+`finally` below clears contextvars during unwind BEFORE that handler
+(app/api/errors.py::_handle_unhandled_exception) runs. request.state survives the unwind.
 """
 from __future__ import annotations
 
@@ -34,13 +24,9 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
     """Rejects an over-sized request body from the Content-Length header, BEFORE anything reads
     or parses it.
 
-    [REVIEW-FIX] the threat-library import route enforces its own upload cap inside the handler —
-    but by then FastAPI has already buffered the whole body and run `json.loads` on it, on the
-    event loop, and that happens BEFORE dependencies resolve, i.e. before `require_admin` has
-    checked the admin key. So an UNAUTHENTICATED caller could make the server parse an arbitrarily
-    large JSON document and stall the loop for every other request on that worker. A per-route
-    check cannot fix that: by the time route code runs, the cost is already paid. The guard has to
-    sit in front of the body read, which is what this middleware is.
+    The import route's own cap cannot replace this: FastAPI buffers and `json.loads` the whole
+    body on the event loop before dependencies resolve — i.e. before `require_admin` runs — so
+    an unauthenticated caller could stall the loop for every other request on that worker.
 
     ponytail: Content-Length only — a chunked upload declares no length, so it still reaches the
     handler's own cap. Add a streaming byte-counter if chunked uploads ever become a real path."""
@@ -66,8 +52,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     """Accepts an inbound `X-Request-Id` header or generates one, binds it into every
     structlog line emitted for the rest of this request (via contextvars), logs a start
     line and an end line (status + duration), and echoes the ID back on the response.
-    Not threaded into Celery task kwargs yet — the pipeline's own session_id-scoped
-    logging already covers the background-work side; this closes the HTTP-request side."""
+    Not threaded into Celery task kwargs — background work is scoped by session_id instead."""
 
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
@@ -83,12 +68,9 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
                             duration_ms=round((time.monotonic() - start) * 1000, 1))
                 raise
             if response.media_type == "text/event-stream":
-                # A long-lived SSE connection (GET /sessions/{id}/events) — BaseHTTPMiddleware's
-                # call_next() returns as soon as headers are available, well before the stream's
-                # body is actually sent/closed (it can stay open for minutes/hours), so a duration
-                # measured HERE would be near-zero and misleading — a healthy-looking instant
-                # request instead of the real, much longer, connection lifetime. Log that the
-                # stream started, not a false "finished" duration.
+                # call_next() returns as soon as headers are available, long before a long-lived
+                # SSE body is closed, so a duration measured here would be a misleading near-zero.
+                # Log that the stream started, not a false "finished" duration.
                 # ponytail: real close-time tracking would need to wrap the ASGI __call__ that
                 # actually sends the stream — EventSourceResponse implements its own __call__
                 # rather than StreamingResponse's body_iterator, so BaseHTTPMiddleware can't hook
@@ -103,7 +85,6 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
             response.headers["X-Request-Id"] = request_id
             return response
         finally:
-            # Always clears, whether the request succeeded, failed, or raised — a leaked
-            # binding would otherwise leak this request's ID into the NEXT request handled
-            # by the same worker/greenlet.
+            # Unconditional: a leaked binding would carry this request's ID into the NEXT
+            # request handled by the same worker/greenlet.
             structlog.contextvars.clear_contextvars()

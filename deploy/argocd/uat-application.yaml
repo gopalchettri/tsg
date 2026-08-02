@@ -1,0 +1,18 @@
+# Manual sync by design (deliberate promotion gate) — after the pipeline commits a new tag
+# (deploy/tekton/pipelinerun-example.yaml, env=uat), a person reviews the diff and runs
+# `argocd app sync tsg-uat` (or clicks Sync in the ArgoCD UI). No `syncPolicy.automated` here.
+# Apply once:  oc apply -f deploy/argocd/uat-application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tsg-uat
+  namespace: openshift-gitops
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/gopalchettri/tsg.git
+    targetRevision: tsg-without-profile-decomposition
+    path: deploy/overlays/uat
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ai-threatgen-uat

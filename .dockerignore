@@ -1,0 +1,18 @@
+# Keep the build context to what the Dockerfile actually COPYs (app/, scripts/, pyproject, lock).
+.git
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+tests/
+docs/
+migrations/
+docker/
+documents/
+.env
+.env.*
+*.ps1
+*.zip
+.pytest_cache
+.mypy_cache
+.ruff_cache

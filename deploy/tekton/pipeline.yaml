@@ -1,0 +1,171 @@
+# TSG CI pipeline: clone -> test -> build+push -> apply-schema -> commit new tag to git.
+# ArgoCD (separate, deploy/argocd/) watches the overlay and applies it — this pipeline never
+# runs `oc apply` and never needs Docker anywhere.
+# Runs in the CI namespace (ai-threatgen-ci) under the operator-provided `pipeline` ServiceAccount.
+# Apply once:  oc apply -f deploy/tekton/pipeline.yaml -n ai-threatgen-ci
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: tsg-pipeline
+spec:
+  params:
+    - name: git-url
+      type: string
+      default: "https://github.com/gopalchettri/tsg.git"
+    - name: git-revision
+      type: string
+      # What `fetch` checks out. Manual runs set this to a branch name; the webhook trigger
+      # sets it to the pushed commit SHA (body.head_commit.id) — NOT necessarily a branch, so
+      # it must never be reused as a push target (see deploy-branch below).
+      default: "tsg-without-profile-decomposition"
+    - name: deploy-branch
+      type: string
+      description: "Branch update-manifest pushes the tag-bump commit to (must be a real branch, unlike git-revision)"
+      default: "tsg-without-profile-decomposition"
+    - name: env
+      type: string
+      default: "dev"
+      description: "Target overlay/namespace suffix: dev | uat | prod"
+    - name: image
+      type: string
+      default: "image-registry.openshift-image-registry.svc:5000/ai-threatgen-ci/tsg"
+    - name: run-schema
+      type: string
+      default: "true"
+      description: "Run the idempotent SQL schema scripts before deploying"
+    - name: sqlcmd-image
+      type: string
+      default: "mcr.microsoft.com/mssql-tools:latest"
+  workspaces:
+    - name: source
+
+  tasks:
+    - name: fetch
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: namespace
+            value: openshift-pipelines
+      params:
+        - name: URL
+          value: $(params.git-url)
+        - name: REVISION
+          value: $(params.git-revision)
+      workspaces:
+        - name: output
+          workspace: source
+
+    - name: test
+      runAfter: [fetch]
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        workspaces:
+          - name: source
+        steps:
+          - name: pytest
+            image: python:3.12-slim
+            workingDir: $(workspaces.source.path)
+            # Tests run on SQLite with a stubbed LLM — no services, no credentials needed.
+            # Live tests (test_live_llm.py etc.) self-skip because no Azure/Redis creds are
+            # injected here. Do NOT add them.
+            script: |
+              #!/bin/sh
+              set -e
+              pip install --quiet -e ".[dev]"
+              ruff check .
+              pytest -q
+
+    - name: build-push
+      runAfter: [test]
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: buildah
+          - name: namespace
+            value: openshift-pipelines
+      params:
+        - name: IMAGE
+          value: "$(params.image):$(tasks.fetch.results.commit)"
+        - name: BUILD_EXTRA_ARGS
+          value: "--build-arg EXTRAS=prod"
+      workspaces:
+        - name: source
+          workspace: source
+
+    - name: apply-schema
+      runAfter: [test]
+      when:
+        - input: $(params.run-schema)
+          operator: in
+          values: ["true"]
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        workspaces:
+          - name: source
+        steps:
+          - name: sqlcmd
+            image: $(params.sqlcmd-image)
+            workingDir: $(workspaces.source.path)
+            # Database-first schema: these scripts ARE the migration (scripts/readme.txt) —
+            # all idempotent (IF OBJECT_ID / IF NOT EXISTS guards), safe to re-run every deploy.
+            # Discrete DB_* creds come from the tsg-db-<env> Secret in the CI namespace
+            # (the app's TSG_DB_DSN is a SQLAlchemy URL sqlcmd can't parse).
+            envFrom:
+              - secretRef:
+                  name: tsg-db-$(params.env)
+            script: |
+              #!/bin/sh
+              set -e
+              export PATH="/opt/mssql-tools18/bin:/opt/mssql-tools/bin:$PATH"
+              # sqlcmd 18 encrypts by default; -C trusts the server cert. With an internal CA,
+              # drop -C and bake the CA into a custom tools image instead.
+              case "$(sqlcmd -? 2>&1)" in *"-C"*) TLS_FLAG="-C";; *) TLS_FLAG="";; esac
+              for f in TSG_Core.sql Threat_library.sql Seed_to_Threat_library.sql \
+                       Control_library.sql Seed_to_Control_library.sql; do
+                echo ">>> $f"
+                sqlcmd $TLS_FLAG -S "$DB_HOST" -d "$DB_NAME" -U "$DB_USER" -P "$DB_PASSWORD" \
+                  -b -i "scripts/$f"
+              done
+
+    - name: update-manifest
+      runAfter: [build-push, apply-schema]
+      timeout: 5m
+      workspaces:
+        - name: source
+          workspace: source
+      taskSpec:
+        workspaces:
+          - name: source
+        steps:
+          - name: commit-tag
+            image: alpine/git:latest
+            workingDir: $(workspaces.source.path)
+            # GitOps handoff: pin the overlay to the image just built and push the commit.
+            # ArgoCD (not this pipeline) watches this path and applies it to the cluster — no
+            # `oc apply`/docker/daemon of any kind runs here or on the jump server.
+            # Auth: the `pipeline` ServiceAccount must have a `kubernetes.io/basic-auth` Secret
+            # annotated `tekton.dev/git-0: https://github.com` attached (see deploy/README.md);
+            # Tekton's creds-init wires it into git's credential helper automatically.
+            # Commit message MUST start with "deploy(" — the webhook's cel filter (triggers.yaml)
+            # relies on this prefix to avoid re-triggering itself on this very push.
+            script: |
+              #!/bin/sh
+              set -e
+              cd deploy/overlays/$(params.env)
+              sed -i "s|newTag:.*|newTag: $(tasks.fetch.results.commit)|" kustomization.yaml
+              git config user.email "tekton-ci@tsg.local"
+              git config user.name "tsg-pipeline"
+              git add kustomization.yaml
+              git commit -m "deploy($(params.env)): tsg@$(tasks.fetch.results.commit)" || echo "no changes to commit"
+              git push origin HEAD:$(params.deploy-branch)

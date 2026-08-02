@@ -86,7 +86,7 @@ def _create_schema_and_seed(engine) -> None:
     with engine.begin() as c:
         # Partial unique indexes (M4/M6/M8) — SQLite supports filtered indexes.
         c.execute(text('CREATE UNIQUE INDEX "UX_Session_ActiveAsset" ON "Scenario_Session"(EntityID, AssetID) WHERE SessionStatus = \'active\''))
-        c.execute(text('CREATE UNIQUE INDEX "UX_Scenario_ActiveIdentity" ON "Threat_Scenario_Output"(SessionID, IdentityHash) WHERE Superseded = 0'))
+        c.execute(text('CREATE UNIQUE INDEX "UX_Scenario_ActiveIdentity" ON "Threat_Scenario_Output"(SessionID, IdentityHash, ScenarioNumber) WHERE Superseded = 0'))
         c.execute(text('CREATE UNIQUE INDEX "UX_Session_IdempotencyKey" ON "Scenario_Session"(EntityID, IdempotencyKey) WHERE IdempotencyKey IS NOT NULL'))
         # M2 — master-library natural-key UNIQUE (safe concurrent promotion, no duplicate masters).
         # COALESCE makes SQLite match MSSQL's unique-index NULL semantics (MSSQL treats
@@ -96,6 +96,13 @@ def _create_schema_and_seed(engine) -> None:
         c.execute(text('CREATE UNIQUE INDEX "UX_ThreatType_NaturalKey" ON "Threat_Type"(ThreatTypeName, COALESCE(ThreatCategoryID, -1), COALESCE(SectorID, -1)) WHERE IsActive = 1 AND IsDeleted = 0'))
         c.execute(text('CREATE UNIQUE INDEX "UX_ThreatCatalogue_NaturalKey" ON "Threat_Catalogue"(ThreatTypeID, ThreatName, COALESCE(SectorID, -1)) WHERE IsActive = 1 AND IsDeleted = 0'))
         c.execute(text('CREATE UNIQUE INDEX "UX_ThreatActor_NaturalKey" ON "Threat_Actor"(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0'))
+        c.execute(text('CREATE UNIQUE INDEX "UX_ThreatCategory_NaturalKey" ON "Threat_Category"(ThreatCategoryName) WHERE IsActive = 1 AND IsDeleted = 0'))
+        c.execute(text('CREATE UNIQUE INDEX "UX_SubsystemStageState_SessionSubLevel" ON "Subsystem_Stage_State"(SessionID, SubsystemID, Level)'))
+        # Control-library natural keys. Filtered on IsActive/IsDeleted as of 2026-07-27 (they
+        # were plain UNIQUE constraints, which reserved a deleted control's code forever) —
+        # without these the CRUD layer's duplicate-code 409 would never fire under test.
+        c.execute(text('CREATE UNIQUE INDEX "UX_Control_Library_Code" ON "Control_Library"(ControlCode) WHERE IsActive = 1 AND IsDeleted = 0'))
+        c.execute(text('CREATE UNIQUE INDEX "UX_Control_Standard_Name" ON "Control_Standard"(StandardName) WHERE IsActive = 1 AND IsDeleted = 0'))
         # Scoping-rule natural key (migration 0027) — makes dal.upsert_threat_rule's
         # IntegrityError-on-duplicate path real under test, not vacuous.
         c.execute(text('CREATE UNIQUE INDEX "UX_ConfigThreatRule_NaturalKey" ON "Config_Threat_Rule"(ThreatTypeID, RuleType, RuleKey, RuleValue) WHERE IsActive = 1 AND IsDeleted = 0'))

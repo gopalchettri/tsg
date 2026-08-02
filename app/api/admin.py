@@ -1,18 +1,12 @@
 """Admin API — threat-library embedding cache maintenance (create/update/recreate/delete).
 
-Gated by TWO independent checks, both required: a static X-Admin-Key header
-(app.api.deps.require_admin — the actual authorization gate; TSG has no admin/curator role,
-and this touches shared, cross-tenant master data, not one entity's data, so the per-entity
-JWT model doesn't fit as the GATE) and a valid bearer JWT (app.api.deps.get_principal — the
-SAME validation every other endpoint already uses), whose `sub` claim attributes the audit
-log to a real caller instead of "someone with the shared key".
+Gated by TWO independent checks, both required: the static X-Admin-Key header
+(deps.require_admin) is the authorization gate — this is shared cross-tenant master data, so
+the per-entity JWT model doesn't fit — and a valid bearer JWT (deps.get_principal) supplies the
+`sub` that attributes the audit log to a real caller rather than "someone with the shared key".
 
-Runs ASYNCHRONOUSLY — same dispatch-then-poll shape as app/api/sessions.py's
-run_pipeline_task/regenerate_task. Each POST route validates the request, writes the audit
-log line, queues app.pipeline.celery_app.admin_embedding_action_task via .delay(), and returns
-202 + a job_id immediately (no DB/LLM access happens inline in the HTTP request anymore).
-GET .../status/{job_id} then polls Celery's own AsyncResult — backed by the already-configured
-result backend, no new infrastructure — for the eventual rows_processed/vectors_deleted/error.
+Asynchronous: each POST validates, audits, queues admin_embedding_action_task and returns 202 +
+a job_id. GET .../status/{job_id} polls Celery's own AsyncResult.
 """
 from __future__ import annotations
 
@@ -28,7 +22,7 @@ from app.pipeline.celery_app import admin_embedding_action_task, celery_app
 
 router = APIRouter(
     prefix="/v1/tsg/threat-library/embeddings",
-    tags=["Threat Library Admin"],
+    tags=["Embeddings Admin"],
     dependencies=[Depends(require_admin)],
 )
 log = get_logger(__name__)
@@ -40,12 +34,10 @@ class AdminValidationError(Exception):
 
 
 def _audit(request: Request, action: str, body: EmbeddingActionBody, principal: Principal, job_id: str) -> None:
-    """Structured log line — the forensic trail for who/what/when a destructive action was
-    queued. Fires AFTER _enqueue confirms the task actually reached the broker (job_id proves
-    it), never before: logging it first would leave a permanent record claiming an action was
-    queued even when .delay() itself failed (e.g. broker down) and nothing ever ran.
-    `principal.user_id` (the JWT `sub` claim, required via get_principal below) names the real
-    caller; the shared X-Admin-Key alone never could."""
+    """Forensic trail for who/what/when a destructive action was queued.
+
+    Fires AFTER _enqueue confirms the task reached the broker (the job_id proves it): logging
+    first would leave a permanent record of an action that never ran when .delay() failed."""
     log.warning("admin.embedding_action", action=action, group=body.group, names=body.names,
                 job_id=job_id, user_id=principal.user_id,
                 source_ip=request.client.host if request.client else None)
@@ -59,19 +51,13 @@ def _require_group_when_names_given(body: EmbeddingActionBody) -> None:
 
 
 def _enqueue(action: str, body: EmbeddingActionBody) -> EmbeddingJobAccepted:
-    """Indirection so tests can run the action synchronously instead of via a broker — same
-    pattern as app/api/sessions.py's enqueue_pipeline/enqueue_regeneration. Also records a
-    provenance marker (`tsg:admin:job:<id>`) for get_status below: run_pipeline_task,
-    regenerate_task, reap_task, and self_check_task all share this SAME Celery app and result
-    backend, so a bare AsyncResult(job_id) lookup has no way to tell "an admin job" apart from
-    "any other task's id" — without this marker, get_status would happily return another
-    tenant's pipeline-run exception text, or crash trying to ** a non-dict result (reap_task/
-    self_check_task return list[str], not a dict) for an id this router never queued.
-    Best-effort: if Redis is unreachable here, the marker write is skipped (fails open on the
-    QUEUE side, same as the rest of this codebase's Redis usage) and the job simply becomes
-    unpollable via status (report success anyway; get_settings().result_expires_seconds is the
-    same TTL the result backend itself already uses, so the marker and the result it gates
-    expire together)."""
+    """Queues the action (indirection so tests can run it synchronously) and records the
+    provenance marker get_status below requires.
+
+    Every other task shares this Celery app and result backend, so without the marker a bare
+    AsyncResult(job_id) lookup cannot tell an admin job from any other task's id — get_status
+    would return another tenant's pipeline exception text, or crash trying to `**` a list.
+    The marker write is best-effort: an unreachable Redis leaves the job merely unpollable."""
     task = admin_embedding_action_task.delay(action, body.group, body.names)
     mark_admin_job(task.id, FAMILY_EMBEDDINGS)  # best-effort — see admin_jobs.mark_admin_job
     return EmbeddingJobAccepted(job_id=task.id)
@@ -112,11 +98,10 @@ def recreate(body: EmbeddingActionBody, request: Request,
 @router.post("/delete", response_model=EmbeddingJobAccepted, status_code=202)
 def delete(body: EmbeddingActionBody, request: Request,
         principal: Principal = Depends(get_principal)) -> EmbeddingJobAccepted:
-    """Wipe a group's (or named items') cached vectors — no re-embed. [REVIEW-FIX] `group`
-    and `names` cannot BOTH be omitted: unlike update/recreate (which rebuild and so
-    self-heal), a bare `{}` here would silently wipe the ENTIRE cross-tenant cache with no
-    extra friction — the one truly destructive, non-self-rebuilding action must require at
-    least one explicit scope."""
+    """Wipe a group's (or named items') cached vectors — no re-embed.
+
+    `group` and `names` cannot BOTH be omitted: unlike update/recreate (which rebuild and so
+    self-heal), a bare `{}` here would silently wipe the ENTIRE cross-tenant cache."""
     if not body.group and not body.names:
         raise AdminValidationError(
             "delete requires group and/or names — refusing to wipe the entire cache with an empty request")
@@ -128,20 +113,15 @@ def delete(body: EmbeddingActionBody, request: Request,
 
 @router.get("/status/{job_id}", response_model=EmbeddingJobStatus)
 def get_status(job_id: str, _principal: Principal = Depends(get_principal)) -> EmbeddingJobStatus:
-    """Polls Celery's own AsyncResult for a job one of the four routes above queued — no new
-    infrastructure beyond the provenance marker _enqueue writes above. That marker is checked
-    FIRST: run_pipeline_task/regenerate_task/reap_task/self_check_task share this same Celery
-    app/result backend, so without it, any caller who learns another task's id (e.g. from logs
-    or Subsystem_Stage_State.ActiveTaskID) could poll ITS result here too — a real per-entity
-    authorization bypass, since this route only checks the admin gates, never
-    principal.require_entity(...). An id this router never queued (or whose marker/result TTL
-    already expired) reports 404, never a guess at Celery's own state for it.
+    """Polls Celery's AsyncResult for a job one of the four routes above queued.
 
-    Deliberately NOT fail-open on a Redis error here, unlike llm.py's concurrency limiter or
-    _enqueue's own marker write above: those guard availability (an infra fault must never
-    block a real call), but this check guards AUTHORIZATION (which job a caller may read) — an
-    unreachable Redis must deny by falling through to the generic 500 handler, not silently
-    let every job_id through."""
+    The provenance marker is checked FIRST: this route never calls require_entity, so without it
+    any caller who learns another task's id (from logs, or Subsystem_Stage_State.ActiveTaskID)
+    could poll ITS result here — a real authorization bypass. An id this router never queued
+    (or whose TTL expired) reports 404, never a guess at Celery's state for it.
+
+    Deliberately NOT fail-open on a Redis error, unlike _enqueue's marker write: that guards
+    availability, this guards AUTHORIZATION, so an unreachable Redis must deny."""
     if not admin_job_exists(job_id, FAMILY_EMBEDDINGS):
         raise NotFoundError(f"unknown or expired job_id: {job_id!r}")
     result = AsyncResult(job_id, app=celery_app)

@@ -343,17 +343,17 @@ def test_security_posture_blocks_missing_jwt_config_in_prod():
     from app.core.config import Settings, assert_security_posture
 
     s = Settings(app_env="prod", auth_dev_mode=False,
-                jwt_jwks_url="", jwt_issuer="", jwt_audience="")
-    with pytest.raises(RuntimeError, match="TSG_JWT_JWKS_URL, TSG_JWT_ISSUER, TSG_JWT_AUDIENCE"):
+                jwt_jwks_url="", jwt_secret="", jwt_issuer="", jwt_audience="")
+    with pytest.raises(RuntimeError, match="TSG_JWT_ISSUER, TSG_JWT_AUDIENCE, TSG_JWT_JWKS_URL or TSG_JWT_SECRET"):
         assert_security_posture(s)
 
 
 def test_security_posture_names_only_the_missing_jwt_setting():
     from app.core.config import Settings, assert_security_posture
 
-    s = Settings(app_env="staging", auth_dev_mode=False, jwt_jwks_url="",
+    s = Settings(app_env="staging", auth_dev_mode=False, jwt_jwks_url="", jwt_secret="",
                 jwt_issuer="https://idp.example", jwt_audience="tsg-api")
-    with pytest.raises(RuntimeError, match=r"missing: TSG_JWT_JWKS_URL\. Refusing"):
+    with pytest.raises(RuntimeError, match=r"missing: TSG_JWT_JWKS_URL or TSG_JWT_SECRET\. Refusing"):
         assert_security_posture(s)
 
 
@@ -1067,6 +1067,26 @@ def test_chat_length_guard_sums_across_all_messages_not_just_one():
     half = "x" * (_MAX_CHAT_CHARS // 2 + 1)
     with pytest.raises(ValueError):
         LiteLLMClient(s).chat([{"role": "system", "content": half}, {"role": "user", "content": half}])
+
+
+def test_chat_maps_provider_rate_limit_to_llm_slot_unavailable(monkeypatch):
+    """[429 fix] A provider rate limit that survives litellm's own num_retries (e.g. kimi-k2.5's
+    platform-wide rpm=192 consumed by other teams) must surface as LLMSlotUnavailable — the
+    retry-not-fail signal Celery's autoretry_for already handles — never as a generic exception
+    that _record_failure would turn into a permanent session ERROR. litellm.RateLimitError
+    subclasses openai.RateLimitError, so raising the litellm type also proves the helper's
+    openai-level catch covers the subclass every chat/embed/rerank path actually raises."""
+    import litellm
+
+    from app.pipeline.llm import LLMSlotUnavailable
+
+    def fake_completion(*, messages, **kw):
+        raise litellm.RateLimitError("rate limited", llm_provider="openai", model="kimi-k2.5")
+
+    monkeypatch.setattr(litellm, "completion", fake_completion)
+    s = Settings(llm_provider="litellm_proxy")
+    with pytest.raises(LLMSlotUnavailable, match="429"):
+        LiteLLMClient(s).chat([{"role": "user", "content": "hi"}])
 
 
 class _FakeJsonResponse:

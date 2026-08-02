@@ -115,6 +115,17 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
     """
     # ponytail: mapping is enrichment; a scenario without controls beats a failed stage — any
     # failure below logs and returns, never raises into the stage.
+    #
+    # SAVEPOINT, not a bare transaction rollback (see the except/finally below). This runs BEFORE
+    # the caller's finish_stage+commit, and on the TARGETED paths (regenerate / next-set) the
+    # caller's scenarios are still UNCOMMITTED here: _reconcile_targeted_regen buffers them and
+    # writes the supersede+insert in one go, unlike the full run which commits per scenario. A
+    # whole-transaction rollback therefore discarded the caller's entire regenerated batch, after
+    # which finish_stage still SUCCEEDED (its RUNNING claim was committed earlier) and the audit
+    # row + stage_completed SSE reported a completed regeneration that had produced nothing.
+    # Scoping the failure to a savepoint unwinds ONLY this function's writes while leaving the
+    # outer transaction usable — which is all the old rollback was ever reaching for.
+    sp = sess.begin_nested()
     try:
         s = get_settings()
         sid, ss = scenario_session["SessionID"], subsystem_id
@@ -161,7 +172,19 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
             # One lease renewal covers the whole batched grounding call (the only long operation
             # left — shortlisting is a cached-matrix matvec and the rerank is one batched local
             # dispatch / bounded-concurrent remote calls; the inserts below are milliseconds).
-            if not dal.renew_lease(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id):
+            # Two legitimate callers, two different stage states. write_scenarios calls us while
+            # the stage is still RUNNING under its claim, so renewing the lease is both possible
+            # and necessary. write_variant_scenarios calls us AFTER the stage went terminal —
+            # variants are a plain side write under the caller's subsystem lock, by design (see
+            # its docstring) — so renew_lease, which fences on Status == RUNNING, can only ever
+            # return False there. Treating that as "lease lost" made Step-4 mapping a guaranteed
+            # no-op for every variant: they shipped with controls: [] and, because the
+            # ControlsMappedAt stamp below was skipped too, stayed unmapped until some later
+            # RUNNING-stage run happened to sweep them up. Accepting a stage already settled at
+            # OUR epoch covers that caller while keeping the reaped/stolen-stage protection
+            # intact for the RUNNING one.
+            if not (dal.renew_lease(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id)
+                    or dal.stage_settled_at_epoch(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch)):
                 log.warning("controls.lease_lost", session_id=sid)
                 return
             flat = [(q, qv_map.get(q)) for _, qs in per_output for q, _ in qs]
@@ -211,10 +234,18 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                  dropped=dropped, fallbacks=fallbacks, skipped=skipped, itot=itot,
                  min_score=min_score)
     except Exception:  # noqa: BLE001
-        # Roll back FIRST: a DBAPI error mid-write (deadlock, constraint conflict) marks the
-        # session's transaction inactive, and without this the caller's very next
-        # finish_stage would die on PendingRollbackError — turning an enrichment failure
+        # Unwind to the savepoint FIRST: a DBAPI error mid-write (deadlock, constraint conflict)
+        # marks the failed statement's transaction inactive, and without this the caller's very
+        # next finish_stage would die on PendingRollbackError — turning an enrichment failure
         # into a whole-stage failure, the exact outcome this catch-all exists to prevent.
-        # This run's committed scenarios are safe (write_scenarios commits them per scenario).
-        sess.rollback()
+        # Unlike the whole-transaction rollback this replaces, it cannot touch the caller's own
+        # uncommitted scenarios (see the savepoint note at the top of this function).
+        sp.rollback()
         log.warning("controls.mapping_failed", session_id=scenario_session.get("SessionID"), exc_info=True)
+    finally:
+        # `finally`, not `else`: the try body has several early `return`s (no candidates, no
+        # unmapped outputs, lease lost, nothing groundable), and an `else` clause is skipped by
+        # a return — which would leave the savepoint open. Releasing it keeps whatever this
+        # function wrote in the caller's transaction, to be committed with the batch.
+        if sp.is_active:
+            sp.commit()

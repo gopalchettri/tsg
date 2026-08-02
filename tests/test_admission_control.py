@@ -32,6 +32,28 @@ def test_idempotency_key_returns_same_session(engine, monkeypatch):
     r2 = client.post("/v1/sessions", json=session_body(100), headers=headers)
     assert r1.json()["session_id"] == r2.json()["session_id"]
     assert r2.status_code == 200
+    assert r1.json()["user_id"] == "u1" and r2.json()["user_id"] == "u1"
+
+
+def test_idempotency_replay_reports_original_owner_not_replaying_caller(engine, monkeypatch):
+    """The idempotency key is scoped by (EntityID, key), not by user — a different caller
+    authorized for the same entity can legitimately hit the replay branch. The response
+    must report who actually OWNS the session (the original creator), never assume it's
+    whoever is asking right now (reserve_idempotency_key_or_get_existing's user_id)."""
+    from app.api.deps import Principal, get_principal
+
+    monkeypatch.setattr("app.api.sessions.enqueue_pipeline", lambda sid: None)
+    client = make_client({"5"})
+    headers = {"Idempotency-Key": "k-shared"}
+    created = client.post("/v1/sessions", json=session_body(100), headers=headers)
+    assert created.json()["user_id"] == "u1"
+
+    # A second, different authorized user replays the exact same key + body.
+    client.app.dependency_overrides[get_principal] = lambda: Principal(claims={"sub": "u2"}, entities={"5"})
+    replayed = client.post("/v1/sessions", json=session_body(100), headers=headers)
+    assert replayed.status_code == 200
+    assert replayed.json()["session_id"] == created.json()["session_id"]
+    assert replayed.json()["user_id"] == "u1"  # the ORIGINAL owner, not "u2"
 
 
 def test_idempotency_key_conflict_different_body(engine, monkeypatch):

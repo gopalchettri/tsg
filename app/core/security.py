@@ -49,15 +49,22 @@ def validate_jwt(token: str, settings: Settings | None = None) -> dict[str, Any]
         # first-party app that omits 'aud' would sail through unscoped. Fail closed.
         raise AuthError("TSG_JWT_AUDIENCE is not configured; refusing to skip audience verification")
     try:
-        # Find the public key (by "kid" in the token header) from the issuer's published key
-        # set, then verify the token's signature and required claims against it.
-        key = _jwks_client(settings.jwt_jwks_url).get_signing_key_from_jwt(token)
+        if settings.jwt_secret:
+            # Shared-secret mode (HS256): the same key signs and verifies, no JWKS fetch.
+            key_material: Any = settings.jwt_secret
+        else:
+            # Find the public key (by "kid" in the token header) from the issuer's published key
+            # set, then verify the token's signature and required claims against it.
+            key_material = _jwks_client(settings.jwt_jwks_url).get_signing_key_from_jwt(token).key
         return jwt.decode(
             token,
-            key.key,
+            key_material,
             algorithms=list(settings.jwt_algorithms),
             audience=settings.jwt_audience or None,
             issuer=settings.jwt_issuer,
+            # Issuer tokens live ~5 minutes; a small clock difference between the issuing
+            # server and this one must not read as "expired"/"not yet valid".
+            leeway=30,
             options={"require": ["exp"]},
         )
     except jwt.PyJWTError as exc:

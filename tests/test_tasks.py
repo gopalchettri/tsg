@@ -275,7 +275,7 @@ def test_scenario_parse_failure_keeps_earlier_prompt_logs_and_never_locks_across
 
     assert llm.scenario_calls == 2  # the failure landed on the SECOND scenario, not the first
 
-    # The reviewer must be able to SEE that the set is partial — SupportingSystemBoard.
+    # The reviewer must be able to SEE that the set is partial — SessionProgress.
     # error_message is documented for exactly this ("the review set may be PARTIAL").
     stage = db.execute(select(m.Subsystem_Stage_State.Status, m.Subsystem_Stage_State.ErrorMessage)
                     .where(m.Subsystem_Stage_State.SessionID == session["SessionID"],
@@ -460,5 +460,4 @@ def test_salvage_revive_preserves_partial_run_marker_and_board_surfaces_it(db):
     assert row.ErrorMessage == "stage processing failed"  # preserved — NOT wiped by the revive
 
     board = build_board(db, dict(dal.load_session(db, sid)))
-    entry = next(e for e in board["supporting_systems"] if e["id"] == ASSET_UNIT_ID)
-    assert entry["error_message"] == "stage processing failed"
+    assert board["progress"]["error_message"] == "stage processing failed"

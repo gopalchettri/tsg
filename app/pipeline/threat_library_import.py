@@ -1,7 +1,7 @@
 """Shared core for importing open-source threat libraries — the logic that used to live
 inside scripts/import_threat_libraries.py, moved here so BOTH front doors (the CLI script
-and the tsg.import_threat_library Celery task behind POST /v1/tsg/threat-library/import)
-drive the exact same code. Each source is adapted to normalized records
+and the tsg.import_threat_library Celery task behind
+POST /v1/tsg/threat-library/sources/{source}/import) drive the exact same code. Each source is adapted to normalized records
 {type_name, threat_name, description, stride_categories[]} and upserted through the same
 race-safe DAL functions the R10 promotion path uses; OT-flavored sources additionally
 auto-write boost-only Config_Threat_Rule rows (apply_ot_rules below).
@@ -17,6 +17,7 @@ import collections
 import json
 import re
 import urllib.request
+from datetime import timedelta
 
 from typing import Any
 
@@ -208,7 +209,7 @@ def _adapt_attack(data, kill_chain_name: str, type_prefix: str):
             continue
         ext_id = _stix_ext_id(obj, {"mitre-attack"})
         tactics = [p["phase_name"] for p in obj.get("kill_chain_phases", [])
-                   if p.get("kill_chain_name") == kill_chain_name]
+                if p.get("kill_chain_name") == kill_chain_name]
         cats = sorted({c for t in tactics for c in TACTIC_STRIDE.get(t, [])})
         if not cats:
             skipped.append({"reason": f"unmapped tactic(s): {tactics}", "item": f"{ext_id} {obj.get('name')}"})
@@ -409,6 +410,39 @@ def record_import_finished(run_id: str, *, stats: dict | None = None, error: str
         log.warning("import.history_finish_failed", run_id=run_id, exc_info=True)
 
 
+# A run is only closed by record_import_finished, which needs the worker to still be alive: a
+# SIGKILLed or permanently hung worker leaves its row at 'running' forever, and nothing sweeps
+# Threat_Library_Import_Run (the reaper handles sessions only). The inventory API then reports
+# that source as perpetually in-flight, and — because `loaded` for misp_actors requires the last
+# run to be 'success' — a killed actors import makes that source read as never-attempted for
+# good, destroying the "attempted vs never attempted" distinction the endpoint exists to draw.
+# Deriving the status on read costs nothing and cannot itself get stuck. The cutoff matches the
+# broker's visibility_timeout (celery_app.py): past it, the message has already been redelivered
+# or abandoned, so no live worker is still holding that row.
+_RUN_STALE_AFTER = timedelta(seconds=3600)
+
+
+def _is_abandoned(row) -> bool:
+    """True for a 'running' row older than the redelivery window — no live worker still holds it."""
+    return (row.Status == "running" and row.StartedAt is not None
+            and now() - row.StartedAt > _RUN_STALE_AFTER)
+
+
+def _settled_status(row) -> str:
+    """`row.Status`, except that an abandoned run reads as 'failed' — it cannot still be running,
+    and reporting it as such misleads every consumer."""
+    return "failed" if _is_abandoned(row) else row.Status
+
+
+def _settled_error(row) -> str | None:
+    """`row.ErrorMessage`, plus a synthesized cause for an abandoned run — which has none of its
+    own precisely because nothing got the chance to record one."""
+    if row.ErrorMessage or not _is_abandoned(row):
+        return row.ErrorMessage
+    return ("import did not report an outcome within the redelivery window — the worker was "
+            "killed or hung; re-run the import")
+
+
 def latest_runs_by_source(sess) -> dict[str, dict[str, Any]]:
     """The most recent run per source — the `last_run` block of the inventory API.
     One query for every source, not one per source."""
@@ -419,17 +453,25 @@ def latest_runs_by_source(sess) -> dict[str, dict[str, Any]]:
         select(r).join(newest, (r.Source == newest.c.Source) & (r.StartedAt == newest.c.started))
     ).scalars().all()
     return {row.Source: {
-        "status": row.Status, "dry_run": bool(row.DryRun), "started_at": row.StartedAt,
-        "finished_at": row.FinishedAt, "error": row.ErrorMessage,
+        "status": _settled_status(row), "dry_run": bool(row.DryRun), "started_at": row.StartedAt,
+        "finished_at": row.FinishedAt, "error": _settled_error(row),
         "types_imported": row.TypesImported, "threats_imported": row.ThreatsImported,
         "actors_upserted": row.ActorsUpserted,
+        # NULL on every run recorded before the API started forwarding the caller over the
+        # broker (_enqueue's started_by), and on any run the CLI drove.
+        "started_by": row.StartedBy,
     } for row in rows}
 
 
-def import_records(sess, records: list[dict], tag: str) -> dict:
+def import_records(sess, records: list[dict], tag: str, created_by: str | None = None) -> dict:
     """Upsert every record into Threat_Type/Threat_Catalogue (+ category links). Returns
     stats INCLUDING type_ids (type_name -> ThreatTypeID) so apply_ot_rules can key its
-    rules without re-querying."""
+    rules without re-querying.
+
+    `created_by` lands in CreatedBy on rows this run actually creates — the API caller's user
+    id when the import came through HTTP, else an 'auto:<tag>' / 'cli:<user>' literal (see
+    run_import). Rows that already exist keep their original stamp: the upserts are
+    first-writer, so a re-import never rewrites who added something."""
     cat_ids = category_ids(sess)
     missing = sorted({c for r in records for c in r["categories"]} - set(cat_ids))
     if missing:
@@ -446,11 +488,13 @@ def import_records(sess, records: list[dict], tag: str) -> dict:
     for type_name, recs in by_type.items():
         counts = collections.Counter(c for r in recs for c in r["categories"])
         default_cat = cat_ids[counts.most_common(1)[0][0]]
-        type_id = dal.upsert_threat_type(sess, type_name, default_cat, None, source=tag)
+        type_id = dal.upsert_threat_type(sess, type_name, default_cat, None, source=tag,
+                                         created_by=created_by)
         type_ids[type_name] = type_id
         for r in recs:
             cat_id_ = dal.upsert_threat_catalogue(sess, r["threat_name"], type_id, None,
-                                                  description=r["description"], source=tag)
+                                                  description=r["description"], source=tag,
+                                                  created_by=created_by)
             for c in r["categories"]:
                 new_links += dal.link_catalogue_category(sess, cat_id_, cat_ids[c])
     return {"types": len(by_type), "threats": len(records), "new_category_links": new_links,
@@ -476,8 +520,13 @@ def apply_ot_rules(sess, records: list[dict], type_ids: dict[str, int], tag: str
 
 
 def run_import(sess, source: str, *, file_content: str | None = None, via_taxii: bool = False,
-               max_actors: int = 40, dry_run: bool = False) -> dict:
+               max_actors: int = 40, dry_run: bool = False, started_by: str | None = None) -> dict:
     """The one entry point both front doors (CLI script, Celery task) call.
+
+    `started_by` is the caller's user id when the import arrived over HTTP; it becomes CreatedBy
+    on every row this run creates. With no caller (a direct task call, a test) it falls back to
+    'auto:<tag>', mirroring the literal upsert_threat_rule already writes for auto-generated
+    scoring rules — so "who added this" is never silently blank.
 
     Returns, for every source: {source, dry_run, skipped_count, skipped (first
     _SKIPPED_CAP entries)}. Catalogue-shaped sources add {types, threats,
@@ -490,6 +539,7 @@ def run_import(sess, source: str, *, file_content: str | None = None, via_taxii:
         raise ThreatLibraryImportError(f"unknown source {source!r} — valid: {sorted(URLS)}")
     data = load(source, file_content, via_taxii)
     tag = SOURCE_TAGS[source]
+    created_by = started_by or f"auto:{tag}"
     result: dict = {"source": source, "dry_run": dry_run}
 
     if source == "misp_actors":
@@ -506,7 +556,10 @@ def run_import(sess, source: str, *, file_content: str | None = None, via_taxii:
                 "expected format") from exc
         if not dry_run:
             for a in actors:
-                dal.upsert_threat_actor(sess, a)
+                # tag ('misp_galaxy') was a dead SOURCE_TAGS entry until Threat_Actor gained a
+                # Source column — with no column to write it to, an imported actor was
+                # indistinguishable from an AI-promoted one and the inventory API counted them all.
+                dal.upsert_threat_actor(sess, a, source=tag, created_by=created_by)
         # actors_upserted must not claim writes a dry run never made, and zero usable records
         # has to read as a problem here exactly as it does for every other source.
         result["actors_upserted"] = 0 if dry_run else len(actors)
@@ -536,7 +589,7 @@ def run_import(sess, source: str, *, file_content: str | None = None, via_taxii:
                 result["ot_rules"] = apply_ot_rules(sess, records, {}, tag, dry_run=True)
             result["after_count"] = result["before_count"]
         else:
-            stats = import_records(sess, records, tag)
+            stats = import_records(sess, records, tag, created_by=created_by)
             type_ids = stats.pop("type_ids")
             result.update(stats)
             if source in OT_SOURCES:

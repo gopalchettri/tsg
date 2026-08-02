@@ -3,7 +3,8 @@
 
 Thin CLI wrapper — ALL real logic lives in app/pipeline/threat_library_import.py
 (shared with the tsg.import_threat_library Celery task behind
-POST /v1/tsg/threat-library/import, so the API and this script can never drift).
+POST /v1/tsg/threat-library/sources/{source}/import, so the API and this script can
+never drift).
 
 Sources (all free/open; license: MITRE catalogs + CAPEC are free with attribution,
 pytm is MIT, Threat Composer is Apache-2.0, MISP galaxy is CC0):
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import getpass
 import os
 import sys
 
@@ -58,6 +60,12 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="show what would be imported; write nothing")
     parser.add_argument("--max-actors", type=int, default=40,
                         help="misp_actors only: cap on imported actors (they feed the prompt hint)")
+    # A CLI run has no authenticated caller, so without this the only recoverable answer to
+    # "who imported these rows?" would be the source tag. Defaults to the OS user rather than
+    # leaving it blank — an operator running this on a server is exactly who CreatedBy means.
+    parser.add_argument("--as-user", default=f"cli:{getpass.getuser()}",
+                        help="recorded as CreatedBy on the rows this import creates "
+                             "(default: cli:<os-user>)")
     args = parser.parse_args()
 
     configure_logging()
@@ -70,7 +78,7 @@ def main() -> int:
         with db_session() as sess:
             result = run_import(sess, args.source, file_content=file_content,
                                 via_taxii=args.via == "taxii", max_actors=args.max_actors,
-                                dry_run=args.dry_run)
+                                dry_run=args.dry_run, started_by=args.as_user)
     except ThreatLibraryImportError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

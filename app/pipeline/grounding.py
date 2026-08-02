@@ -17,6 +17,7 @@ import json
 import math
 import statistics
 from dataclasses import dataclass, field
+from types import ModuleType
 from typing import Any, Callable, Sequence
 
 from sqlalchemy import func, or_, select
@@ -37,7 +38,8 @@ log = get_logger(__name__)
 # which at Control_Library scale (1,288 rows x 1,024 dims) costs whole seconds of CPU per query
 # on a gevent worker. The pure-Python branch below stays as the no-numpy fallback.
 try:
-    import numpy as _np
+    import numpy
+    _np: ModuleType | None = numpy
 except ImportError:  # pragma: no cover — exercised only in numpy-less deployments
     _np = None
 
@@ -345,6 +347,8 @@ def _shortlist_via_matrix(qv: list[float], rows: list[dict[str, Any]],
     """Matrix-path scoring: one `matrix @ q_unit` against embeddings.get_matrix's cached,
     pre-normalized matrix instead of len(rows) dot products. Returns None on a query/matrix
     dimension mismatch — caller falls back to the dict path, which logs per candidate."""
+    if _np is None:  # unreachable via get_matrix (it returns None without numpy) — typed fallback
+        return None
     mat, row_indexes = matrix_info
     if mat.shape[1] != len(qv):
         return None

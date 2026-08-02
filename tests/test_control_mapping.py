@@ -250,6 +250,97 @@ def test_itot_family_recognizes_platform_vocabulary():
     assert _resolve_itot({"asset_type": "IT"}, [{"asset_type": "Operational Technology (OT)"}]) is None
 
 
+def test_scenario_merge_replaces_raw_suggestions_and_recovers_why():
+    """The API delivers ONE control list, nested: the grounded library matches replace the LLM's
+    raw {name, why} suggestions inside `scenario`. `why` is never persisted (only `name[:500]`
+    lands in SuggestedControl), so it has to be recovered from the raw list at read time —
+    which is also what makes it work for sessions mapped before the field existed."""
+    from app.api.schemas import MappedControl
+    from app.api.sessions import _scenario_with_controls
+
+    long_name = "L" * 600  # SuggestedControl is truncated to 500 — the lookup must still match
+    scenario_json = json.dumps({
+        "scenario_title": "T", "scenario_statement": "S", "risk_statement": "R",
+        "controls": [{"name": "Multi-Factor Authentication", "why": "stops stolen passwords"},
+                     {"name": long_name, "why": "long-name rationale"},
+                     {"name": "Never Grounded", "why": "no library counterpart"}],
+    })
+
+    def mapped(suggested, rank):
+        return MappedControl(control_library_id=rank, control_code=f"CII-CID-00{rank}",
+                             domain="D", control_name="N", rank=rank, score=90.0,
+                             suggested_control=suggested, standards=[])
+
+    merged = _scenario_with_controls(scenario_json, [
+        mapped("Multi-Factor Authentication", 1), mapped(long_name[:500], 2), mapped(None, 3)])
+
+    assert merged["scenario_title"] == "T"  # the narrative itself is untouched
+    controls = merged["controls"]
+    # the raw {name, why} shape is gone; both halves resurface on the grounded entries
+    assert all("name" not in c and c["control_code"] for c in controls)
+    assert controls[0]["suggested_control"] == "Multi-Factor Authentication"
+    assert controls[0]["suggested_why"] == "stops stolen passwords"
+    assert controls[1]["suggested_why"] == "long-name rationale"  # matched past the truncation
+    assert controls[2]["suggested_why"] is None  # scenario-text fallback carries no suggestion
+    assert len(controls) == 3
+
+    # ...and every raw suggestion survives under its own key, INCLUDING "Never Grounded", which has
+    # no counterpart in `controls`. That difference is the library-gap signal: overwriting the raw
+    # list outright made a suggestion the library couldn't satisfy vanish without trace.
+    assert merged["suggested_controls"] == [
+        {"name": "Multi-Factor Authentication", "why": "stops stolen passwords"},
+        {"name": long_name, "why": "long-name rationale"},
+        {"name": "Never Grounded", "why": "no library counterpart"}]
+    assert "Never Grounded" not in {c["suggested_control"] for c in controls}
+
+    # Nothing mapped yet (the ~4-min window before Step-4 runs): `controls` is empty, but the
+    # model's suggestions are already there — blanking both is what made an in-progress read look
+    # like the model had proposed nothing at all.
+    in_progress = _scenario_with_controls(scenario_json, [])
+    assert in_progress["controls"] == []
+    assert [c["name"] for c in in_progress["suggested_controls"]] == [
+        "Multi-Factor Authentication", long_name, "Never Grounded"]
+
+    # a pre-v1.3 scenario has no `controls` key at all — empty, not a crash
+    assert _scenario_with_controls(json.dumps({"scenario_title": "T"}), [])["suggested_controls"] == []
+    # unusable entries (missing/blank name, non-dict) are dropped rather than emitted half-formed
+    junk = json.dumps({"controls": [{"why": "no name"}, {"name": "   "}, "not even a dict"]})
+    assert _scenario_with_controls(junk, [])["suggested_controls"] == []
+    # a failed generation has no scenario at all, and must not become an empty dict
+    assert _scenario_with_controls(None, []) is None
+
+    # unmatched_suggestions precomputes the exact library-gap diff: "Never Grounded" is the only
+    # raw suggestion with no counterpart naming it in a mapped control's suggested_control.
+    assert merged["unmatched_suggestions"] == [{"name": "Never Grounded", "why": "no library counterpart"}]
+    # gated on controls_mapped: mapping hasn't run yet -> null, not a misleading "everything unmatched"
+    unmapped = _scenario_with_controls(scenario_json, [
+        mapped("Multi-Factor Authentication", 1), mapped(long_name[:500], 2), mapped(None, 3)], False)
+    assert unmapped["unmatched_suggestions"] is None
+
+
+def test_a_non_object_scenario_json_degrades_to_null_not_a_500():
+    """_safe_scenario_json's whole job is that ONE corrupted row never hides every other scenario
+    in the session. It caught malformed text, but valid JSON that isn't an object parsed fine and
+    then died in response validation — a 500 for the entire endpoint."""
+    from app.api.sessions import _safe_scenario_json
+
+    for not_a_scenario in ("[1,2]", "null", '"a bare string"', "42", "not json at all", "", None):
+        assert _safe_scenario_json(not_a_scenario) is None, not_a_scenario
+    assert _safe_scenario_json('{"scenario_title": "T"}') == {"scenario_title": "T"}
+
+
+def test_controls_mapped_flag_mirrors_the_attempt_stamp():
+    """`controls_mapped` is the ONLY thing separating "mapping ran, nothing in the library
+    matched" from "mapping hasn't run yet" — both of which show an empty scenario.controls."""
+    from app.api.sessions import _scenario_result
+
+    row = {"OutputID": guid(), "ThreatID": guid(), "SubsystemID": ASSET_UNIT_ID, "ScenarioJSON": None,
+           "Accepted": 0, "ValidationJSON": None, "GenerationEpoch": 1, "ScenarioNumber": 1,
+           "ControlsMappedAt": None}
+    assert _scenario_result(row).controls_mapped is False
+    assert _scenario_result({**row, "ControlsMappedAt": now()}).controls_mapped is True
+
+
 def test_min_score_follows_model_pair_unless_pinned():
     """Fix #2: pinned env value wins; otherwise the per-model-pair confirm threshold applies —
     the cutoff follows the models per environment instead of a one-size-fits-none constant."""
@@ -282,9 +373,15 @@ def test_attempt_stamp_stops_rescan_even_with_zero_matches(db, stub_llm):
     assert calls == []  # second run fetched nothing — no model work at all
 
 
-def test_supersede_deletes_control_map_rows(db, stub_llm):
-    """Fix #6: superseding an output deletes its map rows in the same operation — the
-    'superseded ⇒ no map rows' invariant is enforced at the cause."""
+def test_supersede_keeps_control_map_rows(db, stub_llm):
+    """Superseding an output KEEPS its map rows (2026-07-30, replacing the former
+    'superseded ⇒ no map rows' invariant).
+
+    That invariant rested on "a superseded scenario is unreachable through the API, so its old
+    map rows are pure dead weight". GET /results?include_replaced=true makes them reachable, so a
+    reviewer comparing an old version against its replacement gets the controls it actually
+    mapped to — and once deleted those are unrecoverable. This assertion is the point of the
+    change: it fails against the old delete-on-supersede behaviour."""
     from app.db import dal
 
     _seed_controls(db)
@@ -292,10 +389,12 @@ def test_supersede_deletes_control_map_rows(db, stub_llm):
                                       "controls": [{"name": "Multi-Factor Authentication", "why": ""}]})
     map_controls(db, SESSION, {"asset_type": "it"}, None, stub_llm, ASSET_UNIT_ID, TASK, 1)
     db.commit()
-    assert db.execute(select(m.Threat_Scenario_Control_Map).filter_by(OutputID=oid)).scalars().all()
+    before = db.execute(select(m.Threat_Scenario_Control_Map).filter_by(OutputID=oid)).scalars().all()
+    assert before
     dal.supersede(db, m.Threat_Scenario_Output, SID, ASSET_UNIT_ID)
     db.commit()
-    assert db.execute(select(m.Threat_Scenario_Control_Map).filter_by(OutputID=oid)).scalars().all() == []
+    after = db.execute(select(m.Threat_Scenario_Control_Map).filter_by(OutputID=oid)).scalars().all()
+    assert len(after) == len(before)
 
 
 def test_resolve_names_accepts_control_name_prefix():
@@ -334,7 +433,6 @@ def test_map_controls_failure_leaves_session_usable(db, stub_llm, monkeypatch):
     """Reviewer finding (2026-07-26): a failure mid-write must roll back so the caller's
     finish_stage doesn't die on a poisoned session — enrichment failure never fails the stage."""
     from app.db import dal
-    from app.pipeline import control_mapping
 
     _seed_controls(db)
     _seed_stage_and_output(db, {"scenario_title": "T", "scenario_statement": "S",

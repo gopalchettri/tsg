@@ -1,10 +1,10 @@
 # Production image for the TSG service (API + Celery worker + beat share this image).
 # Build:  docker build -t tsg:latest .
-#   DEFAULT includes local in-process models (matches EMBEDDING/RERANKER_PROVIDER=local); pulls torch (large).
-#   Slim image for the proxy path instead:  --build-arg EXTRAS=prod
+#   DEFAULT is the slim proxy-path image (EMBEDDING/RERANKER_PROVIDER=litellm_proxy).
+#   For local in-process models (pulls torch, large):  --build-arg EXTRAS=prod,local
 FROM python:3.12-slim AS base
 
-ARG EXTRAS=prod,local
+ARG EXTRAS=prod
 
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 
@@ -20,15 +20,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY pyproject.toml ./
+# requirements.lock pins the prod dependency set (regenerate with:
+#   uv pip compile pyproject.toml --extra prod -o requirements.lock --python-platform linux --python-version 3.12
+# ) so two builds of the same commit install identical versions. pyproject.toml stays canonical.
+COPY pyproject.toml requirements.lock ./
 COPY app ./app
 # scripts/ carries the schema: database-first, TSG_Core.sql is the only thing that
 # creates the baseline tables (see scripts/readme.txt). No migration tool in the image.
 COPY scripts ./scripts
-RUN pip install -e ".[${EXTRAS}]"
+RUN pip install -r requirements.lock && pip install -e ".[${EXTRAS}]"
 
-# Run as a non-root user (OpenShift-friendly).
-RUN useradd -u 10001 -m appuser && chown -R appuser /app
+# Run as a non-root user. OpenShift's restricted-v2 SCC assigns a RANDOM uid in group 0,
+# so /app must be group-0 writable (chmod g=u) — uid 10001 is only the non-OpenShift default.
+RUN useradd -u 10001 -m appuser && chown -R appuser:0 /app && chmod -R g=u /app
 USER 10001
 
 EXPOSE 8000

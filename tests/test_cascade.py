@@ -317,9 +317,12 @@ def test_write_scenarios_target_excluded_by_rescoring_leaves_old_scenario_untouc
     threats = dal.active_threats(db, sid, ASSET_UNIT_ID)
     monkeypatch.setattr(get_settings(), "scoping_score_threshold", 71.0)  # this threat scores exactly 70
 
-    with pytest.raises(RegenerateConflict):
+    with pytest.raises(RegenerateConflict) as exc_info:
         write_scenarios(db, session, [SUB], DEFAULT_ASSET_CONTEXT, threats, StubLLM(),
                         "44444444-4444-4444-8444-444444444444", epoch=epoch, target_threat_ids={threat_id})
+    # a non-empty target_threat_ids that all rescored out is the "excluded" case, not "no unserved
+    # threats" -- distinct reason code so next_set_result/regen_result can tell them apart
+    assert exc_info.value.reason == "new_threat_did_not_qualify"
 
     # destroyed-with-no-replacement is exactly the bug -- the old scenario must still be active
     assert db.execute(select(m.Threat_Scenario_Output.Superseded)
@@ -351,9 +354,15 @@ def test_regen_target_no_longer_selected_returns_to_review_without_losing_the_sc
     outcome = cascade.run_regeneration(db, session, ASSET_UNIT_ID, RegenGranularity.scenario, [target], epoch,
                                     _TwoThreatLLM(), "55555555-5555-4555-8555-555555555555")
     assert outcome == "review"  # no exception escapes -- a benign conflict, not a recorded failure
-    # fruitless regen still announces itself: regen_result with an empty new_output_ids
+    # fruitless regen still announces itself: regen_result with an empty new_output_ids, PLUS a
+    # reason/detail/message triple so the UI/end user learns why, not just that nothing happened
     regen_events = [e for e in published if str(e.get("type")) == "regen_result"]
     assert len(regen_events) == 1 and regen_events[0]["new_output_ids"] == []
+    assert regen_events[0]["reason"] == "new_threat_did_not_qualify"
+    assert regen_events[0]["message"] == (
+        "We found something new, but it didn't meet our criteria for this "
+        "asset, so we didn't create a scenario for it.")
+    assert regen_events[0]["detail"]  # developer-facing text present, never shown to the end user
 
     active = db.execute(select(func.count()).select_from(m.Threat_Scenario_Output).where(
         m.Threat_Scenario_Output.SessionID == sid, m.Threat_Scenario_Output.Superseded == 0)).scalar()
@@ -361,6 +370,50 @@ def test_regen_target_no_longer_selected_returns_to_review_without_losing_the_sc
     for output_id in (target, sibling):
         assert db.execute(select(m.Threat_Scenario_Output.Superseded)
                         .where(m.Threat_Scenario_Output.OutputID == output_id)).scalar() == 0
+
+
+def test_reason_info_known_and_unknown_codes():
+    """_reason_info is the single source of truth for the detail/message pair riding along
+    next_set_result/regen_result and their audit rows -- a known code returns both, an
+    unrecognized or absent one (e.g. the target-went-stale race, which sets no reason today)
+    returns both as None rather than raising, so callers can always spread it in unconditionally."""
+    found = cascade._reason_info("no_new_threats_found")
+    assert found["message"] == (
+        "There's nothing new to add. We've already created a scenario for every "
+        "threat we know about for this asset.")
+    assert found["detail"]
+
+    qualify = cascade._reason_info("new_threat_did_not_qualify")
+    assert qualify["message"] == (
+        "We found something new, but it didn't meet our criteria for this "
+        "asset, so we didn't create a scenario for it.")
+    assert qualify["detail"]
+
+    assert cascade._reason_info(None) == {"detail": None, "message": None}
+    assert cascade._reason_info("some_future_code_nobody_mapped_yet") == {"detail": None, "message": None}
+
+
+def test_get_threat_id_to_redo_reason_codes(db):
+    """get_threat_id_to_redo's two RegenerateConflict raises each carry a distinct reason so a
+    synchronous 409 (errors.py::_handle_regenerate_conflict) can tell "nothing was even
+    requested" from "the requested id(s) are stale/superseded/foreign" without parsing prose."""
+    from app.db.dal import RegenerateConflict
+
+    sid = _run_to_review(db, StubLLM())
+    real_output_id = _output_ids(db, sid)[0]
+
+    with pytest.raises(RegenerateConflict) as no_ids:
+        cascade.get_threat_id_to_redo(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario, [])
+    assert no_ids.value.reason == "no_target_ids"
+
+    with pytest.raises(RegenerateConflict) as stale_id:
+        cascade.get_threat_id_to_redo(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario,
+                                    ["00000000-0000-4000-8000-000000000000"])
+    assert stale_id.value.reason == "output_not_found_or_superseded"
+
+    # sanity: the real, active id resolves fine and needs no reason at all
+    assert cascade.get_threat_id_to_redo(db, sid, ASSET_UNIT_ID, RegenGranularity.scenario,
+                                        [real_output_id])
 
 
 # --- prompt-quality fix: threat context threading survives the regen cascade ---
