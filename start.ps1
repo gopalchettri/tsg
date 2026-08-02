@@ -59,7 +59,7 @@ $ErrorActionPreference = 'Stop'
 
 $venvActivate = Join-Path $ProjectRoot '.venv\Scripts\Activate.ps1'
 if (-not (Test-Path $venvActivate)) {
-    throw "venv not found at $venvActivate. From $ProjectRoot run:`n  python -m venv .venv`n  ./.venv/Scripts/pip install -e `".[dev]`""
+    throw "venv not found at $venvActivate. From $ProjectRoot run:`n  python -m venv .venv`n  ./.venv/Scripts/pip install -e `".[dev]`"`n  ./.venv/Scripts/pip install -e `".[local]`"  # sentence-transformers, needed by the default EMBEDDING/RERANKER_PROVIDER=local"
 }
 
 # Always address the venv's own celery.exe by full path. A bare `celery` resolves

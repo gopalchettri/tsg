@@ -26,6 +26,11 @@ python -m pip install --upgrade pip
 #    exists too, but only for tooling that can't read pyproject.toml (e.g. Docker).
 pip install -e ".[dev]"
 
+# EMBEDDING_PROVIDER/RERANKER_PROVIDER default to "local" (see .env.example) -- that
+# needs sentence-transformers, which is NOT part of [dev]. Without this, the Celery
+# worker fails fast at boot with "sentence-transformers is not installed".
+pip install -e ".[local]"
+
 # 5. Verify no dependency conflicts
 pip check
 
