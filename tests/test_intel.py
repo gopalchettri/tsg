@@ -26,7 +26,10 @@ _KEV = {"vulnerabilities": [
 _URLHAUS = [{"url": "http://bad.example/x", "urlhaus_reference": "https://urlhaus.abuse.ch/url/1/",
              "threat": "malware_download"}]
 
-_OTX = {"results": [{"id": "p1", "name": "Campaign X", "description": "d", "tags": ["ot"]}]}
+_OTX = {"results": [
+    {"id": "p1", "name": "Campaign X", "description": "d", "tags": ["ot"], "adversary": "Toy Ghouls"},
+    {"id": "p2", "name": "Campaign Y", "description": "d", "tags": []},
+]}
 
 
 class _Resp:
@@ -78,7 +81,30 @@ def test_fetch_otx_parses_pulses(monkeypatch):
     monkeypatch.setattr(fetchers, "_get", _Resp(_OTX))
     s = get_settings().model_copy(update={"intel_otx_api_key": "k"})
     docs = fetchers.fetch_otx(s)
-    assert len(docs) == 1 and docs[0]["kind"] == "pulse" and docs[0]["source"] == "otx"
+    assert len(docs) == 2 and all(d["kind"] == "pulse" and d["source"] == "otx" for d in docs)
+    # adversary → prepended to the title (the prompt shows only the first 140 title chars,
+    # so front placement is what guarantees it survives) and inserted as the first tag
+    assert docs[0]["title"] == "[Toy Ghouls] Campaign X"
+    assert docs[0]["tags"][0] == "toy ghouls" and "ot" in docs[0]["tags"]
+    # no adversary → title and tags untouched
+    assert docs[1]["title"] == "Campaign Y" and docs[1]["tags"] == []
+
+
+def test_fetch_intel_includes_library_actors(monkeypatch):
+    """The threat's library actors must reach query_intel's terms — that is what lets a
+    pulse tagged with its adversary (fetch_otx) surface for an actor-linked threat."""
+    from app.pipeline import tasks
+
+    captured = {}
+
+    def fake_query(terms, prefer_kinds=("cve",), limit=5):
+        captured["terms"] = list(terms)
+        return []
+
+    monkeypatch.setattr(fetchers, "query_intel", fake_query)
+    tasks._fetch_intel("Ransomware", "Production server encryption", ["Toy Ghouls"])
+    assert "Toy Ghouls" in captured["terms"]  # whole name, never word-split
+    assert "Ransomware" in captured["terms"]
 
 
 def test_only_prompt_kinds_reach_prompts():

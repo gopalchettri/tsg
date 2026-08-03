@@ -314,7 +314,8 @@ def _moderation_report(scenario: dict) -> dict:
 _OT_TYPE_PREFIXES = ("ICS", "Embedded Device")
 
 
-def _fetch_intel(threat_type: str | None, threat_name: str | None) -> list[dict] | None:
+def _fetch_intel(threat_type: str | None, threat_name: str | None,
+                 actors: list[str] | None = None) -> list[dict] | None:
     """Current threat-intel items for one verified threat, or None. Fail-open and opt-in
     (TSG_INTEL_ENABLED): any error, disabled flag, or empty result returns None and generation
     proceeds unchanged. OT threats prefer ICS advisories; everything else prefers exploited CVEs."""
@@ -325,8 +326,11 @@ def _fetch_intel(threat_type: str | None, threat_name: str | None) -> list[dict]
 
         is_ot = (threat_type or "").startswith(_OT_TYPE_PREFIXES)
         prefer = ("ics_advisory", "cve") if is_ot else ("cve",)
-        # match on the threat wording; query_intel drops terms shorter than 4 chars itself
+        # match on the threat wording; query_intel drops terms shorter than 4 chars itself.
+        # Library actors are passed WHOLE (never word-split) — fetch_otx tags pulses with
+        # their adversary, so "APT 29" here is what surfaces that actor's current pulses.
         terms = [w for w in re.split(r"[^A-Za-z0-9]+", f"{threat_type} {threat_name}") if w]
+        terms += [a for a in (actors or []) if a]
         return query_intel(terms, prefer_kinds=prefer) or None
     except Exception:  # noqa: BLE001 — enrichment is optional, never breaks generation
         log.warning("scenario.intel_fetch_failed", exc_info=True)
@@ -350,7 +354,7 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     threat_type = info.get("library_threat_type") or info.get("threat_type")
     threat_name = info.get("library_threat_name") or info.get("threat_name")
     actors = info.get("actors") or []
-    intel_items = _fetch_intel(threat_type, threat_name)
+    intel_items = _fetch_intel(threat_type, threat_name, actors)
     if sibling_texts:
         messages = prompts.variant_scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
                                                 intel_items=intel_items, existing=sibling_texts)

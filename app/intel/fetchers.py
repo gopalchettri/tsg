@@ -60,6 +60,9 @@ def _intel_store():
         socketTimeoutMS=max(s.mongo_connect_timeout_ms, 30000),  # bulk upserts of ~1k docs
     )[s.mongo_db]["threat_intel"]
     col.create_index([("source", 1), ("external_id", 1)], unique=True)
+    # query_intel filters per kind and sorts newest-first — let each per-kind query walk
+    # exactly its kind partition in sort order instead of scanning via the TTL index.
+    col.create_index([("kind", 1), ("fetched_at", -1)])
     ttl_seconds = s.intel_ttl_days * 86400
     try:
         col.create_index("fetched_at", expireAfterSeconds=ttl_seconds, name="ttl_fetched_at")
@@ -194,11 +197,18 @@ def fetch_otx(s) -> list[dict]:
     data = json.loads(_get(s.intel_otx_url, headers={"X-OTX-API-KEY": s.intel_otx_api_key}))
     docs = []
     for p in data.get("results", []):
+        # Attribution survives into the prompt only via the title (prompts._intel_block emits
+        # id/title/url alone, title capped at 140 chars) — prepend so truncation can never drop
+        # it. The tag makes actor-linked threats matchable (tasks._fetch_intel adds library
+        # actors to query_intel's terms).
+        adv = (p.get("adversary") or "").strip()
+        title = f"[{adv}] {p.get('name', '')}" if adv else p.get("name", "")
+        tags = ([adv.lower()] if adv else []) + [t for t in (p.get("tags") or [])]
         docs.append(_doc(
-            "otx", "pulse", p.get("id", ""), p.get("name", ""),
+            "otx", "pulse", p.get("id", ""), title,
             description=p.get("description", ""),
             url=f"https://otx.alienvault.com/pulse/{p.get('id', '')}",
-            tags=[t for t in (p.get("tags") or [])][:20], raw=None))
+            tags=tags[:20], raw=None))
     return docs
 
 
