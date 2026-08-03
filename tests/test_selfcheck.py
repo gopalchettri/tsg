@@ -41,6 +41,7 @@ def test_check_dead_threat_rules_ignores_inactive_and_deleted_rows(db):
 
 def test_run_self_checks_reports_dead_threat_rules(db):
     _insert_rule(db, 1, "internet_facing")
+    _seed_context_fields(db)  # keep the empty-context-group alarm out of this test's subject
     assert run_self_checks(db) == ["dead_threat_rules"]
 
 
@@ -79,25 +80,20 @@ def test_check_ctm_scan_category_names_tolerates_whitespace_like_the_runtime_mat
     assert check_ctm_scan_category_names(db) is None
 
 
-# --- check_dead_context_fields: Context_Field_Config rows vs prompts.py's hardcoded ceiling ---
+# --- check_dead_context_fields: Context_Field_Config rows under an unrecognized ContextGroup ---
 def _insert_field(db, group, field_name, *, is_active=True, is_deleted=False):
     db.execute(insert(m.Context_Field_Config).values(
         ContextGroup=group, FieldName=field_name, IsActive=is_active, IsDeleted=is_deleted))
 
 
-def test_check_dead_context_fields_quiet_when_every_active_field_is_on_the_ceiling(db):
+def test_check_dead_context_fields_quiet_for_any_field_under_a_valid_group(db):
     from app.pipeline.selfcheck import check_dead_context_fields
 
     _insert_field(db, "asset", "critical_service")
     _insert_field(db, "subsystem", "vendor_name")
+    # No hardcoded ceiling any more: an unknown FieldName is a curator's business, not drift.
+    _insert_field(db, "asset", "critical_srevice")  # typo — inert, not reported
     assert check_dead_context_fields(db) is None
-
-
-def test_check_dead_context_fields_fires_for_an_unrecognized_field_name(db):
-    from app.pipeline.selfcheck import check_dead_context_fields
-
-    _insert_field(db, "asset", "critical_srevice")  # typo
-    assert check_dead_context_fields(db) == "dead_context_fields"
 
 
 def test_check_dead_context_fields_fires_for_an_unrecognized_context_group(db):
@@ -110,9 +106,25 @@ def test_check_dead_context_fields_fires_for_an_unrecognized_context_group(db):
 def test_check_dead_context_fields_ignores_inactive_and_deleted_rows(db):
     from app.pipeline.selfcheck import check_dead_context_fields
 
-    _insert_field(db, "asset", "critical_srevice", is_active=False)
-    _insert_field(db, "asset", "another_typo", is_deleted=True)
+    # Active rows in both real groups keep the empty-group alarm quiet; the bad-group rows are
+    # inactive/deleted and must not count as drift.
+    _insert_field(db, "asset", "critical_service")
+    _insert_field(db, "subsystem", "vendor_name")
+    _insert_field(db, "Asset", "critical_service", is_active=False)
+    _insert_field(db, "SUBSYSTEM", "vendor_name", is_deleted=True)
     assert check_dead_context_fields(db) is None
+
+
+def test_check_dead_context_fields_fires_when_a_group_has_no_active_rows(db):
+    # prompts.py fails closed — a group with no active rows sends nothing to the model — so an
+    # unseeded table or an all-off group must alarm instead of degrading quality silently.
+    from app.pipeline.selfcheck import check_dead_context_fields
+
+    assert check_dead_context_fields(db) == "empty_context_group"  # unseeded: both groups empty
+    _insert_field(db, "asset", "critical_service")
+    assert check_dead_context_fields(db) == "empty_context_group"  # subsystem still empty
+    _insert_field(db, "subsystem", "vendor_name")
+    assert check_dead_context_fields(db) is None  # both groups populated
 
 
 def test_check_ctm_scan_category_names_quiet_when_no_asset_type_rules_exist(db):
@@ -157,6 +169,7 @@ def test_run_self_checks_includes_llm_slots_only_when_enabled(db, monkeypatch):
     monkeypatch.setattr(get_settings(), "max_concurrent_llm_calls", 1)
     monkeypatch.setattr(get_settings(), "llm_slots_warn_ratio", 0.1)
     monkeypatch.setattr("app.pipeline.llm.current_llm_slot_count", lambda: 1)
+    _seed_context_fields(db)  # keep the empty-context-group alarm out of this test's subject
     assert run_self_checks(db) == ["llm_slots_high"]
 
 
@@ -289,18 +302,28 @@ def test_run_self_checks_includes_litellm_proxy_health_only_when_a_provider_uses
     assert "litellm_proxy_health" not in run_self_checks(db)
     monkeypatch.setattr(get_settings(), "llm_provider", "litellm_proxy")
     monkeypatch.setattr(httpx, "Client", lambda *a, **k: _FakeHttpClient(_FakeHttpResponse()))
+    _seed_context_fields(db)  # keep the empty-context-group alarm out of this test's subject
     assert run_self_checks(db) == []  # check ran (provider now routes through the proxy) but stayed quiet
+
+
+def _seed_context_fields(db):
+    """Both groups populated, so the empty-context-group alarm stays quiet in tests whose
+    subject is a different check."""
+    _insert_field(db, "asset", "critical_service")
+    _insert_field(db, "subsystem", "vendor_name")
 
 
 def test_run_self_checks_skips_mssql_only_checks_on_sqlite(db):
     # engine fixture runs on SQLite; the 3 tempdb/pool checks must not even attempt to
     # run there (they'd error against a database with no sys.dm_tran_* views).
+    _seed_context_fields(db)
     assert run_self_checks(db) == []
 
 
 def test_run_self_checks_reports_active_sessions_high_on_sqlite(db, monkeypatch):
     monkeypatch.setattr(get_settings(), "max_active_sessions", 1)
     _seed_session(db, asset_id=100)
+    _seed_context_fields(db)
     assert run_self_checks(db) == ["active_sessions_high"]
 
 
@@ -310,6 +333,7 @@ def test_run_self_checks_isolates_one_check_failure_from_the_rest(db, monkeypatc
         "app.pipeline.selfcheck.check_active_sessions",
         lambda sess: (_ for _ in ()).throw(RuntimeError("boom")),
     )
+    _seed_context_fields(db)
     assert run_self_checks(db) == []  # the broken check contributes nothing; no exception propagates
 
 

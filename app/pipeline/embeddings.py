@@ -334,29 +334,34 @@ def delete_cached(group: str, names: list[str] | None = None, *, strict: bool = 
 
 
 def _thresholds_col():
-    """Sibling collection holding per-model-pair grounding thresholds. None when Mongo is
-    unavailable — callers degrade to the static defaults."""
+    """Sibling collection holding the per-model-pair grounding threshold. None when Mongo is
+    unavailable — callers degrade to the static default."""
     col = _store_if_healthy()
     if col is None:
         return None
     return col.database["grounding_thresholds"]
 
 
-def load_thresholds(model_pair: tuple[str, str]) -> tuple[float, float] | None:
-    """Stored (grounded_th, confirm_th) for this exact (embedding_model, reranker_model) pair,
-    or None (not calibrated yet / Mongo unreachable)."""
+def load_thresholds(model_pair: tuple[str, str]) -> float | None:
+    """Stored match_th for this exact (embedding_model, reranker_model) pair, or None (not
+    calibrated yet / Mongo unreachable).
+
+    A doc written before the two-band collapse carries `grounded_th`/`confirm_th` and no
+    `match_th`, so `doc.get` misses and this reads as "not calibrated" — one free re-calibration
+    per model pair, never a KeyError."""
     try:
         col = _thresholds_col()
         if col is None:
             return None
         doc = col.find_one({"embedding_model": model_pair[0], "reranker_model": model_pair[1]})
-        return (float(doc["grounded_th"]), float(doc["confirm_th"])) if doc else None
+        raw = doc.get("match_th") if doc else None
+        return float(raw) if raw is not None else None
     except Exception:  # noqa: BLE001 — degrade-safe: an unreadable store means "not calibrated"
         log.warning("embeddings.load_thresholds_failed", exc_info=True)
         return None
 
 
-def store_thresholds(model_pair: tuple[str, str], grounded_th: float, confirm_th: float) -> None:
+def store_thresholds(model_pair: tuple[str, str], match_th: float) -> None:
     """Persist a calibration so every OTHER worker (and every later boot) reuses it instead of
     re-running the paraphrase+scoring pass. Upsert keyed on the model pair — two workers racing
     the same calibration simply write the same answer twice (bounded duplicate cost, no lock)."""
@@ -366,8 +371,8 @@ def store_thresholds(model_pair: tuple[str, str], grounded_th: float, confirm_th
             return
         col.update_one(
             {"embedding_model": model_pair[0], "reranker_model": model_pair[1]},
-            {"$set": {"grounded_th": grounded_th, "confirm_th": confirm_th,
-                    "computed_at": now().isoformat()}},
+            {"$set": {"match_th": match_th, "computed_at": now().isoformat()},
+            "$unset": {"grounded_th": "", "confirm_th": ""}},
             upsert=True)
     except Exception:  # noqa: BLE001 — losing the write only costs a later re-calibration
         log.warning("embeddings.store_thresholds_failed", exc_info=True)

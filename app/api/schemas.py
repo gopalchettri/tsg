@@ -11,6 +11,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import JsonDict
 
+# Typing the wire with these is what puts them in /openapi.json — the UI generates its own
+# string-literal unions from the spec instead of hand-copying codes out of the API guide.
+from app.core.enums import ClickOutcomeReason, NextSetOutcome, ReviewGateReason, SSEEventType
 from app.db.dal import canonical_guid
 
 # Plan item 1b: bound every list-of-targets field so one HTTP request can't turn into an
@@ -163,6 +166,53 @@ class RegenerateScenariosBody(BaseModel):
     _canonicalize_output_ids = field_validator("output_ids")(_canonical_output_ids)
 
 
+class NextSetSummary(BaseModel):
+    """What the most recent "generate next set" click on this session achieved.
+
+    THE DURABLE record, not a convenience copy. The `next_set_result` SSE event carries the same
+    facts, but publishing is best-effort behind a circuit breaker with no replay log
+    (app/sse/bus.py), so a client that polls instead of streaming — or whose stream dropped —
+    would otherwise never learn why a click delivered fewer scenarios than it asked for.
+
+    `epoch` is what makes this unambiguous. POST .../scenarios/next-set returns the epoch it
+    reserved; poll this endpoint until `last_next_set.epoch` equals it and you are reading YOUR
+    click's result rather than the previous one's. Without that comparison a client cannot tell a
+    finished click from a stale summary — precisely how a mid-flight read looks complete."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "outcome": "partial_retryable", "requested": 5, "delivered": 3,
+                "variants": 0, "reason": None, "epoch": 4,
+            }
+        }
+    )
+
+    outcome: NextSetOutcome = Field(
+        description=(
+            "What the click achieved. 'complete' = the full requested batch landed. "
+            "'partial_retryable' = fewer, because generation(s) failed — those threats stay "
+            "re-servable, so clicking 'generate next set' again RETRIES them. 'exhausted' = "
+            "fewer (possibly zero) because nothing further exists for this asset; clicking "
+            "again changes nothing. Switch on this rather than comparing counts: a short "
+            "result is sometimes the correct final answer, not a failure."
+        ),
+    )
+    requested: int = Field(description="Scenarios the click aimed to add (the configured next-set batch size).")
+    delivered: int = Field(description="Scenarios actually added — fresh plus variants.")
+    variants: int = Field(
+        description="How many of `delivered` are alternate takes on already-covered threats "
+                    "(ScenarioNumber > 1) rather than brand-new threats.",
+    )
+    reason: ClickOutcomeReason | None = Field(
+        default=None,
+        description="Why the click fell back to variants or came up empty; null when it simply succeeded.",
+    )
+    epoch: int = Field(
+        description="Generation epoch this summary describes — compare against the `epoch` "
+                    "returned by the POST that started the click.",
+    )
+
+
 class SessionProgress(BaseModel):
     """The session's asset-level progress: per-stage statuses plus a derived overall status. One
     flat object, not a list — the pipeline tracks the asset as a single unit of work (see
@@ -172,6 +222,10 @@ class SessionProgress(BaseModel):
             "example": {
                 "threats": "COMPLETE", "scenarios": "AWAITING_DECISION",
                 "overall": "awaiting_review", "error_message": None,
+                "last_next_set": {
+                    "outcome": "partial_retryable", "requested": 5, "delivered": 3,
+                    "variants": 0, "reason": None, "epoch": 4,
+                },
             }
         }
     )
@@ -185,6 +239,15 @@ class SessionProgress(BaseModel):
             "Client-safe failure reason for the most recent stage error, if any. Non-null "
             "on an awaiting_review board means the run failed mid-batch after generating "
             "some scenarios — the review set may be PARTIAL, not a complete run."
+        ),
+    )
+    last_next_set: NextSetSummary | None = Field(
+        default=None,
+        description=(
+            "Outcome of the most recent 'generate next set' click, or null if none has run. "
+            "Compare `last_next_set.epoch` against the `epoch` returned by the POST that "
+            "started your click: while they differ, your click is still in flight and this "
+            "summary describes an EARLIER one."
         ),
     )
 
@@ -245,7 +308,7 @@ class ThreatResult(BaseModel):
                 "threat_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
                 "threat_type": "Spoofing",
                 "threat_name": "Unauthorized RTU firmware update",
-                "grounding_status": "grounded",
+                "grounding_status": "verified",
                 "threat_catalogue_id": 42,
             }
         }
@@ -256,12 +319,15 @@ class ThreatResult(BaseModel):
     threat_name: str | None = Field(description="Human-readable threat name.")
     grounding_status: str = Field(
         description=(
-            "Match confidence against the threat library: grounded (high confidence), "
-            "confirm (moderate), or flagged (no confident match)."
+            "Whether this threat matched an approved threat-library entry: `verified` (it did) "
+            "or `unverified` (no confident match — a novel candidate, still scenario-generated "
+            "and eligible for library promotion on accept)."
         )
     )
     threat_catalogue_id: int | None = Field(
-        description="Id of the matched threat-catalogue master row, when grounded/confirmed. Null when flagged."
+        description="Id of the matched threat-catalogue master row. Usually null when unverified — "
+                    "though a threat can be unverified on its NAME while still carrying a real "
+                    "catalogue id from a candidate that scored just under the cutoff."
     )
 
 
@@ -530,7 +596,7 @@ class SessionResults(BaseModel):
                         "threat_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
                         "threat_type": "Spoofing",
                         "threat_name": "Unauthorized RTU firmware update",
-                        "grounding_status": "grounded",
+                        "grounding_status": "verified",
                         "threat_catalogue_id": 42,
                     }
                 ],
@@ -544,6 +610,16 @@ class SessionResults(BaseModel):
     asset_id: int = Field(description="Primary key of the asset this session belongs to.")
     asset_name: str = Field(description="Display name of the asset this session belongs to.")
     user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
+    progress: SessionProgress | None = Field(
+        default=None,
+        description=(
+            "Readiness snapshot, so this response can be told apart from a FINISHED one. The "
+            "scenario list below is whatever exists right now: while a run or a 'generate next "
+            "set' click is still working it is a partial view that looks exactly like a "
+            "completed one. Check `progress.overall` before treating it as final, and "
+            "`progress.last_next_set.epoch` to confirm your own click has landed."
+        ),
+    )
     threats: list[ThreatResult] = Field(description="All threats identified so far for this session.")
     scenarios: list[ScenarioResult] = Field(
         description="All scenarios generated so far for this session. Versions that regeneration "
@@ -565,15 +641,29 @@ class AcceptResponse(BaseModel):
 
 
 class RegenerateResponse(BaseModel):
-    """Response confirming a regenerate request was processed."""
+    """Response confirming a regenerate/next-set request was ACCEPTED — not that it finished.
+
+    The work runs on a Celery worker and can take minutes; this returns in milliseconds. `epoch`
+    is how you find out when it is done (see its description) — without it a client has no way to
+    distinguish "my click is still running" from "my click finished", which is exactly how a
+    mid-flight read of /results looks like a completed one."""
     model_config = ConfigDict(
-        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "status": "regenerating"}}
+        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "status": "regenerating", "epoch": 4}}
     )
 
     session_id: str = Field(description="Session's unique id (GUID).")
     user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     status: str = Field(
         description="Result of the request: 'regenerating' for a scenario regenerate request, 'generating' for a next-set request."
+    )
+    epoch: int = Field(
+        description=(
+            "Generation epoch reserved for THIS request. Poll GET /v1/sessions/{session_id} "
+            "until `progress.last_next_set.epoch` equals this value — that, not the stage "
+            "status, is the exact signal that your click landed. It stays correct when another "
+            "tab clicks concurrently (each waits for its own epoch) and it turns a stalled "
+            "worker into a diagnosable 'my epoch never arrived' rather than an endless wait."
+        ),
     )
 
 
@@ -586,6 +676,96 @@ class CancelResponse(BaseModel):
     session_id: str = Field(description="Session's unique id (GUID).")
     user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     status: str = Field(description="Always 'cancelled' on success.")
+
+
+# --- Error envelope -----------------------------------------------------------------------------
+# errors.py builds these bodies by hand; these models exist to DESCRIBE that shape in the OpenAPI
+# spec, not to construct it. Without them ReviewGateReason reaches no route and never appears in
+# /openapi.json — leaving the UI to hand-copy exactly the codes it most needs, since they decide
+# whether a blocked action shows a dead end or a spinner.
+class ErrorDetails(BaseModel):
+    """`details` on a 4xx envelope. Open-ended by design: handlers attach cause-specific keys
+    (`existing_id`, `active_session_id`, …) alongside the common ones below."""
+    model_config = ConfigDict(extra="allow")
+
+    reason: ReviewGateReason | ClickOutcomeReason | None = Field(
+        default=None,
+        description=(
+            "Machine-readable cause, when the raise site gave one. A ReviewGateReason means the "
+            "request never ran (wrong session state); a ClickOutcomeReason means it ran and "
+            "resolved to nothing. Absent on raise sites with no stable cause, e.g. the "
+            "target-went-stale race."
+        ),
+    )
+    detail: str | None = Field(default=None, description="Developer-facing explanation. Never show this to an end user.")
+    message: str | None = Field(default=None, description="End-user-safe sentence for this reason, when one is defined.")
+
+
+class ErrorResponse(BaseModel):
+    """The envelope every 4xx/5xx body uses (see errors.py::_env)."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "error_code": "regenerate_conflict",
+                "message": "session not at REVIEW yet (stage=SCENARIO_GENERATION, status=RUNNING) — generation still in progress",
+                "details": {"reason": "generation_in_progress"},
+            }
+        }
+    )
+
+    error_code: str = Field(description="Stable machine-readable error class, e.g. 'regenerate_conflict'.")
+    message: str = Field(description="Human-readable summary of what went wrong.")
+    details: ErrorDetails | None = Field(default=None, description="Cause-specific extras; omitted when there are none.")
+
+
+# --- SSE event payloads -------------------------------------------------------------------------
+# Same rationale: cascade.py publishes these dicts, and the /events route streams them, so nothing
+# would otherwise describe them in the spec. Publishing through these models keeps the wire and the
+# documented schema from drifting.
+class NextSetResultEvent(BaseModel):
+    """`next_set_result` — one "generate next set" click finished.
+
+    ADVISORY. Best-effort, behind a circuit breaker, never replayed (app/sse/bus.py), so treat it
+    as a prompt to refresh rather than as the record. `SessionProgress.last_next_set` on the status
+    board carries the same facts durably and is what a reconnecting client should trust."""
+    type: SSEEventType = Field(description="Always 'next_set_result'.")
+    session_id: str = Field(description="Session the click belonged to.")
+    subsystem_id: int = Field(description="Unit of work; always 0 (the asset itself).")
+    outcome: NextSetOutcome = Field(description="What the click achieved — see NextSetSummary.outcome.")
+    requested: int = Field(description="Scenarios the click aimed to add.")
+    new_scenarios: int = Field(description="Scenarios actually added — fresh plus variants (i.e. `delivered`).")
+    new_variants: int = Field(description="How many of `new_scenarios` are alternate takes on already-covered threats.")
+    no_new: bool = Field(description="True when the click added nothing at all.")
+    epoch: int = Field(description="Generation epoch this click ran at; matches the POST's `epoch`.")
+    reason: ClickOutcomeReason | None = Field(default=None, description="Why the click fell back or came up empty.")
+    detail: str | None = Field(default=None, description="Developer-facing explanation; populated only on a fruitless click.")
+    message: str | None = Field(
+        default=None,
+        description="End-user sentence; populated only on a fruitless click, because the wording "
+                    "says nothing was added and would contradict a payload reporting new scenarios.",
+    )
+    ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
+
+
+class RegenResultEvent(BaseModel):
+    """`regen_result` — one regenerate click finished.
+
+    Deliberately carries NO outcome/requested fields: regenerate REPLACES rather than adds, so its
+    scenario count never changes and a batch-size notion would be meaningless here."""
+    type: SSEEventType = Field(description="Always 'regen_result'.")
+    session_id: str = Field(description="Session the click belonged to.")
+    subsystem_id: int = Field(description="Unit of work; always 0 (the asset itself).")
+    requested_output_ids: list[str] = Field(description="OutputIDs the client asked to regenerate.")
+    new_output_ids: list[str] = Field(description="Replacement OutputIDs. Empty means the click was fruitless.")
+    replacements: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="old→new pairs. The two flat lists above cannot express the mapping when "
+                    "several targets are regenerated at once; these can.",
+    )
+    reason: ClickOutcomeReason | None = Field(default=None, description="Why the click was fruitless; null for the target-went-stale race.")
+    detail: str | None = Field(default=None, description="Developer-facing explanation.")
+    message: str | None = Field(default=None, description="End-user-safe sentence.")
+    ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
 
 
 #: Shared by AcceptedScenario and by the AcceptedScenariosResponse example that embeds one.
@@ -607,10 +787,10 @@ class AcceptedScenario(BaseModel):
     output_id: str = Field(description="Accepted scenario's unique id (GUID).")
     supporting_system_id: int = Field(description="Supporting system this scenario applies to.")
     threat_type_id: int | None = Field(
-        description="Id of the matched threat-type master row, when grounded/confirmed. Null when flagged."
+        description="Id of the matched threat-type master row. Null when the type came back unverified."
     )
     threat_catalogue_id: int | None = Field(
-        description="Id of the matched threat-catalogue master row, when grounded/confirmed. Null when flagged."
+        description="Id of the matched threat-catalogue master row. Null when no catalogue candidate matched."
     )
     threat_type: str | None = Field(description="STRIDE threat category the scenario was generated from.")
     threat_name: str | None = Field(description="Human-readable name of the threat the scenario was generated from.")

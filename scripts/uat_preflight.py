@@ -102,8 +102,7 @@ def main() -> int:
                                                 if not s.max_active_sessions_per_entity else ""))
     _line("INFO", "max_concurrent_llm_calls",
         str(s.max_concurrent_llm_calls) + ("  <- 0 = unlimited" if not s.max_concurrent_llm_calls else ""))
-    _line("INFO", "grounding thresholds (static)",
-        f"grounded>={s.grounding_grounded_threshold} confirm>={s.grounding_confirm_threshold}")
+    _line("INFO", "grounding threshold (static)", f"verified>={s.grounding_match_threshold}")
 
     print("\nB-D. Infrastructure")
 
@@ -217,25 +216,22 @@ def main() -> int:
             raise RuntimeError(f"{len(scores)} scores for {len(docs)} docs")
         return f"scores={[round(float(x), 1) for x in scores]}"
 
-    print("\nI. Grounding thresholds for THIS model pair")
+    print("\nI. Grounding threshold for THIS model pair")
 
-    @check("thresholds resolved (calibrating now if not stored)")
+    @check("threshold resolved (calibrating now if not stored)")
     def _thresholds():
         from app.db.engine import db_session
         from app.pipeline import embeddings, grounding
         from app.pipeline.llm import get_llm
         pair = (s.embedding_model, s.reranker_model)
-        pinned = ("grounding_grounded_threshold" in s.model_fields_set
-                or "grounding_confirm_threshold" in s.model_fields_set)
-        if pinned:
-            raise SkipCheck(f"pinned in env: grounded>={s.grounding_grounded_threshold} "
-                            f"confirm>={s.grounding_confirm_threshold} (auto-calibration disabled)")
+        if "grounding_match_threshold" in s.model_fields_set:
+            raise SkipCheck(f"pinned in env: verified>={s.grounding_match_threshold} "
+                            "(auto-calibration disabled)")
         was_stored = embeddings.load_thresholds(pair) is not None
         with db_session() as sess:
-            grounded_th, confirm_th = grounding.resolve_thresholds(
-                sess, get_llm(), allow_calibration=True)
+            match_th = grounding.resolve_thresholds(sess, get_llm(), allow_calibration=True)
         origin = "already stored" if was_stored else "CALIBRATED NOW and stored"
-        return f"grounded>={grounded_th:.1f} confirm>={confirm_th:.1f}  ({origin})"
+        return f"verified>={match_th:.1f}  ({origin})"
 
     print("\n" + "=" * 90)
     if _FAILED:

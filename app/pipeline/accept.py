@@ -20,11 +20,12 @@ from __future__ import annotations
 import json
 from typing import Any, Sequence, cast
 
-from sqlalchemy import RowMapping, Table, bindparam, insert, select, update
+from sqlalchemy import RowMapping, Table, bindparam, insert, or_, select, update
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.enums import (
-    ActorType, AuditDecision, AuditEventType, CandidateStatus, GroundingStatus, SessionStatus, StageStatus,
+    ActorType, AuditDecision, AuditEventType, CandidateStatus, SessionStatus, StageStatus,
     SubsystemLevel, WorkflowStage,
 )
 from app.core.logging import get_logger
@@ -175,7 +176,7 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
                     f"accept-all leaves active scenarios in subsystem(s) {sorted(uncovered)} whose "
                     f"SCENARIOS stage is not AWAITING_DECISION (subsystem stage state out of sync)")
 
-        _add_flagged_threats_to_library(sess, scenario_session, good_subs, user_id)
+        _add_unverified_threats_to_library(sess, scenario_session, good_subs, user_id)
 
         # CAS-fenced: False means a concurrent writer (e.g. a cancel) already moved
         # the session off 'active' between our REVIEW-barrier check above and here —
@@ -280,10 +281,10 @@ def _ensure_threat_data_still_active(sess: Session, session_id: str, good_subs: 
     # Collect every referenced type id and catalogue id. A non-null ThreatCatalogueID always
     # means grounding matched a real, pre-existing Threat_Catalogue row (find_threat_in_library
     # only ever sets it from an actual candidate row) — that holds regardless of the threat's
-    # overall GroundingStatus, since a confidently-typed threat can still end up "flagged"
-    # purely because its NAME match scored below grounding_confirm_threshold while a real
+    # overall GroundingStatus, since a confidently-typed threat can still end up "unverified"
+    # purely because its NAME match scored below grounding_match_threshold while a real
     # catalogue candidate existed. So every non-null id genuinely needs re-validating, the same
-    # way type_ids already is below — gating this on GroundingStatus != flagged let a since-
+    # way type_ids already is below — gating this on GroundingStatus != unverified let a since-
     # deactivated/deleted catalogue row slip past the check for exactly that sub-case.
     type_ids = {t for t, _ in rows if t is not None}
     cat_ids = {c for _, c in rows if c is not None}
@@ -367,7 +368,7 @@ def _find_or_create_type_and_catalogue(
     sess: Session, row: RowMapping, sector_id: int | None, resolved: dict,
     created_by: str | None = None,
 ) -> tuple[int, int | None]:
-    """Work out (or create) the Threat_Type and Threat_Catalogue ids this flagged threat
+    """Work out (or create) the Threat_Type and Threat_Catalogue ids this unverified threat
     should end up pointing at: reuse the high-confidence type match recorded at Stage 2
     when present, otherwise resolve/create via category+type name; an accepted
     PROPOSED catalogue name always wins over any low-confidence stored catalogue id.
@@ -386,7 +387,7 @@ def _find_or_create_type_and_catalogue(
             resolved[cat_key] = grounding.find_category(sess, row["ThreatCategory"])
         return resolved[cat_key]
 
-    type_id = row["ThreatTypeID"]  # >=confirm-band match when set — trusted
+    type_id = row["ThreatTypeID"]  # a `verified` type match when set — trusted
     if type_id is None:
         # No high-confidence type match was recorded earlier, so find/create one now,
         # under the resolved category.
@@ -412,17 +413,23 @@ def _find_or_create_type_and_catalogue(
     return type_id, catalogue_id
 
 
-def _add_flagged_threats_to_library(sess: Session, scenario_session: RowMapping, good_subs: list[int], user_id: str | None) -> None:
-    """For every threat that was flagged as "new to the library" and whose scenario got
-    accepted, create/reuse the matching Threat_Type, Threat_Catalogue, and Threat_Actor
-    rows so it becomes part of the shared library, then write audit + candidate-review
-    records for each promotion.
+def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMapping, good_subs: list[int], user_id: str | None) -> None:
+    """For every threat that scored below `library_promotion_threshold` ("new to the library")
+    and whose scenario got accepted, create/reuse the matching Threat_Type, Threat_Catalogue,
+    and Threat_Actor rows so it becomes part of the shared library, then write audit +
+    candidate-review records for each promotion.
+
+    Selects on SCORE, not on GroundingStatus, and that distinction is the point. "Do we trust
+    this match enough to use the library's wording?" and "should this go INTO the library?" are
+    different questions; piggybacking curation on the grounding band meant every retune of the
+    matching cutoff silently moved promotion volume too. With its own threshold,
+    grounding_match_threshold can move to 90 without changing what gets curated.
     """
     sector_id = _pick_sector_for_promotion(scenario_session)
     sid = scenario_session["SessionID"]
     tenant, entity = scenario_session["TenantID"], scenario_session["EntityID"]
     st, out = m.Scoped_Threat, m.Threat_Scenario_Output
-    # A flagged threat only gets promoted if at least one of its scenario outputs was
+    # An unverified threat only gets promoted if at least one of its scenario outputs was
     # actually accepted — being in a "good" subsystem isn't enough on its own.
     scenario_accepted = (
         select(1)
@@ -432,8 +439,13 @@ def _add_flagged_threats_to_library(sess: Session, scenario_session: RowMapping,
             out.Superseded == 0, out.Accepted == 1)
         .exists()
     )
-    # Pull every still-flagged threat, in an accepted subsystem, with at least one
-    # accepted scenario — these are the candidates to promote into the shared library.
+    # Pull every below-threshold threat, in an accepted subsystem, with at least one accepted
+    # scenario — these are the candidates to promote into the shared library.
+    # NULL-safe by design: `GroundingScore < th` alone is UNKNOWN for a NULL score, which would
+    # silently EXCLUDE such a row from promotion where the old band filter included it. A row
+    # with no recorded score is by definition not a confident match, so it belongs in the
+    # candidate set — the column is nullable (TSG_Core.sql:131) and legacy rows can carry NULL.
+    promotion_th = get_settings().library_promotion_threshold
     rows = sess.execute(
         select(m.Identified_Threat.ThreatID, m.Identified_Threat.ThreatCategory,
             m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName,
@@ -442,7 +454,8 @@ def _add_flagged_threats_to_library(sess: Session, scenario_session: RowMapping,
         .where(m.Identified_Threat.SessionID == sid,
             m.Identified_Threat.Superseded == 0,
             m.Identified_Threat.SubsystemID.in_(good_subs),
-            m.Identified_Threat.GroundingStatus == GroundingStatus.flagged,
+            or_(m.Identified_Threat.GroundingScore.is_(None),
+                m.Identified_Threat.GroundingScore < promotion_th),
             scenario_accepted)
     ).mappings().all()
 
@@ -475,7 +488,7 @@ def _add_flagged_threats_to_library(sess: Session, scenario_session: RowMapping,
     # Main promotion loop: for each candidate threat, work out (or create) the Threat_Type,
     # Threat_Catalogue, and actor links it should end up pointing at, then ACCUMULATE the
     # resulting writes — batched below into one UPDATE + 2 INSERTs total instead of one
-    # UPDATE + 3 INSERTs per row, so an accept promoting many newly-flagged threats issues
+    # UPDATE + 3 INSERTs per row, so an accept promoting many newly-unverified threats issues
     # a small fixed number of round trips instead of 4N (same accumulate-then-bulk-insert
     # pattern tasks.py already uses for Identified_Threat), keeping this still-open
     # transaction's lock hold time from scaling with the number of promotions.

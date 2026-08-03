@@ -4,8 +4,8 @@ so the same real-world threat described in different words always resolves
 to the same ThreatTypeID/ThreatCatalogueID instead of being treated as new
 each time.
 
-Every match bands into GroundingStatus.grounded/confirm/flagged (cutoffs are
-configurable Settings, see label_match_from_score) — flagged means "not in
+Every match bands into GroundingStatus.verified/unverified across ONE cutoff
+(a configurable Setting, see label_match_from_score) — unverified means "not in
 the library yet"; accept.py promotes it to a new entry once a human accepts it.
 
 sector_ids is always [own_sector_id, parent_sector_id] (fewer/empty = no
@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import math
-import statistics
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Callable, Sequence
@@ -44,7 +43,7 @@ except ImportError:  # pragma: no cover — exercised only in numpy-less deploym
     _np = None
 
 # Gives each grounding band a rank so two statuses can be compared (see pick_worse_of_two).
-_BAND_ORDER = {GroundingStatus.grounded: 2, GroundingStatus.confirm: 1, GroundingStatus.flagged: 0}
+_BAND_ORDER = {GroundingStatus.verified: 1, GroundingStatus.unverified: 0}
 
 
 def how_similar(a: Sequence[float], b: Sequence[float]) -> float:
@@ -67,22 +66,17 @@ def how_similar(a: Sequence[float], b: Sequence[float]) -> float:
     return 0.0 if na == 0 or nb == 0 else dot / (na * nb)
 
 
-def label_match_from_score(score: float, s: Settings, *, grounded_th: float | None = None,
-                        confirm_th: float | None = None) -> GroundingStatus:
-    """The one place the confirm/grounded score cutoffs are applied. The optional overrides carry
-    resolve_thresholds' per-model-pair values (find_threat_in_library passes them); left None,
-    the static settings fields apply — direct callers and tests are unchanged."""
-    g = s.grounding_grounded_threshold if grounded_th is None else grounded_th
-    c = s.grounding_confirm_threshold if confirm_th is None else confirm_th
-    if score >= g:
-        return GroundingStatus.grounded
-    if score >= c:
-        return GroundingStatus.confirm
-    return GroundingStatus.flagged
+def label_match_from_score(score: float, s: Settings, *, match_th: float | None = None) -> GroundingStatus:
+    """The one place the score cutoff is applied. The optional override carries
+    resolve_thresholds' per-model-pair value (find_threat_in_library passes it); left None,
+    the static settings field applies — direct callers and tests are unchanged."""
+    th = s.grounding_match_threshold if match_th is None else match_th
+    return GroundingStatus.verified if score >= th else GroundingStatus.unverified
 
 
 def pick_worse_of_two(a: GroundingStatus, b: GroundingStatus) -> GroundingStatus:
-    """Overall confidence is only as good as the weaker of two checks (type vs name)."""
+    """Overall confidence is only as good as the weaker of two checks (type vs name) — with two
+    bands that means verified + unverified -> unverified."""
     return a if _BAND_ORDER[a] <= _BAND_ORDER[b] else b
 
 
@@ -473,14 +467,15 @@ def prime_query_embeddings(llm: LLMClient, proposals: list[dict[str, Any]], cach
         cache[("qv", t)] = v
 
 
-# --- self-calibrating thresholds -------------------------------------------------------------
-# The grounded/confirm cutoffs are MODEL-SPECIFIC: a different embedding+reranker pair scores the
-# SAME threat/library match differently, so static numbers silently misclassify after any model
-# change (a threat that grounds in dev can flag in prod, with no error anywhere — and flagged
-# threats are what library promotion feeds on). The resolver below derives the cutoffs from the
-# live models + live library, per model pair, so stale thresholds structurally cannot recur.
+# --- self-calibrating threshold ---------------------------------------------------------------
+# The match cutoff is MODEL-SPECIFIC: a different embedding+reranker pair scores the SAME
+# threat/library match differently, so a static number silently misclassifies after any model
+# change (a threat that verifies in dev can come back unverified in prod, with no error anywhere —
+# and unverified threats are what library promotion feeds on). The resolver below derives the
+# cutoff from the live models + live library, per model pair, so a stale threshold structurally
+# cannot recur.
 
-_RESOLVED_THRESHOLDS: dict[tuple[str, str], tuple[float, float]] = {}
+_RESOLVED_THRESHOLDS: dict[tuple[str, str], float] = {}
 _CALIBRATION_SAMPLE = 30
 # A "negative" at/above this is a DUPLICATE catalogue entry, not an impostor — on the 0-100 rerank
 # scale nothing a paraphrase can score reliably clears it, so calibration is unwinnable until the
@@ -491,9 +486,9 @@ _PARAPHRASES_PER_NAME = 2
 
 def boundary_between(below: list[float], above: list[float]) -> float | None:
     """Midpoint cutoff strictly between two score classes, or None when they overlap/are empty.
-    Shared by _auto_calibrate and scripts/calibrate_grounding.py — deriving each threshold
-    independently (min-margin / max+margin) can emit an inverted CONFIRM >= GROUNDED pair that
-    config's own validator rejects; a midpoint between ADJACENT classes cannot invert."""
+    Shared by _auto_calibrate and scripts/calibrate_grounding.py — a midpoint sits inside the
+    measured gap by construction, so it can never be derived onto or past a measured score the
+    way an independent min-margin/max+margin pair can."""
     if not below or not above:
         return None
     lo, hi = max(below), min(above)
@@ -502,26 +497,25 @@ def boundary_between(below: list[float], above: list[float]) -> float | None:
     # NOT round()-ed: scores are continuous floats, so an integer midpoint can land back ON or
     # OUTSIDE the measured gap when it is under ~1 point (max(neg)=71.2, min(pos)=71.4 →
     # round(71.3)=71 ≤ 71.2, and label_match_from_score's `score >= th` would then band a
-    # measured IMPOSTOR as grounded — auto-accepted with no human review). Return the true
+    # measured IMPOSTOR as verified — trusted against a master it does not match). Return the true
     # midpoint; the value is only ever compared, never displayed as a whole number.
     return (lo + hi) / 2
 
 
 def resolve_thresholds(sess: Session | None, llm: LLMClient | None,
                         s: Settings | None = None, *,
-                        allow_calibration: bool = False) -> tuple[float, float]:
-    """(grounded_th, confirm_th) for the CURRENT embedding+reranker pair. Precedence:
-      1. operator explicitly set them in env (they appear in model_fields_set) → static wins;
+                        allow_calibration: bool = False) -> float:
+    """The match cutoff for the CURRENT embedding+reranker pair. Precedence:
+      1. operator explicitly set it in env (it appears in model_fields_set) → static wins;
       2. stored calibration for this exact model pair (embeddings.load_thresholds, Mongo);
       3. auto-calibrate now from the live library, store for every later worker;
       4. anything unavailable (Mongo down, library too small, no sess/llm) → the static
-         defaults + a WARNING — degrade-safe, never blocks a run.
+         default + a WARNING — degrade-safe, never blocks a run.
     Memoized per process; celery_app._init_worker warms it at boot so the one-time calibration
     cost lands at deploy time, never inside a leased pipeline stage."""
     s = s or get_settings()
-    if ("grounding_grounded_threshold" in s.model_fields_set
-            or "grounding_confirm_threshold" in s.model_fields_set):
-        return s.grounding_grounded_threshold, s.grounding_confirm_threshold
+    if "grounding_match_threshold" in s.model_fields_set:
+        return s.grounding_match_threshold
     key = (s.embedding_model, s.reranker_model)
     hit = _RESOLVED_THRESHOLDS.get(key)
     if hit is not None:
@@ -536,21 +530,20 @@ def resolve_thresholds(sess: Session | None, llm: LLMClient | None,
         # spend discarded. Deploy-time work belongs at deploy time.
         resolved = _auto_calibrate(sess, llm, s)
         if resolved is not None:
-            embeddings.store_thresholds(key, *resolved)
+            embeddings.store_thresholds(key, resolved)
             log.info("grounding.thresholds_calibrated", embedding_model=key[0],
-                    reranker_model=key[1], grounded_th=resolved[0], confirm_th=resolved[1])
+                    reranker_model=key[1], match_th=resolved)
     if resolved is None:
         log.warning("grounding.thresholds_uncalibrated_fallback", embedding_model=key[0],
-                    reranker_model=key[1], grounded_th=s.grounding_grounded_threshold,
-                    confirm_th=s.grounding_confirm_threshold,
-                    note="static defaults in use — they were tuned for a DIFFERENT model pair "
+                    reranker_model=key[1], match_th=s.grounding_match_threshold,
+                    note="static default in use — it was tuned for a DIFFERENT model pair "
                         "and may misclassify; seed the threat library (>=5 entries) so worker "
-                        "boot can calibrate, or set the thresholds explicitly in env")
-        # Deliberately NOT memoized: memoizing the fallback pinned a worker to static defaults
+                        "boot can calibrate, or set the threshold explicitly in env")
+        # Deliberately NOT memoized: memoizing the fallback pinned a worker to the static default
         # for its whole life, even after a SIBLING worker stored a real calibration seconds
         # later. Leaving it unmemoized costs one small indexed find_one per grounding call and
         # lets the worker self-heal the moment a calibration exists.
-        return (s.grounding_grounded_threshold, s.grounding_confirm_threshold)
+        return s.grounding_match_threshold
     _RESOLVED_THRESHOLDS[key] = resolved
     return resolved
 
@@ -583,13 +576,12 @@ def _paraphrase(llm: LLMClient, name: str) -> list[str]:
 
 
 def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
-                    s: Settings) -> tuple[float, float] | None:
-    """Derive (grounded_th, confirm_th) from the LIVE library + CURRENT models, no labelled data:
+                    s: Settings) -> float | None:
+    """Derive the match cutoff from the LIVE library + CURRENT models, no labelled data:
     POSITIVES = scores of LLM paraphrases of sampled catalogue names against the full library
     (what a genuine match scores under THESE models); NEGATIVES = each sampled name scored with
-    itself removed (the best an impostor achieves). grounded_th = midpoint between the classes;
-    confirm_th = midpoint between the negatives' median and grounded_th (the "plausible but
-    unsure" band lives in the negatives' upper tail).
+    itself removed (the best an impostor achieves). The cutoff is the midpoint between the two
+    classes — with one band boundary that IS the whole answer, no derived second number.
     # ponytail: heuristic band placement; a labelled-CSV run of scripts/calibrate_grounding.py
     # beats it when curators can supply ground truth — its env override then wins."""
     if sess is None or llm is None:
@@ -630,8 +622,8 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
                     paraphrase_calls_skipped=len(sample),
                     note="two catalogue entries name the same threat, so no paraphrase can ever "
                         "outscore them — skipped the billed paraphrase pass entirely. Dedupe the "
-                        "pair in `collides`, or pin TSG_GROUNDING_GROUNDED_THRESHOLD / "
-                        "TSG_GROUNDING_CONFIRM_THRESHOLD (see scripts/calibrate_grounding.py)")
+                        "pair in `collides`, or pin TSG_GROUNDING_MATCH_THRESHOLD "
+                        "(see scripts/calibrate_grounding.py)")
         return None
 
     positives: list[float] = []
@@ -639,8 +631,8 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
         for p in _paraphrase(llm, n):
             _row, score = find_closest_match(llm, p, rows_all, "ThreatName", s, group="threat_catalogue")
             positives.append(score)
-    grounded_th = boundary_between(negatives, positives)
-    if grounded_th is None:
+    match_th = boundary_between(negatives, positives)
+    if match_th is None:
         # Counts alone cannot tell the failure modes apart, and they need opposite fixes: a
         # fractional overlap (one stray paraphrase — resample), a wide one, or an EMPTY class
         # (every paraphrase call failed — nothing was measured at all). Emit the deciding scores
@@ -660,15 +652,10 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
                             if worst is not None else None),
                     note="the highest-scoring 'impostor' is usually a near-duplicate library "
                         "entry, not a model failure — dedupe the pair in `collides`, or supply "
-                        "ground truth via scripts/calibrate_grounding.py, or set the thresholds "
-                        "explicitly in env; falling back to static thresholds")
+                        "ground truth via scripts/calibrate_grounding.py, or set the threshold "
+                        "explicitly in env; falling back to the static threshold")
         return None
-    # Annotated float, not left to inference: round() returns int, so the degenerate-spacing
-    # branch below (`grounded_th - 1`, a float) was assigning float into an int-inferred local.
-    confirm_th: float = round((statistics.median(negatives) + grounded_th) / 2)
-    if confirm_th >= grounded_th:  # degenerate spacing — preserve config's confirm < grounded invariant
-        confirm_th = grounded_th - 1
-    return float(grounded_th), float(confirm_th)
+    return float(match_th)
 
 
 def _cached(cache: dict[Any, Any], key: Any, compute: Callable[[], Any]) -> Any:
@@ -685,8 +672,8 @@ def _cached(cache: dict[Any, Any], key: Any, compute: Callable[[], Any]) -> Any:
 def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, Any], sector_ids: list[int],
                             settings: Settings | None = None, cache: dict[Any, Any] | None = None) -> GroundingResult:
     """Matches one AI-proposed threat ({"category", "type", "name", "actors"})
-    against the real library. Matches TYPE first; if that's flagged, stops
-    immediately — there's no confident ThreatTypeID to scope a name/actor
+    against the real library. Matches TYPE first; if that comes back unverified,
+    stops immediately — there's no confident ThreatTypeID to scope a name/actor
     search by — and returns actors raw/unvalidated. Otherwise matches NAME
     within that type only ([R6]), filters actors to the type's allowed set,
     and reports the weaker of the type/name confidence.
@@ -699,9 +686,9 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
     """
     s = settings or get_settings()
     cache = {} if cache is None else cache
-    # Per-model-pair cutoffs (memoized; worker boot warms them) — static settings numbers are
+    # Per-model-pair cutoff (memoized; worker boot warms it) — the static settings number is
     # only the fallback. See resolve_thresholds.
-    grounded_th, confirm_th = resolve_thresholds(sess, llm, s)
+    match_th = resolve_thresholds(sess, llm, s)
     actors_in = ensure_actor_list(proposed.get("actors", []))
     category_text = ensure_text(proposed.get("category"))
 
@@ -736,12 +723,12 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
     trow, tscore = _cached(cache, ("match_type", type_text, category_id),
                         lambda: find_closest_match(llm, type_text, types, "ThreatTypeName", s,
                                                     group="threat_type", qv=type_qv))
-    tstatus = label_match_from_score(tscore, s, grounded_th=grounded_th, confirm_th=confirm_th)
+    tstatus = label_match_from_score(tscore, s, match_th=match_th)
 
-    if trow is None or tstatus == GroundingStatus.flagged:
-        # Flagged type: no grounded ThreatTypeID → actors cannot be map-filtered ([R6]).
+    if trow is None or tstatus == GroundingStatus.unverified:
+        # Unverified type: no trusted ThreatTypeID → actors cannot be map-filtered ([R6]).
         return GroundingResult(
-            status=GroundingStatus.flagged, score=tscore,
+            status=GroundingStatus.unverified, score=tscore,
             actors=list(actors_in), actors_validated=False,
         )
 
@@ -752,8 +739,8 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
                         lambda: find_closest_match(llm, name_text, cats, "ThreatName", s,
                                                     group="threat_catalogue", qv=name_qv))
     # crow is None when this type has no candidate catalogue names at all (cats was empty).
-    cstatus = (label_match_from_score(cscore, s, grounded_th=grounded_th, confirm_th=confirm_th)
-            if crow is not None else GroundingStatus.flagged)
+    cstatus = (label_match_from_score(cscore, s, match_th=match_th)
+            if crow is not None else GroundingStatus.unverified)
 
     akey = ("actors", type_id)
     allowed = _cached(cache, akey, lambda: get_allowed_actor_names(sess, type_id))

@@ -84,10 +84,13 @@ CREATE UNIQUE INDEX UX_ConfigThreatRule_NaturalKey
     WHERE IsActive = 1 AND IsDeleted = 0;
 
 -- Context_Field_Config: which asset/subsystem fields are currently turned on for the AI prompt.
--- A curator can switch a field off here without a deploy — but this table can only narrow which
--- of a fixed, code-reviewed set of field names get sent (app/pipeline/prompts.py's
--- _ASSET_CONTEXT_ALLOWED/_SUB_ALLOWED); it can never add a brand-new field name outside that set.
--- Adding a field to what's ever eligible to reach an external AI call still requires a code change.
+-- This table is the ONLY allowlist: app/pipeline/prompts.py holds no hardcoded set of field
+-- names, so an active row here is exactly what gets sent to the external AI, and adding or
+-- removing a field is a curator edit rather than a deploy. Treat INSERTs here as a data-exposure
+-- change and review them accordingly. No active rows for a group = no context sent for that
+-- group (fail closed); prompts.py never falls back to "send everything". One forced exception:
+-- build_base_context always sends critical_service (validation requires it), so toggling that
+-- row off has no effect.
 
 IF OBJECT_ID('dbo.Context_Field_Config', 'U') IS NULL
 CREATE TABLE Context_Field_Config (
@@ -129,13 +132,13 @@ INSERT INTO Context_Field_Config (ContextGroup, FieldName, IsActive, IsDeleted) 
     (N'subsystem', N'saas_platform_list', 1, 0),
     (N'subsystem', N'public_cloud_platforms', 1, 0);
 
--- New subsystem fields (added to prompts.py::_SUB_ALLOWED in a later session — usage scale,
--- accessibility/hosting/network exposure, DR/backup posture, data-residency, RTO/RPO targets).
+-- New subsystem fields added in a later session (usage scale, accessibility/hosting/network
+-- exposure, DR/backup posture, data-residency, RTO/RPO targets).
 -- Guarded per-row via an anti-join, not per-table like the block above: on a database that
 -- already ran the block above (so Context_Field_Config is non-empty), the `IF NOT EXISTS
 -- (SELECT 1 FROM Context_Field_Config)` guard on that block would skip an INSERT entirely,
--- silently leaving these 21 fields off — _resolve_allowed's DB-active intersection (prompts.py)
--- would then drop them even though the code ceiling now allows them.
+-- silently leaving these 21 fields off — and since this table is now the only allowlist, a
+-- missing row means the field simply never reaches the AI.
 INSERT INTO Context_Field_Config (ContextGroup, FieldName, IsActive, IsDeleted)
 SELECT v.ContextGroup, v.FieldName, 1, 0
 FROM (VALUES

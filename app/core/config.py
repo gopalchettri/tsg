@@ -237,25 +237,35 @@ class Settings(BaseSettings):
     local_model_threadpool_size: int = 10
 
     # --- Grounding: how much to trust an AI-proposed threat's match to the library (0-100 scale) ---
-    # Below grounding_confirm_threshold: unmatched. Between the two: a probable match that still
-    # needs a human look. At or above grounding_grounded_threshold: accepted automatically.
-    # These cutoffs are MODEL-SPECIFIC. Leave them UNSET (the normal case): the app
-    # auto-calibrates a pair per embedding+reranker model from the live library
-    # (grounding.resolve_thresholds), so a model change can never silently run on numbers tuned
-    # for a different model. Setting either one in env pins BOTH and disables auto-calibration.
-    grounding_confirm_threshold: float = 60.0
-    grounding_grounded_threshold: float = 75.0
+    # ONE cutoff, two bands: at or above it a threat is `verified` (it matched an approved library
+    # entry); below it `unverified` (novel — still scenario-generated, and the input to library
+    # promotion on accept).
+    # This cutoff is MODEL-SPECIFIC. Leave it UNSET (the normal case): the app auto-calibrates a
+    # value per embedding+reranker model from the live library (grounding.resolve_thresholds), so
+    # a model change can never silently run on a number tuned for a different model. Setting it in
+    # env disables auto-calibration.
+    grounding_match_threshold: float = 75.0
     # How many of the closest-matching library entries get a closer, second-pass check.
     grounding_shortlist_k: int = 10
+
+    # --- Library curation: which threats get promoted into the shared library on accept ---
+    # A SEPARATE knob from grounding_match_threshold on purpose. The two answer unrelated
+    # questions: the match threshold asks "do we trust this match enough to use the library's
+    # wording and ids?", this one asks "should this threat be ADDED to the library permanently?".
+    # They were one number by accident — three bands happened to separate them — so tuning
+    # matching silently changed curation volume. accept.py selects on SCORE against this value,
+    # never on the grounding band, so the two can now move independently.
+    library_promotion_threshold: float = 75.0
 
     # --- Step 4: control library mapping (control_mapping.map_controls / grounding.ground_control_queries) ---
     # Most controls kept per scenario ("up to K", never padded with weak matches) — also the
     # cap on how many control suggestions the scenario prompt asks the LLM for.
     control_map_top_k: int = Field(5, ge=1)
     # A suggestion whose best library match reranks below the cutoff is dropped — an honest
-    # empty list beats force-fitting the least-bad control. LEAVE UNSET: the cutoff then
-    # follows the per-(embedding, reranker)-pair CONFIRM threshold, so a model swap re-derives
-    # it. Setting this in env pins a static cutoff (control_mapping._min_score).
+    # empty list beats force-fitting the least-bad control. LEAVE UNSET: the cutoff then follows
+    # the per-(embedding, reranker)-pair MATCH threshold, so a model swap re-derives it. Setting
+    # this in env pins a static cutoff (control_mapping._min_score) — the 60.0 below is only ever
+    # used as that pinned value's default, never as the unset fallback.
     control_map_min_score: float = Field(60.0, ge=0.0, le=100.0)
     # How many remote rerank calls llm.rerank_many runs at once (LOCAL politeness cap only —
     # every call still takes its own _llm_slot, so the Redis semaphore stays the global
@@ -276,6 +286,13 @@ class Settings(BaseSettings):
 
     # Batch size of one "generate next set" click (scenarios served/generated per call).
     next_set_size: int = Field(5, ge=1)
+
+    # Ceiling on the already-covered threat names fed to the additive find_threats prompt — the one
+    # prompt input that GROWS with every accumulated next-set round. Steering only, never
+    # enforcement: tasks.py's identity-fold dedup silently drops any re-proposed active threat, so
+    # truncating this list can cost a wasted proposal but never admits a duplicate row. Raise it if
+    # long-running sessions start burning proposals on threats they already have.
+    coverage_exclusions_max: int = Field(50, ge=1)
 
     # --- Threat-scoping selection cutoff ---
     # A threat scoring below this doesn't get a full scenario written for it.
@@ -480,16 +497,23 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _validate_grounding_threshold_order(self) -> "Settings":
-        """grounding_confirm_threshold must stay below grounding_grounded_threshold —
-        grounding.label_match_from_score checks the grounded threshold FIRST, so an inverted pair
-        would silently make the confirm band unreachable (every score that should land "confirm"
-        would instead be classified "grounded" and auto-accepted with no human review)."""
-        if self.grounding_confirm_threshold >= self.grounding_grounded_threshold:
+    def _validate_promotion_below_match(self) -> "Settings":
+        """library_promotion_threshold must not exceed grounding_match_threshold. Above it, a
+        threat that scored high enough to be `verified` — i.e. it MATCHED a real library entry
+        and is carrying that entry's ThreatCatalogueID — would still fall under the promotion
+        cutoff and be promoted, minting a near-duplicate of the very entry it just matched. That
+        is the failure mode that made threshold auto-calibration unwinnable, so it fails closed.
+
+        KNOWN LIMIT: this compares the STATIC settings. The match cutoff actually applied at
+        runtime is per-model-pair (grounding.resolve_thresholds auto-calibrates when this field
+        is left unset), so a calibrated value below library_promotion_threshold re-opens the same
+        window. accept.py's "never override a real ThreatCatalogueID" rule is what closes it for
+        good — see the plan's Change 9b."""
+        if self.library_promotion_threshold > self.grounding_match_threshold:
             raise ValueError(
-                f"grounding_confirm_threshold ({self.grounding_confirm_threshold}) must be lower "
-                f"than grounding_grounded_threshold ({self.grounding_grounded_threshold}) — "
-                "otherwise the 'confirm' band becomes unreachable.")
+                f"library_promotion_threshold ({self.library_promotion_threshold}) must not exceed "
+                f"grounding_match_threshold ({self.grounding_match_threshold}) — otherwise a "
+                "`verified` threat gets promoted, duplicating the library entry it just matched.")
         return self
 
 

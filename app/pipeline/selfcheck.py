@@ -224,27 +224,34 @@ def check_ctm_scan_category_names(sess: Session) -> str | None:
 
 
 def check_dead_context_fields(sess: Session) -> str | None:
-    """Warn if an active Context_Field_Config row names a FieldName/ContextGroup outside
-    prompts.py's hardcoded ceiling (_ASSET_CONTEXT_ALLOWED/_SUB_ALLOWED, or an unrecognized
-    ContextGroup value like a typo'd 'Asset' instead of 'asset'). prompts._resolve_allowed
-    doesn't error on this — it just silently excludes the unrecognized row from what reaches the
-    model (or, if every active row for a group is unrecognized, narrows that group to nothing) —
-    so a curator's typo would otherwise stay invisible until someone notices a field the AI
-    should be seeing but isn't. Same curator-editable-table-vs-hardcoded-allowlist drift class
-    check_dead_threat_rules already exists for Config_Threat_Rule."""
-    from app.pipeline.prompts import _ASSET_CONTEXT_ALLOWED, _SUB_ALLOWED
+    """Warn if an active Context_Field_Config row names a ContextGroup other than 'asset' or
+    'subsystem' (a typo'd 'Asset', say). dal.active_context_fields_by_group reads only those two
+    groups, so such a row is silently excluded from what reaches the model and would otherwise
+    stay invisible until someone notices a field the AI should be seeing but isn't. Same
+    curator-editable-table drift class check_dead_threat_rules covers for Config_Threat_Rule.
 
+    Also warn when 'asset' or 'subsystem' has NO active rows at all. prompts.py fails closed —
+    a group with no active fields sends nothing to the model, with no ceiling fallback — so an
+    unseeded table or an all-off misconfig would otherwise degrade generation quality silently.
+    (critical_service is force-sent regardless, but everything else would vanish.)
+
+    A typo'd FieldName inside a valid group is NOT caught here any more: prompts.py has no
+    hardcoded ceiling to diff field names against, so there is no reference set. Such a row is
+    inert — allowlist_context only copies keys that actually exist in the source dict."""
     cfc = m.Context_Field_Config
     rows = sess.execute(
         select(cfc.ContextGroup, cfc.FieldName)
         .where(cfc.IsActive == True, cfc.IsDeleted == False).distinct()  # noqa: E712
     ).all()
-    ceilings = {"asset": _ASSET_CONTEXT_ALLOWED, "subsystem": _SUB_ALLOWED}
-    dead = sorted(f"{group}.{field}" for group, field in rows
-                if group not in ceilings or field not in ceilings[group])
+    dead = sorted(f"{group}.{field}" for group, field in rows if group not in ("asset", "subsystem"))
     if dead:
         log.warning("selfcheck.dead_context_fields", fields=dead)
         return "dead_context_fields"
+    groups_present = {group for group, _ in rows}
+    empty = sorted(g for g in ("asset", "subsystem") if g not in groups_present)
+    if empty:
+        log.warning("selfcheck.empty_context_group", groups=empty)
+        return "empty_context_group"
     return None
 
 

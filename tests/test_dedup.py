@@ -43,7 +43,7 @@ class _DupCatalogueLLM(StubLLM):
 
 
 class _UngroundedLLM(StubLLM):
-    """Two proposals that match NONE of the seeded masters (both grounded `flagged`,
+    """Two proposals that match NONE of the seeded masters (both come back `unverified`,
     ThreatTypeID/ThreatCatalogueID NULL) — so dedup falls back to normalized text."""
 
     def __init__(self, proposals):
@@ -100,10 +100,10 @@ def test_normalize_folds_punctuation_case_and_whitespace():
 # --- unique-top-N selection pass (pure) -------------------------------------
 def test_select_unique_top_n_frees_the_slot_and_yields_n_distinct():
     # rank order: a(cat10), b(cat10 dup of a), c(cat11), d(cat12); threshold already applied
-    scored = [Scored("a", 80.0, 1, True, "grounding=grounded"),
-            Scored("b", 80.0, 2, True, "grounding=grounded"),
-            Scored("c", 70.0, 3, True, "grounding=grounded"),
-            Scored("d", 60.0, 4, True, "grounding=grounded")]
+    scored = [Scored("a", 80.0, 1, True, "grounding=verified"),
+            Scored("b", 80.0, 2, True, "grounding=verified"),
+            Scored("c", 70.0, 3, True, "grounding=verified"),
+            Scored("d", 60.0, 4, True, "grounding=verified")]
     enriched = {"a": {"catalogue_id": 10}, "b": {"catalogue_id": 10},
                 "c": {"catalogue_id": 11}, "d": {"catalogue_id": 12}}
     _select_unique_top_n(scored, enriched, top_n=2)
@@ -118,7 +118,7 @@ def test_select_unique_top_n_frees_the_slot_and_yields_n_distinct():
 def test_select_unique_top_n_never_promotes_a_threshold_excluded_threat():
     # a threat scoring already excluded stays excluded and never consumes a slot
     scored = [Scored("x", 40.0, 1, False, "below score threshold (55.0)"),
-            Scored("y", 70.0, 2, True, "grounding=grounded")]
+            Scored("y", 70.0, 2, True, "grounding=verified")]
     _select_unique_top_n(scored, {"x": {"catalogue_id": 1}, "y": {"catalogue_id": 2}}, top_n=1)
     assert scored[0].selected is False and "below score threshold" in scored[0].reason
     assert scored[1].selected is True
@@ -224,8 +224,8 @@ def _active_winner_count(db, sid, threat_id):
 
 
 def test_beyond_cutoff_unique_winner_is_regenerable(db, monkeypatch):
-    # Two cat-20 duplicates rank first (grounded, score 70); the cat-21 unique winner scores lower
-    # (confirm, 60) so it lands at raw rank 3 — beyond scoping_top_n=2 in the duplicate-inclusive
+    # Two cat-20 duplicates rank first (verified, score 70); the cat-21 unique winner scores lower
+    # (unverified, 65) so it lands at raw rank 3 — beyond scoping_top_n=2 in the duplicate-inclusive
     # ranking, yet a full run keeps it via free-the-slot. Regenerating it must NOT be re-excluded as
     # 'beyond top-N' (that raised RegenerateConflict → the Regenerate control silently did nothing).
     from app.core.config import get_settings
@@ -235,10 +235,10 @@ def test_beyond_cutoff_unique_winner_is_regenerable(db, monkeypatch):
                         "a0000000-0000-4000-8000-000000000002",
                         "a0000000-0000-4000-8000-000000000003")
     for tid in (dup1, dup2):
-        _seed_threat(db, sid, ss, threat_id=tid, grounding_status=str(GroundingStatus.grounded),
+        _seed_threat(db, sid, ss, threat_id=tid, grounding_status=str(GroundingStatus.verified),
                     catalogue_id=20, type_id=10, threat_type="Firmware Tampering", threat_name="Bootloader implant",
                     library_type="Firmware Tampering", library_name="Bootloader implant")
-    _seed_threat(db, sid, ss, threat_id=winner, grounding_status=str(GroundingStatus.confirm),
+    _seed_threat(db, sid, ss, threat_id=winner, grounding_status=str(GroundingStatus.unverified),
                 catalogue_id=21, type_id=11, threat_type="Config Tampering", threat_name="OTA poisoning",
                 library_type="Config Tampering", library_name="OTA poisoning")
     db.commit()
@@ -266,13 +266,13 @@ def test_regen_two_same_catalogue_outputs_no_integrityerror(db):
     sid, ss = session["SessionID"], ASSET_UNIT_ID
     t1, t2 = "b0000000-0000-4000-8000-000000000001", "b0000000-0000-4000-8000-000000000002"
     for i, tid in enumerate((t1, t2)):
-        _seed_threat(db, sid, ss, threat_id=tid, grounding_status=str(GroundingStatus.grounded),
+        _seed_threat(db, sid, ss, threat_id=tid, grounding_status=str(GroundingStatus.verified),
                     catalogue_id=20, type_id=10, threat_type="Firmware Tampering", threat_name="Bootloader implant",
                     library_type="Firmware Tampering", library_name="Bootloader implant")
         scoped_id = str(uuid.uuid4())
         db.execute(insert(m.Scoped_Threat).values(
             ScopedThreatID=scoped_id, SessionID=sid, TenantID="default", SubsystemID=ss, ThreatID=tid,
-            Score=70.0, ScopeRank=i + 1, Selected=1, Reason="grounding=grounded", Superseded=0, CreatedAt=now()))
+            Score=70.0, ScopeRank=i + 1, Selected=1, Reason="grounding=verified", Superseded=0, CreatedAt=now()))
         db.execute(insert(m.Threat_Scenario_Output).values(
             OutputID=str(uuid.uuid4()), SessionID=sid, TenantID="default", SubsystemID=ss, ScopedThreatID=scoped_id,
             Status=str(ScenarioStatus.complete), ScenarioJSON="{}", Accepted=0, Superseded=0,

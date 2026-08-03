@@ -66,13 +66,16 @@ def _min_score(sess: Session, llm: LLMClient, s) -> float:
     """The rerank cutoff below which a suggestion is dropped. Rerank scores are MODEL-specific
     (a different reranker scores on a different distribution), so a fixed default cannot fit
     every environment. Precedence: an operator-pinned TSG_CONTROL_MAP_MIN_SCORE wins; otherwise
-    reuse the per-(embedding, reranker)-pair CONFIRM threshold grounding already resolves and
+    reuse the per-(embedding, reranker)-pair MATCH threshold grounding already resolves and
     stores per model pair (grounding.resolve_thresholds — memoized, degrade-safe), so the
-    cutoff follows the models in every environment instead of needing manual recalibration."""
+    cutoff follows the models in every environment instead of needing manual recalibration.
+
+    Note this cutoff rose when the bands collapsed: it used to track the lower (confirm) of two
+    numbers and now tracks the only one. Controls are dropped slightly more readily as a result —
+    pin TSG_CONTROL_MAP_MIN_SCORE if an environment wants the old, looser behaviour back."""
     if "control_map_min_score" in s.model_fields_set:
         return s.control_map_min_score
-    _, confirm = grounding.resolve_thresholds(sess, llm, s)
-    return confirm
+    return grounding.resolve_thresholds(sess, llm, s)
 
 
 def collect_control_queries(scenario_json: str | None, top_k: int) -> tuple[list[tuple[str, str | None]], bool]:

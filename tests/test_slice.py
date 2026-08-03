@@ -85,8 +85,8 @@ def test_redact_strips_secrets_and_pii():
 
 
 def test_scoping_deterministic():
-    threats = [{"threat_id": "b", "grounding_status": "grounded"},
-               {"threat_id": "a", "grounding_status": "grounded"}]
+    threats = [{"threat_id": "b", "grounding_status": "verified"},
+               {"threat_id": "a", "grounding_status": "verified"}]
     r1 = [s.threat_id for s in scoping.score_threats(threats)]
     r2 = [s.threat_id for s in scoping.score_threats(threats)]
     assert r1 == r2 == ["a", "b"]  # equal score → stable id tie-break
@@ -95,8 +95,8 @@ def test_scoping_deterministic():
 # --- scoping rule engine ([R12], SDD §5.4) ---
 def test_tech_gate_excludes():
     """SDD-named acceptance: a failed tech_gate forces Selected=0, Reason names the gate."""
-    threats = [{"threat_id": "a", "grounding_status": "grounded", "threat_type_id": 10},
-               {"threat_id": "b", "grounding_status": "grounded", "threat_type_id": 11}]
+    threats = [{"threat_id": "a", "grounding_status": "verified", "threat_type_id": 10},
+               {"threat_id": "b", "grounding_status": "verified", "threat_type_id": 11}]
     sub = {"id": 1, "name": "Core Banking", "asset_type": "IT System", "criticality": 5}
     rules = [{"RuleType": "tech_gate", "ThreatTypeID": 10, "RuleKey": "asset_type",
               "RuleValue": "Operational Technology (OT)", "Metadata": None}]
@@ -108,7 +108,7 @@ def test_tech_gate_excludes():
 
 
 def test_tech_gate_passes_when_context_matches():
-    threats = [{"threat_id": "a", "grounding_status": "grounded", "threat_type_id": 10}]
+    threats = [{"threat_id": "a", "grounding_status": "verified", "threat_type_id": 10}]
     rules = [{"RuleType": "tech_gate", "ThreatTypeID": 10, "RuleKey": "asset_type",
               "RuleValue": "Operational Technology (OT)", "Metadata": None}]
     (s,) = scoping.score_threats(threats, subsystems=[{"asset_type": "Operational Technology (OT)"}], rules=rules)
@@ -117,19 +117,19 @@ def test_tech_gate_passes_when_context_matches():
 
 
 def test_relevance_weight_reorders_rank():
-    threats = [{"threat_id": "a", "grounding_status": "grounded", "threat_type_id": 10},
-               {"threat_id": "b", "grounding_status": "grounded", "threat_type_id": 11}]
+    threats = [{"threat_id": "a", "grounding_status": "verified", "threat_type_id": 10},
+               {"threat_id": "b", "grounding_status": "verified", "threat_type_id": 11}]
     rules = [{"RuleType": "relevance_context_value", "ThreatTypeID": 11, "RuleKey": "criticality",
               "RuleValue": "5", "Metadata": '{"weight": 15}'}]
     out = scoping.score_threats(threats, subsystems=[{"criticality": 5}], rules=rules)
     assert [s.threat_id for s in out] == ["b", "a"]  # boost beats a's id tie-break win
-    assert out[0].score == 85.0  # 50 base + 20 grounded + 15 Metadata weight
+    assert out[0].score == 85.0  # 50 base + 20 verified + 15 Metadata weight
     assert out[0].factors == [{"key": "criticality", "family": "relevance_context_value", "delta": 15.0}]
 
 
 def test_unknown_rulekey_and_absent_field_have_no_effect():
     """§5.4 step 1: unknown key / unresolvable field → rule skipped (logged), never silently false."""
-    threats = [{"threat_id": "a", "grounding_status": "grounded", "threat_type_id": 10}]
+    threats = [{"threat_id": "a", "grounding_status": "verified", "threat_type_id": 10}]
     rules = [{"RuleType": "tech_gate", "ThreatTypeID": 10, "RuleKey": "uses_biometric_data",  # unmapped key
               "RuleValue": None, "Metadata": None},
              {"RuleType": "tech_gate", "ThreatTypeID": 10, "RuleKey": "criticality",  # mapped key, absent field
@@ -141,8 +141,8 @@ def test_unknown_rulekey_and_absent_field_have_no_effect():
 
 def test_scoping_selection_cutoff():
     """§5.4 step 3: cutoff comes from config values, not constants — threshold and top-N."""
-    threats = [{"threat_id": "a", "grounding_status": "grounded"},
-               {"threat_id": "b", "grounding_status": "flagged"}]
+    threats = [{"threat_id": "a", "grounding_status": "verified"},
+               {"threat_id": "b", "grounding_status": "unverified"}]
     out = {s.threat_id: s for s in scoping.score_threats(threats, score_threshold=70.0)}
     assert out["a"].selected is True and out["b"].selected is False  # 70 vs 65
     assert "below score threshold" in out["b"].reason
@@ -151,24 +151,29 @@ def test_scoping_selection_cutoff():
     assert "beyond top-1 cutoff" in out2[1].reason
 
 
-def test_scoping_default_cutoff_does_not_silently_drop_flagged_threats():
+def test_scoping_default_cutoff_does_not_silently_drop_unverified_threats():
     """The real production defaults (Settings.scoping_score_threshold=55.0,
     scoping_top_n=5 — no longer None/None) are what tasks.py::write_scenarios actually
-    passes to score_threats. Pairing a non-None threshold with the old flagged=0.0
-    confidence weight would have scored flagged threats at exactly BASE_SCORE (50) —
-    below the new 55 floor — silently excluding every novel/uncatalogued threat outright,
-    worse than the original low-rank bug. flagged=15.0 (scoping.py) keeps them at 65,
-    clear of the floor."""
+    passes to score_threats. Pairing a non-None threshold with a 0.0 confidence weight
+    would score unverified threats at exactly BASE_SCORE (50) — below the 55 floor —
+    silently excluding every novel/uncatalogued threat outright, worse than the original
+    low-rank bug. unverified=15.0 (scoping.py) keeps them at 65, clear of the floor.
+
+    This is the contract stated on _CONFIDENCE_WEIGHT: grounding confidence ALONE must never
+    reject a threat, so EVERY band must clear the floor — asserted over the whole enum rather
+    than a hand-listed sample, so adding a band with too small a weight fails here."""
     from app.core.config import get_settings
+    from app.core.enums import GroundingStatus
 
     s = get_settings()
     assert (s.scoping_score_threshold, s.scoping_top_n) == (55.0, 5)
-    threats = [{"threat_id": "g", "grounding_status": "grounded"},
-               {"threat_id": "c", "grounding_status": "confirm"},
-               {"threat_id": "f", "grounding_status": "flagged"}]
+    threats = [{"threat_id": str(band), "grounding_status": str(band)} for band in GroundingStatus]
     out = {sc.threat_id: sc for sc in scoping.score_threats(
         threats, score_threshold=s.scoping_score_threshold, top_n=s.scoping_top_n)}
-    assert out["g"].selected and out["c"].selected and out["f"].selected  # 70 / 60 / 65 — all clear 55
+    assert out["verified"].score == 70.0 and out["unverified"].score == 65.0
+    assert all(sc.selected for sc in out.values()), \
+        f"a grounding band scores below the {s.scoping_score_threshold} floor: " \
+        f"{ {k: v.score for k, v in out.items()} }"
 
 
 def test_scoping_negative_rule_weight_can_still_exclude_below_the_default_floor():
@@ -180,12 +185,12 @@ def test_scoping_negative_rule_weight_can_still_exclude_below_the_default_floor(
     from app.core.config import get_settings
 
     s = get_settings()
-    threats = [{"threat_id": "f", "grounding_status": "flagged", "threat_type_id": 10}]
+    threats = [{"threat_id": "f", "grounding_status": "unverified", "threat_type_id": 10}]
     rules = [{"RuleType": "relevance_flag", "ThreatTypeID": 10, "RuleKey": "past_incidents",
               "RuleValue": None, "Metadata": '{"weight": -20}'}]
     (sc,) = scoping.score_threats(threats, subsystems=[{"past_incidents": "None"}], rules=rules,
                                 score_threshold=s.scoping_score_threshold, top_n=s.scoping_top_n)
-    assert sc.score == 45.0  # 50 base + 15 flagged - 20 rule
+    assert sc.score == 45.0  # 50 base + 15 unverified - 20 rule
     assert sc.selected is False
     assert "below score threshold" in sc.reason
 
@@ -194,7 +199,7 @@ def test_rule_value_and_metadata_semantics_hardened():
     """Adversarial-review fixes: '' RuleValue is a literal match-empty (not 'use the
     default'); malformed Metadata skips the rule (no guessed weight); numeric values
     match across representations ('05' == 5)."""
-    threats = [{"threat_id": "a", "grounding_status": "grounded", "threat_type_id": 10}]
+    threats = [{"threat_id": "a", "grounding_status": "verified", "threat_type_id": 10}]
     # empty-string RuleValue compared literally — "IT System" != "" → gate fails
     rules = [{"RuleType": "tech_gate", "ThreatTypeID": 10, "RuleKey": "asset_type",
               "RuleValue": "", "Metadata": None}]
@@ -235,7 +240,7 @@ def test_rule_value_and_metadata_semantics_hardened():
 def test_boolean_rule_value_spelling_contract():
     """Post-fix bool matching: True ≡ "1"/"true", False ≡ "0"/"false" (case-insensitive);
     any other expected string never matches a bool."""
-    threats = [{"threat_id": "a", "grounding_status": "grounded", "threat_type_id": 10}]
+    threats = [{"threat_id": "a", "grounding_status": "verified", "threat_type_id": 10}]
 
     def score(rule_value, sub_value):
         rules = [{"RuleType": "relevance_flag", "ThreatTypeID": 10, "RuleKey": "criticality",
@@ -252,7 +257,7 @@ def test_boolean_rule_value_spelling_contract():
 def test_new_descriptive_rule_keys_resolve():
     """The remaining newly-mapped keys resolve to their subsystem fields (no
     rule_key_unknown no-op) — the fired factor proves resolution end-to-end."""
-    threats = [{"threat_id": "a", "grounding_status": "grounded", "threat_type_id": 10}]
+    threats = [{"threat_id": "a", "grounding_status": "verified", "threat_type_id": 10}]
     rules = [{"RuleType": "relevance_flag", "ThreatTypeID": 10, "RuleKey": "past_incidents",
               "RuleValue": "None", "Metadata": None}]
     (s,) = scoping.score_threats(threats, subsystems=[SUB], rules=rules)
@@ -261,7 +266,7 @@ def test_new_descriptive_rule_keys_resolve():
 
 def test_ungrounded_threat_bypasses_rules():
     """A flagged threat (NULL ThreatTypeID) has no type to key rules on — untouched by design."""
-    threats = [{"threat_id": "a", "grounding_status": "flagged", "threat_type_id": None}]
+    threats = [{"threat_id": "a", "grounding_status": "unverified", "threat_type_id": None}]
     rules = [{"RuleType": "tech_gate", "ThreatTypeID": 10, "RuleKey": "asset_type",
               "RuleValue": None, "Metadata": None}]
     (s,) = scoping.score_threats(threats, subsystems=[{"asset_type": "IT System"}], rules=rules)
@@ -339,7 +344,7 @@ def test_grounding_happy_path(db, stub_llm):
     gr = grounding.find_threat_in_library(db, stub_llm, {
         "category": "Tampering", "type": "Firmware Tampering",
         "name": "Bootloader implant", "actors": ["Hacker", "Nation-state"]}, sector_ids=[])
-    assert gr.status == GroundingStatus.grounded
+    assert gr.status == GroundingStatus.verified
     assert (gr.type_id, gr.catalogue_id) == (10, 20)
     assert gr.actors == ["Hacker"]  # out-of-set actor dropped (§8.4 step 5)
 
@@ -362,7 +367,7 @@ def test_grounding_actors_none_normalized_on_flagged_path(db, stub_llm):
     gr = grounding.find_threat_in_library(db, stub_llm, {
         "category": "Tampering", "type": "Totally Unknown Threat Type",
         "name": "Whatever", "actors": None}, sector_ids=[])
-    assert gr.status == GroundingStatus.flagged
+    assert gr.status == GroundingStatus.unverified
     assert gr.actors == []
 
 
@@ -428,7 +433,7 @@ def test_grounding_zero_type_candidates_flags_not_crashes(db, stub_llm):
     gr = grounding.find_threat_in_library(db, stub_llm, {
         "category": "Repudiation", "type": "Anything", "name": "Anything",
         "actors": ["Hacker"]}, sector_ids=[])
-    assert gr.status == GroundingStatus.flagged
+    assert gr.status == GroundingStatus.unverified
     assert gr.type_id is None and gr.catalogue_id is None
     assert gr.actors == ["Hacker"] and gr.actors_validated is False
 
@@ -497,7 +502,8 @@ def test_threats_prompt_redacts_secret_in_asset_context():
     # cii_asset_description is UI-supplied free text — still redacted like every
     # other allowlisted field before it reaches the model (§10.3).
     asset_context = {**DEFAULT_ASSET_CONTEXT, "cii_asset_description": "Contact a@b.com for access."}
-    msgs = prompts.threats_prompt("CAD", asset_context, [SUB], MAX_THREATS)
+    msgs = prompts.threats_prompt("CAD", asset_context, [SUB], MAX_THREATS,
+                                asset_active_fields=["cii_asset_description"])
     serialized = json.dumps(msgs)
     assert "a@b.com" not in serialized
     assert "[REDACTED]" in serialized
@@ -532,36 +538,43 @@ def test_threats_prompt_honors_curator_toggled_active_fields():
         "CAD", DEFAULT_ASSET_CONTEXT, [SUB], MAX_THREATS,
         asset_active_fields=["critical_service"])[1]["content"]
     assert '"critical_service"' in payload
-    assert '"cii_asset_description"' not in payload  # on the ceiling, but not in the curator's active list
+    assert '"cii_asset_description"' not in payload  # not in the curator's active list
 
 
-def test_threats_prompt_cannot_be_widened_beyond_the_hardcoded_ceiling():
-    # The whole point of the ceiling: a Context_Field_Config row naming something outside
-    # prompts.py's own hardcoded set must never reach the model, no matter what the database says.
+def test_threats_prompt_active_fields_are_the_only_allowlist():
+    # Context_Field_Config is the sole source of what reaches the model — there is no hardcoded
+    # ceiling behind it, so a field a curator activates IS sent, and one they don't, isn't.
+    # critical_service is the one forced exception (validation requires it; every asset is
+    # critical), so it appears even though it's not in the active list.
     payload = prompts.threats_prompt(
-        "CAD", {**DEFAULT_ASSET_CONTEXT, "not_a_real_field": "should never appear"}, [SUB], MAX_THREATS,
-        asset_active_fields=["critical_service", "not_a_real_field"])[1]["content"]
-    assert "should never appear" not in payload
+        "CAD", {**DEFAULT_ASSET_CONTEXT, "a_new_field": "should appear"}, [SUB], MAX_THREATS,
+        asset_active_fields=["a_new_field"])[1]["content"]
+    assert "should appear" in payload
+    assert '"critical_service"' in payload  # forced exception, always sent
+    assert '"cii_asset_description"' not in payload  # everything else still curator-gated
 
 
 def test_threats_prompt_fails_closed_when_active_fields_are_entirely_a_typo():
-    # [REVIEW-FIX] a non-empty active-fields list that shares NOTHING with the hardcoded ceiling
-    # (e.g. every row is a typo/renamed field) must narrow to sending NOTHING for that group —
-    # falling back to the full ceiling here would be a fail-OPEN response to a misconfiguration.
+    # A non-empty active-fields list naming nothing that exists on the context dict (e.g. every
+    # row is a typo/renamed field) sends NOTHING for that group (bar the forced critical_service
+    # exception). Re-expanding to "everything" here would be a fail-OPEN response to a
+    # misconfiguration.
     payload = prompts.threats_prompt(
         "CAD", DEFAULT_ASSET_CONTEXT, [SUB], MAX_THREATS,
-        asset_active_fields=["critical_srevice"])[1]["content"]  # typo, matches nothing on the ceiling
-    for field in ("cii_asset_description", "critical_service", "sector", "sub_sector", "data_handled"):
+        asset_active_fields=["critical_srevice"])[1]["content"]  # typo, matches no real field
+    for field in ("cii_asset_description", "sector", "sub_sector", "data_handled"):
         assert f'"{field}"' not in payload
+    assert '"critical_service"' in payload  # forced exception, always sent
 
 
-def test_threats_prompt_falls_back_to_ceiling_when_active_fields_empty():
-    # An unseeded Context_Field_Config table (or every row for this group switched off) must
-    # still produce a working prompt with the full hardcoded set, not an empty one.
+def test_threats_prompt_sends_no_context_when_active_fields_empty():
+    # An unseeded Context_Field_Config table (or every row for this group switched off) means no
+    # asset context — fail closed, never a fallback to the full set. critical_service is the one
+    # forced exception: validation requires it, every asset is critical.
     payload = prompts.threats_prompt(
         "CAD", DEFAULT_ASSET_CONTEXT, [SUB], MAX_THREATS, asset_active_fields=[])[1]["content"]
-    assert '"critical_service"' in payload
-    assert '"cii_asset_description"' in payload
+    assert '"critical_service"' in payload  # forced exception, always sent
+    assert '"cii_asset_description"' not in payload
 
 
 def test_active_category_and_actor_names_read_live_and_filter_inactive(db):
@@ -1359,7 +1372,7 @@ def test_resume_reloads_threats_for_scenarios_stage(db):
         "ThreatCategory": "Tampering", "ThreatType": "Firmware Tampering", "ThreatName": "Bootloader implant",
         "ThreatActorsJSON": json.dumps({"actors": ["Hacker"], "validated": True}),
         "LibraryThreatType": "Firmware Tampering", "LibraryThreatName": "Bootloader implant",
-        "ThreatTypeID": 10, "ThreatCatalogueID": 20, "GroundingStatus": GroundingStatus.grounded,
+        "ThreatTypeID": 10, "ThreatCatalogueID": 20, "GroundingStatus": GroundingStatus.verified,
         "GroundingScore": 90, "Superseded": 0, "CreatedAt": now(),
     })
     _force_stage(db, sid, SUB["id"], SubsystemLevel.THREATS, StageStatus.COMPLETE)
@@ -1579,7 +1592,7 @@ def _seed_flagged_threat(sess, sid, ssid, category, ttype, tname, actors, type_i
         ThreatCategory=category, ThreatType=ttype, ThreatName=tname,
         ThreatActorsJSON=json.dumps({"actors": actors, "validated": validated}),
         LibraryThreatType=None, LibraryThreatName=None, ThreatTypeID=type_id, ThreatCatalogueID=catalogue_id,
-        GroundingStatus=GroundingStatus.flagged, GroundingScore=30, Superseded=0, CreatedAt=now()))
+        GroundingStatus=GroundingStatus.unverified, GroundingScore=30, Superseded=0, CreatedAt=now()))
     return tid
 
 
@@ -1790,7 +1803,7 @@ def test_accept_does_not_repromote_grounded_threat(db):
         ThreatCategory="Tampering", ThreatType="Firmware Tampering", ThreatName="Bootloader implant",
         ThreatActorsJSON=json.dumps({"actors": ["Hacker"], "validated": True}),
         LibraryThreatType="Firmware Tampering", LibraryThreatName="Bootloader implant",
-        ThreatTypeID=10, ThreatCatalogueID=20, GroundingStatus=GroundingStatus.grounded, GroundingScore=95,
+        ThreatTypeID=10, ThreatCatalogueID=20, GroundingStatus=GroundingStatus.verified, GroundingScore=95,
         Superseded=0, CreatedAt=now()))
     _seed_scenario_chain(db, sid, ASSET_UNIT_ID, grounded_tid)  # its scenario IS accepted — still no promotion
     decide_session_outcome(db, session)
@@ -1800,6 +1813,73 @@ def test_accept_does_not_repromote_grounded_threat(db):
     promoted = db.execute(select(func.count()).select_from(m.Scenario_Audit).where(
         m.Scenario_Audit.SessionID == sid, m.Scenario_Audit.EventType == AuditEventType.library_promoted)).scalar()
     assert promoted == 0  # already-grounded threat is never re-promoted
+
+
+def _promotion_count(db, sid):
+    return db.execute(select(func.count()).select_from(m.Scenario_Audit).where(
+        m.Scenario_Audit.SessionID == sid,
+        m.Scenario_Audit.EventType == AuditEventType.library_promoted)).scalar()
+
+
+def _seed_scored_threat(db, sid, name, *, score, status, type_id=None, catalogue_id=None):
+    tid = str(uuid.uuid4())
+    db.execute(insert(m.Identified_Threat).values(
+        ThreatID=tid, SessionID=sid, TenantID="default", SubsystemID=ASSET_UNIT_ID,
+        ThreatCategory="Tampering", ThreatType="Firmware Tampering", ThreatName=name,
+        ThreatActorsJSON=json.dumps({"actors": [], "validated": False}),
+        LibraryThreatType=None, LibraryThreatName=None,
+        ThreatTypeID=type_id, ThreatCatalogueID=catalogue_id,
+        GroundingStatus=status, GroundingScore=score, Superseded=0, CreatedAt=now()))
+    _seed_scenario_chain(db, sid, ASSET_UNIT_ID, tid)
+    return tid
+
+
+def test_promotion_follows_its_own_threshold_not_the_grounding_band(db):
+    """[Change 9a] Promotion selects on SCORE against library_promotion_threshold, never on the
+    grounding band. This is the case that regressed when the bands collapsed to two: a threat
+    scoring 85 is `unverified` under a match cutoff of 90, and the old
+    `GroundingStatus == unverified` filter therefore promoted it — minting a catalogue entry for
+    something that scored well above the curation bar. Raising the MATCH cutoff must not drag
+    curation volume up with it; that is the whole point of the second knob."""
+    session = _seed_session(db)
+    sid = session["SessionID"]
+    _review_ready(db, sid, ASSET_UNIT_ID)
+    # 85: unverified (< the 90 match cutoff this env pins) but >= the 75 promotion cutoff.
+    _seed_scored_threat(db, sid, "Scored above the curation bar", score=85,
+                        status=GroundingStatus.unverified)
+    decide_session_outcome(db, session)
+    accept_session(db, sid, "5", "u1")
+    db.commit()
+    assert _promotion_count(db, sid) == 0
+
+
+def test_promotion_includes_a_row_with_no_recorded_score(db):
+    """`GroundingScore < th` is UNKNOWN for NULL in SQL, which would silently DROP such a row
+    from the candidate set where the old band filter kept it. The column is nullable
+    (TSG_Core.sql:131), and a threat with no recorded score is by definition not a confident
+    match — so it must still reach a curator."""
+    session = _seed_session(db)
+    sid = session["SessionID"]
+    _review_ready(db, sid, ASSET_UNIT_ID)
+    _seed_scored_threat(db, sid, "No score recorded", score=None,
+                        status=GroundingStatus.unverified)
+    decide_session_outcome(db, session)
+    accept_session(db, sid, "5", "u1")
+    db.commit()
+    assert _promotion_count(db, sid) == 1
+
+
+def test_promotion_threshold_may_not_exceed_the_match_threshold():
+    """Fails CLOSED at boot: above the match cutoff, a `verified` threat — one already carrying
+    the matched entry's ThreatCatalogueID — would fall under the promotion cutoff and duplicate
+    the very entry it matched. That is the near-duplicate machine, refused at construction."""
+    from app.core.config import Settings
+
+    with pytest.raises(ValueError, match="library_promotion_threshold"):
+        Settings(grounding_match_threshold=70.0, library_promotion_threshold=75.0)
+    # equal is allowed — the two knobs may legitimately coincide
+    assert Settings(grounding_match_threshold=75.0,
+                    library_promotion_threshold=75.0).library_promotion_threshold == 75.0
 
 
 # ponytail: no more "errored subsystem stays out of good_subs, its flagged threat never promoted"
@@ -2195,11 +2275,13 @@ def test_unset_new_metadata_fields_dropped_from_prompt():
 
 
 def test_dr_backup_fields_reach_the_prompt_when_set():
-    # Companion to the test above: proves the 21 fields newly added to _SUB_ALLOWED (DR/backup
-    # posture, data-residency, usage scale) actually reach the prompt once a subsystem sets
-    # them, not just that they stay absent when unset — no existing test checked presence.
+    # Companion to the test above: proves the DR/backup posture, data-residency and usage-scale
+    # fields actually reach the prompt once a subsystem sets them AND a curator has them active
+    # in Context_Field_Config, not just that they stay absent when unset.
     sub = {**SUB, "backup_tested": True, "data_residency_restrictions": True, "rto_target_mins": 30.0}
-    payload = prompts.threats_prompt("CAD", DEFAULT_ASSET_CONTEXT, [sub], MAX_THREATS)[1]["content"]
+    payload = prompts.threats_prompt(
+        "CAD", DEFAULT_ASSET_CONTEXT, [sub], MAX_THREATS,
+        sub_active_fields=["backup_tested", "data_residency_restrictions", "rto_target_mins"])[1]["content"]
     for key in ("backup_tested", "data_residency_restrictions", "rto_target_mins"):
         assert f'"{key}"' in payload
 
@@ -2298,7 +2380,9 @@ def test_prompts_carry_generation_constraints_and_safety_rules():
     assert "json array" in threats_msgs[0]["content"].lower()
     scen_sys = scenario_msgs[0]["content"].lower()
     assert "json array" not in scen_sys
-    assert prompts.PROMPT_VERSION == "1.3"
+    # Pinned to "1.0" for the development phase: prompt wording changes without a version bump,
+    # so this asserts the stamp is stable, not that a particular prompt revision is in place.
+    assert prompts.PROMPT_VERSION == "1.0"
 
 
 # --- [R13] downstream consumer contract: GET /v1/sessions/{session_id}/accepted-scenarios ---

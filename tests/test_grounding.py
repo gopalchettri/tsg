@@ -24,25 +24,25 @@ def _unpinned(**kw) -> Settings:
     via the .env FILE, read at class-definition time); init kwargs outrank env and env_file, so
     passing them and then clearing the flag is the only hermetic form.
     """
-    s = Settings(grounding_grounded_threshold=75.0, grounding_confirm_threshold=60.0, **kw)
-    s.model_fields_set.discard("grounding_grounded_threshold")
-    s.model_fields_set.discard("grounding_confirm_threshold")
+    s = Settings(grounding_match_threshold=75.0, **kw)
+    s.model_fields_set.discard("grounding_match_threshold")
     return s
 
 
 def test_route_bands_at_boundaries():
-    s = Settings(grounding_grounded_threshold=75.0, grounding_confirm_threshold=60.0)
-    assert label_match_from_score(75.0, s) is GroundingStatus.grounded   # >= grounded → grounded
-    assert label_match_from_score(74.9, s) is GroundingStatus.confirm    # just under grounded
-    assert label_match_from_score(60.0, s) is GroundingStatus.confirm    # >= confirm → confirm
-    assert label_match_from_score(59.9, s) is GroundingStatus.flagged    # under confirm → flagged
+    s = Settings(grounding_match_threshold=75.0)
+    assert label_match_from_score(75.0, s) is GroundingStatus.verified      # >= cutoff → verified
+    assert label_match_from_score(74.9, s) is GroundingStatus.unverified    # just under → unverified
+    assert label_match_from_score(0.0, s) is GroundingStatus.unverified     # no match at all
+    assert label_match_from_score(100.0, s) is GroundingStatus.verified     # perfect match
 
 
 def test_worst_returns_lower_band():
     # overall confidence can be no higher than the weakest of Type / Threat-name.
-    assert pick_worse_of_two(GroundingStatus.confirm, GroundingStatus.grounded) is GroundingStatus.confirm
-    assert pick_worse_of_two(GroundingStatus.flagged, GroundingStatus.confirm) is GroundingStatus.flagged
-    assert pick_worse_of_two(GroundingStatus.grounded, GroundingStatus.grounded) is GroundingStatus.grounded
+    assert pick_worse_of_two(GroundingStatus.unverified, GroundingStatus.verified) is GroundingStatus.unverified
+    assert pick_worse_of_two(GroundingStatus.verified, GroundingStatus.unverified) is GroundingStatus.unverified
+    assert pick_worse_of_two(GroundingStatus.verified, GroundingStatus.verified) is GroundingStatus.verified
+    assert pick_worse_of_two(GroundingStatus.unverified, GroundingStatus.unverified) is GroundingStatus.unverified
 
 
 def test_cosine_zero_vector_returns_zero_not_error():
@@ -172,18 +172,18 @@ def test_prime_query_embeddings_failure_is_not_fatal():
 # later find_threat_in_library test in the whole suite.
 
 def test_resolve_thresholds_env_override_wins():
-    s = Settings(grounding_grounded_threshold=80.0, grounding_confirm_threshold=70.0)
-    # explicitly-set values pin the cutoffs — no store lookup, no calibration, sess/llm untouched
-    assert grounding.resolve_thresholds(None, None, s) == (80.0, 70.0)
+    s = Settings(grounding_match_threshold=80.0)
+    # an explicitly-set value pins the cutoff — no store lookup, no calibration, sess/llm untouched
+    assert grounding.resolve_thresholds(None, None, s) == 80.0
 
 
 def test_resolve_thresholds_uses_stored_pair_and_memoizes(monkeypatch):
     calls = []
     monkeypatch.setattr(grounding.embeddings, "load_thresholds",
-                        lambda key: calls.append(key) or (72.0, 58.0))
+                        lambda key: calls.append(key) or 72.0)
     s = _unpinned(embedding_model="fake-emb-stored", reranker_model="fake-rr-stored")
-    assert grounding.resolve_thresholds(None, None, s) == (72.0, 58.0)
-    assert grounding.resolve_thresholds(None, None, s) == (72.0, 58.0)
+    assert grounding.resolve_thresholds(None, None, s) == 72.0
+    assert grounding.resolve_thresholds(None, None, s) == 72.0
     assert calls == [("fake-emb-stored", "fake-rr-stored")]  # second hit came from the memo
 
 
@@ -191,12 +191,12 @@ def test_resolve_thresholds_auto_calibrates_and_stores(monkeypatch):
     stored = {}
     monkeypatch.setattr(grounding.embeddings, "load_thresholds", lambda key: None)
     monkeypatch.setattr(grounding.embeddings, "store_thresholds",
-                        lambda key, g, c: stored.update(key=key, g=g, c=c))
-    monkeypatch.setattr(grounding, "_auto_calibrate", lambda sess, llm, s: (71.0, 55.0))
+                        lambda key, th: stored.update(key=key, th=th))
+    monkeypatch.setattr(grounding, "_auto_calibrate", lambda sess, llm, s: 71.0)
     s = _unpinned(embedding_model="fake-emb-auto", reranker_model="fake-rr-auto")
     # allow_calibration=True is the BOOT-ONLY door (celery_app._init_worker) — see the next test
-    assert grounding.resolve_thresholds(object(), object(), s, allow_calibration=True) == (71.0, 55.0)
-    assert stored == {"key": ("fake-emb-auto", "fake-rr-auto"), "g": 71.0, "c": 55.0}
+    assert grounding.resolve_thresholds(object(), object(), s, allow_calibration=True) == 71.0
+    assert stored == {"key": ("fake-emb-auto", "fake-rr-auto"), "th": 71.0}
 
 
 def test_resolve_thresholds_never_calibrates_outside_boot(monkeypatch):
@@ -209,9 +209,8 @@ def test_resolve_thresholds_never_calibrates_outside_boot(monkeypatch):
     monkeypatch.setattr(grounding, "_auto_calibrate",
                         lambda sess, llm, s: pytest.fail("calibration must never run in-request"))
     s = _unpinned(embedding_model="fake-emb-lazy", reranker_model="fake-rr-lazy")
-    # default allow_calibration=False → static defaults, no calibration attempted
-    assert grounding.resolve_thresholds(object(), object(), s) == (
-        s.grounding_grounded_threshold, s.grounding_confirm_threshold)
+    # default allow_calibration=False → static default, no calibration attempted
+    assert grounding.resolve_thresholds(object(), object(), s) == s.grounding_match_threshold
 
 
 def test_uncalibrated_fallback_is_not_memoized_so_a_worker_self_heals(monkeypatch):
@@ -222,10 +221,9 @@ def test_uncalibrated_fallback_is_not_memoized_so_a_worker_self_heals(monkeypatc
     monkeypatch.setattr(grounding.embeddings, "load_thresholds", lambda key: stored_now.get(key))
     s = _unpinned(embedding_model="fake-emb-heal", reranker_model="fake-rr-heal")
 
-    assert grounding.resolve_thresholds(None, None, s) == (
-        s.grounding_grounded_threshold, s.grounding_confirm_threshold)
-    stored_now[("fake-emb-heal", "fake-rr-heal")] = (73.0, 61.0)  # a sibling worker calibrates
-    assert grounding.resolve_thresholds(None, None, s) == (73.0, 61.0)  # picked up, not pinned
+    assert grounding.resolve_thresholds(None, None, s) == s.grounding_match_threshold
+    stored_now[("fake-emb-heal", "fake-rr-heal")] = 73.0  # a sibling worker calibrates
+    assert grounding.resolve_thresholds(None, None, s) == 73.0  # picked up, not pinned
 
 
 _CAL_NAMES = [f"threat-{i}" for i in range(6)]
@@ -262,15 +260,13 @@ def test_auto_calibrate_still_calibrates_when_negatives_are_separable(monkeypatc
     monkeypatch.setattr(grounding, "find_closest_match", _fcm)
     got = grounding._auto_calibrate(object(), object(), _unpinned())
     assert got is not None
-    grounded_th, confirm_th = got
-    assert 10.0 < grounded_th < 95.0        # midpoint between the classes
-    assert confirm_th < grounded_th         # config's invariant, preserved
+    assert 10.0 < got < 95.0        # the one cutoff, midway between the classes
 
 
 def test_boundary_between_stays_strictly_inside_a_sub_point_gap():
     """[review-fix] round()-ing the midpoint could land the cutoff ON or BELOW max(negatives)
     when the class gap was under ~1 point — and `score >= threshold` then bands a measured
-    IMPOSTOR as grounded (auto-accepted, no human review)."""
+    IMPOSTOR as verified, trusting master ids that do not describe it."""
     got = grounding.boundary_between([71.2], [71.4])
     assert got is not None and 71.2 < got < 71.4
 
@@ -279,25 +275,8 @@ def test_resolve_thresholds_falls_back_to_defaults_when_uncalibratable(monkeypat
     monkeypatch.setattr(grounding.embeddings, "load_thresholds", lambda key: None)
     monkeypatch.setattr(grounding, "_auto_calibrate", lambda sess, llm, s: None)
     s = _unpinned(embedding_model="fake-emb-none", reranker_model="fake-rr-none")
-    # degrade-safe: never blocks a run — static defaults + a warning
-    assert grounding.resolve_thresholds(None, None, s) == (
-        s.grounding_grounded_threshold, s.grounding_confirm_threshold)
-
-
-def test_auto_calibrate_orders_confirm_below_grounded(monkeypatch):
-    """Positives (paraphrase scores) high, negatives (leave-one-out) low → grounded_th between
-    the classes and confirm_th strictly below it — the pair config's validator would accept."""
-    monkeypatch.setattr(grounding.embeddings, "_active_names",
-                        lambda sess, t, c: [f"Threat {i}" for i in range(6)])
-    monkeypatch.setattr(grounding, "_paraphrase", lambda llm, n: [f"reworded {n}"])
-    monkeypatch.setattr(grounding, "find_closest_match",
-                        lambda llm, q, rows, key, s, group, qv=None:
-                            ({"ThreatName": "x"}, 80.0 if q.startswith("reworded") else 45.0))
-    got = grounding._auto_calibrate(object(), object(), Settings())
-    assert got is not None
-    grounded_th, confirm_th = got
-    assert 45.0 < grounded_th < 80.0
-    assert confirm_th < grounded_th
+    # degrade-safe: never blocks a run — the static default + a warning
+    assert grounding.resolve_thresholds(None, None, s) == s.grounding_match_threshold
 
 
 class _EmbedSpyStub:

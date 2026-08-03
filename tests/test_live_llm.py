@@ -53,8 +53,9 @@ pytestmark = pytest.mark.skipif(
 
 
 # Small synthetic subsystem reused across the chat tests: an internet-facing login service
-# handling PII. Only allowlisted fields (prompts._ASSET_CONTEXT_ALLOWED / _SUB_ALLOWED) are set,
-# so nothing is silently dropped before the real call.
+# handling PII. The allowlist now comes entirely from Context_Field_Config, which these tests have
+# no DB for — so _ACTIVE_ASSET_FIELDS/_ACTIVE_SUB_FIELDS below stand in for the curator's active
+# rows and are passed explicitly, otherwise no context at all would reach the real call.
 _ASSET_NAME = "Customer Identity Platform"
 _ASSET_CONTEXT = {
     "cii_asset_description": "Internet-facing customer login and identity service",
@@ -69,6 +70,8 @@ _SUBSYSTEM = {
     "accessability_channel": "Public Internet",
     "user_base_count": 500000,
 }
+_ACTIVE_ASSET_FIELDS = list(_ASSET_CONTEXT)
+_ACTIVE_SUB_FIELDS = list(_SUBSYSTEM)
 
 
 def _norm(text: str) -> str:
@@ -90,7 +93,9 @@ def test_live_chat_proposes_parseable_threats():
     """Real model + our parser agree: threats_prompt -> chat() -> parse_json yields a non-empty
     list of well-formed {category, type, name, actors} threats."""
     llm = get_llm()
-    messages = prompts.threats_prompt(_ASSET_NAME, _ASSET_CONTEXT, [_SUBSYSTEM], max_threats=6)
+    messages = prompts.threats_prompt(_ASSET_NAME, _ASSET_CONTEXT, [_SUBSYSTEM], max_threats=6,
+                                    asset_active_fields=_ACTIVE_ASSET_FIELDS,
+                                    sub_active_fields=_ACTIVE_SUB_FIELDS)
     # No temperature override: some deployments (e.g. gpt-5 on Azure) only accept temperature=1,
     # and this test verifies parseability, not temperature handling — let the provider default.
     text, prov = llm.chat(messages)
@@ -121,7 +126,8 @@ def test_live_coverage_aware_returns_new_threats():
 
     llm = get_llm()
     messages = prompts.threats_prompt(
-        _ASSET_NAME, _ASSET_CONTEXT, [_SUBSYSTEM], max_threats=6, exclude=already_covered)
+        _ASSET_NAME, _ASSET_CONTEXT, [_SUBSYSTEM], max_threats=6, exclude=already_covered,
+        asset_active_fields=_ACTIVE_ASSET_FIELDS, sub_active_fields=_ACTIVE_SUB_FIELDS)
     # Provider-default temperature (see test_live_chat_proposes_parseable_threats).
     text, _ = llm.chat(messages)
     threats = validation.parse_json(text, stage="threats", expected_type=list)
@@ -148,7 +154,8 @@ def test_live_scenario_generation_validates():
     threat_name = "SQL Injection"
 
     llm = get_llm()
-    base_ctx = prompts.build_base_context(_ASSET_NAME, _ASSET_CONTEXT, [_SUBSYSTEM])
+    base_ctx = prompts.build_base_context(_ASSET_NAME, _ASSET_CONTEXT, [_SUBSYSTEM],
+                                        _ACTIVE_ASSET_FIELDS, _ACTIVE_SUB_FIELDS)
     messages = prompts.scenario_prompt(base_ctx, threat_type, threat_name)
     text, _ = llm.chat(messages)
     scenario = validation.parse_json(text, stage="scenario", expected_type=dict)

@@ -58,11 +58,16 @@ class SubsystemLevel(StrEnum):
 
 
 class GroundingStatus(StrEnum):
-    """`Identified_Threat.GroundingStatus` — how confidently an AI-proposed threat matched
-    an existing library master (two-band reranker score, default thresholds 75/60)."""
-    grounded = "grounded"   # >=75 — confident match; ThreatTypeID/ThreatCatalogueID set to the matched master
-    confirm = "confirm"     # 60-75 — plausible match, same master ids set, lower-confidence band
-    flagged = "flagged"     # <60 — no confident match; the ONLY status eligible for library promotion on accept
+    """`Identified_Threat.GroundingStatus` — did an AI-proposed threat match an approved library
+    master? TWO bands, split by one cutoff (grounding_match_threshold, default 75).
+
+    Deliberately not three: a middle "plausible, look at it" band read as a confidence gradient
+    but was consumed as a boolean everywhere (promote / don't promote, trust the master ids /
+    don't), so the extra band only ever moved which side of a line a threat fell on. One cutoff,
+    one meaning."""
+    verified = "verified"       # >= threshold — matched an approved entry; ThreatTypeID/ThreatCatalogueID set to that master
+    unverified = "unverified"   # <  threshold — no confident match. Still gets a scenario, and is what
+                                # library promotion feeds on (accept.py) — "novel", not "rejected".
 
 
 class ThreatRuleType(StrEnum):
@@ -72,6 +77,31 @@ class ThreatRuleType(StrEnum):
     tech_gate = "tech_gate"                              # pass/fail gate — failing it excludes the threat outright
     relevance_flag = "relevance_flag"                    # score points from a yes/no flag
     relevance_context_value = "relevance_context_value"  # score points from a specific context value
+
+
+class ScopingRejection(StrEnum):
+    """`Scoped_Threat.RejectionKind` — WHY a threat was not selected, as a value code may branch on.
+
+    `Reason` stays free prose for the reviewer; this is the machine half. The two are written
+    together and must never be derived from each other: "generate next set" decides re-servability
+    from THIS column, and before it existed that decision was `Reason LIKE 'beyond top-%'` —
+    rewording the sentence would have silently emptied the pool forever, with no error. Prose is
+    allowed to change; a rejection KIND is a contract.
+
+    NULL on a selected row (nothing rejected it). Only `top_n_cutoff` is re-servable — the other
+    three fail re-scoring identically, so re-serving one churns a Selected=0 row that
+    write_scenarios keeps refusing: the "no new threats" wedge. See RESERVABLE_REJECTIONS."""
+    top_n_cutoff = "top_n_cutoff"        # above the bar, just outside this round's top-N —
+                                          # target-mode re-scoring WILL re-select it
+    duplicate = "duplicate"              # same catalogue identity as a higher-ranked threat, whose
+                                          # scenario already covers it
+    tech_gate = "tech_gate"              # a required-technology gate failed — permanent
+    below_threshold = "below_threshold"  # score under the configured floor — permanent
+
+
+# The ONLY rejections dal.next_unserved_unique_threats may re-serve. A tuple, not a set: the SQL
+# text stays byte-stable so the plan cache isn't churned by set-iteration order.
+RESERVABLE_REJECTIONS: tuple[ScopingRejection, ...] = (ScopingRejection.top_n_cutoff,)
 
 
 class ScenarioStatus(StrEnum):
@@ -126,11 +156,17 @@ class AuditEventType(StrEnum):
     threat_regrounded = "threat_regrounded"             # reserved — only `scenario` regen is implemented
     subsystem_advanced = "subsystem_advanced"           # written at the START of a subsystem's work, not on completion
     auto_fanout_review = "auto_fanout_review"           # reserved — no current producer
-    library_promoted = "library_promoted"               # on accept, once per NEW master created from a flagged threat
+    library_promoted = "library_promoted"               # on accept, once per NEW master created from an unverified threat
     candidate_reconciled = "candidate_reconciled"       # on accept, once per Threat_Candidate_Review row closed as accepted
     session_cancelled = "session_cancelled"             # explicit cancel route, or `_mark_session_failed`'s total-failure
                                                         # path (live pipeline + reaper) — either way releases the M4 lock
     stage_error = "stage_error"                         # a stage failed after retries
+    next_set_outcome = "next_set_outcome"               # once per "generate next set" click, at the very end —
+                                                        # DetailJSON carries {outcome, requested, delivered,
+                                                        # variants, reason, epoch}. Deliberately a SEPARATE row
+                                                        # from the two generation_complete rows one click can
+                                                        # write (those must be SUMMED); this is the single
+                                                        # authoritative summary the status board reads.
 
 
 class AuditDecision(StrEnum):
@@ -184,11 +220,74 @@ class SSEEventType(StrEnum):
     heartbeat = "heartbeat"                             # periodic keep-alive so proxies don't drop an idle SSE connection
 
 
+class NextSetOutcome(StrEnum):
+    """What one "generate next set" click ACHIEVED — the single field a client switches on.
+
+    Deliberately not a shortfall count: `complete` vs `partial_retryable` vs `exhausted` demand
+    DIFFERENT user actions, and a bare "you are 2 short" cannot express that a short result is
+    sometimes the correct terminal answer. Retryability is stated, never inferred."""
+    complete = "complete"                    # delivered the full next_set_size
+    partial_retryable = "partial_retryable"  # short because generation(s) FAILED. A failed target keeps
+                                            # Selected=1 (tasks.py::_mark_next_set_targets_rescored_out), so
+                                            # dal.next_unserved_unique_threats re-serves it — clicking again
+                                            # IS the retry, and telling the user so is the whole point.
+    exhausted = "exhausted"                  # short (possibly zero) because nothing further EXISTS: the pool is
+                                            # empty and every identity sits at max_scenarios_per_threat.
+                                            # delivered==0 + exhausted is the old "no_new" case.
+
+
+class ClickOutcomeReason(StrEnum):
+    """Why an accepted click RAN and produced nothing. Rides the next_set_result / regen_result SSE
+    `reason` field, the audit DetailJSON, and — for the two regen-target codes — HTTP 409
+    `details.reason`. cascade.py::_REASON_INFO maps every member to its detail/message pair; the
+    consistency test in tests/ pins that mapping in both directions.
+
+    Values are verbatim the strings already published in the API guide and on the live wire — a
+    rename here is a breaking API change, not a refactor."""
+    no_new_threats_found = "no_new_threats_found"                    # tasks.py: empty candidate pool from the start
+    new_threat_did_not_qualify = "new_threat_did_not_qualify"        # tasks.py: candidate found, rescored out
+    no_target_ids = "no_target_ids"                                  # cascade.py: regen request with zero targets
+    output_not_found_or_superseded = "output_not_found_or_superseded"  # cascade.py: stale/foreign OutputIDs
+
+
+class ReviewGateReason(StrEnum):
+    """Why a review action (accept / regenerate / next-set) is refused OUTRIGHT — HTTP 409
+    `details.reason`. Produced in exactly one place, accept.py::review_gate_reason, which the accept
+    gate and the regenerate/next-set gate share so the two can never drift.
+
+    Distinct from ClickOutcomeReason: this means "your request never ran", not "it ran and found
+    nothing". Deliberately absent from cascade.py::_REASON_INFO — gate 409s carry `reason` plus the
+    exception's own message and no detail/message pair, and adding entries would silently reshape
+    every gate 409 body."""
+    session_completed = "session_completed"              # terminal: the review decision is already final
+    session_cancelled = "session_cancelled"              # terminal: start a new session for the asset
+    generation_in_progress = "generation_in_progress"    # transient: not at the REVIEW barrier yet
+
+
 if __name__ == "__main__":  # self-check: values must equal the DB strings verbatim
+    import json  # self-check only — the module itself stays import-free beyond StrEnum
     assert SubsystemLevel.LOCK == "_LOCK"
     assert WorkflowStage.THREAT_IDENTIFICATION == "THREAT_IDENTIFICATION"
-    assert GroundingStatus.confirm == "confirm"
+    assert GroundingStatus.unverified == "unverified"
     assert AuditEventType.session_cancelled == "session_cancelled"
     assert str(SessionStatus.active) == "active"
     assert ValidationStatus.warning == "warning"
+    assert AuditEventType.next_set_outcome == "next_set_outcome"
+    # These three are a PUBLISHED wire contract (SSE payloads, 409 bodies, the API guide's reason
+    # tables), so a value drifting from its documented string breaks clients, not just storage.
+    assert NextSetOutcome.partial_retryable == "partial_retryable"
+    assert ClickOutcomeReason.no_target_ids == "no_target_ids"   # NOT "empty_output_ids"
+    assert ReviewGateReason.generation_in_progress == "generation_in_progress"
+    # Re-servability is a DATA question, not a text one. Exactly one kind may come back; the other
+    # three are permanent and re-serving them is the "no new threats" wedge.
+    assert RESERVABLE_REJECTIONS == (ScopingRejection.top_n_cutoff,)
+    assert not set(RESERVABLE_REJECTIONS) & {ScopingRejection.tech_gate, ScopingRejection.duplicate,
+                                            ScopingRejection.below_threshold}
+    # Members must be usable as dict keys looked up with a plain str (cascade._REASON_INFO does
+    # exactly that with a reason read off an exception), and must serialize as the bare string.
+    # Annotated dict[str, ...]: a StrEnum member IS a str, and this is the exact shape
+    # cascade._REASON_INFO uses — enum-keyed, looked up with a plain str off an exception.
+    probe: dict[str, int] = {ClickOutcomeReason.no_new_threats_found: 1}
+    assert probe.get("no_new_threats_found") == 1
+    assert json.dumps({"r": ClickOutcomeReason.no_new_threats_found}) == '{"r": "no_new_threats_found"}'
     print("enums self-check ok")

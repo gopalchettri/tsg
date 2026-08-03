@@ -17,7 +17,8 @@ from sqlalchemy.orm import Session
 from app.api.deps import Principal, get_principal
 from app.api.schemas import (
     AcceptBody, AcceptedScenario, AcceptedScenariosResponse, AcceptResponse, CancelResponse, CreateSessionBody,
-    CreateSessionResponse, MappedControl, RegenerateResponse, RegenerateScenariosBody, ScenarioListItem,
+    CreateSessionResponse, ErrorResponse, MappedControl, NextSetResultEvent, RegenerateResponse,
+    RegenerateScenariosBody, RegenResultEvent, ScenarioListItem,
     ScenarioResult, SessionBoard, SessionResults, ThreatResult,
 )
 from app.core.config import get_settings
@@ -101,6 +102,13 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
             "threats": t, "scenarios": sc,
             "overall": str(get_overall_status(t, sc, scenario_session["SessionStatus"])),
             "error_message": error_message,
+            # The DURABLE answer to "what did my last 'generate next set' click do?". The SSE
+            # next_set_result event says the same thing, but publishing is best-effort with no
+            # replay (app/sse/bus.py), so a polling client — or one whose stream dropped — has
+            # only this. Because build_board also feeds the SSE reconnect-reconcile snapshot, a
+            # client that missed the event learns the outcome the moment it reconnects.
+            "last_next_set": dal.latest_next_set_outcome(sess, scenario_session["SessionID"],
+                                                        ASSET_UNIT_ID),
         },
     }
 
@@ -324,6 +332,11 @@ def get_results(
             session_id=sid, entity_id=entity_id,
             asset_id=int(scenario_session["AssetID"]), asset_name=scenario_session["AssetName"],
             user_id=scenario_session["UserID"],
+            # Readiness rides along so this endpoint stops looking finished when it isn't: the
+            # scenario list is a live snapshot, and reading it mid-run returns a short-but-valid
+            # list indistinguishable from a completed one. Reuses build_board rather than
+            # re-deriving, so /results and the board can never disagree.
+            progress=build_board(sess, scenario_session)["progress"],
             threats=[ThreatResult(threat_id=t["ThreatID"],
                                 threat_type=t["ThreatType"], threat_name=t["ThreatName"],
                                 grounding_status=t["GroundingStatus"],
@@ -492,7 +505,14 @@ def _subset_from_accept_body(body: AcceptBody) -> list[str] | None:
     return body.output_ids  # mode == "subset"; validator guarantees a non-empty list
 
 
-@router.post("/sessions/{session_id}/accept", response_model=AcceptResponse)
+# `responses` is not decoration: these 409 bodies are the ONLY place ReviewGateReason appears, and
+# FastAPI emits a schema only for models reachable from a route. Without this declaration the enum
+# never reaches /openapi.json, and a UI cannot generate the codes that tell it whether a blocked
+# action is a dead end (session_completed/cancelled) or a spinner (generation_in_progress).
+_CONFLICT_RESPONSES: dict[int | str, dict] = {409: {"model": ErrorResponse, "description": "Conflict — see details.reason."}}
+
+
+@router.post("/sessions/{session_id}/accept", response_model=AcceptResponse, responses=_CONFLICT_RESPONSES)
 def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depends(get_principal)) -> AcceptResponse:
     """Accepts all or a subset of scenarios and finalizes the session; validation and the state
     transition live in `accept_session`, this is the authz + HTTP wrapper."""
@@ -556,10 +576,14 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
         dal.reset_stage_for_regen(sess, session_id, subsystem_id, levels, epoch)
 
     enqueue_regeneration(session_id, subsystem_id, granularity, target_ids, epoch, user_note)
-    return RegenerateResponse(session_id=session_id, user_id=scenario_session["UserID"], status="regenerating")
+    # `epoch` goes back to the caller: a 202 only says "accepted", and this is the token that
+    # lets a client tell ITS request's completion from a previous one's (see RegenerateResponse).
+    return RegenerateResponse(session_id=session_id, user_id=scenario_session["UserID"],
+                            status="regenerating", epoch=epoch)
 
 
-@router.post("/sessions/{session_id}/regenerate/scenarios", status_code=202, response_model=RegenerateResponse)
+@router.post("/sessions/{session_id}/regenerate/scenarios", status_code=202, response_model=RegenerateResponse,
+            responses=_CONFLICT_RESPONSES)
 def post_regenerate_scenarios(session_id: str, body: RegenerateScenariosBody,
                             principal: Principal = Depends(get_principal)) -> RegenerateResponse:
     """Rebuild one or more scenarios' narratives only — siblings untouched (scenarios 1, 2). Scoped
@@ -615,10 +639,16 @@ def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> Re
         threats_epoch = dal.next_epoch(sess, session_id, subsystem_id, (SubsystemLevel.THREATS,))
 
     enqueue_next_set(session_id, subsystem_id, epoch, threats_epoch)
-    return RegenerateResponse(session_id=session_id, user_id=scenario_session["UserID"], status="generating")
+    # The SCENARIOS epoch, not the THREATS one: it is the epoch run_next_set stamps on the
+    # next_set_outcome audit row, so `last_next_set.epoch == this` is the client's exact
+    # "my click landed" signal. Polling stage status instead cannot distinguish my click from
+    # a concurrent one, which is how a mid-flight read looks finished.
+    return RegenerateResponse(session_id=session_id, user_id=scenario_session["UserID"],
+                            status="generating", epoch=epoch)
 
 
-@router.post("/sessions/{session_id}/scenarios/next-set", status_code=202, response_model=RegenerateResponse)
+@router.post("/sessions/{session_id}/scenarios/next-set", status_code=202, response_model=RegenerateResponse,
+            responses=_CONFLICT_RESPONSES)
 def post_next_set_scenarios(session_id: str, principal: Principal = Depends(get_principal)) -> RegenerateResponse:
     """Generate the next set of scenarios — 5 more unique threat scenarios that accumulate onto the
     existing ones for the session's asset, never superseding a prior batch. No request body: the
@@ -653,7 +683,25 @@ def _load_events_board(session_id: str, principal: Principal) -> dict:
         return build_board(sess, scenario_session)
 
 
-@router.get("/sessions/{session_id}/events")
+# The stream has no response_model (it is not a single JSON body), so nothing about the events
+# would otherwise appear in the spec — leaving a UI to hand-copy event shapes and reason codes out
+# of the API guide. Declaring the payloads here puts them, and every enum they reference, into
+# components.schemas so the client can be generated instead of transcribed.
+# Declared via `model` (a union), NOT a hand-inlined model_json_schema(): FastAPI then registers
+# both payloads AND every enum they reference in components.schemas. Inlining instead produces
+# $defs-local refs that dangle once the spec is assembled.
+_EVENT_STREAM_RESPONSES: dict[int | str, dict] = {
+    200: {
+        "model": NextSetResultEvent | RegenResultEvent,
+        "description": "SSE stream; each `data:` line is one event, the advisory ones typed here. "
+                    "Advisory events are best-effort and never replayed — treat them as a prompt "
+                    "to refresh, and trust GET /v1/sessions/{session_id} for durable state.",
+        "content": {"text/event-stream": {}},
+    }
+}
+
+
+@router.get("/sessions/{session_id}/events", responses=_EVENT_STREAM_RESPONSES)
 async def session_events(session_id: str, principal: Principal = Depends(get_principal)):
     """SSE stream (§9.1): sends the current board as a `reconcile` event before
     subscribing to live deltas, so a client that (re)connects mid-session never has to

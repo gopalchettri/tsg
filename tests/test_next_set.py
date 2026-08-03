@@ -349,6 +349,43 @@ def test_next_set_redelivery_runs_additive_find_threats_once(db):
 
 
 # --- FIX 3 Part 1: a full-run tech_gate-rejected (Selected=0) threat is never re-served ---------
+def test_board_reports_the_last_next_set_outcome_durably(db, monkeypatch):
+    """G1 regression — the one that matters for the bug that started all this.
+
+    The SSE next_set_result event is best-effort behind a circuit breaker with NO replay log
+    (app/sse/bus.py), so a curl client, a script, or any UI whose stream dropped learns nothing
+    from it. The status board must carry the same answer durably. `monkeypatch` kills publishing
+    entirely to prove the board does NOT depend on the event having been delivered."""
+    from app.api.sessions import build_board
+
+    monkeypatch.setattr("app.sse.bus.publish", lambda *_a, **_k: None)  # every event dropped
+    llm = _ManyThreatLLM(_threats(10))
+    session = _first_run(db, llm)
+    sid = session["SessionID"]
+    # Null before any click: a client must be able to tell "no click yet" from "a click landed".
+    assert build_board(db, dict(load_session(db, sid)))["progress"]["last_next_set"] is None
+
+    _next_set(db, session, llm, "b0a2d001-0000-4000-8000-000000000001")
+
+    got = build_board(db, dict(load_session(db, sid)))["progress"]["last_next_set"]
+    assert got is not None, "the click's outcome did not survive a dropped SSE event"
+    assert (got["outcome"], got["requested"], got["delivered"]) == ("complete", 5, 5)
+    # The epoch is the client's "is MY click done?" token — it must match the SCENARIOS stage the
+    # click actually ran at, or polling for it would never terminate.
+    scenarios_epoch = db.execute(select(m.Subsystem_Stage_State.GenerationEpoch).where(
+        m.Subsystem_Stage_State.SessionID == sid,
+        m.Subsystem_Stage_State.SubsystemID == ASSET_UNIT_ID,
+        m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS)).scalar()
+    assert got["epoch"] == scenarios_epoch
+
+    # Exactly one summary row per click — the board reads "the newest" and two rows for one click
+    # would make that read ambiguous (which is why this is NOT folded into generation_complete,
+    # of which a single click can legitimately write two that only make sense summed).
+    assert db.execute(select(func.count()).select_from(m.Scenario_Audit).where(
+        m.Scenario_Audit.SessionID == sid,
+        m.Scenario_Audit.EventType == AuditEventType.next_set_outcome)).scalar() == 1
+
+
 def _seed_tech_gate_rule(db):
     """A tech_gate on type 10 requiring asset_type 'Operational Technology (OT)'; the seeded CAD
     subsystem is 'Physical infrastructure', so every type-10 threat is permanently gated out."""
@@ -370,6 +407,12 @@ def test_next_unserved_excludes_full_run_tech_gate_rejected(db):
 
 # --- FIX 3 Part 2: a FRESH mid-next-set tech_gate rejection is marked and not re-picked ---------
 def test_next_set_fresh_tech_gate_target_marked_and_not_repicked(db, monkeypatch):
+    """Doubles as the pin on the fallback rule: a candidate that rescores out must NOT suppress
+    the variant fallback. Whether that fallback can help depends only on whether an already-covered
+    threat is still under max_scenarios_per_threat -- never on WHY the batch came up empty. The
+    under-cap type-11 primary was eligible all along, so gating on exc.reason returned 0 here for
+    no reason. (The fruitless-click reason codes themselves stay pinned by test_cascade.py's regen
+    cases and by test_next_set_repeat_only_returns_no_new_and_supersedes_nothing.)"""
     published: list = []
     monkeypatch.setattr("app.sse.bus.publish", lambda sid_, event: published.append(event))
 
@@ -384,15 +427,19 @@ def test_next_set_fresh_tech_gate_target_marked_and_not_repicked(db, monkeypatch
     assert len(_active_scenarios(db, sid)) == 1        # only the type-11 scenario, pool now empty
 
     outcome = _next_set(db, session, llm, "f3f3f3f3-3333-4333-8333-333333333333")
-    assert outcome == "no_new_threats_this_round"      # the fresh type-10 target rescored out (gated)
-    # unlike an empty-pool-from-the-start round, a candidate WAS found and rejected -- distinct
-    # reason code from test_next_set_repeat_only_returns_no_new_and_supersedes_nothing above
+    # The fresh type-10 target rescored out (gated), so no NEW-threat scenario was possible -- but
+    # the click is still served, by an alternate take on the under-cap type-11 threat.
+    assert outcome != "no_new_threats_this_round"
+    assert len(_active_scenarios(db, sid)) == 2
     events = [e for e in published if str(e.get("type")) == "next_set_result"]
     assert len(events) == 1
+    assert (events[0]["no_new"], events[0]["new_scenarios"], events[0]["new_variants"]) == (False, 1, 1)
+    # G2: the rejection must survive the rescue. Before the fallback ran on this path the client
+    # was told `new_threat_did_not_qualify`; now that variants usually save the click, dropping
+    # `reason` would silently delete the only evidence a candidate was found and refused.
     assert events[0]["reason"] == "new_threat_did_not_qualify"
-    assert events[0]["message"] == (
-        "We found something new, but it didn't meet our criteria for this "
-        "asset, so we didn't create a scenario for it.")
+    assert events[0]["outcome"] == "exhausted"      # nothing fresh served, and the pool is spent
+    assert events[0]["message"] is None, "a 'nothing was added' sentence must not ride a click that added one"
 
     # Part 2: the gated fresh type-10 threat now has an active Selected=0 Scoped_Threat marker ...
     type10_ids = set(db.execute(select(m.Identified_Threat.ThreatID).where(
@@ -578,7 +625,12 @@ def test_next_set_pool_zombie_rescored_out_is_superseded_and_not_reserved(db):
 
     _seed_tech_gate_rule(db)                              # mid-session: type-10 now permanently gated
     outcome = _next_set(db, session, _TwoThreatLLM(), "fcfcfcfc-0000-4000-8000-00000000000c")
-    assert outcome == "no_new_threats_this_round"         # the served zombie rescored out (gated)
+    # The served zombie rescored out (gated) -- but the still-covered type-11 threat is under
+    # max_scenarios_per_threat, so the click falls back to an alternate take on it rather than
+    # returning empty-handed. The zombie's own marker/re-serve behaviour below is what this test
+    # is really about, and is unchanged by that.
+    assert outcome != "no_new_threats_this_round"
+    assert len(_active_scenarios(db, sid)) == 2           # surviving type-11 primary + its variant
 
     # The stale Selected=1 scoped row is superseded; a fresh Selected=0 tech_gate marker replaces it.
     assert db.execute(select(func.count()).select_from(m.Scoped_Threat).where(

@@ -20,9 +20,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.enums import (ActorType, ScenarioStatus, SessionStatus, StageStatus, SubsystemLevel,
-                            WorkflowStage)
+from app.core.enums import (RESERVABLE_REJECTIONS, ActorType, AuditEventType, ScenarioStatus,
+                            SessionStatus, StageStatus, SubsystemLevel, WorkflowStage)
+from app.core.logging import get_logger
 from app.db import models as m
+
+log = get_logger(__name__)
 
 
 def execute_dml(sess: Session, stmt: Executable) -> CursorResult[Any]:
@@ -872,10 +875,14 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
             isouter=True))
         .where(it.SessionID == session_id, it.SubsystemID == subsystem_id, it.Superseded == 0,
             # A rejected active Scoped_Threat is re-servable ONLY if it was demoted by the top-N
-            # cutoff — target-mode re-scoring will re-select it. A tech_gate / below-threshold
-            # rejection is PERMANENT (re-scoring fails the same way), so re-serving it churns a
-            # Selected=0 row and write_scenarios keeps refusing it: the "no new threats" wedge.
-            or_(st.ScopedThreatID.is_(None), st.Selected == 1, st.Reason.like("beyond top-%")))
+            # cutoff — target-mode re-scoring will re-select it. A tech_gate / below-threshold /
+            # duplicate rejection is PERMANENT (re-scoring fails the same way), so re-serving it
+            # churns a Selected=0 row and write_scenarios keeps refusing it: the "no new threats"
+            # wedge. Matched on RejectionKind, NOT on the wording of Reason: this predicate was
+            # `Reason.like("beyond top-%")` until 2026-08-03, so rewording one f-string in
+            # scoping.py would have emptied the pool permanently and silently.
+            or_(st.ScopedThreatID.is_(None), st.Selected == 1,
+                st.RejectionKind.in_(RESERVABLE_REJECTIONS)))
         # Score desc puts NULLs last on both SQLite and SQL Server (NULL sorts lowest); ThreatID
         # is a deterministic tie-break, matching scoping's own score-desc/id-asc convention.
         .order_by(st.Score.desc(), it.ThreatID)
@@ -949,9 +956,11 @@ def active_category_names(sess: Session) -> list[str]:
 def active_context_fields_by_group(sess: Session) -> dict[str, list[str]]:
     """Same live-read contract as active_context_fields below, but fetches BOTH the 'asset' and
     'subsystem' groups in one round-trip — every real caller needs both per session. A group with
-    no active rows comes back empty (caller falls back to its hardcoded default); a row under any
-    OTHER ContextGroup value is silently excluded, and selfcheck.check_dead_context_fields is
-    what surfaces that drift to an operator, not this function."""
+    no active rows comes back empty, which prompts.py treats as "send no context for that group"
+    (fail closed — no hardcoded fallback set, except critical_service, which build_base_context
+    always sends because validation requires it); a row under any OTHER
+    ContextGroup value is silently excluded, and selfcheck.check_dead_context_fields is what
+    surfaces that drift to an operator, not this function."""
     cfc = m.Context_Field_Config
     by_group: dict[str, list[str]] = {"asset": [], "subsystem": []}
     for group, field in sess.execute(
@@ -965,9 +974,10 @@ def active_context_fields_by_group(sess: Session) -> dict[str, list[str]]:
 
 def active_context_fields(sess: Session, context_group: str) -> list[str]:
     """Field names a curator has currently turned ON for the AI prompt (Context_Field_Config).
-    The caller (prompts.py) intersects this with its own hardcoded ceiling — this function
-    returns whatever's active in the DB and never decides what's safe to send to an external
-    model. Empty result (unseeded, or all off) means the caller falls back to its default.
+    This IS the allowlist prompts.py uses — no hardcoded ceiling behind it, so whatever a curator
+    activates here is what reaches the external model (plus critical_service, which
+    build_base_context always adds because validation requires it). Empty result (unseeded, or
+    all off) means the caller sends no other context for that group.
     Prefer active_context_fields_by_group above when both groups are needed at once."""
     cfc = m.Context_Field_Config
     return [r[0] for r in sess.execute(
@@ -1410,6 +1420,35 @@ def append_audit(sess: Session, **cols: Any) -> None:
     INSERT (accept.py) build them with `audit_row` instead — same defaults, one round trip, and
     ONE place that decides what an audit row means."""
     sess.execute(insert(m.Scenario_Audit).values(**audit_row(sess, **cols)))
+
+
+def latest_next_set_outcome(sess: Session, session_id: str, subsystem_id: int) -> dict | None:
+    """DetailJSON of the newest `next_set_outcome` audit row for this (session, subsystem), or
+    None if no "generate next set" click has run. Backs SessionProgress.last_next_set.
+
+    Reads THIS event type, never `generation_complete`: one click can write TWO of the latter (the
+    productive batch plus the variant top-up) which only make sense SUMMED, so "the most recent
+    generation_complete" would report the top-up alone and undercount the click. `next_set_outcome`
+    is written exactly once per click precisely so this read is a single row.
+
+    Ordered by CreatedAt then AuditID — the tie-break matters because two rows of one fast click
+    can land inside a single clock tick, and an unordered LIMIT would be non-deterministic."""
+    row = sess.execute(
+        select(m.Scenario_Audit.DetailJSON)
+        .where(m.Scenario_Audit.SessionID == session_id,
+            m.Scenario_Audit.SubsystemID == subsystem_id,
+            m.Scenario_Audit.EventType == AuditEventType.next_set_outcome)
+        .order_by(m.Scenario_Audit.CreatedAt.desc(), m.Scenario_Audit.AuditID.desc())
+        .limit(1)
+    ).scalar()
+    if not row:
+        return None
+    try:
+        parsed = json.loads(row)
+    except (TypeError, ValueError):  # a truncated/hand-edited row must not 500 a status poll
+        log.warning("audit.next_set_outcome_unparseable", session_id=session_id)
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 # ---------------------------------------------------------------------------

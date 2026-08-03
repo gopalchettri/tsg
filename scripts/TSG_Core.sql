@@ -146,10 +146,19 @@ CREATE TABLE Scoped_Threat (
     ScopeRank       int           NOT NULL,
     Selected        int           NOT NULL,
     Reason          nvarchar(500) NULL,
+    RejectionKind   nvarchar(30)  NULL,
     FactorsJSON     nvarchar(max) NULL,
     Superseded      int           NOT NULL,
     CreatedAt       datetime2     NULL
 );
+
+-- Existing databases created before the typed rejection kind (2026-08-03): add it in place.
+-- Nullable, so no DEFAULT and no table rewrite. Rows written before this column read NULL, which
+-- next_unserved_unique_threats treats as NOT re-servable -- correct-but-lossy, so a pre-existing
+-- database should run scripts/backfill_rejection_kind.sql once. TSG_Core.sql never touches row data.
+IF OBJECT_ID('dbo.Scoped_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scoped_Threat', 'RejectionKind') IS NULL
+    ALTER TABLE Scoped_Threat ADD RejectionKind nvarchar(30) NULL;
 
 IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NULL
 CREATE TABLE Threat_Scenario_Output (

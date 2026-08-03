@@ -154,7 +154,7 @@ def fetch_ics_advisories(s) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=s.intel_ttl_days)
     col = _store_if_healthy()
     known = ({d["external_id"] for d in col.find({"source": "cisa_ics"}, {"external_id": 1, "_id": 0})}
-             if col is not None else set())
+            if col is not None else set())
     docs: list[dict] = []  # _doc()'s own return type — mypy cannot infer it from an empty literal
     for row in rows:
         if len(row) != 2:
@@ -404,7 +404,7 @@ def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",), limi
             if len(out) >= limit:
                 break
             out.extend(col.find({**match, "kind": kind}, {"_id": 0, "raw": 0})
-                       .sort("fetched_at", -1).limit(limit - len(out)))
+                    .sort("fetched_at", -1).limit(limit - len(out)))
         return out
     except Exception:  # noqa: BLE001 — enrichment is optional, never breaks generation
         log.warning("intel.query_failed", exc_info=True)

@@ -53,8 +53,7 @@ def iter_objects(server_url: str, collection_id: str, added_after: str | None = 
     kwargs = {"added_after": added_after} if added_after else {}
     envelope = col.get_objects(**kwargs)
     for _page in range(_MAX_PAGES):
-        for obj in envelope.get("objects", []):
-            yield obj
+        yield from envelope.get("objects", [])
         if not envelope.get("more"):
             return
         envelope = col.get_objects(next=envelope["next"], **kwargs)

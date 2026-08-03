@@ -63,8 +63,8 @@ suggestions, never as final; every AI call is logged word-for-word (`Prompt_Log`
 
 **Step 8 — Each proposal is checked against the threat library ("grounding").** Category by exact
 (case-insensitive) name match; threat type and name by meaning-similarity — a local embedding model
-plus a reranker, with two score bands: rerank ≥ 75 = solid match ("grounded"), 60–74 = near match
-("confirm"), below = not in the library ("flagged"). Threat actors are kept only if they appear in
+plus a reranker, split by one cutoff: rerank ≥ 75 = it matched an approved library entry
+("verified"), below = not in the library yet ("unverified"). Threat actors are kept only if they appear in
 the library's approved actor list for that threat type — invented actors are dropped. The library
 search respects sector visibility: only globally-visible entries or entries for this asset's
 sector/parent-sector are considered. Embeddings are computed once and cached (in-process + MongoDB).
@@ -72,7 +72,8 @@ sector/parent-sector are considered. Embeddings are computed once and cached (in
 official library entry.* (`app/pipeline/grounding.py`, `app/pipeline/embeddings.py`)
 
 **Step 9 — Score and filter ("scoping").** Each threat gets a deterministic score (base 50, +20
-grounded, +10 confirm, +0 flagged), then admin-configured rules from `Config_Threat_Rule` run —
+verified → 70, +15 unverified → 65; both deliberately clear the 55 cutoff, so grounding confidence
+alone never rejects a threat), then admin-configured rules from `Config_Threat_Rule` run —
 `tech_gate` rules hard-exclude a threat, `relevance_*` rules adjust its score. Survivors are
 ranked; the ranking and every fired rule are persisted (`Scoped_Threat.FactorsJSON`) for audit.
 *Business rule as designed: non-applicable threats are excluded here, deterministically, before any
@@ -80,7 +81,7 @@ scenario is written. In practice at the time of writing: the rules table was emp
 ever excluded — see gap 2.* (`app/pipeline/scoping.py`)
 
 **Step 10 — AI writes one scenario per surviving threat.** Using the library's official threat
-name (falling back to the AI's own wording only for flagged threats), the AI writes the scenario:
+name (falling back to the AI's own wording only for unverified threats), the AI writes the scenario:
 title, statement, business impact, operational impact, assumptions, risk statement, excluded
 details. A deterministic checker verifies the required fields are present and that the statement
 actually mentions the threat — problems are flagged for the reviewer (`ValidationJSON`), never
@@ -100,7 +101,7 @@ at the end.* (`app/pipeline/tasks.py::decide_session_outcome`)
 `"subset"` with 1–50 `output_ids`) — there is no default, the caller must always choose explicitly —
 and marks the selected scenarios (none, for `"none"`) accepted and completes the session. Before
 completing, the system re-checks every library entry used is still active. Then any accepted
-"flagged" threats — ones not in the library — are
+"unverified" threats — ones not in the library — are
 automatically promoted into the shared threat library, including their validated actors, race-safely
 (natural-key unique indexes; two concurrent accepts can't create duplicates). *Business rules: the
 library grows only through human-accepted content; accept and regenerate are mutually exclusive.*
@@ -158,7 +159,7 @@ scenarios for that session.
    `Threat_Candidate_Review` record, but only ever with status `accepted` — the pending/rejected
    curator workflow defined in the enums has no code behind it. The library effectively grows with
    reviewer-accept as the only control.
-8. **Newly promoted threats get no filter rules.** When an accepted flagged threat enters the
+8. **Newly promoted threats get no filter rules.** When an accepted unverified threat enters the
    library, nothing assigns it exclusion rules — it applies to every asset type until a curator
    adds a rule. Applicability should be stated at threat intake going forward.
 9. **`Threat_Scenario_Output.AcceptedSubsetJSON` is a dead column** — defined, always written as

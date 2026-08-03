@@ -138,6 +138,9 @@ class Scoped_Threat(Base):
     ScopeRank: Mapped[int] = mapped_column(Integer)
     Selected: Mapped[int] = mapped_column(Integer, default=0)
     Reason: Mapped[str | None] = mapped_column(Unicode(500))
+    # ScopingRejection, or NULL when Selected=1. The machine-readable twin of Reason: next-set
+    # re-servability branches on THIS, so rewording Reason can never change behaviour.
+    RejectionKind: Mapped[str | None] = mapped_column(Unicode(30))
     FactorsJSON: Mapped[str | None] = mapped_column(UnicodeText)
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -375,8 +378,10 @@ class Config_Threat_Rule(Base):
 
 class Context_Field_Config(Base):
     """Which asset/subsystem fields are currently turned on for the AI prompt (see
-    scripts/Threat_library.sql). This table can only narrow prompts.py's hardcoded
-    _ASSET_CONTEXT_ALLOWED/_SUB_ALLOWED ceiling — it can never add a field name outside it."""
+    scripts/Threat_library.sql). This table is the SOLE source of that allowlist — prompts.py
+    keeps no hardcoded ceiling, so an active row here is exactly what reaches the model, and no
+    active rows for a group means no context for that group (fail closed). One forced exception:
+    build_base_context always sends critical_service, because validation requires it."""
     __tablename__ = "Context_Field_Config"
     ContextFieldConfigID: Mapped[int] = mapped_column(Integer, primary_key=True)
     ContextGroup: Mapped[str] = mapped_column(Unicode(20))    # 'asset' | 'subsystem'

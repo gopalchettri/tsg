@@ -17,16 +17,18 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.enums import GroundingStatus, ThreatRuleType
+from app.core.enums import GroundingStatus, ScopingRejection, ThreatRuleType
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
 
 BASE_SCORE = 50.0
-# flagged (novel/unmatched-to-library) threats must land ABOVE the scoping_score_threshold cutoff
-# (default 55) or a curator never sees the ones they haven't catalogued yet: 15.0 puts them at 65,
-# below a real library match (grounded 70, confirm 60) but still surfaced.
-_CONFIDENCE_WEIGHT = {GroundingStatus.grounded: 20.0, GroundingStatus.confirm: 10.0, GroundingStatus.flagged: 15.0}
+# unverified (novel/unmatched-to-library) threats must land ABOVE the scoping_score_threshold
+# cutoff (default 55) or a curator never sees the ones they haven't catalogued yet: 15.0 puts them
+# at 65, below a real library match (verified 70) but still comfortably surfaced. Grounding
+# confidence ALONE must never reject a threat — only a negative rule delta may take a score under
+# the cutoff, so BASE_SCORE + min(weights) stays above it by construction.
+_CONFIDENCE_WEIGHT = {GroundingStatus.verified: 20.0, GroundingStatus.unverified: 15.0}
 _DEFAULT_RULE_WEIGHT = 10.0  # relevance_* delta when the rule's Metadata carries no {"weight": N}
 
 # The fixed RuleKey → context-field allowlist: RuleKey → (subsystem field it reads, default
@@ -56,6 +58,9 @@ class Scored:
     rank: int
     selected: bool
     reason: str
+    # `reason` is prose for the reviewer; `rejection` is the same fact for code. Kept adjacent
+    # because they are always assigned together — split them and they drift.
+    rejection: ScopingRejection | None = None  # None ⟺ selected; persisted to RejectionKind
     factors: list[dict] = field(default_factory=list)  # every fired rule: {key, family, delta[, gate]}
 
 
@@ -152,25 +157,34 @@ def _apply_rules(threat: dict, subsystems: list[dict] | None, rules_by_type: dic
     return delta, selected, gate_failures, factors
 
 
-def _scoring_reason(gate_failures: list[str], grounding_status: Any) -> str:
-    """Reason records the gate on exclusion, else the grounding basis."""
+def _scoring_reason(gate_failures: list[str], grounding_status: Any) -> tuple[str, ScopingRejection | None]:
+    """Reason records the gate on exclusion, else the grounding basis. Returns the prose AND the
+    machine-readable kind, together — never one without the other."""
     if gate_failures:
-        return f"tech_gate:{','.join(gate_failures)} failed"
-    return f"grounding={grounding_status}"
+        return f"tech_gate:{','.join(gate_failures)} failed", ScopingRejection.tech_gate
+    return f"grounding={grounding_status}", None
 
 
-def _apply_selection_cutoffs(selected: bool, score: float, reason: str, kept: int, *,
-                            score_threshold: float | None, top_n: int | None) -> tuple[bool, str, int]:
+def _apply_selection_cutoffs(selected: bool, score: float, reason: str,
+                            rejection: ScopingRejection | None, kept: int, *,
+                            score_threshold: float | None, top_n: int | None,
+                            ) -> tuple[bool, str, ScopingRejection | None, int]:
     """The two config-driven selection cutoffs, applied in rank order. top_n only counts threats
     still selected at this point — ones already excluded by the gate or threshold don't use up a
-    slot. Returns the possibly-updated (selected, reason) plus the running `kept` count."""
+    slot. Returns the possibly-updated (selected, reason, rejection) plus the running `kept` count.
+
+    Only `top_n_cutoff` is re-servable by "generate next set": a below-threshold threat re-scores
+    below threshold every time, whereas a top-N casualty is re-selected the moment it is scored in
+    target mode. That distinction lives in the KIND, never in the wording of `reason`."""
     if selected and score_threshold is not None and score < score_threshold:
         selected, reason = False, f"below score threshold ({score_threshold})"
+        rejection = ScopingRejection.below_threshold
     if selected and top_n is not None:
         kept += 1
         if kept > top_n:
             selected, reason = False, f"beyond top-{top_n} cutoff"
-    return selected, reason, kept
+            rejection = ScopingRejection.top_n_cutoff
+    return selected, reason, rejection, kept
 
 
 def score_threats(threats: list[dict[str, Any]], *, subsystems: list[dict] | None = None,
@@ -188,14 +202,15 @@ def score_threats(threats: list[dict[str, Any]], *, subsystems: list[dict] | Non
         score = BASE_SCORE + _CONFIDENCE_WEIGHT.get(GroundingStatus(t["grounding_status"]), 0.0)
         delta, selected, gate_failures, factors = _apply_rules(t, subsystems, rules_by_type)
         score += delta
-        reason = _scoring_reason(gate_failures, t["grounding_status"])
-        evaluated.append((t["threat_id"], score, selected, reason, factors))
+        reason, rejection = _scoring_reason(gate_failures, t["grounding_status"])
+        evaluated.append((t["threat_id"], score, selected, reason, rejection, factors))
 
     evaluated.sort(key=lambda x: (-x[1], x[0]))  # score desc, id asc — stable
     out: list[Scored] = []
     kept = 0  # fresh per call — cutoff state never crosses subsystems/invocations
-    for rank, (tid, score, selected, reason, factors) in enumerate(evaluated, start=1):
-        selected, reason, kept = _apply_selection_cutoffs(
-            selected, score, reason, kept, score_threshold=score_threshold, top_n=top_n)
-        out.append(Scored(threat_id=tid, score=score, rank=rank, selected=selected, reason=reason, factors=factors))
+    for rank, (tid, score, selected, reason, rejection, factors) in enumerate(evaluated, start=1):
+        selected, reason, rejection, kept = _apply_selection_cutoffs(
+            selected, score, reason, rejection, kept, score_threshold=score_threshold, top_n=top_n)
+        out.append(Scored(threat_id=tid, score=score, rank=rank, selected=selected, reason=reason,
+                        rejection=rejection, factors=factors))
     return out

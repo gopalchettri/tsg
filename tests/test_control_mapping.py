@@ -342,7 +342,7 @@ def test_controls_mapped_flag_mirrors_the_attempt_stamp():
 
 
 def test_min_score_follows_model_pair_unless_pinned():
-    """Fix #2: pinned env value wins; otherwise the per-model-pair confirm threshold applies —
+    """Fix #2: pinned env value wins; otherwise the per-model-pair match threshold applies —
     the cutoff follows the models per environment instead of a one-size-fits-none constant."""
     from app.core.config import get_settings
 
@@ -350,8 +350,7 @@ def test_min_score_follows_model_pair_unless_pinned():
     pinned = s.model_copy(update={"control_map_min_score": 42.0})
     assert _min_score(None, None, pinned) == 42.0
     if "control_map_min_score" not in s.model_fields_set:
-        _, confirm = grounding.resolve_thresholds(None, None, s)
-        assert _min_score(None, None, s) == confirm
+        assert _min_score(None, None, s) == grounding.resolve_thresholds(None, None, s)
 
 
 def test_attempt_stamp_stops_rescan_even_with_zero_matches(db, stub_llm):

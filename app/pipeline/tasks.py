@@ -10,7 +10,8 @@ from sqlalchemy import insert, update
 from sqlalchemy.orm import Session
 
 from app.core.enums import (
-    AuditEventType, ScenarioStatus, SessionStatus, SSEEventType, StageStatus, SubsystemLevel, WorkflowStage,
+    AuditEventType, ScenarioStatus, ScopingRejection, SessionStatus, SSEEventType, StageStatus,
+    SubsystemLevel, WorkflowStage,
 )
 from app.core.logging import get_logger
 from app.db import dal
@@ -380,7 +381,7 @@ def _build_scoped_threat_row(scoped_id: str, sid: str, tenant: str, ss: int, sc:
         "ScopedThreatID": scoped_id, "SessionID": sid, "TenantID": tenant, "EntityID": entity_id,
         "UserID": user_id, "SubsystemID": ss,
         "ThreatID": sc.threat_id, "Score": sc.score, "ScopeRank": sc.rank,
-        "Selected": 1 if sc.selected else 0, "Reason": sc.reason,
+        "Selected": 1 if sc.selected else 0, "Reason": sc.reason, "RejectionKind": sc.rejection,
         "FactorsJSON": json.dumps(sc.factors) if sc.factors else None,
         "Superseded": 0, "CreatedAt": now(),
     }
@@ -446,9 +447,11 @@ def _select_unique_top_n(scoped: list[scoping.Scored], enriched: dict, top_n: in
         key = _dedup_key(enriched.get(sc.threat_id, {}))
         if key in seen:
             sc.selected, sc.reason = False, "duplicate of higher-ranked threat"
+            sc.rejection = ScopingRejection.duplicate  # permanent: the identity is already served
             deduped += 1
         elif top_n is not None and kept >= top_n:
             sc.selected, sc.reason = False, f"beyond top-{top_n} cutoff"
+            sc.rejection = ScopingRejection.top_n_cutoff  # the ONLY kind next-set may re-serve
         else:
             seen.add(key)
             kept += 1

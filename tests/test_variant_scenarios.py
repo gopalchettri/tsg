@@ -399,6 +399,10 @@ def test_partial_pool_is_topped_up_to_the_batch_size_with_other_threats_variants
     event = [e for e in published if str(e.get("type")) == "next_set_result"][-1]
     assert (event["new_scenarios"], event["new_variants"], event["no_new"]) == (5, 2, False)
     assert event.get("reason") is None
+    # A topped-up click is NOT short: the pool came up 2 light but variants closed the gap, so the
+    # user got everything they asked for. Reporting anything but `complete` here would train a UI
+    # to show a warning on a fully successful click.
+    assert (event["outcome"], event["requested"]) == ("complete", 5)
 
     # A topped-up click leaves TWO generation_complete rows that SUM to the click total: the
     # productive one staged inside write_scenarios' transaction, plus the helper's variant row.
@@ -438,6 +442,10 @@ def test_shortfall_from_a_FAILED_generation_is_not_papered_over_with_variants(db
     assert all(r.ScenarioNumber == 1 for r in rows), "a failed generation was papered over"
     event = [e for e in published if str(e.get("type")) == "next_set_result"][-1]
     assert event["new_variants"] == 0
+    # The count stays honest AND the click now says so. `partial_retryable` is the load-bearing
+    # half: the failed target keeps Selected=1, so clicking again re-serves it. Without this the
+    # user sees 4-of-5, has no idea a retry would work, and stops clicking.
+    assert (event["outcome"], event["requested"], event["new_scenarios"]) == ("partial_retryable", 5, 4)
 
 
 # --- F3: the top-up can never turn a committed success into a reported failure -----------------
