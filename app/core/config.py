@@ -116,6 +116,19 @@ class Settings(BaseSettings):
     # AlienVault OTX pulses — requires a free API key; the fetcher is skipped while the key is empty.
     intel_otx_api_key: str = Field("", validation_alias=AliasChoices("OTX_API_KEY", "TSG_INTEL_OTX_API_KEY"))
     intel_otx_url: str = "https://otx.alienvault.com/api/v1/pulses/subscribed"
+    # OTX pagination (app/intel/otx.py). The subscription is ~8.9k pulses over ~178 pages and
+    # deep pages are slow (measured 1.8s at page 1, 35-46s past page 40), so ONE run cannot walk
+    # it all — each run works for a time budget and the next resumes from the stored cursor.
+    intel_otx_page_size: int = 50        # OTX's hard cap; larger `limit` values are ignored
+    intel_otx_max_pages: int = 200       # safety bound on the walk (178 pages real today)
+    # Per-run wall-clock budget. MUST stay well under intel_refresh_feed_task's soft_time_limit
+    # (600s): the deadline is checked between pages and a single deep page can take 45s, or up to
+    # the 120s socket timeout when OTX stalls.
+    intel_otx_sync_seconds: int = 400
+    # Head pages re-read on EVERY run. The rolling cursor reaches page 1 only once per cycle
+    # (~9 days at the daily cadence), so without this a pulse published today would not be
+    # cached until the cursor came back around.
+    intel_otx_fresh_pages: int = 2
 
     # Generic TAXII 2.1 sources — JSON list like
     # [{"label": "org-opencti", "url": "https://cti.example.org/taxii2/root/", "collection": "<id>"}].
@@ -183,6 +196,28 @@ class Settings(BaseSettings):
     # How much "thinking effort" the AI spends per reply. Unset = provider's own default.
     llm_reasoning_effort: Literal["low", "medium", "high"] | None = Field(
         None, validation_alias=AliasChoices("LLM_REASONING_EFFORT", "TSG_LLM_REASONING_EFFORT"))
+
+    # --- Risk Treatment Plan generation (docs/RISK_TREATMENT_PLAN_SDD.md) ---
+    # Master switch. Off (default) = the treatment-plan routes are not mounted at all and the
+    # crm_* boot invariant is disarmed. On = routes mount AND verify_startup requires the CRM
+    # Risk-module tables to exist (a deployment gap crashes boot, never a request).
+    risk_module_enabled: bool = Field(
+        False, validation_alias=AliasChoices("RISK_MODULE_ENABLED", "TSG_RISK_MODULE_ENABLED"))
+
+    # Same idea as threat_identification_temperature, for the treatment-plan step. 0 = repeatable
+    # plans for identical inputs — these land in a risk register, consistency beats creativity.
+    treatment_temperature: float | None = Field(
+        0.0, ge=0.0, le=2.0, validation_alias=AliasChoices(
+            "TREATMENT_TEMPERATURE", "TSG_TREATMENT_TEMPERATURE"))
+
+    # A RUNNING plan row whose UpdatedAt is older than this is treated as abandoned: the next
+    # POST may supersede it, a redelivery may re-claim it, and the GET presents it as timed out.
+    # UpdatedAt is bumped before every LLM attempt, so this measures "no progress", not wall time.
+    # ponytail: staleness-on-next-POST instead of a reaper sweep; add a sweep if operators need
+    # stuck plans auto-flipped to ERROR without a user click.
+    treatment_stale_seconds: int = Field(
+        900, ge=60, validation_alias=AliasChoices(
+            "TREATMENT_STALE_SECONDS", "TSG_TREATMENT_STALE_SECONDS"))
 
     # --- Optional safety features (litellm proxy only, both off by default) ---
     # Check every AI-generated scenario for inappropriate content before saving it. This is a
@@ -314,7 +349,7 @@ class Settings(BaseSettings):
 
     # --- Session capacity limits ---
     # Most sessions the app processes at the same time. New requests are rejected past this.
-    max_active_sessions: int = 100
+    max_active_sessions: int = 0 # 100
 
     # Most sessions any ONE entity can have active at once. 0 (default) = no per-entity cap,
     # only the global max_active_sessions above applies — one entity looping on session
@@ -445,6 +480,20 @@ class Settings(BaseSettings):
                 f"stage_lease_seconds ({self.stage_lease_seconds}s) is below the safe floor "
                 f"({floor:.0f}s = llm_timeout_seconds * (llm_max_retries + 1)) — a genuinely "
                 "slow (not crashed) call could be wrongly reaped. Raise it above the floor.")
+        # Same floor, same reasoning, for the treatment-plan progress clock: one plan attempt
+        # is one LLM call, whose touch_plan bump precedes up to (llm_max_retries + 1) litellm
+        # tries. Below the floor, a healthy in-flight worker reads as stale — its row gets
+        # superseded/re-claimed and a SECOND paid LLM call runs in parallel. Unset → derive
+        # (so raising LLM_TIMEOUT_SECONDS alone can never brick a boot); explicit-but-unsafe
+        # → refuse to start.
+        if "treatment_stale_seconds" not in self.model_fields_set:
+            self.treatment_stale_seconds = max(self.treatment_stale_seconds, int(floor * 2))
+        elif self.treatment_stale_seconds < floor:
+            raise ValueError(
+                f"treatment_stale_seconds ({self.treatment_stale_seconds}s) is below the safe "
+                f"floor ({floor:.0f}s = llm_timeout_seconds * (llm_max_retries + 1)) — a "
+                "slow-but-live plan attempt would be superseded and re-run in parallel. "
+                "Raise it above the floor.")
         return self
 
     @model_validator(mode="after")
@@ -507,8 +556,10 @@ class Settings(BaseSettings):
         KNOWN LIMIT: this compares the STATIC settings. The match cutoff actually applied at
         runtime is per-model-pair (grounding.resolve_thresholds auto-calibrates when this field
         is left unset), so a calibrated value below library_promotion_threshold re-opens the same
-        window. accept.py's "never override a real ThreatCatalogueID" rule is what closes it for
-        good — see the plan's Change 9b."""
+        window. Two later changes close it structurally, so this validator is now defence in
+        depth rather than the only guard: grounding withholds a ThreatCatalogueID unless the name
+        match itself verified, and accept.py never creates a Threat_Catalogue row from a proposed
+        name at all (it queues the name for curation instead)."""
         if self.library_promotion_threshold > self.grounding_match_threshold:
             raise ValueError(
                 f"library_promotion_threshold ({self.library_promotion_threshold}) must not exceed "

@@ -70,7 +70,8 @@ def _provider_429_retryable():
     be throttled by someone else's traffic; that must delay work, never fail it.
 
     openai.RateLimitError is the right catch for all four call paths: litellm.RateLimitError
-    subclasses it (chat/embed/rerank), and moderate()'s raw openai client raises it directly.
+    subclasses it (chat/embed/rerank). moderate() swallows it internally — advisory work
+    after a billed call must never trigger a generation retry.
     Imported lazily, same pattern as the per-method litellm imports — a stub-only test run
     never needs the package."""
     import openai
@@ -304,9 +305,12 @@ class LiteLLMClient:
             if s.openai_base_url:
                 kw["api_base"] = s.openai_base_url
             return kw
-        # default: litellm proxy
+        # default: litellm proxy. custom_llm_provider is required, not cosmetic: litellm's own
+        # get_llm_provider() can't infer a provider from an arbitrary proxy-side model alias
+        # (e.g. "glm-5") even with api_base set, and raises BadRequestError instead of guessing.
         kw = {"model": model or s.inference_model, "api_base": s.litellm_base_url,
-            "api_key": s.litellm_api_key, **_litellm_key_header(s), **common}
+            "api_key": s.litellm_api_key, "custom_llm_provider": "litellm_proxy",
+            **_litellm_key_header(s), **common}
         if s.llm_guardrails:  # names pre-registered on the proxy itself — proxy-only, no direct-provider equivalent
             kw["guardrails"] = s.llm_guardrails
         return kw
@@ -382,7 +386,7 @@ class LiteLLMClient:
         model = model or self.s.embedding_model
         with _llm_slot(self.s), _provider_429_retryable():
             resp = litellm.embedding(
-                model=model, input=texts,
+                model=model, input=texts, custom_llm_provider="litellm_proxy",  # see _chat_kwargs
                 api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
                 **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
                 timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
@@ -410,6 +414,7 @@ class LiteLLMClient:
         with _llm_slot(self.s), _provider_429_retryable():
             resp = litellm.rerank(
                 model=model, query=query, documents=list(docs),
+                custom_llm_provider="litellm_proxy",  # see _chat_kwargs
                 api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
                 **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
                 timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
@@ -457,7 +462,7 @@ class LiteLLMClient:
         failures = 0
         with ThreadPoolExecutor(max_workers=min(self.s.rerank_concurrency, len(items))) as pool:
             futures = {pool.submit(self.rerank, q, docs, model=model): i
-                       for i, (q, docs) in enumerate(items)}
+                    for i, (q, docs) in enumerate(items)}
         for fut, i in futures.items():  # pool exited -> all futures done; order restored via i
             try:
                 results[i] = fut.result()
@@ -493,9 +498,11 @@ def moderate(text: str, *, settings: Settings | None = None) -> ModerationResult
     bounded" rule) and falls back to a GLOBAL api key env var, which could hit real OpenAI
     instead of the configured proxy.
 
-    NEVER RAISES except `LLMSlotUnavailable` (same "temporary, not a bug" contract as
-    chat/embed/rerank): a moderation failure must never block generation. Everything else
-    returns `checked=False` with `error` set.
+    NEVER RAISES, full stop: a moderation failure must never block (or re-run) generation.
+    That includes `LLMSlotUnavailable` — moderation runs AFTER the paid chat call, so letting
+    the slot signal escape made Celery autoretry throw away and re-bill a finished
+    generation. Slot exhaustion returns `checked=False, error="moderation_slots_exhausted"`;
+    every other failure returns `checked=False, error="moderation_unavailable"`.
 
     Applies `_ensure_litellm_proxy_bypassed` itself because moderation's target host is
     independent of the three provider switches — a moderation-only deployment would otherwise
@@ -520,7 +527,10 @@ def moderate(text: str, *, settings: Settings | None = None) -> ModerationResult
         result = resp.results[0]
         flagged_categories = [cat for cat, is_flagged in result.categories.model_dump().items() if is_flagged]
     except LLMSlotUnavailable:
-        raise
+        # Advisory call, made AFTER the billed generation — swallowing the retry signal here
+        # is what keeps a moderation slot shortage from discarding finished work upstream.
+        log.warning("llm.moderation_slots_exhausted")
+        return ModerationResult(checked=False, error="moderation_slots_exhausted")
     except Exception:  # noqa: BLE001 — a moderation-service failure must never block generation
         log.warning("llm.moderation_call_failed", exc_info=True)
         return ModerationResult(checked=False, error="moderation_unavailable")
@@ -654,6 +664,7 @@ def _verify_embedding_dimensions(s: Settings) -> None:
     with _llm_slot(s):
         resp = litellm.embedding(
             model=s.embedding_model, input=["dimension check"],
+            custom_llm_provider="litellm_proxy",  # see _chat_kwargs
             api_base=s.litellm_base_url, api_key=s.litellm_api_key,
             **_litellm_key_header(s),  # gateway-safe alternate auth header, when configured
             timeout=s.llm_timeout_seconds, num_retries=s.llm_max_retries,
@@ -739,3 +750,5 @@ def get_llm() -> LLMClient:
     it a process-wide singleton, which is also why the proxy-bypass fix only runs once here."""
     _ensure_litellm_proxy_bypassed(get_settings())
     return LiteLLMClient()
+
+

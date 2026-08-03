@@ -22,6 +22,7 @@ from app.api.admin import AdminValidationError
 from app.pipeline.embeddings import EmbeddingBusy
 from app.pipeline.llm import LLMSlotUnavailable
 from app.pipeline.threat_library_import import ThreatLibraryImportError
+from app.pipeline.treatment import TreatmentConflict
 
 log = get_logger(__name__)
 
@@ -75,6 +76,13 @@ async def _handle_accept_conflict(_: Request, exc: AcceptConflict):
 async def _handle_master_inactive(_: Request, exc: MasterInactive):
     """Accept was attempted against a master scenario that's no longer active -> 409."""
     return JSONResponse(status_code=409, content=_env("master_inactive", str(exc)))
+
+
+async def _handle_treatment_conflict(_: Request, exc: TreatmentConflict):
+    """Treatment-plan request refused -> 409, with `details.reason` (TreatmentGateReason) when
+    the raise site gave one — same shape as accept_conflict."""
+    extra = {"reason": exc.reason} if exc.reason is not None else {}
+    return JSONResponse(status_code=409, content=_env("treatment_conflict", str(exc), **extra))
 
 
 async def _handle_not_found(_: Request, exc: NotFoundError):
@@ -184,6 +192,7 @@ def register_error_handlers(app: FastAPI) -> None:
     app.exception_handler(SessionConflict)(_handle_session_conflict)
     app.exception_handler(AcceptConflict)(_handle_accept_conflict)
     app.exception_handler(MasterInactive)(_handle_master_inactive)
+    app.exception_handler(TreatmentConflict)(_handle_treatment_conflict)
     app.exception_handler(NotFoundError)(_handle_not_found)
     app.exception_handler(CapacityExceeded)(_handle_capacity_exceeded)
     app.exception_handler(LLMSlotUnavailable)(_handle_llm_slot_unavailable)

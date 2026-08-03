@@ -10,6 +10,7 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from app.core.config import get_settings
 from app.core.enums import SessionStatus
 from app.db import models as m
 
@@ -34,7 +35,30 @@ REQUIRED_INDEXES = [
     # a duplicate would let one CAS match two rows and put two workers on one subsystem.
     ("UX_SubsystemStageState_SessionSubLevel", "Subsystem_Stage_State",
      ("SessionID", "SubsystemID", "Level")),
+    # One active treatment plan per accepted scenario — the concurrent-POST race arbiter
+    # (docs/RISK_TREATMENT_PLAN_SDD.md §4.1). The companion IX_TreatmentPlan_SessionActive is
+    # a plain performance index and deliberately NOT listed: this check rejects non-unique
+    # entries, and registering it would make every boot fail with the DDL correctly applied.
+    ("UX_TreatmentPlan_ActiveOutput", "Risk_Treatment_Plan", ("OutputID",)),
 ]
+
+# CHECKLIST 6 — CRM Risk-module tables the treatment-plan feature reads (read-only). Verified
+# ONLY when risk_module_enabled: the flag arms both the routes and this check together, so a
+# request can never reach a missing table (models are a DB-first mirror — absence would surface
+# as a raw ProgrammingError mid-request without this). crm_assessment_asset and crm_risk_level
+# are optional consumers (SDD §14.3) and deliberately absent.
+REQUIRED_CRM_TABLES = (
+    "crm_risk_identification",
+    "crm_risk_identification_option_value",
+    "crm_assessment",
+    "crm_risk_identification_treatment_plan",
+    "crm_risk_identification_treatment_strategy",
+    "crm_risk_rating",
+    "crm_risk_rating_category",
+    "crm_risk_control_details",
+    "crm_risk_control_status",
+    "group",
+)
 
 # CHECKLIST 2 — columns the code assumes can never be NULL. A NULL EntityID would silently
 # bypass the entity-isolation filters that keep one customer's data away from another's.
@@ -87,6 +111,8 @@ def verify_startup(engine: Engine) -> None:
         _assert_filtered_index_literals(engine)
         _assert_not_null(engine)
         _assert_rcsi_enabled(engine)
+        if get_settings().risk_module_enabled:
+            _assert_crm_tables(engine)
     _assert_no_duplicate_active(engine)
 
 
@@ -152,6 +178,26 @@ def _assert_filtered_index_literals(engine: Engine) -> None:
         raise StartupInvariantError(
             f"filtered index WHERE clause no longer matches the live SessionStatus enum value "
             f"(enum renamed without updating the migration?): {stale}"
+        )
+
+
+def _assert_crm_tables(engine: Engine) -> None:
+    """Runs CHECKLIST 6 (risk_module_enabled only): one INFORMATION_SCHEMA.TABLES query with an
+    IN-list. Missing tables mean the CRM Risk module is not deployed to this database — refuse
+    the boot with the exact names, rather than 500ing the first treatment-plan request."""
+    params = {f"t{i}": name for i, name in enumerate(REQUIRED_CRM_TABLES)}
+    placeholders = ", ".join(f":t{i}" for i in range(len(REQUIRED_CRM_TABLES)))
+    with engine.connect() as c:
+        rows = c.execute(
+            text(f"SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME IN ({placeholders})"),
+            params,
+        ).all()
+    present = {r[0] for r in rows}
+    missing = [t for t in REQUIRED_CRM_TABLES if t not in present]
+    if missing:
+        raise StartupInvariantError(
+            f"risk_module_enabled=true but the CRM Risk-module tables are absent: {missing}. "
+            "Deploy the Risk module to this database, or set RISK_MODULE_ENABLED=false."
         )
 
 

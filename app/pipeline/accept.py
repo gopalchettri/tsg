@@ -25,8 +25,14 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.enums import (
-    ActorType, AuditDecision, AuditEventType, CandidateStatus, SessionStatus, StageStatus,
-    SubsystemLevel, WorkflowStage,
+    ActorType,
+    AuditDecision,
+    AuditEventType,
+    CandidateStatus,
+    SessionStatus,
+    StageStatus,
+    SubsystemLevel,
+    WorkflowStage,
 )
 from app.core.logging import get_logger
 from app.db import dal
@@ -281,11 +287,12 @@ def _ensure_threat_data_still_active(sess: Session, session_id: str, good_subs: 
     # Collect every referenced type id and catalogue id. A non-null ThreatCatalogueID always
     # means grounding matched a real, pre-existing Threat_Catalogue row (find_threat_in_library
     # only ever sets it from an actual candidate row) — that holds regardless of the threat's
-    # overall GroundingStatus, since a confidently-typed threat can still end up "unverified"
-    # purely because its NAME match scored below grounding_match_threshold while a real
-    # catalogue candidate existed. So every non-null id genuinely needs re-validating, the same
-    # way type_ids already is below — gating this on GroundingStatus != unverified let a since-
-    # deactivated/deleted catalogue row slip past the check for exactly that sub-case.
+    # only ever sets it from an actual candidate row) — and, since grounding now withholds the id
+    # unless the NAME match itself verified, a non-null id also means that match was confident.
+    # Every non-null id still needs re-validating, the same way type_ids does below: the master
+    # could have been deactivated between Stage 2 and accept. This check is now load-bearing in a
+    # way it was not before — accept no longer re-points a threat onto a freshly-minted catalogue
+    # row, so the id validated here is the one that persists.
     type_ids = {t for t, _ in rows if t is not None}
     cat_ids = {c for _, c in rows if c is not None}
 
@@ -356,9 +363,9 @@ def _extract_actor_names_per_threat(rows: Sequence[RowMapping]) -> tuple[dict[in
     parsed_actors: dict[int, list[str]] = {}
     all_actor_names: set[str] = set()
     for row in rows:
-        actors_meta = json.loads(row["ThreatActorsJSON"] or "{}")
-        raw_actors = actors_meta.get("actors", []) if actors_meta.get("validated") else []
-        actors = grounding.ensure_actor_list(raw_actors)
+        # The one shared reader for the ThreatActorsJSON shape — also fixes this loop's old
+        # inline parse, which raised on a corrupt blob instead of degrading to no-actors.
+        actors = grounding.validated_actors(row["ThreatActorsJSON"])
         parsed_actors[row["ThreatID"]] = actors
         all_actor_names.update(actors)
     return parsed_actors, all_actor_names
@@ -368,18 +375,24 @@ def _find_or_create_type_and_catalogue(
     sess: Session, row: RowMapping, sector_id: int | None, resolved: dict,
     created_by: str | None = None,
 ) -> tuple[int, int | None]:
-    """Work out (or create) the Threat_Type and Threat_Catalogue ids this unverified threat
-    should end up pointing at: reuse the high-confidence type match recorded at Stage 2
-    when present, otherwise resolve/create via category+type name; an accepted
-    PROPOSED catalogue name always wins over any low-confidence stored catalogue id.
+    """Resolve the Threat_Type id this unverified threat should point at — reusing the verified
+    type match recorded at Stage 2 when present, otherwise creating one under the resolved
+    category — and pass the stored catalogue id straight through.
 
-    A newly-created Threat_Catalogue row also gets linked into Threat_Catalogue_Category_Map
-    under the same resolved category — [A2]'s "authoritative per-threat category source"
-    otherwise only ever gets populated by the curated Excel seed, never by AI promotion, so
-    every threat promoted through this path would be permanently stuck relying on its Type's
-    single rough default instead. One category today (the AI proposes exactly one); the map
-    table is already multi-valued, so a future threat gaining a second category is just
-    another link_catalogue_category call, not a schema change.
+    ONLY the TYPE is auto-promoted. The catalogue name is not, and deliberately: prompts.py
+    REQUIRES `name` to embed the asset's own name ('<impact> of <asset name>'), while it FORBIDS
+    asset/product names in `type`. So `ThreatType` is library-shaped by construction and
+    `ThreatName` never is — auto-minting a Threat_Catalogue row from it could only ever park an
+    asset-named sibling next to the generic entry it belongs under ('Unauthorized disclosure of
+    Citizen Personal Information' beside 'Sensitive data exposure'). Every one of the 75 curated
+    catalogue rows is generic idiom; none is asset-named. The proposal instead goes to
+    Threat_Candidate_Review as `pending`, which is where prompts.py always said it belonged
+    ("carries that asset-named name through the existing curator review, where it can be
+    generalized") — that review just never had a writer until now.
+
+    Consequence for the caller: `catalogue_id` is now always exactly `row["ThreatCatalogueID"]`,
+    so the no-op check in _add_unverified_threats_to_library can no longer use it to detect that
+    something happened. See the `promoted` split there.
     """
     def _category_id() -> int | None:
         cat_key = ("category", row["ThreatCategory"])
@@ -398,19 +411,9 @@ def _find_or_create_type_and_catalogue(
                                              created_by=created_by)
             resolved[key] = type_id
 
-    catalogue_id = row["ThreatCatalogueID"]
-    if row["ThreatName"]:  # the accepted PROPOSED name wins over any low-confidence stored id
-        ckey = ("cat", type_id, row["ThreatName"])
-        catalogue_id = resolved.get(ckey)
-        if catalogue_id is None:
-            catalogue_id = dal.upsert_threat_catalogue(sess, row["ThreatName"], type_id, sector_id,
-                                                       created_by=created_by)
-            resolved[ckey] = catalogue_id
-            category_id = _category_id()
-            if category_id is not None:  # [R6] None means "couldn't resolve" — nothing to link
-                dal.link_catalogue_category(sess, catalogue_id, category_id)
-
-    return type_id, catalogue_id
+    # Passthrough, never overwritten. grounding sets this only on a VERIFIED name match, so when
+    # it is set it already names the right library row and there is nothing to promote.
+    return type_id, row["ThreatCatalogueID"]
 
 
 def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMapping, good_subs: list[int], user_id: str | None) -> None:
@@ -511,35 +514,43 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
         linked_actors = _link_actors_to_threat_type(sess, type_id, actors, resolved,
                                                     created_by=actor_id)  # names NEWLY linked this accept
 
-        if (type_id == row["ThreatTypeID"] and catalogue_id == row["ThreatCatalogueID"]
-                and not linked_actors):
-            continue  # nothing promoted, re-pointed, or newly actor-linked — no false audit trail
+        # Two INDEPENDENT outcomes per row, deliberately not one `continue`. Since
+        # _find_or_create_type_and_catalogue stopped minting, `catalogue_id` is identically
+        # row["ThreatCatalogueID"], so the old combined guard would have collapsed to "skip unless
+        # a TYPE was minted or an actor was newly linked" — and the dominant case (type already
+        # verified, name novel) would have produced no row of any kind, silently discarding the
+        # very proposal this function exists to capture.
+        promoted = type_id != row["ThreatTypeID"] or bool(linked_actors)
+        if promoted:
+            update_rows.append({"b_tid": row["ThreatID"], "ThreatTypeID": type_id,
+                                "ThreatCatalogueID": catalogue_id})
+            audit_rows.append(dal.audit_row(
+                sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=entity,
+                EventType=AuditEventType.library_promoted, ActorUserID=actor_id, ActorType=actor_type,
+                ThreatTypeRefID=type_id, CreatedAt=stamp,
+                DetailJSON=json.dumps({"threat_id": row["ThreatID"], "catalogue_id": catalogue_id,
+                                        "sector_id": sector_id, "actors": linked_actors})))
+            log.info("threat.promoted", session_id=sid, threat_id=row["ThreatID"],
+                    type_id=type_id, catalogue_id=catalogue_id, sector_id=sector_id)
 
-        update_rows.append({"b_tid": row["ThreatID"], "ThreatTypeID": type_id, "ThreatCatalogueID": catalogue_id})
-        audit_rows.append(dal.audit_row(
-            sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=entity,
-            EventType=AuditEventType.library_promoted, ActorUserID=actor_id, ActorType=actor_type,
-            ThreatTypeRefID=type_id, CreatedAt=stamp,
-            DetailJSON=json.dumps({"threat_id": row["ThreatID"], "catalogue_id": catalogue_id,
-                                    "sector_id": sector_id, "actors": linked_actors})))
-
-        # Also record a Threat_Candidate_Review row so this promotion shows up in the
-        # normal candidate-review history/audit trail, already marked as accepted.
-        candidate_id = guid()
-        candidate_rows.append({
-            "CandidateID": candidate_id, "TenantID": tenant, "EntityID": entity,
-            "SessionID": sid, "ProposedCategory": row["ThreatCategory"],
-            "ProposedType": row["ThreatType"], "ProposedName": row["ThreatName"] or "",
-            "Status": CandidateStatus.accepted, "ThreatTypeID": type_id, "ThreatCatalogueID": catalogue_id,
-            "ReviewedBy": user_id, "ReviewedAt": stamp, "CreatedAt": stamp,
-        })
-        audit_rows.append(dal.audit_row(
-            sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=entity,
-            EventType=AuditEventType.candidate_reconciled, ActorUserID=actor_id, ActorType=actor_type,
-            CreatedAt=stamp,
-            DetailJSON=json.dumps({"candidate_id": candidate_id, "threat_id": row["ThreatID"]})))
-        log.info("threat.promoted", session_id=sid, threat_id=row["ThreatID"],
-                type_id=type_id, catalogue_id=catalogue_id, sector_id=sector_id)
+        # The proposed NAME never enters Threat_Catalogue automatically (see
+        # _find_or_create_type_and_catalogue), so it is queued for a curator to generalize
+        # instead. `pending` is the honest status — nothing has been reviewed, hence no
+        # ReviewedBy/ReviewedAt and no `candidate_reconciled` audit (that event means "a row was
+        # CLOSED as accepted"; none is). Written whether or not a type was promoted: the two are
+        # separate facts. Deduped per (type, name) within one accept — the table has no unique
+        # index, so two identical proposals would otherwise queue the same curation task twice.
+        ckey = ("candidate", row["ThreatType"], row["ThreatName"])
+        if row["ThreatName"] and ckey not in resolved:
+            resolved[ckey] = True
+            candidate_rows.append({
+                "CandidateID": guid(), "TenantID": tenant, "EntityID": entity,
+                "SessionID": sid, "ProposedCategory": row["ThreatCategory"],
+                "ProposedType": row["ThreatType"], "ProposedName": row["ThreatName"],
+                "Status": CandidateStatus.pending, "ThreatTypeID": type_id,
+                "ThreatCatalogueID": catalogue_id,
+                "ReviewedBy": None, "ReviewedAt": None, "CreatedAt": stamp,
+            })
 
     if update_rows:
         # Table (Core), not the mapped class: a plain executemany UPDATE, not an ORM bulk-update-

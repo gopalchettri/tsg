@@ -13,7 +13,8 @@ from pydantic.json_schema import JsonDict
 
 # Typing the wire with these is what puts them in /openapi.json — the UI generates its own
 # string-literal unions from the spec instead of hand-copying codes out of the API guide.
-from app.core.enums import ClickOutcomeReason, NextSetOutcome, ReviewGateReason, SSEEventType
+from app.core.enums import (ClickOutcomeReason, NextSetOutcome, ReviewGateReason, SSEEventType,
+                            TreatmentGateReason)
 from app.db.dal import canonical_guid
 
 # Plan item 1b: bound every list-of-targets field so one HTTP request can't turn into an
@@ -325,9 +326,9 @@ class ThreatResult(BaseModel):
         )
     )
     threat_catalogue_id: int | None = Field(
-        description="Id of the matched threat-catalogue master row. Usually null when unverified — "
-                    "though a threat can be unverified on its NAME while still carrying a real "
-                    "catalogue id from a candidate that scored just under the cutoff."
+        description="Id of the matched threat-catalogue master row, set only when the name match "
+                    "itself cleared the cutoff. Null whenever it did not — a close-but-unconfirmed "
+                    "candidate is deliberately not reported as a match."
     )
 
 
@@ -688,12 +689,13 @@ class ErrorDetails(BaseModel):
     (`existing_id`, `active_session_id`, …) alongside the common ones below."""
     model_config = ConfigDict(extra="allow")
 
-    reason: ReviewGateReason | ClickOutcomeReason | None = Field(
+    reason: ReviewGateReason | ClickOutcomeReason | TreatmentGateReason | None = Field(
         default=None,
         description=(
             "Machine-readable cause, when the raise site gave one. A ReviewGateReason means the "
             "request never ran (wrong session state); a ClickOutcomeReason means it ran and "
-            "resolved to nothing. Absent on raise sites with no stable cause, e.g. the "
+            "resolved to nothing; a TreatmentGateReason means a treatment-plan request was "
+            "refused. Absent on raise sites with no stable cause, e.g. the "
             "target-went-stale race."
         ),
     )
@@ -1059,6 +1061,7 @@ class IntelItem(BaseModel):
     url: str = Field(default="", description="Link back to the item at its source.")
     tags: list[str] = Field(default_factory=list, description="Source tags; for attributed OTX pulses the adversary is the first tag.")
     fetched_at: datetime | None = Field(default=None, description="UTC time this item was last written by a refresh (also its TTL clock). Null only on a malformed legacy doc.")
+    published_at: datetime | None = Field(default=None, description="The item's own date at its source (an OTX pulse's last-modified time); falls back to sync time for feeds that publish none. This is the ordering key — newest threat first.")
 
 
 class IntelItemsResponse(BaseModel):
@@ -1399,3 +1402,79 @@ class ControlStandardsResponse(BaseModel):
     control_library_id: int = Field(description="The control these standards belong to.")
     standard_ids: list[int] = Field(description="Linked Control_Standard primary keys.")
     standards: list[str] = Field(description="Their names, alphabetically — the same list a scenario's control shows.")
+
+
+# --- Risk Treatment Plan generation (app/api/treatment.py, docs/RISK_TREATMENT_PLAN_SDD.md §5) ---
+class TreatmentPlanBody(BaseModel):
+    """POST .../scenarios/{output_id}/treatment-plan. `Literal["Mitigate"]` is the v1 strategy
+    gate — any other strategy is a 422 straight from validation (the SDD's Mitigate-only
+    decision); the stored CRM strategy is additionally cross-checked server-side (409
+    strategy_mismatch on disagreement)."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "crm_risk_identification_id": 42, "treatment_strategy": "Mitigate"}})
+
+    crm_risk_identification_id: int = Field(
+        gt=0,
+        description=("The crm_risk_identification.id this plan treats. Client-supplied until the "
+                     "TSG↔CRM bridge tables land; TSG verifies the risk belongs to the session's "
+                     "entity before using it."))
+    treatment_strategy: Literal["Mitigate"] = Field(
+        description="Only 'Mitigate' is implemented; Accept/Transfer/Avoid are rejected (422).")
+
+
+class TreatmentPlanAccepted(BaseModel):
+    """202 body for the POST — the GET on the same path is the poll endpoint."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "plan_id": "0f0e0d0c-0b0a-8988-8786-858483828180",
+        "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
+        "output_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
+        "status": "RUNNING"}})
+
+    plan_id: str = Field(description="The new Risk_Treatment_Plan row's id.")
+    session_id: str = Field(description="Echo of the session in the path.")
+    output_id: str = Field(description="Echo of the scenario in the path.")
+    status: str = Field(description="Always RUNNING at accept time — poll the GET until COMPLETE or ERROR.")
+
+
+class TreatmentPlanStatus(BaseModel):
+    """GET .../treatment-plan — the active plan row. `status` is the poll signal; `plan` is the
+    parsed PlanJSON contract (null until COMPLETE, or when the stored blob is corrupt). A
+    RUNNING row whose progress clock stopped for longer than treatment_stale_seconds is
+    presented as ERROR with a timed-out message — a read-time projection, the stored row is
+    not rewritten."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "plan_id": "0f0e0d0c-0b0a-8988-8786-858483828180",
+        "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
+        "output_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
+        "status": "COMPLETE", "treatment_strategy": "Mitigate",
+        "crm_risk_identification_id": 42,
+        "risk_identification_date": "2026-06-14T08:31:00Z",
+        "plan": {"title": "Remote Access Hardening", "recommended_controls": [],
+                 "remediation_action_plan": []},
+        "warnings": [], "moderation_flagged": False,
+        "error_message": None,
+        "created_at": "2026-08-03T10:00:00Z", "completed_at": "2026-08-03T10:01:20Z"}})
+
+    plan_id: str = Field(description="Risk_Treatment_Plan row id.")
+    session_id: str = Field(description="Owning session.")
+    output_id: str = Field(description="The accepted scenario this plan treats.")
+    status: str = Field(description="RUNNING | COMPLETE | ERROR — the poll signal (stale RUNNING projects as ERROR).")
+    treatment_strategy: str = Field(description="The strategy this plan was generated for ('Mitigate').")
+    crm_risk_identification_id: int = Field(description="The CRM risk record this plan treats.")
+    risk_identification_date: datetime | None = Field(
+        default=None,
+        description="crm_risk_identification.creation_date — record data, never AI-generated (spec).")
+    plan: dict[str, Any] | None = Field(
+        default=None,
+        description=("The generated plan (SDD §7.3 contract: title, treatment_objective, "
+                     "recommended_controls[], remediation_action_plan[], ...). JSON is the wire "
+                     "contract; markdown rendering is the client's job."))
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Advisory validation warnings (vocabulary clamps, empty control map, ...). Never blocking.")
+    moderation_flagged: bool = Field(
+        default=False, description="Advisory content-moderation flag for a human reviewer, when moderation ran.")
+    error_message: str | None = Field(
+        default=None, description="Client-safe failure reason when status is ERROR.")
+    created_at: datetime | None = Field(default=None, description="When this attempt was requested.")
+    completed_at: datetime | None = Field(default=None, description="When it reached COMPLETE/ERROR.")

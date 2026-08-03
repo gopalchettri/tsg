@@ -22,6 +22,8 @@ from app.api.threat_intel import router as threat_intel_router
 from app.api.threat_library_crud import router as threat_library_crud_router
 from app.api.control_library_crud import router as control_library_crud_router
 from app.api.threat_library_import import router as threat_library_import_router
+from app.api.treatment import router as treatment_router
+from app.core.config import get_settings
 from app.core.middleware import BodySizeLimitMiddleware, RequestIDMiddleware
 
 
@@ -146,6 +148,15 @@ def create_app() -> FastAPI:
                     "feed the threats-prompt hint. Requires the admin key."
                 ),
             },
+            {
+                "name": "Treatment Plans",
+                "description": (
+                    "AI-generated Risk Treatment (Mitigate) plans for accepted scenarios, "
+                    "joined to the CRM Risk module's risk records. Present only when "
+                    "RISK_MODULE_ENABLED is on. POST to generate/regenerate, poll the GET on "
+                    "the same path."
+                ),
+            },
         ],
         lifespan=lifespan,
     )
@@ -163,6 +174,11 @@ def create_app() -> FastAPI:
     app.include_router(threat_library_crud_router)
     app.include_router(control_library_crud_router)
     app.include_router(threat_intel_router)
+    # Feature-flagged: flag off -> the treatment-plan paths 404 by absence (no handler code
+    # runs), and invariants.py skips the crm_* table check. Flag on -> routes mount AND boot
+    # verifies the CRM tables exist (docs/RISK_TREATMENT_PLAN_SDD.md D3).
+    if get_settings().risk_module_enabled:
+        app.include_router(treatment_router)
     # [R2 remainder] fail-closed: refuse to boot if any route is missing its entity-scoping
     # dependency, or was never triaged at all — see app/api/route_audit.py. Audits `app`
     # itself (not a hand-maintained router list) so a future router can't ship unaudited.

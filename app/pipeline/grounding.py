@@ -6,7 +6,9 @@ each time.
 
 Every match bands into GroundingStatus.verified/unverified across ONE cutoff
 (a configurable Setting, see label_match_from_score) — unverified means "not in
-the library yet"; accept.py promotes it to a new entry once a human accepts it.
+the library yet". On accept, its Threat_TYPE is promoted automatically; its NAME
+is queued for curator generalization instead (accept.py), because the prompt
+requires that name to embed the asset's own name.
 
 sector_ids is always [own_sector_id, parent_sector_id] (fewer/empty = no
 sector context) — see visible_to_this_sector / how_specific_is_this_sector.
@@ -207,7 +209,7 @@ def get_control_candidates(sess: Session, itot: str | None) -> list[dict[str, An
 
 
 def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] | None]],
-                           rows: list[dict[str, Any]], s: Settings) -> list[tuple[dict[str, Any], float] | None]:
+                        rows: list[dict[str, Any]], s: Settings) -> list[tuple[dict[str, Any], float] | None]:
     """Batch Step-4 grounding: every query shortlists against the SAME candidate set, then all
     shortlists rerank in one llm.rerank_many call (one local model dispatch, or
     bounded-concurrent remote calls) instead of one rerank round trip per query.
@@ -237,7 +239,7 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
         if sl is None:
             if name_vecs is None:
                 name_vecs = embeddings.get_vectors(llm, names, model_id=s.embedding_model,
-                                                   group="control_library", kind="passage")
+                                                group="control_library", kind="passage")
             sl = _shortlist_candidates(qv, rows, name_vecs, "text", s)
         shortlists.append(sl)
     # Rerank only the queries that actually have a shortlist; map results back by position.
@@ -284,7 +286,7 @@ def get_allowed_actor_names(sess: Session, type_id: int) -> set[str]:
 
 
 def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs: dict[str, list[float]],
-                           name_key: str, s: Settings) -> list[dict[str, Any]]:
+                        name_key: str, s: Settings) -> list[dict[str, Any]]:
     """Cosine-scores every candidate against the query embedding, best match
     first. The semantic-match floor keeps only candidates above
     `semantic_match_threshold`, but falls back to the top-K anyway if nothing
@@ -337,7 +339,7 @@ def _apply_shortlist(scored: list[tuple[dict[str, Any], float]], s: Settings) ->
 
 
 def _shortlist_via_matrix(qv: list[float], rows: list[dict[str, Any]],
-                          matrix_info: tuple[Any, list[int]], s: Settings) -> list[dict[str, Any]] | None:
+                        matrix_info: tuple[Any, list[int]], s: Settings) -> list[dict[str, Any]] | None:
     """Matrix-path scoring: one `matrix @ q_unit` against embeddings.get_matrix's cached,
     pre-normalized matrix instead of len(rows) dot products. Returns None on a query/matrix
     dimension mismatch — caller falls back to the dict path, which logs per candidate."""
@@ -403,8 +405,13 @@ class GroundingResult:
     """Verdict for one proposed threat, returned by find_threat_in_library().
 
     score/status         — the weaker of the type-match and name-match confidence.
-    type_id/catalogue_id — the real library IDs matched, or None if flagged.
-    actors_validated      — False means the type was flagged, so `actors` is
+    type_id/catalogue_id — the real library IDs matched. Each is set ONLY when its own
+                            half verified: an unverified type yields type_id=None, and an
+                            unverified name yields catalogue_id=None (and library_name=None)
+                            even though a best-scoring candidate row existed. The shortlist
+                            is fail-open and the rerank has no minimum, so "there was a
+                            candidate" is not evidence of a match — see find_threat_in_library.
+    actors_validated      — False means the type was unverified, so `actors` is
                             the AI's raw/unchecked proposal, not confirmed
                             against the library's allowed set.
     """
@@ -430,6 +437,23 @@ def ensure_actor_list(raw: Any) -> list[str]:
     if isinstance(raw, list):
         return [x for x in raw if isinstance(x, str)]
     return []
+
+
+def validated_actors(threat_actors_json: str | None) -> list[str]:
+    """THE one reader for `Identified_Threat.ThreatActorsJSON`, kept beside the flag it gates
+    on (`GroundingResult.actors_validated`). The stored shape is a DICT —
+    `{"actors": [...], "validated": bool}` (written by tasks.py) — and actors are trusted only
+    when `validated`; ungrounded proposals must not reach downstream documents. A corrupt,
+    absent, or mis-shaped blob returns [] instead of crashing (accept.py used to raise on
+    exactly that; treatment.py used to silently read the dict as a list and get []). Every
+    consumer goes through here so the shape can never drift per-reader again."""
+    try:
+        meta = json.loads(threat_actors_json or "{}")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(meta, dict):
+        return []
+    return ensure_actor_list(meta.get("actors", []) if meta.get("validated") else [])
 
 
 def ensure_text(v: Any, default: str = "") -> str:
@@ -746,12 +770,21 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
     allowed = _cached(cache, akey, lambda: get_allowed_actor_names(sess, type_id))
     actors = [a for a in actors_in if a in allowed]  # drop out-of-set (§8.4 step 5)
 
+    # Symmetry with the TYPE branch above: an unverified type already yields type_id=None. An
+    # unverified NAME must likewise yield no id and no library wording. `crow` is only ever the
+    # best candidate, never necessarily a real match — _apply_shortlist is fail-open
+    # (`above or scored`) and find_closest_match applies no rerank minimum, so a 22/100 row was
+    # stored indistinguishably from a 97/100 one. That id is authoritative downstream in three
+    # places at once: the name the API renders (sessions.py `LibraryThreatName or ThreatName`),
+    # the "official library name" the scenario prompt writes about, and the `cat:` rung of
+    # tasks._dedup_key. Withholding the CLAIM is the fix; `score` still reports what was measured.
+    matched = crow if cstatus == GroundingStatus.verified else None
     return GroundingResult(
         status=pick_worse_of_two(tstatus, cstatus),
         type_id=type_id,
-        catalogue_id=crow["ThreatCatalogueID"] if crow else None,
+        catalogue_id=matched["ThreatCatalogueID"] if matched else None,
         library_type=trow["ThreatTypeName"],
-        library_name=crow["ThreatName"] if crow else None,
+        library_name=matched["ThreatName"] if matched else None,
         score=min(tscore, cscore),
         actors=actors,
         actors_validated=True,

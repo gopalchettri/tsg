@@ -1034,7 +1034,10 @@ def _scenario_read_select():
             out.Accepted, out.Superseded, out.ScenarioNumber, out.CreatedAt, out.ControlsMappedAt,
             ss.EntityID, ss.UserID, ss.SessionStatus,
             it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
-            it.LibraryThreatType, it.LibraryThreatName)
+            it.LibraryThreatType, it.LibraryThreatName,
+            # treatment.build_treatment_input reads these two; every other consumer maps
+            # fields by name through explicit Pydantic models, so the extra keys are inert.
+            it.ThreatCategory, it.ThreatActorsJSON)
         .select_from(out.__table__
             .join(ss, out.SessionID == ss.SessionID)
             .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
@@ -1694,3 +1697,76 @@ def link_catalogue_category(sess: Session, catalogue_id: int, category_id: int) 
         if exists is None:  # not a duplicate link — FK/NOT NULL/other violation
             raise
         return False
+
+
+# ---------------------------------------------------------------------------
+# Risk Treatment Plan rows (docs/RISK_TREATMENT_PLAN_SDD.md §6). The plan row IS the state —
+# no Subsystem_Stage_State involvement (accepted scenarios live on completed sessions, where
+# acquire_lock refuses to run). All conditional-UPDATE fences live here; treatment.py and
+# api/treatment.py never build their own SQL. Insert goes through the generic insert_row().
+# ---------------------------------------------------------------------------
+def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime) -> int:
+    """Retire the scenario's active plan row so a new attempt can be inserted. Matches only
+    rows a re-POST may legitimately replace: finished ones, or a RUNNING claim whose
+    UpdatedAt progress clock stopped before `stale_cutoff` (dead worker / lost enqueue).
+    A FRESH RUNNING row matches nothing — the caller's subsequent insert then hits
+    UX_TreatmentPlan_ActiveOutput and surfaces as 409 generation_in_progress. Returns rowcount."""
+    p = m.Risk_Treatment_Plan
+    return execute_dml(sess, update(p).where(
+        p.OutputID == output_id, p.Superseded == 0,
+        or_(p.Status.in_([StageStatus.COMPLETE, StageStatus.ERROR]),
+            and_(p.Status == StageStatus.RUNNING, p.UpdatedAt < stale_cutoff)),
+    ).values(Superseded=1, UpdatedAt=now())).rowcount
+
+
+def claim_plan(sess: Session, plan_id: str, task_id: str, stale_cutoff: datetime) -> bool:
+    """Worker claim CAS. Admits three cases: unclaimed (ActiveTaskID NULL), a retry/redelivery
+    of the SAME task id (Celery acks_late redelivers with the id unchanged, and autoretry_for
+    re-runs with it too — without this branch every LLMSlotUnavailable retry would no-op and
+    wedge the row), or a stale claim (dead-worker takeover). Same resume posture as
+    claim_stage's own-task branch. False = someone else holds a fresh claim, or the row is
+    finished/superseded — caller logs and returns."""
+    p = m.Risk_Treatment_Plan
+    return execute_dml(sess, update(p).where(
+        p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.RUNNING,
+        or_(p.ActiveTaskID.is_(None), p.ActiveTaskID == task_id, p.UpdatedAt < stale_cutoff),
+    ).values(ActiveTaskID=task_id, UpdatedAt=now())).rowcount == 1
+
+
+def touch_plan(sess: Session, plan_id: str) -> None:
+    """Bump the progress clock before each LLM attempt, so treatment_stale_seconds measures
+    "no progress", not wall time — a healthy worker in a long capacity backoff never looks
+    dead. Fenced on (RUNNING, not superseded): a zombie whose row a re-POST already retired
+    must not smudge the retired row's "when did it stop" timestamp — that clock is exactly
+    what a post-mortem reads. ponytail: one UPDATE per attempt, not a heartbeat thread; a
+    single LLM call is the only work between beats."""
+    p = m.Risk_Treatment_Plan
+    execute_dml(sess, update(p).where(
+        p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.RUNNING,
+    ).values(UpdatedAt=now()))
+
+
+def finish_plan(sess: Session, plan_id: str, *, status: StageStatus,
+                plan_json: str | None = None, validation_json: str | None = None,
+                error_message: str | None = None) -> bool:
+    """Terminal CAS — COMPLETE or ERROR. Fenced on (RUNNING, not superseded): a row a re-POST
+    superseded mid-flight, or that another attempt already finished, matches 0 rows and the
+    caller drops its result with a log line instead of resurrecting a retired plan."""
+    p = m.Risk_Treatment_Plan
+    return execute_dml(sess, update(p).where(
+        p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.RUNNING,
+    ).values(Status=status, PlanJSON=plan_json, ValidationJSON=validation_json,
+             ErrorMessage=error_message, UpdatedAt=now(), CompletedAt=now())).rowcount == 1
+
+
+def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
+    """The scenario's one active plan row for the GET poll endpoint. SessionID predicate keeps
+    a foreign OutputID a 404 rather than a leak (same posture as scenario_row). None on a
+    malformed GUID (→ 404, not an MSSQL 500)."""
+    if not _valid_guid(output_id):
+        return None
+    p = m.Risk_Treatment_Plan
+    return sess.execute(
+        select(p.__table__).where(
+            p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 0)
+    ).mappings().first()

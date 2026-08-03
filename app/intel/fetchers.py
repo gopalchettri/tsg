@@ -1,7 +1,12 @@
 """Live threat-intel fetchers → Mongo `threat_intel` cache.
 
 One small fetcher per open feed, all normalizing to the same doc shape:
-    {source, kind, external_id, title, description, url, tags[], raw, fetched_at}
+    {source, kind, external_id, title, description, url, tags[], raw,
+     fetched_at, published_at}
+
+`fetched_at` is cache age (it drives the TTL); `published_at` is the item's own date at
+the source and is what both read paths RANK on — see query_intel. Retrieval that needs
+more than one request lives in its own module (otx.py, taxii_client.py).
 
 Refresh semantics: every run UPSERTS on (source, external_id) and stamps
 `fetched_at`, so items still present in a feed never expire; the TTL index only
@@ -23,7 +28,7 @@ import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Any
+from typing import Any, Iterator
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -37,6 +42,11 @@ _breaker_open_until = 0.0
 # for analysts/future use but stay out of the LLM context.
 PROMPT_KINDS = ("cve", "ics_advisory", "pulse")
 
+# Single source of truth for how many intel items may enter one prompt: query_intel's
+# default limit, tasks._fetch_intel's merge cap, and prompts._intel_block's slice all
+# use it — one knob, so the three sites can never drift apart.
+PROMPT_INTEL_LIMIT = 5
+
 # Every feed this module knows how to fetch, in report order. The status API reports ALL
 # of them — not just the enabled ones — so "switched off" is visibly different from
 # "enabled but never ran". Keep in step with _enabled_fetchers below.
@@ -44,7 +54,9 @@ ALL_FEEDS = ("cisa_kev", "cisa_ics", "otx", "urlhaus", "taxii")
 
 # Feeds whose items can reach the LLM (they emit PROMPT_KINDS). urlhaus is the deliberate
 # exception: cached for analysts, never prompted — raw IOCs are noise in a narrative scenario.
-PROMPTED_FEEDS = ("cisa_kev", "cisa_ics", "otx", "taxii")
+# taxii is excluded too: fetch_taxii emits kind="stix", which query_intel never draws, so
+# listing it here would make the /feeds API misreport prompted:true for it.
+PROMPTED_FEEDS = ("cisa_kev", "cisa_ics", "otx")
 
 
 @lru_cache
@@ -60,14 +72,22 @@ def _intel_store():
         socketTimeoutMS=max(s.mongo_connect_timeout_ms, 30000),  # bulk upserts of ~1k docs
     )[s.mongo_db]["threat_intel"]
     col.create_index([("source", 1), ("external_id", 1)], unique=True)
-    # query_intel filters per kind and sorts newest-first — let each per-kind query walk
-    # exactly its kind partition in sort order instead of scanning via the TTL index.
-    col.create_index([("kind", 1), ("fetched_at", -1)])
-    # list_intel's per-source page (filter source, sort fetched_at desc + external_id
-    # tiebreak) — without this every /items call re-sorts in memory. The UNFILTERED
-    # listing still sorts in memory: acceptable while TTL caps the collection at a few
-    # thousand docs; add {fetched_at,external_id} if a feed ever grows past that.
-    col.create_index([("source", 1), ("fetched_at", -1), ("external_id", 1)])
+    # Both reads rank on `published_at` (the source's own date), NOT fetched_at: one sync
+    # stamps thousands of docs with the same fetched_at, so ranking on it would pick an
+    # arbitrary 5 out of every large match set.
+    # The fetched_at-ranked pair these replace is dropped rather than left behind: an
+    # unused index is write cost on every upsert forever, and an ops note to remove it by
+    # hand would never reach the environments that already have it. Idempotent both ways —
+    # a rollback recreates them.
+    for superseded in ("kind_1_fetched_at_-1", "source_1_fetched_at_-1_external_id_1"):
+        try:
+            col.drop_index(superseded)
+        except Exception:  # noqa: BLE001 — never created here, or already gone: the normal case
+            pass
+    col.create_index([("kind", 1), ("published_at", -1)])          # query_intel, per kind
+    # list_intel's per-source page; the UNFILTERED listing still sorts in memory, which is
+    # acceptable while the TTL caps the collection at low tens of thousands of docs.
+    col.create_index([("source", 1), ("published_at", -1), ("external_id", 1)])
     ttl_seconds = s.intel_ttl_days * 86400
     try:
         col.create_index("fetched_at", expireAfterSeconds=ttl_seconds, name="ttl_fetched_at")
@@ -198,28 +218,17 @@ def fetch_urlhaus(s) -> list[dict]:
     return docs
 
 
-def fetch_otx(s) -> list[dict]:
-    data = json.loads(_get(s.intel_otx_url, headers={"X-OTX-API-KEY": s.intel_otx_api_key}))
-    docs = []
-    for p in data.get("results", []):
-        # Attribution survives into the prompt only via the title (prompts._intel_block emits
-        # id/title/url alone, title capped at 140 chars) — prepend so truncation can never drop
-        # it. The tag makes actor-linked threats matchable (tasks._fetch_intel adds library
-        # actors to query_intel's terms).
-        adv = (p.get("adversary") or "").strip()
-        title = f"[{adv}] {p.get('name', '')}" if adv else p.get("name", "")
-        tags = ([adv.lower()] if adv else []) + [t for t in (p.get("tags") or [])]
-        doc = _doc(
-            "otx", "pulse", p.get("id", ""), title,
-            description=p.get("description", ""),
-            url=f"https://otx.alienvault.com/pulse/{p.get('id', '')}",
-            tags=tags[:20], raw=None)
-        if adv:
-            # stored as its own field for the /items API — community titles may legitimately
-            # start with [brackets], so attribution is never re-parsed out of the title
-            doc["adversary"] = adv[:200]
-        docs.append(doc)
-    return docs
+def fetch_otx(s) -> Iterator[dict]:
+    """The ONE fetcher that streams instead of returning a list: the subscription is ~8.9k
+    pulses over ~178 increasingly slow pages (about an hour end to end), so it is walked
+    across runs from a stored cursor — see app/intel/otx.py. Yielding lets refresh_one
+    persist each page as it arrives, so a run cut short by the task's soft_time_limit keeps
+    everything it already fetched."""
+    from app.intel import otx  # lazy: same style as fetch_taxii, and breaks the import cycle
+
+    deadline = time.monotonic() + s.intel_otx_sync_seconds
+    for batch in otx.walk(s, _store_if_healthy(), deadline):
+        yield from batch
 
 
 def fetch_taxii(s) -> list[dict]:
@@ -242,7 +251,10 @@ def fetch_taxii(s) -> list[dict]:
 
 # ---------------------------------------------------------------- refresh + query
 def _enabled_fetchers(s) -> list[tuple[str, Any]]:
-    out = []
+    # Annotated because the values are deliberately heterogeneous: a fetcher returns any
+    # ITERABLE of docs — most build a list, otx yields page by page so refresh_one can
+    # persist batches as they arrive instead of holding a whole corpus in memory.
+    out: list[tuple[str, Any]] = []
     if s.intel_kev_enabled:
         out.append(("cisa_kev", fetch_kev))
     if s.intel_ics_advisories_enabled:
@@ -269,14 +281,40 @@ def _record_feed_status(col, feed: str, *, items: int | None = None, error: str 
     Best-effort: bookkeeping must never fail the refresh it is describing."""
     now = datetime.now(timezone.utc)
     update: dict[str, Any] = {"last_attempt_at": now, "last_error": error}
+    if items is not None:
+        # recorded on the FAILURE path too: writes are incremental, so a run that died
+        # partway still stored real items and must not read as a total loss
+        update["item_count"] = items
     if error is None:
         update["last_success_at"] = now
-        update["item_count"] = items
     try:
         col.database["intel_feed_status"].update_one(
             {"feed": feed}, {"$set": update, "$setOnInsert": {"feed": feed}}, upsert=True)
     except Exception:  # noqa: BLE001 — status bookkeeping is never worth failing a refresh over
         log.warning("intel.status_record_failed", feed=feed, exc_info=True)
+
+
+#: Docs per bulk_write. The point is not batch efficiency but DURABILITY: a feed that
+#: streams for minutes (otx walks pages; cisa_ics issues up to 200 sequential requests)
+#: used to write once at the very end, so a soft_time_limit kill or a dead worker threw
+#: away everything already fetched. Now each batch is persisted as it is produced.
+_WRITE_BATCH = 500
+
+
+def _upsert_batch(col, docs: list[dict], now: datetime) -> None:
+    """Stamp and upsert one batch on (source, external_id)."""
+    from pymongo import ReplaceOne
+
+    for d in docs:
+        d["fetched_at"] = now                              # cache age — drives the TTL
+        # One uniform ranking key across every feed: the source's own date where it has one
+        # (OTX pulses), else sync time. query_intel/list_intel sort on this, so it must
+        # never be missing or those docs would rank below everything.
+        d["published_at"] = d.get("published_at") or now
+    col.bulk_write([
+        ReplaceOne({"source": d["source"], "external_id": d["external_id"]}, d, upsert=True)
+        for d in docs
+    ], ordered=False)
 
 
 def refresh_one(feed: str) -> int:
@@ -290,8 +328,6 @@ def refresh_one(feed: str) -> int:
     Note some feeds are deliberately INCREMENTAL (fetch_ics_advisories skips advisories
     already cached), so a count of 0 on an up-to-date cache is success, not a silent
     failure — read `last_success_at` from the status doc, not the count, to judge health."""
-    from pymongo import ReplaceOne
-
     s = get_settings()
     fetcher = dict(_enabled_fetchers(s)).get(feed)
     if fetcher is None:
@@ -299,23 +335,25 @@ def refresh_one(feed: str) -> int:
     col = _store_if_healthy()
     if col is None:
         raise RuntimeError("intel refresh skipped: Mongo unavailable")
+    now = datetime.now(timezone.utc)
+    stored, batch = 0, []
     try:
-        docs = fetcher(s)
-        now = datetime.now(timezone.utc)
-        for d in docs:
-            d["fetched_at"] = now
-        if docs:
-            col.bulk_write([
-                ReplaceOne({"source": d["source"], "external_id": d["external_id"]}, d, upsert=True)
-                for d in docs
-            ], ordered=False)
+        for doc in fetcher(s):        # list or generator — both iterate
+            batch.append(doc)
+            if len(batch) >= _WRITE_BATCH:
+                _upsert_batch(col, batch, now)
+                stored += len(batch)
+                batch = []
+        if batch:
+            _upsert_batch(col, batch, now)
+            stored += len(batch)
     except Exception as exc:  # noqa: BLE001 — record, then re-raise for the retry policy
-        _record_feed_status(col, feed, error=f"{type(exc).__name__}: {exc}"[:500])
-        log.warning("intel.feed_failed", feed=feed, exc_info=True)
+        _record_feed_status(col, feed, items=stored, error=f"{type(exc).__name__}: {exc}"[:500])
+        log.warning("intel.feed_failed", feed=feed, items_stored=stored, exc_info=True)
         raise
-    _record_feed_status(col, feed, items=len(docs))
-    log.info("intel.feed_refreshed", feed=feed, items=len(docs))
-    return len(docs)
+    _record_feed_status(col, feed, items=stored)
+    log.info("intel.feed_refreshed", feed=feed, items=stored)
+    return stored
 
 
 def refresh_all() -> dict[str, int]:
@@ -380,17 +418,26 @@ def feed_status() -> list[dict[str, Any]]:
     return out
 
 
-def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",), limit: int = 5) -> list[dict]:
+def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",),
+                limit: int = PROMPT_INTEL_LIMIT, backfill: bool = True) -> list[dict]:
     """Top current intel items whose title/tags match any term (case-insensitive).
     Fail-open: Mongo down or no matches → empty list. Only PROMPT_KINDS are
     returned — IOC feeds never reach the LLM context.
 
+    Ranked by `published_at` — the item's OWN date, not when it was synced. With a
+    corpus in the thousands a generic term matches hundreds of items, and ranking on
+    sync time would return an arbitrary five of them (one sync stamps every doc
+    identically); the source's date makes "top 5" mean the most recent threats.
+
     `prefer_kinds` are drawn first and in order (e.g. ('ics_advisory','cve') for OT
     threats), then the remaining PROMPT_KINDS backfill. Drawing per-kind in the DB
-    query — rather than post-sorting one recency-capped pool — is deliberate: a single
-    refresh stamps every doc with the same `fetched_at`, so a recency-capped pool would
-    be dominated by whichever source (e.g. KEV's ~1.6k CVEs) inserted first and could
-    starve the preferred kind entirely."""
+    query — rather than post-sorting one pool — is deliberate: a single pool would be
+    dominated by whichever source is largest (e.g. KEV's ~1.6k CVEs) and could starve
+    the preferred kind entirely.
+
+    `backfill=False` draws ONLY prefer_kinds — the reserved-slot draw in
+    tasks._fetch_intel uses it so a no-pulse match returns empty instead of spending a
+    second find on a fallback kind the caller would have to discard."""
     col = _store_if_healthy()
     terms = [t for t in terms if t and len(t) >= 4]
     if col is None or not terms:
@@ -398,13 +445,15 @@ def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",), limi
     try:
         rx = re.compile("|".join(re.escape(t) for t in terms), re.IGNORECASE)
         match = {"$or": [{"title": rx}, {"description": rx}, {"tags": rx}]}
-        ordered_kinds = list(prefer_kinds) + [k for k in PROMPT_KINDS if k not in prefer_kinds]
+        ordered_kinds = list(prefer_kinds)
+        if backfill:
+            ordered_kinds += [k for k in PROMPT_KINDS if k not in prefer_kinds]
         out: list[dict] = []
         for kind in ordered_kinds:
             if len(out) >= limit:
                 break
             out.extend(col.find({**match, "kind": kind}, {"_id": 0, "raw": 0})
-                    .sort("fetched_at", -1).limit(limit - len(out)))
+                    .sort("published_at", -1).limit(limit - len(out)))
         return out
     except Exception:  # noqa: BLE001 — enrichment is optional, never breaks generation
         log.warning("intel.query_failed", exc_info=True)
@@ -412,11 +461,12 @@ def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",), limi
 
 
 def list_intel(source: str | None = None, limit: int = 50, offset: int = 0) -> tuple[list[dict], int] | None:
-    """Stored intel items for the admin /items API, newest first — or None when the store
-    is unavailable, so the route can report 503 (an empty list must mean 'genuinely nothing').
+    """Stored intel items for the admin /items API, newest threat first — or None when the
+    store is unavailable, so the route can report 503 (an empty list must mean 'genuinely
+    nothing').
 
-    external_id tiebreak: one refresh stamps every doc with the SAME fetched_at, so a
-    fetched_at-only sort leaves Mongo's order for ties unstable and pages could repeat or
+    Ordered by `published_at` (the source's own date), with an external_id tiebreak: docs
+    from one sync share a timestamp, and an unstable order for ties lets pages repeat or
     skip items between requests."""
     col = _store_if_healthy()
     if col is None:
@@ -424,7 +474,7 @@ def list_intel(source: str | None = None, limit: int = 50, offset: int = 0) -> t
     q = {"source": source} if source else {}
     try:
         items = list(col.find(q, {"_id": 0, "raw": 0})
-                     .sort([("fetched_at", -1), ("external_id", 1)]).skip(offset).limit(limit))
+                     .sort([("published_at", -1), ("external_id", 1)]).skip(offset).limit(limit))
         return items, col.count_documents(q)
     except Exception:  # noqa: BLE001 — a mid-query blip is the same "store unavailable"
         # as a breaker-open connection: the route's one 503 path must cover both, never

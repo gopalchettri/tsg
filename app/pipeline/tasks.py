@@ -71,7 +71,8 @@ def _flag_sibling_similarity(report: dict, scenario: dict, sibling_texts: list[t
 
 
 def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_session: dict,
-            subsystem_id: int, stage: str, level: SubsystemLevel, epoch: int, task_id: str,
+            subsystem_id: int, stage: str, level: SubsystemLevel | None = None,
+            epoch: int | None = None, task_id: str | None = None,
             expected_type: type, temperature: float | None = None) -> tuple[Any, Provenance | None]:
     """Send a prompt to the LLM, log the raw request/response to Prompt_Log, and parse the
     reply into the expected type. A failed parse is still logged before the error is re-raised.
@@ -80,15 +81,21 @@ def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_ses
     stamp them once, but a stage makes one of these calls per selected threat, so a still-alive
     worker deep in that loop would otherwise expire its own lease and be reaped. Best-effort —
     an already-lost lease is still caught by the caller's finish_stage fencing. Renewing at this
-    one choke point means no caller can reintroduce the gap."""
+    one choke point means no caller can reintroduce the gap.
+
+    `level=None` (with epoch/task_id None too) = stage-less caller (treatment.py — its plan row
+    has its own claim CAS, no Subsystem_Stage_State rows exist): both renewals are skipped, the
+    commit and the Prompt_Log discipline stay. This keeps every LLM call routed through the one
+    choke point instead of forking a renewal-free copy."""
     sid = scenario_session["SessionID"]
-    if not dal.renew_lease(sess, sid, subsystem_id, level, epoch, task_id):
-        log.warning("stage.lease_renewal_failed", session_id=sid,
-                    subsystem=subsystem_id, level=str(level))
-    if not dal.renew_lock_lease(sess, sid, subsystem_id, task_id):
-        # Normal on the full-run path, which holds no _LOCK; release_lock's fencing still
-        # catches an actual theft on the locked paths.
-        log.debug("lock.lease_renewal_skipped", session_id=sid, subsystem=subsystem_id)
+    if level is not None:
+        if not dal.renew_lease(sess, sid, subsystem_id, level, epoch, task_id):
+            log.warning("stage.lease_renewal_failed", session_id=sid,
+                        subsystem=subsystem_id, level=str(level))
+        if not dal.renew_lock_lease(sess, sid, subsystem_id, task_id):
+            # Normal on the full-run path, which holds no _LOCK; release_lock's fencing still
+            # catches an actual theft on the locked paths.
+            log.debug("lock.lease_renewal_skipped", session_id=sid, subsystem=subsystem_id)
     sess.commit()
     text, prov = llm.chat(messages, temperature=temperature)
     if prov is not None:
@@ -97,7 +104,11 @@ def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_ses
         "LogID": guid(), "SessionID": scenario_session["SessionID"], "TenantID": scenario_session["TenantID"],
         "EntityID": scenario_session["EntityID"], "UserID": scenario_session.get("UserID"),
         "SubsystemID": subsystem_id, "Stage": stage, "PromptVersion": prompts.PROMPT_VERSION,
-        "Messages": json.dumps(messages), "ResponseText": text,
+        "Messages": json.dumps(messages),
+        # Same prompt as Messages, flattened so it reads back without unescaping JSON. Role
+        # headers, not a bare concat: without them the system/user boundary is unrecoverable.
+        "Prompt": "\n\n".join(f"[{msg['role']}]\n{msg.get('content') or ''}" for msg in messages),
+        "ResponseText": text,
         "Model": prov.model if prov else None, "ModelVersion": prov.model_version if prov else None,
         "CreatedAt": now(),
     }
@@ -111,6 +122,13 @@ def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_ses
                     subsystem=subsystem_id, stage=stage)
         raise
     dal.insert_row(sess, m.Prompt_Log, {**row, "ParseSucceeded": True})
+    # The Prompt_Log row is the spend/audit record for a call that was ALREADY billed. Commit
+    # it here, at the choke point, so no caller's later failure path (_record_failure and the
+    # per-item handlers all open with sess.rollback(); treatment.py's validate/finish paths
+    # likewise) can ever discard the receipt. The parse-failure branch above already commits —
+    # this makes the success branch symmetric. Safe for every caller: the commit at the top of
+    # this function means the transaction here holds ONLY the Prompt_Log row.
+    sess.commit()
     return parsed, prov
 
 
@@ -183,24 +201,47 @@ def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip().casefold()
 
 
+def _asset_agnostic_name(name: str | None, asset_name: str) -> str | None:
+    """Grounding-query form of a proposed threat name. The prompt mandates
+    '<impact> of <asset name>' so reviewers see the target, but Threat_Catalogue.ThreatName
+    entries are asset-agnostic — the asset name is pure noise in the embed/rerank name match
+    and systematically drags scores toward unverified. Strip it (and the connective it leaves
+    dangling) for the MATCH only; the stored/displayed ThreatName keeps the full form.
+    Falls back to the full name when stripping would leave nothing."""
+    if not name or not asset_name:
+        return name
+    stripped = re.sub(re.escape(asset_name), " ", name, flags=re.IGNORECASE)
+    stripped = re.sub(r"\s+", " ", stripped).strip(" ,;:-")
+    stripped = re.sub(r"\s+(of|to|on|in|for|against)$", "", stripped, flags=re.IGNORECASE)
+    return stripped or name
+
+
 def _dedup_key(info: dict) -> str:
     """Catalogue-level dedup key for one threat, scoped per (session, subsystem) by the caller.
     Prefer the finest real library id; fall back to normalized text for a novel/ungrounded
     proposal. This is the folding rule dal.identity_hash wraps — every IdentityHash producer and
     consumer routes through that helper, so app-level dedup and the DB unique index block the
     SAME pair."""
-    catalogue_id = info.get("catalogue_id")
-    if catalogue_id is not None:
-        return f"cat:{catalogue_id}"
-    type_id = info.get("threat_type_id")
-    if type_id is not None:
-        return f"type:{type_id}"
     # Join the delimiter AFTER normalizing each part: _normalize strips `[^\w\s]`, so an in-text
     # separator would be eaten and 'Firmware'+'Tampering' would collide with 'Firmware Tampering'
     # +None. Both parts empty → a per-threat-unique token, so distinct ungrounded proposals don't
     # all collapse onto a bare 'txt:'.
     key_type = _normalize(info.get("threat_type") or "")
     key_name = _normalize(info.get("threat_name") or "")
+    catalogue_id = info.get("catalogue_id")
+    if catalogue_id is not None:
+        return f"cat:{catalogue_id}"
+    type_id = info.get("threat_type_id")
+    if type_id is not None:
+        # The NAME is part of this rung, not just the type id. grounding now withholds
+        # catalogue_id unless the name match actually verified, so a bare `type:<id>` would fold
+        # EVERY threat sharing a verified type into one identity — an asset with five distinct
+        # Information Disclosure threats would yield one scenario, and _select_unique_top_n drops
+        # the rest as ScopingRejection.duplicate, which is NOT in RESERVABLE_REJECTIONS, so
+        # next-set can never re-serve them. Same type + same name is still one threat; same type
+        # + different names are different threats. Falls back to the bare form when the proposal
+        # carried no name at all (nothing to tell two such rows apart by).
+        return f"type:{type_id}|{key_name}" if key_name else f"type:{type_id}"
     if not key_type and not key_name:
         return "txt:tid:" + str(info.get("threat_id"))
     return "txt:" + key_type + "|" + key_name
@@ -235,9 +276,10 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
             asset_active_fields = resolved["asset"]
         if sub_active_fields is None:
             sub_active_fields = resolved["subsystem"]
+    max_threats = get_settings().max_threats_per_asset
     proposals, prov = _ask_ai(sess, llm, prompts.threats_prompt(
                                 scenario_session["AssetName"], asset_context, subsystems,
-                                max_threats=get_settings().max_threats_per_asset,
+                                max_threats=max_threats,
                                 categories=categories if categories is not None else dal.active_category_names(sess),
                                 actor_examples=actor_examples if actor_examples is not None else dal.active_actor_names(sess),
                                 asset_active_fields=asset_active_fields,
@@ -256,10 +298,26 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     rows: list[dict] = []
     sector_ids = json.loads(scenario_session["SectorIDsJSON"]) if scenario_session.get("SectorIDsJSON") else []
     grounding_cache: dict = {}  # scoped to this call — same sector_ids for every proposal below
+    # Grounding-view proposals: same rows, but `name` stripped of the asset name
+    # (_asset_agnostic_name) so the catalogue match isn't diluted by it. Built once so the
+    # primed embedding cache and the per-proposal match below key on the same text; non-dict
+    # elements pass through to fail loud in the loop exactly as before.
+    to_ground = [{**p, "name": _asset_agnostic_name(_safe_text(p.get("name"), None),
+                                                    scenario_session["AssetName"])}
+                if isinstance(p, dict) else p for p in proposals]
     # One batched embed for every proposal's type/name text, instead of one round trip per
     # proposal inside the loop below. All the texts are already known here.
-    grounding.prime_query_embeddings(llm, proposals, grounding_cache)
-    for p in proposals:
+    grounding.prime_query_embeddings(llm, to_ground, grounding_cache)
+    for p, gp in zip(proposals, to_ground):
+        if len(rows) >= max_threats:
+            # The prompt's "at most N" (rule 1) is advisory to the model; cap ACCEPTED rows here
+            # so an over-returning reply can't buy unbounded grounding calls or Identified_Threat
+            # rows. Deliberately not a head-truncation of the raw reply: an additive round
+            # (supersede=False) skips already-covered proposals and must still reach the fresh
+            # ones further down the list to fill its batch.
+            log.warning("threats.over_proposed", session_id=sid,
+                        proposed=len(proposals), cap=max_threats)
+            break
         # This loop runs one grounding match per proposal with no LLM call in between to renew the
         # lease via _ask_ai, so a long loop could otherwise outlive its own lease and be reaped.
         if not dal.renew_lease(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
@@ -268,7 +326,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         ptype = _safe_text(p.get("type"), "")
         pcat = _safe_text(p.get("category"), "")
         pname = _safe_text(p.get("name"), None)  # ThreatName is nullable
-        gr = grounding.find_threat_in_library(sess, llm, p, sector_ids=sector_ids, cache=grounding_cache)
+        gr = grounding.find_threat_in_library(sess, llm, gp, sector_ids=sector_ids, cache=grounding_cache)
         tid = guid()
         row, summary = _build_threat_records(tid, sid, tenant, ss, ptype, pcat, pname, gr,
                                         scenario_session["EntityID"], scenario_session.get("UserID"))
@@ -319,11 +377,13 @@ def _fetch_intel(threat_type: str | None, threat_name: str | None,
                  actors: list[str] | None = None) -> list[dict] | None:
     """Current threat-intel items for one verified threat, or None. Fail-open and opt-in
     (TSG_INTEL_ENABLED): any error, disabled flag, or empty result returns None and generation
-    proceeds unchanged. OT threats prefer ICS advisories; everything else prefers exploited CVEs."""
+    proceeds unchanged. OT threats prefer ICS advisories; everything else prefers exploited
+    CVEs. When the threat has actors, one actor-matched pulse gets a reserved slot ahead of
+    the CVE matches."""
     if not get_settings().intel_enabled:
         return None
     try:
-        from app.intel.fetchers import query_intel
+        from app.intel.fetchers import PROMPT_INTEL_LIMIT, query_intel
 
         is_ot = (threat_type or "").startswith(_OT_TYPE_PREFIXES)
         prefer = ("ics_advisory", "cve") if is_ot else ("cve",)
@@ -331,8 +391,21 @@ def _fetch_intel(threat_type: str | None, threat_name: str | None,
         # Library actors are passed WHOLE (never word-split) — fetch_otx tags pulses with
         # their adversary, so "APT 29" here is what surfaces that actor's current pulses.
         terms = [w for w in re.split(r"[^A-Za-z0-9]+", f"{threat_type} {threat_name}") if w]
-        terms += [a for a in (actors or []) if a]
-        return query_intel(terms, prefer_kinds=prefer) or None
+        actor_terms = [a for a in (actors or []) if a]
+        items = query_intel(terms + actor_terms, prefer_kinds=prefer)
+        if actor_terms:
+            # Reserved pulse slot: generic threat words alone can match 5+ CVEs (KEV tags
+            # ransomware CVEs with "ransomware"), which starves the pulse kind and defeats
+            # passing actors at all. Draw ONE actor pulse separately and merge it FIRST so
+            # the cap can never cut it. backfill=False makes a non-pulse result impossible
+            # at the source — no stray-CVE fallback, and no second find spent fetching one.
+            pulses = query_intel(actor_terms, prefer_kinds=("pulse",), limit=1, backfill=False)
+            if pulses:
+                seen = {(p["source"], p["external_id"]) for p in pulses}
+                items = pulses + [i for i in items
+                                  if (i["source"], i["external_id"]) not in seen]
+                items = items[:PROMPT_INTEL_LIMIT]
+        return items or None
     except Exception:  # noqa: BLE001 — enrichment is optional, never breaks generation
         log.warning("scenario.intel_fetch_failed", exc_info=True)
         return None

@@ -124,10 +124,12 @@ class ActorType(StrEnum):
 
 
 class CandidateStatus(StrEnum):
-    """`Threat_Candidate_Review.Status` — ahead of its consumer; the curator workflow is a
-    later milestone."""
-    pending = "pending"    # no writer: accept.py inserts every row directly as `accepted`
-    accepted = "accepted"  # the ONLY value the app currently writes — set when accept.py promotes the row
+    """`Threat_Candidate_Review.Status`. The READ side (a curator queue UI/API) is still a later
+    milestone, but the write side is live: accept.py queues every AI-proposed threat NAME here
+    instead of auto-creating a Threat_Catalogue row for it, because prompts.py requires that name
+    to embed the asset's own name and so it is never library-shaped."""
+    pending = "pending"    # what accept.py writes — awaiting a curator to generalize the name
+    accepted = "accepted"  # no writer: set by the curator workflow when it lands
     rejected = "rejected"  # no writer yet (curator workflow)
 
 
@@ -156,8 +158,12 @@ class AuditEventType(StrEnum):
     threat_regrounded = "threat_regrounded"             # reserved — only `scenario` regen is implemented
     subsystem_advanced = "subsystem_advanced"           # written at the START of a subsystem's work, not on completion
     auto_fanout_review = "auto_fanout_review"           # reserved — no current producer
-    library_promoted = "library_promoted"               # on accept, once per NEW master created from an unverified threat
-    candidate_reconciled = "candidate_reconciled"       # on accept, once per Threat_Candidate_Review row closed as accepted
+    library_promoted = "library_promoted"               # on accept, once per NEW master created from an unverified
+                                                        # threat. Only Threat_Type masters now — catalogue names are
+                                                        # queued for curation instead of auto-created
+    candidate_reconciled = "candidate_reconciled"       # reserved — means "a Threat_Candidate_Review row was CLOSED as
+                                                        # accepted", which only the curator workflow can do; accept.py
+                                                        # writes those rows as `pending` and closes nothing
     session_cancelled = "session_cancelled"             # explicit cancel route, or `_mark_session_failed`'s total-failure
                                                         # path (live pipeline + reaper) — either way releases the M4 lock
     stage_error = "stage_error"                         # a stage failed after retries
@@ -167,6 +173,11 @@ class AuditEventType(StrEnum):
                                                         # from the two generation_complete rows one click can
                                                         # write (those must be SUMMED); this is the single
                                                         # authoritative summary the status board reads.
+    treatment_plan_requested = "treatment_plan_requested"  # POST .../treatment-plan accepted a request; DetailJSON
+                                                        # carries {plan_id, output_id, crm_risk_identification_id}.
+                                                        # ActorUserID set -> ActorType=user (a human clicked).
+    treatment_plan_outcome = "treatment_plan_outcome"   # the worker finished one plan attempt (COMPLETE or ERROR);
+                                                        # DetailJSON carries {plan_id, status}. ActorType=system.
 
 
 class AuditDecision(StrEnum):
@@ -264,6 +275,21 @@ class ReviewGateReason(StrEnum):
     generation_in_progress = "generation_in_progress"    # transient: not at the REVIEW barrier yet
 
 
+class TreatmentGateReason(StrEnum):
+    """Why a treatment-plan request is refused — HTTP 409 `details.reason` on
+    POST .../treatment-plan (docs/RISK_TREATMENT_PLAN_SDD.md §5.3). Produced only by
+    app/pipeline/treatment.py / app/api/treatment.py; a separate enum from ReviewGateReason
+    because treatment runs on COMPLETED sessions, after the review gate is history.
+
+    `generation_in_progress` deliberately shares its value with
+    ReviewGateReason.generation_in_progress — same meaning ("wait, then retry"), different
+    route family; clients may switch on the string without caring which gate said it."""
+    scenario_not_accepted = "scenario_not_accepted"      # only accepted scenarios get treatment plans
+    scenario_superseded = "scenario_superseded"          # target scenario was replaced by a regeneration
+    generation_in_progress = "generation_in_progress"    # a fresh RUNNING plan row exists for this scenario
+    strategy_mismatch = "strategy_mismatch"              # the CRM-stored strategy for this risk is not Mitigate
+
+
 if __name__ == "__main__":  # self-check: values must equal the DB strings verbatim
     import json  # self-check only — the module itself stays import-free beyond StrEnum
     assert SubsystemLevel.LOCK == "_LOCK"
@@ -278,6 +304,12 @@ if __name__ == "__main__":  # self-check: values must equal the DB strings verba
     assert NextSetOutcome.partial_retryable == "partial_retryable"
     assert ClickOutcomeReason.no_target_ids == "no_target_ids"   # NOT "empty_output_ids"
     assert ReviewGateReason.generation_in_progress == "generation_in_progress"
+    # Treatment-plan wire contract (docs/RISK_TREATMENT_PLAN_SDD.md §5.3 / §12 item 2).
+    assert TreatmentGateReason.strategy_mismatch == "strategy_mismatch"
+    assert TreatmentGateReason.generation_in_progress == ReviewGateReason.generation_in_progress
+    assert AuditEventType.treatment_plan_outcome == "treatment_plan_outcome"
+    # Scenario_Audit.EventType is Unicode(40) — a longer member would truncate at insert.
+    assert max(len(m.value) for m in AuditEventType) <= 40
     # Re-servability is a DATA question, not a text one. Exactly one kind may come back; the other
     # three are permanent and re-serving them is the "no new threats" wedge.
     assert RESERVABLE_REJECTIONS == (ScopingRejection.top_n_cutoff,)

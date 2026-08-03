@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
 from app.core.config import get_settings  # noqa: E402
-from app.intel import fetchers  # noqa: E402
+from app.intel import fetchers, otx  # noqa: E402
 
 DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "otx_response.json")
 
@@ -41,8 +41,13 @@ def main() -> int:
 
     print(f"GET {s.intel_otx_url}")
     try:
-        docs = fetchers.fetch_otx(s)  # the production parse path
-        raw = json.loads(fetchers._get(s.intel_otx_url, headers={"X-OTX-API-KEY": s.intel_otx_api_key}))
+        # ONE page deliberately: fetch_otx now walks pages for intel_otx_sync_seconds against
+        # a stored cursor (app/intel/otx.py), which is a several-minute job needing Mongo —
+        # not a smoke test. fetch_page is the same parse path, one request, no store.
+        docs, is_last = otx.fetch_page(s, 1)
+        raw = json.loads(fetchers._get(
+            f"{s.intel_otx_url}?limit={s.intel_otx_page_size}&page=1",
+            headers={"X-OTX-API-KEY": s.intel_otx_api_key}))
     except urllib.error.HTTPError as e:
         hint = " — key rejected, check OTX_API_KEY" if e.code in (401, 403) else ""
         print(f"FAIL: OTX returned HTTP {e.code} {e.reason}{hint}")
@@ -51,9 +56,13 @@ def main() -> int:
         print(f"FAIL: {type(e).__name__}: {e}")
         return 1
 
-    print(f"OK  fetched and parsed {len(docs)} pulses (page 1 only — fetch_otx does not paginate)")
+    print(f"OK  fetched and parsed {len(docs)} pulses from page 1 of {raw.get('count')} subscribed"
+          f"{' (this is the only page)' if is_last else ''}")
+    print("    full corpus: python scripts/backfill_otx.py (one-time) — then it self-maintains")
     for d in docs[:10]:
-        print(f"    {d['external_id']}  tags={len(d['tags']):2d}  {d['title'][:70]}")
+        pub = d.get("published_at")
+        print(f"    {d['external_id']}  tags={len(d['tags']):2d}  "
+              f"{pub.date() if pub else '----------'}  {d['title'][:60]}")
     if not docs:
         print("NOTE: 0 pulses is still a pass — subscribe to pulses/users on otx.alienvault.com "
               "for /pulses/subscribed to return results.")
@@ -66,7 +75,7 @@ def main() -> int:
         "normalized_docs": docs,      # the trimmed records TSG stores in Mongo threat_intel
     }
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
+        json.dump(out, f, indent=2, ensure_ascii=False, default=str)  # default=str: published_at is a datetime
     print(f"Saved full response -> {args.out}")
     return 0
 

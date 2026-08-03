@@ -263,12 +263,20 @@ CREATE TABLE Prompt_Log (
     Stage           nvarchar(20)  NOT NULL,
     PromptVersion   nvarchar(20)  NOT NULL,
     Messages        nvarchar(max) NOT NULL,
+    Prompt          nvarchar(max) NULL,
     ResponseText    nvarchar(max) NULL,
     Model           nvarchar(200) NULL,
     ModelVersion    nvarchar(100) NULL,
     ParseSucceeded  bit           NOT NULL,
     CreatedAt       datetime2     NOT NULL
 );
+
+-- Existing databases created before the flattened-prompt column (2026-08-03): add it in place.
+-- Nullable, so no DEFAULT and no table rewrite. Rows written before this column read NULL -- the
+-- same prompt is still recoverable from Messages, so there is nothing to backfill.
+IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Prompt_Log', 'Prompt') IS NULL
+    ALTER TABLE Prompt_Log ADD Prompt nvarchar(max) NULL;
 
 IF OBJECT_ID('dbo.Threat_Candidate_Review', 'U') IS NULL
 CREATE TABLE Threat_Candidate_Review (
@@ -286,6 +294,43 @@ CREATE TABLE Threat_Candidate_Review (
     ReviewedAt        datetime2 NULL,
     CreatedAt         datetime2 NOT NULL
 );
+
+-- The curator queue is read by (SessionID, Status), and the table had no index beyond its PK, so
+-- "list what is pending" was a full scan. Non-unique on purpose: the same proposed name may
+-- legitimately recur across sessions and each occurrence is its own curation record.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_Session_Status')
+    CREATE INDEX IX_ThreatCandidateReview_Session_Status
+        ON Threat_Candidate_Review (SessionID, Status);
+
+-- 2026-08-03: Risk Treatment Plan Generation (docs/RISK_TREATMENT_PLAN_SDD.md). One row per
+-- generation attempt against an ACCEPTED scenario; at most one active (Superseded = 0) row per
+-- OutputID, enforced by UX_TreatmentPlan_ActiveOutput in SECTION 3. Lives OUTSIDE the session
+-- state machine (accepted scenarios sit on completed sessions, where stage locks refuse to run) —
+-- the row's own Status column is the state. Reads crm_* Risk-module tables at POST time only;
+-- the frozen context goes in InputSnapshotJSON so worker and reads never touch crm_*.
+IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NULL
+CREATE TABLE Risk_Treatment_Plan (
+    PlanID                  uniqueidentifier NOT NULL CONSTRAINT PK_Risk_Treatment_Plan PRIMARY KEY,
+    SessionID               uniqueidentifier NOT NULL,
+    OutputID                uniqueidentifier NOT NULL,  -- the accepted Threat_Scenario_Output
+    TenantID                nvarchar(200) NULL,
+    EntityID                nvarchar(200) NULL,         -- copied from the session (authz boundary)
+    UserID                  nvarchar(200) NULL,         -- requesting principal (provenance)
+    CrmRiskIdentificationID int           NOT NULL,     -- crm_risk_identification.id from the request
+    TreatmentStrategy       nvarchar(30)  NOT NULL,     -- 'Mitigate' only in v1
+    Status                  nvarchar(20)  NOT NULL,     -- StageStatus subset: RUNNING | COMPLETE | ERROR
+    ActiveTaskID            nvarchar(100) NULL,         -- Celery claim / redelivery fence
+    RiskIdentificationDate  datetime2     NULL,         -- crm creation_date; never AI-generated
+    InputSnapshotJSON       nvarchar(max) NULL,         -- exact redacted context sent to the LLM
+    PlanJSON                nvarchar(max) NULL,         -- parsed LLM output
+    ValidationJSON          nvarchar(max) NULL,         -- advisory: moderation + vocabulary warnings
+    ErrorMessage            nvarchar(max) NULL,         -- client-safe only; raw text lives in Prompt_Log
+    Superseded              int           NOT NULL CONSTRAINT DF_TreatmentPlan_Superseded DEFAULT 0,
+    CreatedAt               datetime2     NULL,
+    UpdatedAt               datetime2     NULL,         -- progress clock: claim + each LLM attempt bump it
+    CompletedAt             datetime2     NULL
+);
+GO
 
 -- ============================================================
 -- SECTION 2 — Threat-library master tables. Schema only — see
@@ -479,6 +524,16 @@ CREATE INDEX IX_Session_EntityUser ON Scenario_Session(EntityID, UserID) INCLUDE
 -- UNfiltered on purpose: those routes query all three session statuses, so the existing
 -- filtered EntityID indexes (active/completed only) can't serve them.
 
+-- One active treatment plan per scenario — the concurrent-POST race arbiter (the losing INSERT
+-- hits this index and surfaces as 409 generation_in_progress). Boot-blocking via
+-- invariants.REQUIRED_INDEXES; the non-unique session index below is deliberately NOT registered
+-- there (_assert_indexes rejects non-unique entries).
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_TreatmentPlan_ActiveOutput' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
+CREATE UNIQUE INDEX UX_TreatmentPlan_ActiveOutput ON Risk_Treatment_Plan(OutputID) WHERE Superseded = 0;
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_TreatmentPlan_SessionActive' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
+CREATE INDEX IX_TreatmentPlan_SessionActive ON Risk_Treatment_Plan(SessionID) WHERE Superseded = 0;
+
 -- ============================================================
 -- SECTION 4 — Natural-key guard indexes on the threat-library masters
 -- ============================================================
@@ -546,7 +601,7 @@ SELECT 'RCSI' AS what, CAST(is_read_committed_snapshot_on AS int) AS ok FROM sys
 UNION ALL
 SELECT TABLE_NAME, 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME IN (
     'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Scoped_Threat',
-    'Threat_Scenario_Output','Threat_Scenario_Control_Map','Threat_Library_Import_Run','Scenario_Audit','Prompt_Log','Threat_Candidate_Review',
+    'Threat_Scenario_Output','Threat_Scenario_Control_Map','Threat_Library_Import_Run','Scenario_Audit','Prompt_Log','Threat_Candidate_Review','Risk_Treatment_Plan',
     'Threat_Category','Threat_Type','Threat_Catalogue','Threat_Actor','ThreatType_ThreatActor_Map')
 UNION ALL
 SELECT TABLE_NAME + '.' + COLUMN_NAME, 1 FROM INFORMATION_SCHEMA.COLUMNS

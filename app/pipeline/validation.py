@@ -92,10 +92,10 @@ def _mentions(needle: str, haystack: str) -> bool:
 
     Two refinements on the proportional vote, both to stop a same-shaped SIBLING entity matching:
     - A parenthetical/quoted short form ("Power Generation System (PGS)") is the entity's official
-      abbreviation, so a haystack naming it only as "PGS" short-circuits to True rather than being
-      diluted to 1-of-4 tokens and failing the ceil(4/3)=2 threshold.
+    abbreviation, so a haystack naming it only as "PGS" short-circuits to True rather than being
+    diluted to 1-of-4 tokens and failing the ceil(4/3)=2 threshold.
     - Every purely-numeric token MUST match exactly, not merely count as one vote — otherwise
-      "Substation Gateway 4" and "Substation Gateway 7" read as the same entity."""
+    "Substation Gateway 4" and "Substation Gateway 7" read as the same entity."""
     raw = re.findall(r"[a-z0-9]+", needle.lower())
     short_form = re.search(r"[(\"']([a-z0-9]+)[)\"']", needle.lower())
     if short_form and _references(short_form.group(1), haystack):

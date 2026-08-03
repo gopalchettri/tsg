@@ -26,7 +26,7 @@ from app.core.logging import configure_logging
 from app.db import dal
 from app.db.dal import guid
 from app.db.engine import db_session
-from app.pipeline import cascade, embeddings
+from app.pipeline import cascade, embeddings, treatment
 from app.pipeline.llm import LLMSlotUnavailable, get_llm
 from app.pipeline.reaper import clean_up_abandoned_sessions
 from app.pipeline.selfcheck import run_self_checks
@@ -184,6 +184,18 @@ def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_
             return  # deleted or never existed by the time this task ran
         cascade.run_next_set(sess, dict(session), subsystem_id, epoch, threats_epoch,
                             get_llm(), self.request.id or guid())
+
+
+@celery_app.task(bind=True, name="tsg.generate_treatment_plan",
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
+def generate_treatment_plan_task(self, plan_id: str) -> None:
+    """One Risk Treatment Plan attempt (docs/RISK_TREATMENT_PLAN_SDD.md §6.2); queued by
+    POST .../treatment-plan after the RUNNING row is committed. Same `autoretry_for` reasoning
+    as the tasks above — a retry (same task id) resumes via claim_plan's own-task branch, so
+    a slot-exhausted attempt never wedges the row. No epoch: plan rows are never reused
+    (regenerate = supersede + new row), so PlanID itself is the fence."""
+    with db_session() as sess:
+        treatment.run_treatment_generation(sess, plan_id, get_llm(), self.request.id or guid())
 
 
 @celery_app.task(name="tsg.admin_embedding_action",

@@ -42,6 +42,11 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}"),
     ("GET", "/v1/users/{user_id}/scenarios"),
     ("GET", "/v1/entities/{entity_id}/scenarios"),
+    # Treatment plans (app/api/treatment.py) — mounted only when risk_module_enabled. Entries
+    # for an unmounted router are inert (the audit walks LIVE app routes), so these stay
+    # unconditional; when the router IS mounted, missing entries would fail the boot.
+    ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan"),
+    ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan"),
 }
 
 # Routes deliberately outside the entity model, each mapped to the dependency CALLABLE whose
@@ -143,7 +148,7 @@ def _iter_audit_routes(app: FastAPI):
             # Fail closed: a route reaching app.routes some other way (a future
             # app.add_route()/app.mount() for a REAL endpoint) must not bypass this audit.
             raise StartupInvariantError(
-                f"[R2] app.routes contains an entry _iter_audit_routes doesn't recognize "
+                f"app.routes contains an entry _iter_audit_routes doesn't recognize "
                 f"(type={type(entry).__name__}, path={getattr(entry, 'path', '?')!r}) — add its "
                 "path to _FRAMEWORK_ROUTE_PATHS above if it's a known-safe framework route, or "
                 "register it as a real APIRoute/APIRouter so it can be triaged like every other "

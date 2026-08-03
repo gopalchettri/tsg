@@ -214,6 +214,35 @@ class Threat_Scenario_Control_Map(Base):
     SuggestedControl: Mapped[str | None] = mapped_column(Unicode(500))  # LLM's free-text suggestion; NULL on scenario-text fallback
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
+
+class Risk_Treatment_Plan(Base):
+    """One LLM-generated Risk Treatment Plan attempt for an ACCEPTED scenario
+    (docs/RISK_TREATMENT_PLAN_SDD.md). At most one active (Superseded=0) row per OutputID —
+    UX_TreatmentPlan_ActiveOutput is the concurrent-POST race arbiter. Deliberately OUTSIDE the
+    Subsystem_Stage_State machinery: accepted scenarios live on completed sessions, where
+    acquire_lock/claim_stage refuse to run, so this row's own Status column is the state.
+    Regenerate = supersede + new row; rows are never reused, so no GenerationEpoch."""
+    __tablename__ = "Risk_Treatment_Plan"
+    PlanID: Mapped[str] = mapped_column(GUID, primary_key=True)
+    SessionID: Mapped[str] = mapped_column(GUID)
+    OutputID: Mapped[str] = mapped_column(GUID)               # the accepted Threat_Scenario_Output
+    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
+    EntityID: Mapped[str | None] = mapped_column(Unicode(200))  # copied from the session (authz boundary)
+    UserID: Mapped[str | None] = mapped_column(Unicode(200))    # requesting principal (provenance)
+    CrmRiskIdentificationID: Mapped[int] = mapped_column(Integer)  # crm_risk_identification.id from the request
+    TreatmentStrategy: Mapped[str] = mapped_column(Unicode(30))    # 'Mitigate' only in v1
+    Status: Mapped[str] = mapped_column(Unicode(20))          # StageStatus subset: RUNNING | COMPLETE | ERROR
+    ActiveTaskID: Mapped[str | None] = mapped_column(Unicode(100))  # Celery claim / redelivery fence
+    RiskIdentificationDate: Mapped[datetime | None] = mapped_column(DateTime)  # crm creation_date; never AI-generated
+    InputSnapshotJSON: Mapped[str | None] = mapped_column(UnicodeText)  # exact redacted context sent to the LLM
+    PlanJSON: Mapped[str | None] = mapped_column(UnicodeText)
+    ValidationJSON: Mapped[str | None] = mapped_column(UnicodeText)  # advisory: moderation + vocabulary warnings
+    ErrorMessage: Mapped[str | None] = mapped_column(UnicodeText)    # client-safe only; raw text lives in Prompt_Log
+    Superseded: Mapped[int] = mapped_column(Integer, default=0)
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)  # progress clock: claim + each LLM attempt bump it
+    CompletedAt: Mapped[datetime | None] = mapped_column(DateTime)
+
 # ---------------------------------------------------------------------------
 # Threat library masters (seeded; imported, promoted on accept, or curated via
 # app/api/library_crud.py)
@@ -391,8 +420,11 @@ class Context_Field_Config(Base):
     # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
-# TSG-owned (not seeded like the masters above): one row per threat promoted into the library
-# on accept. An audit ledger of promotion events, not a pending-review queue.
+# TSG-owned (not seeded like the masters above): one row per AI-proposed threat NAME reaching
+# accept. Now genuinely a pending-review queue — accept.py writes `pending` and does NOT create a
+# Threat_Catalogue row from the name, because prompts.py requires that name to embed the asset's
+# own name and so it is never library-shaped. A curator generalizes it and creates the real entry.
+# Threat_TYPE promotion stays automatic and still writes its own `library_promoted` audit row.
 class Threat_Candidate_Review(Base):
     __tablename__ = "Threat_Candidate_Review"
     CandidateID: Mapped[str] = mapped_column(GUID, primary_key=True)
@@ -421,7 +453,10 @@ class Prompt_Log(Base):
     SubsystemID: Mapped[int] = mapped_column(Integer)
     Stage: Mapped[str] = mapped_column(Unicode(20))           # 'threats' | 'scenario'
     PromptVersion: Mapped[str] = mapped_column(Unicode(20))
-    Messages: Mapped[str] = mapped_column(UnicodeText)        # exact prompt sent (already redacted/allowlisted)
+    Messages: Mapped[str] = mapped_column(UnicodeText)        # exact prompt sent, as the wire JSON structure
+    # The same prompt flattened to one readable string. Nullable: rows written before this column
+    # existed have no value, and TSG_Core.sql never backfills row data.
+    Prompt: Mapped[str | None] = mapped_column(UnicodeText)
     ResponseText: Mapped[str | None] = mapped_column(UnicodeText)                    # raw LLM reply, including malformed ones
     Model: Mapped[str | None] = mapped_column(Unicode(200))
     ModelVersion: Mapped[str | None] = mapped_column(Unicode(100))
@@ -594,4 +629,104 @@ class ctm_scan_category(Base):
     parent_id: Mapped[int | None] = mapped_column(Integer)
     code: Mapped[str | None] = mapped_column(Unicode(100))
     name: Mapped[str | None] = mapped_column(Unicode(255))
+
+
+# ---------------------------------------------------------------------------
+# CRM Risk module (companion system, read-only — docs/RISK_TREATMENT_PLAN_SDD.md §4.3).
+# May be ABSENT when risk_module_enabled is off; when on, invariants._assert_crm_tables makes
+# their absence a boot failure, so request code never probes. Only the columns
+# treatment.load_crm_risk_context consumes are mirrored. Identifier casing follows the Risk DDD
+# v0.1 draft, which is internally inconsistent (IsDeleted vs is_deleted) — verify each
+# __tablename__/column against the live CRM DDL before enabling the flag; these mirrors are the
+# single fix point for any mismatch (SDD §14.1).
+# ---------------------------------------------------------------------------
+class group_table(Base):  # dbo.[group] — business units/entities; EntityID == str(group.id)
+    __tablename__ = "group"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str | None] = mapped_column(Unicode(255))
+
+
+class crm_risk_identification(Base):
+    __tablename__ = "crm_risk_identification"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    crm_assessment_id: Mapped[int | None] = mapped_column(Integer)
+    description: Mapped[str | None] = mapped_column(UnicodeText)      # the risk statement/description
+    crm_risk_likelihood_id: Mapped[int | None] = mapped_column(Integer)  # -> crm_risk_identification_option_value.id
+    crm_risk_impact_id: Mapped[int | None] = mapped_column(Integer)      # -> crm_risk_identification_option_value.id
+    inherent_risk_score: Mapped[float | None] = mapped_column(Float)
+    control_effectiveness_score: Mapped[float | None] = mapped_column(Float)
+    residual_risk_score: Mapped[float | None] = mapped_column(Float)
+    root_cause: Mapped[str | None] = mapped_column(UnicodeText)
+    risk_owner: Mapped[str | None] = mapped_column(Unicode(55))
+    creation_date: Mapped[datetime | None] = mapped_column(DateTime)  # -> RiskIdentificationDate (never AI-generated)
+    is_deleted: Mapped[bool | None] = mapped_column(Boolean)
+
+
+class crm_risk_identification_option_value(Base):
+    __tablename__ = "crm_risk_identification_option_value"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    label: Mapped[str | None] = mapped_column(UnicodeText)   # "High", "Critical", ...
+    value: Mapped[int | None] = mapped_column(Integer)
+    option_type: Mapped[str | None] = mapped_column(UnicodeText)  # Impact / Likelihood / ...
+
+
+class crm_assessment(Base):
+    __tablename__ = "crm_assessment"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    group_id: Mapped[int | None] = mapped_column(Integer)     # -> group.id — THE ownership column (fail closed on NULL)
+    crm_risk_rating_plan_id: Mapped[int | None] = mapped_column(Integer)  # rating plan used by _band()
+    is_deleted: Mapped[bool | None] = mapped_column(Boolean)
+
+
+class crm_risk_identification_treatment_plan(Base):
+    __tablename__ = "crm_risk_identification_treatment_plan"
+    Id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    crm_risk_identification_treatment_strategy_id: Mapped[int | None] = mapped_column(Integer)
+    crm_risk_identification_id: Mapped[int | None] = mapped_column(Integer)
+    IsDeleted: Mapped[bool | None] = mapped_column(Boolean)   # DDD casing differs from siblings on purpose
+    creation_date: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class crm_risk_identification_treatment_strategy(Base):
+    __tablename__ = "crm_risk_identification_treatment_strategy"
+    Id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    Name: Mapped[str | None] = mapped_column(UnicodeText)     # Accept / Mitigate / Transfer / Avoid
+    IsDeleted: Mapped[bool | None] = mapped_column(Boolean)
+
+
+class crm_risk_rating(Base):
+    __tablename__ = "crm_risk_rating"
+    Id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    risk_level: Mapped[str | None] = mapped_column(UnicodeText)       # band label ("Critical", "High", ...)
+    risk_score_from: Mapped[float | None] = mapped_column(Float)
+    risk_score_to: Mapped[float | None] = mapped_column(Float)
+    response_time: Mapped[int | None] = mapped_column(Integer)        # SLA fed into the prompt to ground timelines
+    remediation_time: Mapped[int | None] = mapped_column(Integer)
+    Priority: Mapped[str | None] = mapped_column(Unicode(55))
+    IsDeleted: Mapped[bool | None] = mapped_column(Boolean)
+    crm_risk_rating_category_id: Mapped[int | None] = mapped_column(Integer)  # -> crm_risk_rating_category.Id
+
+
+class crm_risk_rating_category(Base):  # links a rating band set to its rating PLAN
+    __tablename__ = "crm_risk_rating_category"
+    Id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    crm_risk_rating_plan_id: Mapped[int | None] = mapped_column(Integer)
+    crm_risk_category_id: Mapped[int | None] = mapped_column(Integer)
+    is_deleted: Mapped[bool | None] = mapped_column(Boolean)
+
+
+class crm_risk_control_details(Base):
+    __tablename__ = "crm_risk_control_details"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    crm_risk_identification_id: Mapped[int | None] = mapped_column(Integer)
+    crm_risk_control_status_id: Mapped[int | None] = mapped_column(Integer)  # -> crm_risk_control_status.id (Planned/Implemented)
+    action_plan: Mapped[str | None] = mapped_column(UnicodeText)  # the existing-control text fed to the prompt (redacted)
+    control_effectiveness_score: Mapped[float | None] = mapped_column(Float)
+    is_active: Mapped[bool | None] = mapped_column(Boolean)
+
+
+class crm_risk_control_status(Base):
+    __tablename__ = "crm_risk_control_status"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str | None] = mapped_column(UnicodeText)     # Planned / Implemented / ...
 
