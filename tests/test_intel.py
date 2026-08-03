@@ -86,8 +86,11 @@ def test_fetch_otx_parses_pulses(monkeypatch):
     # so front placement is what guarantees it survives) and inserted as the first tag
     assert docs[0]["title"] == "[Toy Ghouls] Campaign X"
     assert docs[0]["tags"][0] == "toy ghouls" and "ot" in docs[0]["tags"]
-    # no adversary → title and tags untouched
+    # ...and stored as its own field for the /items API (never re-parsed from the title)
+    assert docs[0]["adversary"] == "Toy Ghouls"
+    # no adversary → title and tags untouched, no adversary key at all
     assert docs[1]["title"] == "Campaign Y" and docs[1]["tags"] == []
+    assert "adversary" not in docs[1]
 
 
 def test_fetch_intel_includes_library_actors(monkeypatch):
@@ -184,6 +187,72 @@ def test_feeds_endpoint_lists_all_feeds(intel_client, monkeypatch):
 
 def test_feeds_endpoint_requires_admin_key(intel_client):
     assert intel_client.get("/v1/tsg/threat-intel/feeds").status_code == 401
+
+
+def test_items_endpoint_lists_stored_items(intel_client, monkeypatch):
+    """The viewer: stored docs come back as IntelItem JSON with adversary as its own
+    field. Patches the ROUTER's binding — it imports list_intel by name."""
+    import datetime as dt
+
+    import app.api.threat_intel as api
+
+    item = {"source": "otx", "kind": "pulse", "external_id": "p1",
+            "title": "[Toy Ghouls] Campaign X", "adversary": "Toy Ghouls",
+            "description": "d", "url": "https://otx.alienvault.com/pulse/p1",
+            "tags": ["toy ghouls", "ot"],
+            "fetched_at": dt.datetime(2026, 8, 3, tzinfo=dt.timezone.utc)}
+    monkeypatch.setattr(api, "list_intel", lambda source=None, limit=50, offset=0: ([item], 1))
+    r = intel_client.get("/v1/tsg/threat-intel/items?source=otx", headers={"X-Admin-Key": _KEY})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1 and body["limit"] == 50 and body["offset"] == 0
+    assert body["items"][0]["adversary"] == "Toy Ghouls"
+    assert body["items"][0]["title"].startswith("[Toy Ghouls]")
+
+
+def test_items_endpoint_unknown_source_is_404(intel_client):
+    r = intel_client.get("/v1/tsg/threat-intel/items?source=phishtank",
+                        headers={"X-Admin-Key": _KEY})
+    assert r.status_code == 404
+
+
+def test_items_endpoint_store_down_is_503(intel_client, monkeypatch):
+    """Mongo down must be a visible 503, never an empty list that reads as 'no data'."""
+    import app.api.threat_intel as api
+
+    monkeypatch.setattr(api, "list_intel", lambda **kw: None)
+    r = intel_client.get("/v1/tsg/threat-intel/items", headers={"X-Admin-Key": _KEY})
+    assert r.status_code == 503
+
+
+def test_items_endpoint_requires_admin_key(intel_client):
+    assert intel_client.get("/v1/tsg/threat-intel/items").status_code == 401
+
+
+def test_list_intel_returns_none_when_query_fails(monkeypatch):
+    """A blip DURING the query is the same 'store unavailable' as a breaker-open
+    connection — list_intel must signal None (→ 503), never leak an exception (→ 500)."""
+
+    class _BoomCol:
+        def find(self, *a, **k):
+            raise RuntimeError("connection reset mid-query")
+
+    monkeypatch.setattr(fetchers, "_store_if_healthy", lambda: _BoomCol())
+    assert fetchers.list_intel(source="otx") is None
+
+
+def test_items_endpoint_tolerates_sparse_docs(intel_client, monkeypatch):
+    """One legacy/foreign doc missing optional fields must render as a sparse row,
+    never fail response validation and 500 the whole page."""
+    import app.api.threat_intel as api
+
+    sparse = {"source": "otx", "kind": "pulse", "external_id": "p9", "title": "Old cached pulse"}
+    monkeypatch.setattr(api, "list_intel", lambda source=None, limit=50, offset=0: ([sparse], 1))
+    r = intel_client.get("/v1/tsg/threat-intel/items", headers={"X-Admin-Key": _KEY})
+    assert r.status_code == 200
+    item = r.json()["items"][0]
+    assert item["adversary"] is None and item["fetched_at"] is None
+    assert item["description"] == "" and item["tags"] == []
 
 
 def test_refresh_unknown_or_disabled_feed_is_404(intel_client, monkeypatch):

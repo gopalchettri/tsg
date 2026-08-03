@@ -17,14 +17,16 @@ principal) and cross-tenant by nature: the intel cache is shared, not entity-sco
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.api.admin_jobs import FAMILY_INTEL, mark_admin_job
 from app.api.deps import Principal, get_principal, require_admin
-from app.api.schemas import IntelFeedsResponse, IntelFeedStatus, IntelRefreshAccepted
+from app.api.schemas import (
+    IntelFeedsResponse, IntelFeedStatus, IntelItem, IntelItemsResponse, IntelRefreshAccepted,
+)
 from app.core.logging import get_logger
 from app.db.dal import NotFoundError
-from app.intel.fetchers import ALL_FEEDS, enabled_feed_names, feed_status
+from app.intel.fetchers import ALL_FEEDS, enabled_feed_names, feed_status, list_intel
 from app.pipeline.celery_app import intel_refresh_feed_task
 
 router = APIRouter(
@@ -56,6 +58,26 @@ def list_feeds(_principal: Principal = Depends(get_principal)) -> IntelFeedsResp
     can legitimately add zero items — the incremental feeds skip what they already hold —
     so judge health by `last_success_at`, not by `item_count` moving."""
     return IntelFeedsResponse(feeds=[IntelFeedStatus(**f) for f in feed_status()])
+
+
+@router.get("/items", response_model=IntelItemsResponse)
+def list_items(source: str | None = None,
+               limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
+               _principal: Principal = Depends(get_principal)) -> IntelItemsResponse:
+    """Browse the cached intel items themselves, newest first — `?source=otx` lists the
+    OTX pulses with their `adversary`, `?source=cisa_kev` the exploited CVEs,
+    `?source=cisa_ics` the OT advisories; no filter = every feed interleaved.
+
+    A down intel store is a 503, never an empty page — an empty `items` must mean the
+    cache genuinely holds nothing for the filter."""
+    if source is not None and source not in ALL_FEEDS:
+        raise NotFoundError(f"unknown intel feed: {source!r} — valid: {sorted(ALL_FEEDS)}")
+    got = list_intel(source=source, limit=limit, offset=offset)
+    if got is None:
+        raise HTTPException(status_code=503, detail="intel store unavailable")
+    items, total = got
+    return IntelItemsResponse(items=[IntelItem(**i) for i in items],
+                            total=total, limit=limit, offset=offset)
 
 
 @router.post("/feeds/refresh", response_model=IntelRefreshAccepted, status_code=202)

@@ -63,6 +63,11 @@ def _intel_store():
     # query_intel filters per kind and sorts newest-first — let each per-kind query walk
     # exactly its kind partition in sort order instead of scanning via the TTL index.
     col.create_index([("kind", 1), ("fetched_at", -1)])
+    # list_intel's per-source page (filter source, sort fetched_at desc + external_id
+    # tiebreak) — without this every /items call re-sorts in memory. The UNFILTERED
+    # listing still sorts in memory: acceptable while TTL caps the collection at a few
+    # thousand docs; add {fetched_at,external_id} if a feed ever grows past that.
+    col.create_index([("source", 1), ("fetched_at", -1), ("external_id", 1)])
     ttl_seconds = s.intel_ttl_days * 86400
     try:
         col.create_index("fetched_at", expireAfterSeconds=ttl_seconds, name="ttl_fetched_at")
@@ -204,11 +209,16 @@ def fetch_otx(s) -> list[dict]:
         adv = (p.get("adversary") or "").strip()
         title = f"[{adv}] {p.get('name', '')}" if adv else p.get("name", "")
         tags = ([adv.lower()] if adv else []) + [t for t in (p.get("tags") or [])]
-        docs.append(_doc(
+        doc = _doc(
             "otx", "pulse", p.get("id", ""), title,
             description=p.get("description", ""),
             url=f"https://otx.alienvault.com/pulse/{p.get('id', '')}",
-            tags=tags[:20], raw=None))
+            tags=tags[:20], raw=None)
+        if adv:
+            # stored as its own field for the /items API — community titles may legitimately
+            # start with [brackets], so attribution is never re-parsed out of the title
+            doc["adversary"] = adv[:200]
+        docs.append(doc)
     return docs
 
 
@@ -399,6 +409,28 @@ def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",), limi
     except Exception:  # noqa: BLE001 — enrichment is optional, never breaks generation
         log.warning("intel.query_failed", exc_info=True)
         return []
+
+
+def list_intel(source: str | None = None, limit: int = 50, offset: int = 0) -> tuple[list[dict], int] | None:
+    """Stored intel items for the admin /items API, newest first — or None when the store
+    is unavailable, so the route can report 503 (an empty list must mean 'genuinely nothing').
+
+    external_id tiebreak: one refresh stamps every doc with the SAME fetched_at, so a
+    fetched_at-only sort leaves Mongo's order for ties unstable and pages could repeat or
+    skip items between requests."""
+    col = _store_if_healthy()
+    if col is None:
+        return None
+    q = {"source": source} if source else {}
+    try:
+        items = list(col.find(q, {"_id": 0, "raw": 0})
+                     .sort([("fetched_at", -1), ("external_id", 1)]).skip(offset).limit(limit))
+        return items, col.count_documents(q)
+    except Exception:  # noqa: BLE001 — a mid-query blip is the same "store unavailable"
+        # as a breaker-open connection: the route's one 503 path must cover both, never
+        # a raw 500 with a stack trace.
+        log.warning("intel.list_failed", exc_info=True)
+        return None
 
 
 if __name__ == "__main__":

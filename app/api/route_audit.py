@@ -62,6 +62,7 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("POST", "/v1/tsg/threat-library/sources/{source}/import"): require_admin,
     ("GET", "/v1/tsg/threat-library/imports/{job_id}"): require_admin,
     ("GET", "/v1/tsg/threat-intel/feeds"): require_admin,
+    ("GET", "/v1/tsg/threat-intel/items"): require_admin,
     ("POST", "/v1/tsg/threat-intel/feeds/refresh"): require_admin,
     ("POST", "/v1/tsg/threat-intel/feeds/{feed}/refresh"): require_admin,
     # Threat-library master CRUD (routers in app/api/threat_library_crud.py; shared impl in library_crud.py). One entry PER VERB; a missing one

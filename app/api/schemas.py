@@ -850,6 +850,45 @@ class IntelRefreshAccepted(BaseModel):
     jobs: dict[str, str] = Field(description="feed name -> Celery job id for the refresh queued for it.")
 
 
+class IntelItem(BaseModel):
+    """One cached intel item (GET /v1/tsg/threat-intel/items) — a KEV CVE, an ICS
+    advisory, or an OTX pulse, in the store's normalized shape."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "source": "otx", "kind": "pulse", "external_id": "6a6c1a2b3c4d5e6f7a8b9c0d",
+                "title": "[Armored Likho] Armored Likho's new weapon: BusySnake Stealer",
+                "adversary": "Armored Likho",
+                "description": "BusySnake is a new stealer attributed to ...",
+                "url": "https://otx.alienvault.com/pulse/6a6c1a2b3c4d5e6f7a8b9c0d",
+                "tags": ["armored likho", "stealer"],
+                "fetched_at": "2026-08-03T07:44:27Z",
+            }
+        }
+    )
+
+    source: str = Field(description="Feed this item came from (cisa_kev, cisa_ics, otx, urlhaus, taxii).")
+    kind: str = Field(description="Item kind (cve, ics_advisory, pulse, ioc_url, stix).")
+    external_id: str = Field(description="The item's id in its source — CVE id, advisory code, or pulse id.")
+    title: str = Field(description="Normalized title; OTX pulses carry their adversary as a [Group] prefix.")
+    adversary: str | None = Field(default=None, description="Attributed threat actor, when the source names one (OTX pulses only). Null for feeds without attribution and for items cached before the field existed.")
+    # Read-tolerant defaults: this model validates whatever is IN the collection, not what
+    # our writers produce — one legacy/foreign doc missing a field must render as a sparse
+    # row, never fail validation and 500 the whole page.
+    description: str = Field(default="", description="Truncated source description.")
+    url: str = Field(default="", description="Link back to the item at its source.")
+    tags: list[str] = Field(default_factory=list, description="Source tags; for attributed OTX pulses the adversary is the first tag.")
+    fetched_at: datetime | None = Field(default=None, description="UTC time this item was last written by a refresh (also its TTL clock). Null only on a malformed legacy doc.")
+
+
+class IntelItemsResponse(BaseModel):
+    """One page of cached intel items, newest first."""
+    items: list[IntelItem]
+    total: int = Field(description="Total items matching the filter, across all pages.")
+    limit: int = Field(description="Page size used for this response.")
+    offset: int = Field(description="Offset used for this response.")
+
+
 class ThreatLibraryImportAccepted(BaseModel):
     """Returned immediately (202) when an import is queued — poll
     GET /v1/tsg/threat-library/imports/{job_id} for the eventual outcome."""
