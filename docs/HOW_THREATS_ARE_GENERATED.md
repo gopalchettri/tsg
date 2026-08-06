@@ -537,7 +537,20 @@ order:
 2. Only if that pool can't fill the batch, run **one** additive threat-identification round, told
    which threats are already covered so it proposes genuinely new ones.
 3. If still short, top up with **variants**: a deliberately different scenario for a threat that
-   already has one, up to `max_scenarios_per_threat` = **2**.
+   already has one — through a supporting system it has not been written about yet.
+
+How many scenarios a threat earns is **not a setting**. Each scenario records the *entry point* it
+came in through: the supporting system that carried the threat to the asset, named by the model
+from a closed list of that session's own systems and matched back to a stable id server-side. The
+first scenario also declares which entry points are *plausible* for that threat, and that
+declaration is frozen — later scenarios inherit it rather than re-declaring, so a regeneration
+cannot re-open or silently shrink the target. A threat stays eligible while a plausible entry
+point remains uncovered, so a two-system asset finishes in two scenarios and an eight-system one
+earns eight. `coverage_attempt_slack` (**2**) only bounds retries when the model keeps answering
+with an entry point that is already covered.
+
+That is why `exhausted` below is an evidenced answer rather than a counter running out: it means
+every threat has been written about through every entry point it could plausibly arrive by.
 
 The outcome is reported as one of three words, because they demand different user actions:
 `complete` (got the full batch), `partial_retryable` (short because generations *failed* — clicking
@@ -844,16 +857,16 @@ them back.
 Net effect: a regenerated scenario is prompted differently from the original, and generally with less
 information.
 
-**A2. A completed session's status board contradicts itself.**
-`complete_session` sets `CurrentStage = APPROVED` but never touches `StageStatus`
-(`app/db/dal.py:296`), so an accepted session reports `current_stage = APPROVED` alongside
-`stage_status = AWAITING_DECISION`. Its sibling `cancel_session` sets both, and its docstring names
-this exact staleness as the reason (`app/db/dal.py:307`).
+**A2. [FIXED] A completed session's status board used to contradict itself.**
+`complete_session` used to set `CurrentStage = APPROVED` without touching `StageStatus`
+(`app/db/dal.py`), so an accepted session reported `current_stage = APPROVED` alongside a stale
+`stage_status = AWAITING_DECISION`. It now also stamps `StageStatus = COMPLETE`, mirroring its
+sibling `cancel_session`, which already set both.
 
-It is invisible today only because the rollup checks `session_status == completed`
-(`app/api/sessions.py:68`) **before** it checks `scenarios == AWAITING_DECISION`
-(`app/api/sessions.py:72`). That check ordering is load-bearing and, until now, undocumented —
-reordering it would surface a completed session as "awaiting review".
+The rollup's check ordering — `session_status == completed` (`app/api/sessions.py:68`) **before**
+`scenarios == AWAITING_DECISION` (`app/api/sessions.py:72`) — is unrelated to this column (it reads
+per-subsystem `Subsystem_Stage_State.Status`, not `Scenario_Session.StageStatus`) and remains
+load-bearing regardless of this fix.
 
 **A3. The lease defaults quoted everywhere are the wrong numbers.**
 `stage_lease_seconds` reads `300` in config (`app/core/config.py:363`), but a validator overwrites it
@@ -936,8 +949,10 @@ code, and will go stale silently.
 | `control_map_top_k` | **5** | Controls kept per scenario, and the number the prompt asks for. |
 | `control_map_min_score` | *follows the match threshold* | Control matches below it are dropped. The literal `60.0` is only the default *if pinned*. |
 | `next_set_size` | **5** | Scenarios per "generate next set" click. |
-| `max_scenarios_per_threat` | **2** | Coexisting active scenarios one threat may accumulate. |
-| `coverage_exclusions_max` | **50** | Cap on the already-covered list fed to an additive round. |
+| `coverage_attempt_slack` | **2** | Extra attempts beyond a threat's own coverage target. Scenario depth itself is *derived* — one per plausible entry point — never configured. |
+| `variant_sibling_prompt_k` | **3** | How many of a threat's existing scenarios are quoted back into the variant prompt. Prompt width only, not depth. |
+| `semantic_near_duplicate_threshold` | **0.92** | Cosine at which a proposed threat is *logged* as a probable paraphrase. Observation only — nothing is rejected on it, and the value is embedding-model-specific. |
+| `coverage_exclusions_max` | **50** | Cap on the already-covered list fed to an additive round (most recent kept). |
 | `max_active_sessions` | **100** | Global concurrent-session ceiling. |
 | `max_active_sessions_per_entity` | **0** (off) | Per-organisation ceiling. |
 | `llm_timeout_seconds` | **90** | How long to wait for one AI reply. |
@@ -991,21 +1006,28 @@ Full design: [RISK_TREATMENT_PLAN_SDD.md](RISK_TREATMENT_PLAN_SDD.md). One-parag
 
 Once a scenario is **accepted** (so its session is `completed` and everything above is
 history), the toolkit can ask TSG for an AI-generated **Risk Treatment (Mitigate) Plan** for
-it: `POST /v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan` with the risk's
-`crm_risk_identification_id` from the companion CRM Risk module (same database). The POST
-validates everything synchronously — scenario accepted and not superseded, the CRM risk
-exists and belongs to the caller's entity (identical 404 otherwise, no existence oracle),
-and the CRM-stored treatment strategy does not contradict Mitigate (409 `strategy_mismatch`)
-— then freezes ALL context (asset + threat + scenario + mapped library controls + the CRM
-risk record, ratings banded per-risk via `crm_risk_rating`, every free-text value redacted)
-into `Risk_Treatment_Plan.InputSnapshotJSON`, inserts a `RUNNING` row and queues
+it: `POST /v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan` with the
+register's risk data **in the request body** — existing controls, likelihood/impact ratings
+(1-5), final risk rating (1-25), risk level (Low/Medium/High/Critical), plus optional echo
+fields (identification date, risk owner, impacted business division). TSG reads NO
+risk-module tables. The POST validates synchronously — scenario accepted and not superseded
+(409 with a typed reason otherwise), the body via Pydantic (ranges, enums) — then freezes
+ALL context (asset + threat + scenario + mapped library controls + the body's register data,
+every free-text value redacted; the strategy is server-stamped `Mitigate`, never a request
+field) into `Risk_Treatment_Plan.InputSnapshotJSON`, inserts a `RUNNING` row and queues
 `tsg.generate_treatment_plan`. The worker makes ONE LLM call through `_ask_ai` (so
-`Prompt_Log` records it, `Stage='treatment_plan'`), validates the JSON plan (vocabulary
-problems are flagged in `ValidationJSON`, never blocking), and lands `COMPLETE` — or a
-client-safe `ERROR`. The GET on the same path is the poll endpoint. Re-POST = regenerate
-(old row `Superseded=1`, history kept). Deliberately NO stage rows, locks, leases or epochs:
-`dal.acquire_lock` refuses completed sessions by design, so the plan row's own `Status`
-column plus the filtered unique index `UX_TreatmentPlan_ActiveOutput` carry all the
-concurrency safety (claim CAS for Celery redelivery, staleness takeover instead of a
-reaper). The whole feature is behind `RISK_MODULE_ENABLED` — off (default) the routes don't
-exist; on, boot verifies the `crm_*` tables are present (`invariants._assert_crm_tables`).
+`Prompt_Log` records it, `Stage='treatment_plan'`), prompting a **gap analysis**: recommended
+controls are the scenario-identified controls NOT covered by the register's existing ones
+(semantic matching; fully `covered` → empty recommendations, action plan pivots to
+verification), validates the JSON plan (vocabulary problems are flagged in `ValidationJSON`,
+never blocking), then overwrites the server-owned keys — `treatment_plan`,
+`controls_to_be_implemented` (derived), and the register echoes incl. `risk_owner`, which the
+model never sees — so the stored plan carries the toolkit's nine output columns split
+AI/derived/echo, and lands `COMPLETE` — or a client-safe `ERROR`. The GET on the same path is
+the poll endpoint. Re-POST = regenerate (old row `Superseded=1`, history kept). Deliberately
+NO stage rows, locks, leases or epochs: `dal.acquire_lock` refuses completed sessions by
+design, so the plan row's own `Status` column plus the filtered unique index
+`UX_TreatmentPlan_ActiveOutput` carry all the concurrency safety (claim CAS for Celery
+redelivery, staleness takeover instead of a reaper). The whole feature is behind
+`RISK_MODULE_ENABLED` — off (default) the routes don't exist; on, they mount, and nothing
+else is armed.

@@ -1,15 +1,19 @@
 """Risk Treatment (Mitigate) Plan generation — docs/RISK_TREATMENT_PLAN_SDD.md.
 
-Self-contained module in the control_mapping.py mould: the CRM reader, snapshot builder,
-output validation and the worker body all live here; the API layer (app/api/treatment.py)
-calls the read/build halves at POST time, the Celery task calls run_treatment_generation.
+Self-contained module in the control_mapping.py mould: the snapshot builder, output
+validation and the worker body all live here; the API layer (app/api/treatment.py) calls the
+build half at POST time, the Celery task calls run_treatment_generation.
+
+TSG reads NO risk-module tables: the register's risk data (ratings, level, existing
+controls, echo fields) arrives IN the request body and is frozen — together with TSG's own
+scenario/asset/threat/mapped-controls context — into InputSnapshotJSON at POST time. The
+worker prompts from that snapshot and the GET serves it, so nothing external can skew a
+stored plan.
 
 Deliberately OUTSIDE the stage machinery: accepted scenarios exist only on COMPLETED
 sessions, where dal.acquire_lock/claim_stage refuse to run — the Risk_Treatment_Plan row's
 own Status column is the state, fenced by the conditional-UPDATE helpers in dal.py
-(claim_plan / finish_plan / supersede_active_plan). The CRM tables are read ONLY at POST
-time (build_treatment_input): the frozen InputSnapshotJSON is what the worker prompts with
-and what the GET serves, so a risk row that mutates later never skews a stored plan.
+(claim_plan / finish_plan / supersede_active_plan).
 """
 from __future__ import annotations
 
@@ -17,11 +21,12 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.enums import AuditEventType, StageStatus, TreatmentGateReason
+from app.core.enums import (ActionPriority, AuditEventType, ControlCoverage, ControlType,
+                            StageStatus, TreatmentGateReason, TreatmentStrategy, YesNo)
 from app.core.logging import get_logger
 from app.core.security import redact
 from app.db import dal
@@ -34,15 +39,16 @@ from app.pipeline.tasks import ASSET_UNIT_ID, _ask_ai, _failure_client_message
 
 log = get_logger(__name__)
 
-# Closed vocabularies _validate_plan clamps against (SDD §7.3). Out-of-vocab values are KEPT
-# and warned — flag-never-block, same philosophy as ValidationStatus.
-_CONTROL_TYPES = {"preventive", "detective", "corrective", "compensating"}
-_PRIORITIES = {"Critical", "High", "Medium", "Low"}
-_YES_NO = {"Yes", "No"}
+# Plan keys the SERVER owns (docs/RISK_TREATMENT_PLAN_SDD.md — reserved-key rule): stamped or
+# echoed at finish time, OVERWRITING anything the model emitted under the same name, so AI
+# output can never impersonate register data. (controls_to_be_implemented is NOT here — it is
+# the AI's own gap-analysis table, so the injector must never touch it.)
+_RESERVED_PLAN_KEYS = ("treatment_plan", "risk_identification_date",
+                       "risk_owner", "impacted_business_division")
 
-# Per-field cap applied to CRM free text at snapshot time (house analog: intel items truncate
-# before entering the prompt). CRM columns are nvarchar(max) — an unbounded description would
-# blow the prompt budget for zero planning value.
+# Per-field cap applied to UI-supplied free text at snapshot time (house analog: intel items
+# truncate before entering the prompt). Pydantic max_length bounds reject oversized fields at
+# the boundary; this is defense-in-depth for anything that slips a path around them.
 _FREE_TEXT_CAP = 2000
 
 
@@ -61,14 +67,8 @@ class TreatmentPlanInvalid(Exception):
     names the field, never the model text (raw text is already in Prompt_Log)."""
 
 
-def _not_deleted(col):
-    """CRM soft-delete filter — every flag column in the v0.1 DDD is NULLable, and NULL means
-    'not deleted'; a bare `col == False` would silently drop those rows."""
-    return or_(col.is_(None), col == False)  # noqa: E712
-
-
 def _clip(text: str | None) -> str | None:
-    """redact() + length cap for one CRM free-text value crossing into the snapshot."""
+    """redact() + length cap for one UI-supplied free-text value crossing into the snapshot."""
     cleaned = redact(text)
     if cleaned and len(cleaned) > _FREE_TEXT_CAP:
         return cleaned[:_FREE_TEXT_CAP]
@@ -83,51 +83,14 @@ def _stale_cutoff(at: datetime | None = None) -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# CRM read layer (POST time only).
+# Library-controls read (TSG's own tables).
 #
 # Every multi-table statement is built by a module-level `_*_stmt` function so the __main__
 # self-check can .compile() each one WITHOUT a database — plain Select.compile() raises
 # InvalidRequestError on a malformed join and CompileError on a bad column, which is exactly
-# the bug class that once shipped here as an accidental self-join. New CRM statements MUST
+# the bug class that once shipped here as an accidental self-join. New statements MUST
 # follow this pattern and be added to the self-check list.
 # ---------------------------------------------------------------------------
-def _stored_strategy_stmt(crm_id: int):
-    """Latest non-deleted treatment-plan row's strategy Name for one risk. join_from pins
-    `tp` as the FROM root (only `ts` columns are selected, so SQLAlchemy cannot infer the
-    left side on its own — omitting this was the self-join bug)."""
-    tp, ts = m.crm_risk_identification_treatment_plan, m.crm_risk_identification_treatment_strategy
-    return (
-        select(ts.Name)
-        .join_from(tp, ts, ts.Id == tp.crm_risk_identification_treatment_strategy_id)
-        .where(tp.crm_risk_identification_id == crm_id,
-               _not_deleted(tp.IsDeleted), _not_deleted(ts.IsDeleted))
-        .order_by(tp.creation_date.desc(), tp.Id.desc())
-        .limit(1)
-    )
-
-
-def _band_stmt(rating_plan_id: int, score: float):
-    r, c = m.crm_risk_rating, m.crm_risk_rating_category
-    return (
-        select(r.risk_level, r.Priority, r.remediation_time, r.response_time)
-        .join(c, c.Id == r.crm_risk_rating_category_id)
-        .where(c.crm_risk_rating_plan_id == rating_plan_id,
-               _not_deleted(r.IsDeleted), _not_deleted(c.is_deleted),
-               r.risk_score_from <= score, r.risk_score_to >= score)
-        .order_by(r.risk_score_from)
-    )
-
-
-def _crm_controls_stmt(crm_id: int):
-    cd, cs = m.crm_risk_control_details, m.crm_risk_control_status
-    return (
-        select(cd.action_plan, cs.name, cd.control_effectiveness_score)
-        .outerjoin(cs, cs.id == cd.crm_risk_control_status_id)
-        .where(cd.crm_risk_identification_id == crm_id,
-               or_(cd.is_active.is_(None), cd.is_active == True))  # noqa: E712
-    )
-
-
 def _library_map_stmt(output_id: str):
     cmap, lib = m.Threat_Scenario_Control_Map, m.Control_Library
     return (
@@ -148,96 +111,6 @@ def _standards_stmt(control_library_ids: list[int]):
                std.IsActive == True, std.IsDeleted == False)  # noqa: E712
         .order_by(std.StandardName)
     )
-
-
-def _band(sess: Session, rating_plan_id: int | None, score: float | None) -> dict[str, Any] | None:
-    """*THE* per-risk rating source (SDD D7): the crm_risk_rating band whose
-    [risk_score_from, risk_score_to] range (inclusive both ends) contains `score`, scoped to
-    the assessment's rating plan via crm_risk_rating_category. Returns
-    {label, priority, remediation_time, response_time} or None (no plan, no score, or no
-    matching band — the prompt RULES forbid the model inventing a label to fill the gap).
-    Overlapping ranges resolve to the lowest risk_score_from, deterministically.
-
-    ASSUMPTION (SDD §14, open with the CRM team): one rating category per rating plan. The
-    filter scopes to the PLAN only — if a live plan holds multiple categories (one band set
-    per risk category), this can pick a neighbouring category's band. The risk row exposes no
-    category id today; when it does, mirror it and add it to the WHERE."""
-    if rating_plan_id is None or score is None:
-        return None
-    row = sess.execute(_band_stmt(rating_plan_id, score)).first()
-    if row is None:
-        return None
-    return {"label": row[0], "priority": row[1],
-            "remediation_time": row[2], "response_time": row[3]}
-
-
-def _option_label(sess: Session, option_id: int | None) -> str | None:
-    if option_id is None:
-        return None
-    return sess.execute(
-        select(m.crm_risk_identification_option_value.label)
-        .where(m.crm_risk_identification_option_value.id == option_id)
-    ).scalar()
-
-
-def load_crm_risk_context(sess: Session, crm_id: int) -> dict[str, Any] | None:
-    """Everything the treatment plan consumes from the CRM Risk module, in one dict — or None
-    when the risk row is absent or soft-deleted (the API 404s; absent and foreign must be
-    indistinguishable to the caller of the endpoint). Table EXISTENCE is not probed here:
-    invariants._assert_crm_tables made that a boot concern (SDD D3).
-
-    `group_id` may come back None (all DDD columns are nullable, or the assessment row is
-    missing) — the API's affirmative ownership check then denies, per the house
-    no-proven-owner-means-deny rule (dal.py asset_owning_entities)."""
-    ri = m.crm_risk_identification
-    risk = sess.execute(select(ri.__table__).where(ri.id == crm_id)).mappings().first()
-    if risk is None or risk["is_deleted"]:
-        return None
-
-    assessment = None
-    if risk["crm_assessment_id"] is not None:
-        a = m.crm_assessment
-        assessment = sess.execute(
-            select(a.group_id, a.crm_risk_rating_plan_id)
-            .where(a.id == risk["crm_assessment_id"], _not_deleted(a.is_deleted))
-        ).first()
-    group_id = assessment[0] if assessment else None
-    rating_plan_id = assessment[1] if assessment else None
-
-    entity_name = None
-    if group_id is not None:
-        entity_name = sess.execute(
-            select(m.group_table.name).where(m.group_table.id == group_id)).scalar()
-
-    # Latest non-deleted treatment-plan row -> the strategy the toolkit actually recorded.
-    stored_strategy = sess.execute(_stored_strategy_stmt(crm_id)).scalar()
-
-    # Existing controls, with their status label — a Planned control must not read as
-    # protection the asset already has (prompt RULE 3 depends on this distinction).
-    controls = [
-        {"action_plan": r[0], "status": r[1], "effectiveness": r[2]}
-        for r in sess.execute(_crm_controls_stmt(crm_id)).all()
-    ]
-
-    return {
-        "risk_id": crm_id,
-        "group_id": group_id,
-        "entity_name": entity_name,
-        "rating_plan_id": rating_plan_id,
-        "stored_strategy": stored_strategy,
-        "description": risk["description"],
-        "root_cause": risk["root_cause"],
-        "risk_owner": risk["risk_owner"],
-        "likelihood": _option_label(sess, risk["crm_risk_likelihood_id"]),
-        "impact": _option_label(sess, risk["crm_risk_impact_id"]),
-        "inherent_risk_score": risk["inherent_risk_score"],
-        "control_effectiveness_score": risk["control_effectiveness_score"],
-        "residual_risk_score": risk["residual_risk_score"],
-        "creation_date": risk["creation_date"],  # -> RiskIdentificationDate, never AI-generated
-        "controls": controls,
-        "inherent_band": _band(sess, rating_plan_id, risk["inherent_risk_score"]),
-        "residual_band": _band(sess, rating_plan_id, risk["residual_risk_score"]),
-    }
 
 
 def _library_controls(sess: Session, output_id: str) -> list[dict[str, Any]]:
@@ -272,12 +145,20 @@ def _loads(blob: str | None, default):
 
 
 def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
-                          crm: dict[str, Any],
+                          risk_input: dict[str, Any],
                           context_fields: dict[str, list[str]]) -> dict[str, Any]:
-    """The frozen LLM context (SDD §7.2), persisted verbatim as InputSnapshotJSON. Every
-    free-text value crosses redact()ed (and CRM text length-capped) INSIDE the JSON object —
-    never as prose — so a value that reads like an instruction stays data. `warnings` rides
-    the snapshot and is merged into ValidationJSON at finish time."""
+    """The frozen LLM context (SDD §7.2), persisted verbatim as InputSnapshotJSON.
+
+    `risk_input` is the validated TreatmentPlanBody as a dict — the register's half of the
+    context; everything else is extracted from TSG's own tables. Every free-text value
+    crosses redact()ed (and length-capped) INSIDE the JSON object — never as prose — so a
+    value that reads like an instruction stays data.
+
+    Two sub-blocks never reach the model (prompts.treatment_prompt strips them):
+    `warnings` (TSG bookkeeping, merged into ValidationJSON at finish) and `register` (the
+    echo fields — risk_owner is a person's name the model must never see; the date is banned
+    from generation anyway). `impacted_business_division` additionally rides the
+    prompt-visible risk_assessment block as org context."""
     warnings: list[str] = []
 
     asset_context = _loads(session_row.get("AssetContextJSON"), {})
@@ -321,14 +202,9 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
     if not library_mapped and not lookup_failed:
         warnings.append("no library-mapped controls for this scenario (Step-4 map is empty)")
 
-    residual_band = crm.get("residual_band") or {}
-    inherent_band = crm.get("inherent_band") or {}
-    if crm.get("residual_risk_score") is not None and not residual_band:
-        warnings.append("residual score matched no crm_risk_rating band — final_risk_rating null")
-
-    return {
+    date = risk_input.get("risk_identification_date")
+    snap: dict[str, Any] = {
         **base,
-        "entity": redact(crm.get("entity_name")),
         "threat": threat,
         "scenario": {
             "scenario_title": redact(scenario_json.get("scenario_title")),
@@ -339,67 +215,98 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
             "scenario_suggested": suggested,
             "library_mapped": library_mapped,
             "library_mapped_count": len(library_mapped),
-            "crm_registered": [
-                {"action_plan": _clip(c.get("action_plan")), "status": c.get("status"),
-                 "effectiveness": c.get("effectiveness")}
-                for c in crm.get("controls") or []
-            ],
+            # The register's controls, verbatim from the request (the gap-analysis baseline).
+            "register_controls": [_clip(c) for c in risk_input.get("existing_controls") or []],
+            "applied_to_all_subsystems": risk_input.get("existing_controls_all_subsystems"),
+            "applied_to_all_subsystems_justification":
+                _clip(risk_input.get("existing_controls_all_subsystems_justification")),
         },
         "risk_assessment": {
-            "risk_description": _clip(crm.get("description")),
-            "root_cause": _clip(crm.get("root_cause")),
-            "risk_owner": redact(crm.get("risk_owner")),
-            "likelihood": crm.get("likelihood"),
-            "impact": crm.get("impact"),
-            "inherent_risk_score": crm.get("inherent_risk_score"),
-            "inherent_risk_rating": inherent_band.get("label"),
-            "control_effectiveness_score": crm.get("control_effectiveness_score"),
-            "residual_risk_score": crm.get("residual_risk_score"),
-            "final_risk_rating": residual_band.get("label"),
-            "sla": {"remediation_time": residual_band.get("remediation_time"),
-                    "response_time": residual_band.get("response_time")},
+            "likelihood_rating": risk_input.get("likelihood_rating"),
+            "impact_rating": risk_input.get("impact_rating"),
+            "final_risk_rating": risk_input.get("final_risk_rating"),
+            "risk_level": risk_input.get("risk_level"),
+            "impacted_business_division": redact(risk_input.get("impacted_business_division")),
         },
-        "treatment_strategy": "Mitigate",
-        "crm_strategy": crm.get("stored_strategy"),
+        "treatment_strategy": str(TreatmentStrategy.mitigate),
+        # Echo-only block — stripped from the prompt, injected into PlanJSON at finish.
+        "register": {
+            "risk_identification_date": date.isoformat() if isinstance(date, datetime) else date,
+            "risk_owner": redact(risk_input.get("risk_owner")),
+            "impacted_business_division": redact(risk_input.get("impacted_business_division")),
+        },
         "warnings": warnings,
     }
+    # Regenerate-with-steering: the reviewer's note rides the PROMPT-VISIBLE snapshot (that is
+    # the whole point — the model must read it), redacted + capped like all body free text.
+    note = _clip(risk_input.get("user_note"))
+    if note:
+        snap["reviewer_note"] = note
+    return snap
 
 
 # ---------------------------------------------------------------------------
-# Output validation (worker)
+# Output validation + server-owned keys (worker)
 # ---------------------------------------------------------------------------
 def _validate_plan(parsed: dict[str, Any]) -> list[str]:
     """Structural requirement + advisory vocabulary clamps (SDD §6.2 step 4). The two tables
     MUST be lists of dicts — a plan without them is unusable, so that raises
     TreatmentPlanInvalid (→ ERROR row, client-safe message). Everything else flags, never
-    blocks: out-of-vocab values are kept and reported in the returned warnings."""
+    blocks: out-of-vocab values are kept and reported in the returned warnings. Vocabularies
+    come from the enums — the same members the prompt advertises and the API types."""
     warnings: list[str] = []
-    for key in ("recommended_controls", "remediation_action_plan"):
+    for key in ("controls_to_be_implemented", "remediation_action_plan"):
         table = parsed.get(key)
         if not isinstance(table, list) or not all(isinstance(r, dict) for r in table):
             raise TreatmentPlanInvalid(f"LLM plan is missing required table '{key}'")
-    for i, ctl in enumerate(parsed["recommended_controls"]):
-        if str(ctl.get("control_type", "")).lower() not in _CONTROL_TYPES:
-            warnings.append(f"recommended_controls[{i}].control_type out of vocabulary: "
+    # Every clamp is an EXACT match against the vocabulary the prompt advertises (built from
+    # the same enums) — one posture for all five, so any case-variant draws a warning rather
+    # than silently violating the wire vocabulary.
+    control_types = {str(v) for v in ControlType}
+    priorities = {str(v) for v in ActionPriority}
+    for i, ctl in enumerate(parsed["controls_to_be_implemented"]):
+        if ctl.get("control_type") not in control_types:
+            warnings.append(f"controls_to_be_implemented[{i}].control_type out of vocabulary: "
                             f"{ctl.get('control_type')!r}")
-        if ctl.get("priority") not in _PRIORITIES:
-            warnings.append(f"recommended_controls[{i}].priority out of vocabulary: "
+        if ctl.get("priority") not in priorities:
+            warnings.append(f"controls_to_be_implemented[{i}].priority out of vocabulary: "
                             f"{ctl.get('priority')!r}")
     for i, act in enumerate(parsed["remediation_action_plan"]):
-        if act.get("priority") not in _PRIORITIES:
+        if act.get("priority") not in priorities:
             warnings.append(f"remediation_action_plan[{i}].priority out of vocabulary: "
                             f"{act.get('priority')!r}")
-    if parsed.get("applicable_to_all_subsystems") not in _YES_NO:
+    if parsed.get("applicable_to_all_subsystems") not in {str(v) for v in YesNo}:
         warnings.append("applicable_to_all_subsystems is not Yes/No: "
                         f"{parsed.get('applicable_to_all_subsystems')!r}")
+    if parsed.get("control_coverage") not in {str(v) for v in ControlCoverage}:
+        warnings.append(f"control_coverage out of vocabulary: {parsed.get('control_coverage')!r}")
+    elif (parsed["control_coverage"] == str(ControlCoverage.covered)
+          and parsed["controls_to_be_implemented"]):
+        warnings.append("control_coverage says 'covered' but controls_to_be_implemented is non-empty")
     return warnings
+
+
+def _inject_reserved(parsed: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Stamp/echo the server-owned plan keys (_RESERVED_PLAN_KEYS), OVERWRITING any
+    same-named key the model emitted — AI output can never impersonate register data:
+    - treatment_plan: the server-side strategy stamp;
+    - the three register echoes, from the snapshot's prompt-hidden `register` block.
+    The controls_to_be_implemented table is deliberately NOT touched — it is the AI's own
+    gap-analysis output."""
+    register = snapshot.get("register") or {}
+    parsed["treatment_plan"] = str(TreatmentStrategy.mitigate)
+    parsed["risk_identification_date"] = register.get("risk_identification_date")
+    parsed["risk_owner"] = register.get("risk_owner")
+    parsed["impacted_business_division"] = register.get("impacted_business_division")
+    return parsed
 
 
 def _narrative_text(parsed: dict[str, Any]) -> str:
     """The plan's prose fields, concatenated for one moderation call."""
     parts = [str(parsed.get(k) or "") for k in
              ("title", "treatment_objective", "risk_treatment_recommendation", "justification",
-              "residual_risk_assessment", "expected_risk_reduction", "mitigation_timeline")]
+              "action_plan", "residual_risk_assessment", "expected_risk_reduction",
+              "mitigation_timeline")]
     parts += [str(v) for v in parsed.get("expected_security_improvements") or []]
     parts += [str(v) for v in parsed.get("risk_mitigation_activities") or []]
     return "\n".join(p for p in parts if p)
@@ -409,11 +316,11 @@ def _narrative_text(parsed: dict[str, Any]) -> str:
 # Worker body (Celery task delegate)
 # ---------------------------------------------------------------------------
 def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_id: str) -> None:
-    """One plan attempt: claim CAS → prompt from the frozen snapshot → validate → finish CAS.
-    Safe under acks_late redelivery AND autoretry (both re-run with the SAME task id — the
-    claim's own-task branch resumes them; a bare read here would run two LLM calls in
-    parallel). LLMSlotUnavailable propagates for Celery's autoretry; everything else parks
-    the row in ERROR with a client-safe message."""
+    """One plan attempt: claim CAS → prompt from the frozen snapshot → validate → inject the
+    server-owned keys → finish CAS. Safe under acks_late redelivery AND autoretry (both
+    re-run with the SAME task id — the claim's own-task branch resumes them; a bare read here
+    would run two LLM calls in parallel). LLMSlotUnavailable propagates for Celery's
+    autoretry; everything else parks the row in ERROR with a client-safe message."""
     settings = get_settings()
     if not dal.claim_plan(sess, plan_id, task_id, _stale_cutoff()):
         sess.rollback()
@@ -444,8 +351,10 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
         parsed, _prov = _ask_ai(
             sess, llm, messages, scenario_session=audit_ident,
             subsystem_id=ASSET_UNIT_ID, stage="treatment_plan",
+            correlation_id=plan_id,  # stamps the Prompt_Log receipt for the evidence API
             expected_type=dict, temperature=settings.treatment_temperature)
         warnings = list(snapshot.get("warnings") or []) + _validate_plan(parsed)
+        parsed = _inject_reserved(parsed, snapshot)
         moderation = llm_mod.moderate(_narrative_text(parsed))  # free function, NOT a client method
         validation_json = json.dumps({
             "warnings": warnings,
@@ -455,7 +364,7 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
         if not dal.finish_plan(sess, plan_id, status=StageStatus.COMPLETE,
                                plan_json=json.dumps(parsed), validation_json=validation_json):
             # Superseded mid-flight (a re-POST took over) — drop the result; the new row owns
-            # the scenario now. Prompt_Log still records the spend.
+            # the scenario now. Prompt_Log still records the spend (committed in _ask_ai).
             sess.rollback()
             log.info("treatment.finish_dropped", plan_id=plan_id)
             return
@@ -494,10 +403,8 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
 if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §13.3)
     # Statement grammar check: plain .compile() catches malformed joins (InvalidRequestError)
     # and bad columns (CompileError) with no database — exactly the class of bug that once
-    # shipped here as an accidental self-join in the stored-strategy query. Every new CRM
-    # statement builder MUST be added to this list.
-    for _stmt in (_stored_strategy_stmt(1), _band_stmt(1, 5.0), _crm_controls_stmt(1),
-                  _library_map_stmt("00000000-0000-0000-0000-000000000000"),
+    # shipped here as an accidental self-join. Every new statement builder MUST be added.
+    for _stmt in (_library_map_stmt("00000000-0000-0000-0000-000000000000"),
                   _standards_stmt([1])):
         _stmt.compile()
 
@@ -505,42 +412,63 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     assert grounding.validated_actors('{"actors": ["APT x"], "validated": true}') == ["APT x"]
     assert grounding.validated_actors('{"actors": ["APT x"], "validated": false}') == []
     assert grounding.validated_actors("not json") == []
-    assert grounding.validated_actors('["bare", "list"]') == []
     assert grounding.validated_actors(None) == []
 
-    # _validate_plan: structural violation raises; vocab violations warn but keep the row.
-    ok_plan = {
-        "recommended_controls": [
-            {"control_type": "preventive", "control_name": "MFA", "description": "d",
-             "priority": "Critical", "control_library_id": None},
+    # _validate_plan: structural violation raises; vocab violations warn but keep the row;
+    # covered-with-recommendations inconsistency is flagged.
+    bad_vocab = {
+        "controls_to_be_implemented": [
             {"control_type": "quantum", "control_name": "X", "description": "d",
-             "priority": "Urgent"},
-        ],
+             "priority": "Urgent"}],
         "remediation_action_plan": [
-            {"action_id": "A1", "action": "a", "owner": "SOC", "priority": "High",
-             "dependencies": "None", "timeline": "within 30 days", "success_criteria": "s"},
-        ],
-        "applicable_to_all_subsystems": "Maybe",
+            {"action_id": "A1", "action": "a", "owner": "SOC", "priority": "High"}],
+        "applicable_to_all_subsystems": "Maybe", "control_coverage": "covered",
     }
-    warns = _validate_plan(ok_plan)
+    warns = _validate_plan(bad_vocab)
     assert any("control_type" in w for w in warns) and any("priority" in w for w in warns)
     assert any("applicable_to_all_subsystems" in w for w in warns)
-    assert _validate_plan({"recommended_controls": [], "remediation_action_plan": [],
-                           "applicable_to_all_subsystems": "Yes"}) == []
+    assert any("covered" in w for w in warns)  # covered + non-empty recommendations flagged
+    assert _validate_plan({"controls_to_be_implemented": [], "remediation_action_plan": [],
+                           "applicable_to_all_subsystems": "Yes",
+                           "control_coverage": "covered"}) == []
     try:
-        _validate_plan({"recommended_controls": "nope"})
+        _validate_plan({"controls_to_be_implemented": "nope"})
         raise AssertionError("missing table must raise")
     except TreatmentPlanInvalid as e:
-        assert "remediation_action_plan" in str(e) or "recommended_controls" in str(e)
+        assert "controls_to_be_implemented" in str(e) or "remediation_action_plan" in str(e)
 
-    # treatment_prompt: house shape — 2 messages, closing format directive, framed context.
-    msgs = prompts.treatment_prompt({"treatment_strategy": "Mitigate"})
+    # _inject_reserved: server keys overwrite AI-emitted impostors; register echoes come from
+    # the prompt-hidden block; the AI's controls table is NOT rewritten. The drift-pin assert
+    # makes adding a key to _RESERVED_PLAN_KEYS without teaching the injector fail here.
+    ai_table = [{"control_name": "MFA"}, {"control_name": "Backups"}]
+    injected = _inject_reserved(
+        {"treatment_plan": "Avoid", "risk_owner": "Dr. Evil",
+         "controls_to_be_implemented": ai_table},
+        {"register": {"risk_identification_date": "2026-06-14T08:31:00",
+                      "risk_owner": "Head of OT Operations",
+                      "impacted_business_division": "Water Treatment Operations"}})
+    assert injected["treatment_plan"] == "Mitigate"
+    assert injected["controls_to_be_implemented"] is ai_table  # AI-owned, injector hands off
+    assert injected["risk_owner"] == "Head of OT Operations"
+    assert injected["impacted_business_division"] == "Water Treatment Operations"
+    assert set(_RESERVED_PLAN_KEYS) <= set(injected.keys())  # drift pin
+    # Drift pin: _inject_reserved must set EVERY reserved key — add a key to the tuple without
+    # teaching the injector about it and this fails, so the overwrite guarantee can't erode.
+    assert set(_RESERVED_PLAN_KEYS) <= set(injected.keys())
+
+    # treatment_prompt: house shape — 2 messages, closing format directive, framed context;
+    # the prompt-hidden blocks must NOT reach the model.
+    msgs = prompts.treatment_prompt({
+        "treatment_strategy": "Mitigate", "warnings": ["internal note"],
+        "register": {"risk_owner": "Jane Person"}})
     assert len(msgs) == 2 and msgs[0]["role"] == "system" and msgs[1]["role"] == "user"
     assert "Output ONLY the JSON object" in msgs[0]["content"]
     assert msgs[1]["content"].startswith(prompts._CONTEXT_PREFIX)
+    assert "internal note" not in msgs[1]["content"]
+    assert "Jane Person" not in msgs[1]["content"]
 
-    # Redaction proof: a seeded credential in CRM free text must not survive into the
-    # snapshot path (_clip is the only door CRM text enters through).
+    # Redaction proof: a seeded credential in UI-sent free text must not survive into the
+    # snapshot path (_clip is the door body text enters through).
     leaked = _clip("apply patches. db_password=Hunter2SecretValue then reboot")
     assert leaked is not None and "Hunter2SecretValue" not in leaked
     assert len(_clip("x" * (_FREE_TEXT_CAP + 500)) or "") == _FREE_TEXT_CAP

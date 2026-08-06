@@ -1,7 +1,7 @@
-"""AuthN/AuthZ + model-boundary input handling (SDD §10).
+"""AuthN/AuthZ + model-boundary input handling.
 
 Resource server only: we VALIDATE the platform/SSO JWT (signature + exp/iss/aud)
-and read its claims — we never issue tokens (§10.1). The set of entities the
+and read its claims — we never issue tokens. The set of entities the
 caller may act on comes from the JWT `entities[]` claim; a missing/empty
 set is a hard deny, never allow-all.
 
@@ -103,7 +103,7 @@ _SECRET_PATTERNS = [
         r"(?i)\b(?:api[_-]?key|key|(?:\w+[_-])?(?:secret|password|passwd|token))\b"
         r"\s*(?:=\s*\S+|:\s*.+)"
     ),
-    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),        # AWS access key id (near-zero false positives)
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),        # access key id (near-zero false positives)
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),                 # long hex (keys/hashes)
     re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),         # email (PII)
 ]
@@ -135,7 +135,7 @@ def _redact_value(val: Any) -> Any:
 
 
 def allowlist_context(fields: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
-    """Build model context from ONLY the named allowlisted fields (§10.3);
+    """Build model context from ONLY the named allowlisted fields;
     redact string values recursively (nested lists/dicts included). Anything
     not on the allowlist never reaches the model.
 

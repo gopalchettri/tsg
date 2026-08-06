@@ -75,6 +75,23 @@ IF OBJECT_ID('dbo.Control_Library_Standard_Map', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Control_Library_Standard_Map', 'CreatedAt') IS NULL
     ALTER TABLE Control_Library_Standard_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_ControlStdMap_CreatedAt DEFAULT SYSUTCDATETIME();
 
+-- Threat_Scenario_Control_Map (Step-4 threat->control mapping): moved here from
+-- scripts/TSG_Core.sql on 2026-08-04 so it lives next to the Control_Library it
+-- references (still no physical FK, matching this DB's no-FK convention). This
+-- script runs after TSG_Core.sql in the install order, so Threat_Scenario_Output
+-- already exists by the time this CREATE runs.
+IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NULL
+CREATE TABLE Threat_Scenario_Control_Map (
+    OutputID          uniqueidentifier NOT NULL,
+    ControlLibraryID  int           NOT NULL,
+    SessionID         uniqueidentifier NOT NULL,
+    MapRank           int           NOT NULL,   -- 1 = best match for this scenario
+    Score             float         NULL,       -- raw rerank 0-100
+    SuggestedControl  nvarchar(500) NULL,       -- the LLM's free-text suggestion this grounded from (NULL on scenario-text fallback)
+    CreatedAt         datetime2     NULL,
+    CONSTRAINT PK_Threat_Scenario_Control_Map PRIMARY KEY (OutputID, ControlLibraryID)
+);
+
 -- ---------------------------------------------------------------------------
 -- In-place migration for databases created before the above. Every step is guarded, so this
 -- block is a no-op on a fresh database and safe to re-run on an old one. The CREATEs are
@@ -127,7 +144,9 @@ SELECT 'Control_Standard' AS what, OBJECT_ID('dbo.Control_Standard', 'U') AS exi
 UNION ALL
 SELECT 'Control_Library', OBJECT_ID('dbo.Control_Library', 'U')
 UNION ALL
-SELECT 'Control_Library_Standard_Map', OBJECT_ID('dbo.Control_Library_Standard_Map', 'U');
+SELECT 'Control_Library_Standard_Map', OBJECT_ID('dbo.Control_Library_Standard_Map', 'U')
+UNION ALL
+SELECT 'Threat_Scenario_Control_Map', OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U');
 
 -- ============================================================================
 -- 2026-07-30 in-place migration for databases created before the fixes above.

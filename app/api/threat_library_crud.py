@@ -12,7 +12,14 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Path, Request
 
 from app.api.deps import Principal, get_principal, require_admin
-from app.api.library_crud import _DELETED, _LIMIT, _OFFSET, _create, _delete, _list, _update
+from app.api.library_crud import (
+    _DELETED, _LIMIT, _OFFSET, _RESOURCES, _audit, _create, _delete, _list, _row_out, _update,
+)
+from app.core.logging import get_logger
+from app.db import dal
+from app.db.engine import db_session
+
+log = get_logger(__name__)
 from app.api.schemas import (
     ThreatActorCreate, ThreatActorRow, ThreatActorUpdate,
     ThreatCatalogueCreate, ThreatCatalogueRow, ThreatCatalogueUpdate,
@@ -63,19 +70,73 @@ def list_threat_types(limit: int = _LIMIT, offset: int = _OFFSET, include_delete
     return _list("threat-types", limit, offset, include_deleted)
 
 
+def _link_actor_names(type_id: int, names: list[str], user_id: str | None) -> None:
+    """Admin-supplied actor names for a threat type: reuse the existing row when the name
+    already exists (case-insensitive, via the unique index's collation), create when genuinely
+    new — admin supply is the DELIBERATE way the actor vocabulary grows, unlike the AI
+    promotion path, which is resolve-only. Idempotent per name (upsert + race-safe link), so
+    calling it again with the same names — including via the PATCH repair path below — never
+    duplicates a row or a link. Runs in its own transaction after the CRUD commit: a link
+    failure must not roll back an already-created family."""
+    with db_session() as sess:
+        for name in dict.fromkeys(n.strip() for n in names if n and n.strip()):
+            dal.link_type_actor(sess, type_id,
+                                dal.upsert_threat_actor(sess, name, created_by=user_id))
+
+
+def _link_actor_names_best_effort(type_id: int, names: list[str], user_id: str | None) -> None:
+    """The family row is already COMMITTED when this runs, so a transient link failure must
+    degrade, not 500 the request — a 500 here left an actor-less family behind with no repair
+    route. Logs type_id + the names so the failure is operable; repair = PATCH the same
+    actor_names (additive, idempotent)."""
+    try:
+        _link_actor_names(type_id, names, user_id)
+    except Exception:
+        log.warning("threat_type.actor_link_failed", type_id=type_id, actor_names=names,
+                    note="family committed; re-send the names via PATCH /threat-types/{id} "
+                        "to repair the links", exc_info=True)
+
+
+def _threat_type_row(type_id: int) -> dict:
+    """One family row shaped like the CRUD responses — for the actors-only PATCH, which has
+    no column update to return a row from."""
+    res = _RESOURCES["threat-types"]
+    with db_session() as sess:
+        return _row_out("threat-types", dal.get_library_row(sess, res["model"], res["pk"], type_id))
+
+
 @router.post("/threat-types", response_model=ThreatTypeRow, status_code=201, tags=["Threat Types Admin"])
 def create_threat_type(body: ThreatTypeCreate, request: Request,
                     principal: Principal = Depends(get_principal)):
-    """Create a family. Returns `embeddings_job_id` — poll it on `/embeddings/status/{job_id}`
-    to know when the AI can match the new name."""
-    return _create("threat-types", body, principal, request)
+    """Create a family, linking any supplied `actor_names` to it. Returns
+    `embeddings_job_id` — poll it on `/embeddings/status/{job_id}` to know when the AI can
+    match the new name."""
+    row = _create("threat-types", body, principal, request)
+    if body.actor_names:
+        _link_actor_names_best_effort(row["threat_type_id"], body.actor_names, principal.user_id)
+    return row
 
 
 @router.patch("/threat-types/{threat_type_id}", response_model=ThreatTypeRow, tags=["Threat Types Admin"])
 def update_threat_type(body: ThreatTypeUpdate, request: Request, threat_type_id: int = Path(ge=1),
                     principal: Principal = Depends(get_principal)):
-    """Partial update. A rename re-embeds the row and returns the new job's id."""
-    return _update("threat-types", threat_type_id, body, principal, request)
+    """Partial update. A rename re-embeds the row and returns the new job's id.
+    `actor_names` links ADDITIVELY (idempotent) — the repair path for a create whose actor
+    linking failed after the family committed; existing links are never removed here."""
+    sent = body.model_dump(exclude_unset=True)
+    actor_names = sent.pop("actor_names", None)
+    if sent:  # _to_columns drops actor_names, so column updates behave exactly as before
+        row = _update("threat-types", threat_type_id, body, principal, request)
+    else:  # actors-only PATCH: nothing to update — fetch the row (404s on a missing id)
+        row = _threat_type_row(threat_type_id)
+    if actor_names:
+        _link_actor_names(threat_type_id, actor_names, principal.user_id)
+        # Audited on BOTH paths, and as its own action: linking actors mutates the shared
+        # library, so it owes the same forensic trail every other CRUD mutation writes —
+        # _update's "update" record names no actors, and the actors-only path calls no _update
+        # at all, so without this a library change would land with nothing in the trail.
+        _audit(request, "threat-types", "link-actors", threat_type_id, principal)
+    return row
 
 
 @router.delete("/threat-types/{threat_type_id}", response_model=ThreatTypeRow, tags=["Threat Types Admin"])

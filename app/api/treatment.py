@@ -1,28 +1,34 @@
 """Risk Treatment Plan routes — docs/RISK_TREATMENT_PLAN_SDD.md §5/§6.1.
 
 Mounted by app/main.py ONLY when settings.risk_module_enabled (flag off → these paths 404 by
-absence, zero handler code; the matching crm_* boot invariant lives in app/db/invariants.py).
+absence, zero handler code; the flag arms nothing else — no external tables are required).
 Both routes are registered in app/api/route_audit.py::_ENTITY_SCOPED_ROUTES — registry entries
 for an unmounted router are inert, but a mounted route missing from the registry fails boot.
 
-POST reads the CRM Risk-module tables ONCE, freezes the redacted context into
-InputSnapshotJSON, inserts the RUNNING plan row and enqueues; the GET on the same path is the
-poll endpoint (no separate job-status route). The filtered unique index
-UX_TreatmentPlan_ActiveOutput — not any SELECT — is the concurrent-POST arbiter.
+POST takes the register's risk data IN the request body (TSG reads NO risk-module tables),
+freezes it with TSG's own scenario/asset context into InputSnapshotJSON, inserts the RUNNING
+plan row and enqueues; the GET on the same path is the poll endpoint (no separate job-status
+route). The filtered unique index UX_TreatmentPlan_ActiveOutput — not any SELECT — is the
+concurrent-POST arbiter.
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import Principal, get_principal
-from app.api.schemas import (ErrorResponse, TreatmentPlanAccepted, TreatmentPlanBody,
-                             TreatmentPlanStatus)
+from app.api.schemas import (ErrorResponse, TreatmentAuditEvent, TreatmentAuditTrail,
+                             TreatmentBoard, TreatmentBoardRow, TreatmentCancelResponse,
+                             TreatmentEntityAuditPage, TreatmentEvidence,
+                             TreatmentEvidenceAttempt, TreatmentPlanAccepted,
+                             TreatmentPlanBody, TreatmentPlanStatus, TreatmentRegisterPage,
+                             TreatmentRegisterRow, TreatmentReviewBody,
+                             TreatmentReviewResponse)
 from app.api.sessions import get_authorized_session
-from app.core.enums import AuditEventType, StageStatus, TreatmentGateReason
+from app.core.enums import AuditEventType, StageStatus, TreatmentGateReason, TreatmentStrategy
 from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
@@ -56,15 +62,17 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
 
     Re-POST semantics: COMPLETE/ERROR plan → superseded and regenerated; fresh RUNNING plan →
     409 generation_in_progress; stale RUNNING plan (progress clock older than
-    treatment_stale_seconds) → taken over. All CRM reads happen HERE — the worker and the GET
-    only ever see the frozen snapshot."""
+    treatment_stale_seconds) → taken over. The register's risk data arrives IN the body (TSG
+    reads no risk-module tables); everything is frozen into the snapshot HERE — the worker
+    and the GET only ever see that snapshot."""
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
 
         # Full session row + curator allowlists — the board load behind get_authorized_session
         # deliberately omits the AssetContextJSON/SubsystemsJSON blobs the snapshot needs.
         session_row = dal.load_session(sess, session_id)
-        assert session_row is not None  # board load above already 404'd; same PK, same txn
+        if session_row is None:  # unreachable (board load above 404'd; same PK, same txn) —
+            raise dal.NotFoundError("session not found")  # but assert would vanish under -O
         context_fields = dal.active_context_fields_by_group(sess)
 
         scn = dal.scenario_row(sess, session_id, output_id)
@@ -79,25 +87,10 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
                 "treatment plans are generated for accepted scenarios only",
                 reason=TreatmentGateReason.scenario_not_accepted)
 
-        crm = treatment.load_crm_risk_context(sess, body.crm_risk_identification_id)
-        # Affirmative ownership only — absent, soft-deleted, NULL owner and foreign owner all
-        # return the IDENTICAL 404: a client-supplied id must not become an existence oracle
-        # (house rule: no proven owner = deny, dal.asset_owning_entities).
-        if (crm is None or crm["group_id"] is None
-                or str(crm["group_id"]) != scenario_session["EntityID"]):
-            raise dal.NotFoundError("risk record not found")
-        # NOTE (SDD §14.3): asset↔risk correlation via crm_assessment_asset is an open item —
-        # the table has no column-level definition in the Risk DDD v0.1. Until it lands, the
-        # risk is entity-correlated only.
-        stored = (crm.get("stored_strategy") or "").strip()
-        if stored and stored.lower() != "mitigate":
-            raise treatment.TreatmentConflict(
-                f"the risk register records treatment strategy '{stored}' for this risk — "
-                "a Mitigate plan would contradict it",
-                reason=TreatmentGateReason.strategy_mismatch)
-
+        # The register's half of the context is the validated body — no external reads. The
+        # session-entity check above (get_authorized_session) is THE authorization boundary.
         snapshot = treatment.build_treatment_input(
-            sess, dict(session_row), dict(scn), crm, context_fields)
+            sess, dict(session_row), dict(scn), body.model_dump(mode="json"), context_fields)
 
         plan_id = dal.guid()
         stale_cutoff = treatment._stale_cutoff()
@@ -107,10 +100,11 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
                 "PlanID": plan_id, "SessionID": session_id, "OutputID": scn["OutputID"],
                 "TenantID": session_row["TenantID"], "EntityID": session_row["EntityID"],
                 "UserID": principal.user_id,
-                "CrmRiskIdentificationID": body.crm_risk_identification_id,
-                "TreatmentStrategy": body.treatment_strategy,
+                "CrmRiskIdentificationID": None,  # reserved — no register lookup in this design
+                "TreatmentStrategy": str(TreatmentStrategy.mitigate),  # server stamp, not a body field
+                "RiskLevel": str(body.risk_level),  # denormalized for the register's SQL filter
                 "Status": str(StageStatus.RUNNING), "ActiveTaskID": None,
-                "RiskIdentificationDate": crm.get("creation_date"),
+                "RiskIdentificationDate": body.risk_identification_date,
                 "InputSnapshotJSON": json.dumps(snapshot, default=str),
                 "Superseded": 0, "CreatedAt": dal.now(), "UpdatedAt": dal.now(),
             })
@@ -128,7 +122,8 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
             SubsystemID=ASSET_UNIT_ID, EventType=AuditEventType.treatment_plan_requested,
             ActorUserID=principal.user_id,
             DetailJSON=json.dumps({"plan_id": plan_id, "output_id": scn["OutputID"],
-                                   "crm_risk_identification_id": body.crm_risk_identification_id}))
+                                   **({"note": treatment._clip(body.user_note)}
+                                      if body.user_note else {})}))
 
     # Enqueue OUTSIDE the db_session block (Pattern A). A failed enqueue must not wedge the
     # OutputID behind the staleness window: park the committed RUNNING row in ERROR, re-raise
@@ -158,12 +153,7 @@ def get_treatment_plan(session_id: str, output_id: str,
         if row is None:
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
 
-        status = row["Status"]
-        error_message = row["ErrorMessage"]
-        if status == str(StageStatus.RUNNING):
-            updated = row["UpdatedAt"]
-            if updated is not None and _naive_utc(updated) < _naive_utc(treatment._stale_cutoff()):
-                status, error_message = str(StageStatus.ERROR), _TIMED_OUT_MESSAGE
+        status, error_message = _present_status(row["Status"], row["ErrorMessage"], row["UpdatedAt"])
 
         plan = _safe_json_dict(row["PlanJSON"], row["PlanID"])
         validation = _safe_json_dict(row["ValidationJSON"], row["PlanID"]) or {}
@@ -171,7 +161,9 @@ def get_treatment_plan(session_id: str, output_id: str,
         return TreatmentPlanStatus(
             plan_id=row["PlanID"], session_id=row["SessionID"], output_id=row["OutputID"],
             status=status, treatment_strategy=row["TreatmentStrategy"],
-            crm_risk_identification_id=row["CrmRiskIdentificationID"],
+            risk_level=row["RiskLevel"], review_status=row["ReviewStatus"],
+            review_comment=row["ReviewComment"], reviewed_by=row["ReviewedBy"],
+            reviewed_at=row["ReviewedAt"],
             risk_identification_date=row["RiskIdentificationDate"],
             plan=plan,
             warnings=[w for w in validation.get("warnings") or [] if isinstance(w, str)],
@@ -194,6 +186,236 @@ def _safe_json_dict(blob: str | None, plan_id: str) -> dict | None:
 
 
 def _naive_utc(dt: datetime) -> datetime:
-    """MSSQL datetime2 comes back naive while dal.now() is aware — strip tzinfo on both sides
-    so the staleness comparison never raises on the mismatch."""
-    return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    """Normalize to naive UTC. MSSQL datetime2 stores naive-UTC wall time and pyodbc silently
+    drops tzinfo on bind (the documented reason TreatmentPlanBody._utc_naive exists), so an
+    aware value must be CONVERTED to UTC before the offset is stripped — a bare
+    replace(tzinfo=None) on a +05:30 timestamp would shift every comparison by 5.5 hours.
+    Naive input is trusted as UTC already (that is what the DB hands back)."""
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+
+def _present_status(status: str, error_message: str | None,
+                    updated_at: datetime | None) -> tuple[str, str | None]:
+    """Read-time staleness projection shared by the single-plan GET, the board and the
+    register: a RUNNING row whose progress clock stopped past treatment_stale_seconds
+    presents as ERROR/timed-out; the stored row is never rewritten (D10 — the next POST
+    supersedes it, and a late finish still lands)."""
+    if status == str(StageStatus.RUNNING) and updated_at is not None \
+            and _naive_utc(updated_at) < _naive_utc(treatment._stale_cutoff()):
+        return str(StageStatus.ERROR), _TIMED_OUT_MESSAGE
+    return status, error_message
+
+
+def _scenario_title(scenario_json: str | None) -> str | None:
+    """Display title from a ScenarioJSON blob — defensive, a corrupt blob yields None."""
+    return (_safe_json_dict(scenario_json, "-") or {}).get("scenario_title")
+
+
+_CANCELLED_MESSAGE = "cancelled by user"
+
+#: Wire labels for the audit feeds — short verbs, not internal enum names.
+_EVENT_LABELS = {
+    str(AuditEventType.treatment_plan_requested): "requested",
+    str(AuditEventType.treatment_plan_outcome): "outcome",
+    str(AuditEventType.treatment_plan_cancelled): "cancelled",
+    str(AuditEventType.treatment_plan_reviewed): "reviewed",
+}
+
+
+@router.get("/sessions/{session_id}/treatment-plans", response_model=TreatmentBoard)
+def get_treatment_board(session_id: str,
+                        principal: Principal = Depends(get_principal)) -> TreatmentBoard:
+    """The session plan board — every ACCEPTED scenario's plan state in one call (replaces N
+    per-scenario polls). Null plan fields = never requested (UI shows Generate)."""
+    with db_session() as sess:
+        get_authorized_session(sess, session_id, principal)
+        rows = dal.session_plan_board(sess, session_id)
+        plans = []
+        for r in rows:
+            status: str | None = None
+            err: str | None = None
+            if r["PlanID"] is not None:
+                status, err = _present_status(r["Status"], r["ErrorMessage"], r["PlanUpdatedAt"])
+            plans.append(TreatmentBoardRow(
+                output_id=r["OutputID"], scenario_title=_scenario_title(r["ScenarioJSON"]),
+                plan_id=r["PlanID"], status=status, risk_level=r["RiskLevel"],
+                review_status=r["ReviewStatus"], error_message=err,
+                created_at=r["PlanCreatedAt"], completed_at=r["PlanCompletedAt"]))
+    return TreatmentBoard(session_id=session_id, accepted_scenarios=len(rows), plans=plans)
+
+
+@router.post("/sessions/{session_id}/scenarios/{output_id}/treatment-plan/cancel",
+             response_model=TreatmentCancelResponse, responses=_CONFLICT_RESPONSES)
+def post_cancel_treatment_plan(session_id: str, output_id: str,
+                               principal: Principal = Depends(get_principal)) -> TreatmentCancelResponse:
+    """The stop button: flip a RUNNING generation to ERROR right now, instead of waiting out
+    the staleness window after a mistaken click. Fenced by finish_plan's CAS — if the worker
+    finished first (or nothing is running), 409 not_in_progress and nothing changes."""
+    with db_session() as sess:
+        get_authorized_session(sess, session_id, principal)
+        row = dal.active_plan_row(sess, session_id, output_id)
+        if row is None:
+            raise dal.NotFoundError("no treatment plan has been requested for this scenario")
+        if row["Status"] != str(StageStatus.RUNNING) or not dal.finish_plan(
+                sess, row["PlanID"], status=StageStatus.ERROR, error_message=_CANCELLED_MESSAGE):
+            raise treatment.TreatmentConflict(
+                "no generation is in progress for this scenario",
+                reason=TreatmentGateReason.not_in_progress)
+        dal.append_audit(
+            sess, AuditID=dal.guid(), SessionID=session_id, TenantID=row["TenantID"],
+            EntityID=row["EntityID"], SubsystemID=ASSET_UNIT_ID,
+            EventType=AuditEventType.treatment_plan_cancelled, ActorUserID=principal.user_id,
+            DetailJSON=json.dumps({"plan_id": row["PlanID"]}))
+    log.info("treatment.cancelled", plan_id=row["PlanID"], user=principal.user_id)
+    return TreatmentCancelResponse(plan_id=row["PlanID"], status=str(StageStatus.ERROR),
+                                   error_message=_CANCELLED_MESSAGE)
+
+
+@router.post("/sessions/{session_id}/scenarios/{output_id}/treatment-plan/review",
+             response_model=TreatmentReviewResponse, responses=_CONFLICT_RESPONSES)
+def post_review_treatment_plan(session_id: str, output_id: str, body: TreatmentReviewBody,
+                               principal: Principal = Depends(get_principal)) -> TreatmentReviewResponse:
+    """Record the human adoption decision on the ACTIVE, COMPLETE plan. The reviewer's
+    identity comes from the login token (never the body); a re-review overwrites (latest
+    wins); regenerating supersedes the row, so a new version always starts unreviewed."""
+    # Reviewer free text is redacted+capped like every other client string that lands in a
+    # persistent store (user_note precedent) — a pasted secret must not reach ReviewComment
+    # or the compliance feed's DetailJSON. One timestamp, naive UTC: stored AND echoed, so
+    # the POST receipt matches the next GET byte-for-byte (wire convention: no offset).
+    comment = treatment._clip(body.comment)
+    reviewed_at = _naive_utc(dal.now())
+    with db_session() as sess:
+        get_authorized_session(sess, session_id, principal)
+        row = dal.active_plan_row(sess, session_id, output_id)
+        if row is None:
+            raise dal.NotFoundError("no treatment plan has been requested for this scenario")
+        if not dal.review_plan(sess, row["PlanID"], status=str(body.decision),
+                               comment=comment, reviewer=principal.user_id,
+                               reviewed_at=reviewed_at):
+            raise treatment.TreatmentConflict(
+                "only a COMPLETE plan can be reviewed — wait for generation to finish, or "
+                "regenerate first", reason=TreatmentGateReason.not_complete)
+        dal.append_audit(
+            sess, AuditID=dal.guid(), SessionID=session_id, TenantID=row["TenantID"],
+            EntityID=row["EntityID"], SubsystemID=ASSET_UNIT_ID,
+            EventType=AuditEventType.treatment_plan_reviewed, ActorUserID=principal.user_id,
+            DetailJSON=json.dumps({"plan_id": row["PlanID"], "decision": str(body.decision),
+                                   **({"comment": comment} if comment else {})}))
+    log.info("treatment.reviewed", plan_id=row["PlanID"], decision=str(body.decision),
+             user=principal.user_id)
+    return TreatmentReviewResponse(plan_id=row["PlanID"], review_status=str(body.decision),
+                                   reviewed_by=principal.user_id, reviewed_at=reviewed_at)
+
+
+@router.get("/entities/{entity_id}/treatment-plans", response_model=TreatmentRegisterPage)
+def list_entity_treatment_plans(entity_id: str,
+                                status: str | None = Query(None, description="RUNNING | COMPLETE | ERROR"),
+                                review_status: str | None = Query(None, description="approved | changes_requested"),
+                                risk_level: str | None = Query(None, description="Low | Medium | High | Critical"),
+                                limit: int = Query(100, ge=1, le=500),
+                                offset: int = Query(0, ge=0),
+                                principal: Principal = Depends(get_principal)) -> TreatmentRegisterPage:
+    """The entity-wide remediation register: every active plan across all the entity's
+    assets, newest first, filterable. THE page for 'which Critical risks still have no
+    approved plan?'."""
+    principal.require_entity(entity_id)
+    with db_session() as sess:
+        # Same cutoff instant for the SQL filter and the row presentation — the filter must
+        # match what _present_status will show (a timed-out plan IS an ERROR to the operator).
+        rows = dal.entity_plan_rows(sess, entity_id, stale_cutoff=treatment._stale_cutoff(),
+                                    status=status, review_status=review_status,
+                                    risk_level=risk_level, limit=limit, offset=offset)
+        items = []
+        for r in rows:
+            st, err = _present_status(r["Status"], r["ErrorMessage"], r["UpdatedAt"])
+            items.append(TreatmentRegisterRow(
+                plan_id=r["PlanID"], session_id=r["SessionID"], output_id=r["OutputID"],
+                asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
+                status=st, risk_level=r["RiskLevel"], review_status=r["ReviewStatus"],
+                reviewed_by=r["ReviewedBy"], error_message=err,
+                created_at=r["CreatedAt"], completed_at=r["CompletedAt"]))
+    return TreatmentRegisterPage(entity_id=entity_id, limit=limit, offset=offset, plans=items)
+
+
+@router.get("/sessions/{session_id}/scenarios/{output_id}/treatment-plan/audit",
+            response_model=TreatmentAuditTrail)
+def get_treatment_plan_audit(session_id: str, output_id: str,
+                             principal: Principal = Depends(get_principal)) -> TreatmentAuditTrail:
+    """One scenario's plan life story across ALL versions, oldest first: requested (by whom),
+    each attempt's outcome, cancels, reviews — plus synthesized 'superseded' entries from the
+    never-deleted version chain."""
+    with db_session() as sess:
+        get_authorized_session(sess, session_id, principal)
+        history = dal.plan_history_rows(sess, session_id, output_id)
+        if not history:
+            raise dal.NotFoundError("no treatment plan has been requested for this scenario")
+        plan_ids = {r["PlanID"] for r in history}
+        events = []
+        for a in dal.treatment_audit_rows(sess, session_id):
+            detail = _safe_json_dict(a["DetailJSON"], "-") or {}
+            if detail.get("plan_id") in plan_ids:
+                events.append(TreatmentAuditEvent(
+                    at=a["CreatedAt"], event=_EVENT_LABELS.get(a["EventType"], a["EventType"]),
+                    actor=a["ActorUserID"], actor_type=a["ActorType"], detail=detail))
+        for r in history:
+            if r["Superseded"]:
+                events.append(TreatmentAuditEvent(
+                    at=r["UpdatedAt"], event="superseded", detail={"plan_id": r["PlanID"]}))
+        events.sort(key=lambda e: (e.at is None, e.at))
+    return TreatmentAuditTrail(session_id=session_id, output_id=output_id, events=events)
+
+
+@router.get("/entities/{entity_id}/treatment-plans/audit",
+            response_model=TreatmentEntityAuditPage)
+def list_entity_treatment_audit(entity_id: str,
+                                since: datetime | None = Query(None, alias="from"),
+                                until: datetime | None = Query(None, alias="to"),
+                                user_id: str | None = Query(None, description="Filter to one actor"),
+                                limit: int = Query(200, ge=1, le=1000),
+                                offset: int = Query(0, ge=0),
+                                principal: Principal = Depends(get_principal)) -> TreatmentEntityAuditPage:
+    """The compliance feed: every treatment-plan action across the entity, newest first —
+    'all treatment-plan activity in July' as one request instead of a database ticket."""
+    principal.require_entity(entity_id)
+    with db_session() as sess:
+        # from/to may arrive with any UTC offset — normalize to naive UTC before binding
+        # against the naive-UTC CreatedAt column (same rule as the body's date validator).
+        rows = dal.entity_treatment_audit_rows(
+            sess, entity_id, since=_naive_utc(since) if since else None,
+            until=_naive_utc(until) if until else None,
+            actor=user_id, limit=limit, offset=offset)
+        events = [TreatmentAuditEvent(
+            at=r["CreatedAt"], event=_EVENT_LABELS.get(r["EventType"], r["EventType"]),
+            actor=r["ActorUserID"], actor_type=r["ActorType"], session_id=r["SessionID"],
+            detail=_safe_json_dict(r["DetailJSON"], "-") or {}) for r in rows]
+    return TreatmentEntityAuditPage(entity_id=entity_id, limit=limit, offset=offset,
+                                    events=events)
+
+
+@router.get("/sessions/{session_id}/scenarios/{output_id}/treatment-plan/evidence",
+            response_model=TreatmentEvidence)
+def get_treatment_plan_evidence(session_id: str, output_id: str,
+                                version: str = Query(..., description="The plan_id of the version to inspect (superseded versions allowed)."),
+                                principal: Principal = Depends(get_principal)) -> TreatmentEvidence:
+    """The reproducibility bundle for ONE plan version: the frozen input snapshot (exactly
+    what the AI was given), the validation/moderation record, and every AI-call receipt —
+    joined by Prompt_Log.CorrelationID, byte-for-byte, even for versions replaced long ago.
+
+    `status` is the STORED value, deliberately unprojected (no staleness rewrite): evidence
+    reports the record as written — a stale RUNNING plan reads RUNNING here even while the
+    poll GET presents it as timed out."""
+    with db_session() as sess:
+        get_authorized_session(sess, session_id, principal)
+        row = dal.plan_row_by_id(sess, session_id, output_id, version)
+        if row is None:
+            raise dal.NotFoundError("no such plan version for this scenario")
+        attempts = [TreatmentEvidenceAttempt(
+            at=r["CreatedAt"], prompt=r["Prompt"], response=r["ResponseText"],
+            model_name=r["Model"], model_version=r["ModelVersion"],
+            prompt_version=r["PromptVersion"], parse_succeeded=r["ParseSucceeded"])
+            for r in dal.prompt_logs_for_plan(sess, row["PlanID"])]
+    return TreatmentEvidence(
+        plan_id=row["PlanID"], status=row["Status"],
+        input_snapshot=_safe_json_dict(row["InputSnapshotJSON"], row["PlanID"]),
+        validation=_safe_json_dict(row["ValidationJSON"], row["PlanID"]),
+        attempts=attempts)

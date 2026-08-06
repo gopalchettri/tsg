@@ -236,7 +236,7 @@ def get_vectors(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: s
 
 
 def get_matrix(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: str,
-               kind: str = "passage") -> tuple[Any, list[int]] | None:
+            kind: str = "passage") -> tuple[Any, list[int]] | None:
     """Pre-normalized similarity matrix over `texts`, cached per (model, group, kind).
 
     Returns (matrix, row_indexes) — rows are L2-normalized float32 vectors and row_indexes[i] is

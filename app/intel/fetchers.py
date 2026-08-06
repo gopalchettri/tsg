@@ -42,10 +42,11 @@ _breaker_open_until = 0.0
 # for analysts/future use but stay out of the LLM context.
 PROMPT_KINDS = ("cve", "ics_advisory", "pulse")
 
-# Single source of truth for how many intel items may enter one prompt: query_intel's
-# default limit, tasks._fetch_intel's merge cap, and prompts._intel_block's slice all
-# use it — one knob, so the three sites can never drift apart.
-PROMPT_INTEL_LIMIT = 5
+# How many intel items may enter one prompt lives in config (Settings.prompt_intel_limit,
+# session-tunable via Config_Tuning). ONE site owns the cap — tasks._fetch_intel — and passes
+# it explicitly as query_intel's `limit`; prompts._intel_block renders what it is given. No
+# module constant: a def-time default froze the value at import, and a second slice in prompts
+# silently min-capped any raised limit back to the old default.
 
 # Every feed this module knows how to fetch, in report order. The status API reports ALL
 # of them — not just the enabled ones — so "switched off" is visibly different from
@@ -419,7 +420,7 @@ def feed_status() -> list[dict[str, Any]]:
 
 
 def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",),
-                limit: int = PROMPT_INTEL_LIMIT, backfill: bool = True) -> list[dict]:
+                limit: int | None = None, backfill: bool = True) -> list[dict]:
     """Top current intel items whose title/tags match any term (case-insensitive).
     Fail-open: Mongo down or no matches → empty list. Only PROMPT_KINDS are
     returned — IOC feeds never reach the LLM context.
@@ -437,9 +438,15 @@ def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",),
 
     `backfill=False` draws ONLY prefer_kinds — the reserved-slot draw in
     tasks._fetch_intel uses it so a no-pulse match returns empty instead of spending a
-    second find on a fallback kind the caller would have to discard."""
+    second find on a fallback kind the caller would have to discard.
+
+    `limit=None` resolves from config AT CALL TIME (never a def-time default, which would
+    freeze the value at import and ignore any session-tuned override the caller carries)."""
+    s = get_settings()
+    if limit is None:
+        limit = s.prompt_intel_limit
     col = _store_if_healthy()
-    terms = [t for t in terms if t and len(t) >= 4]
+    terms = [t for t in terms if t and len(t) >= s.intel_min_term_length]
     if col is None or not terms:
         return []
     try:

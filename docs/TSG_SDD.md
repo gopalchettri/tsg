@@ -37,7 +37,7 @@ TSG produces **reviewed, library-grounded cyber threat scenarios for critical in
 5. **Generates a scenario narrative per selected threat** (title, scenario statement, risk statement, suggested controls), then **maps the suggested controls to the curated control library**.
 6. **Stops at a human review barrier.** An analyst accepts all, some, or none of the scenarios. Nothing becomes final without a person deciding.
 7. **Feeds accepted knowledge back into the library**: unverified threat *types* are auto-promoted; proposed threat *names* are queued for curator review.
-8. Optionally (feature-flagged), generates an LLM-drafted **risk treatment plan** for an accepted scenario linked to a CRM risk.
+8. Optionally (feature-flagged), generates an LLM-drafted **risk treatment plan** for an accepted scenario, from the register risk data the client sends in the request body.
 
 The product goal: give analysts a defensible, explainable starting point — every scenario traceable to the exact context the model saw, the library entry it matched (or didn't), the score that ranked it, and the human decision that approved it.
 
@@ -47,7 +47,7 @@ The product goal: give analysts a defensible, explainable starting point — eve
 |---|---|
 | **Analyst** (entity-scoped user) | Creates sessions, watches progress (SSE/polling), reviews and accepts scenarios, regenerates, requests next sets and treatment plans. |
 | **Curator / Administrator** (shared admin key) | Maintains the threat and control libraries, scoping rules, and the prompt-context allowlist; imports open-source libraries; manages embeddings and intel feeds. |
-| **Platform** | Supplies identity (JWT), asset/entity onboarding data, and (optionally) the CRM risk register that treatment plans consume. |
+| **Platform** | Supplies identity (JWT) and asset/entity onboarding data. (The risk register data treatment plans consume arrives in the request body — TSG reads no risk-module tables.) |
 | **Scheduler (Celery beat)** | Reaps stuck sessions, runs operational self-checks, refreshes threat-intel feeds daily. |
 
 ### 2.3 Technology stack
@@ -120,7 +120,7 @@ flowchart LR
 Both processes refuse to start unless the environment is provably safe (`app/main.py`, `app/pipeline/celery_app.py::_init_worker`):
 
 1. **Security posture** — in `staging`/`prod` (without the explicit dev-mode opt-in), JWT issuer, audience, and a key source must be configured, or boot fails with the missing names.
-2. **Database invariants** (`app/db/invariants.py`) — required unique indexes exist with the right columns, tenant-key columns are NOT NULL, no duplicate active rows exist, **RCSI (read-committed snapshot isolation) is ON**, filtered-index literals still match the status enum, and (when the risk module is enabled) the CRM tables exist. A failure raises `StartupInvariantError`: *refusing to start is the point*, because each guard protects an invariant whose silent loss is worse than downtime.
+2. **Database invariants** (`app/db/invariants.py`) — required unique indexes exist with the right columns, tenant-key columns are NOT NULL, no duplicate active rows exist, **RCSI (read-committed snapshot isolation) is ON**, and filtered-index literals still match the status enum. A failure raises `StartupInvariantError`: *refusing to start is the point*, because each guard protects an invariant whose silent loss is worse than downtime.
 3. **Route audit** (`app/api/route_audit.py`) — every registered route must be either registered as entity-scoped (and provably depend on `get_principal`) or explicitly exempted with the dependency its exemption cites. An unknown route, or an exemption that is "now a lie", fails the boot instead of shipping an IDOR.
 4. **Worker extras** — fail-fast if started on a prefork pool (the gevent monkey-patch makes forking unsafe), verify the chat provider actually answers, verify the embedding model returns the configured dimension count, and resolve (or calibrate) the grounding threshold (§9.5).
 
@@ -383,7 +383,7 @@ Everything is resolved once per call: base context, scoping over **all** threats
 
 For each selected threat, `scenario_prompt` (one chat call per threat) produces `scenario_title`, `scenario_statement` (1–3 sentences citing the threat by name: reach, compromise, CIA impact), `risk_statement` (tied to the asset and its critical service when one exists), up to 5 suggested `controls` (`{name, why}`), plus `assumptions` and `excluded_details`. The prompt's most important rule counters hallucination directly: *"if the context is too thin to be specific, one short sentence saying so plainly IS a valid, complete value — never invent specifics."* An actor clause adapts three ways (no actor → don't invent one; one → ground in its tactics; several → what they share, never a composite). Per-threat content is placed **last** in the prompt so inference-server prefix caching can reuse everything before it across the batch.
 
-**Variants:** when the next-set pool runs dry, `variant_scenario_prompt` can add a *meaningfully different* scenario for an already-covered threat (different attack path, entry point, or consequence — never a paraphrase), bounded by `max_scenarios_per_threat` (2). It wraps `scenario_prompt` rather than forking it, so every guardrail stays byte-identical; siblings are shown to the model, and a difflib similarity ≥ 0.85 against a sibling only *warns* (advisory, the scenario is kept). Variants commit per item and deliberately write **no** failure card on error — an error card would squat on the variant's scenario number and block every retry.
+**Variants:** when the next-set pool runs dry, `variant_scenario_prompt` can add a *meaningfully different* scenario for an already-covered threat (different attack path, entry point, or consequence — never a paraphrase), bounded by *coverage*, not by a constant: a threat stays eligible while one of its plausible entry points — the supporting systems the model judged could credibly carry it to the asset, declared once by its first scenario and inherited by every later one — still has no scenario (`dal.variant_eligible_primaries`; `coverage_attempt_slack` only bounds retries on an entry point already covered). It wraps `scenario_prompt` rather than forking it, so every guardrail stays byte-identical; the `variant_sibling_prompt_k` most recent siblings are shown to the model, and a difflib similarity ≥ 0.85 — against a sibling, or against another *threat's* active scenario in the same session — only *warns* (advisory, the scenario is kept). Variants commit per item and deliberately write **no** failure card on error — an error card would squat on the variant's scenario number and block every retry.
 
 ### 8.4 Control mapping (Step 4, the mandatory tail)
 
@@ -494,11 +494,11 @@ erDiagram
 
 **Governance.** `Scenario_Audit` (append-only ledger), `Prompt_Log` (every LLM call verbatim), `Threat_Candidate_Review` (pending curator queue), `Threat_Library_Import_Run` (import history that outlives Celery results; a failed run's terminal row commits in its own transaction so failure always leaves a trace).
 
-**Read-only mirrors.** Platform onboarding/scan tables (asset context and the asset→entity ownership link `ctm_scan_entity_bu.group_id`), and — behind the risk-module flag — the `crm_*` risk-register tables, mirrored only to the columns treatment reads, casing kept deliberately faithful to the CRM DDD draft.
+**Read-only mirrors.** Platform onboarding/scan tables (asset context and the asset→entity ownership link `ctm_scan_entity_bu.group_id`). No risk-module mirrors exist: treatment plans take the register's risk data from the request body, not from other modules' tables.
 
 ### 10.3 Treatment plans
 
-`Risk_Treatment_Plan` sits deliberately **outside** the stage machinery: accepted scenarios live on completed sessions where locks refuse to operate, so the row's own status (RUNNING/COMPLETE/ERROR) is the state machine. `InputSnapshotJSON` freezes the entire redacted CRM + scenario context at POST time (the worker and GET never re-read CRM tables, so a mutating risk row can never skew a stored plan). Concurrency needs no epochs: the filtered unique index `UX_TreatmentPlan_ActiveOutput (OutputID) WHERE Superseded=0` is the arbiter — the losing concurrent POST hits it and surfaces as `409 generation_in_progress`. There is no reaper for plans; a RUNNING row whose progress clock (`UpdatedAt`, bumped per attempt — staleness measures *no progress*, not wall time) has gone stale is **presented** as ERROR at read time and taken over by the next POST.
+`Risk_Treatment_Plan` sits deliberately **outside** the stage machinery: accepted scenarios live on completed sessions where locks refuse to operate, so the row's own status (RUNNING/COMPLETE/ERROR) is the state machine. `InputSnapshotJSON` freezes the entire redacted context at POST time — the request body's register risk data plus TSG's own scenario/asset/mapped-controls context (the worker and GET only ever see that snapshot, so nothing external can skew a stored plan). Concurrency needs no epochs: the filtered unique index `UX_TreatmentPlan_ActiveOutput (OutputID) WHERE Superseded=0` is the arbiter — the losing concurrent POST hits it and surfaces as `409 generation_in_progress`. There is no reaper for plans; a RUNNING row whose progress clock (`UpdatedAt`, bumped per attempt — staleness measures *no progress*, not wall time) has gone stale is **presented** as ERROR at read time and taken over by the next POST.
 
 ### 10.4 Unique indexes as business rules
 

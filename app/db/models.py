@@ -71,6 +71,9 @@ class Scenario_Session(Base):
     IdempotencyKey: Mapped[str | None] = mapped_column(Unicode(200))
     SectorIDsJSON: Mapped[str | None] = mapped_column(UnicodeText)
     AssetContextJSON: Mapped[str | None] = mapped_column(UnicodeText)
+    # The session's frozen tuning rulebook (core.tuning.resolve_snapshot), written once at
+    # creation. NULL = pre-feature session: workers resolve from config instead.
+    TuningJSON: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CompletedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -114,6 +117,10 @@ class Identified_Threat(Base):
     ThreatCategory: Mapped[str] = mapped_column(Unicode(200))
     ThreatType: Mapped[str] = mapped_column(Unicode(300))
     ThreatName: Mapped[str | None] = mapped_column(Unicode(500))
+    # ThreatName's library-shaped form (no asset/product names) — the AI's own generalization,
+    # validated server-side. Persisted at Stage 1 because accept-time triage runs days later;
+    # NULL on legacy rows, where triage falls back to the string-strip.
+    GenericName: Mapped[str | None] = mapped_column(Unicode(500))
     ThreatActorsJSON: Mapped[str | None] = mapped_column(UnicodeText)
     LibraryThreatType: Mapped[str | None] = mapped_column(Unicode(300))
     LibraryThreatName: Mapped[str | None] = mapped_column(Unicode(500))
@@ -141,6 +148,9 @@ class Scoped_Threat(Base):
     # ScopingRejection, or NULL when Selected=1. The machine-readable twin of Reason: next-set
     # re-servability branches on THIS, so rewording Reason can never change behaviour.
     RejectionKind: Mapped[str | None] = mapped_column(Unicode(30))
+    # SelectionReason, or NULL when Selected=0 (and on rows written before the column existed —
+    # readers must treat NULL as "unknown", never re-derive it from Reason prose).
+    SelectionKind: Mapped[str | None] = mapped_column(Unicode(30))
     FactorsJSON: Mapped[str | None] = mapped_column(UnicodeText)
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -163,8 +173,9 @@ class Threat_Scenario_Output(Base):
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
     IdentityHash: Mapped[str | None] = mapped_column(Unicode(64))     #sha256(SessionID|SubsystemID|dedup_key) — dedup_key = cat:/type:/txt: (tasks._dedup_key); UX_Scenario_ActiveIdentity blocks a 2nd active row per (key, ScenarioNumber)
     # Which of the threat's coexisting scenarios this is: 1 = the original, 2+ = alternates
-    # ("generate next set" variant fallback). Cap enforced ONLY by dal.variant_eligible_primaries
-    # against settings.max_scenarios_per_threat — no other code path assigns a number.
+    # ("generate next set" variant fallback). How many a threat accumulates is NOT capped by a
+    # setting: dal.variant_eligible_primaries derives it from that threat's own plausible entry
+    # points — no other code path assigns a number.
     ScenarioNumber: Mapped[int] = mapped_column(Integer, default=1)
     # The OutputID this row replaced; NULL for first-run, next-set and variant rows. Backward-
     # linked, so following it yields the revision chain. Stamped from what the supersede actually
@@ -229,7 +240,7 @@ class Risk_Treatment_Plan(Base):
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))  # copied from the session (authz boundary)
     UserID: Mapped[str | None] = mapped_column(Unicode(200))    # requesting principal (provenance)
-    CrmRiskIdentificationID: Mapped[int] = mapped_column(Integer)  # crm_risk_identification.id from the request
+    CrmRiskIdentificationID: Mapped[int | None] = mapped_column(Integer)  # reserved; unused — the register sends risk data in the request body, no lookup
     TreatmentStrategy: Mapped[str] = mapped_column(Unicode(30))    # 'Mitigate' only in v1
     Status: Mapped[str] = mapped_column(Unicode(20))          # StageStatus subset: RUNNING | COMPLETE | ERROR
     ActiveTaskID: Mapped[str | None] = mapped_column(Unicode(100))  # Celery claim / redelivery fence
@@ -242,6 +253,11 @@ class Risk_Treatment_Plan(Base):
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)  # progress clock: claim + each LLM attempt bump it
     CompletedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    RiskLevel: Mapped[str | None] = mapped_column(Unicode(10))    # register risk level from the request (filterable)
+    ReviewStatus: Mapped[str | None] = mapped_column(Unicode(20))  # TreatmentReviewStatus; NULL = not reviewed
+    ReviewComment: Mapped[str | None] = mapped_column(UnicodeText)
+    ReviewedBy: Mapped[str | None] = mapped_column(Unicode(200))  # from the reviewer's login token
+    ReviewedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 # ---------------------------------------------------------------------------
 # Threat library masters (seeded; imported, promoted on accept, or curated via
@@ -282,8 +298,9 @@ class Threat_Type(Base):
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
     # Provenance: 'functional_team_excel' (curated) | 'ai_auto_promoted' | an import tag
-    # (threat_library_import.SOURCE_TAGS) | 'manual' (CRUD API). Added by
-    # scripts/Threat_library.sql, not this table's CREATE — see test_schema_sync's
+    # (threat_library_import.SOURCE_TAGS) | 'manual' (CRUD API). Added by a separate ALTER
+    # further down scripts/Threat_library.sql, not this table's own CREATE block (which also
+    # lives there, moved from scripts/TSG_Core.sql 2026-08-04) — see test_schema_sync's
     # _COLUMN_DEPLOYED_SEPARATELY.
     Source: Mapped[str | None] = mapped_column(Unicode(50))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -316,8 +333,9 @@ class Threat_Actor(Base):
     IsCapable: Mapped[int] = mapped_column(Integer, default=1)
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
-    # Same provenance vocabulary as Threat_Type.Source, but declared in TSG_Core.sql's CREATE
-    # block — so unlike the other two it needs no _COLUMN_DEPLOYED_SEPARATELY entry.
+    # Same provenance vocabulary as Threat_Type.Source, but declared directly in this table's own
+    # CREATE block in scripts/Threat_library.sql (moved from scripts/TSG_Core.sql 2026-08-04) —
+    # so unlike the other two it needs no _COLUMN_DEPLOYED_SEPARATELY entry.
     Source: Mapped[str | None] = mapped_column(Unicode(50))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
@@ -405,6 +423,27 @@ class Config_Threat_Rule(Base):
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class Config_Tuning(Base):
+    """Business-calibration overrides, editable at runtime (admin/DBA insert; no restart).
+    An active row overrides the matching Settings field for every session created AFTER the
+    edit — never a running one, which keeps its Scenario_Session.TuningJSON snapshot. Only
+    keys in core.tuning.TUNABLE_KEYS have effect; unknown keys are skipped with a warning.
+    EmbeddingModel names the model an embedding-coupled value was tuned on — on mismatch with
+    the running model the row is skipped (config default applies)."""
+    __tablename__ = "Config_Tuning"
+    TuningID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    TuningKey: Mapped[str] = mapped_column(Unicode(100), unique=True)
+    TuningValue: Mapped[str] = mapped_column(Unicode(100))
+    ValueType: Mapped[str] = mapped_column(Unicode(10))  # 'float' | 'int'
+    EmbeddingModel: Mapped[str | None] = mapped_column(Unicode(200))
+    CreateDate: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    UpdateDate: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
+    IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class Context_Field_Config(Base):
     """Which asset/subsystem fields are currently turned on for the AI prompt (see
     scripts/Threat_library.sql). This table is the SOLE source of that allowlist — prompts.py
@@ -434,6 +473,9 @@ class Threat_Candidate_Review(Base):
     ProposedCategory: Mapped[str] = mapped_column(Unicode(200))
     ProposedType: Mapped[str] = mapped_column(Unicode(300))
     ProposedName: Mapped[str] = mapped_column(Unicode(500))
+    # The candidate's library-shaped name — what the curator actually generalizes toward.
+    # NULL on rows queued before the column existed.
+    ProposedGenericName: Mapped[str | None] = mapped_column(Unicode(500))
     Status: Mapped[str] = mapped_column(Unicode(20))
     ThreatTypeID: Mapped[int | None] = mapped_column(Integer)
     ThreatCatalogueID: Mapped[int | None] = mapped_column(Integer)
@@ -462,6 +504,8 @@ class Prompt_Log(Base):
     ModelVersion: Mapped[str | None] = mapped_column(Unicode(100))
     ParseSucceeded: Mapped[bool] = mapped_column(Boolean)
     CreatedAt: Mapped[datetime] = mapped_column(DateTime)
+    # Per-item id of the work this call served (treatment: PlanID) — the audit/evidence join.
+    CorrelationID: Mapped[str | None] = mapped_column(GUID)
 
 # ---------------------------------------------------------------------------
 # Audit (append-only)
@@ -629,104 +673,4 @@ class ctm_scan_category(Base):
     parent_id: Mapped[int | None] = mapped_column(Integer)
     code: Mapped[str | None] = mapped_column(Unicode(100))
     name: Mapped[str | None] = mapped_column(Unicode(255))
-
-
-# ---------------------------------------------------------------------------
-# CRM Risk module (companion system, read-only — docs/RISK_TREATMENT_PLAN_SDD.md §4.3).
-# May be ABSENT when risk_module_enabled is off; when on, invariants._assert_crm_tables makes
-# their absence a boot failure, so request code never probes. Only the columns
-# treatment.load_crm_risk_context consumes are mirrored. Identifier casing follows the Risk DDD
-# v0.1 draft, which is internally inconsistent (IsDeleted vs is_deleted) — verify each
-# __tablename__/column against the live CRM DDL before enabling the flag; these mirrors are the
-# single fix point for any mismatch (SDD §14.1).
-# ---------------------------------------------------------------------------
-class group_table(Base):  # dbo.[group] — business units/entities; EntityID == str(group.id)
-    __tablename__ = "group"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str | None] = mapped_column(Unicode(255))
-
-
-class crm_risk_identification(Base):
-    __tablename__ = "crm_risk_identification"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    crm_assessment_id: Mapped[int | None] = mapped_column(Integer)
-    description: Mapped[str | None] = mapped_column(UnicodeText)      # the risk statement/description
-    crm_risk_likelihood_id: Mapped[int | None] = mapped_column(Integer)  # -> crm_risk_identification_option_value.id
-    crm_risk_impact_id: Mapped[int | None] = mapped_column(Integer)      # -> crm_risk_identification_option_value.id
-    inherent_risk_score: Mapped[float | None] = mapped_column(Float)
-    control_effectiveness_score: Mapped[float | None] = mapped_column(Float)
-    residual_risk_score: Mapped[float | None] = mapped_column(Float)
-    root_cause: Mapped[str | None] = mapped_column(UnicodeText)
-    risk_owner: Mapped[str | None] = mapped_column(Unicode(55))
-    creation_date: Mapped[datetime | None] = mapped_column(DateTime)  # -> RiskIdentificationDate (never AI-generated)
-    is_deleted: Mapped[bool | None] = mapped_column(Boolean)
-
-
-class crm_risk_identification_option_value(Base):
-    __tablename__ = "crm_risk_identification_option_value"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    label: Mapped[str | None] = mapped_column(UnicodeText)   # "High", "Critical", ...
-    value: Mapped[int | None] = mapped_column(Integer)
-    option_type: Mapped[str | None] = mapped_column(UnicodeText)  # Impact / Likelihood / ...
-
-
-class crm_assessment(Base):
-    __tablename__ = "crm_assessment"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    group_id: Mapped[int | None] = mapped_column(Integer)     # -> group.id — THE ownership column (fail closed on NULL)
-    crm_risk_rating_plan_id: Mapped[int | None] = mapped_column(Integer)  # rating plan used by _band()
-    is_deleted: Mapped[bool | None] = mapped_column(Boolean)
-
-
-class crm_risk_identification_treatment_plan(Base):
-    __tablename__ = "crm_risk_identification_treatment_plan"
-    Id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    crm_risk_identification_treatment_strategy_id: Mapped[int | None] = mapped_column(Integer)
-    crm_risk_identification_id: Mapped[int | None] = mapped_column(Integer)
-    IsDeleted: Mapped[bool | None] = mapped_column(Boolean)   # DDD casing differs from siblings on purpose
-    creation_date: Mapped[datetime | None] = mapped_column(DateTime)
-
-
-class crm_risk_identification_treatment_strategy(Base):
-    __tablename__ = "crm_risk_identification_treatment_strategy"
-    Id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    Name: Mapped[str | None] = mapped_column(UnicodeText)     # Accept / Mitigate / Transfer / Avoid
-    IsDeleted: Mapped[bool | None] = mapped_column(Boolean)
-
-
-class crm_risk_rating(Base):
-    __tablename__ = "crm_risk_rating"
-    Id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    risk_level: Mapped[str | None] = mapped_column(UnicodeText)       # band label ("Critical", "High", ...)
-    risk_score_from: Mapped[float | None] = mapped_column(Float)
-    risk_score_to: Mapped[float | None] = mapped_column(Float)
-    response_time: Mapped[int | None] = mapped_column(Integer)        # SLA fed into the prompt to ground timelines
-    remediation_time: Mapped[int | None] = mapped_column(Integer)
-    Priority: Mapped[str | None] = mapped_column(Unicode(55))
-    IsDeleted: Mapped[bool | None] = mapped_column(Boolean)
-    crm_risk_rating_category_id: Mapped[int | None] = mapped_column(Integer)  # -> crm_risk_rating_category.Id
-
-
-class crm_risk_rating_category(Base):  # links a rating band set to its rating PLAN
-    __tablename__ = "crm_risk_rating_category"
-    Id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    crm_risk_rating_plan_id: Mapped[int | None] = mapped_column(Integer)
-    crm_risk_category_id: Mapped[int | None] = mapped_column(Integer)
-    is_deleted: Mapped[bool | None] = mapped_column(Boolean)
-
-
-class crm_risk_control_details(Base):
-    __tablename__ = "crm_risk_control_details"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    crm_risk_identification_id: Mapped[int | None] = mapped_column(Integer)
-    crm_risk_control_status_id: Mapped[int | None] = mapped_column(Integer)  # -> crm_risk_control_status.id (Planned/Implemented)
-    action_plan: Mapped[str | None] = mapped_column(UnicodeText)  # the existing-control text fed to the prompt (redacted)
-    control_effectiveness_score: Mapped[float | None] = mapped_column(Float)
-    is_active: Mapped[bool | None] = mapped_column(Boolean)
-
-
-class crm_risk_control_status(Base):
-    __tablename__ = "crm_risk_control_status"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str | None] = mapped_column(UnicodeText)     # Planned / Implemented / ...
 

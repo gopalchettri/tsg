@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, Path, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy import exists, select, update
 from sqlalchemy.engine import CursorResult
@@ -34,7 +34,9 @@ from app.db.engine import db_session
 from app.pipeline import cascade
 from app.pipeline.accept import accept_session, review_gate_reason
 from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
+from app.core import tuning
 from app.pipeline.context import gather_asset_details
+from app.pipeline.grounding import stored_actors
 from app.pipeline.tasks import ASSET_UNIT_ID, set_up_progress_tracking
 
 log = get_logger(__name__)
@@ -128,11 +130,16 @@ def get_authorized_session(sess: Session, session_id: str, principal: Principal)
 
 
 def _build_session_row(sid: str, tenant: str, body: CreateSessionBody, ctx: dict,
-                    idempotency_key: str | None, user_id: str | None) -> dict:
+                    idempotency_key: str | None, user_id: str | None,
+                    tuning_snapshot: dict) -> dict:
     """Assembles the new Scenario_Session row.
 
     `user_id` must be the AUTHENTICATED principal, never body input: this column feeds the
-    audit trail, and a caller-supplied name makes it trustworthy on no row."""
+    audit trail, and a caller-supplied name makes it trustworthy on no row.
+
+    `tuning_snapshot` freezes the session's business calibration (core.tuning) — resolved
+    once HERE so every worker stage reads one rulebook, and a Config_Tuning edit only ever
+    affects sessions created after it."""
     return {
         "SessionID": sid, "TenantID": tenant, "EntityID": str(body.entity_id),
         "UserID": str(user_id) if user_id is not None else None,
@@ -141,6 +148,7 @@ def _build_session_row(sid: str, tenant: str, body: CreateSessionBody, ctx: dict
         "StageStatus": StageStatus.IDLE, "Mode": SessionMode.AUTO, "CurrentSubsystemIndex": 0,
         "SubsystemsJSON": ctx["subsystems_json"], "SectorIDsJSON": json.dumps(ctx["sector_ids"]),
         "AssetContextJSON": ctx["asset_context_json"],
+        "TuningJSON": json.dumps(tuning_snapshot),
         "CreatedAt": now(), "UpdatedAt": now(),
         "IdempotencyKey": idempotency_key,
     }
@@ -177,8 +185,15 @@ def create_session(
         ctx = gather_asset_details(sess, asset_id=body.asset_id, entity_id=body.entity_id,
                             sector_id=body.sector_id, user_id=principal.user_id,
                             supporting_system_ids=body.supporting_system_id)
+        try:
+            # Freeze the tuning rulebook NOW: a Config_Tuning row that breaks the scoring
+            # invariants fails session creation with the curated message — it must surface to
+            # whoever edited the row, never mint a session under broken arithmetic.
+            tuning_snapshot = tuning.resolve_snapshot(dal.active_tuning_overrides(sess))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         dal.create_session(sess, _build_session_row(sid, tenant, body, ctx, idempotency_key,
-                                                    principal.user_id))
+                                                    principal.user_id, tuning_snapshot))
         set_up_progress_tracking(sess, sid, tenant, str(body.entity_id))
         dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant, EntityID=str(body.entity_id),
                         EventType=AuditEventType.session_started, ActorUserID=principal.user_id)
@@ -294,13 +309,18 @@ def get_results(
         st, out, it = m.Scoped_Threat, m.Threat_Scenario_Output, m.Identified_Threat
         threats = get_current_rows(it,
                         [it.ThreatID, it.ThreatType, it.ThreatName,
-                        it.GroundingStatus, it.ThreatCatalogueID],
+                        it.GroundingStatus, it.ThreatCatalogueID, it.ThreatActorsJSON,
+                        # read at source — deliberately NOT denormalised onto Scoped_Threat,
+                        # so the value can never drift from the row that owns it
+                        it.GroundingScore],
                         # only threats that actually PRODUCED an active scenario — stricter than
                         # "was Selected=1", so a threat whose scenario failed is correctly excluded
                         exists().where(st.ThreatID == it.ThreatID,
                                     st.SessionID == sid, st.Superseded == 0,
                                     out.ScopedThreatID == st.ScopedThreatID,
                                     out.SessionID == sid, out.Superseded == 0))
+        # One grouped round trip — never a join, which would fan out per variant row.
+        scores = dal.threat_scores(sess, sid)
         scenarios = [dict(r) for r in sess.execute(
             _scenario_select().where(out.SessionID == sid, out.Superseded == 0)
         ).mappings()]
@@ -340,7 +360,12 @@ def get_results(
             threats=[ThreatResult(threat_id=t["ThreatID"],
                                 threat_type=t["ThreatType"], threat_name=t["ThreatName"],
                                 grounding_status=t["GroundingStatus"],
-                                threat_catalogue_id=t["ThreatCatalogueID"]) for t in threats],
+                                threat_catalogue_id=t["ThreatCatalogueID"],
+                                threat_actors=stored_actors(t["ThreatActorsJSON"]),
+                                grounding_score=t["GroundingScore"],
+                                score=scores.get(t["ThreatID"], {}).get("score"),
+                                scope_rank=scores.get(t["ThreatID"], {}).get("scope_rank"))
+                    for t in threats],
             scenarios=[_scenario_result(s, controls.get(s["OutputID"]),
                                         _nested(chains.get(s["OutputID"]) or []))
                     for s in scenarios],
@@ -756,6 +781,7 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
                 # controls_mapped=True: an accepted scenario has necessarily passed Stage 2's tail
                 # mapping step before the session could reach REVIEW/accept.
                 scenario=_scenario_with_controls(r["ScenarioJSON"], controls.get(r["OutputID"], []), True),
+                threat_actors=stored_actors(r["ThreatActorsJSON"]),
             ) for r in rows],
         )
 
@@ -790,6 +816,9 @@ def _scenario_list_item(row: dict, controls: list[MappedControl]) -> ScenarioLis
         session_status=row["SessionStatus"], scenario_number=row["ScenarioNumber"],
         accepted=bool(row["Accepted"]), superseded=bool(row["Superseded"]),
         created_at=row["CreatedAt"],
+        # _scenario_read_select already carries ThreatActorsJSON — without this kwarg the list
+        # routes would permanently return [] while /accepted-scenarios returns real actors.
+        threat_actors=stored_actors(row["ThreatActorsJSON"]),
     )
 
 

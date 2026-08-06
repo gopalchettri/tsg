@@ -168,6 +168,27 @@ def assert_asset_owned_by_entity(sess: Session, asset_id: Any, entity_id: Any) -
 # ---------------------------------------------------------------------------
 # Sessions (carry EntityID directly — filtered by it)
 # ---------------------------------------------------------------------------
+def active_tuning_overrides(sess: Session) -> dict[str, tuple[float | int, str | None]]:
+    """Active, non-deleted Config_Tuning rows as {key: (typed value, embedding_model)} for
+    core.tuning.resolve_snapshot. A row whose value doesn't parse as its declared ValueType is
+    skipped LOUDLY — a curator typo must degrade to the config default, never brick session
+    creation."""
+    ct = m.Config_Tuning
+    out: dict[str, tuple[float | int, str | None]] = {}
+    for r in sess.execute(
+        select(ct.TuningKey, ct.TuningValue, ct.ValueType, ct.EmbeddingModel)
+        .where(ct.IsActive == True, ct.IsDeleted == False)  # noqa: E712 — SQL boolean columns
+    ):
+        try:
+            val: float | int = int(r.TuningValue) if r.ValueType == "int" else float(r.TuningValue)
+        except (TypeError, ValueError):
+            log.warning("tuning.value_unparseable", key=r.TuningKey, value=r.TuningValue,
+                        value_type=r.ValueType)
+            continue
+        out[r.TuningKey] = (val, r.EmbeddingModel)
+    return out
+
+
 def create_session(sess: Session, values: Mapping[str, Any]) -> str:
     """Insert a session. Two independent unique indexes can reject the insert:
     (EntityID, AssetID) WHERE active, and (EntityID, IdempotencyKey) WHERE IdempotencyKey IS
@@ -284,6 +305,10 @@ def get_session(sess: Session, session_id: str, entity_id: str) -> RowMapping | 
 def complete_session(sess: Session, session_id: str) -> bool:
     """Accept path: flip to completed/APPROVED — this releases the M4 lock.
 
+    Stamps StageStatus=COMPLETE too, not just CurrentStage — mirrors cancel_session's terminal
+    StageStatus=CANCELLED, so the board never again reports a completed session as still
+    AWAITING_DECISION (the self-contradictory board `review_gate_reason` used to guard against).
+
     CAS-fenced on `SessionStatus == active`: returns True iff THIS call made the transition,
     False if a concurrent writer already ended the session (or the id doesn't exist) — a lost
     race the caller must surface, never a silent overwrite of what the winner committed.
@@ -296,6 +321,7 @@ def complete_session(sess: Session, session_id: str) -> bool:
         .values(
             SessionStatus=SessionStatus.completed,
             CurrentStage=WorkflowStage.APPROVED,
+            StageStatus=StageStatus.COMPLETE,
             CompletedAt=now(),
             UpdatedAt=now(),
         )
@@ -749,25 +775,51 @@ def active_threats(sess: Session, session_id: str, subsystem_id: int) -> list[di
     per-threat prompt enrichment (scenario-granularity regen needs the full sibling list to rank
     the target correctly, even though only ONE row is rewritten). Same dict shape `find_threats`
     returns, so `write_scenarios` consumes both sources identically."""
+    # Lazy import: app.db.dal sits below app.pipeline and takes no load-time dependency on it.
+    from app.pipeline.grounding import stored_actors
     return [
         {
             "threat_id": r["ThreatID"], "grounding_status": r["GroundingStatus"],
+            "category": r["ThreatCategory"],  # impact class — gates the semantic near-duplicate scan
             "threat_type": r["ThreatType"], "threat_name": r["ThreatName"],
             "library_threat_type": r["LibraryThreatType"], "library_threat_name": r["LibraryThreatName"],
             "threat_type_id": r["ThreatTypeID"],  # [R12] scoping rules key on the grounded type
             "catalogue_id": r["ThreatCatalogueID"],  # keeps _dedup_key/IdentityHash identical to a full run's on regen
+            # RAW list, matching find_threats' "actors": gr.actors — validated_actors would return
+            # [] for every unverified threat and reproduce the adversary-blind-reload bug.
+            "actors": stored_actors(r["ThreatActorsJSON"]),
         }
         for r in sess.execute(
             select(m.Identified_Threat.ThreatID, m.Identified_Threat.GroundingStatus,
+                m.Identified_Threat.ThreatCategory,
                 m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName,
                 m.Identified_Threat.LibraryThreatType, m.Identified_Threat.LibraryThreatName,
-                m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatCatalogueID).where(
+                m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatCatalogueID,
+                m.Identified_Threat.ThreatActorsJSON).where(
                 m.Identified_Threat.SessionID == session_id,
                 m.Identified_Threat.SubsystemID == subsystem_id,
                 m.Identified_Threat.Superseded == 0,
-            )
+            ).order_by(m.Identified_Threat.CreatedAt.desc(), m.Identified_Threat.ThreatID.desc())
         ).mappings()
     ]
+
+
+def threat_scores(sess: Session, session_id: str) -> dict[str, dict]:
+    """Best relevance score/rank per threat for one session, in ONE grouped round trip.
+    NEVER a join from the threat select: a threat has MANY active scoped rows (one per
+    variant), so a join returns the same threat once per variant. The aggregates only
+    COLLAPSE identical cloned rows (variants clone the primary's Score/ScopeRank) into one —
+    they are not choosing between differing values."""
+    st = m.Scoped_Threat
+    return {
+        r["ThreatID"]: {"score": r["Score"], "scope_rank": r["ScopeRank"]}
+        for r in sess.execute(
+            select(st.ThreatID, func.max(st.Score).label("Score"),
+                func.min(st.ScopeRank).label("ScopeRank"))
+            .where(st.SessionID == session_id, st.Superseded == 0)
+            .group_by(st.ThreatID)
+        ).mappings()
+    }
 
 
 def has_active_scenarios(sess: Session, session_id: str) -> bool:
@@ -1014,7 +1066,7 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
     return [dict(r) for r in sess.execute(
         select(out.OutputID, out.SubsystemID, out.ScopedThreatID, out.ScenarioJSON,
             it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
-            it.LibraryThreatType, it.LibraryThreatName)
+            it.LibraryThreatType, it.LibraryThreatName, it.ThreatActorsJSON)
         .select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
         .where(out.SessionID == session_id, out.Accepted == 1, out.Superseded == 0)
@@ -1304,50 +1356,101 @@ def supersede_by_identity_hashes(sess: Session, session_id: str, subsystem_id: i
     return retired
 
 
-def variant_eligible_primaries(sess: Session, session_id: str, subsystem_id: int, n: int,
-                            max_per_threat: int,
+def _entry_ids(scenario_json: str | None, key: str) -> list[int]:
+    """Entry-point ids out of a ScenarioJSON blob under `key`; [] on anything unparseable.
+
+    Tolerates every pre-coverage row: a scenario written before entry-point grounding existed
+    simply has no such key and yields [], which the caller reads as "no coverage signal"."""
+    try:
+        data = json.loads(scenario_json) or {}
+    except (TypeError, ValueError):
+        return []
+    raw = data.get(key)
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [v for v in raw if isinstance(v, int) and not isinstance(v, bool)]
+
+
+def variant_eligible_primaries(sess: Session, session_id: str, n: int, *,
+                            rows: list, attempt_slack: int,
                             exclude_threat_ids: set[str] | None = None) -> list[dict]:
-    """The "who can get another scenario?" gate — the ONLY place the `max_scenarios_per_threat`
-    cap is applied, and the only code path that ever assigns a ScenarioNumber > 1. Returns up to
-    `n` work items, best-first by the primary's Scoped_Threat.Score, each: {"threat_id",
-    "identity_hash", "next_number", "score", "scope_rank", "reason", "factors_json"} — the scoped
-    fields cloned from the lowest-numbered COMPLETE scenario's own scoped row so the variant's
-    fresh Scoped_Threat row carries the same scoring provenance without re-running scoping.
+    """The "who can get another scenario?" gate, and the only code path that ever assigns a
+    ScenarioNumber > 1. Returns up to `n` work items, best-first by the primary's
+    Scoped_Threat.Score, each: {"threat_id", "identity_hash", "next_number", "score",
+    "scope_rank", "reason", "factors_json"} — the scoped fields cloned from the lowest-numbered
+    COMPLETE scenario's own scoped row so the variant's fresh Scoped_Threat row carries the same
+    scoring provenance without re-running scoping.
+
+    THIS IS COVERAGE, NOT A CAP. It used to stop at `max_scenarios_per_threat` active rows — a
+    constant that answered "how much analysis does every threat deserve?" with one number for
+    every asset in every sector. A threat is now eligible while it still has an UNCOVERED
+    PLAUSIBLE ENTRY POINT: the supporting systems the model itself judged could credibly carry
+    this threat to the asset, minus the ones a scenario has already been written through. A
+    2-system asset finishes in two scenarios, an 8-system one earns eight, and neither number
+    was chosen by anybody — both fall out of the architecture under analysis.
+
+    PLAUSIBILITY IS FROZEN AT FIRST DECLARATION — read only from the lowest-numbered COMPLETE
+    scenario, never unioned across later ones. Union-growth livelocks: each round fills one cell
+    and declares a new one, so the uncovered count never reaches zero and the click loops
+    forever, one LLM call per round. Frozen, the target set is fixed when the threat is first
+    written and the uncovered set is monotone non-increasing, which is what makes this terminate.
+
+    `attempt_slack` bounds the OTHER non-termination: nothing binds the model to the cell it was
+    asked to fill, so it can answer every request with the same entry point and leave a cell open
+    forever. An identity stops at `len(plausible) + attempt_slack` active rows — derived from its
+    own coverage target, not a global constant.
+
+    FAILS CLOSED when no target is derivable. An identity whose primary declares no plausible
+    entry points — a scenario written before coverage existed, or one where the model honestly
+    answered "none evidenced" — earns no further variants. It must NOT fall back to "every system
+    in the session is plausible": that hands the DEEPEST analysis to the threats with the LEAST
+    evidence, and because a vocabulary is rebuilt per call from live curator data it is not
+    frozen, so adding a supporting system mid-session would grow an already-open target and break
+    the monotone-non-increasing property this whole gate rests on.
+
+    `rows` comes from active_scenario_rows — the caller's single read, shared with sibling and
+    cross-threat steering. Passed in rather than fetched here so one click reads the table once.
 
     Eligible = an identity with at least one active COMPLETE scenario (a threat whose only active
     row is a failure card gets no variant — no sibling text to steer against, and failure
-    recovery is regenerate's job) AND fewer than `max_per_threat` active rows TOTAL (error cards
-    included, so scenario numbers can never collide).
+    recovery is regenerate's job), AND an uncovered plausible entry point, AND still under its
+    attempts bound. Row counts include error cards, so scenario numbers can never collide.
 
     `exclude_threat_ids` drops threats the CALLER just served in this same click: eligibility has
     no recency fence and the sort is best-score-first, so a caller topping up a short batch would
     otherwise re-pick the very primaries it committed seconds earlier. Applied in the fold BELOW,
     before sort/[:n], so an exclusion frees its slot for the next-best threat instead of silently
     shrinking the batch."""
-    out = m.Threat_Scenario_Output
-    rows = sess.execute(
-        select(out.IdentityHash, out.ScenarioNumber, out.Status, out.ScopedThreatID)
-        .where(out.SessionID == session_id, out.SubsystemID == subsystem_id,
-            out.Superseded == 0, out.IdentityHash.is_not(None))
-    ).all()
     by_hash: dict[str, list] = {}
     for r in rows:
         by_hash.setdefault(r.IdentityHash, []).append(r)
     candidates: dict[str, tuple[int, str]] = {}  # hash -> (next_number, primary ScopedThreatID)
     for identity, group in by_hash.items():
-        if len(group) >= max_per_threat:
-            continue
         complete = [r for r in group if r.Status == ScenarioStatus.complete]
         if not complete:
             continue
         primary = min(complete, key=lambda r: r.ScenarioNumber)
+        # FROZEN: every scenario of an identity carries the SAME declaration, because
+        # tasks._ground_entry_points copies the primary's forward onto each new one. Reading the
+        # primary is therefore stable even across a regeneration that replaces it in place.
+        plausible = set(_entry_ids(primary.ScenarioJSON, "plausible_entry_point_ids"))
+        if not plausible:
+            continue  # no coverage target derivable — fail closed, see docstring
+        used = {eid for r in group for eid in _entry_ids(r.ScenarioJSON, "entry_point_id")}
+        if not plausible - used:
+            continue  # every plausible entry point covered — this threat is DONE
+        if len(group) >= len(plausible) + attempt_slack:
+            continue  # attempts bound: the model keeps re-using one entry point
         next_number = max(r.ScenarioNumber for r in group) + 1
         candidates[identity] = (next_number, primary.ScopedThreatID)
     if not candidates:
         return []
     st = m.Scoped_Threat
     scoped_rows = {r.ScopedThreatID: r for r in sess.execute(
-        select(st.ScopedThreatID, st.ThreatID, st.Score, st.ScopeRank, st.Reason, st.FactorsJSON)
+        select(st.ScopedThreatID, st.ThreatID, st.Score, st.ScopeRank, st.Reason, st.FactorsJSON,
+            st.SelectionKind)
         .where(st.ScopedThreatID.in_([sid_ for _, sid_ in candidates.values()]))
     ).all()}
     # Case-fold: MSSQL hands uniqueidentifier back upper-case while the ORM/SQLite path is
@@ -1363,26 +1466,37 @@ def variant_eligible_primaries(sess: Session, session_id: str, subsystem_id: int
             continue  # caller just served this threat in this same click — see docstring
         items.append({"threat_id": sr.ThreatID, "identity_hash": identity, "next_number": next_number,
                     "score": sr.Score, "scope_rank": sr.ScopeRank, "reason": sr.Reason,
-                    "factors_json": sr.FactorsJSON})
+                    "factors_json": sr.FactorsJSON,
+                    # cloned like Reason/FactorsJSON — otherwise every variant row would get the
+                    # column default while carrying the primary's prose (prose/enum drift)
+                    "selection_kind": sr.SelectionKind})
     items.sort(key=lambda d: (-(d["score"] or 0), str(d["threat_id"])))
     return items[:n]
 
 
-def active_scenarios_by_identity(sess: Session, session_id: str, subsystem_id: int,
-                                identity_hashes) -> list:
-    """Every active COMPLETE scenario row for the given identity hashes, in ONE query —
-    (OutputID, IdentityHash, ScenarioNumber, ScenarioJSON). The batched sibling fetch for
-    variant/regen prompt-steering and the difflib similarity check: fetched once per
-    write_scenarios/write_variant_scenarios call and passed down, never one SELECT per scenario
-    inside the generation loop."""
-    if not identity_hashes:
-        return []
+def active_scenario_rows(sess: Session, session_id: str, subsystem_id: int) -> list:
+    """THE read of a session's active scenarios — one query, one projection, every consumer.
+
+    Returns (OutputID, IdentityHash, ScenarioNumber, Status, ScopedThreatID, ScenarioJSON) for
+    every non-superseded row carrying an identity, INCLUDING error cards: coverage counts them
+    toward a threat's attempts, and scenario numbering must never reuse one.
+
+    Deliberately ONE function rather than three narrow ones. Coverage eligibility, sibling
+    steering and cross-threat comparison all want the same rows of the same table under the same
+    (SessionID, SubsystemID, Superseded=0) predicate, and each had grown its own SELECT — three
+    round trips per click, each dragging ScenarioJSON (nvarchar(max), the whole scenario) to read
+    a couple of small fields, each seek followed by a key lookup into a clustered PK that is a
+    random uniqueidentifier. Fetching once and folding in Python costs one round trip and one
+    pass; the active set is bounded by the session's own threats, so it fits in memory easily.
+
+    Callers filter by Status/identity themselves — see tasks._fold_scenario_rows, the single
+    place that fold is written."""
     out = m.Threat_Scenario_Output
     return list(sess.execute(
-        select(out.OutputID, out.IdentityHash, out.ScenarioNumber, out.ScenarioJSON)
+        select(out.OutputID, out.IdentityHash, out.ScenarioNumber, out.Status,
+            out.ScopedThreatID, out.ScenarioJSON)
         .where(out.SessionID == session_id, out.SubsystemID == subsystem_id,
-            out.Superseded == 0, out.Status == ScenarioStatus.complete,
-            out.IdentityHash.in_(identity_hashes))
+            out.Superseded == 0, out.IdentityHash.is_not(None))
     ).all())
 
 
@@ -1762,11 +1876,175 @@ def finish_plan(sess: Session, plan_id: str, *, status: StageStatus,
 def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
     """The scenario's one active plan row for the GET poll endpoint. SessionID predicate keeps
     a foreign OutputID a 404 rather than a leak (same posture as scenario_row). None on a
-    malformed GUID (→ 404, not an MSSQL 500)."""
+    malformed GUID (→ 404, not an MSSQL 500).
+
+    Explicit columns, NOT the whole table: InputSnapshotJSON is the frozen asset context —
+    tens of KB the poll endpoint never returns — and this is the poll target, hit repeatedly
+    per plan (same rationale as _SESSION_BOARD_COLS vs load_session)."""
     if not _valid_guid(output_id):
         return None
     p = m.Risk_Treatment_Plan
     return sess.execute(
-        select(p.__table__).where(
+        select(p.PlanID, p.SessionID, p.OutputID, p.TenantID, p.EntityID, p.Status,
+               p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON, p.ValidationJSON,
+               p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment, p.ReviewedBy,
+               p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt).where(
             p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 0)
     ).mappings().first()
+
+
+def review_plan(sess: Session, plan_id: str, *, status: str, comment: str | None,
+                reviewer: str | None, reviewed_at: datetime) -> bool:
+    """Record the human adoption decision — CAS fenced on (COMPLETE, not superseded): only a
+    finished, current plan can be adopted; a re-review overwrites (latest decision wins); a
+    regenerated plan is a NEW row, so approval never silently carries across versions.
+    `reviewed_at` comes from the caller so the response can echo the EXACT stored instant
+    (naive UTC, per the wire convention) instead of a second clock read."""
+    p = m.Risk_Treatment_Plan
+    return execute_dml(sess, update(p).where(
+        p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.COMPLETE,
+    ).values(ReviewStatus=status, ReviewComment=comment, ReviewedBy=reviewer,
+             ReviewedAt=reviewed_at, UpdatedAt=reviewed_at)).rowcount == 1
+
+
+def session_plan_board(sess: Session, session_id: str) -> list[RowMapping]:
+    """One row per ACCEPTED, non-superseded scenario of the session, LEFT-joined to its
+    active plan (NULL plan columns = never requested). Deliberately excludes PlanJSON — the
+    board is a glance, the single-plan GET is the document (same blob-exclusion rationale as
+    active_plan_row); ScenarioJSON rides along only because the title lives inside it."""
+    out, p = m.Threat_Scenario_Output, m.Risk_Treatment_Plan
+    return sess.execute(
+        select(out.OutputID, out.ScenarioJSON,
+               p.PlanID, p.Status, p.RiskLevel, p.ReviewStatus, p.ErrorMessage,
+               p.CreatedAt.label("PlanCreatedAt"), p.UpdatedAt.label("PlanUpdatedAt"),
+               p.CompletedAt.label("PlanCompletedAt"))
+        .select_from(out.__table__.outerjoin(
+            p, and_(p.OutputID == out.OutputID, p.Superseded == 0)))
+        .where(out.SessionID == session_id, out.Accepted == 1, out.Superseded == 0)
+        .order_by(out.CreatedAt, out.OutputID)
+    ).mappings().all()
+
+
+def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
+                     status: str | None = None, review_status: str | None = None,
+                     risk_level: str | None = None, limit: int = 100,
+                     offset: int = 0) -> list[RowMapping]:
+    """The entity-wide remediation register: every active plan across all the entity's
+    sessions, newest first. Filters on Scenario_Session.EntityID — the NOT NULL authz truth,
+    never the nullable denormalized copy (same rule as scenario_rows).
+
+    The status filter matches the PRESENTED status, not the stored one: a stale RUNNING row
+    (progress clock stopped before `stale_cutoff`) is projected to ERROR at read time, so it
+    must surface under status=ERROR and stay out of status=RUNNING — the filter and the page
+    the caller renders may never disagree. Branched in SQL rather than post-filtered in
+    Python, which would under-fill limit/offset pages.
+
+    ScenarioTitle is extracted server-side (JSON_VALUE) instead of hauling every row's
+    multi-KB ScenarioJSON blob for one key; malformed JSON yields NULL — the same degrade
+    as the defensive Python parse it replaces."""
+    p, ss, out = m.Risk_Treatment_Plan, m.Scenario_Session, m.Threat_Scenario_Output
+    stmt = (
+        select(p.PlanID, p.SessionID, p.OutputID, p.Status, p.RiskLevel, p.ReviewStatus,
+               p.ReviewedBy, p.ReviewedAt, p.ErrorMessage, p.CreatedAt, p.UpdatedAt,
+               p.CompletedAt, ss.AssetName,
+               func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle"))
+        .select_from(p.__table__
+            .join(ss, ss.SessionID == p.SessionID)
+            .outerjoin(out, out.OutputID == p.OutputID))
+        .where(ss.EntityID == entity_id, p.Superseded == 0))
+    if status == str(StageStatus.ERROR):
+        stmt = stmt.where(or_(p.Status == StageStatus.ERROR,
+                              and_(p.Status == StageStatus.RUNNING,
+                                   p.UpdatedAt < stale_cutoff)))
+    elif status == str(StageStatus.RUNNING):
+        stmt = stmt.where(p.Status == StageStatus.RUNNING, p.UpdatedAt >= stale_cutoff)
+    elif status is not None:
+        stmt = stmt.where(p.Status == status)
+    if review_status is not None:
+        stmt = stmt.where(p.ReviewStatus == review_status)
+    if risk_level is not None:
+        stmt = stmt.where(p.RiskLevel == risk_level)
+    return sess.execute(
+        stmt.order_by(p.CreatedAt.desc(), p.PlanID).limit(limit).offset(offset)
+    ).mappings().all()
+
+
+def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[RowMapping]:
+    """Every version (active AND superseded) of one scenario's plan, oldest first — the
+    audit trail's version chain. Rows are never deleted, so this IS the complete history."""
+    if not _valid_guid(output_id):
+        return []
+    p = m.Risk_Treatment_Plan
+    return sess.execute(
+        select(p.PlanID, p.Status, p.Superseded, p.ErrorMessage, p.RiskLevel, p.ReviewStatus,
+               p.ReviewedBy, p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
+        .where(p.SessionID == session_id, p.OutputID == output_id)
+        .order_by(p.CreatedAt)
+    ).mappings().all()
+
+
+def plan_row_by_id(sess: Session, session_id: str, output_id: str, plan_id: str) -> RowMapping | None:
+    """One SPECIFIC version (evidence endpoint) — the session/output predicates keep a
+    foreign plan id a 404 rather than a leak; superseded versions are deliberately readable
+    (that is what an auditor asks for). Explicit columns, NOT the whole table (the
+    active_plan_row rule): PlanJSON and ReviewComment are blobs this endpoint never returns."""
+    if not (_valid_guid(output_id) and _valid_guid(plan_id)):
+        return None
+    p = m.Risk_Treatment_Plan
+    return sess.execute(
+        select(p.PlanID, p.Status, p.InputSnapshotJSON, p.ValidationJSON).where(
+            p.PlanID == plan_id, p.SessionID == session_id, p.OutputID == output_id)
+    ).mappings().first()
+
+
+#: The treatment-plan lifecycle events. A tuple, not a set — byte-stable SQL for the plan cache.
+_TREATMENT_EVENTS = (
+    AuditEventType.treatment_plan_requested, AuditEventType.treatment_plan_outcome,
+    AuditEventType.treatment_plan_cancelled, AuditEventType.treatment_plan_reviewed)
+
+
+def treatment_audit_rows(sess: Session, session_id: str) -> list[RowMapping]:
+    """All treatment-plan audit events of one session, oldest first (trail endpoint filters
+    them to one scenario in Python via DetailJSON — the JSON is opaque to SQL Server here)."""
+    a = m.Scenario_Audit
+    return sess.execute(
+        select(a.EventType, a.ActorUserID, a.ActorType, a.DetailJSON, a.CreatedAt)
+        .where(a.SessionID == session_id, a.EventType.in_(_TREATMENT_EVENTS))
+        .order_by(a.CreatedAt, a.AuditID)
+    ).mappings().all()
+
+
+def entity_treatment_audit_rows(sess: Session, entity_id: str, *, since=None, until=None,
+                                actor: str | None = None, limit: int = 200,
+                                offset: int = 0) -> list[RowMapping]:
+    """The entity-wide treatment audit feed (compliance export), newest first. Filters the
+    audit rows' own EntityID — always server-written from the session row at event time,
+    never client-supplied, so it is safe as a filter here."""
+    a = m.Scenario_Audit
+    stmt = (
+        select(a.SessionID, a.EventType, a.ActorUserID, a.ActorType, a.DetailJSON, a.CreatedAt)
+        .where(a.EntityID == entity_id, a.EventType.in_(_TREATMENT_EVENTS)))
+    if since is not None:
+        stmt = stmt.where(a.CreatedAt >= since)
+    if until is not None:
+        stmt = stmt.where(a.CreatedAt <= until)
+    if actor is not None:
+        stmt = stmt.where(a.ActorUserID == actor)
+    return sess.execute(
+        stmt.order_by(a.CreatedAt.desc(), a.AuditID.desc()).limit(limit).offset(offset)
+    ).mappings().all()
+
+
+def prompt_logs_for_plan(sess: Session, plan_id: str) -> list[RowMapping]:
+    """Every AI-call receipt for one plan version, oldest first — joined on
+    Prompt_Log.CorrelationID (stamped by the worker), never by time-window guessing. Rows
+    written before the CorrelationID column simply do not appear (nothing to backfill)."""
+    if not _valid_guid(plan_id):
+        return []
+    pl = m.Prompt_Log
+    return sess.execute(
+        select(pl.Prompt, pl.ResponseText, pl.Model, pl.ModelVersion, pl.PromptVersion,
+               pl.ParseSucceeded, pl.CreatedAt)
+        .where(pl.CorrelationID == plan_id)
+        .order_by(pl.CreatedAt)
+    ).mappings().all()

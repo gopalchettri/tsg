@@ -47,6 +47,13 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     # unconditional; when the router IS mounted, missing entries would fail the boot.
     ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan"),
     ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan"),
+    ("GET", "/v1/sessions/{session_id}/treatment-plans"),
+    ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/cancel"),
+    ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/review"),
+    ("GET", "/v1/entities/{entity_id}/treatment-plans"),
+    ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/audit"),
+    ("GET", "/v1/entities/{entity_id}/treatment-plans/audit"),
+    ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/evidence"),
 }
 
 # Routes deliberately outside the entity model, each mapped to the dependency CALLABLE whose

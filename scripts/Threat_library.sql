@@ -1,13 +1,151 @@
 -- ============================================================================
--- Threat_library — TSG-owned threat-library schema NOT created by
--- scripts/TSG_Core.sql: Threat_Catalogue_Category_Map, Threat_Type/Catalogue's
--- Source provenance columns, and Config_Threat_Rule. Formerly two separate
--- files (add_threat_catalogue_category_map.sql + seed_threat_rules_asset_type.sql),
+-- Threat_library — TSG-owned threat-library schema. Creates the threat-library
+-- MASTER tables (Threat_Category/Type/Catalogue/Actor + the type-actor map —
+-- moved here from scripts/TSG_Core.sql on 2026-08-04 so each script owns its
+-- own domain instead of splitting "masters" from "extras" across files) plus
+-- what TSG_Core.sql never created: Threat_Catalogue_Category_Map, Threat_Type/
+-- Catalogue's Source provenance columns, and Config_Threat_Rule. Formerly two
+-- separate files (add_threat_catalogue_category_map.sql + seed_threat_rules_asset_type.sql),
 -- merged 2026-07-19. Schema only — real row content lives in
 -- scripts/Seed_to_Threat_library.sql.
 --
 -- Run with SSMS or sqlcmd against the TSG database, after TSG_Core.sql.
 -- ============================================================================
+
+-- ============================================================
+-- Threat-library MASTER tables (moved from scripts/TSG_Core.sql 2026-08-04).
+-- Type/Catalogue/Actor PKs are IDENTITY (R10 promote-on-accept inserts new
+-- masters and reads the generated key back). Threat_Category stays a plain
+-- int PK (fixed STRIDE set, app never inserts it).
+-- ============================================================
+
+-- Audit quartet on all four masters (CreatedAt/CreatedBy/UpdatedAt/UpdatedBy): all NULL and
+-- DEFAULT-less on purpose. Seed_to_Threat_library.sql inserts with explicit column lists, so a
+-- NOT NULL column without a default would break every one of its ~120 statements; NULL also reads
+-- honestly as "row predates the audit columns" rather than a fabricated timestamp. CreatedBy /
+-- UpdatedBy hold the caller's user id (Principal.user_id / JWT sub) — the same identity
+-- Scenario_Audit.ActorUserID records — or an 'auto:<source>' / 'cli:<user>' literal when a
+-- background import had no logged-in caller. Updated* are written ONLY by the CRUD endpoints
+-- (app/api/threat_library_crud.py): the importer and promote-on-accept upserts deliberately leave
+-- an existing row untouched, because provenance is first-writer (dal.upsert_threat_type).
+IF OBJECT_ID('dbo.Threat_Category', 'U') IS NULL
+CREATE TABLE Threat_Category (
+    ThreatCategoryID    int            NOT NULL CONSTRAINT PK_Threat_Category PRIMARY KEY,
+    ThreatCategoryName  nvarchar(200)  NOT NULL,
+    ThreatCategoryCode  nvarchar(20)   NULL,
+    SecurityObjective   nvarchar(200)  NULL,
+    IsActive            bit            NOT NULL,
+    IsDeleted           bit            NOT NULL,
+    CreatedAt           datetime2      NULL,
+    CreatedBy           nvarchar(200)  NULL,
+    UpdatedAt           datetime2      NULL,
+    UpdatedBy           nvarchar(200)  NULL
+);
+
+IF OBJECT_ID('dbo.Threat_Type', 'U') IS NULL
+CREATE TABLE Threat_Type (
+    ThreatTypeID             int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Type PRIMARY KEY,
+    ThreatTypeName           nvarchar(300)  NOT NULL,
+    Description              nvarchar(max)  NULL,
+    SectorID                 int            NULL,
+    ThreatCategoryID  int            NULL,
+    IsActive                 bit            NOT NULL,
+    IsDeleted                bit            NOT NULL,
+    CreatedAt                datetime2      NULL,
+    CreatedBy                nvarchar(200)  NULL,
+    UpdatedAt                datetime2      NULL,
+    UpdatedBy                nvarchar(200)  NULL
+);
+
+IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NULL
+CREATE TABLE Threat_Catalogue (
+    ThreatCatalogueID  int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Catalogue PRIMARY KEY,
+    ThreatTypeID       int            NOT NULL,
+    ThreatName         nvarchar(500)  NOT NULL,
+    Description        nvarchar(max)  NULL,
+    SectorID           int            NULL,
+    IsActive           bit            NOT NULL,
+    IsDeleted          bit            NOT NULL,
+    CreatedAt          datetime2      NULL,
+    CreatedBy          nvarchar(200)  NULL,
+    UpdatedAt          datetime2      NULL,
+    UpdatedBy          nvarchar(200)  NULL
+);
+
+-- Source mirrors Threat_Type.Source/Threat_Catalogue.Source (added by the guarded ALTERs below) so
+-- an imported actor is distinguishable from an AI-promoted or hand-curated one. Declared directly
+-- in this CREATE block (unlike the other two, which get it via ALTER) because the column was new
+-- at the same time this table was — see test_schema_sync's _COLUMN_DEPLOYED_SEPARATELY allowlist.
+IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NULL
+CREATE TABLE Threat_Actor (
+    ThreatActorID    int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Actor PRIMARY KEY,
+    ThreatActorName  nvarchar(200)  NOT NULL,
+    IsCapable        int            NOT NULL,
+    IsActive         bit            NOT NULL,
+    IsDeleted        bit            NOT NULL,
+    Source           nvarchar(50)   NULL,
+    CreatedAt        datetime2      NULL,
+    CreatedBy        nvarchar(200)  NULL,
+    UpdatedAt        datetime2      NULL,
+    UpdatedBy        nvarchar(200)  NULL
+);
+
+-- Existing databases: every CREATE above is IF OBJECT_ID(...) IS NULL guarded, so it is a no-op
+-- once the table exists and the new columns would never arrive. Guarded on one column per table —
+-- the four are always added together, so the first one's absence proves none of them are there.
+IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Actor', 'Source') IS NULL
+    ALTER TABLE Threat_Actor ADD Source nvarchar(50) NULL;
+
+IF OBJECT_ID('dbo.Threat_Category', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Category', 'CreatedAt') IS NULL
+    ALTER TABLE Threat_Category ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
+
+IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Type', 'CreatedAt') IS NULL
+    ALTER TABLE Threat_Type ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
+
+IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Catalogue', 'CreatedAt') IS NULL
+    ALTER TABLE Threat_Catalogue ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
+
+IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Actor', 'CreatedAt') IS NULL
+    ALTER TABLE Threat_Actor ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
+
+IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NULL
+CREATE TABLE ThreatType_ThreatActor_Map (
+    ThreatTypeID   int NOT NULL,
+    ThreatActorID  int NOT NULL,
+    CreatedAt datetime2 NULL CONSTRAINT DF_TypeActorMap_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_ThreatType_ThreatActor_Map PRIMARY KEY (ThreatTypeID, ThreatActorID)
+);
+
+-- Existing databases created before the CreatedAt stamp (2026-07-30): add it in place.
+IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.ThreatType_ThreatActor_Map', 'CreatedAt') IS NULL
+    ALTER TABLE ThreatType_ThreatActor_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_TypeActorMap_CreatedAt DEFAULT SYSUTCDATETIME();
+
+-- Natural-key guard indexes on the threat-library masters (moved from scripts/TSG_Core.sql
+-- 2026-08-04). Makes concurrent promote-on-accept safe: two sessions accepting at once can't
+-- both create the same library master. Boot-asserted in app/db/invariants.REQUIRED_INDEXES.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Type'))
+CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName, ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCatalogue_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Catalogue'))
+CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatTypeID, ThreatName, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
+CREATE UNIQUE INDEX UX_ThreatActor_NaturalKey ON Threat_Actor(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0;
+
+-- Threat_Category was the ONLY CRUD-writable master without one (2026-07-30). The shared CRUD
+-- create/update path turns a clash into a 409 purely by catching the IntegrityError this index
+-- raises (app/api/library_crud.py) — with no index there is no error, so a duplicate name was
+-- accepted silently, and the two consumers then disagreed about which id it means:
+-- grounding.find_category orders by ThreatCategoryID and takes the LOWEST, while the library
+-- importer builds its own name->id map. Same filtered shape as its three siblings above, so a
+-- soft-deleted category frees its name for reuse.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCategory_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Category'))
+CREATE UNIQUE INDEX UX_ThreatCategory_NaturalKey ON Threat_Category(ThreatCategoryName) WHERE IsActive = 1 AND IsDeleted = 0;
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatType_Category_Active' AND object_id = OBJECT_ID('dbo.Threat_Type'))
+CREATE INDEX IX_ThreatType_Category_Active ON Threat_Type(ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
+-- supports grounding.get_possible_types()'s category+sector filter.
 
 -- Threat_Catalogue <-> Threat_Category many-to-many: 74/75 real threats
 -- (functional-team Excel review) carry more than one STRIDE category at
@@ -170,7 +308,17 @@ WHERE NOT EXISTS (
 );
 
 -- Verify
-SELECT 'Threat_Catalogue_Category_Map' AS what, OBJECT_ID('dbo.Threat_Catalogue_Category_Map', 'U') AS exists_check
+SELECT 'Threat_Category' AS what, OBJECT_ID('dbo.Threat_Category', 'U') AS exists_check
+UNION ALL
+SELECT 'Threat_Type', OBJECT_ID('dbo.Threat_Type', 'U')
+UNION ALL
+SELECT 'Threat_Catalogue', OBJECT_ID('dbo.Threat_Catalogue', 'U')
+UNION ALL
+SELECT 'Threat_Actor', OBJECT_ID('dbo.Threat_Actor', 'U')
+UNION ALL
+SELECT 'ThreatType_ThreatActor_Map', OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U')
+UNION ALL
+SELECT 'Threat_Catalogue_Category_Map', OBJECT_ID('dbo.Threat_Catalogue_Category_Map', 'U')
 UNION ALL
 SELECT 'Threat_Type.Source', COL_LENGTH('dbo.Threat_Type', 'Source')
 UNION ALL

@@ -15,8 +15,8 @@ class SessionStatus(StrEnum):
     track pipeline *progress*, not liveness — a cancelled session keeps its last real
     progress values everywhere except here, by design (history, not a status)."""
     active = "active"        # holds the one-active-session-per-asset lock
-    completed = "completed"  # human accepted (all or partial) — terminal, M4 lock released
-    cancelled = "cancelled"  # user cancel, fatal error, or reaper gave up — terminal, M4 lock released
+    completed = "completed"  # human accepted (all or partial) — terminal, lock released
+    cancelled = "cancelled"  # user cancel, fatal error, or reaper gave up — terminal, lock released
 
 
 class SessionMode(StrEnum):
@@ -91,17 +91,42 @@ class ScopingRejection(StrEnum):
     NULL on a selected row (nothing rejected it). Only `top_n_cutoff` is re-servable — the other
     three fail re-scoring identically, so re-serving one churns a Selected=0 row that
     write_scenarios keeps refusing: the "no new threats" wedge. See RESERVABLE_REJECTIONS."""
-    top_n_cutoff = "top_n_cutoff"        # above the bar, just outside this round's top-N —
-                                          # target-mode re-scoring WILL re-select it
-    duplicate = "duplicate"              # same catalogue identity as a higher-ranked threat, whose
-                                          # scenario already covers it
-    tech_gate = "tech_gate"              # a required-technology gate failed — permanent
-    below_threshold = "below_threshold"  # score under the configured floor — permanent
+    top_n_cutoff = "top_n_cutoff"       # above the bar, just outside this round's top-N —
+                                        # target-mode re-scoring WILL re-select it
+    duplicate = "duplicate"             # same catalogue identity as a higher-ranked threat, whose
+                                        # scenario already covers it
+    tech_gate = "tech_gate"             # a required-technology gate failed — permanent
+    below_threshold = "below_threshold" # score under the configured floor — permanent
 
 
 # The ONLY rejections dal.next_unserved_unique_threats may re-serve. A tuple, not a set: the SQL
 # text stays byte-stable so the plan cache isn't churned by set-iteration order.
 RESERVABLE_REJECTIONS: tuple[ScopingRejection, ...] = (ScopingRejection.top_n_cutoff,)
+
+
+class TriageVerdict(StrEnum):
+    """Library-promotion triage outcome for one candidate generic name (accept.py's banded
+    triage). Stored in Scenario_Audit DetailJSON (`promotion_triage` / `library_promoted`
+    rows), so the values are a persistence contract — code branches on the MEMBER, never on a
+    bare string, and the wording is maintained here in one place."""
+    auto_reject = "auto_reject"    # >= reject band: same idea reworded — link to the existing entry
+    auto_approve = "auto_approve"  # < approve band vs everything: genuinely novel — insert active
+    review = "review"              # between the bands, or any doubt — the curator decides
+
+
+class SelectionReason(StrEnum):
+    """`Scoped_Threat.SelectionKind` — WHY a threat WAS selected, as a value code may branch on.
+    The selection-side twin of ScopingRejection: set on every Selected=1 row, NULL on rejected
+    rows (and on rows written before the column existed). `Reason` prose is DERIVED from this +
+    FactorsJSON, never typed freehand — the same discipline ScopingRejection documents.
+
+    Deliberately only the two members that have a producer, mapped 1:1 from GroundingStatus at
+    scoring time. No `flagged_match`: GroundingStatus is deliberately two-band (see its
+    docstring) and no code path can produce a third value. No `rule_boosted`: boosts are
+    orthogonal to the grounding basis (a verified AND boosted row would force a precedence
+    choice) and are already machine-readable as non-empty relevance_* entries in FactorsJSON."""
+    verified_match = "verified_match"       # grounding matched an approved library entry
+    unverified_match = "unverified_match"   # no confident library match — AI wording kept
 
 
 class ScenarioStatus(StrEnum):
@@ -159,8 +184,11 @@ class AuditEventType(StrEnum):
     subsystem_advanced = "subsystem_advanced"           # written at the START of a subsystem's work, not on completion
     auto_fanout_review = "auto_fanout_review"           # reserved — no current producer
     library_promoted = "library_promoted"               # on accept, once per NEW master created from an unverified
-                                                        # threat. Only Threat_Type masters now — catalogue names are
-                                                        # queued for curation instead of auto-created
+                                                        # threat. Only Threat_Type masters now — catalogue names go
+                                                        # through the banded triage instead of unconditional curation
+    promotion_triage = "promotion_triage"               # on accept, ONE row per accept listing every candidate's
+                                                        # {generic_name, cosine, matched catalogue id, band verdict} —
+                                                        # the calibration record the triage bands are tightened from
     candidate_reconciled = "candidate_reconciled"       # reserved — means "a Threat_Candidate_Review row was CLOSED as
                                                         # accepted", which only the curator workflow can do; accept.py
                                                         # writes those rows as `pending` and closes nothing
@@ -174,10 +202,14 @@ class AuditEventType(StrEnum):
                                                         # write (those must be SUMMED); this is the single
                                                         # authoritative summary the status board reads.
     treatment_plan_requested = "treatment_plan_requested"  # POST .../treatment-plan accepted a request; DetailJSON
-                                                        # carries {plan_id, output_id, crm_risk_identification_id}.
-                                                        # ActorUserID set -> ActorType=user (a human clicked).
+                                                        # carries {plan_id, output_id}. ActorUserID set ->
+                                                        # ActorType=user (a human clicked).
     treatment_plan_outcome = "treatment_plan_outcome"   # the worker finished one plan attempt (COMPLETE or ERROR);
                                                         # DetailJSON carries {plan_id, status}. ActorType=system.
+    treatment_plan_cancelled = "treatment_plan_cancelled"  # a human stopped a RUNNING generation; DetailJSON
+                                                        # carries {plan_id}. ActorUserID set -> ActorType=user.
+    treatment_plan_reviewed = "treatment_plan_reviewed"  # a human recorded the adoption decision; DetailJSON
+                                                        # carries {plan_id, decision, comment?}. ActorType=user.
 
 
 class AuditDecision(StrEnum):
@@ -243,15 +275,19 @@ class NextSetOutcome(StrEnum):
                                             # dal.next_unserved_unique_threats re-serves it — clicking again
                                             # IS the retry, and telling the user so is the whole point.
     exhausted = "exhausted"                  # short (possibly zero) because nothing further EXISTS: the pool is
-                                            # empty and every identity sits at max_scenarios_per_threat.
-                                            # delivered==0 + exhausted is the old "no_new" case.
+                                            # empty AND every identity already has a scenario through every
+                                            # plausible entry point it declared (dal.variant_eligible_primaries).
+                                            # Coverage-derived: an evidenced terminal answer, not a counter
+                                            # running out. delivered==0 + exhausted is the old "no_new" case.
 
 
 class ClickOutcomeReason(StrEnum):
     """Why an accepted click RAN and produced nothing. Rides the next_set_result / regen_result SSE
     `reason` field, the audit DetailJSON, and — for the two regen-target codes — HTTP 409
-    `details.reason`. cascade.py::_REASON_INFO maps every member to its detail/message pair; the
-    consistency test in tests/ pins that mapping in both directions.
+    `details.reason`. cascade.py::_REASON_INFO maps every member to its detail/message pair.
+    NOTHING PINS THAT MAPPING ANY MORE — the consistency test that did lived in tests/, which was
+    removed — so a member added here without its _REASON_INFO entry now surfaces only at runtime,
+    as a reason code whose detail and message come back None.
 
     Values are verbatim the strings already published in the API guide and on the live wire — a
     rename here is a breaking API change, not a refactor."""
@@ -287,39 +323,68 @@ class TreatmentGateReason(StrEnum):
     scenario_not_accepted = "scenario_not_accepted"      # only accepted scenarios get treatment plans
     scenario_superseded = "scenario_superseded"          # target scenario was replaced by a regeneration
     generation_in_progress = "generation_in_progress"    # a fresh RUNNING plan row exists for this scenario
-    strategy_mismatch = "strategy_mismatch"              # the CRM-stored strategy for this risk is not Mitigate
+    not_in_progress = "not_in_progress"                  # cancel refused: no RUNNING generation to stop
+    not_complete = "not_complete"                        # review refused: only a COMPLETE plan can be adopted
 
 
-if __name__ == "__main__":  # self-check: values must equal the DB strings verbatim
-    import json  # self-check only — the module itself stays import-free beyond StrEnum
-    assert SubsystemLevel.LOCK == "_LOCK"
-    assert WorkflowStage.THREAT_IDENTIFICATION == "THREAT_IDENTIFICATION"
-    assert GroundingStatus.unverified == "unverified"
-    assert AuditEventType.session_cancelled == "session_cancelled"
-    assert str(SessionStatus.active) == "active"
-    assert ValidationStatus.warning == "warning"
-    assert AuditEventType.next_set_outcome == "next_set_outcome"
-    # These three are a PUBLISHED wire contract (SSE payloads, 409 bodies, the API guide's reason
-    # tables), so a value drifting from its documented string breaks clients, not just storage.
-    assert NextSetOutcome.partial_retryable == "partial_retryable"
-    assert ClickOutcomeReason.no_target_ids == "no_target_ids"   # NOT "empty_output_ids"
-    assert ReviewGateReason.generation_in_progress == "generation_in_progress"
-    # Treatment-plan wire contract (docs/RISK_TREATMENT_PLAN_SDD.md §5.3 / §12 item 2).
-    assert TreatmentGateReason.strategy_mismatch == "strategy_mismatch"
-    assert TreatmentGateReason.generation_in_progress == ReviewGateReason.generation_in_progress
-    assert AuditEventType.treatment_plan_outcome == "treatment_plan_outcome"
-    # Scenario_Audit.EventType is Unicode(40) — a longer member would truncate at insert.
-    assert max(len(m.value) for m in AuditEventType) <= 40
-    # Re-servability is a DATA question, not a text one. Exactly one kind may come back; the other
-    # three are permanent and re-serving them is the "no new threats" wedge.
-    assert RESERVABLE_REJECTIONS == (ScopingRejection.top_n_cutoff,)
-    assert not set(RESERVABLE_REJECTIONS) & {ScopingRejection.tech_gate, ScopingRejection.duplicate,
-                                            ScopingRejection.below_threshold}
-    # Members must be usable as dict keys looked up with a plain str (cascade._REASON_INFO does
-    # exactly that with a reason read off an exception), and must serialize as the bare string.
-    # Annotated dict[str, ...]: a StrEnum member IS a str, and this is the exact shape
-    # cascade._REASON_INFO uses — enum-keyed, looked up with a plain str off an exception.
-    probe: dict[str, int] = {ClickOutcomeReason.no_new_threats_found: 1}
-    assert probe.get("no_new_threats_found") == 1
-    assert json.dumps({"r": ClickOutcomeReason.no_new_threats_found}) == '{"r": "no_new_threats_found"}'
-    print("enums self-check ok")
+# --- Risk Treatment Plan vocabularies (docs/RISK_TREATMENT_PLAN_SDD.md) -------------------
+# One source of truth per closed vocabulary, consumed three ways: Pydantic wire fields (422s +
+# /openapi.json literal unions), treatment._validate_plan's advisory clamps, and
+# prompts.treatment_prompt's FIELDS lines (built FROM these members, so the words the model is
+# allowed to use can never drift from the words the API accepts).
+
+class TreatmentStrategy(StrEnum):
+    """The register's chosen treatment for a risk. Only Mitigate is implemented — the endpoint
+    IS the Mitigate generator and stamps this server-side (never a request field in v1);
+    Accept/Transfer/Avoid become members when their flows ship."""
+    mitigate = "Mitigate"
+
+
+class RiskLevel(StrEnum):
+    """Register risk level — request field `risk_level`, verbatim toolkit vocabulary."""
+    low = "Low"
+    medium = "Medium"
+    high = "High"
+    critical = "Critical"
+
+
+class YesNo(StrEnum):
+    """Toolkit boolean-as-text — request `existing_controls_all_subsystems` and plan output
+    `applicable_to_all_subsystems`. Kept as Yes/No (not bool) because the toolkit columns and
+    the spec's output format say Yes/No verbatim."""
+    yes = "Yes"
+    no = "No"
+
+
+class TreatmentReviewStatus(StrEnum):
+    """`Risk_Treatment_Plan.ReviewStatus` — the human adoption decision on a COMPLETE plan
+    (POST .../treatment-plan/review). NULL on the column = not reviewed yet; a re-review
+    overwrites (latest decision wins); a regenerate supersedes the row, so the NEW version
+    starts unreviewed — approval never silently carries across versions."""
+    approved = "approved"                      # the organization adopted this plan
+    changes_requested = "changes_requested"    # reviewer wants a different plan (regenerate with a note)
+
+
+class ControlCoverage(StrEnum):
+    """Gap-analysis outcome on the generated plan (`plan.control_coverage`): did the request's
+    existing controls already cover every control identified at scenario generation?"""
+    gaps = "gaps"          # at least one identified control is uncovered -> controls to implement
+    covered = "covered"    # fully covered -> empty to-implement list; action plan pivots to verification
+
+
+class ControlType(StrEnum):
+    """`plan.controls_to_be_implemented[].control_type` — the four classic control functions
+    the spec's instructions name."""
+    preventive = "preventive"
+    detective = "detective"
+    corrective = "corrective"
+    compensating = "compensating"
+
+
+class ActionPriority(StrEnum):
+    """Priority vocabulary for recommended controls and action-plan rows — the spec's
+    instruction list (Critical/High/Medium/Low)."""
+    critical = "Critical"
+    high = "High"
+    medium = "Medium"
+    low = "Low"

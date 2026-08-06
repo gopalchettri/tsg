@@ -29,6 +29,49 @@ def _env_file() -> str:
     return chosen
 
 
+# Settings that USED to exist. `extra="ignore"` below is required — a shared .env legitimately
+# carries variables for other tools — but it also means deleting a setting turns every deployment
+# that still sets it into a silent no-op: the operator reads their own .env, believes the value is
+# in force, and the behaviour it used to control has quietly changed underneath them. That is a
+# defect of the DELETION, not of the operator, so every removal is recorded here and fails loudly
+# at startup naming what replaced it. Add an entry whenever a setting is retired; never just
+# delete the field.
+_RETIRED_SETTINGS: dict[str, str] = {
+    "TSG_MAX_SCENARIOS_PER_THREAT": (
+        "scenario depth is no longer a fixed cap. A threat now earns one scenario per supporting "
+        "system that could credibly carry it to the asset (its plausible entry points), derived "
+        "per threat by dal.variant_eligible_primaries — a 2-system asset finishes in two, an "
+        "8-system one earns eight. Delete this variable. To bound retries when the model keeps "
+        "re-using one entry point, set TSG_COVERAGE_ATTEMPT_SLACK instead."),
+}
+
+
+def _reject_retired_settings() -> None:
+    """Fail startup when the environment still sets a setting that no longer exists.
+
+    Reads os.environ AND the resolved .env file: pydantic has merged both by the time a validator
+    could run, but it discards unknown keys, so by then the evidence that the operator set
+    anything is already gone."""
+    present = {name for name in _RETIRED_SETTINGS if os.environ.get(name) is not None}
+    env_path = Path(_env_file())
+    if env_path.is_file():
+        try:
+            for raw in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue  # commented-out documentation is fine — only a LIVE line is a lie
+                key = line.split("=", 1)[0].strip()
+                if key in _RETIRED_SETTINGS:
+                    present.add(key)
+        except OSError:  # an unreadable .env is _env_file()'s problem, not this guard's
+            pass
+    if present:
+        raise RuntimeError(
+            "This deployment sets settings that no longer exist, so they are doing nothing:\n"
+            + "\n".join(f"  - {n}: {_RETIRED_SETTINGS[n]}" for n in sorted(present))
+            + "\nRemove them from the environment and from the .env file.")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="TSG_", env_file=_env_file(), extra="ignore", populate_by_name=True)
@@ -198,9 +241,9 @@ class Settings(BaseSettings):
         None, validation_alias=AliasChoices("LLM_REASONING_EFFORT", "TSG_LLM_REASONING_EFFORT"))
 
     # --- Risk Treatment Plan generation (docs/RISK_TREATMENT_PLAN_SDD.md) ---
-    # Master switch. Off (default) = the treatment-plan routes are not mounted at all and the
-    # crm_* boot invariant is disarmed. On = routes mount AND verify_startup requires the CRM
-    # Risk-module tables to exist (a deployment gap crashes boot, never a request).
+    # Master switch. Off (default) = the treatment-plan routes are not mounted at all. On =
+    # routes mount; nothing else is armed — the register's risk data arrives in the request
+    # body, so no external tables are required.
     risk_module_enabled: bool = Field(
         False, validation_alias=AliasChoices("RISK_MODULE_ENABLED", "TSG_RISK_MODULE_ENABLED"))
 
@@ -313,11 +356,29 @@ class Settings(BaseSettings):
     max_threats_per_asset: int = Field(
         10, validation_alias=AliasChoices("TSG_MAX_THREATS_PER_ASSET", "TSG_MAX_THREATS_PER_SUBSYSTEM"))
 
-    # How many coexisting ACTIVE scenarios one threat identity may accumulate (1 original +
-    # N-1 "generate next set" variant alternates). Enforced ONLY by
-    # dal.variant_eligible_primaries — the single gate that ever assigns a ScenarioNumber > 1.
-    # Also bounds the variant prompt: at most N-1 sibling scenarios are ever included.
-    max_scenarios_per_threat: int = Field(2, ge=1)
+    # How many scenarios one threat identity accumulates is NOT configured — it is DERIVED, in
+    # dal.variant_eligible_primaries, as the number of supporting systems the model judged could
+    # credibly carry that threat to the asset (its plausible entry points). A 2-system asset
+    # finishes in two scenarios, an 8-system one earns eight. This replaced
+    # `max_scenarios_per_threat`, a single constant that claimed every threat in every asset in
+    # every sector deserved exactly the same depth of analysis.
+    #
+    # This is the ONLY number left, and it is a non-termination guard, not a depth policy:
+    # nothing binds the model to the entry point it was asked to write about, so it can answer
+    # every request with the same one and leave a cell open forever. An identity therefore stops
+    # at (its own plausible-entry-point count + this slack). Raise it to give the model more
+    # chances to reach an awkward entry point; it can never make analysis shallower.
+    coverage_attempt_slack: int = Field(2, ge=0)
+
+    # How many of a threat's existing scenarios are quoted back into the variant prompt, newest
+    # first. A SEPARATE knob from max_scenarios_per_threat on purpose: that one is a generation
+    # policy ("how much analysis does this threat deserve"), this one is a prompt-width bound
+    # ("how many examples does the model need in order to write something different"). They were
+    # the same number only by accident — the cap happened to bound the prompt too — so raising
+    # analysis depth silently inflated every variant and regen prompt. Deliberately NOT
+    # grounding_shortlist_k either: that is a library-matching knob, and sharing it would mean
+    # tuning retrieval quietly changes prompt width.
+    variant_sibling_prompt_k: int = Field(3, ge=1)
 
     # Batch size of one "generate next set" click (scenarios served/generated per call).
     next_set_size: int = Field(5, ge=1)
@@ -329,13 +390,51 @@ class Settings(BaseSettings):
     # long-running sessions start burning proposals on threats they already have.
     coverage_exclusions_max: int = Field(50, ge=1)
 
+    # Cosine at or above which a proposed threat is LOGGED as a probable paraphrase of one the
+    # session already has. Observation only — nothing is ever rejected on this number, and it
+    # must stay that way until production logs show a cutoff that separates real paraphrases from
+    # genuinely distinct threats (tasks._log_semantic_near_duplicates explains why a wrong merge
+    # is unrecoverable). EMBEDDING-MODEL-SPECIFIC: a value tuned for e5-large@1024 means nothing
+    # on qwen3-8b@4096, so re-derive it from the logs after any embedding model change.
+    semantic_near_duplicate_threshold: float = Field(0.92, ge=0.0, le=1.0)
+
     # --- Threat-scoping selection cutoff ---
     # A threat scoring below this doesn't get a full scenario written for it.
     scoping_score_threshold: float | None = Field(55.0, ge=0.0, le=100.0)
 
-    # Only the highest-scoring N unique threats get a scenario written. None = no limit.
-    # 5 scenarios from 10 candidates = 2x headroom, so catalogue-dedup reliably still hits 5.
-    scoping_top_n: int | None = Field(5, ge=1)
+    # --- Scoring & calibration (business values — no literals in pipeline code) ---
+    # Every threat's score starts here; grounding confidence and rule weights add on top.
+    # Coupled to scoping_score_threshold and default_rule_weight by
+    # _validate_scoring_floor_invariant below — read that before changing any of the three.
+    base_score: float = Field(50.0, ge=0.0, le=100.0)
+    # relevance_* rule delta when the rule's Metadata carries no explicit {"weight": N}.
+    default_rule_weight: float = Field(10.0)
+    # difflib ratio at/above which a scenario is flagged as a near-duplicate of a sibling or of
+    # another threat's scenario (a reviewer warning, not a rejection).
+    sibling_similarity_ratio: float = Field(0.85, ge=0.0, le=1.0)
+    # Advisories injected per scenario prompt. Raising it raises tokens per LLM call.
+    prompt_intel_limit: int = Field(5, ge=0)
+    # Shortest word (chars) that participates in intel keyword search; shorter terms only add noise.
+    intel_min_term_length: int = Field(4, ge=1)
+    # Weight of the auto-written OT relevance rules (threat_library_import.apply_ot_rules).
+    # Boost-only by design — auto-rules never write a tech_gate.
+    auto_ot_relevance_weight: float = Field(10.0)
+    # Reranker score at/above which two CATALOGUE entries are treated as the same idea during
+    # threshold auto-calibration (grounding.resolve_thresholds gives up separating them).
+    near_duplicate_score: float = Field(99.0, ge=0.0, le=100.0)
+    # Library-promotion triage bands (Fix 6): cosine of a candidate generic name to its nearest
+    # active catalogue entry. >= reject band → auto-reject (same idea, reworded); < approve band
+    # → auto-approve; between → human review. EMBEDDING-MODEL-SPECIFIC estimates — recalibrate
+    # from the accept-time audit rows after any embedding model change (see
+    # semantic_near_duplicate_threshold's warning, which is the same discipline).
+    triage_auto_reject_cosine: float = Field(0.95, ge=0.0, le=1.0)
+    triage_auto_approve_cosine: float = Field(0.80, ge=0.0, le=1.0)
+
+    # Only the highest-scoring N unique threats get a scenario written. None (default) = no
+    # limit: every unique threat that clears scoping_score_threshold gets a scenario —
+    # tasks._select_unique_top_n still demotes duplicates, the threshold still drops weak ones.
+    # The old default of 5 silently abandoned the other half of every 10-threat round.
+    scoping_top_n: int | None = Field(None, ge=1)
 
     # --- Threat-library import (admin) ---
     # Max size of an uploaded library file (the file_content field of
@@ -523,12 +622,85 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _validate_coverage_knobs(self) -> "Settings":
+        """The three coverage knobs have no cross-field inversion to hard-fail on, but two have a
+        setting that is technically valid and operationally useless, so they warn.
+
+        A near-duplicate threshold low enough to match unrelated threats turns an observation log
+        into a flood and destroys the calibration data it exists to produce — cosine over real
+        threat labels sits well above 0.5 even for unrelated pairs, so anything below that flags
+        essentially every pair. A sibling-prompt width far above the exclusions cap means the
+        variant prompt carries more history than the threat prompt is even steered by, which is
+        prompt spend with nothing behind it."""
+        from app.core.logging import get_logger  # lazy: logging imports config
+        if self.semantic_near_duplicate_threshold < 0.5:
+            get_logger(__name__).warning(
+                "config.semantic_threshold_floods",
+                semantic_near_duplicate_threshold=self.semantic_near_duplicate_threshold,
+                note="below ~0.5 nearly every threat pair matches — the near-duplicate log stops "
+                    "being a signal and cannot be used to calibrate a real cutoff")
+        if self.variant_sibling_prompt_k > self.coverage_exclusions_max:
+            get_logger(__name__).warning(
+                "config.sibling_prompt_width_exceeds_coverage",
+                variant_sibling_prompt_k=self.variant_sibling_prompt_k,
+                coverage_exclusions_max=self.coverage_exclusions_max,
+                note="the variant prompt quotes more sibling scenarios than the threat prompt is "
+                    "steered away from — tokens spent with no coverage behind them")
+        return self
+
+    @model_validator(mode="after")
     def _derive_reaper_stale_grace_seconds(self) -> "Settings":
         """If not set explicitly, follows stage_lease_seconds. Must stay ordered AFTER
         _derive_stage_lease_seconds so it reads that field's DERIVED value, not its unresolved
         300-second class default, when both are left unset."""
         if "reaper_stale_grace_seconds" not in self.model_fields_set:
             self.reaper_stale_grace_seconds = self.stage_lease_seconds
+        return self
+
+    @model_validator(mode="after")
+    def _validate_scoring_floor_invariant(self) -> "Settings":
+        """scoping_score_threshold is not an independent number: it sits between base_score and
+        base_score + default_rule_weight BY DESIGN, so the rule is "no scoping rule vouched for
+        this threat → drop it; any rule vouched → keep it". Breaking that arithmetic from .env
+        (e.g. TSG_DEFAULT_RULE_WEIGHT=3 → 50+3=53 < 55) silently drops threats a rule DID match,
+        and the operator only sees "the AI found fewer threats today" — so it hard-fails.
+
+        Runs against the values as configured; Fix 9's session-snapshot resolver re-runs the
+        same arithmetic on Config_Tuning-overridden values at session creation."""
+        if self.scoping_score_threshold is None:
+            return self  # None = "no cutoff, keep everything, rank only" — neither check applies
+        if self.base_score + self.default_rule_weight <= self.scoping_score_threshold:
+            raise ValueError(
+                f"scoping_score_threshold ({self.scoping_score_threshold}) is at or above "
+                f"base_score ({self.base_score}) + default_rule_weight "
+                f"({self.default_rule_weight}) = {self.base_score + self.default_rule_weight} — "
+                "a threat that a scoping rule DID match would still be dropped. Lower the "
+                f"threshold below {self.base_score + self.default_rule_weight}, or raise the "
+                "weight.")
+        if self.scoping_score_threshold <= self.base_score:
+            # Legitimate ("keep everything, rank only") but almost certainly unintended —
+            # every threat starts at base_score, so this floor can never reject anything.
+            from app.core.logging import get_logger  # lazy: logging imports config
+            get_logger(__name__).warning(
+                "config.scoping_floor_never_rejects",
+                scoping_score_threshold=self.scoping_score_threshold,
+                base_score=self.base_score,
+                note="threshold <= base_score: every threat clears the floor — it ranks but "
+                    "never rejects. Set scoping_score_threshold above base_score to make the "
+                    "floor real, or leave as-is if keep-everything is intended.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_triage_bands(self) -> "Settings":
+        """The two promotion-triage bands must leave the middle band (human review) intact:
+        approve < reject. Inverted or equal bands would auto-approve and auto-reject the same
+        cosine — silent, contradictory automation on a shared global library."""
+        if self.triage_auto_approve_cosine >= self.triage_auto_reject_cosine:
+            raise ValueError(
+                f"triage_auto_approve_cosine ({self.triage_auto_approve_cosine}) must be below "
+                f"triage_auto_reject_cosine ({self.triage_auto_reject_cosine}) — the gap between "
+                "them IS the human-review band; equal or inverted bands make automation "
+                "contradict itself.")
         return self
 
     @model_validator(mode="after")
@@ -570,7 +742,12 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """The one shared settings object every part of the app reads from. Built once, then reused."""
+    """The one shared settings object every part of the app reads from. Built once, then reused.
+
+    The retired-setting check runs HERE rather than as a model_validator because pydantic has
+    already discarded unknown keys by the time a validator sees the model. It is inside the
+    lru_cache, so it costs one .env read per process, not one per call."""
+    _reject_retired_settings()
     return Settings()
 
 

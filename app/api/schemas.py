@@ -5,7 +5,7 @@ can be found in one place without wading through route logic.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -13,8 +13,8 @@ from pydantic.json_schema import JsonDict
 
 # Typing the wire with these is what puts them in /openapi.json — the UI generates its own
 # string-literal unions from the spec instead of hand-copying codes out of the API guide.
-from app.core.enums import (ClickOutcomeReason, NextSetOutcome, ReviewGateReason, SSEEventType,
-                            TreatmentGateReason)
+from app.core.enums import (ClickOutcomeReason, NextSetOutcome, ReviewGateReason, RiskLevel,
+                            SSEEventType, TreatmentGateReason, TreatmentReviewStatus, YesNo)
 from app.db.dal import canonical_guid
 
 # Plan item 1b: bound every list-of-targets field so one HTTP request can't turn into an
@@ -330,6 +330,26 @@ class ThreatResult(BaseModel):
                     "itself cleared the cutoff. Null whenever it did not — a close-but-unconfirmed "
                     "candidate is deliberately not reported as a match."
     )
+    threat_actors: list[str] = Field(
+        default=[],
+        description="Adversary types proposed for this threat (raw Stage-1 list, drawn from the "
+                    "closed Threat_Actor vocabulary shown to the model). Empty when none were "
+                    "proposed."
+    )
+    grounding_score: float | None = Field(
+        default=None,
+        description="Library-match confidence (reranker score, 0-100) against the threat "
+                    "catalogue. Null for rows written before this field existed."
+    )
+    score: float | None = Field(
+        default=None,
+        description="Relevance score from scoping (base + confidence + rule boosts). Higher = "
+                    "more relevant to this asset; rank best-first on this."
+    )
+    scope_rank: int | None = Field(
+        default=None,
+        description="1-based rank the scoping pass assigned within its round (1 = strongest)."
+    )
 
 
 #: One `scenario.controls` entry, for the OpenAPI examples below.
@@ -538,10 +558,13 @@ class ScenarioResult(BaseModel):
         default=1,
         description=(
             "Which of its threat's coexisting scenarios this is: 1 = the original, 2+ = alternate "
-            "takes added by 'generate next set' when no brand-new threat could be found (capped by "
-            "the max_scenarios_per_threat setting, default 2). Group cards by threat_id and label "
-            "them with this number ('Scenario 1 of 2'); without it, two scenarios of one threat "
-            "look like unrelated entries."
+            "takes added by 'generate next set' when no brand-new threat could be found. How many "
+            "a threat accumulates is not a fixed setting — it is one per supporting system that "
+            "could credibly carry that threat to the asset, so it varies by threat and by asset. "
+            "Group cards by threat_id and label them with this number; do NOT render a "
+            "'Scenario 1 of N' total, because N is not known until that threat's coverage is "
+            "complete. Without this number, two scenarios of one threat look like unrelated "
+            "entries."
         ),
     )
     # Step-4 mapping is a TAIL step of scenario generation (tasks.py::write_scenarios runs it once,
@@ -802,6 +825,11 @@ class AcceptedScenario(BaseModel):
             "the Step-4 `controls` mapped from the control library. Identical shape to "
             "ScenarioResult.scenario."
         )
+    )
+    threat_actors: list[str] = Field(
+        default=[],
+        description="Adversary types of the threat this scenario was generated from (raw Stage-1 "
+                    "list). Empty when none were proposed."
     )
 
 
@@ -1230,6 +1258,12 @@ class ThreatTypeCreate(BaseModel):
     sector_id: int | None = Field(default=None, ge=1, description="Scope to one sector, or null for every sector.")
     threat_category_id: int | None = Field(default=None, ge=1, description="Owning STRIDE category. Must reference a live Threat_Category row.")
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
+    actor_names: list[str] = Field(
+        default=[],
+        description="Adversary types for this family, linked on create. Existing names "
+                    "(case-insensitive) are reused; genuinely new ones are created — admin "
+                    "supply is the deliberate way the actor vocabulary grows."
+    )
 
 
 class ThreatTypeUpdate(BaseModel):
@@ -1243,6 +1277,12 @@ class ThreatTypeUpdate(BaseModel):
     sector_id: int | None = Field(default=None, ge=1)
     threat_category_id: int | None = Field(default=None, ge=1)
     is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a natural-key clash.")
+    actor_names: list[str] | None = Field(
+        default=None,
+        description="Adversary types to link to this family — ADDITIVE and idempotent "
+                    "(existing links are never removed). Also the repair path when a create's "
+                    "actor linking failed after the family was committed."
+    )
 
 
 class ThreatTypeRow(LibraryRowAudit):
@@ -1406,20 +1446,78 @@ class ControlStandardsResponse(BaseModel):
 
 # --- Risk Treatment Plan generation (app/api/treatment.py, docs/RISK_TREATMENT_PLAN_SDD.md §5) ---
 class TreatmentPlanBody(BaseModel):
-    """POST .../scenarios/{output_id}/treatment-plan. `Literal["Mitigate"]` is the v1 strategy
-    gate — any other strategy is a 422 straight from validation (the SDD's Mitigate-only
-    decision); the stored CRM strategy is additionally cross-checked server-side (409
-    strategy_mismatch on disagreement)."""
-    model_config = ConfigDict(json_schema_extra={"example": {
-        "crm_risk_identification_id": 42, "treatment_strategy": "Mitigate"}})
+    """POST .../scenarios/{output_id}/treatment-plan — the register's risk data, sent by the
+    UI (TSG reads NO risk-module tables; the body is the single source). TSG extracts the
+    asset/threat/scenario/mapped-controls half itself via the path's session_id + output_id.
 
-    crm_risk_identification_id: int = Field(
-        gt=0,
-        description=("The crm_risk_identification.id this plan treats. Client-supplied until the "
-                     "TSG↔CRM bridge tables land; TSG verifies the risk belongs to the session's "
-                     "entity before using it."))
-    treatment_strategy: Literal["Mitigate"] = Field(
-        description="Only 'Mitigate' is implemented; Accept/Transfer/Avoid are rejected (422).")
+    The endpoint IS the Mitigate generator — there is no strategy field; TreatmentStrategy is
+    stamped server-side (TreatmentStrategy.mitigate). Register facts the AI must never invent
+    (risk_identification_date, risk_owner, impacted_business_division) are optional: absent →
+    the output shows null, the model is never asked to fill the gap. `user_id` is deliberately
+    NOT a field — the acting user comes from the authenticated principal (see
+    CreateSessionBody's rationale)."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "existing_controls": ["annual patching", "network firewall"],
+        "likelihood_rating": 4, "impact_rating": 5,
+        "final_risk_rating": 20, "risk_level": "Critical",
+        "risk_identification_date": "2026-06-14T08:31:00Z",
+        "risk_owner": "Head of OT Operations",
+        "impacted_business_division": "Water Treatment Operations",
+        "existing_controls_all_subsystems": "No",
+        "existing_controls_all_subsystems_justification": "Controls deployed on IT systems only."}})
+
+    existing_controls: list[str] = Field(
+        max_length=_MAX_BATCH,
+        description=("The register's controls already applied to this risk, as plain text — may "
+                     "be [] (a risk with no controls), but the key must be present. The AI's "
+                     "recommended controls are the scenario-identified controls NOT covered by "
+                     "this list."))
+    likelihood_rating: int = Field(ge=1, le=5, description="Register likelihood, 1-5.")
+    impact_rating: int = Field(ge=1, le=5, description="Register impact, 1-5.")
+    final_risk_rating: int = Field(
+        ge=1, le=25,
+        description="Register final risk rating, 1-25 (5x5 matrix). Taken as-is; never re-derived.")
+    risk_level: RiskLevel = Field(description="Register risk level: Low | Medium | High | Critical.")
+    risk_identification_date: datetime | None = Field(
+        default=None,
+        description=("When the risk was recorded in the register — echoed into the output, never "
+                     "AI-generated. Normalized to UTC (naive input treated as UTC)."))
+    risk_owner: str | None = Field(
+        default=None, max_length=200,
+        description=("Register risk owner — echoed into the output; deliberately NOT shown to "
+                     "the AI (a person's name; the model must only ever name roles)."))
+    impacted_business_division: str | None = Field(
+        default=None, max_length=200,
+        description="Impacted business division within the entity — echoed into the output.")
+    existing_controls_all_subsystems: YesNo | None = Field(
+        default=None,
+        description=("Are the existing controls applied to ALL sub-systems? Steers the AI's own "
+                     "applicable_to_all_subsystems answer and per-sub-system extension actions."))
+    existing_controls_all_subsystems_justification: str | None = Field(
+        default=None, max_length=1000,
+        description="Free-text justification for the Yes/No above (redacted before reaching the AI).")
+    user_note: str | None = Field(
+        default=None, max_length=1000,
+        description=("Steering for a regenerate — e.g. 'vendor owns the network; prefer "
+                     "host-level controls'. Redacted, then shown to the AI as reviewer_note "
+                     "(prompt RULE 6). Omit on a first generation unless you want to steer it."))
+
+    @field_validator("existing_controls")
+    @classmethod
+    def _cap_control_text(cls, v: list[str]) -> list[str]:
+        for item in v:
+            if len(item) > 500:
+                raise ValueError("each existing_controls entry must be 500 characters or fewer")
+        return v
+
+    @field_validator("risk_identification_date")
+    @classmethod
+    def _utc_naive(cls, v: datetime | None) -> datetime | None:
+        # pyodbc silently drops tzinfo binding into datetime2 (UTC-by-convention everywhere in
+        # this schema) — normalize here so a "+05:30" timestamp can't store the wrong wall time.
+        if v is None or v.tzinfo is None:
+            return v
+        return v.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 class TreatmentPlanAccepted(BaseModel):
@@ -1447,28 +1545,40 @@ class TreatmentPlanStatus(BaseModel):
         "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
         "output_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
         "status": "COMPLETE", "treatment_strategy": "Mitigate",
-        "crm_risk_identification_id": 42,
-        "risk_identification_date": "2026-06-14T08:31:00Z",
-        "plan": {"title": "Remote Access Hardening", "recommended_controls": [],
+        "risk_identification_date": "2026-06-14T08:31:00",
+        "plan": {"treatment_plan": "Mitigate", "title": "Remote Access Hardening",
+                 "control_coverage": "gaps", "controls_to_be_implemented": [],
                  "remediation_action_plan": []},
         "warnings": [], "moderation_flagged": False,
         "error_message": None,
-        "created_at": "2026-08-03T10:00:00Z", "completed_at": "2026-08-03T10:01:20Z"}})
+        # No 'Z' suffix on purpose: values round-trip as NAIVE datetimes (UTC by convention —
+        # the body validator normalizes, datetime2 stores naive), so the wire has no offset.
+        "created_at": "2026-08-03T10:00:00", "completed_at": "2026-08-03T10:01:20"}})
 
     plan_id: str = Field(description="Risk_Treatment_Plan row id.")
     session_id: str = Field(description="Owning session.")
     output_id: str = Field(description="The accepted scenario this plan treats.")
     status: str = Field(description="RUNNING | COMPLETE | ERROR — the poll signal (stale RUNNING projects as ERROR).")
-    treatment_strategy: str = Field(description="The strategy this plan was generated for ('Mitigate').")
-    crm_risk_identification_id: int = Field(description="The CRM risk record this plan treats.")
+    treatment_strategy: str = Field(description="The strategy this plan was generated for — server-stamped 'Mitigate'.")
+    risk_level: str | None = Field(
+        default=None, description="The register risk level this plan was generated against (from the request).")
+    review_status: str | None = Field(
+        default=None, description="TreatmentReviewStatus (approved / changes_requested) — null until a human reviews.")
+    review_comment: str | None = Field(default=None, description="The reviewer's comment, if any.")
+    reviewed_by: str | None = Field(default=None, description="Who recorded the decision (from their login token).")
+    reviewed_at: datetime | None = Field(default=None, description="When the decision was recorded.")
     risk_identification_date: datetime | None = Field(
         default=None,
-        description="crm_risk_identification.creation_date — record data, never AI-generated (spec).")
+        description="Echo of the request's register date — record data, never AI-generated (spec). Null when not sent.")
     plan: dict[str, Any] | None = Field(
         default=None,
-        description=("The generated plan (SDD §7.3 contract: title, treatment_objective, "
-                     "recommended_controls[], remediation_action_plan[], ...). JSON is the wire "
-                     "contract; markdown rendering is the client's job."))
+        description=("The generated plan (SDD §7.3 contract): AI fields (title, objective, "
+                     "recommendation, justification, controls_to_be_implemented[] — the "
+                     "gap-analysis table, remediation_action_plan[], action_plan, "
+                     "mitigation_owner, control_coverage, ...), the server stamp "
+                     "(treatment_plan), and register echoes (risk_identification_date, "
+                     "risk_owner, impacted_business_division). JSON is the wire contract; "
+                     "markdown rendering is the client's job."))
     warnings: list[str] = Field(
         default_factory=list,
         description="Advisory validation warnings (vocabulary clamps, empty control map, ...). Never blocking.")
@@ -1478,3 +1588,135 @@ class TreatmentPlanStatus(BaseModel):
         default=None, description="Client-safe failure reason when status is ERROR.")
     created_at: datetime | None = Field(default=None, description="When this attempt was requested.")
     completed_at: datetime | None = Field(default=None, description="When it reached COMPLETE/ERROR.")
+
+
+class TreatmentBoardRow(BaseModel):
+    """One accepted scenario's line on the session plan board. Null plan fields = no plan has
+    ever been requested for it (the UI shows a Generate button)."""
+    output_id: str = Field(description="The accepted scenario.")
+    scenario_title: str | None = Field(default=None, description="From the scenario, for display.")
+    plan_id: str | None = Field(default=None, description="Active plan id; null = never requested.")
+    status: str | None = Field(default=None, description="RUNNING | COMPLETE | ERROR (stale RUNNING projects as ERROR).")
+    risk_level: str | None = Field(default=None)
+    review_status: str | None = Field(default=None, description="approved / changes_requested / null.")
+    error_message: str | None = Field(default=None)
+    created_at: datetime | None = Field(default=None)
+    completed_at: datetime | None = Field(default=None)
+
+
+class TreatmentBoard(BaseModel):
+    """GET /v1/sessions/{id}/treatment-plans — every accepted scenario's plan state in ONE
+    call (the page the reviewer looks at daily; replaces N per-scenario polls)."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "accepted_scenarios": 2,
+        "plans": [{"output_id": "1a2b…", "scenario_title": "Ransomware via exposed RDP",
+                   "plan_id": "b9fe…", "status": "COMPLETE", "risk_level": "Critical",
+                   "review_status": "approved"},
+                  {"output_id": "9f3c…", "scenario_title": "Insider tampering",
+                   "plan_id": None, "status": None}]}})
+    session_id: str
+    accepted_scenarios: int = Field(description="How many accepted scenarios the session holds.")
+    plans: list[TreatmentBoardRow]
+
+
+class TreatmentCancelResponse(BaseModel):
+    """POST .../treatment-plan/cancel — the stop button's receipt."""
+    plan_id: str
+    status: str = Field(description="Always ERROR after a successful cancel.")
+    error_message: str | None = Field(default=None, description="'cancelled by user'.")
+
+
+class TreatmentReviewBody(BaseModel):
+    """POST .../treatment-plan/review — record the human adoption decision on a COMPLETE
+    plan. The reviewer's identity comes from the login token, never from this body."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "decision": "approved", "comment": "A3 timeline extended per operations."}})
+    decision: TreatmentReviewStatus = Field(description="approved | changes_requested.")
+    comment: str | None = Field(default=None, max_length=2000, description="Optional reviewer comment.")
+
+
+class TreatmentReviewResponse(BaseModel):
+    plan_id: str
+    review_status: str
+    reviewed_by: str | None = Field(default=None, description="From the reviewer's login token.")
+    reviewed_at: datetime | None = None
+
+
+class TreatmentRegisterRow(BaseModel):
+    """One plan in the entity-wide remediation register."""
+    plan_id: str
+    session_id: str
+    output_id: str
+    asset_name: str | None = None
+    scenario_title: str | None = None
+    status: str = Field(description="RUNNING | COMPLETE | ERROR (stale RUNNING projects as ERROR).")
+    risk_level: str | None = None
+    review_status: str | None = None
+    reviewed_by: str | None = None
+    error_message: str | None = None
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class TreatmentRegisterPage(BaseModel):
+    """GET /v1/entities/{id}/treatment-plans — every plan across the entity, newest first,
+    filterable by status / review_status / risk_level. This list IS the remediation register."""
+    entity_id: str
+    limit: int
+    offset: int
+    plans: list[TreatmentRegisterRow]
+
+
+class TreatmentAuditEvent(BaseModel):
+    """One entry in a treatment-plan audit trail. `detail` is the event's DetailJSON verbatim
+    (plan_id, status, decision, note… depending on the event type)."""
+    at: datetime | None = Field(default=None, description="When it happened (UTC).")
+    event: str = Field(description="requested | outcome | cancelled | reviewed | superseded.")
+    actor: str | None = Field(default=None, description="The person (null on system events).")
+    actor_type: str | None = Field(default=None, description="user | system.")
+    session_id: str | None = Field(default=None, description="Present on the entity-wide feed.")
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class TreatmentAuditTrail(BaseModel):
+    """GET .../treatment-plan/audit — one scenario's plan life story across ALL versions:
+    who requested, each attempt's outcome, cancels, reviews, and supersedes, oldest first."""
+    session_id: str
+    output_id: str
+    events: list[TreatmentAuditEvent]
+
+
+class TreatmentEntityAuditPage(BaseModel):
+    """GET /v1/entities/{id}/treatment-plans/audit — the compliance feed: every treatment-plan
+    action across the entity, newest first, filterable by date range and person."""
+    entity_id: str
+    limit: int
+    offset: int
+    events: list[TreatmentAuditEvent]
+
+
+class TreatmentEvidenceAttempt(BaseModel):
+    """One AI-call receipt (Prompt_Log row) for the plan version — the exact words exchanged."""
+    at: datetime | None = None
+    prompt: str | None = Field(default=None, description="The exact flattened prompt sent.")
+    response: str | None = Field(default=None, description="The exact raw model reply.")
+    model_name: str | None = None
+    model_version: str | None = None
+    prompt_version: str | None = None
+    parse_succeeded: bool | None = None
+
+
+class TreatmentEvidence(BaseModel):
+    """GET .../treatment-plan/evidence?version={plan_id} — the reproducibility bundle for ONE
+    version (superseded versions included — that is what an auditor asks for): the frozen
+    input snapshot, the validation/moderation record, and every AI-call receipt (linked by
+    Prompt_Log.CorrelationID; attempts generated before that column exist as rows without
+    linkage and return empty here)."""
+    plan_id: str
+    status: str = Field(description="The STORED status, deliberately unprojected — evidence "
+                                    "reports the record as written, so a stale RUNNING plan "
+                                    "reads RUNNING here while the poll GET presents it as "
+                                    "timed out.")
+    input_snapshot: dict[str, Any] | None = Field(default=None, description="Exactly what the AI was given.")
+    validation: dict[str, Any] | None = Field(default=None, description="Warnings + moderation record.")
+    attempts: list[TreatmentEvidenceAttempt]

@@ -12,17 +12,21 @@ IF OBJECT_ID(...) IS NULL, so re-running it is safe). app/db/engine.py never cal
 metadata.create_all() -- the app only ever reads a schema these scripts built.
 
 Full install order (all idempotent, all required for a working environment):
-  1. TSG_Core.sql                 -- baseline tables (incl. Threat_Scenario_Control_Map)
-  2. Threat_library.sql           -- threat-library extras (maps, rules, context config)
+  1. TSG_Core.sql                 -- baseline tables (TSG's own session/pipeline tables)
+  2. Threat_library.sql           -- threat-library master tables + extras (maps, rules, context config)
   3. Seed_to_Threat_library.sql   -- curated threat library data
-  4. Control_library.sql          -- control library tables (Step-4 control mapping)
+  4. Control_library.sql          -- control library tables + Threat_Scenario_Control_Map (Step-4 control mapping)
   5. Seed_to_Control_library.sql  -- 30 standards, 1288 controls, 6105 control-standard links
 
 
 WHEN YOU CHANGE THE SCHEMA: edit TSG_Core.sql and models.py together, in the same
-change. tests/test_schema_sync.py fails if a column exists in models.py but not in
-the script -- that test is now the only guard against a production DB being born
-missing a column the app selects, so do not skip it.
+change. THERE IS NO LONGER AN AUTOMATED GUARD FOR THIS. tests/test_schema_sync.py used
+to fail when a column existed in models.py but not in the script; the tests/ directory
+was removed, so nothing catches that drift now -- a column added to models.py and
+missed in TSG_Core.sql will not surface until a production query fails at runtime with
+"Invalid column name". Re-read both files side by side before committing.
+(app/db/invariants.py still asserts the UNIQUE indexes at boot; that check is alive and
+unrelated -- it does not look at columns.)
 
 2026-07-25: Alembic was REMOVED. It was a second, parallel owner of the same schema, and on a
 hand-scripted database it could only ever be wrong. These .sql scripts are the ONE source of
@@ -39,8 +43,11 @@ re-asserts rows rather than editing them, and provenance is first-writer.
 
 2026-07-29: Threat_Scenario_Output gained ScenarioNumber (int NOT NULL DEFAULT 1) -- which of a
 threat's coexisting scenarios this row is: 1 = the original, 2+ = alternate takes added by
-"generate next set" when no brand-new threat could be found, capped by max_scenarios_per_threat
-(default 2). UX_Scenario_ActiveIdentity was widened from (SessionID, IdentityHash) to
+"generate next set" when no brand-new threat could be found. (2026-08-05: the
+max_scenarios_per_threat cap named here was REMOVED -- how many scenarios a threat accumulates is
+now derived from its own plausible entry points, so the number varies per threat and per asset.
+The column and the index below are unchanged.) UX_Scenario_ActiveIdentity was widened from
+(SessionID, IdentityHash) to
 (SessionID, IdentityHash, ScenarioNumber) so those alternates can coexist while a second row at
 the SAME number still collides -- the double-click race guard is intact. TSG_Core.sql upgrades an
 existing database in place: a guarded ALTER adds the column (DEFAULT 1 -- every pre-existing row
@@ -155,3 +162,18 @@ endpoint becomes an existence oracle for other tenants' OutputIDs
 itself be superseded (v2 -> v3 -> v4), so it would sometimes hand back another dead id. The
 message points at ?include_replaced=true instead, which nests the retired version inside its
 current card and is always right. mark_scenarios_accepted's signature and return are unchanged.
+
+2026-08-05: Scenario_Audit gained IX_ScenarioAudit_SessionSubEvent (SessionID, SubsystemID,
+EventType, CreatedAt DESC). dal.latest_next_set_outcome reads the newest next_set_outcome row on
+every status poll, and Scenario_Audit grows with every event in a session's life, so unindexed
+that read was a scan whose cost climbed as the session was worked. Guarded IF NOT EXISTS, so
+re-running TSG_Core.sql is the upgrade. Deliberately NOT added to invariants.REQUIRED_INDEXES:
+that list is for UNIQUE indexes whose absence is a correctness bug, and a missing performance
+index must never fail boot.
+  Same date, no schema change but worth knowing when reading Threat_Scenario_Output rows:
+ScenarioJSON now carries entry_point (label), entry_point_id (the supporting system's own id) and
+plausible_entry_point_ids (that threat's coverage target, declared by its FIRST scenario and
+inherited by every later one). They are additive JSON keys inside the existing nvarchar(max)
+column -- no DDL, and rows written before this simply lack them, which every reader treats as
+"no coverage signal". IX_ScenarioOutput_SessionSubActive is what serves the single
+dal.active_scenario_rows read that folds those out.

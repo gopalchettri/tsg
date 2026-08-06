@@ -23,6 +23,7 @@ from typing import Any
 
 from sqlalchemy import func, insert, select, update
 
+from app.core.config import get_settings
 from app.core.enums import ThreatRuleType
 from app.core.logging import get_logger
 from app.db import dal
@@ -61,9 +62,9 @@ SOURCE_TAGS = {  # Threat_Type.Source / Threat_Catalogue.Source provenance value
     "misp_actors": "misp_galaxy",
 }
 
-# Weight for the auto-written OT relevance rules — matches scoping._DEFAULT_RULE_WEIGHT,
-# kept explicit here so the persisted Metadata is self-documenting.
-_AUTO_OT_RELEVANCE_WEIGHT = 10.0
+# Weight for the auto-written OT relevance rules lives in config
+# (Settings.auto_ot_relevance_weight, default matching default_rule_weight) — read at write
+# time so the persisted Metadata stays self-documenting.
 
 # The result dict caps the skipped list it carries (full counts always reported) — a big
 # STIX bundle can skip hundreds of rows, and this dict travels through the Celery result
@@ -514,7 +515,7 @@ def apply_ot_rules(sess, records: list[dict], type_ids: dict[str, int], tag: str
         if not dry_run:
             entry["threat_rule_id"] = dal.upsert_threat_rule(
                 sess, type_ids[type_name], str(ThreatRuleType.relevance_flag), "asset_type",
-                "OT", _AUTO_OT_RELEVANCE_WEIGHT, source=f"auto:{tag}")
+                "OT", get_settings().auto_ot_relevance_weight, source=f"auto:{tag}")
         rules.append(entry)
     return rules
 

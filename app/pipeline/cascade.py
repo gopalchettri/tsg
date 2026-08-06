@@ -18,6 +18,7 @@ from typing import Iterator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core import tuning
 from app.core.config import get_settings
 from app.core.enums import (
     AuditEventType, NextSetOutcome, RegenGranularity, SSEEventType, StageStatus, SubsystemLevel,
@@ -121,7 +122,8 @@ def _reason_info(reason: str | None) -> dict[str, str | None]:
     return {"detail": info.get("detail"), "message": info.get("message")}
 
 
-def _next_set_outcome(requested: int, made: int, variants: int, pool_size: int) -> NextSetOutcome:
+def _next_set_outcome(requested: int, made: int, variants: int, pool_size: int, *,
+                    top_up_failed: bool = False) -> NextSetOutcome:
     """Classify what a click ACHIEVED. `made` is fresh-threat scenarios committed, `variants` the
     alternate takes topped up, `pool_size` how many unserved threats the click actually targeted.
 
@@ -129,17 +131,26 @@ def _next_set_outcome(requested: int, made: int, variants: int, pool_size: int) 
     back, so generation(s) failed. Those targets keep Selected=1 and stay re-servable, making the
     next click a genuine retry. Anything else short means nothing further EXISTS — a correct
     terminal answer, not a deficiency, which is exactly the distinction a bare shortfall count
-    cannot express."""
+    cannot express.
+
+    `top_up_failed` closes the one hole in that reasoning. `_top_up_with_variants` MUST NEVER
+    RAISE, so it reports every failure — a dropped connection, a malformed ScenarioJSON, a bug —
+    as `created=0`, which is byte-identical to "nothing was eligible". On the conflict path
+    (made=0, pool_size=0) that lands on `exhausted`, which schemas.py publishes to the client as
+    "nothing further exists for this asset; clicking again changes nothing" and greys the button.
+    A transient error must never present as a terminal state, so a FAILED top-up is
+    partial_retryable — the one outcome that tells the user to click again."""
     if made + variants >= requested:
         return NextSetOutcome.complete
-    if made < pool_size:
-        return NextSetOutcome.partial_retryable  # actionable case wins when both apply
+    if made < pool_size or top_up_failed:  # actionable case wins when both apply
+        return NextSetOutcome.partial_retryable
     return NextSetOutcome.exhausted
 
 
 def _settle_next_set_click(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int, *,
                         requested: int, made: int, variants: int, pool_size: int,
-                        reason: str | None = None) -> NextSetOutcome:
+                        reason: str | None = None,
+                        top_up_failed: bool = False) -> NextSetOutcome:
     """The ONE place a "generate next set" click reports itself. Records the durable audit row
     FIRST, then mirrors it to the advisory SSE, and returns the outcome.
 
@@ -156,7 +167,7 @@ def _settle_next_set_click(sess: Session, scenario_session: dict, subsystem_id: 
     contradict a payload reporting five new scenarios."""
     sid = scenario_session["SessionID"]
     delivered = made + variants
-    outcome = _next_set_outcome(requested, made, variants, pool_size)
+    outcome = _next_set_outcome(requested, made, variants, pool_size, top_up_failed=top_up_failed)
     detail = json.dumps({"outcome": str(outcome), "requested": requested, "delivered": delivered,
                         "variants": variants, "reason": reason, "epoch": epoch,
                         "subsystem_id": subsystem_id})
@@ -391,27 +402,40 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
     return tasks.decide_session_outcome(sess, scenario_session)
 
 
-def _coverage_exclusions(threats: list[dict]) -> list[str]:
+def _coverage_exclusions(threats: list[dict], cap: int | None = None) -> list[str]:
     """Distinct labels of the threats already proposed for this subsystem, fed to the
     coverage-aware prompt so an additive round asks for genuinely NEW ones. Prefer the grounded
     library label, fall back to the raw proposal; drop blanks.
 
     Capped by `coverage_exclusions_max` — the one prompt input that GROWS with every accumulated
-    next-set round.
+    next-set round. Truncation keeps the MOST RECENT labels: `dal.active_threats` returns newest
+    first and the fold below preserves that order, so a session past the cap drops the threats
+    least likely to be re-proposed. This previously sorted ALPHABETICALLY before truncating, which
+    froze the list on an arbitrary prefix — past the cap the newest threats never reached the
+    prompt at all, and the additive round kept re-proposing exactly the ones it had just found.
     # ponytail: the exclusion list is steering, not enforcement — tasks.py's identity-fold dedup
     # silently drops any re-proposed already-active threat, so truncation can only ever cost one
     # wasted proposal, never a duplicate row. Configurable so a long-running session that starts
     # burning proposals on threats it already has can be tuned without a code change."""
-    labels = {(t.get("library_threat_name") or t.get("threat_name")
-            or t.get("library_threat_type") or t.get("threat_type") or "") for t in threats}
-    return sorted(lbl for lbl in labels if lbl)[:get_settings().coverage_exclusions_max]
+    # tasks.threat_label is THE definition — the semantic near-duplicate scan measures against
+    # the same string this list steers away from, so the two can never drift apart.
+    if cap is None:  # session-tuned when the caller carries a snapshot; config otherwise
+        cap = get_settings().coverage_exclusions_max
+    labels = (tasks.threat_label(t) for t in threats)
+    # dict.fromkeys, not set(): dedup while PRESERVING the newest-first order the cap slices.
+    return list(dict.fromkeys(lbl for lbl in labels if lbl))[:cap]
 
 
 def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
                         subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
-                        shortfall: int, *, exclude: set[str] | None = None) -> int:
+                        shortfall: int, *, exclude: set[str] | None = None) -> tuple[int, bool]:
     """Fill the slots a next-set click could NOT fill from the unserved pool, with one alternate
-    scenario per already-covered threat. Returns how many landed.
+    scenario per already-covered threat. Returns (how many landed, whether it FAILED).
+
+    The bool is the whole point of the tuple: because this never raises, a caller reading only
+    the count cannot tell "nothing was eligible" (a true terminal answer) from "the attempt blew
+    up" (retry me). `_next_set_outcome` needs that distinction or a transient error reports as
+    `exhausted` and permanently greys the client's button.
 
     `shortfall` is what the POOL came up short by, never `next_set_size - committed`: a generation
     that FAILED already reports itself via the stage row's partial_error, and filling its slot
@@ -423,7 +447,7 @@ def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: i
     are unconditional. LLMSlotUnavailable is swallowed too: the redelivery's claim_stage no-ops
     against an AWAITING_DECISION stage, so re-raising loses the SSE and buys no retry."""
     if shortfall <= 0:
-        return 0
+        return 0, False  # nothing was asked for — not a failure
     sid = scenario_session["SessionID"]
     try:
         created = tasks.write_variant_scenarios(sess, scenario_session, subsystem_id, subsystems,
@@ -439,7 +463,7 @@ def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: i
                             DetailJSON=json.dumps({"next_set": True, "subsystem_id": subsystem_id,
                                                 "new_scenarios": created, "variants_generated": created}))
             sess.commit()
-        return created
+        return created, False
     except Exception as exc:  # noqa: BLE001 — see docstring; a committed batch must never report failure
         # ROLLBACK needs its own guard: on a broken connection whose SQLSTATE isn't in the
         # dialect's is_disconnect set it re-raises, and an escape from HERE recreates the exact
@@ -456,7 +480,7 @@ def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: i
         (log.warning if transient else log.error)(
             "next_set.variant_top_up_failed", session_id=sid, subsystem=subsystem_id,
             shortfall=shortfall, transient=transient, exc_info=True)
-        return 0
+        return 0, True
 
 
 def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
@@ -467,8 +491,8 @@ def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_i
     about it and reports the outcome; it never re-raises.
 
     The variant fallback runs for EVERY reason code. Whether it can help depends only on whether
-    some already-covered threat is still under max_scenarios_per_threat — dal.variant_eligible_
-    primaries answers that on its own and yields 0 when it can't. The old
+    some already-covered threat still has an uncovered plausible entry point —
+    dal.variant_eligible_primaries answers that on its own and yields 0 when it can't. The old
     `if exc.reason == "no_new_threats_found"` allowlist answered a DIFFERENT question ("why was
     the batch empty") and so suppressed a working fallback whenever a candidate was found and
     rescored out, leaving the click with 0 scenarios while eligible primaries sat unused — and
@@ -478,8 +502,9 @@ def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_i
     just-served threat to exclude. The stage is already terminal and the subsystem lock is still
     held, so this is a plain side write — no claim/epoch dance."""
     sid = scenario_session["SessionID"]
-    created = _top_up_with_variants(sess, scenario_session, subsystem_id, epoch, subsystems,
-                                    asset_context, llm, task_id, next_set_size)
+    created, top_up_failed = _top_up_with_variants(sess, scenario_session, subsystem_id, epoch,
+                                                subsystems, asset_context, llm, task_id,
+                                                next_set_size)
     if not created:
         # Deliberately NOT routed through _record_failure — that avoidance is what keeps a
         # transient additive failure from wedging or cancelling the session.
@@ -493,13 +518,15 @@ def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_i
         sess.commit()
     # Both branches report through the same call, so the durable row and the SSE can never
     # disagree about what this click did. `made=0` (nothing fresh was committed on this path) and
-    # `pool_size=0` (the pool is what came up empty) ⇒ never `partial_retryable`: there was no
-    # served-then-failed target here. `exc.reason` rides along even when variants SUCCEEDED —
-    # that provenance ("a candidate was found and rejected") used to reach the client via the
-    # fruitless path and would otherwise be lost now that the fallback usually rescues the click.
+    # `pool_size=0` (the pool is what came up empty), so `made < pool_size` can never fire here —
+    # which is exactly why `top_up_failed` has to be threaded: without it this path reports a
+    # blown-up top-up as `exhausted` ("nothing further exists"), the single most misleading
+    # answer available. `exc.reason` rides along even when variants SUCCEEDED — that provenance
+    # ("a candidate was found and rejected") used to reach the client via the fruitless path and
+    # would otherwise be lost now that the fallback usually rescues the click.
     _settle_next_set_click(sess, scenario_session, subsystem_id, epoch,
                         requested=next_set_size, made=0, variants=created,
-                        pool_size=0, reason=exc.reason)
+                        pool_size=0, reason=exc.reason, top_up_failed=top_up_failed)
     return "generated" if created else "no_new_threats_this_round"
 
 
@@ -527,7 +554,8 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
             log.warning("next_set.locked", session_id=sid, subsystem=subsystem_id)
             return tasks.decide_session_outcome(sess, scenario_session)
         try:
-            next_set_size = get_settings().next_set_size
+            tn = tuning.from_session(scenario_session)  # the session's frozen rulebook
+            next_set_size = tn.next_set_size
             fresh = dal.next_unserved_unique_threats(sess, sid, subsystem_id, next_set_size)
             if len(fresh) < next_set_size and not dal.stage_completed_at_epoch_or_newer(
                     sess, sid, subsystem_id, SubsystemLevel.THREATS, threats_epoch):
@@ -540,12 +568,17 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
                 # terminal, or THREATS stays RUNNING and decide_session_outcome wedges the session.
                 # The endpoint reserved the epoch but did NOT reset THREATS (an IDLE row would
                 # wedge decide_session_outcome), so the reset lives here, guarded.
-                exclude = _coverage_exclusions(dal.active_threats(sess, sid, subsystem_id))
+                # Read ONCE, used twice: the labels steer the prompt, and the rows themselves
+                # carry each threat's category so the semantic near-duplicate scan can gate on
+                # impact class rather than on similarity alone.
+                prior_threats = dal.active_threats(sess, sid, subsystem_id)
+                exclude = _coverage_exclusions(prior_threats, cap=tn.coverage_exclusions_max)
                 dal.reset_stage_for_regen(sess, sid, subsystem_id, (SubsystemLevel.THREATS,), threats_epoch)
                 new_threats: list[dict] = []
                 try:
                     new_threats, _prov = tasks.find_threats(sess, scenario_session, subsystems, asset_context, llm, task_id,
-                                                        epoch=threats_epoch, supersede=False, exclude=exclude)
+                                                        epoch=threats_epoch, supersede=False, exclude=exclude,
+                                                        prior_threats=prior_threats)
                 except LLMSlotUnavailable:
                     raise  # retryable capacity squeeze — leave THREATS reclaimable so the retry re-runs it
                 except Exception as exc:  # noqa: BLE001 — a transient additive-threats failure must not wedge/cancel
@@ -591,15 +624,17 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
                 made = len(scen_provs)
                 # Top up when the POOL came up short — see _top_up_with_variants for why the
                 # shortfall is `fresh`-derived, not `next_set_size - committed`.
-                variants = _top_up_with_variants(sess, scenario_session, subsystem_id, epoch,
-                                                subsystems, asset_context, llm, task_id,
-                                                next_set_size - len(fresh), exclude=set(fresh))
+                variants, top_up_failed = _top_up_with_variants(
+                    sess, scenario_session, subsystem_id, epoch, subsystems, asset_context, llm,
+                    task_id, next_set_size - len(fresh), exclude=set(fresh))
                 # `pool_size=len(fresh)` is what makes a FAILED generation distinguishable from an
                 # exhausted library: fewer scenarios back than threats handed over means the
                 # targets are still Selected=1 and re-servable, so the next click retries them.
+                # `top_up_failed` covers the other half — a pool that delivered in full while the
+                # variant top-up blew up would otherwise round to `exhausted`.
                 _settle_next_set_click(sess, scenario_session, subsystem_id, epoch,
                                     requested=next_set_size, made=made, variants=variants,
-                                    pool_size=len(fresh))
+                                    pool_size=len(fresh), top_up_failed=top_up_failed)
         except RegenerateConflict as exc:
             # No new unique threats this round. write_scenarios already returned the stage to
             # AWAITING_DECISION and mutated nothing — benign: no ERROR, no error SSE, click again.

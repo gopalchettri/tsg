@@ -123,7 +123,7 @@ def _normalize_str_list(raw: Any) -> list[str]:
 
 def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_name: str | None,
                     asset_name: str | None = None, critical_service: list[str] | None = None) -> dict[str, Any]:
-    """Structural check (scenario_title, scenario_statement, risk_statement present and non-empty)
+    """Structural check (scenario_title, scenario_statement, risk_statement are present and non-empty)
     plus a consistency proxy: the statement references the threat it narrates, title and statement
     reference the asset, and risk_statement references the asset and critical service. The proxy
     is TOKEN OVERLAP via `_mentions`, not whole-phrase containment. Flags, never raises.

@@ -21,20 +21,26 @@
 -- Contract (safe to re-run any time): enables RCSI once; creates any missing
 -- table/column/index; never touches row data.
 --
--- Creates TSG's own pipeline tables and the threat-library masters
--- (Threat_Category/Type/Catalogue/Actor + the type-actor map), schema-only —
--- see scripts/Seed_to_Threat_library.sql for real rows. Config_Threat_Rule
--- and Threat_Catalogue_Category_Map live in scripts/Threat_library.sql
--- instead. Assumes the ASSET/ONBOARDING platform tables already exist
--- (group, onboarding_*, ctm_scan_*) — a different system's schema TSG reuses
--- but does not create (SDD §7.7). No FOREIGN KEYs by design (SDD §7.7).
+-- Creates TSG's own pipeline tables, schema-only. The threat-library MASTER
+-- tables (Threat_Category/Type/Catalogue/Actor + the type-actor map),
+-- Config_Threat_Rule and Threat_Catalogue_Category_Map live in
+-- scripts/Threat_library.sql instead; Threat_Scenario_Control_Map lives in
+-- scripts/Control_library.sql (both moved out of this file 2026-08-04 so
+-- each script owns its own domain) — see scripts/Seed_to_Threat_library.sql
+-- for real threat rows. Assumes the ASSET/ONBOARDING platform tables already
+-- exist (group, onboarding_*, ctm_scan_*) — a different system's schema TSG
+-- reuses but does not create (SDD §7.7). No FOREIGN KEYs by design (SDD §7.7).
 --
 -- Uses GO batch separators: SQL Server binds object/column names for an
 -- entire batch before executing any of it, so a table created earlier in the
 -- same unbroken batch as a later reference to it fails to resolve.
 --
--- tests/test_schema_sync.py asserts every models.py column appears in the
--- CREATE TABLE blocks below — keep both in lockstep.
+-- Every models.py column must appear in the CREATE TABLE blocks across
+-- TSG_Core.sql, Threat_library.sql and Control_library.sql — keep all three in
+-- lockstep with models.py. A new column needs BOTH the CREATE TABLE entry (for
+-- a fresh database) AND a guarded ALTER below it (for existing ones): without
+-- the ALTER, dal.load_session-style full-row SELECTs break on the first read
+-- after the model gains the column.
 -- ============================================================================
 
 SET QUOTED_IDENTIFIER ON;
@@ -81,11 +87,20 @@ CREATE TABLE Scenario_Session (
     IdempotencyKey        nvarchar(200)  NULL,
     SectorIDsJSON         nvarchar(max)  NULL,
     AssetContextJSON      nvarchar(max)  NULL,
+    TuningJSON            nvarchar(max)  NULL,               -- frozen tuning rulebook (core.tuning); NULL = pre-feature session
     CreatedAt             datetime2      NULL,
     UpdatedAt             datetime2      NULL,
     CompletedAt           datetime2      NULL,
     CONSTRAINT CK_Session_Status CHECK (SessionStatus IN ('active', 'completed', 'cancelled'))
 );
+
+-- TuningJSON: the session's frozen business-calibration snapshot, resolved from Config_Tuning
+-- at creation. Guarded ALTER for existing databases -- without it, dal.load_session's full-row
+-- SELECT fails on the first session read after the model gains the column. NULL means
+-- "pre-feature session: resolve tuning from config".
+IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Session', 'TuningJSON') IS NULL
+    ALTER TABLE Scenario_Session ADD TuningJSON nvarchar(max) NULL;
 
 IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NULL
 CREATE TABLE Subsystem_Stage_State (
@@ -122,6 +137,7 @@ CREATE TABLE Identified_Threat (
     ThreatCategory     nvarchar(200) NOT NULL,
     ThreatType         nvarchar(300) NOT NULL,
     ThreatName         nvarchar(500) NULL,
+    GenericName        nvarchar(500) NULL,   -- library-shaped ThreatName (no asset/product names); NULL = legacy row
     ThreatActorsJSON   nvarchar(max) NULL,
     LibraryThreatType  nvarchar(300) NULL,
     LibraryThreatName  nvarchar(500) NULL,
@@ -147,6 +163,7 @@ CREATE TABLE Scoped_Threat (
     Selected        int           NOT NULL,
     Reason          nvarchar(500) NULL,
     RejectionKind   nvarchar(30)  NULL,
+    SelectionKind   nvarchar(30)  NULL,
     FactorsJSON     nvarchar(max) NULL,
     Superseded      int           NOT NULL,
     CreatedAt       datetime2     NULL
@@ -159,6 +176,27 @@ CREATE TABLE Scoped_Threat (
 IF OBJECT_ID('dbo.Scoped_Threat', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scoped_Threat', 'RejectionKind') IS NULL
     ALTER TABLE Scoped_Threat ADD RejectionKind nvarchar(30) NULL;
+
+-- SelectionKind: WHY a threat WAS selected (SelectionReason enum: verified_match /
+-- unverified_match). The selection-side twin of RejectionKind. NULL on rejected rows and on
+-- rows written before this column existed -- readers treat NULL as "unknown", never re-derive
+-- it from Reason prose.
+IF OBJECT_ID('dbo.Scoped_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scoped_Threat', 'SelectionKind') IS NULL
+    ALTER TABLE Scoped_Threat ADD SelectionKind nvarchar(30) NULL;
+
+-- GenericName: the library-shaped form of ThreatName (no asset/product names), written at
+-- Stage 1 so accept-time promotion triage runs on the AI's own generalization instead of the
+-- string-strip fallback. NULL = legacy row (triage falls back to the strip).
+IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'GenericName') IS NULL
+    ALTER TABLE Identified_Threat ADD GenericName nvarchar(500) NULL;
+
+-- ProposedGenericName: carried onto the curator queue so middle-band reviewers see the
+-- library-shaped proposal, not only the asset-embedded name.
+IF OBJECT_ID('dbo.Threat_Candidate_Review', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Candidate_Review', 'ProposedGenericName') IS NULL
+    ALTER TABLE Threat_Candidate_Review ADD ProposedGenericName nvarchar(500) NULL;
 
 IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NULL
 CREATE TABLE Threat_Scenario_Output (
@@ -222,17 +260,9 @@ CREATE TABLE Threat_Library_Import_Run (
     ErrorMessage     nvarchar(max) NULL
 );
 
-IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NULL
-CREATE TABLE Threat_Scenario_Control_Map (
-    OutputID          uniqueidentifier NOT NULL,
-    ControlLibraryID  int           NOT NULL,
-    SessionID         uniqueidentifier NOT NULL,
-    MapRank           int           NOT NULL,   -- 1 = best match for this scenario
-    Score             float         NULL,       -- raw rerank 0-100
-    SuggestedControl  nvarchar(500) NULL,       -- the LLM's free-text suggestion this grounded from (NULL on scenario-text fallback)
-    CreatedAt         datetime2     NULL,
-    CONSTRAINT PK_Threat_Scenario_Control_Map PRIMARY KEY (OutputID, ControlLibraryID)
-);
+-- Threat_Scenario_Control_Map (Step-4 threat->control mapping) moved to
+-- scripts/Control_library.sql on 2026-08-04 -- it references ControlLibraryID,
+-- so it now lives next to the Control_Library table it maps to.
 
 IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NULL
 CREATE TABLE Scenario_Audit (
@@ -268,8 +298,16 @@ CREATE TABLE Prompt_Log (
     Model           nvarchar(200) NULL,
     ModelVersion    nvarchar(100) NULL,
     ParseSucceeded  bit           NOT NULL,
-    CreatedAt       datetime2     NOT NULL
+    CreatedAt       datetime2     NOT NULL,
+    CorrelationID   uniqueidentifier NULL      -- per-item id of the work this call served
+                                               -- (treatment: PlanID) — the audit/evidence join
 );
+
+-- Existing databases created before CorrelationID (2026-08-06): add it in place. Nullable —
+-- legacy rows simply have no per-item linkage; nothing to backfill.
+IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Prompt_Log', 'CorrelationID') IS NULL
+    ALTER TABLE Prompt_Log ADD CorrelationID uniqueidentifier NULL;
 
 -- Existing databases created before the flattened-prompt column (2026-08-03): add it in place.
 -- Nullable, so no DEFAULT and no table rewrite. Rows written before this column read NULL -- the
@@ -287,6 +325,7 @@ CREATE TABLE Threat_Candidate_Review (
     ProposedCategory  nvarchar(200) NOT NULL,
     ProposedType      nvarchar(300) NOT NULL,
     ProposedName      nvarchar(500) NOT NULL,
+    ProposedGenericName nvarchar(500) NULL,  -- library-shaped name the curator generalizes toward
     Status            nvarchar(20)  NOT NULL,
     ThreatTypeID      int NULL,
     ThreatCatalogueID int NULL,
@@ -306,8 +345,9 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_
 -- generation attempt against an ACCEPTED scenario; at most one active (Superseded = 0) row per
 -- OutputID, enforced by UX_TreatmentPlan_ActiveOutput in SECTION 3. Lives OUTSIDE the session
 -- state machine (accepted scenarios sit on completed sessions, where stage locks refuse to run) —
--- the row's own Status column is the state. Reads crm_* Risk-module tables at POST time only;
--- the frozen context goes in InputSnapshotJSON so worker and reads never touch crm_*.
+-- the row's own Status column is the state. 2026-08-06: the register's risk data (ratings,
+-- level, existing controls, echo fields) arrives IN the request body — TSG reads no external
+-- risk tables; the frozen context goes in InputSnapshotJSON so worker and reads see one truth.
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NULL
 CREATE TABLE Risk_Treatment_Plan (
     PlanID                  uniqueidentifier NOT NULL CONSTRAINT PK_Risk_Treatment_Plan PRIMARY KEY,
@@ -316,7 +356,7 @@ CREATE TABLE Risk_Treatment_Plan (
     TenantID                nvarchar(200) NULL,
     EntityID                nvarchar(200) NULL,         -- copied from the session (authz boundary)
     UserID                  nvarchar(200) NULL,         -- requesting principal (provenance)
-    CrmRiskIdentificationID int           NOT NULL,     -- crm_risk_identification.id from the request
+    CrmRiskIdentificationID int           NULL,         -- reserved; unused (no register lookup)
     TreatmentStrategy       nvarchar(30)  NOT NULL,     -- 'Mitigate' only in v1
     Status                  nvarchar(20)  NOT NULL,     -- StageStatus subset: RUNNING | COMPLETE | ERROR
     ActiveTaskID            nvarchar(100) NULL,         -- Celery claim / redelivery fence
@@ -328,123 +368,39 @@ CREATE TABLE Risk_Treatment_Plan (
     Superseded              int           NOT NULL CONSTRAINT DF_TreatmentPlan_Superseded DEFAULT 0,
     CreatedAt               datetime2     NULL,
     UpdatedAt               datetime2     NULL,         -- progress clock: claim + each LLM attempt bump it
-    CompletedAt             datetime2     NULL
+    CompletedAt             datetime2     NULL,
+    RiskLevel               nvarchar(10)  NULL,         -- register risk level from the request (filterable)
+    ReviewStatus            nvarchar(20)  NULL,         -- TreatmentReviewStatus; NULL = not reviewed
+    ReviewComment           nvarchar(max) NULL,
+    ReviewedBy              nvarchar(200) NULL,         -- from the reviewer's login token
+    ReviewedAt              datetime2     NULL
 );
 GO
 
+-- Existing databases created before the review/register columns (2026-08-06): add in place.
+IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'RiskLevel') IS NULL
+BEGIN
+    ALTER TABLE Risk_Treatment_Plan ADD RiskLevel nvarchar(10) NULL;
+    ALTER TABLE Risk_Treatment_Plan ADD ReviewStatus nvarchar(20) NULL;
+    ALTER TABLE Risk_Treatment_Plan ADD ReviewComment nvarchar(max) NULL;
+    ALTER TABLE Risk_Treatment_Plan ADD ReviewedBy nvarchar(200) NULL;
+    ALTER TABLE Risk_Treatment_Plan ADD ReviewedAt datetime2 NULL;
+END
+GO
+
+-- 2026-08-06: databases created before the request-body redesign have this column NOT NULL;
+-- nothing populates it anymore, so relax it. Idempotent: guarded on the live nullability.
+IF COLUMNPROPERTY(OBJECT_ID('dbo.Risk_Treatment_Plan'), 'CrmRiskIdentificationID', 'AllowsNull') = 0
+    ALTER TABLE Risk_Treatment_Plan ALTER COLUMN CrmRiskIdentificationID int NULL;
+GO
+
 -- ============================================================
--- SECTION 2 — Threat-library master tables. Schema only — see
--- scripts/Seed_to_Threat_library.sql for real rows. Type/Catalogue/Actor
--- PKs are IDENTITY (R10 promote-on-accept inserts new masters and reads the
--- generated key back). Threat_Category stays a plain int PK (fixed STRIDE
--- set, app never inserts it).
+-- SECTION 2 — (moved 2026-08-04) Threat-library master tables
+-- (Threat_Category/Type/Catalogue/Actor + the type-actor map) and their
+-- natural-key guard indexes (formerly SECTION 4 below) now live in
+-- scripts/Threat_library.sql, alongside Config_Threat_Rule and
+-- Threat_Catalogue_Category_Map, which already lived there.
 -- ============================================================
-
--- Audit quartet on all four masters (CreatedAt/CreatedBy/UpdatedAt/UpdatedBy): all NULL and
--- DEFAULT-less on purpose. Seed_to_Threat_library.sql inserts with explicit column lists, so a
--- NOT NULL column without a default would break every one of its ~120 statements; NULL also reads
--- honestly as "row predates the audit columns" rather than a fabricated timestamp. CreatedBy /
--- UpdatedBy hold the caller's user id (Principal.user_id / JWT sub) — the same identity
--- Scenario_Audit.ActorUserID records — or an 'auto:<source>' / 'cli:<user>' literal when a
--- background import had no logged-in caller. Updated* are written ONLY by the CRUD endpoints
--- (app/api/threat_library_crud.py): the importer and promote-on-accept upserts deliberately leave
--- an existing row untouched, because provenance is first-writer (dal.upsert_threat_type).
-IF OBJECT_ID('dbo.Threat_Category', 'U') IS NULL
-CREATE TABLE Threat_Category (
-    ThreatCategoryID    int            NOT NULL CONSTRAINT PK_Threat_Category PRIMARY KEY,
-    ThreatCategoryName  nvarchar(200)  NOT NULL,
-    ThreatCategoryCode  nvarchar(20)   NULL,
-    SecurityObjective   nvarchar(200)  NULL,
-    IsActive            bit            NOT NULL,
-    IsDeleted           bit            NOT NULL,
-    CreatedAt           datetime2      NULL,
-    CreatedBy           nvarchar(200)  NULL,
-    UpdatedAt           datetime2      NULL,
-    UpdatedBy           nvarchar(200)  NULL
-);
-
-IF OBJECT_ID('dbo.Threat_Type', 'U') IS NULL
-CREATE TABLE Threat_Type (
-    ThreatTypeID             int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Type PRIMARY KEY,
-    ThreatTypeName           nvarchar(300)  NOT NULL,
-    Description              nvarchar(max)  NULL,
-    SectorID                 int            NULL,
-    ThreatCategoryID  int            NULL,
-    IsActive                 bit            NOT NULL,
-    IsDeleted                bit            NOT NULL,
-    CreatedAt                datetime2      NULL,
-    CreatedBy                nvarchar(200)  NULL,
-    UpdatedAt                datetime2      NULL,
-    UpdatedBy                nvarchar(200)  NULL
-);
-
-IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NULL
-CREATE TABLE Threat_Catalogue (
-    ThreatCatalogueID  int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Catalogue PRIMARY KEY,
-    ThreatTypeID       int            NOT NULL,
-    ThreatName         nvarchar(500)  NOT NULL,
-    Description        nvarchar(max)  NULL,
-    SectorID           int            NULL,
-    IsActive           bit            NOT NULL,
-    IsDeleted          bit            NOT NULL,
-    CreatedAt          datetime2      NULL,
-    CreatedBy          nvarchar(200)  NULL,
-    UpdatedAt          datetime2      NULL,
-    UpdatedBy          nvarchar(200)  NULL
-);
-
--- Source mirrors Threat_Type.Source/Threat_Catalogue.Source (which Threat_library.sql bolts on) so
--- an imported actor is distinguishable from an AI-promoted or hand-curated one. Declared in this
--- CREATE block rather than as an ALTER over there because the column is new — that keeps it out of
--- test_schema_sync's _COLUMN_DEPLOYED_SEPARATELY allowlist.
-IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NULL
-CREATE TABLE Threat_Actor (
-    ThreatActorID    int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Actor PRIMARY KEY,
-    ThreatActorName  nvarchar(200)  NOT NULL,
-    IsCapable        int            NOT NULL,
-    IsActive         bit            NOT NULL,
-    IsDeleted        bit            NOT NULL,
-    Source           nvarchar(50)   NULL,
-    CreatedAt        datetime2      NULL,
-    CreatedBy        nvarchar(200)  NULL,
-    UpdatedAt        datetime2      NULL,
-    UpdatedBy        nvarchar(200)  NULL
-);
-
--- Existing databases: every CREATE above is IF OBJECT_ID(...) IS NULL guarded, so it is a no-op
--- once the table exists and the new columns would never arrive. Same in-place pattern as
--- Threat_Scenario_Output.ControlsMappedAt in Section 1. Guarded on one column per table — the four
--- are always added together, so the first one's absence proves none of them are there.
-IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Actor', 'Source') IS NULL
-    ALTER TABLE Threat_Actor ADD Source nvarchar(50) NULL;
-
-IF OBJECT_ID('dbo.Threat_Category', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Category', 'CreatedAt') IS NULL
-    ALTER TABLE Threat_Category ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
-
-IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Type', 'CreatedAt') IS NULL
-    ALTER TABLE Threat_Type ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
-
-IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Catalogue', 'CreatedAt') IS NULL
-    ALTER TABLE Threat_Catalogue ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
-
-IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Actor', 'CreatedAt') IS NULL
-    ALTER TABLE Threat_Actor ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
-
-IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NULL
-CREATE TABLE ThreatType_ThreatActor_Map (
-    ThreatTypeID   int NOT NULL,
-    ThreatActorID  int NOT NULL,
-    CreatedAt datetime2 NULL CONSTRAINT DF_TypeActorMap_CreatedAt DEFAULT SYSUTCDATETIME(),
-    CONSTRAINT PK_ThreatType_ThreatActor_Map PRIMARY KEY (ThreatTypeID, ThreatActorID)
-);
-
--- Existing databases created before the CreatedAt stamp (2026-07-30): add it in place.
-IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.ThreatType_ThreatActor_Map', 'CreatedAt') IS NULL
-    ALTER TABLE ThreatType_ThreatActor_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_TypeActorMap_CreatedAt DEFAULT SYSUTCDATETIME();
-
--- Config_Threat_Rule and Threat_Catalogue_Category_Map live in
--- scripts/Threat_library.sql instead — see that file.
 
 GO
 
@@ -515,8 +471,32 @@ CREATE INDEX IX_IdentifiedThreat_SessionSubActive ON Identified_Threat(SessionID
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScopedThreat_SessionSubActive' AND object_id = OBJECT_ID('dbo.Scoped_Threat'))
 CREATE INDEX IX_ScopedThreat_SessionSubActive ON Scoped_Threat(SessionID, SubsystemID) WHERE Superseded = 0;
 
+-- UNFILTERED and covering, deliberately: every app query sends Superseded as a BIND PARAMETER
+-- (SQLAlchemy parameterizes `Superseded == 0`), and SQL Server cannot match a filtered index
+-- against a parameterized predicate — it must prove the filter covers the query at compile
+-- time. So the filtered index above is never chosen by dal.threat_scores, whose grouped
+-- max(Score)/min(ScopeRank) per ThreatID would otherwise scan the whole clustered PK on every
+-- /results poll. Superseded as a trailing KEY column seeks regardless of parameterization, and
+-- the INCLUDE answers the aggregate with zero key lookups.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScopedThreat_SessionActiveScores' AND object_id = OBJECT_ID('dbo.Scoped_Threat'))
+CREATE INDEX IX_ScopedThreat_SessionActiveScores ON Scoped_Threat(SessionID, Superseded)
+    INCLUDE (ThreatID, Score, ScopeRank);
+
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioOutput_SessionSubActive' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
 CREATE INDEX IX_ScenarioOutput_SessionSubActive ON Threat_Scenario_Output(SessionID, SubsystemID) WHERE Superseded = 0;
+-- Also THE index behind dal.active_scenario_rows, the single read serving coverage eligibility,
+-- sibling steering and cross-threat comparison. Deliberately NOT extended to
+-- INCLUDE(ScenarioJSON): that column holds the entire scenario, so covering it would duplicate
+-- the table into the index. One key lookup per active row is the right trade now that the three
+-- separate reads of these same rows have been collapsed into one.
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_SessionSubEvent' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+CREATE INDEX IX_ScenarioAudit_SessionSubEvent ON Scenario_Audit(SessionID, SubsystemID, EventType, CreatedAt DESC);
+-- dal.latest_next_set_outcome reads the newest next_set_outcome row for a (session, subsystem)
+-- on EVERY status poll, and Scenario_Audit grows with every event in a session's life, so
+-- unindexed that read is a scan whose cost climbs as the session is worked. Deliberately NOT in
+-- invariants.REQUIRED_INDEXES: that list is for UNIQUE indexes whose absence is a CORRECTNESS
+-- bug, and a missing performance index must never fail boot.
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Session_EntityUser' AND object_id = OBJECT_ID('dbo.Scenario_Session'))
 CREATE INDEX IX_Session_EntityUser ON Scenario_Session(EntityID, UserID) INCLUDE (SessionStatus);
@@ -535,31 +515,10 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_TreatmentPlan_SessionA
 CREATE INDEX IX_TreatmentPlan_SessionActive ON Risk_Treatment_Plan(SessionID) WHERE Superseded = 0;
 
 -- ============================================================
--- SECTION 4 — Natural-key guard indexes on the threat-library masters
+-- SECTION 4 — (moved 2026-08-04) Natural-key guard indexes on the
+-- threat-library masters now live in scripts/Threat_library.sql, next to
+-- the tables they guard.
 -- ============================================================
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Type'))
-CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName, ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCatalogue_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Catalogue'))
-CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatTypeID, ThreatName, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
-CREATE UNIQUE INDEX UX_ThreatActor_NaturalKey ON Threat_Actor(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0;
-
--- Threat_Category was the ONLY CRUD-writable master without one (2026-07-30). The shared CRUD
--- create/update path turns a clash into a 409 purely by catching the IntegrityError this index
--- raises (app/api/library_crud.py) — with no index there is no error, so a duplicate name was
--- accepted silently, and the two consumers then disagreed about which id it means:
--- grounding.find_category orders by ThreatCategoryID and takes the LOWEST, while the library
--- importer builds its own name->id map. Same filtered shape as its three siblings above, so a
--- soft-deleted category frees its name for reuse.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCategory_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Category'))
-CREATE UNIQUE INDEX UX_ThreatCategory_NaturalKey ON Threat_Category(ThreatCategoryName) WHERE IsActive = 1 AND IsDeleted = 0;
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatType_Category_Active' AND object_id = OBJECT_ID('dbo.Threat_Type'))
-CREATE INDEX IX_ThreatType_Category_Active ON Threat_Type(ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
--- supports grounding.get_possible_types()'s category+sector filter.
 
 -- ============================================================
 -- SECTION 5 — Platform-table columns app code reads (ctm_scan_entity,
@@ -594,6 +553,30 @@ BEGIN
         ALTER TABLE onboarding_supporting_systems ADD database_platforms nvarchar(300) NULL;
 END
 
+-- ============================================================
+-- Config_Tuning: business-calibration overrides, editable at runtime (no restart).
+-- An active row overrides the matching Settings field for every session created AFTER the
+-- edit; a running session keeps its Scenario_Session.TuningJSON snapshot. Only keys in
+-- app/core/tuning.py::TUNABLE_KEYS have effect. EmbeddingModel names the model an
+-- embedding-coupled value (semantic thresholds, triage bands) was tuned on -- on mismatch
+-- with the running embedding model the row is skipped and the config default applies.
+-- An EMPTY table is byte-identical to config-only behaviour (no-op rollout).
+-- ============================================================
+IF OBJECT_ID('dbo.Config_Tuning', 'U') IS NULL
+CREATE TABLE Config_Tuning (
+    TuningID        int            NOT NULL IDENTITY(1,1) CONSTRAINT PK_Config_Tuning PRIMARY KEY,
+    TuningKey       nvarchar(100)  NOT NULL CONSTRAINT UQ_Config_Tuning_Key UNIQUE,
+    TuningValue     nvarchar(100)  NOT NULL,
+    ValueType       nvarchar(10)   NOT NULL CONSTRAINT CK_Config_Tuning_ValueType CHECK (ValueType IN ('float', 'int')),
+    EmbeddingModel  nvarchar(200)  NULL,
+    CreateDate      datetime2      NULL,
+    CreatedBy       nvarchar(200)  NULL,
+    UpdateDate      datetime2      NULL,
+    UpdatedBy       nvarchar(200)  NULL,
+    IsActive        bit            NOT NULL CONSTRAINT DF_Config_Tuning_IsActive DEFAULT 1,
+    IsDeleted       bit            NOT NULL CONSTRAINT DF_Config_Tuning_IsDeleted DEFAULT 0
+);
+
 GO
 
 -- Verify
@@ -601,8 +584,8 @@ SELECT 'RCSI' AS what, CAST(is_read_committed_snapshot_on AS int) AS ok FROM sys
 UNION ALL
 SELECT TABLE_NAME, 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME IN (
     'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Scoped_Threat',
-    'Threat_Scenario_Output','Threat_Scenario_Control_Map','Threat_Library_Import_Run','Scenario_Audit','Prompt_Log','Threat_Candidate_Review','Risk_Treatment_Plan',
-    'Threat_Category','Threat_Type','Threat_Catalogue','Threat_Actor','ThreatType_ThreatActor_Map')
+    'Threat_Scenario_Output','Threat_Library_Import_Run','Scenario_Audit','Prompt_Log',
+    'Threat_Candidate_Review','Risk_Treatment_Plan')
 UNION ALL
 SELECT TABLE_NAME + '.' + COLUMN_NAME, 1 FROM INFORMATION_SCHEMA.COLUMNS
 WHERE (TABLE_NAME = 'ctm_scan_entity' AND COLUMN_NAME IN

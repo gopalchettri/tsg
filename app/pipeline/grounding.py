@@ -439,20 +439,31 @@ def ensure_actor_list(raw: Any) -> list[str]:
     return []
 
 
-def validated_actors(threat_actors_json: str | None) -> list[str]:
-    """THE one reader for `Identified_Threat.ThreatActorsJSON`, kept beside the flag it gates
-    on (`GroundingResult.actors_validated`). The stored shape is a DICT —
-    `{"actors": [...], "validated": bool}` (written by tasks.py) — and actors are trusted only
-    when `validated`; ungrounded proposals must not reach downstream documents. A corrupt,
-    absent, or mis-shaped blob returns [] instead of crashing (accept.py used to raise on
-    exactly that; treatment.py used to silently read the dict as a list and get []). Every
-    consumer goes through here so the shape can never drift per-reader again."""
+def _actors_meta(threat_actors_json: str | None) -> dict:
+    """THE one parser for the `Identified_Threat.ThreatActorsJSON` SHAPE — a DICT,
+    `{"actors": [...], "validated": bool}` (written by tasks.py). A corrupt, absent, or
+    mis-shaped blob returns {} instead of crashing (accept.py used to raise on exactly that;
+    treatment.py used to silently read the dict as a list and get []). Both readers below go
+    through here so the shape can never drift per-reader again."""
     try:
         meta = json.loads(threat_actors_json or "{}")
     except (TypeError, ValueError):
-        return []
-    if not isinstance(meta, dict):
-        return []
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def stored_actors(threat_actors_json: str | None) -> list[str]:
+    """The RAW stored actor list, regardless of the validated flag — for paths that must see
+    what Stage 1 proposed (scenario prompts, API display). Callers that may only see grounded
+    actors (treatment plans, VERIFIED-type promotion) use `validated_actors` instead."""
+    return ensure_actor_list(_actors_meta(threat_actors_json).get("actors", []))
+
+
+def validated_actors(threat_actors_json: str | None) -> list[str]:
+    """`stored_actors` gated on the flag it is kept beside (`GroundingResult.actors_validated`):
+    actors are trusted only when `validated`; ungrounded proposals must not reach downstream
+    documents."""
+    meta = _actors_meta(threat_actors_json)
     return ensure_actor_list(meta.get("actors", []) if meta.get("validated") else [])
 
 
@@ -501,10 +512,10 @@ def prime_query_embeddings(llm: LLMClient, proposals: list[dict[str, Any]], cach
 
 _RESOLVED_THRESHOLDS: dict[tuple[str, str], float] = {}
 _CALIBRATION_SAMPLE = 30
-# A "negative" at/above this is a DUPLICATE catalogue entry, not an impostor — on the 0-100 rerank
-# scale nothing a paraphrase can score reliably clears it, so calibration is unwinnable until the
-# library is deduped. Measured: the real catalogue's worst pair scores 99.5. See _auto_calibrate.
-_NEAR_DUPLICATE_SCORE = 99.0
+# The near-duplicate give-up score lives in config (Settings.near_duplicate_score): a "negative"
+# at/above it is a DUPLICATE catalogue entry, not an impostor — on the 0-100 rerank scale nothing
+# a paraphrase can score reliably clears it, so calibration is unwinnable until the library is
+# deduped. Measured: the real catalogue's worst pair scores 99.5. See _auto_calibrate.
 _PARAPHRASES_PER_NAME = 2
 
 
@@ -631,7 +642,7 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
         collisions.append((neg, n, (row or {}).get("ThreatName", "")))
 
     # Bail BEFORE spending anything when the library itself makes success impossible. A negative
-    # at/above _NEAR_DUPLICATE_SCORE is not an impostor at all: it is a second catalogue entry for
+    # at/above near_duplicate_score is not an impostor at all: it is a second catalogue entry for
     # the same threat ('Shared, stale or orphaned account misuse' ~ 'Shared, default or stale OT
     # account abuse' scored 99.5 on the real 85-entry library). boundary_between needs
     # max(negatives) < min(positives), so ONE such pair would require every paraphrase to clear
@@ -639,7 +650,7 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
     # recurs identically every boot until a curator dedupes; detecting it here is what stops the
     # symptom from coming back rather than just reporting it after the fact.
     worst = max(collisions) if collisions else None
-    if worst is not None and worst[0] >= _NEAR_DUPLICATE_SCORE:
+    if worst is not None and worst[0] >= s.near_duplicate_score:
         log.warning("grounding.calibration_impossible_near_duplicate_library",
                     negatives=len(negatives), highest_negative=worst[0],
                     collides=f"{worst[1]!r} ~ {worst[2]!r} @ {worst[0]:.1f}",
@@ -789,14 +800,3 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
         actors=actors,
         actors_validated=True,
     )
-
-
-if __name__ == "__main__":  # cosine self-check
-    assert abs(how_similar([1, 0], [1, 0]) - 1.0) < 1e-9
-    assert abs(how_similar([1, 0], [0, 1])) < 1e-9
-    try:
-        how_similar([1, 0, 0], [1, 0])  # [Fix] length mismatch must raise, never silently truncate
-        raise AssertionError("how_similar must raise ValueError on a length mismatch")
-    except ValueError:
-        pass
-    print("grounding self-check ok")

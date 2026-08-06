@@ -18,13 +18,14 @@ accept). It re-validates grounded master ids are still active, then sets
 from __future__ import annotations
 
 import json
-from typing import Any, Sequence, cast
+from typing import Any, NamedTuple, Sequence, cast
 
 from sqlalchemy import RowMapping, Table, bindparam, insert, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.enums import (
+    TriageVerdict,
     ActorType,
     AuditDecision,
     AuditEventType,
@@ -34,11 +35,17 @@ from app.core.enums import (
     SubsystemLevel,
     WorkflowStage,
 )
+from app.core import tuning
 from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
 from app.db.dal import EntityForbidden, NotFoundError, guid, now
-from app.pipeline import grounding
+from app.pipeline import embeddings, grounding
+from app.pipeline.llm import get_llm
+# THE one asset-name strip (legacy-row fallback only; new rows carry the AI's GenericName)
+# and THE one junk-name gate — both defined beside their Stage-1 writers so the vocabulary
+# of what may enter the shared library lives in exactly one module.
+from app.pipeline.tasks import asset_agnostic_name, clean_library_name
 
 log = get_logger(__name__)
 
@@ -236,13 +243,15 @@ def review_gate_reason(scenario_session: RowMapping | dict) -> tuple[str, str] |
     """Why this session cannot take a review action (accept/regenerate) right now, as a
     (machine_reason, human_message) pair — or None if it is at the REVIEW barrier.
 
-    Branches on SessionStatus FIRST — the authoritative liveness signal — because
-    CurrentStage/StageStatus are progress history: complete_session deliberately never
-    rewrites StageStatus, so a completed session still reads AWAITING_DECISION, and echoing
-    that verbatim produced a self-contradictory message ("not at REVIEW ...
-    status=AWAITING_DECISION") that misled callers into retrying a final decision. Shared by
-    the accept gate (below) and sessions.py's regenerate/next-set gate so the two can never
-    drift apart again."""
+    Branches on SessionStatus FIRST — the authoritative liveness signal — rather than
+    inferring completed/cancelled from CurrentStage/StageStatus, which are progress history.
+    complete_session and cancel_session both stamp a terminal StageStatus (COMPLETE /
+    CANCELLED respectively), so the two stay in sync today, but SessionStatus remains the
+    single source of truth here: it is what previously caught the case where a completed
+    session still read AWAITING_DECISION and echoing that verbatim produced a
+    self-contradictory message ("not at REVIEW ... status=AWAITING_DECISION") that misled
+    callers into retrying a final decision. Shared by the accept gate (below) and
+    sessions.py's regenerate/next-set gate so the two can never drift apart again."""
     if (scenario_session["CurrentStage"] == WorkflowStage.REVIEW
             and scenario_session["StageStatus"] == StageStatus.AWAITING_DECISION):
         return None
@@ -330,10 +339,20 @@ def _pick_sector_for_promotion(scenario_session: RowMapping) -> int | None:
 
 
 def _link_actors_to_threat_type(sess: Session, type_id: int, actors: list[str], resolved: dict,
-                                created_by: str | None = None) -> list[str]:
+                                created_by: str | None = None,
+                                resolve_only: bool = False) -> list[str]:
     """Make sure each actor name is a real Threat_Actor row and is linked to this threat
-    type, creating whichever rows/links don't exist yet. Returns the actor names that
-    got a brand-new link (used for audit logging), not ones that were already linked.
+    type. Returns the actor names that got a brand-new link (used for audit logging), not
+    ones that were already linked.
+
+    `resolve_only=True` — the AI-promotion posture — links EXISTING active actors but NEVER
+    creates one. The closed actor vocabulary is enforced only in the Stage-1 prompt; on the
+    unverified grounding branch (the only branch that mints new types) actors pass RAW with no
+    server-side membership check, so an upsert here would turn any hallucinated string into a
+    permanent global Threat_Actor row — which immediately enters dal.active_actor_names and
+    therefore every future session's Stage-1 closed list: a self-reinforcing vocabulary-growth
+    loop with no review step. Unresolved names are skipped and logged; POST /threat-actors
+    stays the one deliberate creation path.
 
     `created_by` is the accountable user for this accept — the same value the audit rows
     carry, so a row promoted into the shared library names whoever caused it to exist.
@@ -343,10 +362,20 @@ def _link_actors_to_threat_type(sess: Session, type_id: int, actors: list[str], 
     # so repeated actor names across many threats in this accept don't hit the DB twice.
     for actor_name in actors:
         actor_key = ("actor", actor_name)
+        # exact first, then case-insensitive — MSSQL's collation resolves 'nation state' to
+        # 'Nation State', so the memo must too or a case-variant would mint a duplicate row.
         actor_id = resolved.get(actor_key)
         if actor_id is None:
+            actor_id = resolved.get(("actor_cf", actor_name.casefold()))
+        if actor_id is None:
+            if resolve_only:
+                log.warning("accept.actor_not_in_vocabulary", actor=actor_name, type_id=type_id,
+                            note="AI-proposed actor has no active Threat_Actor row — skipped, "
+                                "never auto-created; add it via POST /threat-actors if real")
+                continue
             actor_id = dal.upsert_threat_actor(sess, actor_name, created_by=created_by)
-            resolved[actor_key] = actor_id
+        resolved[actor_key] = actor_id
+        resolved[("actor_cf", actor_name.casefold())] = actor_id
         link_key = ("link", type_id, actor_id)
         if link_key not in resolved:
             if dal.link_type_actor(sess, type_id, actor_id):  # True only when a NEW link row was inserted
@@ -356,16 +385,19 @@ def _link_actors_to_threat_type(sess: Session, type_id: int, actors: list[str], 
 
 
 def _extract_actor_names_per_threat(rows: Sequence[RowMapping]) -> tuple[dict[int, list[str]], set[str]]:
-    """Parse each row's stored actor JSON up front, but only trust the actor list if it was
-    marked "validated" — otherwise treat the threat as having no actors. Returns the
-    per-threat actor lists plus the union of every actor name seen (for the bulk id lookup).
-    """
+    """Parse each row's stored actor JSON up front — the RAW list, deliberately. Promotion
+    candidates are exactly the UNVERIFIED threats, whose stored blob is always
+    validated=false, so the old validated_actors gate returned [] for every one of them and
+    made the whole actor-linking pass a silent no-op. Trust is enforced downstream instead:
+    _link_actors_to_threat_type(resolve_only=True) links raw names only when they already
+    exist as active Threat_Actor rows and never creates one. Returns the per-threat actor
+    lists plus the union of every actor name seen (for the bulk id lookup)."""
     parsed_actors: dict[int, list[str]] = {}
     all_actor_names: set[str] = set()
     for row in rows:
-        # The one shared reader for the ThreatActorsJSON shape — also fixes this loop's old
-        # inline parse, which raised on a corrupt blob instead of degrading to no-actors.
-        actors = grounding.validated_actors(row["ThreatActorsJSON"])
+        # The one shared reader for the ThreatActorsJSON shape — a corrupt blob degrades to
+        # no-actors instead of raising.
+        actors = grounding.stored_actors(row["ThreatActorsJSON"])
         parsed_actors[row["ThreatID"]] = actors
         all_actor_names.update(actors)
     return parsed_actors, all_actor_names
@@ -416,21 +448,93 @@ def _find_or_create_type_and_catalogue(
     return type_id, row["ThreatCatalogueID"]
 
 
-def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMapping, good_subs: list[int], user_id: str | None) -> None:
-    """For every threat that scored below `library_promotion_threshold` ("new to the library")
-    and whose scenario got accepted, create/reuse the matching Threat_Type, Threat_Catalogue,
-    and Threat_Actor rows so it becomes part of the shared library, then write audit +
-    candidate-review records for each promotion.
+def _active_catalogue_with_categories(sess: Session) -> list[dict]:
+    """Every active Threat_Catalogue entry with its resolved STRIDE category ids —
+    `Threat_Catalogue_Category_Map` rows (multi-category, ANY-overlap semantics), falling back
+    to the owning `Threat_Type.ThreatCategoryID`: the same resolution `get_possible_types`
+    implements. An entry with NO resolvable category gets an empty set — the triage never
+    auto-rejects against it (it still counts for the novelty check).
+
+    `type_id`/`sector_id` ride along because an auto-REJECT stores the matched entry onto the
+    threat row: the stored (ThreatTypeID, ThreatCatalogueID) pair must keep the invariant that
+    the catalogue entry's OWNER defines the type, and the entry must be sector-visible — the
+    same two rules grounding.get_possible_names enforces everywhere else a match is stored."""
+    tc, tt, mp = m.Threat_Catalogue, m.Threat_Type, m.Threat_Catalogue_Category_Map
+    rows = sess.execute(
+        select(tc.ThreatCatalogueID, tc.ThreatName, tc.ThreatTypeID, tc.SectorID,
+            tt.ThreatCategoryID)
+        .select_from(tc.__table__.outerjoin(tt, tc.ThreatTypeID == tt.ThreatTypeID))
+        .where(tc.IsActive == True, tc.IsDeleted == False)  # noqa: E712
+    ).all()
+    mapped: dict[int, set[int]] = {}
+    for cat_id, category_id in sess.execute(select(mp.ThreatCatalogueID, mp.ThreatCategoryID)):
+        mapped.setdefault(cat_id, set()).add(category_id)
+    return [{"id": r.ThreatCatalogueID, "name": r.ThreatName,
+            "type_id": r.ThreatTypeID, "sector_id": r.SectorID,
+            "cats": frozenset(mapped.get(r.ThreatCatalogueID)
+                            or ([r.ThreatCategoryID] if r.ThreatCategoryID is not None else []))}
+            for r in rows if r.ThreatName]
+
+
+def _triage_generic_name(qv: Sequence[float], cand_cat_id: int | None, sector_ids: list[int],
+                        entries: list[dict], name_vecs: dict[str, Sequence[float]],
+                        tn: tuning.ResolvedTuning) -> tuple[str, int | None, float | None]:
+    """Banded triage of one candidate generic name against the active catalogue →
+    (verdict: auto_reject | auto_approve | review, matched catalogue id, cosine).
+
+    `qv` is the candidate's PRE-COMPUTED query vector — the caller batch-embeds every
+    candidate in ONE llm.embed call (kind='query', never get_vectors: a one-off text must not
+    enter the shared library cache), so lock-hold time inside the open accept transaction no
+    longer scales with candidate count. The CATALOGUE side arrives pre-embedded via
+    get_vectors(group='threat_catalogue') — the library embeds once ever.
+
+    Auto-REJECT eligibility = shared resolved STRIDE category AND sector visibility
+    (SectorID NULL or in the session's sector_ids — grounding.visible_to_this_sector's rule):
+    a reject stores the matched entry onto the threat row, and no other writer can store a
+    sector-invisible or wrong-category match. Measured basis for the category gate:
+    'Unauthorized disclosure of X' vs '…modification of X' scores 0.969, above every true
+    paraphrase — ungated high cosine reads 'same words', not 'same idea'.
+
+    Auto-APPROVE requires the candidate to be far from EVERY entry (category- and sector-free
+    novelty check — safe by construction, and it correctly leaves a cross-category near-twin
+    in the review band). The CALLER additionally demotes a category-unresolvable auto_approve
+    to review: inserting an entry whose category cannot be linked would breed exactly the
+    NULL-category rows that force everything back to human review."""
+    best_any: tuple[float, int] | None = None
+    best_reject: tuple[float, int] | None = None
+    for e in entries:
+        vec = name_vecs.get(e["name"])
+        if vec is None:
+            continue
+        cos = grounding.how_similar(qv, vec)
+        if best_any is None or cos > best_any[0]:
+            best_any = (cos, e["id"])
+        if (cand_cat_id is not None and cand_cat_id in e["cats"]
+                and (e["sector_id"] is None or e["sector_id"] in sector_ids)):
+            if best_reject is None or cos > best_reject[0]:
+                best_reject = (cos, e["id"])
+    if best_any is None:  # empty/unembeddable library — a first entry is novel by definition
+        return TriageVerdict.auto_approve, None, None
+    if best_reject is not None and best_reject[0] >= tn.triage_auto_reject_cosine:
+        return TriageVerdict.auto_reject, best_reject[1], best_reject[0]
+    if best_any[0] < tn.triage_auto_approve_cosine:
+        return TriageVerdict.auto_approve, best_any[1], best_any[0]
+    return TriageVerdict.review, best_any[1], best_any[0]
+
+
+def _promotion_candidates(sess: Session, sid: str, good_subs: list[int]) -> list[RowMapping]:
+    """Every below-threshold threat, in an accepted subsystem, with at least one ACCEPTED
+    scenario — the candidate set for library promotion.
 
     Selects on SCORE, not on GroundingStatus, and that distinction is the point. "Do we trust
     this match enough to use the library's wording?" and "should this go INTO the library?" are
     different questions; piggybacking curation on the grounding band meant every retune of the
-    matching cutoff silently moved promotion volume too. With its own threshold,
-    grounding_match_threshold can move to 90 without changing what gets curated.
+    matching cutoff silently moved promotion volume too.
+
+    NULL-safe by design: `GroundingScore < th` alone is UNKNOWN for a NULL score, which would
+    silently EXCLUDE such a row. A row with no recorded score is by definition not a confident
+    match, so it belongs in the candidate set — the column is nullable and legacy rows carry NULL.
     """
-    sector_id = _pick_sector_for_promotion(scenario_session)
-    sid = scenario_session["SessionID"]
-    tenant, entity = scenario_session["TenantID"], scenario_session["EntityID"]
     st, out = m.Scoped_Threat, m.Threat_Scenario_Output
     # An unverified threat only gets promoted if at least one of its scenario outputs was
     # actually accepted — being in a "good" subsystem isn't enough on its own.
@@ -442,42 +546,36 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
             out.Superseded == 0, out.Accepted == 1)
         .exists()
     )
-    # Pull every below-threshold threat, in an accepted subsystem, with at least one accepted
-    # scenario — these are the candidates to promote into the shared library.
-    # NULL-safe by design: `GroundingScore < th` alone is UNKNOWN for a NULL score, which would
-    # silently EXCLUDE such a row from promotion where the old band filter included it. A row
-    # with no recorded score is by definition not a confident match, so it belongs in the
-    # candidate set — the column is nullable (TSG_Core.sql:131) and legacy rows can carry NULL.
-    promotion_th = get_settings().library_promotion_threshold
-    rows = sess.execute(
+    return sess.execute(
         select(m.Identified_Threat.ThreatID, m.Identified_Threat.ThreatCategory,
             m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName,
+            m.Identified_Threat.GenericName,
             m.Identified_Threat.ThreatActorsJSON, m.Identified_Threat.ThreatTypeID,
             m.Identified_Threat.ThreatCatalogueID)
         .where(m.Identified_Threat.SessionID == sid,
             m.Identified_Threat.Superseded == 0,
             m.Identified_Threat.SubsystemID.in_(good_subs),
             or_(m.Identified_Threat.GroundingScore.is_(None),
-                m.Identified_Threat.GroundingScore < promotion_th),
+                m.Identified_Threat.GroundingScore < get_settings().library_promotion_threshold),
             scenario_accepted)
     ).mappings().all()
 
-    resolved: dict[tuple, Any] = {}  # in-accept memo: ("category"|"type"|"cat"|"actor"|"link", ...) -> id/True
 
-    parsed_actors, all_actor_names = _extract_actor_names_per_threat(rows)
-
-    # Bulk-load ids for actor names that already exist, so the per-row loop below doesn't
-    # issue a separate query per actor.
+def _preload_actor_memo(sess: Session, rows: Sequence[RowMapping], all_actor_names: set[str],
+                        resolved: dict) -> None:
+    """Bulk-load existing actor ids and type-actor links into the in-accept memo, so the
+    promotion loop issues no per-actor query. Two queries, both skipped when there is nothing
+    to look up."""
     if all_actor_names:
         for actor_id, name in sess.execute(
             select(m.Threat_Actor.ThreatActorID, m.Threat_Actor.ThreatActorName).where(
                 m.Threat_Actor.ThreatActorName.in_(all_actor_names),
-                m.Threat_Actor.IsActive == True, m.Threat_Actor.IsDeleted == False)
+                m.Threat_Actor.IsActive == True, m.Threat_Actor.IsDeleted == False)  # noqa: E712
         ):
             resolved[("actor", name)] = actor_id
-
-    # Same idea for type-actor links: pre-load the ones that already exist so the main
-    # loop below only has to insert genuinely new links.
+            # casefold alias so a case-variant proposal resolves to the canonical row instead
+            # of reading as unknown (MSSQL's IN() above matches case-insensitively already)
+            resolved[("actor_cf", name.casefold())] = actor_id
     known_type_ids = {r["ThreatTypeID"] for r in rows if r["ThreatTypeID"] is not None}
     actor_ids = {v for k, v in resolved.items() if k[0] == "actor"}
     if known_type_ids and actor_ids:
@@ -487,6 +585,159 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
                 m.ThreatType_ThreatActor_Map.ThreatActorID.in_(actor_ids))
         ):
             resolved[("link", type_id, actor_id)] = True  # pre-existing link, not newly created
+
+
+class _TriageInputs(NamedTuple):
+    """Everything the banded triage needs, resolved ONCE per accept."""
+    entries: list[dict]          # active catalogue: id, name, owner type, sector, categories
+    catalogue_vecs: dict         # entry name -> cached passage vector
+    query_vecs: dict             # candidate generic name -> query vector (ONE batched embed)
+    generic_by_tid: dict         # threat id -> library-shaped name
+    sector_ids: list[int]        # the session's sector visibility list
+
+
+def _prepare_triage(sess: Session, llm, scenario_session: RowMapping,
+                    rows: Sequence[RowMapping]) -> _TriageInputs:
+    """Resolve the triage inputs in a fixed number of round trips: the active catalogue with
+    its resolved categories/owner/sector, that catalogue's CACHED passage vectors (embedded
+    once ever, per find_closest_match's contract), and ONE batched query-embed of every
+    candidate generic name — per-row embeds made lock-hold time inside the still-open accept
+    transaction scale with candidate count.
+
+    Any failure degrades to entries=[] — every candidate then falls to the review queue.
+    Automation fails TOWARD the human, never silently approves or rejects."""
+    asset_name = scenario_session["AssetName"]
+    sector_ids = (json.loads(scenario_session["SectorIDsJSON"])
+                if scenario_session.get("SectorIDsJSON") else [])
+    generic_by_tid = {row["ThreatID"]: (row["GenericName"]
+                                        or asset_agnostic_name(row["ThreatName"], asset_name))
+                    for row in rows}
+    if not rows:
+        return _TriageInputs([], {}, {}, generic_by_tid, sector_ids)
+    try:
+        entries = _active_catalogue_with_categories(sess)
+        if not entries:
+            return _TriageInputs([], {}, {}, generic_by_tid, sector_ids)
+        catalogue_vecs = embeddings.get_vectors(
+            llm, [e["name"] for e in entries], model_id=get_settings().embedding_model,
+            group="threat_catalogue", kind="passage")
+        to_embed = sorted({g for row in rows if row["ThreatCatalogueID"] is None
+                        for g in [generic_by_tid[row["ThreatID"]]] if g})
+        query_vecs: dict = {}
+        if to_embed:
+            vecs = llm.embed(to_embed, kind="query")
+            if len(vecs) != len(to_embed):
+                raise RuntimeError(f"embed returned {len(vecs)} vectors for {len(to_embed)} queries")
+            query_vecs = dict(zip(to_embed, vecs))
+        return _TriageInputs(entries, catalogue_vecs, query_vecs, generic_by_tid, sector_ids)
+    except Exception:
+        log.warning("accept.triage_unavailable",
+                    session_id=scenario_session["SessionID"], exc_info=True)
+        return _TriageInputs([], {}, {}, generic_by_tid, sector_ids)
+
+
+class _CandidateFate(NamedTuple):
+    """One candidate's resolved library outcome."""
+    verdict: str                   # auto_reject | auto_approve | review
+    type_id: int                   # the Threat_Type the threat ends up pointing at
+    catalogue_id: int | None       # its Threat_Catalogue id after triage (None = none matched)
+    matched_id: int | None         # the entry the cosine was measured against (audit/calibration)
+    cosine: float | None
+
+
+def _decide_candidate_fate(sess: Session, row: RowMapping, generic: str | None, sector_id: int | None,
+                        resolved: dict, triage: _TriageInputs, tn: tuning.ResolvedTuning,
+                        *, created_by: str | None) -> _CandidateFate:
+    """Banded triage of the LIBRARY-SHAPED name (never the asset-embedded one), then the type
+    and catalogue ids that follow from it. Runs triage BEFORE type resolution so an auto-reject
+    adopts the matched entry's owning type instead of minting a fresh Threat_Type it is about
+    to abandon:
+
+      >= reject band (shared category + sector-visible): same idea reworded → link this threat
+         to the entry it duplicates, under THAT entry's owning type;
+      <  approve band vs EVERYTHING: genuinely novel → insert active, with its category linked
+         (upsert_threat_catalogue deliberately doesn't link — without it the automation would
+         breed the NULL-category entries that force everything back to review);
+      between, or category unresolvable, or the embedder failed → the curator queue.
+
+    Auto-MERGE stays forbidden: automation never rewrites or retires an existing entry.
+    An auto-approve also appends itself to the in-accept snapshot, so two paraphrases in ONE
+    accept cannot both read "novel" and both insert."""
+    cat_key = ("category", row["ThreatCategory"])
+    if cat_key not in resolved:
+        resolved[cat_key] = grounding.find_category(sess, row["ThreatCategory"])
+    cand_cat = resolved[cat_key]
+    verdict, matched_id, cosine = TriageVerdict.review, None, None
+    qv = triage.query_vecs.get(generic) if generic else None
+    if row["ThreatCatalogueID"] is None and generic and triage.entries and qv is not None:
+        try:
+            verdict, matched_id, cosine = _triage_generic_name(
+                qv, cand_cat, triage.sector_ids, triage.entries, triage.catalogue_vecs, tn)
+        except Exception:
+            verdict, matched_id, cosine = TriageVerdict.review, None, None
+            log.warning("accept.triage_failed", threat_id=row["ThreatID"], exc_info=True)
+    if verdict is TriageVerdict.auto_approve and cand_cat is None:
+        # a category-less insert would breed exactly the NULL-category entries the gate
+        # exists to prevent — the curator decides instead
+        verdict = TriageVerdict.review
+    if verdict is TriageVerdict.auto_approve and clean_library_name(generic) is None:
+        # junk/degenerate text ('N/A', one-word fragments from the legacy strip fallback)
+        # embeds far from everything, so it lands EXACTLY in the auto-approve band — the one
+        # band no curator sees. Nothing enters the shared library without passing the gate.
+        verdict = TriageVerdict.review
+    matched_entry = (next((e for e in triage.entries if e["id"] == matched_id), None)
+                    if verdict is TriageVerdict.auto_reject else None)
+    if verdict is TriageVerdict.auto_reject and matched_entry is None:
+        verdict = TriageVerdict.review  # unreachable today; keeps the audit record truthful if it ever is
+    if (matched_entry is not None and row["ThreatTypeID"] is not None
+            and matched_entry["type_id"] != row["ThreatTypeID"]):
+        # A reranked, thresholded Stage-2 TYPE match must not be outranked by a raw-cosine
+        # NAME hit: verified-type/unverified-name is the DOMINANT candidate shape here, and
+        # adopting the entry's owner would rewrite the verified ThreatTypeID and link actors
+        # under the wrong type in the shared map. The two verdicts disagree — the curator
+        # decides, same fail-toward-the-human rule as the category-unresolvable demotion.
+        verdict, matched_entry = TriageVerdict.review, None
+
+    if matched_entry is not None:
+        # the catalogue entry's OWNER defines the type — the invariant every other writer of a
+        # stored (ThreatTypeID, ThreatCatalogueID) pair keeps (grounding's model)
+        type_id = matched_entry["type_id"]
+        if type_id is None:  # ownerless legacy entry — resolve/mint as usual
+            type_id, _ = _find_or_create_type_and_catalogue(sess, row, sector_id, resolved,
+                                                            created_by=created_by)
+        return _CandidateFate(verdict, type_id, matched_id, matched_id, cosine)
+
+    type_id, catalogue_id = _find_or_create_type_and_catalogue(sess, row, sector_id, resolved,
+                                                            created_by=created_by)
+    if verdict is TriageVerdict.auto_approve:
+        catalogue_id = dal.upsert_threat_catalogue(sess, generic, type_id, sector_id,
+                                                created_by=created_by)
+        dal.link_catalogue_category(sess, catalogue_id, cand_cat)
+        # Visible to the LATER candidates by construction: _pick_sector_for_promotion draws
+        # sector_id from the session's own SectorIDsJSON — the same list _prepare_triage puts
+        # in triage.sector_ids — so this entry passes _triage_generic_name's visibility test.
+        # Break that and the in-accept dedup silently stops working (duplicates return).
+        triage.entries.append({"id": catalogue_id, "name": generic, "type_id": type_id,
+                            "sector_id": sector_id, "cats": frozenset({cand_cat})})
+        triage.catalogue_vecs.setdefault(generic, qv)
+    return _CandidateFate(verdict, type_id, catalogue_id, matched_id, cosine)
+
+
+def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMapping, good_subs: list[int], user_id: str | None) -> None:
+    """Promote this accept's novel threats into the shared library: for each candidate, decide
+    its catalogue fate by banded triage, create/reuse the matching Threat_Type and actor links,
+    and accumulate the audit + candidate-review records. Reads are pre-resolved by
+    `_promotion_candidates` / `_preload_actor_memo` / `_prepare_triage`; writes are batched at
+    the bottom.
+    """
+    sector_id = _pick_sector_for_promotion(scenario_session)
+    sid = scenario_session["SessionID"]
+    tenant, entity = scenario_session["TenantID"], scenario_session["EntityID"]
+    rows = _promotion_candidates(sess, sid, good_subs)
+
+    resolved: dict[tuple, Any] = {}  # in-accept memo: ("category"|"type"|"cat"|"actor"|"link", ...) -> id/True
+    parsed_actors, all_actor_names = _extract_actor_names_per_threat(rows)
+    _preload_actor_memo(sess, rows, all_actor_names, resolved)
 
     # Main promotion loop: for each candidate threat, work out (or create) the Threat_Type,
     # Threat_Catalogue, and actor links it should end up pointing at, then ACCUMULATE the
@@ -501,57 +752,88 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
     # threat. The session row is already in hand, so answer both questions here instead.
     actor_id = user_id or scenario_session["UserID"]
     actor_type = ActorType.user if user_id else ActorType.system
+    llm = get_llm()
+    tn = tuning.from_session(scenario_session)
+    triage = _prepare_triage(sess, llm, scenario_session, rows)
     update_rows: list[dict] = []
     audit_rows: list[dict] = []
     candidate_rows: list[dict] = []
+    triage_details: list[dict] = []
     for row in rows:
-        # actor_id above is the accountable USER for this accept (not a Threat_Actor id) — the same
-        # value the audit rows carry, so a library row promoted here names who caused it to exist.
-        type_id, catalogue_id = _find_or_create_type_and_catalogue(sess, row, sector_id, resolved,
-                                                                   created_by=actor_id)
+        # Banded triage of the LIBRARY-SHAPED name FIRST (never the asset-embedded one) —
+        # before any type resolution, so an auto-reject adopts the matched entry's owning type
+        # instead of minting a fresh Threat_Type it is about to abandon:
+        # >= reject band (shared category + sector-visible): same idea reworded → link this
+        #    threat to the entry it duplicates;
+        # <  approve band vs EVERYTHING: genuinely novel → insert active, with its category
+        #    linked (upsert_threat_catalogue deliberately doesn't link — without it the
+        #    automation would breed the NULL-category entries that force everything to review);
+        # between, or category unresolvable, or the embedder failed → the curator queue.
+        # Auto-MERGE stays forbidden: automation never rewrites or retires an existing entry.
+        generic = triage.generic_by_tid[row["ThreatID"]]
+        fate = _decide_candidate_fate(sess, row, generic, sector_id, resolved, triage, tn,
+                                    created_by=actor_id)
+        verdict, type_id, catalogue_id_new, matched_id, cosine = fate
 
         actors = parsed_actors[row["ThreatID"]]
+        # resolve_only: AI-proposed names may LINK existing actors, never CREATE one — see
+        # _link_actors_to_threat_type's docstring for the vocabulary-growth loop this prevents.
         linked_actors = _link_actors_to_threat_type(sess, type_id, actors, resolved,
-                                                    created_by=actor_id)  # names NEWLY linked this accept
+                                                    created_by=actor_id,
+                                                    resolve_only=True)  # names NEWLY linked this accept
+        triage_details.append({"threat_id": row["ThreatID"], "generic_name": generic,
+                            "verdict": verdict, "cosine": cosine,
+                            "matched_catalogue_id": matched_id})
 
-        # Two INDEPENDENT outcomes per row, deliberately not one `continue`. Since
-        # _find_or_create_type_and_catalogue stopped minting, `catalogue_id` is identically
-        # row["ThreatCatalogueID"], so the old combined guard would have collapsed to "skip unless
-        # a TYPE was minted or an actor was newly linked" — and the dominant case (type already
-        # verified, name novel) would have produced no row of any kind, silently discarding the
-        # very proposal this function exists to capture.
-        promoted = type_id != row["ThreatTypeID"] or bool(linked_actors)
+        # Three INDEPENDENT outcomes per row, deliberately not one `continue` — a type mint, a
+        # new actor link and a triage decision are separate facts, any of which warrants the
+        # UPDATE + audit.
+        promoted = (type_id != row["ThreatTypeID"] or bool(linked_actors)
+                    or catalogue_id_new != row["ThreatCatalogueID"])
         if promoted:
             update_rows.append({"b_tid": row["ThreatID"], "ThreatTypeID": type_id,
-                                "ThreatCatalogueID": catalogue_id})
+                                "ThreatCatalogueID": catalogue_id_new})
             audit_rows.append(dal.audit_row(
                 sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=entity,
                 EventType=AuditEventType.library_promoted, ActorUserID=actor_id, ActorType=actor_type,
                 ThreatTypeRefID=type_id, CreatedAt=stamp,
-                DetailJSON=json.dumps({"threat_id": row["ThreatID"], "catalogue_id": catalogue_id,
-                                        "sector_id": sector_id, "actors": linked_actors})))
+                DetailJSON=json.dumps({"threat_id": row["ThreatID"], "catalogue_id": catalogue_id_new,
+                                        "sector_id": sector_id, "actors": linked_actors,
+                                        # keeps the record truthful: an auto_reject LINKED the
+                                        # threat to an existing entry, it created nothing
+                                        "triage_verdict": verdict})))
             log.info("threat.promoted", session_id=sid, threat_id=row["ThreatID"],
-                    type_id=type_id, catalogue_id=catalogue_id, sector_id=sector_id)
+                    type_id=type_id, catalogue_id=catalogue_id_new, sector_id=sector_id)
 
-        # The proposed NAME never enters Threat_Catalogue automatically (see
-        # _find_or_create_type_and_catalogue), so it is queued for a curator to generalize
-        # instead. `pending` is the honest status — nothing has been reviewed, hence no
-        # ReviewedBy/ReviewedAt and no `candidate_reconciled` audit (that event means "a row was
-        # CLOSED as accepted"; none is). Written whether or not a type was promoted: the two are
-        # separate facts. Deduped per (type, name) within one accept — the table has no unique
-        # index, so two identical proposals would otherwise queue the same curation task twice.
+        # ONLY the middle band reaches a human. `pending` is the honest status — nothing has
+        # been reviewed, hence no ReviewedBy/ReviewedAt and no `candidate_reconciled` audit.
+        # Deduped per (type, name) within one accept — the table has no unique index, so two
+        # identical proposals would otherwise queue the same curation task twice.
         ckey = ("candidate", row["ThreatType"], row["ThreatName"])
-        if row["ThreatName"] and ckey not in resolved:
+        if verdict is TriageVerdict.review and row["ThreatName"] and ckey not in resolved:
             resolved[ckey] = True
             candidate_rows.append({
                 "CandidateID": guid(), "TenantID": tenant, "EntityID": entity,
                 "SessionID": sid, "ProposedCategory": row["ThreatCategory"],
                 "ProposedType": row["ThreatType"], "ProposedName": row["ThreatName"],
+                "ProposedGenericName": generic,
                 "Status": CandidateStatus.pending, "ThreatTypeID": type_id,
-                "ThreatCatalogueID": catalogue_id,
+                "ThreatCatalogueID": catalogue_id_new,
                 "ReviewedBy": None, "ReviewedAt": None, "CreatedAt": stamp,
             })
 
+    if triage_details:
+        # ONE calibration record per accept (AuditEventType.promotion_triage): every candidate's
+        # cosine, matched entry and band verdict, plus the bands in force — 6d tightens the
+        # bands by comparing these against what curators actually chose in the middle band.
+        audit_rows.append(dal.audit_row(
+            sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=entity,
+            EventType=AuditEventType.promotion_triage, ActorUserID=actor_id, ActorType=actor_type,
+            CreatedAt=stamp,
+            DetailJSON=json.dumps({
+                "bands": {"auto_reject": tn.triage_auto_reject_cosine,
+                        "auto_approve": tn.triage_auto_approve_cosine},
+                "candidates": triage_details})))
     if update_rows:
         # Table (Core), not the mapped class: a plain executemany UPDATE, not an ORM bulk-update-
         # by-PK (which requires the dict key to be the PK attribute name, not a bindparam name,

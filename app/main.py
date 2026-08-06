@@ -151,10 +151,10 @@ def create_app() -> FastAPI:
             {
                 "name": "Treatment Plans",
                 "description": (
-                    "AI-generated Risk Treatment (Mitigate) plans for accepted scenarios, "
-                    "joined to the CRM Risk module's risk records. Present only when "
-                    "RISK_MODULE_ENABLED is on. POST to generate/regenerate, poll the GET on "
-                    "the same path."
+                    "AI-generated Risk Treatment (Mitigate) plans for accepted scenarios. "
+                    "The register's risk data (ratings, level, existing controls) is sent in "
+                    "the request body. Present only when RISK_MODULE_ENABLED is on. POST to "
+                    "generate/regenerate, poll the GET on the same path."
                 ),
             },
         ],
@@ -175,8 +175,8 @@ def create_app() -> FastAPI:
     app.include_router(control_library_crud_router)
     app.include_router(threat_intel_router)
     # Feature-flagged: flag off -> the treatment-plan paths 404 by absence (no handler code
-    # runs), and invariants.py skips the crm_* table check. Flag on -> routes mount AND boot
-    # verifies the CRM tables exist (docs/RISK_TREATMENT_PLAN_SDD.md D3).
+    # runs). Flag on -> routes mount; nothing else is armed — the register's risk data arrives
+    # in the request body, so no external tables are required (docs/RISK_TREATMENT_PLAN_SDD.md).
     if get_settings().risk_module_enabled:
         app.include_router(treatment_router)
     # [R2 remainder] fail-closed: refuse to boot if any route is missing its entity-scoping

@@ -17,19 +17,22 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.enums import GroundingStatus, ScopingRejection, ThreatRuleType
+from app.core.enums import GroundingStatus, ScopingRejection, SelectionReason, ThreatRuleType
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
 
-BASE_SCORE = 50.0
+# base_score and default_rule_weight live in config (Settings.base_score /
+# Settings.default_rule_weight) and arrive as score_threats parameters — never module literals,
+# so a Config_Tuning session snapshot can override them per assessment. Their arithmetic against
+# scoping_score_threshold is enforced by config._validate_scoring_floor_invariant.
+#
 # unverified (novel/unmatched-to-library) threats must land ABOVE the scoping_score_threshold
 # cutoff (default 55) or a curator never sees the ones they haven't catalogued yet: 15.0 puts them
 # at 65, below a real library match (verified 70) but still comfortably surfaced. Grounding
 # confidence ALONE must never reject a threat — only a negative rule delta may take a score under
-# the cutoff, so BASE_SCORE + min(weights) stays above it by construction.
+# the cutoff, so base_score + min(weights) stays above it by construction.
 _CONFIDENCE_WEIGHT = {GroundingStatus.verified: 20.0, GroundingStatus.unverified: 15.0}
-_DEFAULT_RULE_WEIGHT = 10.0  # relevance_* delta when the rule's Metadata carries no {"weight": N}
 
 # The fixed RuleKey → context-field allowlist: RuleKey → (subsystem field it reads, default
 # expected value used when RuleValue is NULL; None = plain truthy check). Extending it is one line
@@ -61,26 +64,30 @@ class Scored:
     # `reason` is prose for the reviewer; `rejection` is the same fact for code. Kept adjacent
     # because they are always assigned together — split them and they drift.
     rejection: ScopingRejection | None = None  # None ⟺ selected; persisted to RejectionKind
+    # The selection-side twin: set ⟺ selected; persisted to SelectionKind. Maps 1:1 from
+    # GroundingStatus — see SelectionReason's docstring for why there are exactly two values.
+    selection: SelectionReason | None = None
     factors: list[dict] = field(default_factory=list)  # every fired rule: {key, family, delta[, gate]}
 
 
-def _rule_weight(rule: dict) -> float | None:
+def _rule_weight(rule: dict, default_weight: float) -> float | None:
     """Metadata `{"weight": N}` override. Curator-entered JSON is a trust boundary: log, never
     crash, never guess.
-      * absent, or `{"weight": null}` → default;
+      * absent, or `{"weight": null}` → `default_weight` (config default_rule_weight, possibly
+        session-tuned);
       * a number or numeric string like "15" → that weight (0 is a legal choice);
       * a bool, any other non-numeric value, or unparseable JSON → None, and the caller skips the
         rule — firing with a guessed weight is a silent effect the curator never chose."""
     meta = rule.get("Metadata")
     if not meta:
-        return _DEFAULT_RULE_WEIGHT
+        return default_weight
     try:
         weight = json.loads(meta).get("weight")
     except (ValueError, AttributeError):
         log.warning("scoping.rule_metadata_invalid", rule_key=rule.get("RuleKey"))
         return None
     if weight is None:
-        return _DEFAULT_RULE_WEIGHT
+        return default_weight
     if isinstance(weight, bool):  # bool is not a weight — no-effect, not a guess of 1.0/0.0
         log.warning("scoping.rule_metadata_invalid", rule_key=rule.get("RuleKey"))
         return None
@@ -109,7 +116,8 @@ def _matches(value: Any, expected: str | None) -> bool:
     return str(value).strip().lower() == expected.strip().lower()
 
 
-def _apply_rules(threat: dict, subsystems: list[dict] | None, rules_by_type: dict) -> tuple[float, bool, list[str], list[dict]]:
+def _apply_rules(threat: dict, subsystems: list[dict] | None, rules_by_type: dict,
+                default_rule_weight: float) -> tuple[float, bool, list[str], list[dict]]:
     """Evaluate every rule for this threat's grounded type. The asset is threat-modeled as a
     whole, so a subsystem-keyed rule fires if ANY supporting system matches: a tech_gate passes
     when any does, a relevance_* weight is added once. Returns (score delta, selected, failed gate
@@ -147,7 +155,7 @@ def _apply_rules(threat: dict, subsystems: list[dict] | None, rules_by_type: dic
                             "gate": "passed" if matched else "failed"})
         elif family in (ThreatRuleType.relevance_flag, ThreatRuleType.relevance_context_value):
             if matched:
-                weight = _rule_weight(rule)
+                weight = _rule_weight(rule, default_rule_weight)
                 if weight is None:  # malformed Metadata → rule skipped (logged in _rule_weight)
                     continue
                 delta += weight
@@ -157,12 +165,18 @@ def _apply_rules(threat: dict, subsystems: list[dict] | None, rules_by_type: dic
     return delta, selected, gate_failures, factors
 
 
-def _scoring_reason(gate_failures: list[str], grounding_status: Any) -> tuple[str, ScopingRejection | None]:
+def _scoring_reason(gate_failures: list[str], grounding_status: Any,
+                    ) -> tuple[str, ScopingRejection | None, SelectionReason | None]:
     """Reason records the gate on exclusion, else the grounding basis. Returns the prose AND the
-    machine-readable kind, together — never one without the other."""
+    machine-readable kinds, together — never one without the other. The SelectionReason here is
+    provisional: score_threats clears it if a later cutoff rejects the threat, keeping the
+    invariant `selection is not None ⟺ selected`."""
     if gate_failures:
-        return f"tech_gate:{','.join(gate_failures)} failed", ScopingRejection.tech_gate
-    return f"grounding={grounding_status}", None
+        return f"tech_gate:{','.join(gate_failures)} failed", ScopingRejection.tech_gate, None
+    selection = (SelectionReason.verified_match
+                if GroundingStatus(grounding_status) == GroundingStatus.verified
+                else SelectionReason.unverified_match)
+    return f"grounding={grounding_status}", None, selection
 
 
 def _apply_selection_cutoffs(selected: bool, score: float, reason: str,
@@ -189,28 +203,40 @@ def _apply_selection_cutoffs(selected: bool, score: float, reason: str,
 
 def score_threats(threats: list[dict[str, Any]], *, subsystems: list[dict] | None = None,
                 rules: list[dict] | None = None, score_threshold: float | None = None,
-                top_n: int | None = None) -> list[Scored]:
+                top_n: int | None = None, base_score: float | None = None,
+                default_rule_weight: float | None = None) -> list[Scored]:
     """Score and rank the asset's identified threats and decide which move forward to a written
     scenario. Deterministic: same inputs → same ranking. Called with only `threats` (no rules, no
-    cutoff) it is base + grounding weight with everything selected."""
+    cutoff) it is base + grounding weight with everything selected.
+
+    `base_score`/`default_rule_weight` default to config when not passed; the pipeline passes the
+    session's resolved tuning so one assessment is never scored under two rulebooks."""
+    if base_score is None or default_rule_weight is None:
+        from app.core.config import get_settings  # lazy: keeps import-time coupling minimal
+        _s = get_settings()
+        base_score = _s.base_score if base_score is None else base_score
+        default_rule_weight = (_s.default_rule_weight if default_rule_weight is None
+                            else default_rule_weight)
     rules_by_type: dict[int, list[dict]] = {}
     for r in rules or []:
         rules_by_type.setdefault(r["ThreatTypeID"], []).append(r)
 
     evaluated = []
     for t in threats:
-        score = BASE_SCORE + _CONFIDENCE_WEIGHT.get(GroundingStatus(t["grounding_status"]), 0.0)
-        delta, selected, gate_failures, factors = _apply_rules(t, subsystems, rules_by_type)
+        score = base_score + _CONFIDENCE_WEIGHT.get(GroundingStatus(t["grounding_status"]), 0.0)
+        delta, selected, gate_failures, factors = _apply_rules(t, subsystems, rules_by_type,
+                                                            default_rule_weight)
         score += delta
-        reason, rejection = _scoring_reason(gate_failures, t["grounding_status"])
-        evaluated.append((t["threat_id"], score, selected, reason, rejection, factors))
+        reason, rejection, selection = _scoring_reason(gate_failures, t["grounding_status"])
+        evaluated.append((t["threat_id"], score, selected, reason, rejection, selection, factors))
 
     evaluated.sort(key=lambda x: (-x[1], x[0]))  # score desc, id asc — stable
     out: list[Scored] = []
     kept = 0  # fresh per call — cutoff state never crosses subsystems/invocations
-    for rank, (tid, score, selected, reason, rejection, factors) in enumerate(evaluated, start=1):
+    for rank, (tid, score, selected, reason, rejection, selection, factors) in enumerate(evaluated, start=1):
         selected, reason, rejection, kept = _apply_selection_cutoffs(
             selected, score, reason, rejection, kept, score_threshold=score_threshold, top_n=top_n)
         out.append(Scored(threat_id=tid, score=score, rank=rank, selected=selected, reason=reason,
-                        rejection=rejection, factors=factors))
+                        rejection=rejection, selection=selection if selected else None,
+                        factors=factors))
     return out
