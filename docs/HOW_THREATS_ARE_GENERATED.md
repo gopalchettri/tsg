@@ -6,6 +6,10 @@
 >
 > **Vintage:** branch `tsg-without-profile-decomposition`, commit `912fbe9`. Produced from a
 > line-by-line read of the codebase. If the pipeline changes, update this document with it.
+>
+> **Looking for the non-technical version?** [THREAT_WORKFLOW_BUSINESS.md](THREAT_WORKFLOW_BUSINESS.md)
+> covers how threat types, threat actors and threats are generated, compared and saved, in plain
+> business English with no source references.
 
 ---
 

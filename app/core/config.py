@@ -236,9 +236,10 @@ class Settings(BaseSettings):
         0.0, ge=0.0, le=2.0, validation_alias=AliasChoices(
             "THREAT_IDENTIFICATION_TEMPERATURE", "TSG_THREAT_IDENTIFICATION_TEMPERATURE"))
 
-    # Same idea, for the scenario-writing step. Unset (default) = provider's default, NOT 0.0
-    # like the threat step: the same call serves variant generation, where a pinned-0
-    # temperature works against the "MEANINGFULLY DIFFERENT" sibling steering.
+    # Same idea, for the scenario-writing step. Unset (default) falls back to llm_temperature,
+    # then the provider's default — deliberately NOT 0.0 like the threat step: the same call
+    # serves variant generation, where a pinned-0 temperature works against the
+    # "MEANINGFULLY DIFFERENT" sibling steering.
     scenario_generation_temperature: float | None = Field(
         None, ge=0.0, le=2.0, validation_alias=AliasChoices(
             "SCENARIO_GENERATION_TEMPERATURE", "TSG_SCENARIO_GENERATION_TEMPERATURE"))

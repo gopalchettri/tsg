@@ -44,7 +44,7 @@ log = get_logger(__name__)
 # output can never impersonate register data. (controls_to_be_implemented is NOT here — it is
 # the AI's own gap-analysis table, so the injector must never touch it.)
 _RESERVED_PLAN_KEYS = ("treatment_plan", "risk_identification_date",
-                       "risk_owner", "impacted_business_division")
+                    "risk_owner", "impacted_business_division")
 
 # Per-field cap applied to UI-supplied free text at snapshot time (house analog: intel items
 # truncate before entering the prompt). Pydantic max_length bounds reject oversized fields at
@@ -145,8 +145,7 @@ def _loads(blob: str | None, default):
 
 
 def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
-                          risk_input: dict[str, Any],
-                          context_fields: dict[str, list[str]]) -> dict[str, Any]:
+                          risk_input: dict[str, Any]) -> dict[str, Any]:
     """The frozen LLM context (SDD §7.2), persisted verbatim as InputSnapshotJSON.
 
     `risk_input` is the validated TreatmentPlanBody as a dict — the register's half of the
@@ -163,12 +162,12 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
 
     asset_context = _loads(session_row.get("AssetContextJSON"), {})
     subsystems = _loads(session_row.get("SubsystemsJSON"), [])
+    # Every context field the session froze is sent (SDD §7.2's sector/sub_sector/
+    # cii_asset_description included) — build_base_context applies no field-name gate, only
+    # redaction and the no-value scrub, so a field is absent here exactly when it was empty
+    # or a placeholder in the snapshot.
     base = prompts.build_base_context(
-        session_row.get("AssetName") or "", asset_context, subsystems,
-        context_fields.get("asset"), context_fields.get("subsystem"),
-        # The spec's prompt template requires these three unconditionally; the curator
-        # allowlist fails closed and would otherwise silently drop them (SDD §7.2).
-        force_fields={"sector", "sub_sector", "cii_asset_description"})
+        session_row.get("AssetName") or "", asset_context, subsystems)
 
     # Threat block — both hops to Identified_Threat are OUTER joins, so a broken linkage
     # nulls the columns; an explicit null + warning beats a silently empty block.
@@ -286,18 +285,35 @@ def _validate_plan(parsed: dict[str, Any]) -> list[str]:
     return warnings
 
 
+def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    """Put `control_library_id` back on each recommended control, in place.
+
+    The model is never shown a primary key (prompts._EXCLUDE_DB_KEY_TO_PROMPT):
+    it echoes the stable `control_code` instead. The id is resolved HERE, server-side, from the
+    snapshot's own library_mapped rows — so the persisted plan and the API response still carry
+    it, and a code the model invented or mistyped resolves to None rather than to some other
+    library row. Both keys are kept: the code is what a human reads, the id is what joins."""
+    by_code = {c["control_code"]: c["control_library_id"]
+               for c in ((snapshot.get("existing_controls") or {}).get("library_mapped") or [])
+               if isinstance(c, dict) and c.get("control_code") and c.get("control_library_id")}
+    for ctl in parsed.get("controls_to_be_implemented") or []:
+        if isinstance(ctl, dict):
+            ctl["control_library_id"] = by_code.get(ctl.get("control_code"))
+
+
 def _inject_reserved(parsed: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
     """Stamp/echo the server-owned plan keys (_RESERVED_PLAN_KEYS), OVERWRITING any
     same-named key the model emitted — AI output can never impersonate register data:
     - treatment_plan: the server-side strategy stamp;
     - the three register echoes, from the snapshot's prompt-hidden `register` block.
-    The controls_to_be_implemented table is deliberately NOT touched — it is the AI's own
-    gap-analysis output."""
+    The controls_to_be_implemented table is otherwise the AI's own gap-analysis output; only
+    its control_library_id is server-owned, resolved from the model's echoed control_code."""
     register = snapshot.get("register") or {}
     parsed["treatment_plan"] = str(TreatmentStrategy.mitigate)
     parsed["risk_identification_date"] = register.get("risk_identification_date")
     parsed["risk_owner"] = register.get("risk_owner")
     parsed["impacted_business_division"] = register.get("impacted_business_division")
+    _resolve_control_library_ids(parsed, snapshot)
     return parsed
 
 

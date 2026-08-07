@@ -1539,34 +1539,51 @@ class TreatmentPlanStatus(BaseModel):
     parsed PlanJSON contract (null until COMPLETE, or when the stored blob is corrupt). A
     RUNNING row whose progress clock stopped for longer than treatment_stale_seconds is
     presented as ERROR with a timed-out message — a read-time projection, the stored row is
-    not rewritten."""
+    not rewritten.
+
+    PRESENTATION TRIM (user request, 06 Aug 2026): the fields marked exclude=True below are
+    HIDDEN from the response for now, not deleted — they are still populated and stored;
+    remove the exclude flag to unhide. The `plan` document is trimmed the same way by
+    api.treatment._VISIBLE_PLAN_KEYS (the full document stays in PlanJSON)."""
     model_config = ConfigDict(json_schema_extra={"example": {
         "plan_id": "0f0e0d0c-0b0a-8988-8786-858483828180",
         "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
         "output_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
         "status": "COMPLETE", "treatment_strategy": "Mitigate",
-        "risk_identification_date": "2026-06-14T08:31:00",
-        "plan": {"treatment_plan": "Mitigate", "title": "Remote Access Hardening",
-                 "control_coverage": "gaps", "controls_to_be_implemented": [],
-                 "remediation_action_plan": []},
-        "warnings": [], "moderation_flagged": False,
-        "error_message": None,
+        "scenario": {"scenario_title": "Ransomware via exposed RDP",
+                     "scenario_statement": "A ransomware operator gains access through…",
+                     "risk_statement": "Loss of treatment-plant availability…"},
+        "risk_level": "Critical", "review_status": None,
         # No 'Z' suffix on purpose: values round-trip as NAIVE datetimes (UTC by convention —
         # the body validator normalizes, datetime2 stores naive), so the wire has no offset.
-        "created_at": "2026-08-03T10:00:00", "completed_at": "2026-08-03T10:01:20"}})
+        "risk_identification_date": "2026-06-14T08:31:00",
+        "error_message": None,
+        "plan": {"title": "Remote Access Hardening", "treatment_plan": "Mitigate",
+                 "action_plan": "Harden remote access in three phases…",
+                 "applicable_to_all_subsystems": "No",
+                 "controls_to_be_implemented": [],
+                 "mitigation_timeline": "90 days overall; critical actions within 30 days",
+                 "mitigation_owner": "OT Security Team",
+                 "risk_owner": "Head of OT Operations",
+                 "impacted_business_division": "Water Treatment Operations"}}})
 
     plan_id: str = Field(description="Risk_Treatment_Plan row id.")
     session_id: str = Field(description="Owning session.")
     output_id: str = Field(description="The accepted scenario this plan treats.")
     status: str = Field(description="RUNNING | COMPLETE | ERROR — the poll signal (stale RUNNING projects as ERROR).")
     treatment_strategy: str = Field(description="The strategy this plan was generated for — server-stamped 'Mitigate'.")
+    scenario: dict[str, Any] | None = Field(
+        default=None,
+        description=("The accepted scenario this plan treats: scenario_title, "
+                     "scenario_statement, risk_statement. Null only if the scenario row is "
+                     "unreadable (defensive parse)."))
     risk_level: str | None = Field(
         default=None, description="The register risk level this plan was generated against (from the request).")
     review_status: str | None = Field(
         default=None, description="TreatmentReviewStatus (approved / changes_requested) — null until a human reviews.")
-    review_comment: str | None = Field(default=None, description="The reviewer's comment, if any.")
-    reviewed_by: str | None = Field(default=None, description="Who recorded the decision (from their login token).")
-    reviewed_at: datetime | None = Field(default=None, description="When the decision was recorded.")
+    review_comment: str | None = Field(default=None, exclude=True, description="The reviewer's comment, if any.")
+    reviewed_by: str | None = Field(default=None, exclude=True, description="Who recorded the decision (from their login token).")
+    reviewed_at: datetime | None = Field(default=None, exclude=True, description="When the decision was recorded.")
     risk_identification_date: datetime | None = Field(
         default=None,
         description="Echo of the request's register date — record data, never AI-generated (spec). Null when not sent.")
@@ -1580,14 +1597,15 @@ class TreatmentPlanStatus(BaseModel):
                      "risk_owner, impacted_business_division). JSON is the wire contract; "
                      "markdown rendering is the client's job."))
     warnings: list[str] = Field(
-        default_factory=list,
+        default_factory=list, exclude=True,
         description="Advisory validation warnings (vocabulary clamps, empty control map, ...). Never blocking.")
     moderation_flagged: bool = Field(
-        default=False, description="Advisory content-moderation flag for a human reviewer, when moderation ran.")
+        default=False, exclude=True,
+        description="Advisory content-moderation flag for a human reviewer, when moderation ran.")
     error_message: str | None = Field(
         default=None, description="Client-safe failure reason when status is ERROR.")
-    created_at: datetime | None = Field(default=None, description="When this attempt was requested.")
-    completed_at: datetime | None = Field(default=None, description="When it reached COMPLETE/ERROR.")
+    created_at: datetime | None = Field(default=None, exclude=True, description="When this attempt was requested.")
+    completed_at: datetime | None = Field(default=None, exclude=True, description="When it reached COMPLETE/ERROR.")
 
 
 class TreatmentBoardRow(BaseModel):

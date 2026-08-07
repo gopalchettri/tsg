@@ -32,6 +32,8 @@ def check_active_sessions(sess: Session) -> str | None:
     with a 503. Reuses dal.count_active_sessions — the same racy-by-design count
     assert_capacity_available already checks on every POST /v1/sessions."""
     s = get_settings()
+    if not s.max_active_sessions:
+        return None
     active = dal.count_active_sessions(sess)
     ceiling = s.max_active_sessions * s.active_sessions_warn_ratio
     if active >= ceiling:
@@ -223,38 +225,6 @@ def check_ctm_scan_category_names(sess: Session) -> str | None:
     return None
 
 
-def check_dead_context_fields(sess: Session) -> str | None:
-    """Warn if an active Context_Field_Config row names a ContextGroup other than 'asset' or
-    'subsystem' (a typo'd 'Asset', say). dal.active_context_fields_by_group reads only those two
-    groups, so such a row is silently excluded from what reaches the model and would otherwise
-    stay invisible until someone notices a field the AI should be seeing but isn't. Same
-    curator-editable-table drift class check_dead_threat_rules covers for Config_Threat_Rule.
-
-    Also warn when 'asset' or 'subsystem' has NO active rows at all. prompts.py fails closed —
-    a group with no active fields sends nothing to the model, with no ceiling fallback — so an
-    unseeded table or an all-off misconfig would otherwise degrade generation quality silently.
-    (critical_service is force-sent regardless, but everything else would vanish.)
-
-    A typo'd FieldName inside a valid group is NOT caught here any more: prompts.py has no
-    hardcoded ceiling to diff field names against, so there is no reference set. Such a row is
-    inert — allowlist_context only copies keys that actually exist in the source dict."""
-    cfc = m.Context_Field_Config
-    rows = sess.execute(
-        select(cfc.ContextGroup, cfc.FieldName)
-        .where(cfc.IsActive == True, cfc.IsDeleted == False).distinct()  # noqa: E712
-    ).all()
-    dead = sorted(f"{group}.{field}" for group, field in rows if group not in ("asset", "subsystem"))
-    if dead:
-        log.warning("selfcheck.dead_context_fields", fields=dead)
-        return "dead_context_fields"
-    groups_present = {group for group, _ in rows}
-    empty = sorted(g for g in ("asset", "subsystem") if g not in groups_present)
-    if empty:
-        log.warning("selfcheck.empty_context_group", groups=empty)
-        return "empty_context_group"
-    return None
-
-
 def run_self_checks(sess: Session) -> list[str]:
     """THE ENTRY POINT — runs every check above, in order, and returns the names of
     whichever ones fired a warning this pass (same list[str] contract reaper.py's
@@ -273,7 +243,6 @@ def run_self_checks(sess: Session) -> list[str]:
         ("active_sessions", lambda: check_active_sessions(sess)),
         ("dead_threat_rules", lambda: check_dead_threat_rules(sess)),
         ("ctm_scan_category_names", lambda: check_ctm_scan_category_names(sess)),
-        ("dead_context_fields", lambda: check_dead_context_fields(sess)),
     ]
     if s.max_concurrent_llm_calls:
         checks.append(("llm_slots", lambda: check_llm_slots()))

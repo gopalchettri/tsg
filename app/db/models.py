@@ -444,18 +444,9 @@ class Config_Tuning(Base):
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
-class Context_Field_Config(Base):
-    """Which asset/subsystem fields are currently turned on for the AI prompt (see
-    scripts/Threat_library.sql). This table is the SOLE source of that allowlist — prompts.py
-    keeps no hardcoded ceiling, so an active row here is exactly what reaches the model, and no
-    active rows for a group means no context for that group (fail closed). One forced exception:
-    build_base_context always sends critical_service, because validation requires it."""
-    __tablename__ = "Context_Field_Config"
-    ContextFieldConfigID: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ContextGroup: Mapped[str] = mapped_column(Unicode(20))    # 'asset' | 'subsystem'
-    FieldName: Mapped[str] = mapped_column(Unicode(100))
-    IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
-    IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+# Context_Field_Config (the per-field AI-prompt allowlist) was removed: prompts.build_base_context
+# now sends every context field the context layer assembled, filtered only by redaction and the
+# no-value scrub in core.security.scrub_context. The SQL table still exists but nothing reads it.
     # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 

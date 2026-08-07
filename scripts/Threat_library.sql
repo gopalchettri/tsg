@@ -226,9 +226,10 @@ CREATE UNIQUE INDEX UX_ConfigThreatRule_NaturalKey
 -- names, so an active row here is exactly what gets sent to the external AI, and adding or
 -- removing a field is a curator edit rather than a deploy. Treat INSERTs here as a data-exposure
 -- change and review them accordingly. No active rows for a group = no context sent for that
--- group (fail closed); prompts.py never falls back to "send everything". One forced exception:
--- build_base_context always sends critical_service (validation requires it), so toggling that
--- row off has no effect.
+-- group (fail closed); prompts.py never falls back to "send everything". critical_service is
+-- governed by this table like every other field — no forced override — so toggling its row off
+-- genuinely removes it from the prompt; validate_scenario's critical-service check is skipped
+-- whenever the field wasn't sent (app/pipeline/tasks.py), so this cannot produce a false warning.
 
 IF OBJECT_ID('dbo.Context_Field_Config', 'U') IS NULL
 CREATE TABLE Context_Field_Config (

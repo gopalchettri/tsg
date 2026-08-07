@@ -356,9 +356,6 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
             # re-check under the lock, in case state changed since the pre-check above
             targets = get_threat_id_to_redo(sess, sid, subsystem_id, granularity, target_ids)
             threats = dal.active_threats(sess, sid, subsystem_id)
-            # asset_active_fields/sub_active_fields deliberately NOT passed — a regeneration must
-            # reflect the CURRENT Context_Field_Config policy, not whatever was active when the
-            # session first ran, so a field a curator has since disabled stays disabled.
             # The audit row is staged INSIDE write_scenarios' transaction, so the regeneration and
             # its record land together or not at all; written afterwards, a failure there would
             # report a committed success as failed via the generic handler below.

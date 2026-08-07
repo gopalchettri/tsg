@@ -385,8 +385,6 @@ def _dedup_key(info: dict) -> str:
 def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
                 epoch: int = _EPOCH, categories: list[str] | None = None,
                 actor_examples: list[str] | None = None,
-                asset_active_fields: list[str] | None = None,
-                sub_active_fields: list[str] | None = None,
                 supersede: bool = True, exclude: list[str] | None = None,
                 prior_threats: list[dict] | None = None) -> tuple[list[dict], Provenance | None]:
     # `exclude` is the label strings that steer the prompt; `prior_threats` is the same threats as
@@ -397,12 +395,6 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         return [], None
     sess.commit()
     _send_live_update(sid, SSEEventType.stage_started, ss, SubsystemLevel.THREATS, StageStatus.RUNNING, epoch)
-    if asset_active_fields is None or sub_active_fields is None:
-        resolved = dal.active_context_fields_by_group(sess)
-        if asset_active_fields is None:
-            asset_active_fields = resolved["asset"]
-        if sub_active_fields is None:
-            sub_active_fields = resolved["subsystem"]
     tn = tuning.from_session(scenario_session)  # the session's frozen rulebook — never live config
     max_threats = tn.max_threats_per_asset
     proposals, prov = _ask_ai(sess, llm, prompts.threats_prompt(
@@ -410,8 +402,6 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                                 max_threats=max_threats,
                                 categories=categories if categories is not None else dal.active_category_names(sess),
                                 actor_examples=actor_examples if actor_examples is not None else dal.active_actor_names(sess),
-                                asset_active_fields=asset_active_fields,
-                                sub_active_fields=sub_active_fields,
                                 exclude=exclude),
                                 scenario_session=scenario_session, subsystem_id=ss, stage="threats",
                                 level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
@@ -501,9 +491,7 @@ _INTEL_TECH_FIELDS = ("technology_used", "vendor_name", "database_platforms",
                     "saas_platform_list", "public_cloud_platforms")
 
 
-def _intel_vocabulary(subsystems: list[dict], asset_context: dict,
-                    sub_active_fields: list[str] | None,
-                    asset_active_fields: list[str] | None) -> tuple[list[str], bool]:
+def _intel_vocabulary(subsystems: list[dict], asset_context: dict) -> tuple[list[str], bool]:
     """Intel search terms from the asset's TECHNOLOGY inventory and CLASSIFICATION taxonomy —
     never from threat wording.
     Threat names are deliberately business-impact prose, so their words match the BUSINESS
@@ -516,23 +504,21 @@ def _intel_vocabulary(subsystems: list[dict], asset_context: dict,
     free-text impact prose the rule above excludes. They are what rescues an asset whose
     entire technology inventory reads 'Custom Application' / 'NA' from matching nothing.
 
-    FAIL-CLOSED on the Context_Field_Config allowlist: a deactivated source field contributes
-    no terms. Advisory titles selected by those terms would carry the excluded product names
-    into the prompt — a side channel around the one table that gates what reaches the external
-    model. Same posture as prompts.entry_point_vocabulary, built from the same resolved lists.
+    Terms are drawn from whatever the context layer supplied — the same fields
+    prompts.build_base_context sends to the model — with no field-name gate; placeholder values
+    ("NA", "Unknown") are skipped by the shared is_placeholder test so they never become
+    search terms.
 
     Returns (terms, is_ot). is_ot is true when ANY subsystem type or the asset type resolves
     OT via control_mapping.itot_family — deliberately NOT _resolve_itot, which returns None
     unless every component agrees, so a plant with one IT historian would never prefer ICS
     advisories. Empty terms → the caller sends no intel block at all (silence over noise —
     same as today's no-match path)."""
-    sub_ok = set(sub_active_fields or ())
-    asset_ok = set(asset_active_fields or ())
     terms: list[str] = []
     seen: set[str] = set()
 
     def _add(value: Any) -> None:
-        from app.core.security import is_placeholder  # shared no-value test (allowlist_context)
+        from app.core.security import is_placeholder  # shared no-value test (scrub_context)
 
         for v in value if isinstance(value, (list, tuple)) else [value]:
             text = str(v).strip() if v is not None else ""
@@ -542,21 +528,13 @@ def _intel_vocabulary(subsystems: list[dict], asset_context: dict,
 
     for sub in subsystems or []:
         for fld in _INTEL_TECH_FIELDS:
-            if fld in sub_ok:
-                _add(sub.get(fld))
-    if "asset_type" in asset_ok:
-        _add(asset_context.get("asset_type"))
+            _add(sub.get(fld))
     # Classification taxonomy, NOT threat prose: 'Energy'/'Power Generation' are curated
     # dropdown values, and they are exactly how OTX pulses and CISA ICS advisories label
     # themselves. Without them an asset whose whole inventory reads "Custom Application"
     # matches nothing and silently loses its intel block entirely.
-    for fld in ("sector", "sub_sector"):
-        if fld in asset_ok:
-            _add(asset_context.get(fld))
-    # critical_service is force-allowlisted into EVERY prompt by build_base_context
-    # (prompts.py:74 — validate_scenario needs it), so terming on it opens no side channel
-    # the way an allowlist-gated field would. _add already flattens its list shape.
-    _add(asset_context.get("critical_service"))
+    for fld in ("asset_type", "sector", "sub_sector", "critical_service"):
+        _add(asset_context.get(fld))
     is_ot = any(control_mapping.itot_family(s.get("asset_type")) == "OT"
                 for s in subsystems or [])
     is_ot = is_ot or control_mapping.itot_family(asset_context.get("asset_type")) == "OT"
@@ -655,9 +633,13 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
                             scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID, stage="scenario",
                             level=SubsystemLevel.SCENARIOS, epoch=epoch, task_id=task_id, expected_type=dict,
                             temperature=get_settings().scenario_generation_temperature)
+    # critical_service comes from the PROMPT's view (base_ctx), not raw asset_context: the
+    # allowlist gate scrubs placeholder values ("Unknown", "TBD"...), and validation must never
+    # demand a service name the model was never shown.
     report = validation.validate_scenario(
         scenario, threat_type, threat_name,
-        asset_name=scenario_session["AssetName"], critical_service=asset_context.get("critical_service"))
+        asset_name=scenario_session["AssetName"],
+        critical_service=base_ctx["asset_context"].get("critical_service"))
     # One bounded repair turn, on STRUCTURAL misses only (the "missing <field>" entries from
     # validation._check_fields) — never on _mentions consistency warnings, which are advisory.
     # "Do not change factual content" keeps this from becoming a free re-roll that would defeat
@@ -668,7 +650,10 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     missing = [e for e in report["errors"] if e.startswith("missing ")]
     if missing:
         repair_messages = messages + [
-            {"role": "assistant", "content": json.dumps(scenario)},
+            # Scrubbed like any other payload: today the scenario carries no ids (repair runs
+            # before _ground_entry_points stamps entry_point_id/plausible_entry_point_ids), so
+            # this is a no-op — and it stays correct if that ordering ever changes.
+            {"role": "assistant", "content": json.dumps(prompts._scrub_db_keys(scenario))},
             {"role": "user", "content":
                 "The previous response failed validation: " + "; ".join(missing) +
                 ". Correct only these violations. Do not change factual content unless "
@@ -679,14 +664,20 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
                                     stage="scenario", level=SubsystemLevel.SCENARIOS, epoch=epoch,
                                     task_id=task_id, expected_type=dict,
                                     temperature=get_settings().scenario_generation_temperature)
-        except validation.LLMResponseParseError:
-            log.warning("scenario.repair_parse_failed", session_id=scenario_session["SessionID"],
-                        threat_id=sc.threat_id)
+        except Exception:
+            # The repair is ADVISORY: the primary scenario already generated, parsed and
+            # validated (with warnings) — no repair failure may destroy it. Blanket on purpose:
+            # a parse error, a provider error surviving retries, the chat char-cap ValueError,
+            # and LLMSlotUnavailable all end the same way — keep the original. Slot exhaustion
+            # especially must NOT propagate: Celery would retry the whole stage and re-bill the
+            # completed primary call (same keep-going posture as moderate() in llm.py).
+            log.warning("scenario.repair_failed", session_id=scenario_session["SessionID"],
+                        threat_id=sc.threat_id, exc_info=True)
         else:
             r_report = validation.validate_scenario(
                 repaired, threat_type, threat_name,
                 asset_name=scenario_session["AssetName"],
-                critical_service=asset_context.get("critical_service"))
+                critical_service=base_ctx["asset_context"].get("critical_service"))
             still = [e for e in r_report["errors"] if e.startswith("missing ")]
             if len(still) < len(missing):
                 scenario, report, prov = repaired, r_report, r_prov
@@ -917,18 +908,10 @@ class _ScenarioBatch(NamedTuple):
 
 def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: dict,
                             subsystems: list[dict], asset_context: dict, threats: list[dict],
-                            asset_active_fields: list[str] | None, sub_active_fields: list[str] | None,
                             target_threat_ids: set[str] | None,
                             regen_targets: dict[str, RegenTarget] | None,
                             targeted: bool) -> _ScenarioBatch:
-    if asset_active_fields is None or sub_active_fields is None:
-        resolved = dal.active_context_fields_by_group(sess)
-        if asset_active_fields is None:
-            asset_active_fields = resolved["asset"]
-        if sub_active_fields is None:
-            sub_active_fields = resolved["subsystem"]
-    base_ctx = prompts.build_base_context(scenario_session["AssetName"], asset_context, subsystems,
-                                        asset_active_fields, sub_active_fields)
+    base_ctx = prompts.build_base_context(scenario_session["AssetName"], asset_context, subsystems)
 
     tn = tuning.from_session(scenario_session)  # the session's frozen rulebook — never live config
     type_ids = sorted({t["threat_type_id"] for t in threats if t.get("threat_type_id") is not None})
@@ -944,7 +927,7 @@ def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: 
     deduped = _select_unique_top_n(scoped_all, enriched, top_n) if not targeted else 0
     pairs, scoped_count = _build_work_items(scoped_all, target_threat_ids, regen_targets)
     entry_vocab, ambiguous = prompts.entry_point_vocabulary(
-        subsystems, sub_active_fields, scenario_session["AssetName"])
+        subsystems, scenario_session["AssetName"])
     if ambiguous:
         log.warning("scenario.entry_points_ambiguous", session_id=sid, subsystem=ss,
                     labels=ambiguous)
@@ -952,8 +935,7 @@ def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: 
         log.info("scenario.entry_points_unavailable", session_id=sid, subsystem=ss,
                 subsystems=len(subsystems))
     fold = _fold_scenario_rows(dal.active_scenario_rows(sess, sid, ss))
-    intel_terms, intel_ot = _intel_vocabulary(subsystems, asset_context,
-                                            sub_active_fields, asset_active_fields)
+    intel_terms, intel_ot = _intel_vocabulary(subsystems, asset_context)
     return _ScenarioBatch(base_ctx, enriched, deduped, pairs, scoped_count, fold, entry_vocab,
                         intel_terms, intel_ot)
 
@@ -991,8 +973,6 @@ def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, en
 def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, threats: list[dict],
                 llm: LLMClient, task_id: str,
                 epoch: int = _EPOCH, target_threat_ids: set[str] | None = None,
-                asset_active_fields: list[str] | None = None,
-                sub_active_fields: list[str] | None = None,
                 *, require_lock: bool = False,
                 regen_targets: dict[str, RegenTarget] | None = None,
                 on_before_commit: Callable[[list[Provenance | None]], None] | None = None) -> list[Provenance | None]:
@@ -1009,7 +989,6 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
 
     targeted = target_threat_ids is not None or regen_targets is not None
     batch = _prepare_scenario_batch(sess, sid, ss, scenario_session, subsystems, asset_context, threats,
-                                    asset_active_fields, sub_active_fields,
                                     target_threat_ids, regen_targets, targeted)
     base_ctx, enriched, deduped = batch.base_ctx, batch.enriched, batch.deduped
     pairs, scoped_threat_count = batch.pairs, batch.scoped_count
@@ -1119,19 +1098,16 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
     if not eligible:
         log.info("variant.coverage_exhausted", session_id=sid, subsystem=ss)
         return 0
-    resolved = dal.active_context_fields_by_group(sess)
     entry_vocab, ambiguous = prompts.entry_point_vocabulary(
-        subsystems, resolved["subsystem"], scenario_session["AssetName"])
+        subsystems, scenario_session["AssetName"])
     if ambiguous:
         log.warning("variant.entry_points_ambiguous", session_id=sid, subsystem=ss, labels=ambiguous)
     # Variants never run _prepare_scenario_batch, so the intel vocabulary is resolved here from
     # the same shared helper — without this, every variant would silently lose its intel block.
-    intel_terms, intel_ot = _intel_vocabulary(subsystems, asset_context,
-                                            resolved["subsystem"], resolved["asset"])
+    intel_terms, intel_ot = _intel_vocabulary(subsystems, asset_context)
     threats = dal.active_threats(sess, sid, ss)
     enriched = {t["threat_id"]: t for t in threats}
-    base_ctx = prompts.build_base_context(scenario_session["AssetName"], asset_context, subsystems,
-                                        resolved["asset"], resolved["subsystem"])
+    base_ctx = prompts.build_base_context(scenario_session["AssetName"], asset_context, subsystems)
     siblings_by_hash = {h: [(n, s) for _oid, n, s in v]
                         for h, v in fold.siblings_by_hash.items()}
     cross_pairs = list(fold.cross_pairs)
@@ -1328,13 +1304,9 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
         try:
             categories = dal.active_category_names(sess)
             actor_examples = dal.active_actor_names(sess)
-            active_fields = dal.active_context_fields_by_group(sess)
-            asset_active_fields = active_fields["asset"]
-            sub_active_fields = active_fields["subsystem"]
             _announce_generation_started(sess, scenario_session, ASSET_UNIT_ID)
             threats, prov_i = find_threats(sess, scenario_session, subsystems, asset_context, llm, task_id,
-                                        categories=categories, actor_examples=actor_examples,
-                                        asset_active_fields=asset_active_fields, sub_active_fields=sub_active_fields)
+                                        categories=categories, actor_examples=actor_examples)
             sess.commit()
             threats_stage_done = True
             if not threats:
@@ -1343,7 +1315,6 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
                     sess, session_id, ASSET_UNIT_ID, SubsystemLevel.THREATS, _EPOCH)
             if threats_stage_done:
                 scen_provs = write_scenarios(sess, scenario_session, subsystems, asset_context, threats, llm, task_id,
-                                            asset_active_fields=asset_active_fields, sub_active_fields=sub_active_fields,
                                             require_lock=True)
                 dal.append_audit(sess, AuditID=guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
                                 EntityID=scenario_session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,

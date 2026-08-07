@@ -17,9 +17,9 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
+from collections.abc import Sequence
 from urllib.parse import urlparse
-
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 

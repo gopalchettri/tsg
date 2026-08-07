@@ -373,10 +373,11 @@ def count_active_sessions_for_entity(sess: Session, entity_id: str) -> int:
 
 
 def assert_capacity_available(sess: Session, entity_id: str | None = None) -> None:
-    """Raise CapacityExceeded at/over the global `max_active_sessions` ceiling, and at/over the
-    per-entity `max_active_sessions_per_entity` (0 = disabled) when `entity_id` is given —
-    without the latter one entity could loop session creation and starve the whole tenant.
-    Checked before the more expensive `gather_asset_details`."""
+    """Raise CapacityExceeded at/over the global `max_active_sessions` ceiling (0 = disabled),
+    and at/over the per-entity `max_active_sessions_per_entity` (0 = disabled) when `entity_id`
+    is given — without the latter one entity could loop session creation and starve the whole
+    tenant. Checked before the more expensive `gather_asset_details`."""
+    global_cap = get_settings().max_active_sessions
     per_entity_cap = get_settings().max_active_sessions_per_entity
     if entity_id and per_entity_cap:
         # One round trip for both counts (same filtered IX_Session_Active index); the two
@@ -388,12 +389,12 @@ def assert_capacity_available(sess: Session, entity_id: str | None = None) -> No
             ).select_from(m.Scenario_Session)
             .where(m.Scenario_Session.SessionStatus == SessionStatus.active)
         ).one()
-        if total >= get_settings().max_active_sessions:
+        if global_cap and total >= global_cap:
             raise CapacityExceeded()
         if (entity_total or 0) >= per_entity_cap:
             raise CapacityExceeded()
         return
-    if count_active_sessions(sess) >= get_settings().max_active_sessions:
+    if global_cap and count_active_sessions(sess) >= global_cap:
         raise CapacityExceeded()
 
 
@@ -1002,39 +1003,6 @@ def active_category_names(sess: Session) -> list[str]:
         select(tc.ThreatCategoryName)
         .where(tc.IsActive == True, tc.IsDeleted == False)  # noqa: E712
         .order_by(tc.ThreatCategoryID)
-    )]
-
-
-def active_context_fields_by_group(sess: Session) -> dict[str, list[str]]:
-    """Same live-read contract as active_context_fields below, but fetches BOTH the 'asset' and
-    'subsystem' groups in one round-trip — every real caller needs both per session. A group with
-    no active rows comes back empty, which prompts.py treats as "send no context for that group"
-    (fail closed — no hardcoded fallback set, except critical_service, which build_base_context
-    always sends because validation requires it); a row under any OTHER
-    ContextGroup value is silently excluded, and selfcheck.check_dead_context_fields is what
-    surfaces that drift to an operator, not this function."""
-    cfc = m.Context_Field_Config
-    by_group: dict[str, list[str]] = {"asset": [], "subsystem": []}
-    for group, field in sess.execute(
-        select(cfc.ContextGroup, cfc.FieldName)
-        .where(cfc.IsActive == True, cfc.IsDeleted == False)  # noqa: E712
-    ):
-        if group in by_group:
-            by_group[group].append(field)
-    return by_group
-
-
-def active_context_fields(sess: Session, context_group: str) -> list[str]:
-    """Field names a curator has currently turned ON for the AI prompt (Context_Field_Config).
-    This IS the allowlist prompts.py uses — no hardcoded ceiling behind it, so whatever a curator
-    activates here is what reaches the external model (plus critical_service, which
-    build_base_context always adds because validation requires it). Empty result (unseeded, or
-    all off) means the caller sends no other context for that group.
-    Prefer active_context_fields_by_group above when both groups are needed at once."""
-    cfc = m.Context_Field_Config
-    return [r[0] for r in sess.execute(
-        select(cfc.FieldName)
-        .where(cfc.ContextGroup == context_group, cfc.IsActive == True, cfc.IsDeleted == False)  # noqa: E712
     )]
 
 
@@ -1880,16 +1848,19 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
 
     Explicit columns, NOT the whole table: InputSnapshotJSON is the frozen asset context —
     tens of KB the poll endpoint never returns — and this is the poll target, hit repeatedly
-    per plan (same rationale as _SESSION_BOARD_COLS vs load_session)."""
+    per plan (same rationale as _SESSION_BOARD_COLS vs load_session). ScenarioJSON rides
+    along (1:1 outer join on the output's PK) so the GET can show WHICH scenario the plan
+    treats — same per-row cost the board already pays."""
     if not _valid_guid(output_id):
         return None
-    p = m.Risk_Treatment_Plan
+    p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
     return sess.execute(
         select(p.PlanID, p.SessionID, p.OutputID, p.TenantID, p.EntityID, p.Status,
                p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON, p.ValidationJSON,
                p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment, p.ReviewedBy,
-               p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt).where(
-            p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 0)
+               p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt, out.ScenarioJSON)
+        .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID))
+        .where(p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 0)
     ).mappings().first()
 
 

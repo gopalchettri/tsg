@@ -136,7 +136,7 @@ def _redact_value(val: Any) -> Any:
 
 # No-value tokens that reach us as curator-dropdown labels ("NA" is a real option in the
 # multiselect lookup tables — context._resolve_multiselect hands it over as a display name)
-# or as free-text filler. The same class of non-value as ""/[] in allowlist_context below.
+# or as free-text filler. The same class of non-value as ""/[] in scrub_context below.
 _PLACEHOLDER_VALUES = frozenset({
     "na", "n/a", "n.a.", "n.a", "not applicable", "none", "nil", "null",
     "-", "--", "tbd", "to be determined", "unknown", "not available"})
@@ -152,22 +152,21 @@ def _has_value(item: Any) -> bool:
     return not (isinstance(item, str) and (not item.strip() or is_placeholder(item)))
 
 
-def allowlist_context(fields: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
-    """Build model context from ONLY the named allowlisted fields;
-    redact string values recursively (nested lists/dicts included). Anything
-    not on the allowlist never reaches the model.
+def scrub_context(fields: dict[str, Any]) -> dict[str, Any]:
+    """Build model context from EVERY supplied field, redacting string values recursively
+    (nested lists/dicts included). There is no field-name allowlist: whatever the caller
+    assembles is what reaches the model, so the caller owns that decision.
 
-    A field with no real value never reaches the model either — not just None, but also an
-    empty string/list/dict (e.g. "" or []), a whitespace-only string, and placeholder labels
-    like "NA"/"N/A"/"Not Applicable" (case-insensitive — see _PLACEHOLDER_VALUES), alone or as
-    list items. Sending a no-value field wastes prompt space and can read to the AI as "this
-    asset has no critical service" instead of "we don't know" — dropping it means the model
-    sees only what's actually filled in. A numeric 0 or boolean False is a real value
+    A field with no real value is still dropped — not just None, but also an empty
+    string/list/dict (e.g. "" or []), a whitespace-only string, and placeholder labels like
+    "NA"/"N/A"/"Not Applicable" (case-insensitive — see _PLACEHOLDER_VALUES), alone or as list
+    items. Sending a no-value field wastes prompt space and can read to the AI as "this asset
+    has no critical service" instead of "we don't know" — dropping it means the model sees only
+    what's actually filled in. A numeric 0 or boolean False is a real value
     (e.g. target_rto_hours=0), so those are kept.
     """
     out: dict[str, Any] = {}
-    for name in allowed:
-        val = fields.get(name)
+    for name, val in fields.items():
         if val is None:
             continue
         if isinstance(val, (str, list, dict, tuple, set)) and not val:

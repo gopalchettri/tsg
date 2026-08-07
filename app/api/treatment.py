@@ -48,6 +48,15 @@ _CONFLICT_RESPONSES: dict[int | str, dict] = {
 
 _TIMED_OUT_MESSAGE = "generation timed out — request it again"
 
+#: PRESENTATION TRIM (user request, 06 Aug 2026): the poll GET serves only these plan keys
+#: for now — the toolkit's output columns plus the title. The FULL document stays in
+#: PlanJSON (nothing is deleted); widen this tuple or drop the filter in get_treatment_plan
+#: to unhide. Envelope fields are hidden the same way via exclude=True on TreatmentPlanStatus.
+_VISIBLE_PLAN_KEYS = (
+    "title", "treatment_plan", "action_plan", "applicable_to_all_subsystems",
+    "controls_to_be_implemented", "mitigation_timeline", "mitigation_owner", "risk_owner",
+    "impacted_business_division")
+
 
 def enqueue_treatment_plan(plan_id: str) -> None:
     """Indirection so tests can run the generation synchronously instead of via a broker."""
@@ -68,12 +77,11 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
 
-        # Full session row + curator allowlists — the board load behind get_authorized_session
-        # deliberately omits the AssetContextJSON/SubsystemsJSON blobs the snapshot needs.
+        # Full session row — the board load behind get_authorized_session deliberately omits
+        # the AssetContextJSON/SubsystemsJSON blobs the snapshot needs.
         session_row = dal.load_session(sess, session_id)
         if session_row is None:  # unreachable (board load above 404'd; same PK, same txn) —
             raise dal.NotFoundError("session not found")  # but assert would vanish under -O
-        context_fields = dal.active_context_fields_by_group(sess)
 
         scn = dal.scenario_row(sess, session_id, output_id)
         if scn is None:
@@ -90,7 +98,7 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
         # The register's half of the context is the validated body — no external reads. The
         # session-entity check above (get_authorized_session) is THE authorization boundary.
         snapshot = treatment.build_treatment_input(
-            sess, dict(session_row), dict(scn), body.model_dump(mode="json"), context_fields)
+            sess, dict(session_row), dict(scn), body.model_dump(mode="json"))
 
         plan_id = dal.guid()
         stale_cutoff = treatment._stale_cutoff()
@@ -156,11 +164,18 @@ def get_treatment_plan(session_id: str, output_id: str,
         status, error_message = _present_status(row["Status"], row["ErrorMessage"], row["UpdatedAt"])
 
         plan = _safe_json_dict(row["PlanJSON"], row["PlanID"])
+        if plan is not None:
+            plan = {k: plan[k] for k in _VISIBLE_PLAN_KEYS if k in plan}
+        scenario_json = _safe_json_dict(row["ScenarioJSON"], row["PlanID"])
+        scenario = ({k: scenario_json.get(k) for k in
+                     ("scenario_title", "scenario_statement", "risk_statement")}
+                    if scenario_json else None)
         validation = _safe_json_dict(row["ValidationJSON"], row["PlanID"]) or {}
         moderation = validation.get("moderation") or {}
         return TreatmentPlanStatus(
             plan_id=row["PlanID"], session_id=row["SessionID"], output_id=row["OutputID"],
             status=status, treatment_strategy=row["TreatmentStrategy"],
+            scenario=scenario,
             risk_level=row["RiskLevel"], review_status=row["ReviewStatus"],
             review_comment=row["ReviewComment"], reviewed_by=row["ReviewedBy"],
             reviewed_at=row["ReviewedAt"],
