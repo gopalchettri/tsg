@@ -292,13 +292,36 @@ def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any
     it echoes the stable `control_code` instead. The id is resolved HERE, server-side, from the
     snapshot's own library_mapped rows — so the persisted plan and the API response still carry
     it, and a code the model invented or mistyped resolves to None rather than to some other
-    library row. Both keys are kept: the code is what a human reads, the id is what joins."""
-    by_code = {c["control_code"]: c["control_library_id"]
+    library row. Both keys are kept: the code is what a human reads, the id is what joins.
+
+    The join key now travels through model-reproduced free text, so it is FOLDED (strip +
+    casefold) on both sides before lookup — the same posture as every other model-echoed
+    identifier in the pipeline (accept.py's name folding, _ground_entry_points' casefold entry
+    points, embeddings' normalisation). A bare exact match would send ' CII-CID-028' or
+    'cii-cid-028' to None, indistinguishable from an invented code, and one model version that
+    lowercases its output would silently null every link in every plan. ControlCode is unique
+    among live rows, so folding cannot produce a wrong-row match — only a recovered one. The
+    canonical code is written back too, so the human-visible half is repaired as well.
+    """
+    by_code = {str(c["control_code"]).strip().casefold(): c
                for c in ((snapshot.get("existing_controls") or {}).get("library_mapped") or [])
                if isinstance(c, dict) and c.get("control_code") and c.get("control_library_id")}
+    unresolved: list[str] = []
     for ctl in parsed.get("controls_to_be_implemented") or []:
-        if isinstance(ctl, dict):
-            ctl["control_library_id"] = by_code.get(ctl.get("control_code"))
+        if not isinstance(ctl, dict):
+            continue
+        raw = str(ctl.get("control_code") or "").strip()
+        hit = by_code.get(raw.casefold())
+        ctl["control_library_id"] = hit["control_library_id"] if hit else None
+        if hit:
+            ctl["control_code"] = hit["control_code"]   # canonical spelling, not the echo
+        elif raw:
+            unresolved.append(raw)
+    # A code the model invented is expected and fine (it becomes a null link); a code that
+    # SHOULD have matched is a silent join-key loss, so leave a trace rather than nothing.
+    if unresolved:
+        log.info("treatment.control_code_unresolved", codes=unresolved,
+                 known=sorted(c["control_code"] for c in by_code.values()))
 
 
 def _inject_reserved(parsed: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:

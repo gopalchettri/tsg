@@ -83,9 +83,10 @@ flowchart TD
 
     A5 --> A6["<b>6 · THE REQUEST TO THE AI IS ASSEMBLED</b>
     WHY: the AI must see enough to be useful and nothing it should not.
-    HOW: only field names an administrator switched on are included —
-    an empty list sends NOTHING. Blank values are removed, so the AI
-    cannot read an empty box as 'this asset has no critical service'.
+    HOW: the field set is fixed in code (context.py) — there is no
+    per-field switch. Blank and placeholder values are removed, so the
+    AI cannot read an empty box as 'this asset has no critical service',
+    and database ids are stripped out.
     Numeric 0 and false ARE kept, because they are real answers. Six
     categories of secret are replaced, including inside nested data:
     private keys, tokens, name=value credentials, cloud key IDs, long

@@ -2015,7 +2015,7 @@ def prompt_logs_for_plan(sess: Session, plan_id: str) -> list[RowMapping]:
     pl = m.Prompt_Log
     return sess.execute(
         select(pl.Prompt, pl.ResponseText, pl.Model, pl.ModelVersion, pl.PromptVersion,
-               pl.ParseSucceeded, pl.CreatedAt)
+            pl.ParseSucceeded, pl.CreatedAt)
         .where(pl.CorrelationID == plan_id)
         .order_by(pl.CreatedAt)
     ).mappings().all()

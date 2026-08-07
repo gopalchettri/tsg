@@ -221,91 +221,16 @@ CREATE UNIQUE INDEX UX_ConfigThreatRule_NaturalKey
     ON Config_Threat_Rule(ThreatTypeID, RuleType, RuleKey, RuleValue)
     WHERE IsActive = 1 AND IsDeleted = 0;
 
--- Context_Field_Config: which asset/subsystem fields are currently turned on for the AI prompt.
--- This table is the ONLY allowlist: app/pipeline/prompts.py holds no hardcoded set of field
--- names, so an active row here is exactly what gets sent to the external AI, and adding or
--- removing a field is a curator edit rather than a deploy. Treat INSERTs here as a data-exposure
--- change and review them accordingly. No active rows for a group = no context sent for that
--- group (fail closed); prompts.py never falls back to "send everything". One forced exception:
--- build_base_context always sends critical_service (validation requires it), so toggling that
--- row off has no effect.
+-- Context_Field_Config (the per-field AI-prompt allowlist) HAS BEEN REMOVED.
+-- Nothing in the application reads it. What governs data leaving the system is, in order:
+--   1. app/pipeline/context.py        - the SOLE owner of which fields are assembled at all
+--   2. core.security.redact()         - strips secrets/PII from every free-text value
+--   3. core.security.scrub_context()  - drops empties, whitespace and placeholder labels ('NA')
+--   4. prompts._EXCLUDE_DB_KEY_TO_PROMPT - drops table primary keys at any nesting depth
+-- There is NO field-name allowlist and no curator toggle; adding a field to context.py is what
+-- changes what reaches the external model, and THAT is the data-exposure review point.
+-- NOTE: this file duplicates scripts/Threat_library.sql, which is canonical.
 
-IF OBJECT_ID('dbo.Context_Field_Config', 'U') IS NULL
-CREATE TABLE Context_Field_Config (
-    ContextFieldConfigID INT IDENTITY NOT NULL CONSTRAINT PK_Context_Field_Config PRIMARY KEY,
-    ContextGroup          nvarchar(20)   NOT NULL,          -- 'asset' | 'subsystem'
-    FieldName             nvarchar(100)  NOT NULL,
-    IsActive              bit            NOT NULL,
-    IsDeleted             bit            NOT NULL,
-    CreatedAt datetime2 NULL CONSTRAINT DF_ContextFieldConfig_CreatedAt DEFAULT SYSUTCDATETIME(),
-    CONSTRAINT UQ_Context_Field_Config UNIQUE (ContextGroup, FieldName)
-);
-
--- Existing databases created before the CreatedAt stamp (2026-07-30): add it in place.
-IF OBJECT_ID('dbo.Context_Field_Config', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Context_Field_Config', 'CreatedAt') IS NULL
-    ALTER TABLE Context_Field_Config ADD CreatedAt datetime2 NULL CONSTRAINT DF_ContextFieldConfig_CreatedAt DEFAULT SYSUTCDATETIME();
-
--- Seed: every field currently sent to the AI, all turned on. A curator can flip IsActive to 0
--- for any row to stop sending that field, without touching code.
-IF NOT EXISTS (SELECT 1 FROM Context_Field_Config)
-INSERT INTO Context_Field_Config (ContextGroup, FieldName, IsActive, IsDeleted) VALUES
-    (N'asset', N'cii_asset_description', 1, 0),
-    (N'asset', N'critical_service', 1, 0),
-    (N'asset', N'sector', 1, 0),
-    (N'asset', N'sub_sector', 1, 0),
-    (N'asset', N'data_handled', 1, 0),
-    (N'asset', N'asset_type', 1, 0),
-    (N'asset', N'operating_system', 1, 0),
-    (N'asset', N'location', 1, 0),
-    (N'asset', N'target_rto_hours', 1, 0),
-    (N'asset', N'target_rpo_hours', 1, 0),
-    (N'subsystem', N'name', 1, 0),
-    (N'subsystem', N'asset_type', 1, 0),
-    (N'subsystem', N'past_incidents', 1, 0),
-    (N'subsystem', N'technology_used', 1, 0),
-    (N'subsystem', N'vendor_name', 1, 0),
-    (N'subsystem', N'database_platforms', 1, 0),
-    (N'subsystem', N'targeted_users', 1, 0),
-    (N'subsystem', N'saas_platform_list', 1, 0),
-    (N'subsystem', N'public_cloud_platforms', 1, 0);
-
--- New subsystem fields added in a later session (usage scale, accessibility/hosting/network
--- exposure, DR/backup posture, data-residency, RTO/RPO targets).
--- Guarded per-row via an anti-join, not per-table like the block above: on a database that
--- already ran the block above (so Context_Field_Config is non-empty), the `IF NOT EXISTS
--- (SELECT 1 FROM Context_Field_Config)` guard on that block would skip an INSERT entirely,
--- silently leaving these 21 fields off — and since this table is now the only allowlist, a
--- missing row means the field simply never reaches the AI.
-INSERT INTO Context_Field_Config (ContextGroup, FieldName, IsActive, IsDeleted)
-SELECT v.ContextGroup, v.FieldName, 1, 0
-FROM (VALUES
-    (N'subsystem', N'min_no_of_transactions'),
-    (N'subsystem', N'max_no_of_transactions'),
-    (N'subsystem', N'user_base_count'),
-    (N'subsystem', N'accessability_channel'),
-    (N'subsystem', N'hosting_location'),
-    (N'subsystem', N'dr_location'),
-    (N'subsystem', N'network_connectivity_primary_dr'),
-    (N'subsystem', N'dr_drill_frequency'),
-    (N'subsystem', N'maintenance_contract_exists'),
-    (N'subsystem', N'last_dr_test_date'),
-    (N'subsystem', N'backup_multi_site'),
-    (N'subsystem', N'backup_retention_period_days'),
-    (N'subsystem', N'backup_tested'),
-    (N'subsystem', N'offsite_air_gapped_backup'),
-    (N'subsystem', N'data_residency_restrictions'),
-    (N'subsystem', N'data_residency_restriction_justification'),
-    (N'subsystem', N'document_drp_exists'),
-    (N'subsystem', N'saas_backup_required'),
-    (N'subsystem', N'rto_target_mins'),
-    (N'subsystem', N'rpo_target_mins'),
-    (N'subsystem', N'data_loss_incident_last_3_years')
-) AS v(ContextGroup, FieldName)
-WHERE NOT EXISTS (
-    SELECT 1 FROM Context_Field_Config c
-    WHERE c.ContextGroup = v.ContextGroup AND c.FieldName = v.FieldName
-);
 
 -- Verify
 SELECT 'Threat_Category' AS what, OBJECT_ID('dbo.Threat_Category', 'U') AS exists_check
@@ -326,4 +251,4 @@ SELECT 'Threat_Catalogue.Source', COL_LENGTH('dbo.Threat_Catalogue', 'Source')
 UNION ALL
 SELECT 'Config_Threat_Rule', OBJECT_ID('dbo.Config_Threat_Rule', 'U')
 UNION ALL
-SELECT 'Context_Field_Config', OBJECT_ID('dbo.Context_Field_Config', 'U');
+

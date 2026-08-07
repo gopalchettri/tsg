@@ -446,9 +446,7 @@ class Config_Tuning(Base):
 
 # Context_Field_Config (the per-field AI-prompt allowlist) was removed: prompts.build_base_context
 # now sends every context field the context layer assembled, filtered only by redaction and the
-# no-value scrub in core.security.scrub_context. The SQL table still exists but nothing reads it.
-    # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
-    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+# no-value scrub in core.security.scrub_context. The SQL table and its seed are gone too.
 
 # TSG-owned (not seeded like the masters above): one row per AI-proposed threat NAME reaching
 # accept. Now genuinely a pending-review queue — accept.py writes `pending` and does NOT create a

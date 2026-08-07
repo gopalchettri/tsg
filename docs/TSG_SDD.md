@@ -297,11 +297,11 @@ flowchart TD
     SC --> SEL[Top-N unique selection]
 ```
 
-### 7.2 Context assembly: the allowlist is data, not code
+### 7.2 Context assembly: the field set is code, and that is the review point
 
-What the model may see is controlled by the `Context_Field_Config` table, **not by anything hardcoded**: `prompts.build_base_context` sends exactly the active rows for the `asset` and `subsystem` groups, and an empty table sends **nothing** (fail closed) — the deliberate consequence is that an unseeded environment degrades generation quality rather than leaking unvetted fields. One exception is forced: `critical_service` is always sent because downstream validation checks the risk statement against it. Every value crosses two filters first: `redact()` (seven secret-shaped regex patterns — private-key blocks, JWTs, name/value credentials, AWS key ids, long hex, emails) and `allowlist_context()` (recursive field-name allowlisting that drops empty values so "no data" never reads as meaningful). Curators therefore treat an INSERT into `Context_Field_Config` as a **data-exposure change**, which is exactly what it is.
+What the model may see is decided in **code**, not data: `app/pipeline/context.py` is the sole owner of which asset and subsystem fields are resolved into the frozen `AssetContextJSON`/`SubsystemsJSON`, and `prompts.build_base_context` sends every field it assembled. The former `Context_Field_Config` allowlist has been **removed** — there is no per-field curator toggle and no fail-closed empty state; an unseeded environment no longer degrades exposure in either direction. Four filters stand between a resolved field and the wire, in order: (1) `redact()` — seven secret-shaped regex patterns (private-key blocks, JWTs, name/value credentials, AWS key ids, long hex, emails); (2) `scrub_context()` — drops None, empty, whitespace-only and placeholder values ("NA"/"N/A"/"Not Applicable"/"TBD"/…) so "no data" never reads to the model as a meaningful absence; (3) `prompts._EXCLUDE_DB_KEY_TO_PROMPT` via `_scrub_db_keys` — strips table primary keys at any nesting depth, including ids carried under non-PK names (`entry_point_id`, `plausible_entry_point_ids`); (4) `_CONTEXT_PREFIX` framing — the payload is labelled data, not instructions. **Adding a field to `context.py` is therefore the data-exposure change, and the code review of that commit is the control.**
 
-One extension caveat for developers: the config table controls exposure of fields that `app/pipeline/context.py` *already resolves* into the frozen `AssetContextJSON`. Adding a **new** field is a two-step change — (1) make `context.py` produce it (a code change; note its option-code decoding maps for onboarding columns), then (2) activate it with a `Context_Field_Config` row. A config row naming a field the context never carries is **silently inert** (the operational self-check warns about exactly this, §13.5), and existing sessions keep their frozen context — only new sessions see the field.
+One extension note for developers: adding a **new** field is now a one-step change — make `context.py` produce it (note its option-code decoding maps for onboarding columns) and it flows to the model on the next session. Existing sessions keep their frozen context, so only new sessions see it. Because there is no second activation step, the pull request that touches `context.py` is the only place the exposure decision is visible — treat it accordingly.
 
 ### 7.3 The threats prompt contract
 
@@ -422,7 +422,7 @@ All prompts share one architecture (`app/pipeline/prompts.py`): exactly two mess
 
 ### 9.2 Hallucination and injection constraints, layered
 
-1. **Input:** field allowlist from `Context_Field_Config` (fail closed) + `redact()` on every free-text value.
+1. **Input:** the fixed field set assembled by `context.py` + `redact()` on every free-text value + `scrub_context()` (empties/placeholders) + `_EXCLUDE_DB_KEY_TO_PROMPT` (primary keys, any depth).
 2. **Vocabulary:** closed category and actor lists built from live DB rows.
 3. **Instruction:** "invent nothing", "thin is a valid answer", "you decide nothing".
 4. **Intel fencing:** intel items expose only id (60 chars), title (140), url (200) — never descriptions or raw records; every value is defanged (fence-like character runs stripped) because OTX titles are community-submitted; adversary attribution is prepended inside the title where truncation cannot reach it.
@@ -490,7 +490,7 @@ erDiagram
 
 **Control library.** `Control_Standard` (30), `Control_Library` (1,288, with an IT/OT applicability column used as grounding's tolerant pre-filter), and a genuine many-to-many standard map (99% of controls cite 2+ standards).
 
-**Curator configuration.** `Config_Threat_Rule` (the scoping rule engine's data, §7.5) and `Context_Field_Config` (the sole prompt-exposure allowlist, §7.2).
+**Curator configuration.** `Config_Threat_Rule` (the scoping rule engine's data, §7.5). Prompt exposure is no longer curator-configurable — see §7.2.
 
 **Governance.** `Scenario_Audit` (append-only ledger), `Prompt_Log` (every LLM call verbatim), `Threat_Candidate_Review` (pending curator queue), `Threat_Library_Import_Run` (import history that outlives Celery results; a failed run's terminal row commits in its own transaction so failure always leaves a trace).
 

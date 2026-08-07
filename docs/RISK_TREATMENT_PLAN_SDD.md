@@ -313,7 +313,7 @@ RULES (numbered):
 
 Built by `treatment.build_treatment_input` at POST time from the validated body (the register's half) plus TSG's own tables (the scenario half).
 
-**Force-fields mechanism:** `prompts.build_base_context` takes keyword-only `force_fields: set[str] | None = None`, merged into the asset allowlist. `treatment.build_treatment_input` passes `force_fields={"sector", "sub_sector", "cii_asset_description"}` — the spec's prompt template requires these three unconditionally, and the curator allowlist fails closed and would otherwise silently drop them. `threats_prompt`/`scenario_prompt` do not pass it — their prompts stay byte-identical.
+**Force-fields mechanism: removed.** It existed only to defeat the curator allowlist, which no longer exists — `build_base_context` sends every field `context.py` assembled, so `sector`/`sub_sector`/`cii_asset_description` reach the treatment prompt unconditionally with nothing to force.
 
 ```jsonc
 {

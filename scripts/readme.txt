@@ -78,7 +78,8 @@ database is recreated).
     rules steering real generations.
 
 2026-07-30: CreatedAt datetime2 added to Subsystem_Stage_State, ThreatType_ThreatActor_Map,
-Threat_Catalogue_Category_Map, Context_Field_Config and Control_Library_Standard_Map -- the five
+Threat_Catalogue_Category_Map, Context_Field_Config (since removed) and
+Control_Library_Standard_Map -- the five
 tables that had no creation stamp at all. Nullable WITH a DEFAULT SYSUTCDATETIME(): nullable so
 the seeds' explicit column lists keep working, defaulted so seeded rows still get a real UTC
 value rather than NULL. Every app write site stamps dal.now() explicitly, so the DB default only

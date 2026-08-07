@@ -607,7 +607,7 @@ def _ground_entry_points(scenario: dict, vocab: dict[str, int],
     scenario["plausible_entry_point_ids"] = list(frozen) if frozen else ids
 
 
-def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict, asset_context: dict, sc,
+def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict, sc,
                     enriched: dict, llm: LLMClient, task_id: str, epoch: int,
                     sibling_texts: list[tuple[int, str]] | None = None,
                     coverage: _Coverage | None = None) -> tuple[dict, dict, Provenance | None]:    
@@ -665,6 +665,15 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
                                     task_id=task_id, expected_type=dict,
                                     temperature=get_settings().scenario_generation_temperature)
         except Exception:
+            # MUST roll back first. _ask_ai does session-mutating DB work around the LLM call
+            # (renew_lease + commit before, Prompt_Log insert + commit after) across a pooled
+            # connection that idles for the whole call. A mid-transaction disconnect leaves the
+            # Session needing an explicit rollback; without one the next statement — the
+            # renew_lease in write_scenarios, which sits OUTSIDE the per-threat try — raises
+            # PendingRollbackError and parks the whole SCENARIOS stage in ERROR, discarding a
+            # batch of already-billed scenarios because an ADVISORY call failed. No-op on the
+            # LLM/parse/slot paths (nothing pending there).
+            sess.rollback()
             # The repair is ADVISORY: the primary scenario already generated, parsed and
             # validated (with warnings) — no repair failure may destroy it. Blanket on purpose:
             # a parse error, a provider error surviving retries, the chat char-cap ValueError,
@@ -674,13 +683,26 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
             log.warning("scenario.repair_failed", session_id=scenario_session["SessionID"],
                         threat_id=sc.threat_id, exc_info=True)
         else:
+            # MERGE, never replace. The prompt asks for "the corrected JSON object", which
+            # invites a partial one, and json_object mode + parse_json(dict) make
+            # {"risk_statement": "..."} a perfectly legal repair. Replacing wholesale would then
+            # DELETE entry_point/other_plausible_entry_points — _ground_entry_points would set
+            # plausible_entry_point_ids=[], dal's coverage loop would skip the identity, and the
+            # threat would be frozen at one scenario forever, logged as ordinary success. The
+            # accept gate only counts the three narrative fields, so it cannot see that loss.
+            # Merging makes the whole class impossible: a repair can overwrite only keys it
+            # actually returned, and can never remove one.
+            merged = {**scenario, **repaired}
+            # Validate the MERGED object, not the raw repair: validate_scenario's envelope also
+            # carries assumptions/excluded_details, so a pre-merge report would be persisted
+            # alongside a post-merge ScenarioJSON that disagrees with it.
             r_report = validation.validate_scenario(
-                repaired, threat_type, threat_name,
+                merged, threat_type, threat_name,
                 asset_name=scenario_session["AssetName"],
                 critical_service=base_ctx["asset_context"].get("critical_service"))
             still = [e for e in r_report["errors"] if e.startswith("missing ")]
             if len(still) < len(missing):
-                scenario, report, prov = repaired, r_report, r_prov
+                scenario, report, prov = merged, r_report, r_prov
                 log.info("scenario.repaired", session_id=scenario_session["SessionID"],
                         threat_id=sc.threat_id, was_missing=missing, still_missing=still)
     report["moderation"] = _moderation_report(scenario)
@@ -1016,7 +1038,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
                             others=[s for h, s in cross_pairs if h != own_identity] or None,
                             intel_terms=batch.intel_terms, intel_ot=batch.intel_ot)
         try:
-            scenario, report, prov = _generate_one_scenario(sess, scenario_session, base_ctx, asset_context, sc,
+            scenario, report, prov = _generate_one_scenario(sess, scenario_session, base_ctx, sc,
                                                             enriched, llm, task_id, epoch,
                                                             sibling_texts=sibling_texts,
                                                             coverage=coverage)
@@ -1130,7 +1152,7 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
                             factors=factors)
         try:
             scenario, report, prov = _generate_one_scenario(
-                sess, scenario_session, base_ctx, asset_context, sc, enriched, llm, task_id, epoch,
+                sess, scenario_session, base_ctx, sc, enriched, llm, task_id, epoch,
                 sibling_texts=siblings_by_hash.get(item["identity_hash"]) or None,
                 coverage=_Coverage(
                     vocab=entry_vocab,

@@ -135,7 +135,7 @@ nothing.
 | **Embedding cache** in MongoDB | `POST /v1/tsg/threat-library/embeddings/update`, or automatically after a library import | A library row with no stored vector is **invisible to grounding**. The row exists but can never be matched. |
 | **Threat-intel cache** in MongoDB `threat_intel` | Scheduled fan-out (`app/pipeline/celery_app.py:232`), or `scripts/backfill_otx.py` | Scenarios are written without current CVE/advisory references. Completely harmless — this is fail-open enrichment. |
 | **`Config_Threat_Rule`** — the scoping rules | Curator/admin | No threat is ever excluded by rule; scoring is base + grounding weight only. |
-| **`Context_Field_Config`** — which context fields may be sent to the AI | Curator/admin | **This table *is* the allowlist.** Empty means *nothing* is sent for that group — it fails closed, not open (`app/pipeline/prompts.py:62`). |
+| *(removed)* `Context_Field_Config` | — | **Deleted.** There is no field-name allowlist any more: `app/pipeline/context.py` is the sole owner of which fields are assembled, and everything it assembles is sent, filtered only by `redact()`, `scrub_context()` and `prompts._EXCLUDE_DB_KEY_TO_PROMPT`. |
 | **A calibrated grounding cutoff** | Warmed at worker boot (`app/pipeline/celery_app.py:120`) | Falls back to the static 75 with a loud warning — a number tuned for a *different* model pair, so matches may be misclassified. |
 
 **Two boot gates that refuse to start rather than run wrong** (`app/main.py:29`):
@@ -250,7 +250,7 @@ is not re-claimable, so a duplicate background message is a genuine no-op, never
 **Step 15 — Build the prompt.** Two safety layers apply to everything that leaves the building
 (`app/pipeline/prompts.py:54`):
 
-1. **Allowlist** — only fields a curator has switched on in `Context_Field_Config` are included.
+1. **Fixed field set** — `context.py` decides what is assembled; there is no per-field toggle. Adding a field there is the data-exposure review point.
    Anything not on the list never reaches the model. A field that is empty (`""`, `[]`, `{}`) is
    dropped too, because sending it reads to the AI as *"this asset has no critical service"* rather
    than *"we don't know"*. Numeric `0` and `false` are kept — those are real answers.
@@ -992,7 +992,7 @@ code, and will go stale silently.
 | `Threat_Candidate_Review` | One AI-proposed threat name queued for a curator to generalise into a real catalogue entry. |
 | `Threat_Category` / `Threat_Type` / `Threat_Catalogue` / `Threat_Actor` | The approved threat library. |
 | `Control_Library` / `Control_Standard` | The approved control library. |
-| `Config_Threat_Rule` / `Context_Field_Config` | Curator-controlled scoping rules, and the prompt allowlist. |
+| `Config_Threat_Rule` | Curator-controlled scoping rules. (`Context_Field_Config`, the former prompt allowlist, has been removed.) |
 
 **MongoDB** — caches, all rebuildable:
 

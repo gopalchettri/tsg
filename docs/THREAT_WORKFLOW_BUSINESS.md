@@ -105,9 +105,14 @@ flowchart TD
 **What the request contains.** Only facts drawn from the platform's own records — the asset, and the
 supporting systems it depends on. Two protections apply before anything leaves the building:
 
-1. **An allowlist.** Only fields a curator has switched on are included. Anything not on the list
-   never reaches the AI. If the list is empty, *nothing* is sent — it fails closed, not open.
+1. **A fixed field set.** The platform decides in code which asset and supporting-system facts are
+   assembled at all; nothing outside that set exists to be sent. There is no per-field on/off
+   switch — changing what the AI can see is a code change, and that is the point at which the
+   exposure is reviewed.
 2. **Redaction.** Every free-text value is scrubbed for secrets and personal data first.
+3. **No-value and identifier removal.** Blank values and placeholder labels ("NA") are dropped so
+   the AI is never told something is *absent* when it is merely unrecorded, and internal database
+   identifiers are stripped out entirely.
 
 The asset's data is also clearly labelled as *information to describe, not instructions to follow*,
 so an asset description that happens to read like a command is not obeyed.
@@ -396,7 +401,7 @@ for a human. It did not gain an asset-named near-duplicate, and it did not gain 
 | The **threat library** is empty or unseeded | Every threat comes back unverified. Scenarios are still produced, but no official wording is ever used. |
 | The **actor table** is unseeded | The AI is asked for generic role labels instead of a closed list, and no actor can ever be validated. |
 | A library entry has **no stored comparison data** | That entry exists but is invisible to comparison. It can never be matched. |
-| The **allowlist of context fields** is empty | Nothing about the asset is sent to the AI. It fails closed, so proposals will be generic and weak. |
+| The asset's **context fields are mostly unrecorded** | Blank and placeholder values are dropped, so little reaches the AI and proposals come back generic and weak. The remedy is completing the asset record, not a configuration change. |
 | The match cutoff is **pinned by hand** | Automatic per-model calibration is switched off. After a model change, matches may be misjudged in either direction. |
 | The library contains **two entries naming the same threat** | Automatic calibration becomes mathematically impossible. The system detects this, skips the expensive step, and logs which pair to merge. Worth acting on. |
 
