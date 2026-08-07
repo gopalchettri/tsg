@@ -236,6 +236,13 @@ class Settings(BaseSettings):
         0.0, ge=0.0, le=2.0, validation_alias=AliasChoices(
             "THREAT_IDENTIFICATION_TEMPERATURE", "TSG_THREAT_IDENTIFICATION_TEMPERATURE"))
 
+    # Same idea, for the scenario-writing step. Unset (default) = provider's default, NOT 0.0
+    # like the threat step: the same call serves variant generation, where a pinned-0
+    # temperature works against the "MEANINGFULLY DIFFERENT" sibling steering.
+    scenario_generation_temperature: float | None = Field(
+        None, ge=0.0, le=2.0, validation_alias=AliasChoices(
+            "SCENARIO_GENERATION_TEMPERATURE", "TSG_SCENARIO_GENERATION_TEMPERATURE"))
+
     # How much "thinking effort" the AI spends per reply. Unset = provider's own default.
     llm_reasoning_effort: Literal["low", "medium", "high"] | None = Field(
         None, validation_alias=AliasChoices("LLM_REASONING_EFFORT", "TSG_LLM_REASONING_EFFORT"))

@@ -532,9 +532,11 @@ def _intel_vocabulary(subsystems: list[dict], asset_context: dict,
     seen: set[str] = set()
 
     def _add(value: Any) -> None:
+        from app.core.security import is_placeholder  # shared no-value test (allowlist_context)
+
         for v in value if isinstance(value, (list, tuple)) else [value]:
             text = str(v).strip() if v is not None else ""
-            if text and text.casefold() not in seen:
+            if text and not is_placeholder(text) and text.casefold() not in seen:
                 seen.add(text.casefold())
                 terms.append(text)
 
@@ -651,10 +653,45 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
                                         intel_items=intel_items, entry_points=entry_labels)
     scenario, prov = _ask_ai(sess, llm, messages,
                             scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID, stage="scenario",
-                            level=SubsystemLevel.SCENARIOS, epoch=epoch, task_id=task_id, expected_type=dict)
+                            level=SubsystemLevel.SCENARIOS, epoch=epoch, task_id=task_id, expected_type=dict,
+                            temperature=get_settings().scenario_generation_temperature)
     report = validation.validate_scenario(
         scenario, threat_type, threat_name,
         asset_name=scenario_session["AssetName"], critical_service=asset_context.get("critical_service"))
+    # One bounded repair turn, on STRUCTURAL misses only (the "missing <field>" entries from
+    # validation._check_fields) — never on _mentions consistency warnings, which are advisory.
+    # "Do not change factual content" keeps this from becoming a free re-roll that would defeat
+    # _flag_sibling_similarity below. Accepted only if it strictly reduces the structural
+    # misses; a repair that fails to parse keeps the original (same flag-never-raise posture
+    # as validate_scenario itself). Runs BEFORE moderation/grounding/similarity so all
+    # post-processing sees the final scenario.
+    missing = [e for e in report["errors"] if e.startswith("missing ")]
+    if missing:
+        repair_messages = messages + [
+            {"role": "assistant", "content": json.dumps(scenario)},
+            {"role": "user", "content":
+                "The previous response failed validation: " + "; ".join(missing) +
+                ". Correct only these violations. Do not change factual content unless "
+                "required. Return only the corrected JSON object."}]
+        try:  # through _ask_ai, so Prompt_Log keeps both attempts and the stage lease renews
+            repaired, r_prov = _ask_ai(sess, llm, repair_messages,
+                                    scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID,
+                                    stage="scenario", level=SubsystemLevel.SCENARIOS, epoch=epoch,
+                                    task_id=task_id, expected_type=dict,
+                                    temperature=get_settings().scenario_generation_temperature)
+        except validation.LLMResponseParseError:
+            log.warning("scenario.repair_parse_failed", session_id=scenario_session["SessionID"],
+                        threat_id=sc.threat_id)
+        else:
+            r_report = validation.validate_scenario(
+                repaired, threat_type, threat_name,
+                asset_name=scenario_session["AssetName"],
+                critical_service=asset_context.get("critical_service"))
+            still = [e for e in r_report["errors"] if e.startswith("missing ")]
+            if len(still) < len(missing):
+                scenario, report, prov = repaired, r_report, r_prov
+                log.info("scenario.repaired", session_id=scenario_session["SessionID"],
+                        threat_id=sc.threat_id, was_missing=missing, still_missing=still)
     report["moderation"] = _moderation_report(scenario)
     
     _ground_entry_points(scenario, cov.vocab, cov.frozen)

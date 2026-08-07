@@ -134,16 +134,36 @@ def _redact_value(val: Any) -> Any:
     return val
 
 
+# No-value tokens that reach us as curator-dropdown labels ("NA" is a real option in the
+# multiselect lookup tables — context._resolve_multiselect hands it over as a display name)
+# or as free-text filler. The same class of non-value as ""/[] in allowlist_context below.
+_PLACEHOLDER_VALUES = frozenset({
+    "na", "n/a", "n.a.", "n.a", "not applicable", "none", "nil", "null",
+    "-", "--", "tbd", "to be determined", "unknown", "not available"})
+
+
+def is_placeholder(value: Any) -> bool:
+    """True when a string carries no real information (a placeholder label, not data)."""
+    return isinstance(value, str) and value.strip().casefold() in _PLACEHOLDER_VALUES
+
+
+def _has_value(item: Any) -> bool:
+    """List-item test: a blank/whitespace or placeholder string is noise, everything else is data."""
+    return not (isinstance(item, str) and (not item.strip() or is_placeholder(item)))
+
+
 def allowlist_context(fields: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
     """Build model context from ONLY the named allowlisted fields;
     redact string values recursively (nested lists/dicts included). Anything
     not on the allowlist never reaches the model.
 
     A field with no real value never reaches the model either — not just None, but also an
-    empty string/list/dict (e.g. "" or []). Sending an empty field wastes prompt space and can
-    read to the AI as "this asset has no critical service" instead of "we don't know" — dropping
-    it means the model sees only what's actually filled in. A numeric 0 or boolean False is a
-    real value (e.g. target_rto_hours=0), so those are kept.
+    empty string/list/dict (e.g. "" or []), a whitespace-only string, and placeholder labels
+    like "NA"/"N/A"/"Not Applicable" (case-insensitive — see _PLACEHOLDER_VALUES), alone or as
+    list items. Sending a no-value field wastes prompt space and can read to the AI as "this
+    asset has no critical service" instead of "we don't know" — dropping it means the model
+    sees only what's actually filled in. A numeric 0 or boolean False is a real value
+    (e.g. target_rto_hours=0), so those are kept.
     """
     out: dict[str, Any] = {}
     for name in allowed:
@@ -152,6 +172,12 @@ def allowlist_context(fields: dict[str, Any], allowed: set[str]) -> dict[str, An
             continue
         if isinstance(val, (str, list, dict, tuple, set)) and not val:
             continue
+        if isinstance(val, str) and not _has_value(val):
+            continue
+        if isinstance(val, (list, tuple)):
+            val = [v for v in val if _has_value(v)]
+            if not val:
+                continue
         out[name] = _redact_value(val)
     return out
 

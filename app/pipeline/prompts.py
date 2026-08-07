@@ -240,9 +240,10 @@ def entry_point_vocabulary(subsystems: list[dict[str, Any]], sub_active_fields: 
     The label is what the model actually SEES — `redact()`ed exactly as build_base_context
     redacts it — while the id is `subsystems[i]["id"]`, the supporting system's DB primary key
     (context._build_subsystems:334). Keying coverage on the id rather than the label is the whole
-    point: `redact()` is not injective. Two systems named like hostnames or hashes
-    ("billing.internal.dc-a" / "...dc-b") both match the JWT-ish and long-hex patterns in
-    core.security and reach the model as the SAME "[REDACTED]" string. Keyed by label they would
+    point: `redact()` is not injective. Two systems with email-shaped or credential-shaped
+    names ("scada-ops@plant.local" / "scada-eng@plant.local", or "Vault key: prod" /
+    "Vault key: dev") match the email / key-value patterns in core.security and reach the
+    model as the SAME "[REDACTED]" string. Keyed by label they would
     silently become one coverage cell and an entire supporting system would go unexamined while
     the report claimed full coverage.
 
@@ -317,7 +318,10 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
     if not threat_type or not threat_name:
         # raise, not assert — asserts vanish under `python -O`, and this is a contract violation
         raise ValueError("scenario_prompt requires a verified threat_type and threat_name")
-
+    # OTX Report Use
+    print("\n\n\n")
+    print("inel_items", intel_items)
+    print("\n\n\n")
     intel_text, intel_instruction = _intel_block(intel_items)
 
     # Empty/absent vocabulary → these two fields are never asked for and the prompt stays
@@ -357,6 +361,9 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
             "there. The asset, by its context-given name, is the subject of every field; "
             "supporting systems appear only as the path the threat travels or as operational "
             "context.\n"
+            "Objective: an evidence-grounded scenario for downstream risk review. When multiple "
+            "readings of the context are plausible, choose the one requiring the fewest "
+            "assumptions.\n"
             "\nFIELDS (return a JSON object)\n"
             "scenario_title: the asset and the impact against it.\n"
             "scenario_statement: how the threat (cited by its threat_name) reaches and "
@@ -370,11 +377,17 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
             "scenario, each {\"name\": <concrete control, e.g. 'Multi-factor authentication "
             "for privileged accounts'>, \"why\": <one sentence on how it mitigates this "
             "scenario>}. Real, established control practices only — no invented product names, "
-            "no procedural steps. Empty is valid.\n"
+            "no procedural steps; each control semantically distinct from the others — no "
+            "rewordings of the same practice — and named as the control practice itself, never "
+            "a framework identifier such as 'NIST CSF PR.AC-1'. Empty is valid.\n"
             "assumptions: short strings — assumptions you had to make because the context "
             "leaves them unstated. Empty if none.\n"
             "excluded_details: short strings — attack specifics you deliberately left out "
             "under rule 2. Empty if none.\n"
+            # NON-REMOVABLE: tasks._ground_entry_points resolves the model's answers against
+            # this closed vocabulary by exact casefold match. Without it every lookup misses,
+            # plausible_entry_point_ids stays empty, and dal's coverage loop silently collapses
+            # to ONE scenario per threat — logged as ordinary completion, never as an error.
             + entry_point_fields +
             "\nRULES\n"
             "1) Use ONLY the supplied context — do not invent assets, technologies, or facts. "
@@ -388,6 +401,9 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
             # Keep the per-threat pieces LAST. sglang/vLLM cache a prompt PREFIX, which only pays
             # off up to the first difference — actor_clause mid-paragraph forfeited reuse of
             # everything after it, including the asset-context block in the user message.
+            # intel_instruction is NON-REMOVABLE while intel_text ships in the user message
+            # below: it carries the citation discipline, the abstention rule, and the
+            # never-promote-a-reference-adversary rule for that fenced block.
             f"{actor_clause}{intel_instruction} Output ONLY the JSON object."
         )
 
