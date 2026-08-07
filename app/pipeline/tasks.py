@@ -504,11 +504,17 @@ _INTEL_TECH_FIELDS = ("technology_used", "vendor_name", "database_platforms",
 def _intel_vocabulary(subsystems: list[dict], asset_context: dict,
                     sub_active_fields: list[str] | None,
                     asset_active_fields: list[str] | None) -> tuple[list[str], bool]:
-    """Intel search terms from the asset's TECHNOLOGY inventory — never from threat wording.
+    """Intel search terms from the asset's TECHNOLOGY inventory and CLASSIFICATION taxonomy —
+    never from threat wording.
     Threat names are deliberately business-impact prose, so their words match the BUSINESS
     words of advisories ('failure', 'maintenance', 'system') — which is how a power plant got
     Cisco/Fortinet/SharePoint CVEs while ICS advisories sat unused. Product names
     ('Siemens', 'SCADA', 'Windows Server') match what advisories actually describe.
+
+    Sector/sub_sector/critical_service join them because they are curated dropdown values —
+    the same vocabulary OTX pulses and CISA ICS advisories tag themselves with — not the
+    free-text impact prose the rule above excludes. They are what rescues an asset whose
+    entire technology inventory reads 'Custom Application' / 'NA' from matching nothing.
 
     FAIL-CLOSED on the Context_Field_Config allowlist: a deactivated source field contributes
     no terms. Advisory titles selected by those terms would carry the excluded product names
@@ -538,6 +544,17 @@ def _intel_vocabulary(subsystems: list[dict], asset_context: dict,
                 _add(sub.get(fld))
     if "asset_type" in asset_ok:
         _add(asset_context.get("asset_type"))
+    # Classification taxonomy, NOT threat prose: 'Energy'/'Power Generation' are curated
+    # dropdown values, and they are exactly how OTX pulses and CISA ICS advisories label
+    # themselves. Without them an asset whose whole inventory reads "Custom Application"
+    # matches nothing and silently loses its intel block entirely.
+    for fld in ("sector", "sub_sector"):
+        if fld in asset_ok:
+            _add(asset_context.get(fld))
+    # critical_service is force-allowlisted into EVERY prompt by build_base_context
+    # (prompts.py:74 — validate_scenario needs it), so terming on it opens no side channel
+    # the way an allowlist-gated field would. _add already flattens its list shape.
+    _add(asset_context.get("critical_service"))
     is_ot = any(control_mapping.itot_family(s.get("asset_type")) == "OT"
                 for s in subsystems or [])
     is_ot = is_ot or control_mapping.itot_family(asset_context.get("asset_type")) == "OT"

@@ -425,6 +425,15 @@ def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",),
     Fail-open: Mongo down or no matches → empty list. Only PROMPT_KINDS are
     returned — IOC feeds never reach the LLM context.
 
+    `description` is DELIBERATELY not searched. Title and tags are curated: an analyst chose
+    them to say what a report is ABOUT. A description is narrative prose that mentions every
+    sector and product in passing, so matching it finds mentions rather than subjects. Measured
+    on the live cache for the term 'Energy': title/tags matching is 75% on-topic (15/20) while
+    description-ONLY matches are 5% (2/39) — that is how a campaign against Russian orgs via
+    ViPNet reached a power-plant prompt, on one word buried in its summary. Cost is 2-13% recall
+    on product terms, and the dropped items are themselves mismatches (an Erlang and an XStream
+    CVE surfacing from a 'Fortinet'/'Cisco' search).
+
     Ranked by `published_at` — the item's OWN date, not when it was synced. With a
     corpus in the thousands a generic term matches hundreds of items, and ranking on
     sync time would return an arbitrary five of them (one sync stamps every doc
@@ -451,7 +460,7 @@ def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",),
         return []
     try:
         rx = re.compile("|".join(re.escape(t) for t in terms), re.IGNORECASE)
-        match = {"$or": [{"title": rx}, {"description": rx}, {"tags": rx}]}
+        match = {"$or": [{"title": rx}, {"tags": rx}]}
         ordered_kinds = list(prefer_kinds)
         if backfill:
             ordered_kinds += [k for k in PROMPT_KINDS if k not in prefer_kinds]
