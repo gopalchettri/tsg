@@ -593,7 +593,10 @@ def _paraphrase(llm: LLMClient, name: str) -> list[str]:
             "role": "user",
             "content": (f"Reword this cybersecurity threat name {_PARAPHRASES_PER_NAME} different "
                         f"ways, keeping the same meaning: {name!r}. "
-                        f"Reply with ONLY a json array of {_PARAPHRASES_PER_NAME} strings.")}])
+                        f"Reply with ONLY a json array of {_PARAPHRASES_PER_NAME} strings.")}],
+            # ARRAY, not object — without this, provider JSON mode would force json_object and
+            # every paraphrase call would fail wherever TSG_LLM_JSON_MODE is enabled.
+            expected_type=list)
         out = json.loads(text)
         if not isinstance(out, list):
             return []

@@ -121,8 +121,35 @@ def _normalize_str_list(raw: Any) -> list[str]:
     return []
 
 
+#: Advisory identifiers the prompt lets the model cite VERBATIM from the injected intel block:
+#: CVE-2026-42945, ICSA-26-188-03, ICSAMA-25-100-01. Deliberately narrow — only shapes that are
+#: unambiguously advisory ids, so ordinary prose can never look like a citation.
+_ADVISORY_ID_RX = re.compile(r"\b(?:CVE-\d{4}-\d{4,7}|ICSA(?:MA)?-\d{2}-\d{3}-\d{2})\b", re.I)
+
+
+def _uncited_advisory_ids(scenario: dict[str, Any], injected_ids: set[str] | None) -> list[str]:
+    """Advisory ids the scenario cites that were NOT in the block the model was given.
+
+    The prompt says "cite verbatim, never invent identifiers" — but nothing checked it, so an
+    invented or mis-copied CVE was persisted and served to reviewers as if it were real evidence.
+    Compared casefolded: a case variant is a real citation, not a fabrication.
+
+    `injected_ids=None` means the caller does not know what was injected (legacy call) — the
+    check is skipped rather than flagging every citation as invented."""
+    if injected_ids is None:
+        return []
+    known = {i.casefold() for i in injected_ids}
+    text = " ".join(str(scenario.get(f) or "") for f in
+                    ("scenario_title", "scenario_statement", "risk_statement"))
+    seen: dict[str, str] = {}
+    for raw in _ADVISORY_ID_RX.findall(text):
+        seen.setdefault(raw.casefold(), raw)
+    return sorted(v for k, v in seen.items() if k not in known)
+
+
 def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_name: str | None,
-                    asset_name: str | None = None, critical_service: list[str] | None = None) -> dict[str, Any]:
+                    asset_name: str | None = None, critical_service: list[str] | None = None,
+                    injected_intel_ids: set[str] | None = None) -> dict[str, Any]:
     """Structural check (scenario_title, scenario_statement, risk_statement are present and non-empty)
     plus a consistency proxy: the statement references the threat it narrates, title and statement
     reference the asset, and risk_statement references the asset and critical service. The proxy
@@ -154,6 +181,11 @@ def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_
         errors.append(f"risk_statement does not reference the asset ({asset_name})")
     if risk_statement.strip() and critical_service and not any(_mentions(cs, risk_statement) for cs in critical_service):
         errors.append(f"risk_statement does not reference the critical service ({', '.join(critical_service)})")
+    # Citation discipline: the prompt permits citing an advisory ONLY from the injected block.
+    invented = _uncited_advisory_ids(scenario, injected_intel_ids)
+    if invented:
+        errors.append("cites advisory identifiers that were not provided in the intel block "
+                    f"({', '.join(invented)})")
     return {**_result(errors),
             "assumptions": _normalize_str_list(scenario.get("assumptions")),
             "excluded_details": _normalize_str_list(scenario.get("excluded_details"))}

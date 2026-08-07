@@ -200,7 +200,10 @@ def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_ses
         if not dal.renew_lock_lease(sess, sid, subsystem_id, task_id):
             log.debug("lock.lease_renewal_skipped", session_id=sid, subsystem=subsystem_id)
     sess.commit()
-    text, prov = llm.chat(messages, temperature=temperature)
+    # expected_type drives provider-side JSON mode: json_object forces a top-level OBJECT, which
+    # would make the threats stage (expected_type=list) fail on every call wherever
+    # TSG_LLM_JSON_MODE is on. One source of truth for the shape — this parameter.
+    text, prov = llm.chat(messages, temperature=temperature, expected_type=expected_type)
     if prov is not None:
         prov.prompt_version = prompts.PROMPT_VERSION
     row = {
@@ -620,6 +623,10 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     cov = coverage or _Coverage(vocab={}, frozen=None, others=None)
     # Intel matched on the technology inventory carried by coverage — never on threat wording.
     intel_items = _fetch_intel(cov.intel_terms, cov.intel_ot, actors, limit=tn.prompt_intel_limit)
+    # Exactly what the model was allowed to cite. None (not an empty set) when no block was
+    # injected at all, so validation skips the citation check instead of flagging every id.
+    injected_intel_ids = ({str(i.get("external_id")) for i in intel_items if i.get("external_id")}
+                        if intel_items else None)
     entry_labels = sorted(cov.vocab) if cov.vocab else None
     if sibling_texts:
         messages = prompts.variant_scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
@@ -639,7 +646,8 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     report = validation.validate_scenario(
         scenario, threat_type, threat_name,
         asset_name=scenario_session["AssetName"],
-        critical_service=base_ctx["asset_context"].get("critical_service"))
+        critical_service=base_ctx["asset_context"].get("critical_service"),
+        injected_intel_ids=injected_intel_ids)
     # One bounded repair turn, on STRUCTURAL misses only (the "missing <field>" entries from
     # validation._check_fields) — never on _mentions consistency warnings, which are advisory.
     # "Do not change factual content" keeps this from becoming a free re-roll that would defeat
@@ -699,7 +707,8 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
             r_report = validation.validate_scenario(
                 merged, threat_type, threat_name,
                 asset_name=scenario_session["AssetName"],
-                critical_service=base_ctx["asset_context"].get("critical_service"))
+                critical_service=base_ctx["asset_context"].get("critical_service"),
+        injected_intel_ids=injected_intel_ids)
             still = [e for e in r_report["errors"] if e.startswith("missing ")]
             if len(still) < len(missing):
                 scenario, report, prov = merged, r_report, r_prov

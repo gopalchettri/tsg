@@ -18,3 +18,9 @@ scripts/test_db_connectivity.py
 scripts/redis_acl_check.py
 
 .claude/
+
+# Local run artifacts and duplicated schema copies — not part of the repo.
+# NOTE: the blobs committed in 3774a82 remain reachable in history; this only stops future churn.
+*.zip
+uvicorn_*.log
+scripts/share/

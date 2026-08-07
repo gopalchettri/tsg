@@ -187,6 +187,48 @@ def _llm_slot(s: Settings):
             pass
 
 
+@lru_cache(maxsize=1)
+def _db_key_scan_pattern():
+    """Regex matching an excluded DB key used as a JSON key in an outgoing message.
+
+    Built from prompts._EXCLUDE_DB_KEY_TO_PROMPT, MINUS the bare name `id`: two characters that
+    occur in ordinary prose and model output ('the incident was identified'), so scanning raw
+    text for it would false-positive and raise on legitimate data. `id` is still removed
+    structurally by prompts._scrub_db_keys — this scan is the net for keys that never went
+    through it, where the distinctive `*_id` names carry effectively zero false-positive risk.
+    Imported lazily: app.pipeline must not import app.db (via prompts) at module load."""
+    import re
+    from app.pipeline.prompts import _EXCLUDE_DB_KEY_TO_PROMPT
+
+    names = sorted(k for k in _EXCLUDE_DB_KEY_TO_PROMPT if k != "id")
+    return re.compile(r'"(' + "|".join(re.escape(n) for n in names) + r')"\s*:')
+
+
+def _assert_no_db_keys(messages: list[dict], settings: Settings) -> None:
+    """LAST LINE: no table primary key leaves the process, whatever built the prompt.
+
+    prompts._scrub_db_keys runs at payload CONSTRUCTION — six sites to remember, and a new
+    prompt that assembles its own dict and calls chat() directly (the pattern
+    grounding._paraphrase already uses) bypasses every one of them. chat() is the single
+    function every prompt in the system must call, so the guarantee belongs here.
+
+    Raises outside production so a bug fails loudly in dev/test/CI; logs and continues in
+    production, because a leaked surrogate id is a hygiene defect rather than a secret and
+    killing a user's generation over it is the worse outcome. The error log is the prod control.
+    """
+    hits: set[str] = set()
+    for m in messages:
+        hits.update(_db_key_scan_pattern().findall(m.get("content") or ""))
+    if not hits:
+        return
+    log.error("prompt.db_key_leak", keys=sorted(hits), app_env=settings.app_env,
+            hint="payload bypassed prompts._scrub_db_keys / _context_message")
+    if str(settings.app_env).lower() not in ("prod", "production"):
+        raise ValueError(
+            f"prompt carries database primary keys {sorted(hits)} — build the payload through "
+            "prompts._context_message (or _scrub_db_keys) instead of json.dumps")
+
+
 @dataclass
 class Provenance:
     """Which model answered a call and with what settings, so a stored result is traceable."""
@@ -201,10 +243,16 @@ class LLMClient(Protocol):
     `StubLLMClient`. Pipeline code never checks which one it holds."""
 
     def chat(self, messages: list[dict], *, model: str | None = None,
-            temperature: float | None = None) -> tuple[str, Provenance]:
+            temperature: float | None = None,
+            expected_type: type | None = None) -> tuple[str, Provenance]:
         """Single chat completion; returns (text, Provenance) so callers can persist model+params
         without threading litellm-specific response shapes around. `temperature`, like `model`,
-        is a per-call override — None means "use the configured default"."""
+        is a per-call override — None means "use the configured default".
+
+        `expected_type` is the top-level JSON type the caller will parse (dict or list). It is
+        what decides whether provider-side JSON mode is requested: `{"type":"json_object"}`
+        forces an OBJECT, which is wrong for a caller expecting an array. Passing the parser's
+        own declaration here makes the two impossible to contradict."""
         ...
 
     def embed(self, texts: Sequence[str], *, model: str | None = None, kind: str = "query") -> list[list[float]]:
@@ -274,12 +322,21 @@ class LiteLLMClient:
         """Accepts an explicit `Settings` for tests; production goes through `get_llm()`."""
         self.s = settings or get_settings()
 
-    def _chat_kwargs(self, model: str | None = None, temperature: float | None = None) -> dict[str, Any]:
+    def _chat_kwargs(self, model: str | None = None, temperature: float | None = None,  # noqa: PLR0912
+                    expected_type: type | None = None) -> dict[str, Any]:
         """Provider dispatch for chat(): azure_openai / openai / (default) litellm proxy, plus
         the timeout+retry budget every call in this file shares."""
         s = self.s
         common: dict[str, Any] = {"timeout": s.llm_timeout_seconds, "num_retries": s.llm_max_retries}
-        if s.llm_json_mode:  # API-enforced JSON output; off by default
+        # JSON mode is gated on the CALLER'S declared shape, not on the flag alone.
+        # `{"type":"json_object"}` forces a top-level OBJECT. find_threats and
+        # grounding._paraphrase both parse a top-level ARRAY, so sending it there instructs the
+        # provider to produce exactly what parse_json will then reject — a guaranteed
+        # LLMResponseParseError, and only in environments that enable the flag
+        # (.env.prod.example does). Driving it from expected_type — the same value the parser
+        # asserts on — makes the two impossible to disagree. expected_type=None (a caller with
+        # no JSON contract) also opts out.
+        if s.llm_json_mode and expected_type is dict:
             common["response_format"] = {"type": "json_object"}
         effective_temperature = temperature if temperature is not None else s.llm_temperature
         if effective_temperature is not None:
@@ -315,14 +372,16 @@ class LiteLLMClient:
             kw["guardrails"] = s.llm_guardrails
         return kw
 
-    def chat(self, messages, *, model=None, temperature=None):
+    def chat(self, messages, *, model=None, temperature=None, expected_type=None):
         """One completion → (text, Provenance). litellm is imported locally so a stub-only test
         run never needs the package installed.
 
-        Unlike embed()'s guard, a long chat prompt isn't inherently a bug — allowlisted free-text
-        context fields can legitimately run long against a 131k-token window. `_MAX_CHAT_CHARS`
-        sits far above that, purely as a net for pathological input (a document landing in a
-        field that expected a short value).
+        Unlike embed()'s guard, a long chat prompt isn't inherently a bug — free-text context
+        fields can legitimately run long against a 131k-token window. `_MAX_CHAT_CHARS` sits far
+        above that, purely as a net for pathological input (a document landing in a field that
+        expected a short value).
+
+        `expected_type` drives provider-side JSON mode — see _chat_kwargs.
         """
         import litellm
 
@@ -333,7 +392,8 @@ class LiteLLMClient:
                 "safety cap — check for an unexpectedly large free-text field (e.g. "
                 "technology_used, incident_description, cii_asset_description)")
 
-        kwargs = self._chat_kwargs(model, temperature)
+        _assert_no_db_keys(messages, self.s)
+        kwargs = self._chat_kwargs(model, temperature, expected_type)
         with _llm_slot(self.s), _provider_429_retryable():
             resp = litellm.completion(messages=messages, **kwargs)
             # Suspenders to _chat_kwargs' stream=False belt: if the server streamed anyway (a

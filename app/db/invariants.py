@@ -11,7 +11,10 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from app.core.enums import SessionStatus
+from app.core.logging import get_logger
 from app.db import models as m
+
+log = get_logger(__name__)
 
 # CHECKLIST 1 — UNIQUE indexes the code relies on the DB to enforce. Created by the schema
 # scripts, only verified here.
@@ -95,7 +98,9 @@ def verify_startup(engine: Engine) -> None:
         _assert_indexes(engine)
         _assert_filtered_index_literals(engine)
         _assert_not_null(engine)
+        _assert_mapped_columns_exist(engine)
         _assert_rcsi_enabled(engine)
+        _warn_dead_context_field_config(engine)
     _assert_no_duplicate_active(engine)
 
 
@@ -209,6 +214,73 @@ def _assert_not_null(engine: Engine) -> None:
         # Drivers return nullability as "YES", "1" or "TRUE" — accept all three.
         if str(nullable).upper() in ("YES", "1", "TRUE"):
             raise StartupInvariantError(f"{table}.{col} must be NOT NULL (M3/[R7])")
+
+
+def _assert_mapped_columns_exist(engine: Engine) -> None:
+    """Every column the ORM believes in must actually exist in the database.
+
+    models.py is a hand-maintained mirror of a database-first schema, so the two drift silently:
+    a mapped column the DB lacks raises SQL Server error 207 only on the FIRST query that selects
+    it — which in practice means in production, on a rarely-hit code path. This happened: deleting
+    the Context_Field_Config class stopped two lines short and the trailing mapped_column
+    re-entered the PRECEDING class body (comments emit no DEDENT), silently adding CreatedAt to
+    Config_Tuning. Nothing caught it because its only reader selects four explicit columns.
+
+    One INFORMATION_SCHEMA query for the whole metadata, compared case-insensitively (SQL Server
+    is case-insensitive by default collation; matching case-sensitively here would produce false
+    failures). Tables absent from the DB are SKIPPED, not failed: models.py deliberately mirrors
+    only part of a larger platform schema, and _assert_not_null already covers the tables whose
+    presence is required."""
+    want: dict[str, set[str]] = {
+        t.name.lower(): {c.name.lower() for c in t.columns} for t in m.Base.metadata.tables.values()}
+    with engine.connect() as c:
+        rows = c.execute(text(
+            "SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS")).all()
+    have: dict[str, set[str]] = {}
+    for table, col in rows:
+        have.setdefault(str(table).lower(), set()).add(str(col).lower())
+    missing: list[str] = []
+    for table, cols in sorted(want.items()):
+        actual = have.get(table)
+        if actual is None:      # table not in this database — see docstring
+            continue
+        missing += [f"{table}.{c}" for c in sorted(cols - actual)]
+    if missing:
+        raise StartupInvariantError(
+            "ORM maps columns the database does not have: " + ", ".join(missing) +
+            " — models.py has drifted from the live schema")
+
+
+def _warn_dead_context_field_config(engine: Engine) -> None:
+    """WARN (never fail) if a legacy Context_Field_Config still holds switched-off rows.
+
+    That table used to be a fail-closed allowlist: a curator could switch a field off and it
+    stopped reaching the external model. It has been removed from the code — every field
+    context.py assembles is now sent. On a database where someone HAD switched a field off
+    (location, vendor_name, past_incidents), deploying this version silently resumes sending it,
+    with no migration and nothing in the logs. This is the operator-facing signal for exactly
+    that moment.
+
+    Warns rather than raises: a leftover table must never block a boot. Self-extinguishing —
+    once a DBA drops the table (the DDL is gone from scripts/Threat_library.sql), the OBJECT_ID
+    check short-circuits and this is silent forever."""
+    try:
+        with engine.connect() as c:
+            if c.execute(text("SELECT OBJECT_ID('dbo.Context_Field_Config', 'U')")).scalar() is None:
+                return
+            rows = c.execute(text(
+                "SELECT ContextGroup, FieldName FROM Context_Field_Config "
+                "WHERE IsActive = 0 AND IsDeleted = 0")).all()
+    except Exception:  # noqa: BLE001 — an advisory check must never break startup
+        log.debug("startup.dead_context_field_config_check_skipped", exc_info=True)
+        return
+    if not rows:
+        return
+    log.warning(
+        "startup.disabled_context_fields_now_sent",
+        fields=sorted(f"{g}.{f}" for g, f in rows),
+        detail="Context_Field_Config is no longer read; these previously-disabled fields now "
+            "reach the external model. Drop the table once reviewed.")
 
 
 def _assert_no_duplicate_active(engine: Engine) -> None:
