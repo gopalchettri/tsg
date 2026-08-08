@@ -313,8 +313,12 @@ def get_results(
                         # read at source — deliberately NOT denormalised onto Scoped_Threat,
                         # so the value can never drift from the row that owns it
                         it.GroundingScore],
-                        # only threats that actually PRODUCED an active scenario — stricter than
-                        # "was Selected=1", so a threat whose scenario failed is correctly excluded
+                        # only threats with an ACTIVE scenario row — including a FAILURE CARD,
+                        # deliberately (no Status filter here): the card is returned in
+                        # scenarios[] with scenario:null, so its threat must stay in threats[]
+                        # or the card would reference a threat this same response says does not
+                        # exist. This comment used to claim failed threats were excluded — the
+                        # code never did that, and the claim was the drift, not the behaviour.
                         exists().where(st.ThreatID == it.ThreatID,
                                     st.SessionID == sid, st.Superseded == 0,
                                     out.ScopedThreatID == st.ScopedThreatID,

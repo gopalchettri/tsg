@@ -1583,9 +1583,11 @@ def latest_next_set_outcome(sess: Session, session_id: str, subsystem_id: int) -
 # ---------------------------------------------------------------------------
 def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector_id: int | None,
                     description: str | None = None, source: str = "ai_auto_promoted",
-                    created_by: str | None = None) -> int:
+                    created_by: str | None = None) -> tuple[int, bool]:
     """Insert-if-not-exists keyed by (ThreatTypeName, ThreatCategoryID, SectorID) —
-    `UX_ThreatType_NaturalKey`. Returns the winning ThreatTypeID either way.
+    `UX_ThreatType_NaturalKey`. Returns (winning ThreatTypeID, created) — `created` is True only
+    when THIS call inserted the row. accept.py gates actor linking on it: links may seed a type
+    minted in the same accept, never extend a pre-existing (curated) type's approved actor set.
 
     `source` records provenance ('ai_auto_promoted' for the accept.py promotion path, a
     per-library tag from scripts/import_threat_libraries.py); `created_by` is the accountable
@@ -1604,7 +1606,7 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector
                 ThreatTypeName=name, ThreatCategoryID=category_id, SectorID=sector_id,
                 Description=description, IsActive=True, IsDeleted=False, Source=source,
                 CreatedAt=now(), CreatedBy=created_by))
-        return inserted_pk(res)
+        return inserted_pk(res), True
     except IntegrityError:
         # BOTH predicates must be NULL-safe. SQL Server's unique index treats NULLs as equal, so
         # a second promotion of a name whose category never resolved (grounding.find_category
@@ -1622,7 +1624,7 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector
         ).scalar()
         if winner is None:  # not a natural-key duplicate (NOT NULL / missing IDENTITY /
             raise           # truncation / other violation) — fail loud, never return a NULL id
-        return winner
+        return winner, False
 
 
 def upsert_threat_catalogue(sess: Session, name: str, type_id: int, sector_id: int | None,

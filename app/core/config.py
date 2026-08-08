@@ -416,6 +416,17 @@ class Settings(BaseSettings):
     # so re-derive it from the logs after any embedding model change.
     semantic_near_duplicate_threshold: float = Field(0.92, ge=0.0, le=1.0)
 
+    # SECOND, much stricter ceiling for threats in DIFFERENT STRIDE categories. The category gate
+    # exists because 'Unauthorized disclosure of X' vs 'Unauthorized modification of X' measures
+    # 0.969 — above every true paraphrase — so cross-class pairs must never be judged at the
+    # normal threshold. But the category label is the MODEL'S choice among ~6 values: the same
+    # threat tagged 'Tampering' one round and 'Information Disclosure' the next used to bypass
+    # dedup entirely. This ceiling closes that hole for near-verbatim repeats only: 0.98 sits
+    # safely above the 0.969 trap (both real threats survive) while catching relabelled
+    # restatements. Must stay ABOVE both 0.969 and the same-category threshold — the validator
+    # below enforces the ordering at boot.
+    semantic_cross_category_threshold: float = Field(0.98, ge=0.0, le=1.0)
+
     # --- Threat-scoping selection cutoff ---
     # A threat scoring below this doesn't get a full scenario written for it.
     scoping_score_threshold: float | None = Field(55.0, ge=0.0, le=100.0)
@@ -680,6 +691,21 @@ class Settings(BaseSettings):
         300-second class default, when both are left unset."""
         if "reaper_stale_grace_seconds" not in self.model_fields_set:
             self.reaper_stale_grace_seconds = self.stage_lease_seconds
+        return self
+
+    @model_validator(mode="after")
+    def _validate_semantic_threshold_ordering(self) -> "Settings":
+        """The cross-category ceiling must sit at or above the same-category threshold. Inverted,
+        two threats in DIFFERENT impact classes would merge more eagerly than two in the same
+        class — the exact backwards behaviour the category gate exists to prevent — and the
+        0.969-scoring disclosure/modification pair would silently fold into one threat."""
+        if self.semantic_cross_category_threshold < self.semantic_near_duplicate_threshold:
+            raise ValueError(
+                f"semantic_cross_category_threshold ({self.semantic_cross_category_threshold}) is "
+                f"below semantic_near_duplicate_threshold ({self.semantic_near_duplicate_threshold}) "
+                "— cross-class pairs would merge more eagerly than same-class ones. Raise the "
+                "cross ceiling above the same-category threshold (and keep it above the measured "
+                "0.969 cross-class trap).")
         return self
 
     @model_validator(mode="after")

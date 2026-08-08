@@ -225,6 +225,26 @@ def check_ctm_scan_category_names(sess: Session) -> str | None:
     return None
 
 
+def check_ungated_threat_types(sess: Session) -> None:
+    """INFORMATIONAL, never fires: log which active threat families have no active tech_gate
+    rule. Deliberately not a warning — a genuinely cross-domain family (Malware/Ransomware,
+    Social Engineering) SHOULD be ungated, so a permanent warning would be noise. The log line
+    exists so coverage is a visible, periodically-restated fact a curator can diff, instead of
+    an assumption; 6 of the 27 seeded families shipped ungated and nothing surfaced it."""
+    tt, ct = m.Threat_Type, m.Config_Threat_Rule
+    has_gate = select(ct.ThreatRuleID).where(
+        ct.ThreatTypeID == tt.ThreatTypeID, ct.RuleType == "tech_gate",
+        ct.IsActive == True, ct.IsDeleted == False)  # noqa: E712
+    ungated = sess.execute(
+        select(tt.ThreatTypeName).where(
+            tt.IsActive == True, tt.IsDeleted == False,  # noqa: E712
+            ~has_gate.exists()).order_by(tt.ThreatTypeName)
+    ).scalars().all()
+    if ungated:
+        log.info("selfcheck.ungated_threat_types", count=len(ungated), names=ungated[:40])
+    return None
+
+
 def check_orphaned_scenario_outputs(sess: Session) -> str | None:
     """Warn on any active Threat_Scenario_Output whose Scoped_Threat parent is superseded or gone.
 
@@ -271,6 +291,7 @@ def run_self_checks(sess: Session) -> list[str]:
         ("dead_threat_rules", lambda: check_dead_threat_rules(sess)),
         ("ctm_scan_category_names", lambda: check_ctm_scan_category_names(sess)),
         ("orphaned_scenario_outputs", lambda: check_orphaned_scenario_outputs(sess)),
+        ("ungated_threat_types", lambda: check_ungated_threat_types(sess)),
     ]
     if s.max_concurrent_llm_calls:
         checks.append(("llm_slots", lambda: check_llm_slots()))

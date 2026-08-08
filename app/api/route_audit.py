@@ -95,6 +95,12 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("POST", "/v1/tsg/threat-library/threat-actors"): require_admin,
     ("PATCH", "/v1/tsg/threat-library/threat-actors/{threat_actor_id}"): require_admin,
     ("DELETE", "/v1/tsg/threat-library/threat-actors/{threat_actor_id}"): require_admin,
+    # Scoping-rule CRUD (threat_library_crud.py's dedicated tail — Config_Threat_Rule breaks the
+    # shared framework's audit-column assumptions, see the comment there).
+    ("GET", "/v1/tsg/threat-library/threat-rules"): require_admin,
+    ("POST", "/v1/tsg/threat-library/threat-rules"): require_admin,
+    ("PATCH", "/v1/tsg/threat-library/threat-rules/{threat_rule_id}"): require_admin,
+    ("DELETE", "/v1/tsg/threat-library/threat-rules/{threat_rule_id}"): require_admin,
     # Control-library master CRUD (routers in app/api/control_library_crud.py; shared impl in library_crud.py). The last two are the
     # control<->standard link.
     ("GET", "/v1/tsg/control-library/standards"): require_admin,

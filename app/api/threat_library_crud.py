@@ -202,3 +202,172 @@ def delete_threat_actor(request: Request, threat_actor_id: int = Path(ge=1),
     return _delete("threat-actors", threat_actor_id, principal, request)
 
 
+# --- Scoping rules (Config_Threat_Rule) ----------------------------------------------------
+# Not routed through library_crud's _RESOURCES registry: this table's audit columns are
+# CreateDate/UpdateDate (not CreatedAt/UpdatedAt), it backs no embedding group, and its natural
+# key is a QUADRUPLE behind a filtered unique index — three framework assumptions broken at
+# once, so a small dedicated set of routes is less machinery than teaching the framework three
+# exceptions. Until these routes existed, changing a scoping gate meant SQL against production.
+
+import json as _json  # noqa: E402 — scoped alias; the module has no other json use
+
+from fastapi import Query as _Query  # noqa: E402
+from sqlalchemy import insert as _sa_insert, select as _sa_select, update as _sa_update  # noqa: E402
+from sqlalchemy.exc import IntegrityError as _IntegrityError  # noqa: E402
+
+from app.api.admin import AdminValidationError  # noqa: E402
+from app.api.library_crud import _DELETED as _RULE_DELETED  # noqa: E402
+from app.api.library_crud import LibraryConflict, _require_parent  # noqa: E402
+from app.api.schemas import ThreatRuleCreate, ThreatRuleRow, ThreatRuleUpdate  # noqa: E402
+from app.core.enums import ThreatRuleType  # noqa: E402
+from app.db import models as m  # noqa: E402
+from app.db.dal import NotFoundError, now  # noqa: E402
+
+
+def _validate_rule_fields(rule_type: str, rule_key: str, weight: float | None) -> None:
+    """The three ways a rule row can be VALID SQL and still broken in production, all rejected
+    at the door. scoping._apply_rules deliberately no-ops (with a log) on an unknown key or
+    family — safe at runtime, but it means a typo here would create a rule that silently never
+    fires; check_dead_threat_rules exists because that already happened once."""
+    if rule_type not in {str(v) for v in ThreatRuleType}:
+        raise AdminValidationError(
+            f"rule_type {rule_type!r} is not one of {sorted(str(v) for v in ThreatRuleType)}")
+    from app.pipeline.scoping import _RULE_KEY_FIELDS  # lazy: keep api->pipeline import cold
+    if rule_key not in _RULE_KEY_FIELDS:
+        raise AdminValidationError(
+            f"rule_key {rule_key!r} is not resolvable by scoping (allowlist: "
+            f"{sorted(_RULE_KEY_FIELDS)}) — the rule would exist but never fire")
+    if rule_type == str(ThreatRuleType.tech_gate) and weight is not None:
+        raise AdminValidationError(
+            "tech_gate rules take no weight — a gate is a hard include/exclude (delta 0.0); "
+            "use relevance_flag/relevance_context_value for score weights")
+
+
+def _rule_row_out(r) -> dict:
+    """Row -> response dict. `weight` is unpacked from Metadata the same tolerant way
+    scoping._rule_weight reads it — a legacy malformed blob reports null, never 500s the list."""
+    weight = None
+    if r.Metadata:
+        try:
+            w = _json.loads(r.Metadata).get("weight")
+            weight = float(w) if w is not None and not isinstance(w, bool) else None
+        except (ValueError, TypeError, AttributeError):
+            weight = None
+    return {"threat_rule_id": r.ThreatRuleID, "rule_type": r.RuleType,
+            "threat_type_id": r.ThreatTypeID, "rule_key": r.RuleKey, "rule_value": r.RuleValue,
+            "weight": weight, "is_active": bool(r.IsActive), "is_deleted": bool(r.IsDeleted),
+            "created_at": r.CreateDate, "created_by": r.CreatedBy,
+            "updated_at": r.UpdateDate, "updated_by": r.UpdatedBy}
+
+
+def _get_rule(sess, rule_id: int):
+    row = sess.execute(_sa_select(m.Config_Threat_Rule).where(
+        m.Config_Threat_Rule.ThreatRuleID == rule_id)).scalar_one_or_none()
+    if row is None:
+        raise NotFoundError(f"Config_Threat_Rule {rule_id} not found")
+    return row
+
+
+@router.get("/threat-rules", response_model=list[ThreatRuleRow], tags=["Threat Rules Admin"])
+def list_threat_rules(limit: int = _LIMIT, offset: int = _OFFSET,
+                    include_deleted: bool = _RULE_DELETED,
+                    threat_type_id: int | None = _Query(default=None, ge=1,
+                                                        description="Only this family's rules."),
+                    _principal: Principal = Depends(get_principal)):
+    """Scoping rules. tech_gate = hard include/exclude by asset context; relevance_* = score
+    weights. A rule whose parent Threat_Type is soft-deleted still lists here but no longer
+    fires (dal.active_threat_rules re-asserts the parent)."""
+    with db_session() as sess:
+        stmt = _sa_select(m.Config_Threat_Rule)
+        if not include_deleted:
+            stmt = stmt.where(m.Config_Threat_Rule.IsDeleted == False)  # noqa: E712
+        if threat_type_id is not None:
+            stmt = stmt.where(m.Config_Threat_Rule.ThreatTypeID == threat_type_id)
+        rows = sess.execute(stmt.order_by(m.Config_Threat_Rule.ThreatRuleID)
+                            .limit(limit).offset(offset)).scalars().all()
+        return [_rule_row_out(r) for r in rows]
+
+
+@router.post("/threat-rules", response_model=ThreatRuleRow, status_code=201, tags=["Threat Rules Admin"])
+def create_threat_rule(body: ThreatRuleCreate, request: Request,
+                    principal: Principal = Depends(get_principal)):
+    """Create a scoping rule. 404s if the family doesn't exist; 409s on the live
+    (threat_type_id, rule_type, rule_key, rule_value) natural key."""
+    _validate_rule_fields(body.rule_type, body.rule_key, body.weight)
+    with db_session() as sess:
+        _require_parent(sess, m.Threat_Type, m.Threat_Type.ThreatTypeID,
+                        body.threat_type_id, "Threat_Type")
+        try:
+            res = sess.execute(_sa_insert(m.Config_Threat_Rule).values(
+                RuleType=body.rule_type, ThreatTypeID=body.threat_type_id,
+                RuleKey=body.rule_key, RuleValue=body.rule_value,
+                Metadata=_json.dumps({"weight": body.weight}) if body.weight is not None else None,
+                IsActive=body.is_active, IsDeleted=False,
+                CreateDate=now(), CreatedBy=principal.user_id))
+            sess.commit()
+        except _IntegrityError:
+            sess.rollback()
+            raise LibraryConflict(
+                "a live Config_Threat_Rule row already matches this "
+                "(threat_type_id, rule_type, rule_key, rule_value) natural key") from None
+        new_id = res.inserted_primary_key[0]
+        out = _rule_row_out(_get_rule(sess, new_id))
+    _audit(request, "threat-rules", "create", new_id, principal)
+    return out
+
+
+@router.patch("/threat-rules/{threat_rule_id}", response_model=ThreatRuleRow, tags=["Threat Rules Admin"])
+def update_threat_rule(body: ThreatRuleUpdate, request: Request, threat_rule_id: int = Path(ge=1),
+                    principal: Principal = Depends(get_principal)):
+    """Partial update of rule_value / weight / is_active. rule_type, rule_key and
+    threat_type_id are immutable — retire and recreate instead, so the audit trail stays honest.
+    An explicit `"weight": null` clears the override back to the configured default."""
+    sent = body.model_dump(exclude_unset=True)
+    if not sent:
+        raise AdminValidationError("empty update body — send at least one field to change")
+    with db_session() as sess:
+        row = _get_rule(sess, threat_rule_id)
+        if row.IsDeleted:
+            raise NotFoundError(f"Config_Threat_Rule {threat_rule_id} is deleted")
+        if "weight" in sent and sent["weight"] is not None and row.RuleType == str(ThreatRuleType.tech_gate):
+            raise AdminValidationError("tech_gate rules take no weight — see POST /threat-rules")
+        values: dict = {"UpdateDate": now(), "UpdatedBy": principal.user_id}
+        if "rule_value" in sent:
+            values["RuleValue"] = sent["rule_value"]
+        if "weight" in sent:
+            values["Metadata"] = (_json.dumps({"weight": sent["weight"]})
+                                if sent["weight"] is not None else None)
+        if "is_active" in sent:
+            values["IsActive"] = sent["is_active"]
+        try:
+            sess.execute(_sa_update(m.Config_Threat_Rule)
+                        .where(m.Config_Threat_Rule.ThreatRuleID == threat_rule_id)
+                        .values(**values))
+            sess.commit()
+        except _IntegrityError:
+            sess.rollback()
+            raise LibraryConflict(
+                "this change collides with a live Config_Threat_Rule natural key "
+                "(re-enabling a rule whose quadruple was recreated?)") from None
+        out = _rule_row_out(_get_rule(sess, threat_rule_id))
+    _audit(request, "threat-rules", "update", threat_rule_id, principal)
+    return out
+
+
+@router.delete("/threat-rules/{threat_rule_id}", response_model=ThreatRuleRow, tags=["Threat Rules Admin"])
+def delete_threat_rule(request: Request, threat_rule_id: int = Path(ge=1),
+                    principal: Principal = Depends(get_principal)):
+    """Soft delete (IsDeleted=1) — same convention as every other library table: ids may be
+    referenced by history, so nothing is ever hard-deleted. Returns the row with its who/when."""
+    with db_session() as sess:
+        row = _get_rule(sess, threat_rule_id)
+        if not row.IsDeleted:
+            sess.execute(_sa_update(m.Config_Threat_Rule)
+                        .where(m.Config_Threat_Rule.ThreatRuleID == threat_rule_id)
+                        .values(IsDeleted=True, UpdateDate=now(), UpdatedBy=principal.user_id))
+            sess.commit()
+        out = _rule_row_out(_get_rule(sess, threat_rule_id))
+    _audit(request, "threat-rules", "delete", threat_rule_id, principal)
+    return out
+
+

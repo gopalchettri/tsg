@@ -1356,6 +1356,60 @@ class ThreatActorRow(LibraryRowAudit):
     is_capable: int = Field(description="Capability weight.")
 
 
+class ThreatRuleCreate(BaseModel):
+    """New Config_Threat_Rule row — a scoping rule (tech_gate hard include/exclude, or a
+    relevance_* score weight) keyed to one threat family. Unique on the live
+    (threat_type_id, rule_type, rule_key, rule_value) quadruple.
+
+    `weight` is stored server-side as Metadata {"weight": N} — callers never write raw Metadata
+    JSON, because a malformed blob makes scoping skip the rule silently (_rule_weight's contract).
+    tech_gate rules take NO weight (they are a hard door; scoping records delta 0.0)."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "rule_type": "relevance_flag", "threat_type_id": 12, "rule_key": "asset_type",
+        "rule_value": "Operational Technology (OT)", "weight": 10.0}})
+
+    rule_type: str = Field(description="One of: tech_gate, relevance_flag, relevance_context_value.")
+    threat_type_id: int = Field(ge=1, description="The Threat_Type this rule scopes — must name a live family.")
+    rule_key: str = Field(min_length=1, max_length=200,
+                        description="Context field the rule reads. Must be in scoping's allowlist "
+                                    "(currently: criticality, subsystem_name, asset_type, past_incidents) "
+                                    "— an unknown key would create a rule that silently never fires.")
+    rule_value: str | None = Field(default=None, max_length=450,
+                                description="Expected value. Omit for the key's default/truthy check; "
+                                            "an explicit empty string means 'match a blank field'.")
+    weight: float | None = Field(default=None,
+                                description="relevance_* score delta. Omit to use the configured "
+                                            "default_rule_weight. Forbidden on tech_gate.")
+    is_active: bool = Field(default=True, description="Set false to create the rule already disabled.")
+
+
+class ThreatRuleUpdate(BaseModel):
+    """Partial update — send only what changes. `rule_type`/`rule_key`/`threat_type_id` are
+    deliberately immutable (retire the rule and create a new one; keeps the audit trail honest).
+    Sending `weight: null` explicitly CLEARS the override back to the configured default."""
+    model_config = ConfigDict(json_schema_extra={"example": {"weight": 15.0}})
+
+    rule_value: str | None = Field(default=None, max_length=450)
+    weight: float | None = Field(default=None)
+    is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a natural-key clash.")
+
+
+class ThreatRuleRow(BaseModel):
+    """One Config_Threat_Rule row as returned by the CRUD endpoints."""
+    threat_rule_id: int = Field(description="Primary key.")
+    rule_type: str = Field(description="tech_gate | relevance_flag | relevance_context_value.")
+    threat_type_id: int = Field(description="The Threat_Type this rule scopes.")
+    rule_key: str = Field(description="Context field the rule reads.")
+    rule_value: str | None = Field(description="Expected value; null = default/truthy check.")
+    weight: float | None = Field(description="Metadata weight override; null = configured default (or n/a for tech_gate).")
+    is_active: bool
+    is_deleted: bool
+    created_at: datetime | None = None
+    created_by: str | None = None
+    updated_at: datetime | None = None
+    updated_by: str | None = None
+
+
 # --- Control library (/v1/tsg/control-library) -------------------------------------------
 # Same three-model-per-table shape as the threat masters above. The one behavioural difference
 # worth knowing: a control's embedded text is `control_name + ": " + control_description`, so

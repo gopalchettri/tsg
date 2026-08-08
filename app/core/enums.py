@@ -295,6 +295,12 @@ class ClickOutcomeReason(StrEnum):
     new_threat_did_not_qualify = "new_threat_did_not_qualify"        # tasks.py: candidate found, rescored out
     no_target_ids = "no_target_ids"                                  # cascade.py: regen request with zero targets
     output_not_found_or_superseded = "output_not_found_or_superseded"  # cascade.py: stale/foreign OutputIDs
+    generation_failed = "generation_failed"                          # tasks.py/cascade.py: the LLM call itself failed —
+                                                                     # targets stay Selected=1, the next click retries.
+                                                                     # Distinct from new_threat_did_not_qualify, which
+                                                                     # this used to masquerade as: a transient provider
+                                                                     # error is NOT a scoping rejection, and reporting it
+                                                                     # as one sent support down the wrong path.
 
 
 class ReviewGateReason(StrEnum):

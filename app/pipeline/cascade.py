@@ -97,6 +97,13 @@ _REASON_INFO: dict[str, dict[str, str]] = {
         "message": "We found something new, but it didn't meet our criteria for this "
                 "asset, so we didn't create a scenario for it.",
     },
+    "generation_failed": {
+        "detail": "The AI call that writes the scenario failed (provider error or timeout) — "
+                "not a scoping rejection. The affected threat(s) remain selected and "
+                "re-servable, so this is transient by construction.",
+        "message": "We hit a temporary problem generating the scenario(s). Nothing was lost — "
+                "click 'generate next set' again to retry.",
+    },
     "no_target_ids": {
         "detail": "The regenerate request specified zero target ids after canonicalization — "
                 "normally rejected by the request schema itself (output_ids requires at least "
@@ -521,9 +528,14 @@ def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_i
     # answer available. `exc.reason` rides along even when variants SUCCEEDED — that provenance
     # ("a candidate was found and rejected") used to reach the client via the fruitless path and
     # would otherwise be lost now that the fallback usually rescues the click.
+    # generation_failed is transient BY DEFINITION (the targets stay Selected=1) — with
+    # made=0/pool_size=0 it would otherwise classify as `exhausted` when the variant fallback
+    # also comes up empty, permanently greying the client's button over a provider blip.
+    retryable = exc.reason == "generation_failed"
     _settle_next_set_click(sess, scenario_session, subsystem_id, epoch,
                         requested=next_set_size, made=0, variants=created,
-                        pool_size=0, reason=exc.reason, top_up_failed=top_up_failed)
+                        pool_size=0, reason=exc.reason,
+                        top_up_failed=top_up_failed or retryable)
     return "generated" if created else "no_new_threats_this_round"
 
 
@@ -550,6 +562,10 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
             # the per-(session,subsystem) mutex serialises concurrent clicks so two can't double-generate
             log.warning("next_set.locked", session_id=sid, subsystem=subsystem_id)
             return tasks.decide_session_outcome(sess, scenario_session)
+        # Bound BEFORE the try: the generic handler below settles the click with
+        # requested=next_set_size, and the failure it handles can fire before the session's
+        # tuning snapshot resolves. The config default is only the fallback for that window.
+        next_set_size = get_settings().next_set_size
         try:
             tn = tuning.from_session(scenario_session)  # the session's frozen rulebook
             next_set_size = tn.next_set_size
@@ -643,6 +659,20 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
         except Exception as exc:  # noqa: BLE001 — capture, don't swallow ([R8], same as run_regeneration)
             tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch)
             sess.commit()
+            # EVERY accepted click must leave a durable next_set_outcome row — this path used to
+            # leave none, so `last_next_set` stayed null and the client could not tell "my click
+            # failed, retry" from "my click never ran" (observed live 2026-08-08: a transient
+            # Azure failure produced exactly that silence). partial_retryable is forced via
+            # top_up_failed because made=0/pool_size=0 would otherwise classify as `exhausted` —
+            # the one answer a transient failure must never give. Guarded: a settle failure must
+            # not mask the recorded stage error.
+            try:
+                _settle_next_set_click(sess, scenario_session, subsystem_id, epoch,
+                                    requested=next_set_size, made=0, variants=0, pool_size=0,
+                                    reason="generation_failed", top_up_failed=True)
+            except Exception:  # noqa: BLE001
+                log.warning("next_set.failure_outcome_record_failed", session_id=sid,
+                            subsystem=subsystem_id, exc_info=True)
 
     # decide_session_outcome runs either way so the session re-enters REVIEW; the signal only
     # changes what the caller is told.

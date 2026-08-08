@@ -489,7 +489,7 @@ def import_records(sess, records: list[dict], tag: str, created_by: str | None =
     for type_name, recs in by_type.items():
         counts = collections.Counter(c for r in recs for c in r["categories"])
         default_cat = cat_ids[counts.most_common(1)[0][0]]
-        type_id = dal.upsert_threat_type(sess, type_name, default_cat, None, source=tag,
+        type_id, _created = dal.upsert_threat_type(sess, type_name, default_cat, None, source=tag,
                                          created_by=created_by)
         type_ids[type_name] = type_id
         for r in recs:

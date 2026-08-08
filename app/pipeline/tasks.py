@@ -113,6 +113,12 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
     cat_of = {lbl: c for lbl, c in prior_entries + [(lbl, c) for _tid, lbl, c in entries]}
     if threshold is None:  # session-tuned when the caller carries a snapshot; config otherwise
         threshold = get_settings().semantic_near_duplicate_threshold
+    # Cross-class pairs are judged at this STRICTER ceiling instead of being skipped outright.
+    # The category is the MODEL'S label: the same threat tagged 'Tampering' one round and
+    # 'Information Disclosure' the next used to bypass dedup entirely. At 0.98 the measured
+    # 0.969 disclosure/modification trap still survives (two real threats), while a relabelled
+    # near-verbatim restatement does not. Config-static, deliberately not session-tunable.
+    cross_threshold = max(get_settings().semantic_cross_category_threshold, threshold)
     try:
         # `texts` is the DISTINCT strings to embed — deduped only to avoid paying for the same
         # vector twice. It is not a count of comparable entries: N threats sharing one label
@@ -148,10 +154,15 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
             if ov is None or len(ov) != len(qv):
                 continue
             other_cat = cat_of.get(other, "")
+            # Same class -> calibrated threshold. Different classes -> the cross ceiling, never a
+            # blanket skip — see cross_threshold above. A missing category on either side still
+            # compares at the normal threshold (a missed duplicate costs a paid generation; for
+            # an unlabeled row the class-trap risk is unmeasurable either way).
+            eff_threshold = threshold
             if cat and other_cat and cat != other_cat:
-                continue  # different impact class — the gate; see the note above
+                eff_threshold = cross_threshold
             score = sum(x * y for x, y in zip(qv, ov)) / (norms[label] * norms[other])
-            if score >= threshold:
+            if score >= eff_threshold:
                 dupes.add(tid)
                 log.info("threats.semantic_near_duplicate", session_id=sid, subsystem=ss,
                         proposed=label, matched=other, category=cat or None,
@@ -337,10 +348,16 @@ def _asset_boundary_pattern(asset_name: str) -> re.Pattern | None:
     fires INSIDE unrelated words: asset 'CIS' matched 'decision' (rejecting every valid
     generic_name and corrupting the strip to 'Loss of de ion integrity'), which then flowed
     into grounding queries, the persisted GenericName, and accept-time triage."""
-    a = (asset_name or "").strip()
+    # Tolerant on three axes a literal re.escape of the raw name was not — each one a measured
+    # leak path for the asset name into GenericName and from there the shared library:
+    #   * trailing punctuation on the NAME ('ACME Corp.') failed to match 'ACME Corp systems';
+    #   * internal whitespace drift ('Power  Plant' in curated data vs 'Power Plant' in prose);
+    #   * a possessive after the match ('Citizen Portal's credentials') left a dangling 's.
+    a = (asset_name or "").strip().rstrip(".,;:!")
     if not a:
         return None
-    return re.compile(r"(?<!\w)" + re.escape(a) + r"(?!\w)", re.IGNORECASE)
+    body = r"\s+".join(re.escape(tok) for tok in a.split())
+    return re.compile(r"(?<!\w)" + body + r"(?:'s)?(?!\w)", re.IGNORECASE)
 
 
 def asset_agnostic_name(name: str | None, asset_name: str) -> str | None:
@@ -352,8 +369,17 @@ def asset_agnostic_name(name: str | None, asset_name: str) -> str | None:
     if not name or not asset_name:
         return name
     pat = _asset_boundary_pattern(asset_name)
-    stripped = pat.sub(" ", name) if pat else name
-    stripped = re.sub(r"\s+", " ", stripped).strip(" ,;:-.")
+    if pat:
+        # Consume an immediately-PRECEDING preposition with the asset span, so a MID-string
+        # removal doesn't leave it dangling: 'Compromise of X leading to outage' used to strip to
+        # 'Compromise of leading to outage' — the old cleanup below is $-anchored and only ever
+        # fixed the tail.
+        combined = re.compile(r"(?:\b(?:of|from|to|in|on|for|against|at)\s+)?" + pat.pattern,
+                            pat.flags)
+        stripped = combined.sub(" ", name)
+    else:
+        stripped = name
+    stripped = re.sub(r"\s+", " ", stripped).strip(" ,;:-.'")
     stripped = re.sub(r"\s+(of|to|on|in|for|against)$", "", stripped, flags=re.IGNORECASE)
     return stripped or None
 
@@ -383,7 +409,14 @@ def clean_library_name(name: str | None) -> str | None:
         return None
     if len([w for w in core.split() if any(ch.isalpha() for ch in w)]) < 2:
         return None
-    return name.strip()
+    # Return the name with WRAPPING junk stripped, not the raw input. This used to validate
+    # `core` but return `name.strip()`, so '"Data exfiltration"' passed the checks and was stored
+    # QUOTES AND ALL — becoming the accept-time triage query and, on auto-approve, the shared
+    # library entry's literal wording. Only the wrapper is stripped; interior punctuation is the
+    # name's own business ('e-mail', 'command & control').
+    display = re.sub(r"""^[\s\[\]{}()<>'"`]+|[\s\[\]{}()<>'"`]+$""", "", name)
+    display = display.strip(" ,;:.-")
+    return display or None
 
 
 def _generic_name_of(p: dict, asset_name: str) -> str | None:
@@ -931,13 +964,23 @@ def _begin_full_run_attempt(sess: Session, sid: str, ss: int, tenant: str,
 def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
                             entity_id: str | None, user_id: str | None,
                             pairs: list, scenarios: dict, enriched: dict,
-                            epoch: int, task_id: str, *, regen_mode: bool) -> bool:
+                            epoch: int, task_id: str, *, regen_mode: bool,
+                            failed_ids: set[str] | None = None) -> bool:
+    failed_ids = failed_ids or set()
     generated_ids = {sc.threat_id for sc, scoped_id, _t in pairs if scoped_id in scenarios}
     all_target_ids = {sc.threat_id for sc, _scoped_id, _t in pairs}
     excluded_ids = all_target_ids - generated_ids
-    if excluded_ids:
+    # Two DIFFERENT facts that used to share one log line and one reason code: a target whose
+    # generation BLEW UP (transient — stays Selected=1, next click retries) versus one that
+    # genuinely rescored out of scope (terminal — gets a Selected=0 marker below). Reporting a
+    # provider error as "no longer meets the scoping cutoff" sent support down the wrong path.
+    rescored_ids = excluded_ids - failed_ids
+    if rescored_ids:
         log.warning("regen.target_no_longer_selected", session_id=sid, subsystem=ss,
-                    threat_ids=sorted(excluded_ids))
+                    threat_ids=sorted(rescored_ids))
+    if failed_ids:
+        log.warning("regen.target_generation_failed", session_id=sid, subsystem=ss,
+                    threat_ids=sorted(failed_ids))
 
     if not regen_mode:
         _mark_next_set_targets_rescored_out(sess, sid, ss, pairs, excluded_ids, tenant, entity_id, user_id)
@@ -948,11 +991,19 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
             log.warning("stage.claim_lost", session_id=sid, subsystem=ss, stage="SCENARIOS", epoch=epoch)
             return False
         sess.commit()
+        if failed_ids:
+            # Failure wins the diagnosis: any failed target makes the click retryable, so the
+            # terminal-sounding messages below must not fire. cascade treats this reason as
+            # retryable when settling (never `exhausted`).
+            raise dal.RegenerateConflict(
+                f"scenario generation failed for {len(failed_ids)} threat(s); they remain "
+                "selected and re-servable — retrying the same action repeats them",
+                reason="generation_failed")
         if not pairs:
             raise dal.RegenerateConflict(
                 "no unserved threats remain for this asset", reason="no_new_threats_found")
         raise dal.RegenerateConflict(
-            f"threat(s) no longer meet the scoping cutoff and cannot be regenerated: {sorted(excluded_ids)}",
+            f"threat(s) no longer meet the scoping cutoff and cannot be regenerated: {sorted(rescored_ids)}",
             reason="new_threat_did_not_qualify")
 
     generated_pairs = [(sc, scoped_id, t) for sc, scoped_id, t in pairs if scoped_id in scenarios]
@@ -1099,6 +1150,12 @@ def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, en
                             user_id: str | None, sc, scoped_id: str, info: dict,
                             scenario: dict, report: dict, epoch: int) -> None:
     retired_card = _retire_prior_card(sess, sid, ss, info)
+    # Mirror _persist_full_run_failure: retire any prior active Scoped_Threat row for this threat
+    # before inserting the new one. On a Celery redelivery (attempt >= 2), a threat whose
+    # attempt-1 scenario ERRORED is retried here — its attempt-1 scoped row was still active, so
+    # this path minted a SECOND active row per threat: invisible (invariants.py exempts the
+    # table; aggregates absorb it) but a standing violation of the active-row rule.
+    dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, {sc.threat_id})
     sess.execute(insert(m.Scoped_Threat),
                 [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
     sess.execute(insert(m.Threat_Scenario_Output),
@@ -1138,6 +1195,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     if not targeted:
         already_done = _begin_full_run_attempt(sess, sid, ss, tenant, entity_id, user_id, pairs, epoch)
     failures: list[str] = []
+    failed_ids: set[str] = set()  # threat ids whose GENERATION failed — never "rescored out"
     first_failure: Exception | None = None
     for sc, scoped_id, target in pairs:
         if not sc.selected or sc.threat_id in already_done:
@@ -1162,6 +1220,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
         except Exception as exc:
             sess.rollback()
             first_failure = first_failure or exc
+            failed_ids.add(sc.threat_id)
             client_msg = _failure_client_message(exc)
             failures.append(f"{enriched.get(sc.threat_id, {}).get('threat_name') or sc.threat_id}: {client_msg}")
             log.warning("scenario.generation_failed", session_id=sid, subsystem=ss,
@@ -1200,7 +1259,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     if targeted and not _reconcile_targeted_regen(
             sess, sid, ss, tenant, entity_id, user_id,
             pairs, scenarios, enriched, epoch, task_id,
-            regen_mode=regen_targets is not None):
+            regen_mode=regen_targets is not None, failed_ids=failed_ids):
         return []
     partial_error = (f"{len(failures)} of {len(failures) + len(provs)} scenario(s) failed to "
                     f"generate: {'; '.join(failures)}") if failures else None

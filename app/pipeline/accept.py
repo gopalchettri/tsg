@@ -188,6 +188,18 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
                 raise AcceptConflict(
                     f"accept-all leaves active scenarios in subsystem(s) {sorted(uncovered)} whose "
                     f"SCENARIOS stage is not AWAITING_DECISION (subsystem stage state out of sync)")
+            if matched == 0:
+                # Zero completed scenarios anywhere (e.g. every generation failed and only error
+                # cards remain). Completing here would stamp the session a success with
+                # accepted_count=0 — confusing at best. The uncovered guard above cannot catch
+                # this: with NO active complete scenarios at all, `uncovered` is empty by
+                # construction. Reject-all (an explicit empty accepted_scenario_ids) remains the
+                # deliberate way to close a session as reviewed-with-nothing.
+                raise AcceptConflict(
+                    "accept-all found no completed scenarios to accept — regenerate or request a "
+                    "next set first, or submit an explicit empty accepted_scenario_ids to close "
+                    "the session as reviewed-with-none",
+                    reason="nothing_to_accept")
 
         _add_unverified_threats_to_library(sess, scenario_session, good_subs, user_id)
 
@@ -439,9 +451,14 @@ def _find_or_create_type_and_catalogue(
         key = ("type", row["ThreatCategory"], row["ThreatType"])
         type_id = resolved.get(key)
         if type_id is None:
-            type_id = dal.upsert_threat_type(sess, row["ThreatType"], _category_id(), sector_id,
-                                             created_by=created_by)
+            type_id, created = dal.upsert_threat_type(sess, row["ThreatType"], _category_id(),
+                                                    sector_id, created_by=created_by)
             resolved[key] = type_id
+            if created:
+                # Minted THIS accept — the one case actor linking may seed. A type that already
+                # existed (curated, or minted by an earlier accept) keeps its curator-owned actor
+                # set; see the linking gate in _add_unverified_threats_to_library.
+                resolved[("minted_type", type_id)] = True
 
     # Passthrough, never overwritten. grounding sets this only on a VERIFIED name match, so when
     # it is set it already names the right library row and there is nothing to promote.
@@ -776,11 +793,26 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
         verdict, type_id, catalogue_id_new, matched_id, cosine = fate
 
         actors = parsed_actors[row["ThreatID"]]
-        # resolve_only: AI-proposed names may LINK existing actors, never CREATE one — see
-        # _link_actors_to_threat_type's docstring for the vocabulary-growth loop this prevents.
-        linked_actors = _link_actors_to_threat_type(sess, type_id, actors, resolved,
-                                                    created_by=actor_id,
-                                                    resolve_only=True)  # names NEWLY linked this accept
+        # TWO gates, closing two different loops:
+        # * resolve_only — AI-proposed names may LINK existing actors, never CREATE one (the
+        #   vocabulary-growth loop, _link_actors_to_threat_type's docstring);
+        # * minted-only — links may SEED a type minted in this very accept, never extend a
+        #   pre-existing type's actor set. Without this, an unvalidated AI assertion ("Hacktivist
+        #   does type 210") written today becomes the very set get_allowed_actor_names validates
+        #   future sessions against tomorrow — attribution laundering one level up from the
+        #   vocabulary loop. A curated type's actor set changes only via
+        #   PATCH /threat-types/{id} (actor_names), the deliberate, audited path.
+        if resolved.get(("minted_type", type_id)):
+            linked_actors = _link_actors_to_threat_type(sess, type_id, actors, resolved,
+                                                        created_by=actor_id,
+                                                        resolve_only=True)  # names NEWLY linked this accept
+        else:
+            linked_actors = []
+            if actors:
+                log.info("accept.actor_links_withheld", type_id=type_id, actors=actors,
+                        threat_id=row["ThreatID"],
+                        note="type pre-exists this accept; curator owns its actor set — add via "
+                            "PATCH /v1/tsg/threat-library/threat-types/{id} if the attribution is real")
         triage_details.append({"threat_id": row["ThreatID"], "generic_name": generic,
                             "verdict": verdict, "cosine": cosine,
                             "matched_catalogue_id": matched_id})

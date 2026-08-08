@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.pipeline import scoping  # noqa: E402
 from app.pipeline.tasks import (_MAX_PROPOSAL_CHARS, _semantic_duplicates,  # noqa: E402
-                                _usable_proposal)
+                                _usable_proposal, asset_agnostic_name, clean_library_name)
 
 ASSET = "Widget Control System"
 
@@ -29,7 +29,10 @@ class _StubLLM:
     sharing a first word are exactly parallel (cosine 1.0) and anything else is orthogonal.
     Lets each case below control similarity outright instead of depending on a real model."""
 
-    _AXES = {"alpha": [1.0, 0.0, 0.0], "beta": [0.0, 1.0, 0.0], "gamma": [0.0, 0.0, 1.0]}
+    # "trapx" sits at cosine 0.969 to "alpha" — the measured cross-class similarity of
+    # 'Unauthorized disclosure of X' vs 'Unauthorized modification of X' on the live embedder.
+    _AXES = {"alpha": [1.0, 0.0, 0.0], "beta": [0.0, 1.0, 0.0], "gamma": [0.0, 0.0, 1.0],
+             "trapx": [0.969, 0.246779, 0.0]}
 
     def embed(self, texts, kind=None):  # noqa: ARG002 — signature parity with LLMClient
         out = []
@@ -94,16 +97,54 @@ def check_semantic_duplicates_identical_labels() -> None:
 
 
 def check_semantic_duplicates_category_gate() -> None:
-    """The STRIDE-category gate is mandatory, not an optimisation. On the live embedder
-    'Unauthorized disclosure of X' vs 'Unauthorized modification of X' scores 0.969 — above every
-    genuine paraphrase — because embeddings track word overlap and those differ by one noun. They
-    are opposite impact classes; no threshold separates them, only the category restriction does."""
+    """Cross-category pairs are judged at the STRICTER cross ceiling (0.98), not skipped and not
+    the normal threshold. Two contracts pinned at once: the measured 0.969 disclosure/modification
+    trap (two REAL threats, different impact classes) must survive, while a byte-identical label
+    the model merely relabelled into another category must be dropped."""
     llm = _StubLLM()
+    # cosine(alpha, trapx) = 0.969 -> below the 0.98 cross ceiling -> both survive.
     threats = [_threat("t1", "alpha disclosure", category="Information Disclosure"),
-               _threat("t2", "alpha modification", category="Tampering")]
+               _threat("t2", "trapx modification", category="Tampering")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
-    assert dupes == set(), dupes  # identical vectors, different impact class — both survive
-    print("ok  _semantic_duplicates respects the category gate")
+    assert dupes == set(), dupes
+    # cosine 1.0 (same first word) across categories -> at/above 0.98 -> relabel caught.
+    threats = [_threat("t1", "alpha disclosure", category="Information Disclosure"),
+               _threat("t2", "alpha disclosure", category="Tampering")]
+    dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
+    assert dupes == {"t2"}, dupes
+    print("ok  _semantic_duplicates cross-category ceiling: trap survives, relabel caught")
+
+
+def check_clean_library_name() -> None:
+    """The wrapper junk must be STRIPPED from the returned value, not merely tolerated —
+    '\"Data exfiltration\"' used to pass validation and be stored quotes-and-all, becoming the
+    triage query and (on auto-approve) the shared library entry's literal wording."""
+    assert clean_library_name('"Data exfiltration by insiders"') == "Data exfiltration by insiders"
+    assert clean_library_name("[Credential theft attack]") == "Credential theft attack"
+    assert clean_library_name("  Sensitive data exposure  ") == "Sensitive data exposure"
+    assert clean_library_name("e-mail account takeover") == "e-mail account takeover"  # interior kept
+    assert clean_library_name("N/A") is None
+    assert clean_library_name('["NA"]') is None
+    assert clean_library_name("Ransomware") is None  # one word — below the two-word floor
+    assert clean_library_name(None) is None
+    print("ok  clean_library_name strips wrappers and keeps interiors")
+
+
+def check_asset_name_stripping() -> None:
+    """Three measured leak paths through the old literal re.escape boundary pattern."""
+    # Trailing punctuation on the ASSET name no longer breaks the match.
+    assert asset_agnostic_name("Data exfiltration from ACME Corp systems", "ACME Corp.") == \
+        "Data exfiltration systems"
+    # Possessive is consumed with the span instead of leaving a dangling 's.
+    got = asset_agnostic_name("Citizen Portal's credentials exposed", "Citizen Portal")
+    assert got == "credentials exposed", got
+    # Mid-string removal consumes its preceding preposition — no more 'Compromise of leading to'.
+    got = asset_agnostic_name("Compromise of Widget Control System leading to outage",
+                            "Widget Control System")
+    assert got == "Compromise leading to outage", got
+    # Nothing-but-the-asset still returns None, never the raw asset-embedded string.
+    assert asset_agnostic_name("Widget Control System", "Widget Control System") is None
+    print("ok  asset_agnostic_name handles punctuation, possessive, mid-string")
 
 
 def check_semantic_duplicates_no_chain_drop() -> None:
@@ -175,6 +216,8 @@ def demo() -> None:
     check_semantic_duplicates_same_category()
     check_semantic_duplicates_identical_labels()
     check_semantic_duplicates_category_gate()
+    check_clean_library_name()
+    check_asset_name_stripping()
     check_semantic_duplicates_no_chain_drop()
     check_semantic_duplicates_against_priors()
     check_semantic_scan_failure_is_not_fatal()
