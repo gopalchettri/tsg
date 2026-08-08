@@ -88,48 +88,65 @@ def _log_semantic_near_duplicates(llm: LLMClient, sid: str, ss: int,
     def _key(t: dict) -> str:
         return asset_agnostic_name(threat_label(t), asset_name) or ""
 
-    entries = [(_key(t), _cat(t)) for t in threats]
-    entries = [(lbl, c) for lbl, c in entries if lbl]
+    entries = [(t.get("threat_id"), _key(t), _cat(t)) for t in threats]
+    entries = [(tid, lbl, c) for tid, lbl, c in entries if tid and lbl]
     prior_entries = [(_key(t), _cat(t)) for t in (priors or [])]
     prior_entries = [(lbl, c) for lbl, c in prior_entries if lbl]
     if not entries or not (prior_entries or len(entries) > 1):
-        return 0
-    labels = [lbl for lbl, _c in entries]
+        return set()
+    labels = [lbl for _tid, lbl, _c in entries]
     prior = [lbl for lbl, _c in prior_entries]
-    cat_of = {lbl: c for lbl, c in prior_entries + entries}  # this batch wins on a label clash
+    # this batch wins on a label clash
+    cat_of = {lbl: c for lbl, c in prior_entries + [(lbl, c) for _tid, lbl, c in entries]}
     if threshold is None:  # session-tuned when the caller carries a snapshot; config otherwise
         threshold = get_settings().semantic_near_duplicate_threshold
     try:
+        # `texts` is the DISTINCT strings to embed — deduped only to avoid paying for the same
+        # vector twice. It is not a count of comparable entries: N threats sharing one label
+        # collapse to a single text, and the old `len(texts) < 2` bail-out then returned "no
+        # duplicates" for the most clear-cut duplicate there is. The real "nothing to compare"
+        # check is the entries/prior_entries guard above; this one only needs to catch empty.
         texts = list(dict.fromkeys([lbl for lbl in labels if lbl] + prior))
-        if len(texts) < 2:
-            return 0
-        
+        if not texts:
+            return set()
+
         vectors = dict(zip(texts, llm.embed(texts, kind="query")))
-        
+
         norms = {t: math.sqrt(sum(x * x for x in v)) or 1.0 for t, v in vectors.items()}
     except Exception:
+        # Never block generation on a failed scan: returning "no duplicates" degrades to today's
+        # behaviour (identity dedup only), whereas raising would lose the whole round's threats.
         log.warning("threats.semantic_scan_failed", session_id=sid, subsystem=ss, exc_info=True)
-        return 0
-    hits = 0
-    for i, (label, cat) in enumerate(entries):
+        return set()
+    dupes: set[str] = set()
+    kept: list[str] = []  # survivors only — see the first-wins note in the docstring
+    for tid, label, cat in entries:
         qv = vectors.get(label)
         if qv is None:
+            kept.append(label)
             continue
-        for other in prior + labels[:i]:
+        for other in prior + kept:
             ov = vectors.get(other)
-            if ov is None or other == label or len(ov) != len(qv):
+            # No `other == label` guard. `kept` never contains this entry (it is appended only
+            # after the entry survives) and `prior` is read before this batch is inserted, so
+            # self-comparison is impossible by construction. That guard compared by VALUE, which
+            # meant two DISTINCT threats whose stripped labels were byte-identical — cosine 1.0,
+            # the strongest signal available — were the one pair silently skipped.
+            if ov is None or len(ov) != len(qv):
                 continue
             other_cat = cat_of.get(other, "")
             if cat and other_cat and cat != other_cat:
                 continue  # different impact class — the gate; see the note above
             score = sum(x * y for x, y in zip(qv, ov)) / (norms[label] * norms[other])
             if score >= threshold:
-                hits += 1
+                dupes.add(tid)
                 log.info("threats.semantic_near_duplicate", session_id=sid, subsystem=ss,
                         proposed=label, matched=other, category=cat or None,
                         cosine=round(score, 4), threshold=threshold)
                 break
-    return hits
+        else:
+            kept.append(label)
+    return dupes
 
 
 def _statement_of(scenario_json: str | None) -> str:
@@ -385,6 +402,34 @@ def _dedup_key(info: dict) -> str:
     return "txt:" + key_type + "|" + key_name
 
 
+#: Ceiling on one proposal's grounding query text. Sits below llm._MAX_EMBED_CHARS (4000), which
+#: RAISES rather than truncates — and that raise escapes find_threats, losing EVERY threat in the
+#: round, not just the oversized one. A hard provider limit, so a constant and not a config knob.
+_MAX_PROPOSAL_CHARS = 3500
+
+
+def _usable_proposal(p: object) -> bool:
+    """Is this element of the model's JSON array safe to persist?
+
+    parse_json validates only that the TOP LEVEL is a list, so elements are whatever the model
+    emitted. Three ways an unchecked element does real damage, all fixed by rejecting it here
+    rather than by guarding each reader:
+
+    * not a dict -> `.get()` raises AttributeError in grounding.prime_query_embeddings and again
+      in the loop below. That is not the typed LLMResponseParseError [R8] expects, so it reaches
+      the catch-all and CANCELS THE SESSION.
+    * empty type/name -> nothing to ground, score or dedup on, and scenario_prompt rightly
+      refuses it later. Because nothing ever UPDATEs Identified_Threat, the resulting error card
+      re-raises identically on every regenerate: permanently unclearable.
+    * over-long -> llm.embed raises and the whole round's threats are lost.
+    """
+    if not isinstance(p, dict):
+        return False
+    ptype = _safe_text(p.get("type"), "") or ""
+    pname = _safe_text(p.get("name"), "") or ""
+    return bool(ptype) and bool(pname) and len(ptype) + len(pname) <= _MAX_PROPOSAL_CHARS
+
+
 def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
                 epoch: int = _EPOCH, categories: list[str] | None = None,
                 actor_examples: list[str] | None = None,
@@ -409,6 +454,14 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                                 scenario_session=scenario_session, subsystem_id=ss, stage="threats",
                                 level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
                                 temperature=get_settings().threat_identification_temperature)
+    # Untrusted input, filtered ONCE at the boundary — see _usable_proposal. Every reader below
+    # (and grounding.prime_query_embeddings) dereferences these elements, so guarding them here
+    # is both the smallest and the only complete fix.
+    usable = [p for p in proposals if _usable_proposal(p)]
+    if len(usable) != len(proposals):
+        log.warning("threats.proposals_dropped", session_id=sid,
+                    dropped=len(proposals) - len(usable), received=len(proposals))
+    proposals = usable
     if supersede:
         dal.supersede(sess, m.Identified_Threat, sid, ss)
     existing_identities = dal.active_identified_threat_identities(sess, sid, ss) if not supersede else set()
@@ -420,7 +473,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # Grounding and the identity fingerprint run on the LIBRARY-SHAPED name: the AI's own
     # generic_name when valid, the string-strip fallback otherwise (_generic_name_of).
     to_ground = [{**p, "name": _generic_name_of(p, scenario_session["AssetName"])}
-                if isinstance(p, dict) else p for p in proposals]
+                for p in proposals]  # every element is a dict — _usable_proposal guaranteed it
     grounding.prime_query_embeddings(llm, to_ground, grounding_cache)
     for p, gp in zip(proposals, to_ground):
         if len(rows) >= max_threats:            
@@ -701,6 +754,12 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
             # Merging makes the whole class impossible: a repair can overwrite only keys it
             # actually returned, and can never remove one.
             merged = {**scenario, **repaired}
+            # ...but it CAN empty one, which costs exactly as much: an explicit
+            # "other_plausible_entry_points": [] in the repair is a legal key that merging happily
+            # accepts, and an empty list freezes the threat at one scenario just as a missing key
+            # would. Keep the original whenever the repair's version is empty.
+            if not merged.get("other_plausible_entry_points"):
+                merged["other_plausible_entry_points"] = scenario.get("other_plausible_entry_points") or []
             # Validate the MERGED object, not the raw repair: validate_scenario's envelope also
             # carries assumptions/excluded_details, so a pre-merge report would be persisted
             # alongside a post-merge ScenarioJSON that disagrees with it.
@@ -781,6 +840,16 @@ def _select_unique_top_n(scoped: list[scoping.Scored], enriched: dict, top_n: in
             continue
         key = _dedup_key(enriched.get(sc.threat_id, {}))
         if key in seen:
+            # UNREACHABLE while find_threats holds the invariant — dal.identity_hash IS
+            # _dedup_key, and find_threats already folded on it against both the in-batch set and
+            # active_identified_threat_identities, so everything arriving here is already
+            # key-unique. Kept anyway, as a live invariant check rather than dead code: it is the
+            # last guard before a duplicate reaches a PAID scenario call, and the module that
+            # maintains the invariant is a different one. `deduped` is therefore an alarm counter
+            # that should read 0 forever — not evidence the model never repeats itself. Semantic
+            # duplicates are a separate mechanism with its own counter.
+            log.warning("scoping.duplicate_survived_identity_dedup",
+                        threat_id=sc.threat_id, dedup_key=key)
             sc.selected, sc.reason = False, "duplicate of higher-ranked threat"
             # selection cleared WITH the demotion — `selection is not None ⟺ selected` is a
             # persisted contract (SelectionKind must be NULL on every Selected=0 row)
@@ -801,6 +870,13 @@ def _mark_next_set_targets_rescored_out(sess: Session, sid: str, ss: int, pairs:
                             if excluded_ids else set())
     if not excluded_needing_marker:
         return
+    # Outputs FIRST — supersede_outputs_for_threats reaches them through the scoped row, so once
+    # the scoped rows below are retired it can no longer find them. A threat reaching here whose
+    # only active output is a FAILURE CARD (threats_with_active_scenario is complete-only, so it
+    # does not exclude one) would otherwise keep that card active with its parent retired: the
+    # card still renders in /results `scenarios[]` while its threat vanishes from `threats[]`.
+    # The card is stale either way — the threat just rescored out of scope.
+    dal.supersede_outputs_for_threats(sess, sid, ss, excluded_needing_marker)
     dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, excluded_needing_marker)
     sess.execute(insert(m.Scoped_Threat), [
         _build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)
@@ -951,7 +1027,7 @@ def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: 
         top_n = min(top_n, tn.max_threats_per_asset)
     scoped_all = scoping.score_threats(threats, subsystems=subsystems,
                                     rules=dal.active_threat_rules(sess, type_ids),
-                                    score_threshold=tn.scoping_score_threshold, top_n=None,
+                                    score_threshold=tn.scoping_score_threshold,
                                     base_score=tn.base_score,
                                     default_rule_weight=tn.default_rule_weight)
     enriched = {t["threat_id"]: t for t in threats}
@@ -963,8 +1039,14 @@ def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: 
         log.warning("scenario.entry_points_ambiguous", session_id=sid, subsystem=ss,
                     labels=ambiguous)
     if not entry_vocab:
-        log.info("scenario.entry_points_unavailable", session_id=sid, subsystem=ss,
-                subsystems=len(subsystems))
+        # WARNING, not INFO. An empty vocabulary silently caps the WHOLE session at one scenario
+        # per threat: scenario_prompt omits the entry-point fields, _ground_entry_points writes
+        # plausible_entry_point_ids=[], and dal.variant_eligible_primaries then skips every
+        # identity. validate_scenario only checks the three narrative fields, so validation_status
+        # still reads "ok" — an 8-system asset ships an eighth of its analysis looking like a
+        # clean run. The count also rides the scoping_complete audit row so it survives the logs.
+        log.warning("scenario.entry_points_unavailable", session_id=sid, subsystem=ss,
+                    subsystems=len(subsystems))
     fold = _fold_scenario_rows(dal.active_scenario_rows(sess, sid, ss))
     intel_terms, intel_ot = _intel_vocabulary(subsystems, asset_context)
     return _ScenarioBatch(base_ctx, enriched, deduped, pairs, scoped_count, fold, entry_vocab,
@@ -1083,7 +1165,12 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.SCENARIO_GENERATION, SubsystemID=ss,
                     EventType=AuditEventType.scoping_complete,
-                    DetailJSON=json.dumps({"scoped": scoped_threat_count, "selected": len(provs), "deduped": deduped}))
+                    # entry_points: 0 means no threat in this batch could earn a second scenario —
+                    # the whole session is capped at one per threat. Durable here because the log
+                    # line alone is invisible to anyone reading the session's history, and nothing
+                    # else on the board or in /results reveals the collapse.
+                    DetailJSON=json.dumps({"scoped": scoped_threat_count, "selected": len(provs),
+                                        "deduped": deduped, "entry_points": len(entry_vocab)}))
     log.info("scenarios.deduped", session_id=sid, subsystem=ss, deduped=deduped, kept=len(provs))
 
     if targeted and not _reconcile_targeted_regen(

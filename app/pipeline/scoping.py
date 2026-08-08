@@ -179,38 +179,43 @@ def _scoring_reason(gate_failures: list[str], grounding_status: Any,
     return f"grounding={grounding_status}", None, selection
 
 
-def _apply_selection_cutoffs(selected: bool, score: float, reason: str,
-                            rejection: ScopingRejection | None, kept: int, *,
-                            score_threshold: float | None, top_n: int | None,
-                            ) -> tuple[bool, str, ScopingRejection | None, int]:
-    """The two config-driven selection cutoffs, applied in rank order. top_n only counts threats
-    still selected at this point — ones already excluded by the gate or threshold don't use up a
-    slot. Returns the possibly-updated (selected, reason, rejection) plus the running `kept` count.
+def _apply_score_floor(selected: bool, score: float, reason: str,
+                    rejection: ScopingRejection | None, *, score_threshold: float | None,
+                    ) -> tuple[bool, str, ScopingRejection | None]:
+    """The configured score floor, applied in rank order.
 
-    Only `top_n_cutoff` is re-servable by "generate next set": a below-threshold threat re-scores
-    below threshold every time, whereas a top-N casualty is re-selected the moment it is scored in
-    target mode. That distinction lives in the KIND, never in the wording of `reason`."""
+    DORMANT under the shipped rulebook, deliberately kept. The lowest reachable score is
+    base(50) + unverified(15) = 65 against a threshold of 55, and every seeded rule is a
+    `tech_gate` contributing 0.0 while every auto-written one carries a positive weight — so
+    nothing can currently land below the floor. It stays because it is the control a curator's
+    negative-weight rule acts through (`_rule_weight` accepts negative floats); deleting it would
+    make such a rule silently inert.
+
+    top-N used to live here too and has been REMOVED. The only caller has always passed
+    top_n=None (tasks._prepare_scenario_batch), because tasks._select_unique_top_n owns that
+    cutoff — it has to, since duplicates must be folded BEFORE slots are counted, or a duplicate
+    consumes a slot that a distinct threat should have had. Two implementations of one cutoff,
+    one of them unreachable, is how that invariant gets silently re-broken.
+
+    `top_n_cutoff` therefore still has exactly one producer, and it is not this function."""
     if selected and score_threshold is not None and score < score_threshold:
-        selected, reason = False, f"below score threshold ({score_threshold})"
-        rejection = ScopingRejection.below_threshold
-    if selected and top_n is not None:
-        kept += 1
-        if kept > top_n:
-            selected, reason = False, f"beyond top-{top_n} cutoff"
-            rejection = ScopingRejection.top_n_cutoff
-    return selected, reason, rejection, kept
+        return False, f"below score threshold ({score_threshold})", ScopingRejection.below_threshold
+    return selected, reason, rejection
 
 
 def score_threats(threats: list[dict[str, Any]], *, subsystems: list[dict] | None = None,
                 rules: list[dict] | None = None, score_threshold: float | None = None,
-                top_n: int | None = None, base_score: float | None = None,
+                base_score: float | None = None,
                 default_rule_weight: float | None = None) -> list[Scored]:
     """Score and rank the asset's identified threats and decide which move forward to a written
     scenario. Deterministic: same inputs → same ranking. Called with only `threats` (no rules, no
     cutoff) it is base + grounding weight with everything selected.
 
     `base_score`/`default_rule_weight` default to config when not passed; the pipeline passes the
-    session's resolved tuning so one assessment is never scored under two rulebooks."""
+    session's resolved tuning so one assessment is never scored under two rulebooks.
+
+    No `top_n` parameter: tasks._select_unique_top_n owns that cutoff (see _apply_score_floor).
+    The only caller always passed None."""
     if base_score is None or default_rule_weight is None:
         from app.core.config import get_settings  # lazy: keeps import-time coupling minimal
         _s = get_settings()
@@ -230,12 +235,22 @@ def score_threats(threats: list[dict[str, Any]], *, subsystems: list[dict] | Non
         reason, rejection, selection = _scoring_reason(gate_failures, t["grounding_status"])
         evaluated.append((t["threat_id"], score, selected, reason, rejection, selection, factors))
 
-    evaluated.sort(key=lambda x: (-x[1], x[0]))  # score desc, id asc — stable
+    # Score desc ONLY, relying on list.sort being stable — the incoming order IS the tie-break,
+    # and on both paths it is deterministic AND meaningful:
+    #   * fresh run  — tasks.find_threats appends in the model's own proposal order, and
+    #                  threats_prompt asks for threats "most contextually relevant first";
+    #   * regen/next-set — dal.active_threats has an explicit ORDER BY (CreatedAt DESC, ThreatID DESC).
+    # This previously tie-broke on `threat_id`, which reads as deterministic but is not useful:
+    # dal.guid() puts the random bytes in the LEADING string positions (the COMB timestamp is in
+    # the trailing six, for SQL Server's index ordering), so ascending id order is effectively a
+    # lottery. With scores taking only two distinct values in practice, nearly every threat ties —
+    # so that lottery decided rank order, and would decide which of two duplicates survives once
+    # dedup runs in rank order. Discarding a real relevance signal for a random one.
+    evaluated.sort(key=lambda x: -x[1])
     out: list[Scored] = []
-    kept = 0  # fresh per call — cutoff state never crosses subsystems/invocations
     for rank, (tid, score, selected, reason, rejection, selection, factors) in enumerate(evaluated, start=1):
-        selected, reason, rejection, kept = _apply_selection_cutoffs(
-            selected, score, reason, rejection, kept, score_threshold=score_threshold, top_n=top_n)
+        selected, reason, rejection = _apply_score_floor(
+            selected, score, reason, rejection, score_threshold=score_threshold)
         out.append(Scored(threat_id=tid, score=score, rank=rank, selected=selected, reason=reason,
                         rejection=rejection, selection=selection if selected else None,
                         factors=factors))

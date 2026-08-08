@@ -438,10 +438,17 @@ class Settings(BaseSettings):
     triage_auto_reject_cosine: float = Field(0.95, ge=0.0, le=1.0)
     triage_auto_approve_cosine: float = Field(0.80, ge=0.0, le=1.0)
 
-    # Only the highest-scoring N unique threats get a scenario written. None (default) = no
-    # limit: every unique threat that clears scoping_score_threshold gets a scenario —
-    # tasks._select_unique_top_n still demotes duplicates, the threshold still drops weak ones.
-    # The old default of 5 silently abandoned the other half of every 10-threat round.
+    # Only the highest-scoring N unique threats get a scenario written. None (default) = no limit:
+    # every threat that survives its tech_gate gets a scenario. The old default of 5 silently
+    # abandoned the other half of every 10-threat round.
+    #
+    # Be honest about what the default leaves running. This comment used to justify None with
+    # "tasks._select_unique_top_n still demotes duplicates, the threshold still drops weak ones";
+    # neither holds. Duplicates are already folded upstream by find_threats' identity check, so
+    # that branch is an invariant alarm that should never fire, and scoping_score_threshold (55)
+    # sits below the lowest reachable score (base 50 + unverified 15 = 65) with no negative rule
+    # weight seeded anywhere — so it rejects nothing either. With None here, the ONLY things that
+    # drop a threat are its tech_gate and the identity/semantic dedup in find_threats.
     scoping_top_n: int | None = Field(None, ge=1)
 
     # --- Threat-library import (admin) ---

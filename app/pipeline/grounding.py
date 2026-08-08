@@ -326,6 +326,14 @@ def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs
                 scored.append((r, how_similar(qv, name_vecs[r[name_key]])))
             except ValueError:
                 log.warning("grounding.dimension_mismatch_skipped", candidate=r.get(name_key))
+    if rows and not scored:
+        # Candidates existed and EVERY one was skipped — systemic embedding-dimension drift, never
+        # a genuine no-match. Silent, this returns unverified/score=0.0 for every threat in every
+        # session: the audit row still reads as a healthy run, and at accept a 0.0 score sits below
+        # every promotion threshold, so raw AI text is mass-minted into the shared library. ERROR
+        # rather than raise — the session still yields usable unverified threats, so degrading is
+        # acceptable; degrading SILENTLY is not.
+        log.error("grounding.all_candidates_skipped", candidates=len(rows), name_key=name_key)
     return _apply_shortlist(scored, s)
 
 
@@ -782,7 +790,15 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
 
     akey = ("actors", type_id)
     allowed = _cached(cache, akey, lambda: get_allowed_actor_names(sess, type_id))
-    actors = [a for a in actors_in if a in allowed]  # drop out-of-set (§8.4 step 5)
+    # Case-insensitive, and normalised to the LIBRARY's spelling — the same convention
+    # accept.py's actor memo documents ("MSSQL's collation resolves 'nation state' to
+    # 'Nation State', so the memo must too"). An exact `in` dropped any actor differing only in
+    # case, and it drops it ONLY on a verified type — an unverified one returns actors raw above
+    # — so exact matching made better grounding yield FEWER actors. Returning the canonical
+    # spelling also keeps ThreatActorsJSON joinable to accept.py's exact-first lookup.
+    allowed_cf = {a.casefold(): a for a in allowed}
+    actors = [allowed_cf[cf] for a in actors_in
+              if (cf := a.casefold()) in allowed_cf]  # drop out-of-set (§8.4 step 5)
 
     # Symmetry with the TYPE branch above: an unverified type already yields type_id=None. An
     # unverified NAME must likewise yield no id and no library wording. `crow` is only ever the

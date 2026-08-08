@@ -225,6 +225,33 @@ def check_ctm_scan_category_names(sess: Session) -> str | None:
     return None
 
 
+def check_orphaned_scenario_outputs(sess: Session) -> str | None:
+    """Warn on any active Threat_Scenario_Output whose Scoped_Threat parent is superseded or gone.
+
+    This shape renders INCONSISTENTLY and silently: /results returns the row in `scenarios[]`
+    (dal's scenario read select outer-joins with no Superseded predicate on the parent) while
+    dropping its threat from `threats[]` (that query requires both rows active). A reviewer sees a
+    scenario card belonging to a threat the same response says does not exist.
+
+    It is the failure mode tasks._mark_next_set_targets_rescored_out used to have — it retired a
+    threat's Scoped_Threat rows without retiring the outputs hanging off them, which became
+    reachable the moment next_unserved_unique_threats stopped counting failure cards as served.
+    dal.supersede_outputs_for_threats now closes it; this is the regression guard, and it catches
+    any FUTURE one-sided supersede too, because it asserts the invariant rather than the fix.
+    Cheap: one NOT EXISTS, no session scoping, nothing session-specific to iterate."""
+    o, st = m.Threat_Scenario_Output, m.Scoped_Threat
+    has_active_parent = select(st.ScopedThreatID).where(
+        st.ScopedThreatID == o.ScopedThreatID, st.Superseded == 0)
+    orphans = sess.execute(
+        select(o.OutputID).where(o.Superseded == 0, ~has_active_parent.exists()).limit(20)
+    ).scalars().all()
+    if orphans:
+        log.warning("selfcheck.orphaned_scenario_outputs",
+                    output_ids=[str(x) for x in orphans], sample_capped_at=20)
+        return "orphaned_scenario_outputs"
+    return None
+
+
 def run_self_checks(sess: Session) -> list[str]:
     """THE ENTRY POINT — runs every check above, in order, and returns the names of
     whichever ones fired a warning this pass (same list[str] contract reaper.py's
@@ -243,6 +270,7 @@ def run_self_checks(sess: Session) -> list[str]:
         ("active_sessions", lambda: check_active_sessions(sess)),
         ("dead_threat_rules", lambda: check_dead_threat_rules(sess)),
         ("ctm_scan_category_names", lambda: check_ctm_scan_category_names(sess)),
+        ("orphaned_scenario_outputs", lambda: check_orphaned_scenario_outputs(sess)),
     ]
     if s.max_concurrent_llm_calls:
         checks.append(("llm_slots", lambda: check_llm_slots()))

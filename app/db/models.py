@@ -412,7 +412,11 @@ class Config_Threat_Rule(Base):
     ThreatRuleID: Mapped[int] = mapped_column(Integer, primary_key=True)
     RuleType: Mapped[str] = mapped_column(Unicode(50))       # enums.ThreatRuleType
     ThreatTypeID: Mapped[int] = mapped_column(Integer)        # app-enforced FK → Threat_Type
-    RuleKey: Mapped[str] = mapped_column(Unicode(200))        # e.g. "internet_facing" — scoping._RULE_KEY_FIELDS allowlist
+    # One of scoping._RULE_KEY_FIELDS — currently exactly: criticality, subsystem_name,
+    # asset_type, past_incidents. This example used to read "internet_facing", a key REMOVED on
+    # 2026-07-12 because gather_asset_details never produced it. An unknown key here is a silent
+    # no-op (scoping._apply_rules logs and continues), so a stale example invites dead rules.
+    RuleKey: Mapped[str] = mapped_column(Unicode(200))
     RuleValue: Mapped[str | None] = mapped_column(Unicode(450))                    # optional expected value
     Metadata: Mapped[str | None] = mapped_column(UnicodeText)                      # extra rule config (JSON), e.g. {"weight": 15}
     CreateDate: Mapped[datetime | None] = mapped_column(DateTime)

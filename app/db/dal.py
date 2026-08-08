@@ -916,6 +916,13 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
             m.Threat_Scenario_Output.SessionID == session_id,
             m.Threat_Scenario_Output.SubsystemID == subsystem_id,
             m.Threat_Scenario_Output.Superseded == 0,
+            # complete ONLY — the same contract threats_with_active_scenario states: a threat
+            # whose only active row is a FAILURE CARD has NOT been served, and the next-set sweep
+            # must treat it as unserved. Without this predicate a failed generation stamps a real
+            # IdentityHash here, the threat reads as done, and it becomes permanently unreachable
+            # by "generate next set" — only a per-card regenerate recovers it. Every sibling read
+            # of this table filters the same way; this query was the lone exception.
+            m.Threat_Scenario_Output.Status == ScenarioStatus.complete,
         )
     ).scalars())
     it, st = m.Identified_Threat, m.Scoped_Threat
@@ -1258,6 +1265,38 @@ def supersede_by_threats(sess: Session, table, session_id: str, subsystem_id: in
     )
 
 
+def supersede_outputs_for_threats(sess: Session, session_id: str, subsystem_id: int, threat_ids) -> None:
+    """Retire every active Threat_Scenario_Output hanging off these threats' active Scoped_Threat
+    rows.
+
+    Not a sibling of supersede_by_threats: Threat_Scenario_Output has NO ThreatID column — it
+    links through ScopedThreatID — so this has to go through a subquery.
+
+    CALL ORDER IS LOAD-BEARING: run this BEFORE supersede_by_threats(Scoped_Threat, ...). Once the
+    scoped rows are retired the subquery no longer finds them and the outputs are left active but
+    parentless, which is the exact inconsistency this exists to prevent — /results renders such a
+    row in `scenarios[]` (the read select doesn't check the scoped row) while dropping its threat
+    from `threats[]` (that query requires both active)."""
+    if not threat_ids:
+        return
+    scoped = select(m.Scoped_Threat.ScopedThreatID).where(
+        m.Scoped_Threat.SessionID == session_id,
+        m.Scoped_Threat.SubsystemID == subsystem_id,
+        m.Scoped_Threat.ThreatID.in_(threat_ids),
+        m.Scoped_Threat.Superseded == 0,
+    )
+    sess.execute(
+        update(m.Threat_Scenario_Output)
+        .where(
+            m.Threat_Scenario_Output.SessionID == session_id,
+            m.Threat_Scenario_Output.SubsystemID == subsystem_id,
+            m.Threat_Scenario_Output.ScopedThreatID.in_(scoped),
+            m.Threat_Scenario_Output.Superseded == 0,
+        )
+        .values(Superseded=1)
+    )
+
+
 def supersede_scoped_rows(sess: Session, scoped_threat_ids) -> None:
     """Retire exactly these Scoped_Threat rows (by their own PK) — the regen path's row-scoped
     replacement. NEVER threat-wide: with multiple coexisting scenarios per threat, a sibling
@@ -1567,11 +1606,18 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res)
     except IntegrityError:
+        # BOTH predicates must be NULL-safe. SQL Server's unique index treats NULLs as equal, so
+        # a second promotion of a name whose category never resolved (grounding.find_category
+        # returning None is a documented [R6] path) is a genuine natural-key collision — but
+        # `== NULL` matches nothing, so the recovery lookup returned None and re-raised, aborting
+        # the entire accept-session transaction. sector_pred was already null-safe; this was not.
+        cat_pred = (m.Threat_Type.ThreatCategoryID.is_(None) if category_id is None
+                    else m.Threat_Type.ThreatCategoryID == category_id)
         sector_pred = m.Threat_Type.SectorID.is_(None) if sector_id is None else m.Threat_Type.SectorID == sector_id
         winner = sess.execute(
             select(m.Threat_Type.ThreatTypeID).where(
                 m.Threat_Type.ThreatTypeName == name,
-                m.Threat_Type.ThreatCategoryID == category_id, sector_pred,
+                cat_pred, sector_pred,
                 m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
         ).scalar()
         if winner is None:  # not a natural-key duplicate (NOT NULL / missing IDENTITY /
