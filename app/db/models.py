@@ -597,10 +597,12 @@ class onboarding_supporting_systems(Base):
     asset_type: Mapped[int | None] = mapped_column(Integer)
     min_no_of_transactions: Mapped[int | None] = mapped_column(Integer)
     max_no_of_transactions: Mapped[int | None] = mapped_column(Integer)
+    url: Mapped[str | None] = mapped_column(Unicode(500))
     accessability_channel: Mapped[int | None] = mapped_column(Integer)  # single option_value code (option code 'acc-channel')
     technology_used: Mapped[str | None] = mapped_column(UnicodeText)
     user_base_count: Mapped[int | None] = mapped_column(Integer)
-    url: Mapped[str | None] = mapped_column(Unicode(500))
+    targeted_users: Mapped[str | None] = mapped_column(UnicodeText)  # JSON array of option_value codes, e.g. "[6]" — see option/option_value
+    managed_by: Mapped[int | None] = mapped_column(Integer)  # single option_value code (option code 'managed-by'), not free text
     vendor_name: Mapped[str | None] = mapped_column(Unicode(200))
     maintenance_contract_exists: Mapped[bool | None] = mapped_column(Boolean)
     hosting_location: Mapped[int | None] = mapped_column(Integer)  # single option_value code (option code 'hosting-location')
@@ -623,9 +625,12 @@ class onboarding_supporting_systems(Base):
     rpo_target_mins: Mapped[float | None] = mapped_column(Float)
     data_loss_incident_last_3_years: Mapped[bool | None] = mapped_column(Boolean)
     incident_description: Mapped[str | None] = mapped_column(UnicodeText)
-    targeted_users: Mapped[str | None] = mapped_column(UnicodeText)  # JSON array of option_value codes, e.g. "[6]" — see option/option_value
-    managed_by: Mapped[int | None] = mapped_column(Integer)  # single option_value code (option code 'managed-by'), not free text
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)  # soft-delete flag — real queries filter WHERE is_deleted = 0
+    delete_reason: Mapped[str | None] = mapped_column(UnicodeText)
+    creation_date: Mapped[datetime | None] = mapped_column(DateTime)
+    date_updated: Mapped[datetime | None] = mapped_column(DateTime)
+    created_by: Mapped[str | None] = mapped_column(Unicode(200))
+    updated_by: Mapped[str | None] = mapped_column(Unicode(200))
 
 # Read-only platform mirrors used by gather_asset_details (app/pipeline/context.py)
 # to resolve every session-creation context field authoritatively from the real DB.
