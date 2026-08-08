@@ -24,6 +24,7 @@ dependencies = [
   "httpx>=0.28.1",
   "ruff>=0.16.1",
   "mypy>=2.3.0",
+  "tenacity>=9.1.4",
   "taxii2-client>=2.3",     # generic TAXII 2.1 pull (app/intel/taxii_client.py)
 ]
 
