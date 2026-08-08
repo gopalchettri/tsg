@@ -398,12 +398,22 @@ class Settings(BaseSettings):
     # long-running sessions start burning proposals on threats they already have.
     coverage_exclusions_max: int = Field(50, ge=1)
 
-    # Cosine at or above which a proposed threat is LOGGED as a probable paraphrase of one the
-    # session already has. Observation only — nothing is ever rejected on this number, and it
-    # must stay that way until production logs show a cutoff that separates real paraphrases from
-    # genuinely distinct threats (tasks._log_semantic_near_duplicates explains why a wrong merge
-    # is unrecoverable). EMBEDDING-MODEL-SPECIFIC: a value tuned for e5-large@1024 means nothing
-    # on qwen3-8b@4096, so re-derive it from the logs after any embedding model change.
+    # Cosine at or above which a proposed threat is DROPPED as a paraphrase of one the session
+    # already has. This is the definition of "unique" for a threat: unique in MEANING. The
+    # identity fold above it is exact/ID-only, so without this gate the same threat in different
+    # words survives as two rows and costs two paid generations.
+    #
+    # ENFORCING as of this change — it was observation-only, on the reasoning that a cutoff had to
+    # wait for production logs. Two things settled that: the same-category case is already
+    # measured on real CII data at this value (4/4 paraphrases caught, 0/5 false positives), and
+    # the log that was supposed to supply the evidence was itself skipping byte-identical pairs,
+    # so waiting longer would only have deepened the wrong baseline.
+    #
+    # Set to 1.0 to disable the gate without a deploy — new sessions snapshot it, running ones
+    # keep the value they started with. tasks._semantic_duplicates carries the reasoning for why
+    # the STRIDE-category gate beside this threshold is mandatory rather than an optimisation.
+    # EMBEDDING-MODEL-SPECIFIC: a value tuned for e5-large@1024 means nothing on qwen3-8b@4096,
+    # so re-derive it from the logs after any embedding model change.
     semantic_near_duplicate_threshold: float = Field(0.92, ge=0.0, le=1.0)
 
     # --- Threat-scoping selection cutoff ---

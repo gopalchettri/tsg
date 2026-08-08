@@ -63,11 +63,24 @@ def threat_label(t: dict) -> str:
             or t.get("library_threat_type") or t.get("threat_type") or "")
 
 
-def _log_semantic_near_duplicates(llm: LLMClient, sid: str, ss: int,
-                                threats: list[dict],
-                                priors: list[dict] | None = None,
-                                asset_name: str = "",
-                                threshold: float | None = None) -> int:
+def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
+                        threats: list[dict],
+                        priors: list[dict] | None = None,
+                        asset_name: str = "",
+                        threshold: float | None = None) -> set[str]:
+    """ThreatIDs from `threats` that mean the same as a higher-ranked threat in this batch, or as
+    one already active on the session. ENFORCING: the caller drops these before the insert.
+
+    This is the definition of "unique" for a threat — unique in MEANING. dal.identity_hash only
+    catches exact/ID matches, so "Data leakage from X" and "Unauthorised disclosure of X" both
+    survive it as distinct rows and the reviewer sees the same threat twice. Cosine on the
+    asset-stripped label is the only instrument that can express the real rule.
+
+    FIRST-WINS, compared against SURVIVORS only. Similarity is not transitive — A~B and B~C does
+    not give A~C — so comparing against already-dropped labels would chain-drop C for resembling
+    a B that is no longer there. Deterministic because the incoming order is: find_threats
+    appends in the model's own relevance order, and dal.active_threats has an explicit ORDER BY
+    (scoping.score_threats relies on the same property; see its sort)."""
     # Compare labels with the ASSET NAME STRIPPED, the same way grounding does before matching the
     # catalogue. threats_prompt mandates '<impact> of <asset name>', so every label in a session
     # ends with the same string; measured on real data that constant suffix lifts median pairwise
@@ -506,11 +519,22 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         existing_identities.add(identity)
         rows.append(row)
         threats.append(summary)
+    # BEFORE the insert, not after: this is a gate now, not an observation. The identity check in
+    # the loop above catches only exact/ID matches, so two proposals meaning the same thing in
+    # different words both survive it — and both reach the reviewer as separate scenarios, each
+    # costing a paid generation. Reversible without a deploy: Config_Tuning can set
+    # semantic_near_duplicate_threshold to 1.0, which makes the gate unreachable for new sessions.
+    dupe_ids = _semantic_duplicates(llm, sid, ss, threats, prior_threats,
+                                    scenario_session["AssetName"],
+                                    threshold=tn.semantic_near_duplicate_threshold)
+    near_dupes = len(dupe_ids)
+    if dupe_ids:
+        rows = [r for r in rows if r["ThreatID"] not in dupe_ids]
+        threats = [t for t in threats if t["threat_id"] not in dupe_ids]
+        log.info("threats.semantic_duplicates_dropped", session_id=sid, subsystem=ss,
+                dropped=near_dupes)
     if rows:
-        sess.execute(insert(m.Identified_Threat), rows)    
-    near_dupes = _log_semantic_near_duplicates(llm, sid, ss, threats, prior_threats,
-                                            scenario_session["AssetName"],
-                                            threshold=tn.semantic_near_duplicate_threshold)
+        sess.execute(insert(m.Identified_Threat), rows)
     if not dal.finish_stage(sess, sid, ss, SubsystemLevel.THREATS, StageStatus.COMPLETE, epoch, task_id):
         sess.rollback()
         log.warning("stage.claim_lost", session_id=sid, subsystem=ss, stage="THREATS", epoch=epoch)
