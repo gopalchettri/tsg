@@ -1,17 +1,14 @@
 """Celery transport wiring — kept separate from the pipeline work.
 
-`acks_late` + `reject_on_worker_lost` mean a worker crash redelivers the task; the stage CAS
-makes that safe (finished stages skip, mid-flight resume), and the reaper recovers a session
-whose worker died so the lock never leaks.
+`acks_late` + the stage CAS make a crash-redelivery safe (finished stages skip, mid-flight
+resume); the reaper recovers a session whose worker died so the lock never leaks.
+`reject_on_worker_lost` is effectively inert under gevent — it needs a supervisor to notice a
+killed *child*, but a SIGKILL takes the single gevent process down whole; `visibility_timeout`
+below is the real redelivery mechanism.
 
-`reject_on_worker_lost` is effectively inert under the gevent pool: it relies on a supervising
-process detecting a killed *child*, and a SIGKILL of the single gevent process takes down the
-Consumer and every greenlet at once. The Redis broker's `visibility_timeout` below — not that
-flag — is the real redelivery mechanism when a worker is killed outright.
-
-This module must NEVER monkey-patch gevent: it is imported by the FastAPI app and by celery
-beat, both on asyncio, and patching select/socket inside an asyncio process hangs every request.
-celery_worker.py is the patch-first entrypoint for `celery worker`.
+NEVER monkey-patch gevent here — the FastAPI app and `celery beat` import this module on
+asyncio, where patching select/socket hangs every request. celery_worker.py is the patch-first
+entrypoint for `celery worker`.
 """
 from __future__ import annotations
 
@@ -64,17 +61,13 @@ celery_app.conf.update(
 
 
 @worker_init.connect        # fires exactly once per worker process, for EVERY pool type
-@worker_process_init.connect  # fires per forked child under prefork specifically 
+@worker_process_init.connect  # fires per forked child under prefork specifically
 def _init_worker(sender=None, **_):
     """Per-worker-process startup: verify posture/DB invariants and warm the models.
 
-    BOTH signals are needed. `worker_process_init` is prefork-only and NEVER fires under the
-    gevent pool this service actually runs, so without `worker_init` a gevent worker silently
-    skips the fail-closed security guard and the fail-fast local-model check.
-
-    verify_startup runs here as well as in the API's startup hook because a worker can be
-    deployed independently and would otherwise never check that the database it runs CAS writes
-    against has the required indexes/columns/RCSI setting."""
+    BOTH signals are needed: `worker_process_init` is prefork-only and never fires under gevent,
+    so without `worker_init` a gevent worker skips the security and local-model guards entirely.
+    verify_startup repeats the API's check because a worker can be deployed independently."""
     # worker-only setup: imported here so merely importing this module (e.g. from FastAPI)
     # doesn't drag it in
     from app.core.config import assert_security_posture
@@ -144,12 +137,11 @@ def _init_worker(sender=None, **_):
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def run_pipeline_task(self, session_id: str) -> None:
     """Runs the whole pipeline for one session; queued by the API on session creation.
-    `self.request.id` becomes the run id stamped into each claimed stage, so an acks_late
-    redelivery is distinguishable from a fresh run for the stage CAS.
+    `self.request.id` is the run id stamped into each claimed stage, so the CAS can tell an
+    acks_late redelivery from a fresh run.
 
-    `autoretry_for=(LLMSlotUnavailable,)`: a confirmed "no free LLM call slot" is temporary, and
-    the retry resumes exactly like a crash-redelivery via claim_stage's CAS. `max_retries=None`
-    because Subsystem_Stage_State.AttemptCount's poison-terminal cap is the real ceiling.
+    `autoretry_for=(LLMSlotUnavailable,)`: a slot shortage is temporary and the retry resumes via
+    claim_stage's CAS. `max_retries=None` — AttemptCount's poison-terminal cap is the real ceiling.
     """
     with db_session() as sess:
         _process_all_supporting_systems(sess, session_id, get_llm(), self.request.id or guid())
@@ -159,10 +151,9 @@ def run_pipeline_task(self, session_id: str) -> None:
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
                     target_ids: list[str] | list[int] | None, epoch: int, user_note: str | None = None) -> None:
-    """Redoes one or more scenarios of a session. Same `autoretry_for` reasoning as
-    run_pipeline_task above. `epoch` is reserved once by the API endpoint's session-level CAS,
-    never minted here, so a redelivery re-executes at the SAME epoch and claim_stage's CAS no-ops
-    an already-terminal level instead of destructively re-running the hop."""
+    """Redoes one or more scenarios of a session. Same `autoretry_for` reasoning as above.
+    `epoch` is reserved once by the endpoint's session-level CAS and never minted here, so a
+    redelivery re-executes at the SAME epoch and the CAS no-ops an already-terminal level."""
     with db_session() as sess:
         session = dal.load_session(sess, session_id)
         if session is None:
@@ -174,10 +165,10 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
 @celery_app.task(bind=True, name="tsg.next_set",
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_epoch: int) -> None:
-    """Adds the next batch of unique, accumulating scenarios for one subsystem. Same `autoretry_for`
-    and caller-reserved `epoch` reasoning as regenerate_task above. `threats_epoch` is the
-    additive-find_threats epoch, ALSO reserved once by the endpoint and held fixed here, so a
-    redelivery skips a second AI call once that stage is COMPLETE at it."""
+    """Adds the next batch of unique, accumulating scenarios for one subsystem. Same
+    `autoretry_for` and caller-reserved `epoch` reasoning as above. `threats_epoch` is the
+    additive-find_threats epoch, also endpoint-reserved and held fixed here, so a redelivery
+    skips a second AI call once that stage is COMPLETE at it."""
     with db_session() as sess:
         session = dal.load_session(sess, session_id)
         if session is None:
@@ -189,10 +180,9 @@ def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_
 @celery_app.task(bind=True, name="tsg.generate_treatment_plan",
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
 def generate_treatment_plan_task(self, plan_id: str) -> None:
-    """One Risk Treatment Plan attempt (docs/RISK_TREATMENT_PLAN_SDD.md §6.2); queued by
-    POST .../treatment-plan after the RUNNING row is committed. Same `autoretry_for` reasoning
-    as the tasks above — a retry (same task id) resumes via claim_plan's own-task branch, so
-    a slot-exhausted attempt never wedges the row. No epoch: plan rows are never reused
+    """One Risk Treatment Plan attempt (docs/RISK_TREATMENT_PLAN_SDD.md §6.2); queued after the
+    RUNNING row is committed. A retry (same task id) resumes via claim_plan's own-task branch, so
+    a slot-exhausted attempt never wedges the row. No epoch — plan rows are never reused
     (regenerate = supersede + new row), so PlanID itself is the fence."""
     with db_session() as sess:
         treatment.run_treatment_generation(sess, plan_id, get_llm(), self.request.id or guid())
@@ -203,11 +193,10 @@ def generate_treatment_plan_task(self, plan_id: str) -> None:
 def admin_embedding_action_task(action: str, group: str | None, names: list[str] | None,
                                 strict: bool = True) -> dict:
     """Background counterpart to app/api/admin.py's four embedding-cache routes; the caller polls
-    GET .../status/{job_id}. Same `autoretry_for` reasoning as the tasks above.
+    GET .../status/{job_id}.
 
     `create`/`update` are idempotent on retry (they only embed what's missing). `recreate`
-    re-wipes and re-embeds every group in scope from scratch, even ones an earlier partial
-    attempt finished — wasted work, not a correctness bug.
+    re-wipes and re-embeds every group in scope from scratch — wasted work, not a correctness bug.
     ponytail: accepted; revisit only if recreate is ever run against a much larger library.
     """
     if action == "delete":
@@ -243,12 +232,12 @@ def reap_task() -> list[str]:
 
 @celery_app.task(name="tsg.intel_refresh")
 def intel_refresh_task() -> dict[str, str]:
-    """Scheduled pull of the open threat-intel feeds into the Mongo `threat_intel` cache that
-    scenario generation reads for enrichment. Gated by `intel_enabled`.
+    """Scheduled pull of the open threat-intel feeds into the Mongo `threat_intel` cache. Gated
+    by `intel_enabled`.
 
-    DISPATCHER, not a worker: spawns one `tsg.intel_refresh_feed` job per enabled feed and returns
-    {feed: job_id}. Fanning out is what buys per-feed isolation — a slow or broken feed can't
-    delay the others, and each records its own outcome for the per-feed status API."""
+    DISPATCHER, not a worker: one `tsg.intel_refresh_feed` job per enabled feed, returning
+    {feed: job_id}. The fan-out buys per-feed isolation — a slow or broken feed can't delay the
+    others, and each records its own outcome for the per-feed status API."""
     from app.intel.fetchers import enabled_feed_names  # local import, mirrors admin-task style
 
     # This module has no module-level logger; a bare `log` raises NameError on every scheduled run
@@ -279,7 +268,7 @@ def intel_refresh_feed_task(feed: str) -> int:
 
     Deliberately allowed to RAISE (unlike most tasks here) — the retry policy above is the point.
     `refresh_one` records the failure to the feed's status doc BEFORE re-raising, so the outcome
-    survives even if every retry is exhausted and the Celery result later expires."""
+    survives an exhausted retry chain and an expired Celery result."""
     from app.intel.fetchers import refresh_one
 
     return refresh_one(feed)
@@ -297,14 +286,13 @@ def self_check_task() -> list[str]:
 def import_threat_library_task(source: str, file_content: str | None, via_taxii: bool,
                             max_actors: int, dry_run: bool, started_by: str | None = None) -> dict:
     """Background counterpart to app/api/threat_library_import.py: runs the same run_import the
-    CLI script drives, then (real runs only) dispatches the embeddings refresh so newly imported
-    rows become matchable by grounding.
+    CLI script drives, then (real runs only) dispatches the embeddings refresh.
 
-    ORDERING IS LOAD-BEARING: the import commits inside its OWN db_session block FIRST, and the
-    embeddings dispatch happens strictly after that block exits, or the embeddings task's fresh
-    session reads a snapshot without the new rows. It is a SEPARATE job so a late embeddings
-    failure can never roll back a successful import. This task makes no LLM calls, so it carries
-    no autoretry_for; a crash-redelivery is safe because every write path is a natural-key upsert.
+    ORDERING IS LOAD-BEARING: the import commits inside its OWN db_session block first, and the
+    embeddings dispatch happens strictly after that block exits — otherwise the embeddings task's
+    fresh session reads a snapshot without the new rows. A SEPARATE job, so a late embeddings
+    failure can never roll back a successful import. No autoretry_for (no LLM calls); a
+    crash-redelivery is safe because every write path is a natural-key upsert.
 
     ponytail: file_content rides the Redis broker as a plain (size-capped) string — move to a
     shared blob store + a reference argument if much larger bundles are ever needed."""

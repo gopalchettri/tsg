@@ -1,9 +1,5 @@
-"""Data-access layer — the ONE place isolation and concurrency guards live.
-
-Every entity-scoped read/write goes through here so the `EntityID` predicate and the
-active-row rule (`Superseded=0`) can never be forgotten, and the CAS primitives (stage
-claim, `_LOCK`) are written once, correctly.
-"""
+"""Data-access layer: the one place the `EntityID` predicate, the `Superseded=0` active-row rule
+and the CAS primitives (stage claim, `_LOCK`) are written."""
 from __future__ import annotations
 
 import hashlib
@@ -29,24 +25,16 @@ log = get_logger(__name__)
 
 
 def execute_dml(sess: Session, stmt: Executable) -> CursorResult[Any]:
-    """Run a Core INSERT/UPDATE/DELETE, narrowed to `CursorResult` — the only `Result`
-    subclass carrying `.rowcount`/`.inserted_primary_key`, which every CAS below reads.
-    `Session.execute()` can only be annotated `-> Result[Any]` because it also serves ORM
-    queries, so narrow once here instead of casting at each call site.
+    """INSERT/UPDATE/DELETE as `CursorResult` — the only `Result` carrying `.rowcount`.
 
-    `.rowcount` is only a trustworthy CAS signal while no `SET NOCOUNT ON` is in effect and
-    no trigger fires on the target table — either would make it -1 or inflated.
-    """
+    `.rowcount` is a trustworthy CAS signal only without `SET NOCOUNT ON` and without a trigger on
+    the target table; either makes it -1 or inflated."""
     return cast("CursorResult[Any]", sess.execute(stmt))
 
 
 def inserted_pk(res: CursorResult[Any]) -> int:
-    """First column of the primary key of the row just inserted.
-
-    SQLAlchemy never hands back None for a single-row `insert()` against an IDENTITY table,
-    but check anyway: the `upsert_*` callers below run inside an IntegrityError retry, where
-    a bare `NoneType is not subscriptable` would be far harder to trace back here.
-    """
+    """First PK column of the row just inserted. Raises rather than returning None — the `upsert_*`
+    callers run inside an IntegrityError retry where `NoneType is not subscriptable` is untraceable."""
     pk = res.inserted_primary_key
     if pk is None:
         raise RuntimeError("INSERT yielded no primary key (not an IDENTITY table?)")
@@ -54,8 +42,7 @@ def inserted_pk(res: CursorResult[Any]) -> int:
 
 
 def now() -> datetime:
-    """Current UTC timestamp — one clock/timezone convention for every
-    CreatedAt/UpdatedAt/LeaseExpiresAt column."""
+    """Current UTC timestamp — one clock convention for every CreatedAt/UpdatedAt/LeaseExpiresAt."""
     return datetime.now(timezone.utc)
 
 
@@ -64,14 +51,12 @@ _COMB_TS_MASK = (1 << 48) - 1
 
 
 def guid() -> str:
-    """Row-key primitive. SEQUENTIAL (COMB), not uuid4: nine tables have a uniqueidentifier PK,
-    which SQL Server clusters, so a random key page-splits on every insert.
+    """Sequential (COMB) uuid, never uuid4: uniqueidentifier PKs are clustered, so a random key
+    page-splits on every insert.
 
-    The timestamp sits in the LAST 6 bytes because SQL Server orders uniqueidentifier by bytes
-    10-15 first — a UUIDv7 (timestamp in the FIRST bytes) would sort on the random tail and buy
-    nothing. Generated app-side, not via NEWSEQUENTIALID(), because ids are needed before the
-    insert. Valid RFC 9562 UUID (version 8); ~74 random bits remain per millisecond.
-    """
+    Timestamp in the LAST 6 bytes — SQL Server orders uniqueidentifier by bytes 10-15 first, so a
+    UUIDv7 layout would sort on the random tail. App-side, not NEWSEQUENTIALID(), because ids are
+    needed before the insert. Valid RFC 9562 version-8 UUID."""
     b = bytearray(os.urandom(10) + (int(time.time() * 1000) & _COMB_TS_MASK).to_bytes(6, "big"))
     b[6] = (b[6] & 0x0F) | 0x80   # version 8 — custom layout
     b[8] = (b[8] & 0x3F) | 0x80   # RFC 4122/9562 variant
@@ -83,8 +68,7 @@ class SessionConflict(Exception):
     """An active session already exists for this (entity, asset) → 409."""
 
     def __init__(self, active_session_id: str):
-        """Carries the conflicting session's id for the 409 body. Never None: `create_session`
-        raises this only once it has positively identified the active row that beat us."""
+        """Carries the conflicting session's id for the 409 body; never None."""
         self.active_session_id = active_session_id
         super().__init__(active_session_id)
 
@@ -93,23 +77,19 @@ class IdempotencyKeyConflict(Exception):
     """Idempotency-Key reused against a different (entity, asset) → 409."""
 
     def __init__(self, existing_session_id: str):
-        """Carries the session id the reused key was already bound to, so the 409 body can
-        point the caller at the (entity, asset) that actually owns this Idempotency-Key."""
+        """Carries the session id the reused key is already bound to, for the 409 body."""
         self.existing_session_id = existing_session_id
         super().__init__(existing_session_id)
 
 
 class CapacityExceeded(Exception):
-    """Active-session ceiling reached → 503 (soft, deliberately racy — see
-    `count_active_sessions`)."""
+    """Active-session ceiling reached → 503 (soft, deliberately racy)."""
 
 
 class RegenerateConflict(Exception):
-    """Regenerate rejected: not at REVIEW, target lock held, a concurrent regen/accept won the
-    race, or every requested target no longer clears the scoping cutoff on rescoring → 409.
+    """Regenerate rejected: wrong state, lock held, lost race, or no surviving target → 409.
 
-    `reason` is an optional machine-readable code (e.g. "session_completed") surfaced by the
-    HTTP handler as `details.reason`. Raise sites without a stable cause just omit it."""
+    `reason` is an optional machine-readable code surfaced as `details.reason`."""
 
     def __init__(self, message: str, reason: str | None = None):
         super().__init__(message)
@@ -117,8 +97,7 @@ class RegenerateConflict(Exception):
 
 
 class CancelConflict(Exception):
-    """Cancel rejected: the session was already terminal (completed/cancelled by a
-    concurrent writer) when `cancel_session`'s CAS ran → 409."""
+    """Cancel rejected: the session was already terminal when `cancel_session`'s CAS ran → 409."""
 
 
 class EntityForbidden(Exception):
@@ -128,8 +107,7 @@ class EntityForbidden(Exception):
 class NotFoundError(Exception):
     """Requested entity does not exist → 404.
 
-    `details` rides through to the response envelope's `details` key, same as
-    RegenerateConflict.reason. Optional, so every plain NotFoundError("...") is unaffected."""
+    `details` rides through to the response envelope's `details` key."""
 
     def __init__(self, message: str, details: dict | None = None):
         super().__init__(message)
@@ -140,15 +118,8 @@ class NotFoundError(Exception):
 # Object-level authz — asset ownership
 # ---------------------------------------------------------------------------
 def asset_owning_entities(sess: Session, asset_id: Any) -> set[str]:
-    """The group/entity id(s) that own `asset_id`, read off `ctm_scan_entity_bu.group_id` — the
-    direct asset->entity link. An asset can have more than one such row, hence the set return.
-
-    NOT `ctm_scan_entity.tier1_critical_service_id`: that field is unpopulated on every current
-    asset, and context.py only reads it to label the grounding context's `critical_service`.
-
-    Returns an empty set if the asset doesn't exist or has no `ctm_scan_entity_bu` row —
-    callers must treat that as "no proven owner" (deny), never as "open to everyone".
-    """
+    """Entity ids owning `asset_id`, from `ctm_scan_entity_bu.group_id`. An empty set means no
+    proven owner — callers must deny, never read it as "open to everyone"."""
     rows = sess.execute(
         select(m.ctm_scan_entity_bu.group_id)
         .where(m.ctm_scan_entity_bu.ctm_scan_entity_id == asset_id)
@@ -157,10 +128,9 @@ def asset_owning_entities(sess: Session, asset_id: Any) -> set[str]:
 
 
 def assert_asset_owned_by_entity(sess: Session, asset_id: Any, entity_id: Any) -> None:
-    """Deny unless `asset_id` is actually owned by `entity_id`. `require_entity()` only proves
-    the caller may act AS entity_id; without this, any authorized caller could submit someone
-    else's asset_id (a plain IDOR) and pull that asset's context, threats or scenarios.
-    """
+    """Raise EntityForbidden unless `entity_id` owns `asset_id`. `require_entity()` only proves the
+    caller may act AS entity_id, so without this any authorized caller could submit someone else's
+    asset_id — a plain IDOR."""
     if str(entity_id) not in asset_owning_entities(sess, asset_id):
         raise EntityForbidden(f"asset {asset_id} not owned by entity {entity_id}")
 
@@ -169,10 +139,9 @@ def assert_asset_owned_by_entity(sess: Session, asset_id: Any, entity_id: Any) -
 # Sessions (carry EntityID directly — filtered by it)
 # ---------------------------------------------------------------------------
 def active_tuning_overrides(sess: Session) -> dict[str, tuple[float | int, str | None]]:
-    """Active, non-deleted Config_Tuning rows as {key: (typed value, embedding_model)} for
-    core.tuning.resolve_snapshot. A row whose value doesn't parse as its declared ValueType is
-    skipped LOUDLY — a curator typo must degrade to the config default, never brick session
-    creation."""
+    """Active Config_Tuning rows as {key: (typed value, embedding_model)}. A value that doesn't
+    parse as its declared ValueType is skipped loudly — a curator typo must degrade to the config
+    default, never brick session creation."""
     ct = m.Config_Tuning
     out: dict[str, tuple[float | int, str | None]] = {}
     for r in sess.execute(
@@ -190,18 +159,11 @@ def active_tuning_overrides(sess: Session) -> dict[str, tuple[float | int, str |
 
 
 def create_session(sess: Session, values: Mapping[str, Any]) -> str:
-    """Insert a session. Two independent unique indexes can reject the insert:
-    (EntityID, AssetID) WHERE active, and (EntityID, IdempotencyKey) WHERE IdempotencyKey IS
-    NOT NULL. Check the idempotency-key index FIRST when a key was supplied: the two racing
-    requests need not share an AssetID, so re-scoping by (EntityID, AssetID) alone would
-    silently miss a same-key/different-asset winner and return the wrong conflict type with
-    no session id.
+    """Insert a session; raises SessionConflict / IdempotencyKeyConflict on a unique-index clash.
 
-    An IntegrityError attributable to NEITHER index (NOT NULL, FK, truncation) is re-raised
-    untouched — answering `SessionConflict(None)` turns every schema fault into a 409 naming
-    an asset that has no active session. Same fail-loud rule as the `upsert_*` helpers below:
-    only a violation you can positively identify may be absorbed.
-    """
+    Check the (EntityID, IdempotencyKey) index FIRST when a key was supplied — racing requests need
+    not share an AssetID, so scoping by (EntityID, AssetID) alone misses a same-key winner. An
+    IntegrityError attributable to NEITHER index is re-raised untouched."""
     try:
         with sess.begin_nested():  # savepoint so a violation doesn't kill the txn
             sess.execute(insert(m.Scenario_Session).values(**values))
@@ -230,24 +192,15 @@ def create_session(sess: Session, values: Mapping[str, Any]) -> str:
 
 
 def canonical_guid(value: str) -> str:
-    """The one canonical spelling of a client-supplied GUID: exactly what `guid()` mints and
-    what `models.GUID.result_processor` hands back from the DB (lowercase, dashed).
-
-    `models.GUID` normalizes on BOTH bind and result, so SQL comparisons already treat
-    uppercase / dashless / braced / `urn:uuid:` spellings as equal — but a PYTHON-side
-    comparison (a set difference, a dict lookup, a `len(set(...))` count) does not, and
-    silently reports a matched row as missing. Normalize at the boundary, in one place.
-
-    Raises ValueError on a malformed id, so callers can turn it into a 4xx instead of letting
-    it reach `GUID.bind_processor` and surface as a 500."""
+    """Canonical lowercase-dashed spelling of a client GUID; ValueError if malformed. `models.GUID`
+    already normalizes SQL comparisons, but a PYTHON-side set/dict comparison does not, and
+    silently reports a matched row as missing."""
     return str(uuid.UUID(str(value).strip()))
 
 
 def _valid_guid(value: str) -> bool:
-    """A caller-supplied id that isn't UUID-shaped must never reach a WHERE clause on a
-    `uniqueidentifier` column: MSSQL rejects the conversion with a raw pyodbc.ProgrammingError,
-    not a clean empty result. Checked here, once, so every id-keyed lookup 404s, not 500s.
-    """
+    """True if `value` is UUID-shaped. A non-UUID reaching a `uniqueidentifier` WHERE clause makes
+    MSSQL raise pyodbc.ProgrammingError rather than return empty — unchecked ids 500, not 404."""
     try:
         uuid.UUID(str(value))
         return True
@@ -255,8 +208,8 @@ def _valid_guid(value: str) -> bool:
         return False
 
 
-# The columns the HTTP layer actually reads off a session row — the three nvarchar(max) blobs
-# (SubsystemsJSON, SectorIDsJSON, AssetContextJSON) are consumed ONLY by the pipeline.
+# The columns the HTTP layer actually reads off a session row; the nvarchar(max) JSON blobs are
+# consumed ONLY by the pipeline and are deliberately absent.
 _SESSION_BOARD_COLS = (
     m.Scenario_Session.SessionID, m.Scenario_Session.TenantID, m.Scenario_Session.EntityID,
     m.Scenario_Session.UserID, m.Scenario_Session.AssetID, m.Scenario_Session.AssetName,
@@ -266,10 +219,9 @@ _SESSION_BOARD_COLS = (
 
 
 def load_session_board(sess: Session, session_id: str) -> RowMapping | None:
-    """`load_session` for the HTTP layer: the same row, without the three `nvarchar(max)` JSON
-    blobs no route reads. Front door for the status-board poll and SSE connect/reconnect, where
-    selecting the whole table drags the full gathered asset context (tens of KB) across pyodbc
-    on every poll only to discard it. The pipeline keeps using `load_session`; it needs them."""
+    """Session row for the HTTP layer without the nvarchar(max) JSON blobs no route reads — the
+    status-board poll and SSE connect would otherwise drag tens of KB across pyodbc per poll.
+    None on a malformed GUID."""
     if not _valid_guid(session_id):
         return None
     return sess.execute(
@@ -278,9 +230,8 @@ def load_session_board(sess: Session, session_id: str) -> RowMapping | None:
 
 
 def load_session(sess: Session, session_id: str) -> RowMapping | None:
-    """Load a session by id WITHOUT an entity filter — the API then checks the row's EntityID is
-    in the caller's authorized set ([R2] object-level authz). Returns the FULL row including the
-    JSON blobs; HTTP callers want `load_session_board` above instead."""
+    """Full session row by id with NO entity filter; the caller must then check EntityID against
+    its authorized set ([R2]). HTTP callers want `load_session_board` instead."""
     if not _valid_guid(session_id):
         return None
     return sess.execute(
@@ -289,8 +240,7 @@ def load_session(sess: Session, session_id: str) -> RowMapping | None:
 
 
 def get_session(sess: Session, session_id: str, entity_id: str) -> RowMapping | None:
-    """Fetch a session **only within the caller's entity** — the data-layer IDOR
-    guard (INV-1): another entity's session is invisible even with a valid token.
+    """Session row scoped to the caller's entity — the data-layer IDOR guard (INV-1).
     """
     if not _valid_guid(session_id):
         return None
@@ -303,16 +253,11 @@ def get_session(sess: Session, session_id: str, entity_id: str) -> RowMapping | 
 
 
 def complete_session(sess: Session, session_id: str) -> bool:
-    """Accept path: flip to completed/APPROVED — this releases the M4 lock.
+    """Accept path: flip the session to completed/APPROVED/COMPLETE, releasing the M4 lock.
 
-    Stamps StageStatus=COMPLETE too, not just CurrentStage — mirrors cancel_session's terminal
-    StageStatus=CANCELLED, so the board never again reports a completed session as still
-    AWAITING_DECISION (the self-contradictory board `review_gate_reason` used to guard against).
-
-    CAS-fenced on `SessionStatus == active`: returns True iff THIS call made the transition,
-    False if a concurrent writer already ended the session (or the id doesn't exist) — a lost
-    race the caller must surface, never a silent overwrite of what the winner committed.
-    """
+    StageStatus moves too, or the board shows a completed session as still AWAITING_DECISION.
+    CAS-fenced on `SessionStatus == active` — False means a concurrent writer already ended it and
+    the caller must surface the lost race."""
     res = execute_dml(
         sess,
         update(m.Scenario_Session)
@@ -330,13 +275,9 @@ def complete_session(sess: Session, session_id: str) -> bool:
 
 
 def cancel_session(sess: Session, session_id: str) -> bool:
-    """Cancel/reaper path → cancelled (also releases the M4 lock). CurrentStage/StageStatus move
-    to a terminal value too, not just SessionStatus — otherwise the board keeps showing the
-    stale pre-cancel stage forever (e.g. AWAITING_DECISION on a session that's actually dead).
-
-    Same CAS fence as `complete_session`: True iff this call made the transition; False means
-    already terminal, which the caller must treat as a conflict.
-    """
+    """Cancel/reaper path → cancelled/CANCELLED, releasing the M4 lock. CurrentStage/StageStatus
+    move too, or the board shows the stale pre-cancel stage forever. Same CAS fence as
+    `complete_session`: False means already terminal — a conflict."""
     res = execute_dml(
         sess,
         update(m.Scenario_Session)
@@ -352,10 +293,8 @@ def cancel_session(sess: Session, session_id: str) -> bool:
 # Admission control — backpressure + idempotent create
 # ---------------------------------------------------------------------------
 def count_active_sessions(sess: Session) -> int:
-    """Index-only-scan COUNT against the filtered `IX_Session_Active` index. Deliberately racy:
-    a soft backpressure ceiling only needs to protect an already-saturated system, not be exact
-    — unlike the M4 per-asset lock, which IS a correctness invariant and must never be racy.
-    """
+    """Count of active sessions (index-only scan of `IX_Session_Active`). Deliberately racy — a
+    soft backpressure ceiling, unlike the M4 per-asset lock, which is a correctness invariant."""
     return sess.execute(
         select(func.count()).select_from(m.Scenario_Session)
         .where(m.Scenario_Session.SessionStatus == SessionStatus.active)
@@ -363,8 +302,8 @@ def count_active_sessions(sess: Session) -> int:
 
 
 def count_active_sessions_for_entity(sess: Session, entity_id: str) -> int:
-    """Same racy-by-design soft count, scoped to one entity — backs the per-entity cap so one
-    entity looping session creation can't exhaust the global ceiling for everyone else."""
+    """Same racy soft count, scoped to one entity. Currently uncalled: `assert_capacity_available`
+    does both counts in one round trip."""
     return sess.execute(
         select(func.count()).select_from(m.Scenario_Session)
         .where(m.Scenario_Session.SessionStatus == SessionStatus.active,
@@ -373,15 +312,12 @@ def count_active_sessions_for_entity(sess: Session, entity_id: str) -> int:
 
 
 def assert_capacity_available(sess: Session, entity_id: str | None = None) -> None:
-    """Raise CapacityExceeded at/over the global `max_active_sessions` ceiling (0 = disabled),
-    and at/over the per-entity `max_active_sessions_per_entity` (0 = disabled) when `entity_id`
-    is given — without the latter one entity could loop session creation and starve the whole
-    tenant. Checked before the more expensive `gather_asset_details`."""
+    """Raise CapacityExceeded at/over `max_active_sessions` and, with `entity_id`, the per-entity
+    `max_active_sessions_per_entity` (0 disables either). Checked before `gather_asset_details`."""
     global_cap = get_settings().max_active_sessions
     per_entity_cap = get_settings().max_active_sessions_per_entity
     if entity_id and per_entity_cap:
-        # One round trip for both counts (same filtered IX_Session_Active index); the two
-        # standalone counters above stay for their other callers.
+        # One round trip for both counts (same filtered IX_Session_Active index).
         total, entity_total = sess.execute(
             select(
                 func.count(),
@@ -401,15 +337,13 @@ def assert_capacity_available(sess: Session, entity_id: str | None = None) -> No
 def reserve_idempotency_key_or_get_existing(
     sess: Session, entity_id: str, idempotency_key: str, asset_id: str,
 ) -> tuple[str | None, bool, str | None]:
-    """One indexed SELECT against `UX_Session_IdempotencyKey`. Returns:
-    - (None, False, None)             — key unused, caller proceeds to create.
-    - (session_id, False, user_id)    — same key + same asset → return the existing session.
-    - (session_id, True, user_id)     — same key + a DIFFERENT asset → caller raises 409.
-    `user_id` is the EXISTING row's owner, not the current caller's — the key is scoped by
-    (EntityID, key), not by user, so a different caller authorized for the same entity can
-    legitimately hit the replay branch and the response must report who actually owns it.
-    The create-time race past this read is caught by `create_session`'s IntegrityError handler.
-    """
+    """One indexed read of `UX_Session_IdempotencyKey`:
+    - (None, False, None)          — key unused, caller proceeds to create.
+    - (session_id, False, user_id) — same key + same asset → return the existing session.
+    - (session_id, True, user_id)  — same key + DIFFERENT asset → caller raises 409.
+
+    `user_id` is the EXISTING row's owner (the key is scoped by (EntityID, key), not by user). The
+    race past this read is caught by `create_session`'s IntegrityError handler."""
     row = sess.execute(
         select(m.Scenario_Session.SessionID, m.Scenario_Session.AssetID, m.Scenario_Session.UserID)
         .where(m.Scenario_Session.EntityID == entity_id,
@@ -427,20 +361,12 @@ def claim_stage(
     sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel,
     epoch: int, task_id: str,
 ) -> bool:
-    """Atomically claim a work stage for one attempt; True iff this call won the claim.
-    Claimable: `IDLE`/`ERROR`, or a row THIS task left `RUNNING` (a mid-flight retry resumes
-    it), AND `AttemptCount` under `stage_max_attempts`. `COMPLETE`/`AWAITING_DECISION` is NOT
-    re-claimable, so a Celery redelivery of a finished stage is a true no-op, never a
-    destructive re-run. At the attempt cap the row stops being claimable (so stops refreshing
-    its lease) and the reaper sweep + `decide_session_outcome` carry it to a terminal state.
+    """Atomically claim a work stage for one attempt; True iff this call won.
 
-    Paired with `finish_stage`, which fences the exit on this same (epoch, task_id).
-
-    Deliberately does NOT check `_LOCK` ownership, so it stays usable standalone. A caller that
-    must not resume work after losing the `_LOCK` mutex mid-flight needs its own `holds_lock`
-    check (see `write_scenarios`' `require_lock`) — the uncovered case is a zombie claiming a
-    stage on a *sibling* level that carries no epoch/task_id fencing of its own yet.
-    """
+    Claimable: IDLE/ERROR, or a row THIS task left RUNNING (a mid-flight retry resumes), under
+    `stage_max_attempts`. COMPLETE/AWAITING_DECISION is NOT re-claimable, so a redelivery of a
+    finished stage is a true no-op. Paired with `finish_stage`, fenced on the same (epoch,
+    task_id). Does NOT check `_LOCK` ownership — see `write_scenarios`' `require_lock`."""
     s = get_settings()
     _now = now()  # one instant for lease/heartbeat/updated — three now() calls drift apart
     res = execute_dml(
@@ -473,11 +399,9 @@ def claim_stage(
 def stage_attempt_count(
     sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel, epoch: int,
 ) -> int:
-    """AttemptCount as `claim_stage` just left it: `1` is the first successful claim of this
-    epoch (a fresh run), `>1` a resumed/redelivered claim (it resets to 0 on every
-    `reset_stage_for_regen` and increments on EVERY successful claim, resume included).
-    `write_scenarios` gates its once-per-epoch supersede on this, so a Celery retry never
-    re-supersedes rows the failed attempt already committed."""
+    """AttemptCount as `claim_stage` left it: 1 = first claim of this epoch, >1 = a resumed or
+    redelivered claim. `write_scenarios` gates its once-per-epoch supersede on this, so a retry
+    never re-supersedes rows the failed attempt already committed."""
     return sess.execute(
         select(m.Subsystem_Stage_State.AttemptCount).where(
             m.Subsystem_Stage_State.SessionID == session_id,
@@ -489,9 +413,8 @@ def stage_attempt_count(
 
 
 def holds_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
-    """True iff `task_id` currently holds this subsystem's `_LOCK` row (RUNNING, owned by it).
-    A stalled worker whose lease expired has it reclaimed by the reaper out from under it, so
-    check this before resuming multi-step work (see `write_scenarios`'s `require_lock`)."""
+    """True iff `task_id` still holds this subsystem's `_LOCK` row. Check before resuming
+    multi-step work: the reaper reclaims an expired lease out from under a stalled worker."""
     return sess.execute(
         select(1).select_from(m.Subsystem_Stage_State)
         .where(m.Subsystem_Stage_State.SessionID == session_id,
@@ -503,13 +426,12 @@ def holds_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) 
 
 
 def acquire_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
-    """Compare-and-set on the `_LOCK` row — serialises work on one subsystem.
-    Only one caller can flip IDLE→RUNNING; returns True iff we hold it. A lease is
-    set so the reaper can reclaim it if the holder dies.
+    """CAS on the `_LOCK` row (IDLE→RUNNING) serialising work on one subsystem; True iff we hold
+    it. Sets a lease so the reaper can reclaim it if the holder dies.
     """
     s = get_settings()
-    # A lock may only be taken while the owning session is still 'active' — otherwise a
-    # redelivered task (or the reaper) resumes a session that was concurrently cancelled.
+    # Only takeable while the session is still active, or a redelivered task resumes a session
+    # that was concurrently cancelled.
     session_active = (
         select(1)
         .where(m.Scenario_Session.SessionID == session_id,
@@ -535,12 +457,9 @@ def acquire_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str
 
 
 def renew_lock_lease(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
-    """Push the `_LOCK` lease forward for its holder. Best-effort; True iff it landed.
-
-    acquire_lock stamps the lease ONCE, but the work it guards is a whole click — and the variant
-    top-up runs after finish_stage NULLed the stage lease, so stage-level renew_lease cannot cover
-    that window. Without this the reaper reclaims an expired lock and a second writer lands on the
-    subsystem. No epoch here: RUNNING + ActiveTaskID is the whole fence, same as release_lock."""
+    """Push the `_LOCK` lease forward for its holder. Best-effort; True iff it landed. acquire_lock
+    stamps the lease once but the work spans a whole click, so without this the reaper reclaims the
+    lock and a second writer lands on the subsystem. RUNNING + ActiveTaskID is the whole fence."""
     s = get_settings()
     _now = now()
     res = execute_dml(
@@ -559,15 +478,10 @@ def renew_lock_lease(sess: Session, session_id: str, subsystem_id: int, task_id:
 
 
 def release_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
-    """Flip the `_LOCK` row back to IDLE — but ONLY if we still hold it. Returns True iff the
-    release landed; False means the lock was taken from us while we worked.
-
-    Winning `acquire_lock` does NOT prove ownership *later*: a holder that stalls past its
-    lease has the lock reclaimed to IDLE by the reaper and immediately re-taken. An
-    unconditional release would free the NEW owner's lock, putting two writers on one
-    subsystem — the [R5] mutual exclusion this row exists to enforce. Fencing on
-    `ActiveTaskID` makes a stale holder's release a no-op.
-    """
+    """Flip `_LOCK` back to IDLE, fenced on `ActiveTaskID`; True iff the release landed. Winning
+    `acquire_lock` does NOT prove ownership later — a stalled holder has the lock reaped and
+    re-taken, so an unconditional release would free the NEW owner's lock and put two writers on
+    one subsystem, breaking [R5]."""
     res = execute_dml(
         sess,
         update(m.Subsystem_Stage_State)
@@ -578,8 +492,7 @@ def release_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str
             m.Subsystem_Stage_State.Status == StageStatus.RUNNING,
             m.Subsystem_Stage_State.ActiveTaskID == task_id,  # fencing token
         )
-        # Clear the lease too: a released lock holds no lease, so the reaper's "any live
-        # lease?" liveness check never mistakes a freed lock for a running worker.
+        # Clear the lease: a freed lock must not read as a running worker to the reaper.
         .values(Status=StageStatus.IDLE, ActiveTaskID=None, LeaseExpiresAt=None, UpdatedAt=now())
     )
     return res.rowcount == 1
@@ -587,13 +500,9 @@ def release_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str
 
 def renew_lease(sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel,
                 epoch: int, task_id: str) -> bool:
-    """Push a held stage's lease forward — call before a long operation (an LLM call) so a
-    still-alive worker's claim isn't reaped mid-work. `claim_stage` sets the lease once; a stage
-    making several long calls in a row can outlive it under entirely normal latency, not just a
-    crash. Fenced on (epoch, task_id, Status==RUNNING) so a zombie that already lost the claim
-    cannot resurrect it. Best-effort: on False, let `finish_stage`'s fencing catch the lost
-    claim at the end of the work, as it always has.
-    """
+    """Push a held stage's lease forward so a live worker isn't reaped mid-work. Fenced on (epoch,
+    task_id, RUNNING) so a zombie cannot resurrect a lost claim. Best-effort — on False,
+    `finish_stage`'s fencing catches it at the end of the work."""
     s = get_settings()
     _now = now()
     res = execute_dml(
@@ -616,21 +525,11 @@ def finish_stage(
     sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel,
     status: StageStatus, epoch: int, task_id: str, error: str | None = None,
 ) -> bool:
-    """Terminal transition OUT of a stage — the exit half of `claim_stage`'s CAS, fenced on the
-    same (epoch, task_id) identity. Only the worker that still owns THIS generation of the row
-    may record its outcome. Returns True iff the write landed.
+    """Terminal transition out of a stage, fenced on the same (epoch, task_id) as `claim_stage`.
 
-    Unfenced, a stalled worker's late result overwrites whatever replaced it, both observed:
-      * the reaper flips an abandoned RUNNING row to ERROR; the zombie wakes and stamps
-        COMPLETE back over it, so a dead session reports success;
-      * a regeneration resets the row to a fresh claimable IDLE at epoch N+1; the epoch-N
-        zombie stamps AWAITING_DECISION over it, the epoch-N+1 task can then never claim it,
-        and the subsystem serves stale scenarios as though they were the regenerated ones.
-
-    `LeaseExpiresAt` is cleared on the way out: the lease means "someone is RUNNING this right
-    now", so a long-finished row carrying one makes the reaper's `dead_lease` check fire on a
-    session that simply left REVIEW for a routine regeneration.
-    """
+    Unfenced, a stalled worker's late result overwrites whatever replaced it: COMPLETE over the
+    reaper's ERROR, or epoch-N status over the epoch-N+1 IDLE a regen just wrote, leaving the row
+    unclaimable. `LeaseExpiresAt` is cleared so a finished row never trips the reaper."""
     res = execute_dml(
         sess,
         update(m.Subsystem_Stage_State)
@@ -650,15 +549,9 @@ def finish_stage(
 def stage_completed_at_epoch_or_newer(
     sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel, epoch: int,
 ) -> bool:
-    """True iff this subsystem's `level` stage row is COMPLETE at GenerationEpoch >= `epoch`.
-    run_next_set skips re-running the additive reset+find_threats only when it actually FINISHED
-    at the reserved epoch — or the row has ADVANCED past it (a stale redelivery; re-entering is a
-    no-op since reset/claim/finish all fence on the exact epoch and match nothing).
-
-    COMPLETE is load-bearing: an epoch-only check also returned True for a row left RUNNING by an
-    attempt that FAILED before finish_stage, so the Celery retry skipped the additive block and
-    THREATS stayed RUNNING, wedging decide_session_outcome until the reaper. Requiring COMPLETE
-    makes the retry re-enter, resume the row it still owns, and drive THREATS terminal."""
+    """True iff this `level` row is COMPLETE at GenerationEpoch >= `epoch` — run_next_set's test for
+    "the additive block already finished". COMPLETE is load-bearing: an epoch-only check also passes
+    for a row left RUNNING by a failed attempt, wedging decide_session_outcome until the reaper."""
     live = sess.execute(
         select(m.Subsystem_Stage_State.GenerationEpoch).where(
             m.Subsystem_Stage_State.SessionID == session_id,
@@ -673,10 +566,9 @@ def stage_completed_at_epoch_or_newer(
 def stage_settled_at_epoch(
     sess: Session, session_id: str, subsystem_id: int, level: SubsystemLevel, epoch: int,
 ) -> bool:
-    """True iff this subsystem's `level` stage row is at `epoch` and already terminal-reviewable
-    (AWAITING_DECISION or COMPLETE). Lets run_next_set / run_regeneration tell an idempotent
-    redelivery of an already-landed batch apart from a genuine lost claim — the former must fall
-    through to decide_session_outcome, NOT raise and fire a spurious error SSE."""
+    """True iff this `level` row is at `epoch` and already AWAITING_DECISION or COMPLETE. Lets
+    run_next_set / run_regeneration tell a redelivery of a landed batch from a genuine lost claim —
+    the former must fall through, not fire a spurious error SSE."""
     return sess.execute(
         select(1).select_from(m.Subsystem_Stage_State).where(
             m.Subsystem_Stage_State.SessionID == session_id,
@@ -690,8 +582,7 @@ def stage_settled_at_epoch(
 
 def stage_rows(sess: Session, session_id: str) -> list[RowMapping]:
     """Per-subsystem stage rows for the status board (§6.1), excluding `_LOCK`. `ErrorMessage`
-    rides along because an AWAITING_DECISION row revived by the salvage path keeps its message
-    as the "this review set may be partial" marker (see revive_errored_scenarios_to_review)."""
+    rides along: on a revived AWAITING_DECISION row it is the "review set may be partial" marker."""
     return list(
         sess.execute(
             select(
@@ -710,9 +601,8 @@ def stage_rows(sess: Session, session_id: str) -> list[RowMapping]:
 def subsystem_ids_at_level(
     sess: Session, session_id: str, level: SubsystemLevel, status: StageStatus | None = None,
 ) -> list[int]:
-    """Every SubsystemID for this session at a given Subsystem_Stage_State Level,
-    optionally narrowed to a specific Status (e.g. accept's REVIEW-barrier check:
-    which subsystems are `_LOCK`ed, or which reached `SCENARIOS`/`AWAITING_DECISION`)."""
+    """Every SubsystemID for this session at a given Subsystem_Stage_State Level, optionally
+    narrowed to one Status."""
     where = [m.Subsystem_Stage_State.SessionID == session_id, m.Subsystem_Stage_State.Level == level]
     if status is not None:
         where.append(m.Subsystem_Stage_State.Status == status)
@@ -720,10 +610,8 @@ def subsystem_ids_at_level(
 
 
 def subsystem_has_pending_work(sess: Session, session_id: str, subsystem_id: int) -> bool:
-    """True iff any non-_LOCK stage for this subsystem is IDLE or RUNNING — genuinely unstarted
-    or resumable. False means every stage is already terminal, i.e. a redelivery is re-confirming
-    finished work. Gates the one-time `subsystem_advanced` signal so a redelivery doesn't
-    re-announce work nothing is about to happen to."""
+    """True iff any non-_LOCK stage for this subsystem is IDLE or RUNNING. Gates the one-time
+    `subsystem_advanced` signal so a redelivery doesn't re-announce finished work."""
     return sess.execute(
         select(1).where(
             m.Subsystem_Stage_State.SessionID == session_id,
@@ -738,8 +626,8 @@ def subsystem_has_pending_work(sess: Session, session_id: str, subsystem_id: int
 # Regeneration (per-(subsystem, level) generation epoch bump
 # ---------------------------------------------------------------------------
 def next_epoch(sess: Session, session_id: str, subsystem_id: int, levels: tuple) -> int:
-    """max(GenerationEpoch) over ONLY the levels touched in this regen hop, +1. Narrower than a
-    subsystem-wide max on purpose: regenerating SCENARIOS must not bump THREATS' epoch."""
+    """max(GenerationEpoch) over ONLY the levels in this regen hop, +1 — regenerating SCENARIOS
+    must not bump THREATS' epoch."""
     current = sess.execute(
         select(func.max(m.Subsystem_Stage_State.GenerationEpoch)).where(
             m.Subsystem_Stage_State.SessionID == session_id,
@@ -751,19 +639,17 @@ def next_epoch(sess: Session, session_id: str, subsystem_id: int, levels: tuple)
 
 
 def reset_stage_for_regen(sess: Session, session_id: str, subsystem_id: int, levels: tuple, new_epoch: int) -> None:
-    """Reset the target level(s) to a fresh, claimable IDLE row at `new_epoch` so `claim_stage`'s
-    `GenerationEpoch == epoch` CAS matches. Also zeroes `AttemptCount` and clears `ErrorMessage`:
-    otherwise a subsystem that exhausted its attempt budget under the OLD epoch stays permanently
-    unclaimable under the new one too — a regenerated subsystem born poisoned."""
+    """Reset the target level(s) to a claimable IDLE row at `new_epoch` so `claim_stage`'s epoch
+    CAS matches. Zeroes AttemptCount and clears ErrorMessage, or a subsystem that exhausted its
+    attempt budget under the old epoch stays unclaimable under the new one."""
     sess.execute(
         update(m.Subsystem_Stage_State)
         .where(
             m.Subsystem_Stage_State.SessionID == session_id,
             m.Subsystem_Stage_State.SubsystemID == subsystem_id,
             m.Subsystem_Stage_State.Level.in_(levels),
-            # Epoch fence: only ever move a row FORWARD, so a STALE in-task reset (a redelivery
-            # whose reserved epoch is behind the live one) is a no-op instead of downgrading the
-            # row and inverting the epoch lineage. A live endpoint reset always passes (max+1).
+            # Epoch fence: only ever move a row FORWARD, so a stale in-task reset is a no-op
+            # instead of downgrading the row and inverting the epoch lineage.
             m.Subsystem_Stage_State.GenerationEpoch < new_epoch,
         )
         .values(GenerationEpoch=new_epoch, Status=StageStatus.IDLE, AttemptCount=0,
@@ -773,9 +659,8 @@ def reset_stage_for_regen(sess: Session, session_id: str, subsystem_id: int, lev
 
 def active_threats(sess: Session, session_id: str, subsystem_id: int) -> list[dict]:
     """Active threats for a subsystem, shaped for `scoping.score_threats` AND `write_scenarios`'s
-    per-threat prompt enrichment (scenario-granularity regen needs the full sibling list to rank
-    the target correctly, even though only ONE row is rewritten). Same dict shape `find_threats`
-    returns, so `write_scenarios` consumes both sources identically."""
+    prompt enrichment — regen needs the full sibling list to rank the target even though only ONE
+    row is rewritten. Same dict shape `find_threats` returns, so both sources are consumed alike."""
     # Lazy import: app.db.dal sits below app.pipeline and takes no load-time dependency on it.
     from app.pipeline.grounding import stored_actors
     return [
@@ -806,11 +691,9 @@ def active_threats(sess: Session, session_id: str, subsystem_id: int) -> list[di
 
 
 def threat_scores(sess: Session, session_id: str) -> dict[str, dict]:
-    """Best relevance score/rank per threat for one session, in ONE grouped round trip.
-    NEVER a join from the threat select: a threat has MANY active scoped rows (one per
-    variant), so a join returns the same threat once per variant. The aggregates only
-    COLLAPSE identical cloned rows (variants clone the primary's Score/ScopeRank) into one —
-    they are not choosing between differing values."""
+    """Best score/rank per threat for one session, in ONE grouped round trip. NEVER a join from the
+    threat select: a threat has MANY active scoped rows (one per variant), so a join returns it once
+    per variant. The aggregates only COLLAPSE identical cloned rows, never choose between values."""
     st = m.Scoped_Threat
     return {
         r["ThreatID"]: {"score": r["Score"], "scope_rank": r["ScopeRank"]}
@@ -824,10 +707,9 @@ def threat_scores(sess: Session, session_id: str) -> dict[str, dict]:
 
 
 def has_active_scenarios(sess: Session, session_id: str) -> bool:
-    """True iff the session has any active (Superseded=0) Threat_Scenario_Output row.
-    decide_session_outcome uses it to keep a session whose stage ERROR'd but whose earlier
-    batches left salvageable scenarios in REVIEW instead of cancelling — a transient failure
-    must never destroy already-committed, reviewable work."""
+    """True iff the session has any active (Superseded=0) scenario row. decide_session_outcome uses
+    it to keep an ERROR'd session with salvageable earlier batches in REVIEW instead of cancelling —
+    a transient failure must never destroy already-committed, reviewable work."""
     return sess.execute(
         select(1).select_from(m.Threat_Scenario_Output).where(
             m.Threat_Scenario_Output.SessionID == session_id,
@@ -840,15 +722,13 @@ def has_active_scenarios(sess: Session, session_id: str) -> bool:
 
 
 def revive_errored_scenarios_to_review(sess: Session, session_id: str) -> int:
-    """Restore the board invariant "session at REVIEW/AWAITING_DECISION => >=1 subsystem SCENARIOS
-    row at AWAITING_DECISION". decide_session_outcome's salvage branch moves the SESSION row to
-    REVIEW but leaves the per-subsystem SCENARIOS row ERROR — so accept's good_subs comes back
-    empty, mark_scenarios_accepted matches 0 rows, and the session completes having accepted
-    nothing (silent data loss). Flips the ERRORed row (in place, at its current epoch) of every
-    subsystem that still has an active scenario. Returns the number of rows revived.
+    """Restore the invariant "session at REVIEW => >=1 subsystem SCENARIOS row at
+    AWAITING_DECISION". The salvage branch moves the SESSION to REVIEW but leaves the subsystem row
+    ERROR, so accept's good_subs is empty and the session completes having accepted nothing (silent
+    data loss). Flips the ERRORed row, in place at its current epoch, for every subsystem with an
+    active scenario. Returns rows revived.
 
-    `ErrorMessage` is deliberately PRESERVED: it is the only durable marker telling a reviewer
-    this review set may be PARTIAL rather than a complete run."""
+    `ErrorMessage` is PRESERVED — the only durable marker that this review set may be PARTIAL."""
     active_subs = (
         select(m.Threat_Scenario_Output.SubsystemID)
         .where(m.Threat_Scenario_Output.SessionID == session_id,
@@ -894,23 +774,21 @@ def _row_to_dedup_info(row) -> dict:
 
 
 def identity_hash(session_id: str, subsystem_id: int, info: dict) -> str:
-    """The ONE catalogue-level IdentityHash fold: sha256(SessionID|SubsystemID|_dedup_key(info)).
-    Every producer/consumer of Threat_Scenario_Output.IdentityHash routes through here so the
-    app-level dedup and the UX_Scenario_ActiveIdentity index can never disagree. `_dedup_key` is
-    lazy-imported so app.db.dal (below app.pipeline) takes no load-time dependency on it."""
+    """The ONE IdentityHash fold: sha256(SessionID|SubsystemID|_dedup_key(info)). Every producer and
+    consumer routes through here, so app-level dedup and the UX_Scenario_ActiveIdentity index can
+    never disagree. `_dedup_key` is lazy-imported to keep dal below app.pipeline at load time."""
     from app.pipeline.tasks import _dedup_key
     return hashlib.sha256(f"{session_id}|{subsystem_id}|{_dedup_key(info)}".encode()).hexdigest()
 
 
 def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: int, n: int) -> list[str]:
-    """Up to `n` active ThreatIDs for this (session, subsystem) whose catalogue-level dedup
-    identity has NO active scenario yet — the pool "generate next set" serves from before it
-    falls back to a fresh AI batch. Best-first (Score desc, then ThreatID); a threat a fresh
-    additive find_threats added but write_scenarios hasn't scored yet has a NULL score and sorts
-    last (LEFT JOIN), but is still eligible. Identity is folded exactly like the IdentityHash on
-    Threat_Scenario_Output, so "already shown" == an active IdentityHash. Two candidates sharing
-    one identity in this call collapse to the best-ranked, so one call never proposes an
-    internal duplicate."""
+    """Up to `n` active ThreatIDs whose dedup identity has NO active scenario yet — the pool
+    "generate next set" serves from before falling back to a fresh AI batch.
+
+    Best-first (Score desc, then ThreatID); an unscored threat has a NULL score and sorts last
+    (LEFT JOIN) but stays eligible. Identity folds exactly like Threat_Scenario_Output's
+    IdentityHash, so "already shown" == an active IdentityHash. Candidates sharing one identity
+    collapse to the best-ranked, so one call never proposes an internal duplicate."""
     active_hashes = set(sess.execute(
         select(m.Threat_Scenario_Output.IdentityHash).where(
             m.Threat_Scenario_Output.SessionID == session_id,
@@ -961,11 +839,10 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
 
 
 def active_identified_threat_identities(sess: Session, session_id: str, subsystem_id: int) -> set[str]:
-    """The folded catalogue-level identities of this (session, subsystem)'s ACTIVE
-    Identified_Threat rows. find_threats(supersede=False) uses it to skip an additive proposal
-    whose identity already matches a live threat — otherwise a re-proposal leaves a never-scored
-    dead Identified_Threat row (the IdentityHash index would still block the duplicate scenario,
-    but the leaked threat row lingers)."""
+    """Folded identities of this (session, subsystem)'s ACTIVE Identified_Threat rows.
+    find_threats(supersede=False) skips an additive proposal matching one — otherwise a
+    re-proposal leaks a never-scored dead threat row (the index still blocks the duplicate
+    scenario)."""
     identities: set[str] = set()
     for r in sess.execute(
         select(m.Identified_Threat.ThreatID, m.Identified_Threat.ThreatCatalogueID,
@@ -979,15 +856,13 @@ def active_identified_threat_identities(sess: Session, session_id: str, subsyste
 
 
 def active_threat_rules(sess: Session, threat_type_ids: list[int]) -> list[dict]:
-    """Active scoping rules for the given grounded master types ([R12], SDD §5.4) — one query for
-    the whole subsystem, ordered by ThreatRuleID so rule evaluation (and the FactorsJSON it
-    records) is deterministic. Empty input → no query, no rules.
+    """Active scoping rules for the given grounded master types ([R12], SDD §5.4) — one query,
+    ordered by ThreatRuleID so evaluation and the FactorsJSON it records are deterministic.
 
-    The rule's OWN IsActive/IsDeleted is not sufficient: this schema has no foreign keys, so
-    soft-deleting a Threat_Type leaves its Config_Threat_Rule children live and still gating and
-    boosting real generations. The EXISTS re-asserts the parent, which is what an ON DELETE
-    cascade would do. Enforced HERE because this is the single choke point every rule read
-    passes through, so full runs, regen, next-set and the variant top-up are all covered."""
+    The rule's OWN IsActive/IsDeleted is not sufficient: with no foreign keys, soft-deleting a
+    Threat_Type leaves its Config_Threat_Rule children live and still gating real generations. The
+    EXISTS re-asserts the parent, as ON DELETE cascade would. Enforced here because this is the
+    single choke point every rule read passes through."""
     if not threat_type_ids:
         return []
     ct, tt = m.Config_Threat_Rule, m.Threat_Type
@@ -1026,17 +901,14 @@ def active_actor_names(sess: Session) -> list[str]:
 
 
 def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
-    """Accepted, non-superseded scenario rows for one (completed) session, joined to
-    their grounded threat so every row carries the [R13] contract's join ids
-    (ThreatTypeID/ThreatCatalogueID/SubsystemID). One query; ordered for stable output.
-    The joins are by globally-unique GUID keys, so no extra Superseded filter is needed
-    on the joined tables — a completed session's rows are immutable.
+    """Accepted, non-superseded scenarios for one session, joined to their grounded threat so every
+    row carries the [R13] join ids. One ordered query; a completed session's rows are immutable, so
+    the joined tables need no Superseded filter.
 
-    OUTER, not INNER: this schema has no enforced foreign keys, so the ScopedThreatID/ThreatID
-    linkage isn't DB-guaranteed, and accept already flipped Accepted=1 independent of whether
-    this join resolves. An INNER join would silently drop an already-accepted row from this
-    contract while accept's own accepted_count still counted it. Worst case with OUTER is null
-    threat_* columns, never a vanished row."""
+    OUTER, not INNER: with no enforced foreign keys the ScopedThreatID/ThreatID linkage isn't
+    guaranteed, and accept flipped Accepted=1 regardless. INNER would silently drop an
+    already-accepted row while accept's own count still included it. Worst case is null threat_*
+    columns, never a vanished row."""
     out, st, it = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
     return [dict(r) for r in sess.execute(
         select(out.OutputID, out.SubsystemID, out.ScopedThreatID, out.ScenarioJSON,
@@ -1075,18 +947,15 @@ def _scenario_read_select():
 def scenario_rows(sess: Session, *, entity_ids: set[str], user_id: str | None = None,
                 status: str | None = None, include_superseded: bool = False,
                 limit: int = 100, offset: int = 0) -> list[dict]:
-    """Cross-session scenario list for GET /v1/users/{user_id}/scenarios and
-    GET /v1/entities/{entity_id}/scenarios.
+    """Cross-session scenario list for the users/ and entities/ scenario routes.
 
-    `entity_ids` is ALWAYS applied and must already be authorized by the caller (the
-    principal's entity set, or one require_entity'd id) — it is the object-level authz
-    boundary, checked against Scenario_Session.EntityID (NOT NULL), never the nullable
-    denormalized copy on the output row. Same reasoning for `user_id`: the session's
-    UserID is the accountable owner; the output copy is provenance.
+    `entity_ids` is ALWAYS applied and must already be authorized by the caller — it is the
+    object-level authz boundary, checked against Scenario_Session.EntityID (NOT NULL), never the
+    nullable copy on the output row. Same for `user_id`: the session's UserID is the accountable
+    owner, the output copy is provenance.
 
-    `status`: 'accepted' filters the scenario flag; 'active'/'completed'/'cancelled'
-    filter the parent session's status. Failure cards (Status='error') never appear —
-    they have no narrative. Newest first, OutputID tiebreak for stable pages."""
+    `status`: 'accepted' filters the scenario flag, the others filter the parent session. Failure
+    cards never appear — they have no narrative. Newest first, OutputID tiebreak."""
     out, ss = m.Threat_Scenario_Output, m.Scenario_Session
     stmt = _scenario_read_select().where(
         ss.EntityID.in_({str(e) for e in entity_ids}),
@@ -1108,11 +977,9 @@ def scenario_rows(sess: Session, *, entity_ids: set[str], user_id: str | None = 
 
 
 def scenario_row(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
-    """One output row for GET /v1/sessions/{session_id}/scenarios/{output_id}. The caller
-    has already authorized the session; the SessionID predicate makes an OutputID from
-    another session 404 rather than leak. No Superseded/Status filter — an explicit-id
-    fetch returns the row with its flags visible. None on a malformed GUID (→ 404, not a
-    MSSQL 500 — see _valid_guid)."""
+    """One output row by id. The SessionID predicate makes an OutputID from another session 404
+    rather than leak. No Superseded/Status filter — an explicit-id fetch returns the row with its
+    flags visible. None on a malformed GUID (→ 404, not a MSSQL 500 — see _valid_guid)."""
     if not _valid_guid(output_id):
         return None
     out = m.Threat_Scenario_Output
@@ -1124,18 +991,14 @@ def scenario_row(sess: Session, session_id: str, output_id: str) -> RowMapping |
 def mark_scenarios_accepted(
     sess: Session, session_id: str, subsystem_ids: list[int], subset: list[str] | None = None,
 ) -> int:
-    """Sets Accepted=1 on every non-superseded scenario for these subsystems (accept, §5.7),
-    optionally narrowed to `subset` OutputIDs ([R8] partial accept — `subset=[]` means
-    "accept none", distinct from `subset=None` meaning "accept all").
+    """Accepted=1 on every non-superseded scenario for these subsystems (§5.7), optionally narrowed
+    to `subset` OutputIDs — `subset=[]` means "accept none", `subset=None` means "accept all".
 
-    Also stamps `AcceptedSubsetJSON` with the exact `subset` list on every row this call
-    touches, but ONLY for a partial accept (`subset is not None`) — NULL on a full accept, so
-    "non-NULL" means precisely "this row was part of an explicit partial pick", and a reviewer
-    can see which selection accepted a given row without joining Scenario_Audit.
+    Stamps `AcceptedSubsetJSON` only for a partial accept, so non-NULL means precisely "part of an
+    explicit partial pick" and a reviewer needs no Scenario_Audit join.
 
-    Returns the number of rows actually flipped, so the caller can tell "N requested, N matched"
-    apart from "N requested, M<N matched" instead of reporting a clean accept either way (a
-    subset id for a wrong/superseded/nonexistent row otherwise vanishes silently)."""
+    Returns rows actually flipped, so the caller can tell "N requested, M<N matched" from a clean
+    accept — otherwise a subset id naming a wrong/superseded row vanishes silently."""
     where = [m.Threat_Scenario_Output.SessionID == session_id, m.Threat_Scenario_Output.Superseded == 0,
             m.Threat_Scenario_Output.SubsystemID.in_(subsystem_ids),
             # complete only: a FAILURE CARD (null scenario) must never be marked Accepted — it
@@ -1153,17 +1016,15 @@ def mark_scenarios_accepted(
 def unacceptable_subset_reasons(
     sess: Session, session_id: str, subset: list[str], subsystem_ids: list[int],
 ) -> dict[str, str]:
-    """Why each requested OutputID could not be accepted — one code per id that mark_scenarios_
-    accepted would reject, mirroring its four predicates. Ids it WOULD accept are absent.
+    """Why each requested OutputID could not be accepted — one code per id mark_scenarios_accepted
+    would reject, mirroring its four predicates. Accepted ids are absent.
 
-    FAILURE-PATH DIAGNOSTIC. Only worth running once the caller already knows the counts
-    disagree, because that request is about to 404 and roll back anyway; on the happy path it
-    would be a second read of rows just written, for nobody.
+    FAILURE-PATH ONLY: run it once the counts already disagree, since that request is about to 404
+    and roll back anyway.
 
-    `SessionID == session_id` is a TENANT BOUNDARY, not an optimisation. The caller was
-    authorized for ONE session, so an id from elsewhere must come back `unknown` — reporting
-    "exists, wrong session" would confirm another tenant's row exists from an unauthenticated
-    guess. Same reasoning as the ancestry walk in the results read path."""
+    `SessionID == session_id` is a TENANT BOUNDARY, not an optimisation: an id from elsewhere must
+    come back `unknown`, because "exists, wrong session" would confirm another tenant's row from an
+    unauthenticated guess."""
     out = m.Threat_Scenario_Output
     rows = {str(r["OutputID"]): r for r in sess.execute(
         select(out.OutputID, out.SubsystemID, out.Status, out.Superseded)
@@ -1222,14 +1083,12 @@ def active_scoped_threat_ids(sess: Session, session_id: str, subsystem_id: int, 
 
 
 def threats_with_active_scenario(sess: Session, session_id: str, subsystem_id: int, threat_ids) -> set[str]:
-    """The subset of `threat_ids` that already have an active (Superseded=0)
-    Threat_Scenario_Output, joined via Scoped_Threat.ScopedThreatID — the stable GUID link,
-    resolved even if the scoped row itself was later superseded. write_scenarios keys its
-    next-set cleanup on this, NOT on "has an active scoped row": a genuine REGEN target keeps its
-    active scenario, while a POOL ZOMBIE (a served pool threat that rescored OUT after a
-    mid-session tech_gate/threshold tightening) still has its old active scoped row but NO active
-    scenario, so it lands in the marker set and gets superseded instead of re-served every
-    click."""
+    """Which of `threat_ids` already have an active scenario, joined via ScopedThreatID — the stable
+    GUID link, resolved even if the scoped row was later superseded.
+
+    write_scenarios keys next-set cleanup on this, NOT on "has an active scoped row": a REGEN target
+    keeps its scenario, while a POOL ZOMBIE (rescored out by a mid-session tightening) has the old
+    scoped row but NO scenario, so it gets superseded instead of re-served every click."""
     if not threat_ids:
         return set()
     st, out = m.Scoped_Threat, m.Threat_Scenario_Output
@@ -1266,17 +1125,12 @@ def supersede_by_threats(sess: Session, table, session_id: str, subsystem_id: in
 
 
 def supersede_outputs_for_threats(sess: Session, session_id: str, subsystem_id: int, threat_ids) -> None:
-    """Retire every active Threat_Scenario_Output hanging off these threats' active Scoped_Threat
-    rows.
+    """Retire every active scenario hanging off these threats' active Scoped_Threat rows. Needs a
+    subquery because Threat_Scenario_Output has no ThreatID column.
 
-    Not a sibling of supersede_by_threats: Threat_Scenario_Output has NO ThreatID column — it
-    links through ScopedThreatID — so this has to go through a subquery.
-
-    CALL ORDER IS LOAD-BEARING: run this BEFORE supersede_by_threats(Scoped_Threat, ...). Once the
-    scoped rows are retired the subquery no longer finds them and the outputs are left active but
-    parentless, which is the exact inconsistency this exists to prevent — /results renders such a
-    row in `scenarios[]` (the read select doesn't check the scoped row) while dropping its threat
-    from `threats[]` (that query requires both active)."""
+    CALL ORDER IS LOAD-BEARING: run BEFORE supersede_by_threats(Scoped_Threat, ...). Retire the
+    scoped rows first and the subquery finds nothing, leaving outputs active but parentless —
+    /results then renders the row in `scenarios[]` while dropping its threat from `threats[]`."""
     if not threat_ids:
         return
     scoped = select(m.Scoped_Threat.ScopedThreatID).where(
@@ -1330,22 +1184,17 @@ def supersede_by_scoped_threats(sess: Session, session_id: str, subsystem_id: in
 
 def supersede_by_identity_hashes(sess: Session, session_id: str, subsystem_id: int, identity_hashes,
                                 scenario_number: int) -> dict[str, str]:
-    """Supersede every active Threat_Scenario_Output in this (session, subsystem) whose
-    IdentityHash is in the requested set AND sits at `scenario_number` — one UPDATE, not a loop.
-    `write_scenarios`' regen path clears the colliding active row before inserting the
-    regenerated one so the filtered `UX_Scenario_ActiveIdentity(SessionID, IdentityHash,
-    ScenarioNumber)` index can't collide (regen skips `_select_unique_top_n`, so nothing else
-    guarantees the folded hashes are unique). `scenario_number` is REQUIRED: an identity-wide
-    supersede would retire a sibling scenario while regenerating another.
+    """Supersede active scenarios in this (session, subsystem) whose IdentityHash is in the set AND
+    sit at `scenario_number` — one UPDATE. Regen skips `_select_unique_top_n`, so this is what keeps
+    `UX_Scenario_ActiveIdentity` from colliding. `scenario_number` is REQUIRED: an identity-wide
+    supersede would retire a sibling while regenerating another.
 
-    RETURNS `{IdentityHash: retired OutputID}` so the caller stamps ReplacesOutputID from what
-    was ACTUALLY retired rather than the requested target id — retirement is keyed on
-    (IdentityHash, ScenarioNumber), so a collapsed duplicate target could otherwise be retired
+    RETURNS `{IdentityHash: retired OutputID}` so the caller stamps ReplacesOutputID from what was
+    ACTUALLY retired, not the requested id — a collapsed duplicate target would otherwise be retired
     with nothing pointing at it.
 
-    One statement, not a SELECT then an UPDATE over the identical predicate: RETURNING reports
-    exactly the rows this UPDATE changed, so the answer cannot drift from the write under a
-    concurrent regen the way a separate read could. MSSQL emits OUTPUT, SQLite 3.35+ RETURNING."""
+    One statement, not SELECT-then-UPDATE: RETURNING reports exactly the rows this UPDATE changed,
+    so the answer can't drift under a concurrent regen. MSSQL emits OUTPUT, SQLite 3.35+ RETURNING."""
     if not identity_hashes:
         return {}
     retired = {h: oid for oid, h in sess.execute(
@@ -1383,53 +1232,25 @@ def _entry_ids(scenario_json: str | None, key: str) -> list[int]:
 def variant_eligible_primaries(sess: Session, session_id: str, n: int, *,
                             rows: list, attempt_slack: int,
                             exclude_threat_ids: set[str] | None = None) -> list[dict]:
-    """The "who can get another scenario?" gate, and the only code path that ever assigns a
-    ScenarioNumber > 1. Returns up to `n` work items, best-first by the primary's
-    Scoped_Threat.Score, each: {"threat_id", "identity_hash", "next_number", "score",
-    "scope_rank", "reason", "factors_json"} — the scoped fields cloned from the lowest-numbered
-    COMPLETE scenario's own scoped row so the variant's fresh Scoped_Threat row carries the same
-    scoring provenance without re-running scoping.
+    """Up to `n` variant work items, best-first by the primary's Score — the ONLY path assigning a
+    ScenarioNumber > 1. Scoped fields are cloned from the lowest-numbered COMPLETE scenario's scoped
+    row, so a variant carries the same scoring provenance without re-scoping.
 
-    THIS IS COVERAGE, NOT A CAP. It used to stop at `max_scenarios_per_threat` active rows — a
-    constant that answered "how much analysis does every threat deserve?" with one number for
-    every asset in every sector. A threat is now eligible while it still has an UNCOVERED
-    PLAUSIBLE ENTRY POINT: the supporting systems the model itself judged could credibly carry
-    this threat to the asset, minus the ones a scenario has already been written through. A
-    2-system asset finishes in two scenarios, an 8-system one earns eight, and neither number
-    was chosen by anybody — both fall out of the architecture under analysis.
+    COVERAGE, NOT A CAP: an identity stays eligible while a plausible entry point its primary
+    declared is uncovered, so scenario count falls out of the architecture, not a constant.
 
-    PLAUSIBILITY IS FROZEN AT FIRST DECLARATION — read only from the lowest-numbered COMPLETE
-    scenario, never unioned across later ones. Union-growth livelocks: each round fills one cell
-    and declares a new one, so the uncovered count never reaches zero and the click loops
-    forever, one LLM call per round. Frozen, the target set is fixed when the threat is first
-    written and the uncovered set is monotone non-increasing, which is what makes this terminate.
+    PLAUSIBILITY IS FROZEN at that lowest-numbered scenario, never unioned across later ones —
+    union-growth livelocks (each round fills one cell and declares a new one). Frozen, the uncovered
+    set is monotone non-increasing, which is what makes this terminate. `attempt_slack` bounds the
+    other non-termination (nothing binds the model to the cell it was asked to fill) by stopping at
+    `len(plausible) + attempt_slack` active rows.
 
-    `attempt_slack` bounds the OTHER non-termination: nothing binds the model to the cell it was
-    asked to fill, so it can answer every request with the same entry point and leave a cell open
-    forever. An identity stops at `len(plausible) + attempt_slack` active rows — derived from its
-    own coverage target, not a global constant.
+    FAILS CLOSED when no target is derivable — no plausible entry points, no variants. It must NOT
+    fall back to "every system is plausible": that vocabulary is rebuilt per call from live curator
+    data, so it isn't frozen and would break the monotone property this rests on.
 
-    FAILS CLOSED when no target is derivable. An identity whose primary declares no plausible
-    entry points — a scenario written before coverage existed, or one where the model honestly
-    answered "none evidenced" — earns no further variants. It must NOT fall back to "every system
-    in the session is plausible": that hands the DEEPEST analysis to the threats with the LEAST
-    evidence, and because a vocabulary is rebuilt per call from live curator data it is not
-    frozen, so adding a supporting system mid-session would grow an already-open target and break
-    the monotone-non-increasing property this whole gate rests on.
-
-    `rows` comes from active_scenario_rows — the caller's single read, shared with sibling and
-    cross-threat steering. Passed in rather than fetched here so one click reads the table once.
-
-    Eligible = an identity with at least one active COMPLETE scenario (a threat whose only active
-    row is a failure card gets no variant — no sibling text to steer against, and failure
-    recovery is regenerate's job), AND an uncovered plausible entry point, AND still under its
-    attempts bound. Row counts include error cards, so scenario numbers can never collide.
-
-    `exclude_threat_ids` drops threats the CALLER just served in this same click: eligibility has
-    no recency fence and the sort is best-score-first, so a caller topping up a short batch would
-    otherwise re-pick the very primaries it committed seconds earlier. Applied in the fold BELOW,
-    before sort/[:n], so an exclusion frees its slot for the next-best threat instead of silently
-    shrinking the batch."""
+    Row counts include error cards, so scenario numbers never collide. `exclude_threat_ids` is
+    applied before sort/[:n], so an exclusion frees its slot instead of shrinking the batch."""
     by_hash: dict[str, list] = {}
     for r in rows:
         by_hash.setdefault(r.IdentityHash, []).append(r)
@@ -1439,9 +1260,8 @@ def variant_eligible_primaries(sess: Session, session_id: str, n: int, *,
         if not complete:
             continue
         primary = min(complete, key=lambda r: r.ScenarioNumber)
-        # FROZEN: every scenario of an identity carries the SAME declaration, because
-        # tasks._ground_entry_points copies the primary's forward onto each new one. Reading the
-        # primary is therefore stable even across a regeneration that replaces it in place.
+        # FROZEN: tasks._ground_entry_points copies the primary's declaration onto every new
+        # scenario, so this read is stable even across a regeneration that replaces it in place.
         plausible = set(_entry_ids(primary.ScenarioJSON, "plausible_entry_point_ids"))
         if not plausible:
             continue  # no coverage target derivable — fail closed, see docstring
@@ -1460,9 +1280,8 @@ def variant_eligible_primaries(sess: Session, session_id: str, n: int, *,
             st.SelectionKind)
         .where(st.ScopedThreatID.in_([sid_ for _, sid_ in candidates.values()]))
     ).all()}
-    # Case-fold: MSSQL hands uniqueidentifier back upper-case while the ORM/SQLite path is
-    # lower-case, so a raw string compare would silently never match and the exclusion would
-    # be a no-op exactly where it matters most (production).
+    # Case-fold: MSSQL returns uniqueidentifier upper-case, the ORM/SQLite path lower-case, so a
+    # raw compare would make the exclusion a silent no-op exactly in production.
     excluded = {str(t).lower() for t in (exclude_threat_ids or ())}
     items = []
     for identity, (next_number, scoped_id) in candidates.items():
@@ -1474,30 +1293,17 @@ def variant_eligible_primaries(sess: Session, session_id: str, n: int, *,
         items.append({"threat_id": sr.ThreatID, "identity_hash": identity, "next_number": next_number,
                     "score": sr.Score, "scope_rank": sr.ScopeRank, "reason": sr.Reason,
                     "factors_json": sr.FactorsJSON,
-                    # cloned like Reason/FactorsJSON — otherwise every variant row would get the
-                    # column default while carrying the primary's prose (prose/enum drift)
+                    # cloned like Reason/FactorsJSON, else the variant gets the column default
+                    # while carrying the primary's prose (prose/enum drift)
                     "selection_kind": sr.SelectionKind})
     items.sort(key=lambda d: (-(d["score"] or 0), str(d["threat_id"])))
     return items[:n]
 
 
 def active_scenario_rows(sess: Session, session_id: str, subsystem_id: int) -> list:
-    """THE read of a session's active scenarios — one query, one projection, every consumer.
-
-    Returns (OutputID, IdentityHash, ScenarioNumber, Status, ScopedThreatID, ScenarioJSON) for
-    every non-superseded row carrying an identity, INCLUDING error cards: coverage counts them
-    toward a threat's attempts, and scenario numbering must never reuse one.
-
-    Deliberately ONE function rather than three narrow ones. Coverage eligibility, sibling
-    steering and cross-threat comparison all want the same rows of the same table under the same
-    (SessionID, SubsystemID, Superseded=0) predicate, and each had grown its own SELECT — three
-    round trips per click, each dragging ScenarioJSON (nvarchar(max), the whole scenario) to read
-    a couple of small fields, each seek followed by a key lookup into a clustered PK that is a
-    random uniqueidentifier. Fetching once and folding in Python costs one round trip and one
-    pass; the active set is bounded by the session's own threats, so it fits in memory easily.
-
-    Callers filter by Status/identity themselves — see tasks._fold_scenario_rows, the single
-    place that fold is written."""
+    """THE read of a session's active scenarios, INCLUDING error cards — coverage counts them and
+    scenario numbers must never be reused. One function, not three: coverage, sibling steering and
+    cross-threat comparison want the same rows, so fetch once and fold in tasks._fold_scenario_rows."""
     out = m.Threat_Scenario_Output
     return list(sess.execute(
         select(out.OutputID, out.IdentityHash, out.ScenarioNumber, out.Status,
@@ -1508,26 +1314,17 @@ def active_scenario_rows(sess: Session, session_id: str, subsystem_id: int) -> l
 
 
 def insert_row(sess: Session, table, values: Mapping[str, Any]) -> None:
-    """Generic single-row insert — no active-row or Superseded handling of its own; callers are
-    expected to `supersede` the prior row first."""
+    """Generic single-row insert; callers must `supersede` the prior active row first."""
     sess.execute(insert(table).values(**values))
 
 
 def audit_row(sess: Session, **cols: Any) -> dict[str, Any]:
     """One Scenario_Audit row with CreatedAt, ActorUserID and ActorType defaulted.
 
-    `ActorUserID` = WHO IS ACCOUNTABLE for this session, not "who typed the command". A caller
-    that knows the acting human passes it; every background row (grounding_summary, stage_error,
-    regeneration_completed, ...) has no human in the call stack and back-fills the session's
-    UserID, so a NULL never reads as missing data rather than "not applicable".
-
-    `ActorType` answers the question that back-fill destroys — "gopal accepted this" vs "the
-    pipeline did this, gopal is answerable" — so it is decided from whether the CALLER named a
-    human, BEFORE the back-fill runs.
-
-    Defaulting HERE, not at the 13 call sites, is the point: a future audit write cannot forget.
-    # ponytail: per-write PK lookup; pass ActorUserID explicitly from an in-hand session dict
-    # if audit volume ever makes it measurable."""
+    `ActorUserID` = WHO IS ACCOUNTABLE: a background row back-fills the session's UserID, so a NULL
+    never reads as missing data. `ActorType` is decided from whether the CALLER named a human,
+    BEFORE that back-fill destroys the signal. Defaulting here means a future write cannot forget.
+    # ponytail: per-write PK lookup; pass ActorUserID explicitly if audit volume ever matters."""
     cols.setdefault("CreatedAt", now())
     # setdefault so an explicit caller value still wins; must run BEFORE the back-fill below.
     cols.setdefault("ActorType", ActorType.user if cols.get("ActorUserID") else ActorType.system)
@@ -1540,23 +1337,15 @@ def audit_row(sess: Session, **cols: Any) -> dict[str, Any]:
 
 
 def append_audit(sess: Session, **cols: Any) -> None:
-    """Append-only audit write for ONE row. Callers accumulating many rows for a single bulk
-    INSERT (accept.py) build them with `audit_row` instead — same defaults, one round trip, and
-    ONE place that decides what an audit row means."""
+    """Append-only audit write for one row. Bulk callers build rows with `audit_row` instead —
+    same defaults, one round trip, one place that decides what an audit row means."""
     sess.execute(insert(m.Scenario_Audit).values(**audit_row(sess, **cols)))
 
 
 def latest_next_set_outcome(sess: Session, session_id: str, subsystem_id: int) -> dict | None:
-    """DetailJSON of the newest `next_set_outcome` audit row for this (session, subsystem), or
-    None if no "generate next set" click has run. Backs SessionProgress.last_next_set.
-
-    Reads THIS event type, never `generation_complete`: one click can write TWO of the latter (the
-    productive batch plus the variant top-up) which only make sense SUMMED, so "the most recent
-    generation_complete" would report the top-up alone and undercount the click. `next_set_outcome`
-    is written exactly once per click precisely so this read is a single row.
-
-    Ordered by CreatedAt then AuditID — the tie-break matters because two rows of one fast click
-    can land inside a single clock tick, and an unordered LIMIT would be non-deterministic."""
+    """DetailJSON of the newest `next_set_outcome` audit row, backing SessionProgress.last_next_set.
+    Never `generation_complete` — one click can write two of those and they only make sense summed.
+    Ordered by CreatedAt then AuditID: two rows of one fast click can share a clock tick."""
     row = sess.execute(
         select(m.Scenario_Audit.DetailJSON)
         .where(m.Scenario_Audit.SessionID == session_id,
@@ -1576,29 +1365,22 @@ def latest_next_set_outcome(sess: Session, session_id: str, subsystem_id: int) -
 
 
 # ---------------------------------------------------------------------------
-# Threat-library promotion — race-safe insert-if-not-exists, guarded by the M2 natural-key
-# UNIQUE indexes. Same savepoint + catch-IntegrityError + select idiom as `create_session`:
-# two concurrent accepts proposing the identical new master lose the DB race deterministically,
-# and the loser gets back the winner's id instead of a crash.
+# Threat-library promotion — race-safe insert-if-not-exists guarded by the M2 natural-key UNIQUE
+# indexes. Same savepoint + catch-IntegrityError + select idiom as `create_session`: the loser of
+# a concurrent promotion gets the winner's id back instead of a crash.
 # ---------------------------------------------------------------------------
 def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector_id: int | None,
                     description: str | None = None, source: str = "ai_auto_promoted",
                     created_by: str | None = None) -> tuple[int, bool]:
-    """Insert-if-not-exists keyed by (ThreatTypeName, ThreatCategoryID, SectorID) —
-    `UX_ThreatType_NaturalKey`. Returns (winning ThreatTypeID, created) — `created` is True only
-    when THIS call inserted the row. accept.py gates actor linking on it: links may seed a type
-    minted in the same accept, never extend a pre-existing (curated) type's approved actor set.
+    """Insert-if-not-exists on `UX_ThreatType_NaturalKey`; returns (winning ThreatTypeID, created).
 
-    `source` records provenance ('ai_auto_promoted' for the accept.py promotion path, a
-    per-library tag from scripts/import_threat_libraries.py); `created_by` is the accountable
-    user id, or an 'auto:<tag>' / 'cli:<user>' literal when a background import had no logged-in
-    caller. Both are FIRST-WRITER: the collision branch below returns the winner untouched, so
-    re-importing never restamps them — and never writes UpdatedAt/UpdatedBy at all, because
-    re-asserting an existing row is not an edit. Only the CRUD endpoints
-    (app/api/library_crud.py) write the Updated* pair."""
-    # Bound to ThreatTypeName's real column width (Unicode(300)) before it reaches the INSERT:
-    # an over-long LLM-derived name raises DataError, NOT the IntegrityError this function
-    # catches, so it would escape uncaught and abort the whole accept-session transaction.
+    `created` is True only when THIS call inserted — accept.py gates actor linking on it, so links
+    may seed a type minted in the same accept but never extend a curated type's actors.
+    `source`/`created_by` are FIRST-WRITER provenance: the collision branch never writes Updated*,
+    because re-asserting a row is not an edit."""
+    # Bound to ThreatTypeName's real column width (Unicode(300)) before the INSERT: an over-long
+    # name raises DataError, NOT the IntegrityError caught here, so it would abort the whole
+    # accept-session transaction.
     name = name[:300]
     try:
         with sess.begin_nested():
@@ -1608,11 +1390,9 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res), True
     except IntegrityError:
-        # BOTH predicates must be NULL-safe. SQL Server's unique index treats NULLs as equal, so
-        # a second promotion of a name whose category never resolved (grounding.find_category
-        # returning None is a documented [R6] path) is a genuine natural-key collision — but
-        # `== NULL` matches nothing, so the recovery lookup returned None and re-raised, aborting
-        # the entire accept-session transaction. sector_pred was already null-safe; this was not.
+        # BOTH predicates must be NULL-safe: SQL Server's unique index treats NULLs as equal, so
+        # a second promotion with an unresolved category IS a natural-key collision — but
+        # `== NULL` matches nothing, and the recovery lookup would re-raise and abort the accept.
         cat_pred = (m.Threat_Type.ThreatCategoryID.is_(None) if category_id is None
                     else m.Threat_Type.ThreatCategoryID == category_id)
         sector_pred = m.Threat_Type.SectorID.is_(None) if sector_id is None else m.Threat_Type.SectorID == sector_id
@@ -1622,20 +1402,17 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector
                 cat_pred, sector_pred,
                 m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
         ).scalar()
-        if winner is None:  # not a natural-key duplicate (NOT NULL / missing IDENTITY /
-            raise           # truncation / other violation) — fail loud, never return a NULL id
+        if winner is None:  # not a natural-key duplicate — fail loud, never return a NULL id
+            raise
         return winner, False
 
 
 def upsert_threat_catalogue(sess: Session, name: str, type_id: int, sector_id: int | None,
                             description: str | None = None, source: str = "ai_auto_promoted",
                             created_by: str | None = None) -> int:
-    """Insert-if-not-exists keyed by (ThreatTypeID, ThreatName, SectorID) —
-    `UX_ThreatCatalogue_NaturalKey`. Returns the winning ThreatCatalogueID either way.
-
-    Same first-writer `source`/`created_by` provenance contract as upsert_threat_type above.
-    Does NOT link the new row into Threat_Catalogue_Category_Map — call link_catalogue_category
-    once you have a category id."""
+    """Insert-if-not-exists on `UX_ThreatCatalogue_NaturalKey`; returns the winning id either way.
+    Same first-writer provenance as upsert_threat_type. Does NOT link into
+    Threat_Catalogue_Category_Map — call link_catalogue_category once you have a category id."""
     # See upsert_threat_type — ThreatName's real column width is Unicode(500).
     name = name[:500]
     try:
@@ -1660,10 +1437,9 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int, sector_id: i
 
 def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promoted",
                         created_by: str | None = None) -> int:
-    """Insert-if-not-exists keyed by (ThreatActorName) — `UX_ThreatActor_NaturalKey`
-    (no sector on this table). Returns the winning ThreatActorID either way.
-
-    Same first-writer `source`/`created_by` provenance contract as upsert_threat_type above."""
+    """Insert-if-not-exists keyed by `UX_ThreatActor_NaturalKey` (ThreatActorName, no sector);
+    returns the winning ThreatActorID either way. Same first-writer provenance as
+    upsert_threat_type."""
     # See upsert_threat_type — ThreatActorName's real column width is Unicode(200).
     name = name[:200]
     try:
@@ -1684,23 +1460,17 @@ def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promote
 
 
 # ---------------------------------------------------------------------------
-# Threat-library master CRUD (app/api/library_crud.py)
-#
-# Generic over the four masters on purpose: create/update/soft-delete are the same four steps
-# every time (write or fetch-or-404, apply, stamp Updated*, let a natural-key clash surface as
-# IntegrityError) and only the column names differ. Four copies would be four places to forget
-# the stamp.
-#
-# These are the ONLY functions that write UpdatedAt/UpdatedBy — the upsert_* family above
-# re-asserts rows rather than editing them, so first-writer provenance stands.
+# Threat-library master CRUD (app/api/library_crud.py) — generic over the four masters because
+# the steps are identical and only column names differ; four copies would be four places to
+# forget the Updated* stamp. These are the ONLY functions that write UpdatedAt/UpdatedBy.
 # ---------------------------------------------------------------------------
 def create_library_row(sess: Session, model, values: dict, user_id: str | None) -> int:
-    """Insert one master row, stamped CreatedAt/CreatedBy. Returns the new PK.
+    """Insert one master row stamped CreatedAt/CreatedBy; returns the new PK.
 
-    Lets IntegrityError escape: only the caller knows which natural key was violated, and with
-    the filtered unique indexes a clash is a real 409, not a retry."""
-    # IsActive first so a caller-supplied value still wins; the rest last so nothing can forge
-    # its own provenance stamp or create a row that is born deleted.
+    IntegrityError escapes: only the caller knows which natural key was violated, and a clash is
+    a real 409, not a retry."""
+    # IsActive first so a caller value still wins; the rest last so nothing can forge its own
+    # provenance stamp or be born deleted.
     res = execute_dml(sess, insert(model).values(
         **{"IsActive": True, **values,
         "IsDeleted": False, "CreatedAt": now(), "CreatedBy": user_id}))
@@ -1721,14 +1491,10 @@ def get_library_row(sess: Session, model, pk_col, pk_value: int, *, include_dele
 
 def update_library_row(sess: Session, model, pk_col, pk_value: int, values: dict,
                     user_id: str | None) -> None:
-    """Partial update of one master row plus the UpdatedAt/UpdatedBy stamp. `values` carries only
-    the fields the caller actually sent, so an omitted field keeps its current value.
-    IntegrityError escapes for the caller to translate (see create_library_row).
-
-    The 404 comes from the UPDATE's own rowcount, not a preceding SELECT: one statement instead
-    of two, and it closes the window where a concurrent soft-delete lands between the check and
-    the write. `IsDeleted == False` in the WHERE makes rowcount 0 mean exactly "no live row with
-    this id" — missing and already-deleted are deliberately the same 404 to a caller."""
+    """Partial update plus the Updated* stamp; omitted fields keep their value. Raises
+    NotFoundError; IntegrityError escapes for the caller to translate. The 404 comes from the
+    UPDATE's own rowcount, not a preceding SELECT — one statement, no window for a concurrent
+    soft-delete. Missing and already-deleted are deliberately the same."""
     res = execute_dml(sess, update(model).where(pk_col == pk_value, model.IsDeleted == False)  # noqa: E712
                     .values(**values, UpdatedAt=now(), UpdatedBy=user_id))
     if not res.rowcount:
@@ -1736,15 +1502,10 @@ def update_library_row(sess: Session, model, pk_col, pk_value: int, values: dict
 
 
 def soft_delete_library_row(sess: Session, model, pk_col, pk_value: int, user_id: str | None) -> None:
-    """IsDeleted=1 plus the same Updated* stamp — which is exactly why there is no DeletedBy
-    column: a delete IS an update, so UpdatedBy already answers "who deleted this".
-
-    Never a hard DELETE. Threat_Type/Threat_Catalogue/Control_Library ids are referenced by rows
-    in completed sessions, so removing one would orphan historical scenarios. The natural-key
-    indexes are filtered on `IsDeleted = 0`, so the freed name/code can be reused.
-
-    Same rowcount-not-SELECT reasoning as update_library_row, which also makes this atomically
-    single-shot: two concurrent deletes cannot both report success."""
+    """IsDeleted=1 plus the same Updated* stamp — a delete IS an update, hence no DeletedBy column.
+    Never a hard DELETE: completed sessions reference these ids. The natural-key indexes are
+    filtered on IsDeleted=0, so the freed name/code is reusable. Same rowcount-not-SELECT reasoning
+    as update_library_row, so two concurrent deletes can't both report success."""
     res = execute_dml(sess, update(model).where(pk_col == pk_value, model.IsDeleted == False)  # noqa: E712
                     .values(IsDeleted=True, UpdatedAt=now(), UpdatedBy=user_id))
     if not res.rowcount:
@@ -1753,15 +1514,10 @@ def soft_delete_library_row(sess: Session, model, pk_col, pk_value: int, user_id
 
 def upsert_threat_rule(sess: Session, threat_type_id: int, rule_type: str, rule_key: str,
                     rule_value: str, weight: float, source: str) -> int:
-    """Insert-if-not-exists keyed by (ThreatTypeID, RuleType, RuleKey, RuleValue) —
-    `UX_ConfigThreatRule_NaturalKey`. Returns the winning ThreatRuleID either way, the same
-    race-safe shape as upsert_threat_type above: the DB's IDENTITY assigns the id (never MAX+1
-    in app code), and a concurrent import or crash-redelivery re-writing the same rule collapses
-    onto the existing row instead of double-counting its weight (scoping._apply_rules sums
-    fired weights).
-
-    `source` lands in CreatedBy (e.g. 'auto:mitre_attack_ics') so auto-written rows are
-    distinguishable from a curator's manual SQL inserts."""
+    """Insert-if-not-exists on `UX_ConfigThreatRule_NaturalKey`; returns the winning id either way.
+    IDENTITY assigns it (never MAX+1 in app code), and a re-import collapses onto the existing row
+    instead of double-counting its weight (scoping._apply_rules sums fired weights). `source` lands
+    in CreatedBy, marking auto-written rules."""
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Config_Threat_Rule).values(
@@ -1785,15 +1541,10 @@ def upsert_threat_rule(sess: Session, threat_type_id: int, rule_type: str, rule_
 
 
 def link_type_actor(sess: Session, type_id: int, actor_id: int) -> bool:
-    """Idempotent link into `ThreatType_ThreatActor_Map` — the composite (ThreatTypeID,
-    ThreatActorID) PRIMARY KEY guards duplicates, so a repeat call is a race-safe no-op. Returns
-    True iff a NEW link row was inserted, so callers can audit real library growth rather than a
-    re-affirmed link.
-
-    The IntegrityError is absorbed only once the link is CONFIRMED present: a bad
-    type_id/actor_id raises an FK/NOT NULL violation through this same branch, and answering
-    False there would report "already linked" for a link that does not exist and never will.
-    """
+    """Idempotent link into `ThreatType_ThreatActor_Map`; True iff a NEW row was inserted, so
+    callers can audit real library growth. The IntegrityError is absorbed only once the link is
+    CONFIRMED present — a bad id raises through the same branch, and answering False would report
+    "already linked" for a link that does not exist."""
     try:
         with sess.begin_nested():
             sess.execute(insert(m.ThreatType_ThreatActor_Map).values(
@@ -1810,10 +1561,9 @@ def link_type_actor(sess: Session, type_id: int, actor_id: int) -> bool:
 
 
 def link_catalogue_category(sess: Session, catalogue_id: int, category_id: int) -> bool:
-    """Idempotent link into `Threat_Catalogue_Category_Map` — same composite-PK-guards-
-    duplicates, race-safe-no-op, fail-loud-on-real-violation contract as `link_type_actor`.
-    Returns True iff a NEW link row was inserted. The map is naturally multi-valued, so a
-    threat that later gains a second category is just a second call, not a schema change."""
+    """Idempotent link into `Threat_Catalogue_Category_Map` — same composite-PK, race-safe-no-op,
+    fail-loud contract as `link_type_actor`; True iff a NEW row was inserted. The map is
+    multi-valued, so a second category is just a second call."""
     try:
         with sess.begin_nested():
             sess.execute(insert(m.Threat_Catalogue_Category_Map).values(
@@ -1830,17 +1580,15 @@ def link_catalogue_category(sess: Session, catalogue_id: int, category_id: int) 
 
 
 # ---------------------------------------------------------------------------
-# Risk Treatment Plan rows (docs/RISK_TREATMENT_PLAN_SDD.md §6). The plan row IS the state —
-# no Subsystem_Stage_State involvement (accepted scenarios live on completed sessions, where
-# acquire_lock refuses to run). All conditional-UPDATE fences live here; treatment.py and
-# api/treatment.py never build their own SQL. Insert goes through the generic insert_row().
+# Risk Treatment Plan rows (docs/RISK_TREATMENT_PLAN_SDD.md §6). The plan row IS the state — no
+# Subsystem_Stage_State involvement, since accepted scenarios live on completed sessions where
+# acquire_lock refuses to run. Every conditional-UPDATE fence lives here; treatment.py and
+# api/treatment.py never build their own SQL.
 # ---------------------------------------------------------------------------
 def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime) -> int:
-    """Retire the scenario's active plan row so a new attempt can be inserted. Matches only
-    rows a re-POST may legitimately replace: finished ones, or a RUNNING claim whose
-    UpdatedAt progress clock stopped before `stale_cutoff` (dead worker / lost enqueue).
-    A FRESH RUNNING row matches nothing — the caller's subsequent insert then hits
-    UX_TreatmentPlan_ActiveOutput and surfaces as 409 generation_in_progress. Returns rowcount."""
+    """Retire the scenario's active plan row so a new attempt can insert; returns rowcount. Matches
+    only replaceable rows: finished, or a RUNNING claim stalled before `stale_cutoff`. A FRESH
+    RUNNING row matches nothing, so the insert hits UX_TreatmentPlan_ActiveOutput → 409."""
     p = m.Risk_Treatment_Plan
     return execute_dml(sess, update(p).where(
         p.OutputID == output_id, p.Superseded == 0,
@@ -1850,12 +1598,9 @@ def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime)
 
 
 def claim_plan(sess: Session, plan_id: str, task_id: str, stale_cutoff: datetime) -> bool:
-    """Worker claim CAS. Admits three cases: unclaimed (ActiveTaskID NULL), a retry/redelivery
-    of the SAME task id (Celery acks_late redelivers with the id unchanged, and autoretry_for
-    re-runs with it too — without this branch every LLMSlotUnavailable retry would no-op and
-    wedge the row), or a stale claim (dead-worker takeover). Same resume posture as
-    claim_stage's own-task branch. False = someone else holds a fresh claim, or the row is
-    finished/superseded — caller logs and returns."""
+    """Worker claim CAS; True iff we hold it. Admits unclaimed, the SAME task id (acks_late and
+    autoretry_for both re-run with it unchanged — without this branch every retry no-ops and wedges
+    the row), or a stale claim. False = someone else holds it, or the row is finished/superseded."""
     p = m.Risk_Treatment_Plan
     return execute_dml(sess, update(p).where(
         p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.RUNNING,
@@ -1864,12 +1609,10 @@ def claim_plan(sess: Session, plan_id: str, task_id: str, stale_cutoff: datetime
 
 
 def touch_plan(sess: Session, plan_id: str) -> None:
-    """Bump the progress clock before each LLM attempt, so treatment_stale_seconds measures
-    "no progress", not wall time — a healthy worker in a long capacity backoff never looks
-    dead. Fenced on (RUNNING, not superseded): a zombie whose row a re-POST already retired
-    must not smudge the retired row's "when did it stop" timestamp — that clock is exactly
-    what a post-mortem reads. ponytail: one UPDATE per attempt, not a heartbeat thread; a
-    single LLM call is the only work between beats."""
+    """Bump the progress clock before each LLM attempt, so treatment_stale_seconds measures "no
+    progress", not wall time. Fenced on (RUNNING, not superseded) — a zombie must not smudge a
+    retired row's stop timestamp, which is what a post-mortem reads.
+    # ponytail: one UPDATE per attempt, not a heartbeat thread."""
     p = m.Risk_Treatment_Plan
     execute_dml(sess, update(p).where(
         p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.RUNNING,
@@ -1879,9 +1622,9 @@ def touch_plan(sess: Session, plan_id: str) -> None:
 def finish_plan(sess: Session, plan_id: str, *, status: StageStatus,
                 plan_json: str | None = None, validation_json: str | None = None,
                 error_message: str | None = None) -> bool:
-    """Terminal CAS — COMPLETE or ERROR. Fenced on (RUNNING, not superseded): a row a re-POST
-    superseded mid-flight, or that another attempt already finished, matches 0 rows and the
-    caller drops its result with a log line instead of resurrecting a retired plan."""
+    """Terminal CAS to COMPLETE or ERROR. Fenced on (RUNNING, not superseded), so a superseded or
+    already-finished row matches 0 rows and the caller drops its result instead of resurrecting a
+    retired plan."""
     p = m.Risk_Treatment_Plan
     return execute_dml(sess, update(p).where(
         p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.RUNNING,
@@ -1890,15 +1633,9 @@ def finish_plan(sess: Session, plan_id: str, *, status: StageStatus,
 
 
 def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
-    """The scenario's one active plan row for the GET poll endpoint. SessionID predicate keeps
-    a foreign OutputID a 404 rather than a leak (same posture as scenario_row). None on a
-    malformed GUID (→ 404, not an MSSQL 500).
-
-    Explicit columns, NOT the whole table: InputSnapshotJSON is the frozen asset context —
-    tens of KB the poll endpoint never returns — and this is the poll target, hit repeatedly
-    per plan (same rationale as _SESSION_BOARD_COLS vs load_session). ScenarioJSON rides
-    along (1:1 outer join on the output's PK) so the GET can show WHICH scenario the plan
-    treats — same per-row cost the board already pays."""
+    """The scenario's one active plan row for the GET poll, with its scenario JSON alongside. The
+    SessionID predicate keeps a foreign OutputID a 404, not a leak; None on a malformed GUID.
+    Explicit columns, NOT the whole table — InputSnapshotJSON is tens of KB this poll never returns."""
     if not _valid_guid(output_id):
         return None
     p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
@@ -1914,11 +1651,10 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
 
 def review_plan(sess: Session, plan_id: str, *, status: str, comment: str | None,
                 reviewer: str | None, reviewed_at: datetime) -> bool:
-    """Record the human adoption decision — CAS fenced on (COMPLETE, not superseded): only a
-    finished, current plan can be adopted; a re-review overwrites (latest decision wins); a
-    regenerated plan is a NEW row, so approval never silently carries across versions.
-    `reviewed_at` comes from the caller so the response can echo the EXACT stored instant
-    (naive UTC, per the wire convention) instead of a second clock read."""
+    """Record the human adoption decision, CAS-fenced on (COMPLETE, not superseded): only a
+    finished, current plan is adoptable, a re-review overwrites, and a regenerated plan is a NEW
+    row so approval never carries across versions. `reviewed_at` comes from the caller so the
+    response echoes the exact stored instant."""
     p = m.Risk_Treatment_Plan
     return execute_dml(sess, update(p).where(
         p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.COMPLETE,
@@ -1927,10 +1663,9 @@ def review_plan(sess: Session, plan_id: str, *, status: str, comment: str | None
 
 
 def session_plan_board(sess: Session, session_id: str) -> list[RowMapping]:
-    """One row per ACCEPTED, non-superseded scenario of the session, LEFT-joined to its
-    active plan (NULL plan columns = never requested). Deliberately excludes PlanJSON — the
-    board is a glance, the single-plan GET is the document (same blob-exclusion rationale as
-    active_plan_row); ScenarioJSON rides along only because the title lives inside it."""
+    """One row per accepted, active scenario of the session, LEFT-joined to its active plan (NULL
+    plan columns = never requested). Excludes PlanJSON — the board is a glance, the single-plan
+    GET is the document; ScenarioJSON rides along only because the title lives inside it."""
     out, p = m.Threat_Scenario_Output, m.Risk_Treatment_Plan
     return sess.execute(
         select(out.OutputID, out.ScenarioJSON,
@@ -1948,19 +1683,13 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
                      status: str | None = None, review_status: str | None = None,
                      risk_level: str | None = None, limit: int = 100,
                      offset: int = 0) -> list[RowMapping]:
-    """The entity-wide remediation register: every active plan across all the entity's
-    sessions, newest first. Filters on Scenario_Session.EntityID — the NOT NULL authz truth,
-    never the nullable denormalized copy (same rule as scenario_rows).
+    """Entity-wide remediation register: every active plan across the entity's sessions, newest
+    first. Filters Scenario_Session.EntityID — the NOT NULL authz truth, never the nullable copy.
 
-    The status filter matches the PRESENTED status, not the stored one: a stale RUNNING row
-    (progress clock stopped before `stale_cutoff`) is projected to ERROR at read time, so it
-    must surface under status=ERROR and stay out of status=RUNNING — the filter and the page
-    the caller renders may never disagree. Branched in SQL rather than post-filtered in
-    Python, which would under-fill limit/offset pages.
-
-    ScenarioTitle is extracted server-side (JSON_VALUE) instead of hauling every row's
-    multi-KB ScenarioJSON blob for one key; malformed JSON yields NULL — the same degrade
-    as the defensive Python parse it replaces."""
+    `status` matches the PRESENTED status: a stale RUNNING row projects to ERROR at read time, so it
+    must surface under status=ERROR and stay out of status=RUNNING. Branched in SQL, not
+    post-filtered in Python, which would under-fill pages. ScenarioTitle comes from JSON_VALUE
+    server-side rather than hauling every multi-KB blob; malformed JSON yields NULL."""
     p, ss, out = m.Risk_Treatment_Plan, m.Scenario_Session, m.Threat_Scenario_Output
     stmt = (
         select(p.PlanID, p.SessionID, p.OutputID, p.Status, p.RiskLevel, p.ReviewStatus,
@@ -1989,8 +1718,8 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
 
 
 def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[RowMapping]:
-    """Every version (active AND superseded) of one scenario's plan, oldest first — the
-    audit trail's version chain. Rows are never deleted, so this IS the complete history."""
+    """Every version (active and superseded) of one scenario's plan, oldest first. Rows are never
+    deleted, so this IS the complete history."""
     if not _valid_guid(output_id):
         return []
     p = m.Risk_Treatment_Plan
@@ -2003,10 +1732,9 @@ def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[Ro
 
 
 def plan_row_by_id(sess: Session, session_id: str, output_id: str, plan_id: str) -> RowMapping | None:
-    """One SPECIFIC version (evidence endpoint) — the session/output predicates keep a
-    foreign plan id a 404 rather than a leak; superseded versions are deliberately readable
-    (that is what an auditor asks for). Explicit columns, NOT the whole table (the
-    active_plan_row rule): PlanJSON and ReviewComment are blobs this endpoint never returns."""
+    """One specific plan version for the evidence endpoint. The session/output predicates keep a
+    foreign plan id a 404 rather than a leak; superseded versions are deliberately readable.
+    Explicit columns — PlanJSON and ReviewComment are blobs this endpoint never returns."""
     if not (_valid_guid(output_id) and _valid_guid(plan_id)):
         return None
     p = m.Risk_Treatment_Plan
@@ -2023,8 +1751,8 @@ _TREATMENT_EVENTS = (
 
 
 def treatment_audit_rows(sess: Session, session_id: str) -> list[RowMapping]:
-    """All treatment-plan audit events of one session, oldest first (trail endpoint filters
-    them to one scenario in Python via DetailJSON — the JSON is opaque to SQL Server here)."""
+    """All treatment-plan audit events of one session, oldest first; the trail endpoint narrows
+    them to one scenario in Python, since DetailJSON is opaque to SQL here."""
     a = m.Scenario_Audit
     return sess.execute(
         select(a.EventType, a.ActorUserID, a.ActorType, a.DetailJSON, a.CreatedAt)
@@ -2036,9 +1764,8 @@ def treatment_audit_rows(sess: Session, session_id: str) -> list[RowMapping]:
 def entity_treatment_audit_rows(sess: Session, entity_id: str, *, since=None, until=None,
                                 actor: str | None = None, limit: int = 200,
                                 offset: int = 0) -> list[RowMapping]:
-    """The entity-wide treatment audit feed (compliance export), newest first. Filters the
-    audit rows' own EntityID — always server-written from the session row at event time,
-    never client-supplied, so it is safe as a filter here."""
+    """The entity-wide treatment audit feed (compliance export), newest first. Filters the audit
+    rows' own EntityID, always server-written from the session row at event time."""
     a = m.Scenario_Audit
     stmt = (
         select(a.SessionID, a.EventType, a.ActorUserID, a.ActorType, a.DetailJSON, a.CreatedAt)
@@ -2055,9 +1782,9 @@ def entity_treatment_audit_rows(sess: Session, entity_id: str, *, since=None, un
 
 
 def prompt_logs_for_plan(sess: Session, plan_id: str) -> list[RowMapping]:
-    """Every AI-call receipt for one plan version, oldest first — joined on
-    Prompt_Log.CorrelationID (stamped by the worker), never by time-window guessing. Rows
-    written before the CorrelationID column simply do not appear (nothing to backfill)."""
+    """Every AI-call receipt for one plan version, oldest first, joined on Prompt_Log.CorrelationID
+    (stamped by the worker), never by time-window guessing. Rows predating that column do not
+    appear."""
     if not _valid_guid(plan_id):
         return []
     pl = m.Prompt_Log

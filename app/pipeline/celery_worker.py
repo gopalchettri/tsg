@@ -1,19 +1,13 @@
-"""Gevent worker bootstrap — the real `-A` target for `celery worker` (NOT `beat`, NOT imported
-by the API or anywhere else).
+"""Gevent worker bootstrap — the `-A` target for `celery worker` only (NOT `beat`, NOT the API).
 
-Patches BEFORE `celery_app` and everything it transitively pulls in (pyodbc, litellm's httpx
-client, redis-py, pymongo). Kept out of `celery_app.py` because that module is shared with
-processes that must NOT be patched: the FastAPI app and `celery beat`, both on asyncio. gevent's
-monkey-patch rewrites `select`/`socket` process-wide, which hangs every request there.
+Patches before `celery_app` and its transitive imports (pyodbc, httpx, redis-py, pymongo). Kept
+out of `celery_app.py`, which the FastAPI app and `celery beat` also import: the patch rewrites
+`select`/`socket` process-wide and hangs every request on asyncio.
 
-A pyodbc query blocking under gevent freezes the WHOLE worker, including the greenlet that would
-release whatever lock it waits on. That is why tasks.py commits immediately after each
-claim_stage succeeds, before the LLM call — leaving the row lock open across the call gave the
-reaper's targeted UPDATE a lock only that greenlet could release.
-
-Residual, deliberate gap: pyodbc is a C extension talking to the ODBC driver manager directly, so
-gevent can NEVER make it cooperative. ponytail: if a genuinely slow query is ever observed to
-stall the worker, mirror local_models.py's `_offload` threadpool pattern in dal.py.
+A blocking pyodbc query freezes the WHOLE worker, including the greenlet holding the lock it
+waits on — hence tasks.py commits immediately after claim_stage, before the LLM call.
+ponytail: pyodbc is a C extension gevent can never make cooperative; if a slow query is ever
+observed to stall the worker, mirror local_models.py's `_offload` threadpool in dal.py.
 """
 from __future__ import annotations
 

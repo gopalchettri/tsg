@@ -1,19 +1,11 @@
-""" this is what runs when a human clicks "Accept" — it locks
-everything down, marks the chosen items as approved, and (if new threats were
-found) adds them to the shared threat library.
+"""The single final review & accept: mark chosen scenarios approved and promote novel threats
+into the shared library.
 
-Single final review & accept.
-
-One transaction (Unit of Work) for the accept decision itself — each `_LOCK`
-acquisition commits immediately (same discipline as tasks.py/cascade.py) so its
-row-level lock isn't held for the rest of the request, but validation, marking
-scenarios accepted, promotion, `complete_session`, and audit writes all commit
-or roll back together. Mutual exclusion with an in-flight regeneration is
-enforced two ways: a **positive state gate** (accept only when the session
-is actually at the REVIEW barrier — which the pipeline reaches only after every
-subsystem finishes) and by **honoring the `_LOCK` CAS** (a held lock aborts the
-accept). It re-validates grounded master ids are still active, then sets
-`Accepted=1` and flips the session to `completed`, releasing the lock.
+One transaction for the decision — validation, marking accepted, promotion, `complete_session`
+and audit commit or roll back together; each `_LOCK` acquisition commits immediately so its row
+lock isn't held for the rest of the request. Mutual exclusion with an in-flight regeneration is
+enforced two ways: a positive state gate (accept only at the REVIEW barrier) and honouring the
+`_LOCK` CAS (a held lock aborts the accept).
 """
 from __future__ import annotations
 
@@ -51,11 +43,8 @@ log = get_logger(__name__)
 
 
 class AcceptConflict(Exception):
-    """Accept attempted off the REVIEW barrier or against a held lock → 409 ([R5]).
-
-    `reason` is an optional machine-readable code (e.g. "session_completed") surfaced by the
-    HTTP handler as `details.reason` — same pattern as dal.SessionConflict's
-    `active_session_id`. Raise sites without a stable cause just omit it."""
+    """Accept attempted off the REVIEW barrier or against a held lock → 409 ([R5]). `reason` is an
+    optional machine-readable code surfaced as `details.reason`; raise sites without one omit it."""
 
     def __init__(self, message: str, reason: str | None = None):
         super().__init__(message)
@@ -78,10 +67,8 @@ _REASON_TEXT = {
 
 def _unacceptable_subset(sess: Session, session_id: str, subset: list[str],
                         good_subs: list[int], *, requested: int, matched: int) -> NotFoundError:
-    """Build the partial-accept 404, naming each id that cannot be accepted and why.
-
-    Returns rather than raises so the call site still reads as `raise ...` — the diagnosis is a
-    one-off read on a request that is already failing, not control flow."""
+    """Build the partial-accept 404, naming each unacceptable id and why. Returns rather than
+    raises so the call site still reads as `raise ...`."""
     reasons = dal.unacceptable_subset_reasons(sess, session_id, subset, good_subs)
     named = list(reasons)[:_NAMED_IN_MESSAGE]
     # Outcome FIRST — "nothing was accepted" is the fact the reader acts on, and burying it
@@ -104,11 +91,9 @@ class MasterInactive(Exception):
 
 def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str | None,
                 subset: list[str] | None = None) -> int:
-    """Run the "Accept" action for a session in one transaction: lock the session's
-    subsystems, re-check the master data is still valid, mark the chosen scenarios
-    accepted, promote any newly-approved threats into the shared library, and mark
-    the session complete. Locks are always released in the `finally` block.
-    """
+    """Accept in one transaction: lock the subsystems, re-check master data is still valid, mark
+    the chosen scenarios accepted, promote novel threats, complete the session. Locks are always
+    released in the `finally`."""
     # Look up the session scoped to this entity; a miss means the caller doesn't
     # own this session (wrong tenant/entity), so treat it as forbidden.
     scenario_session = dal.get_session(sess, session_id, entity_id)
@@ -252,18 +237,14 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
 
 
 def review_gate_reason(scenario_session: RowMapping | dict) -> tuple[str, str] | None:
-    """Why this session cannot take a review action (accept/regenerate) right now, as a
-    (machine_reason, human_message) pair — or None if it is at the REVIEW barrier.
+    """Why this session cannot take a review action right now, as (machine_reason, human_message),
+    or None if it is at the REVIEW barrier.
 
-    Branches on SessionStatus FIRST — the authoritative liveness signal — rather than
-    inferring completed/cancelled from CurrentStage/StageStatus, which are progress history.
-    complete_session and cancel_session both stamp a terminal StageStatus (COMPLETE /
-    CANCELLED respectively), so the two stay in sync today, but SessionStatus remains the
-    single source of truth here: it is what previously caught the case where a completed
-    session still read AWAITING_DECISION and echoing that verbatim produced a
-    self-contradictory message ("not at REVIEW ... status=AWAITING_DECISION") that misled
-    callers into retrying a final decision. Shared by the accept gate (below) and
-    sessions.py's regenerate/next-set gate so the two can never drift apart again."""
+    Branches on SessionStatus FIRST — the authoritative liveness signal — never inferring
+    completed/cancelled from CurrentStage/StageStatus, which are progress history. Echoing those
+    verbatim yields self-contradictory messages ("not at REVIEW ... status=AWAITING_DECISION") that
+    send callers back to retry a final decision. Shared by the accept gate and sessions.py's
+    regenerate/next-set gate so the two cannot drift."""
     if (scenario_session["CurrentStage"] == WorkflowStage.REVIEW
             and scenario_session["StageStatus"] == StageStatus.AWAITING_DECISION):
         return None
@@ -293,10 +274,8 @@ def _ensure_session_ready_to_accept(scenario_session: RowMapping) -> None:
 
 
 def _ensure_threat_data_still_active(sess: Session, session_id: str, good_subs: list[int]) -> None:
-    """Re-check that every Threat_Type / Threat_Catalogue id referenced by this session's
-    threats is still active. Someone could have deactivated one after Stage 2 ran, so we
-    block the accept (raise MasterInactive) rather than accept against stale master data.
-    """
+    """Raise MasterInactive if any Threat_Type / Threat_Catalogue id this session references was
+    deactivated after Stage 2 — better to block than accept against stale master data."""
     rows = sess.execute(
         select(m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatCatalogueID)
         .where(
@@ -337,10 +316,8 @@ def _ensure_threat_data_still_active(sess: Session, session_id: str, good_subs: 
 
 
 def _pick_sector_for_promotion(scenario_session: RowMapping) -> int | None:
-    """Pick which sector a newly-promoted threat type/catalogue entry should be scoped to,
-    based on the session's sector hierarchy JSON. Prefers the parent sector; falls back to
-    the only sector if there's no parent, or None (global) if there's no sector at all.
-    """
+    """Sector for a newly-promoted entry, from the session's sector hierarchy: prefers the parent,
+    falls back to the only sector, else None (global)."""
     raw = scenario_session.get("SectorIDsJSON")
     ids = json.loads(raw) if raw else []
     if len(ids) >= 2:
@@ -353,22 +330,15 @@ def _pick_sector_for_promotion(scenario_session: RowMapping) -> int | None:
 def _link_actors_to_threat_type(sess: Session, type_id: int, actors: list[str], resolved: dict,
                                 created_by: str | None = None,
                                 resolve_only: bool = False) -> list[str]:
-    """Make sure each actor name is a real Threat_Actor row and is linked to this threat
-    type. Returns the actor names that got a brand-new link (used for audit logging), not
-    ones that were already linked.
+    """Link actor names to this threat type; returns only the names that got a BRAND-NEW link, for
+    audit.
 
-    `resolve_only=True` — the AI-promotion posture — links EXISTING active actors but NEVER
-    creates one. The closed actor vocabulary is enforced only in the Stage-1 prompt; on the
-    unverified grounding branch (the only branch that mints new types) actors pass RAW with no
-    server-side membership check, so an upsert here would turn any hallucinated string into a
-    permanent global Threat_Actor row — which immediately enters dal.active_actor_names and
-    therefore every future session's Stage-1 closed list: a self-reinforcing vocabulary-growth
-    loop with no review step. Unresolved names are skipped and logged; POST /threat-actors
-    stays the one deliberate creation path.
-
-    `created_by` is the accountable user for this accept — the same value the audit rows
-    carry, so a row promoted into the shared library names whoever caused it to exist.
-    """
+    `resolve_only=True` — the AI-promotion posture — links EXISTING active actors but NEVER creates
+    one. The closed actor vocabulary lives only in the Stage-1 prompt, and the unverified branch
+    passes actors RAW, so an upsert here would turn any hallucinated string into a permanent global
+    Threat_Actor row — which immediately enters every future session's closed list: a
+    self-reinforcing vocabulary loop with no review step. Unresolved names are skipped and logged;
+    POST /threat-actors stays the one deliberate creation path."""
     newly_linked: list[str] = []
     # `resolved` is a shared memo (actor name -> id, and (type,actor) -> "already linked")
     # so repeated actor names across many threats in this accept don't hit the DB twice.
@@ -397,13 +367,12 @@ def _link_actors_to_threat_type(sess: Session, type_id: int, actors: list[str], 
 
 
 def _extract_actor_names_per_threat(rows: Sequence[RowMapping]) -> tuple[dict[int, list[str]], set[str]]:
-    """Parse each row's stored actor JSON up front — the RAW list, deliberately. Promotion
-    candidates are exactly the UNVERIFIED threats, whose stored blob is always
-    validated=false, so the old validated_actors gate returned [] for every one of them and
-    made the whole actor-linking pass a silent no-op. Trust is enforced downstream instead:
-    _link_actors_to_threat_type(resolve_only=True) links raw names only when they already
-    exist as active Threat_Actor rows and never creates one. Returns the per-threat actor
-    lists plus the union of every actor name seen (for the bulk id lookup)."""
+    """Per-threat actor lists plus the union of all names seen (for the bulk id lookup).
+
+    Reads the RAW list deliberately: promotion candidates are exactly the UNVERIFIED threats, whose
+    stored blob is always validated=false, so a validated_actors gate returns [] for every one and
+    makes actor linking a silent no-op. Trust is enforced downstream by
+    _link_actors_to_threat_type(resolve_only=True)."""
     parsed_actors: dict[int, list[str]] = {}
     all_actor_names: set[str] = set()
     for row in rows:
@@ -419,25 +388,19 @@ def _find_or_create_type_and_catalogue(
     sess: Session, row: RowMapping, sector_id: int | None, resolved: dict,
     created_by: str | None = None,
 ) -> tuple[int, int | None]:
-    """Resolve the Threat_Type id this unverified threat should point at — reusing the verified
-    type match recorded at Stage 2 when present, otherwise creating one under the resolved
-    category — and pass the stored catalogue id straight through.
+    """Resolve the Threat_Type id this unverified threat points at — reusing Stage 2's verified type
+    match when present, else creating one under the resolved category — and pass the stored
+    catalogue id straight through.
 
-    ONLY the TYPE is auto-promoted. The catalogue name is not, and deliberately: prompts.py
-    REQUIRES `name` to embed the asset's own name ('<impact> of <asset name>'), while it FORBIDS
-    asset/product names in `type`. So `ThreatType` is library-shaped by construction and
-    `ThreatName` never is — auto-minting a Threat_Catalogue row from it could only ever park an
-    asset-named sibling next to the generic entry it belongs under ('Unauthorized disclosure of
-    Citizen Personal Information' beside 'Sensitive data exposure'). Every one of the 75 curated
-    catalogue rows is generic idiom; none is asset-named. The proposal instead goes to
-    Threat_Candidate_Review as `pending`, which is where prompts.py always said it belonged
-    ("carries that asset-named name through the existing curator review, where it can be
-    generalized") — that review just never had a writer until now.
+    ONLY the TYPE is auto-promoted. prompts.py REQUIRES `name` to embed the asset's own name and
+    FORBIDS asset names in `type`, so `ThreatType` is library-shaped by construction and
+    `ThreatName` never is: auto-minting a catalogue row from it could only park an asset-named
+    sibling beside the generic entry it belongs under. The proposal goes to Threat_Candidate_Review
+    as `pending` instead.
 
-    Consequence for the caller: `catalogue_id` is now always exactly `row["ThreatCatalogueID"]`,
-    so the no-op check in _add_unverified_threats_to_library can no longer use it to detect that
-    something happened. See the `promoted` split there.
-    """
+    So `catalogue_id` is always exactly `row["ThreatCatalogueID"]` — the caller cannot use it to
+    detect that something happened; see the `promoted` split in
+    _add_unverified_threats_to_library."""
     def _category_id() -> int | None:
         cat_key = ("category", row["ThreatCategory"])
         if cat_key not in resolved:

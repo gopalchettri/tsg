@@ -31,8 +31,7 @@ _probe_lock = threading.Lock()
 
 
 def channel(session_id: str) -> str:
-    """Redis pub/sub channel name for a session — the single naming convention shared
-    by `publish` and `subscribe` so a worker and the SSE endpoint always agree on it."""
+    """The one naming convention `publish` and `subscribe` share, so worker and SSE agree."""
     return f"tsg:sse:{session_id}"
 
 
@@ -54,15 +53,14 @@ def _redis():
 
 
 def publish(session_id: str, event: dict) -> None:
-    """Best-effort SSE publish behind a circuit breaker: a down/slow Redis costs at most one
-    timeout per cooldown window, not one per event. `_probe_lock` extends that to the window
-    BEFORE the first failure — only the lock winner (the prober) pays the timeout; the rest
-    wait for its outcome, then no-op (breaker open) or publish their own event (Redis healthy,
-    so nothing is ever silently dropped while Redis is up).
+    """Best-effort publish behind a circuit breaker: a down Redis costs at most one timeout per
+    cooldown window. `_probe_lock` extends that to the window BEFORE the first failure — only the
+    prober pays the timeout; the rest wait for its outcome, then no-op (breaker open) or publish
+    their own event (Redis healthy, so nothing is dropped while Redis is up).
 
-    Worker-only by design: `_probe_lock` is cooperative only under the gevent worker's
-    monkey-patched threading. Do NOT call this from the asyncio API process — there it is a
-    real OS lock and a contended wait blocks a threadpool thread for the prober's round trip."""
+    WORKER-ONLY: `_probe_lock` is cooperative only under the gevent worker's monkey-patched
+    threading. From the asyncio API process it is a real OS lock and a contended wait blocks a
+    threadpool thread for the prober's whole round trip."""
     global _breaker_until
     if time.monotonic() < _breaker_until:
         return

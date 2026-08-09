@@ -1,11 +1,10 @@
 """Provenance markers for admin-family background jobs (see admin.py for the full rationale).
 
-Every admin job family marks the job ids IT queued; each family's status route answers ONLY for
-its own family's ids, so no status route can surface another task type's result.
+Each family's status route answers ONLY for ids its own family marked, so no status route can
+surface another task type's result.
 
-DEPENDENCY-LIGHT ON PURPOSE (redis + settings + logging only, no FastAPI, no Celery): the
-tsg.import_threat_library worker task also marks the follow-up job it dispatches, so this must
-be importable from app/pipeline/celery_app.py without an api<->pipeline import cycle.
+DEPENDENCY-LIGHT ON PURPOSE (redis + settings + logging only, no FastAPI, no Celery): worker
+tasks in celery_app.py mark jobs too, so this must import without an api<->pipeline cycle.
 """
 from __future__ import annotations
 
