@@ -18,6 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.pipeline import scoping  # noqa: E402
+from app.pipeline.cascade import (NextSetOutcome, _build_regen_audit_detail,  # noqa: E402
+                                _next_set_outcome)
 from app.pipeline.tasks import (_MAX_PROPOSAL_CHARS, _semantic_duplicates,  # noqa: E402
                                 _usable_proposal, asset_agnostic_name, clean_library_name)
 
@@ -217,6 +219,76 @@ def check_score_floor_still_reachable() -> None:
     print("ok  score_threats floor still rejects when it can bite")
 
 
+def check_next_set_outcome_additive_failure_is_retryable() -> None:
+    """A non-slot exception from the additive find_threats call used to be swallowed inside
+    run_next_set with no signal reaching outcome classification, so an already-empty pool plus a
+    failed additive call read as `exhausted` ("nothing further exists", greys the client's retry
+    button) — indistinguishable from a genuine "nothing new exists". cascade.py now forces
+    top_up_failed=True whenever that call raised (run_next_set's `additive_failed`, threaded into
+    _settle_next_set_conflict's `retryable` and the generated branch's top_up_failed). This pins
+    the contract that fix depends on: the SAME made=0/pool_size=0 inputs must flip outcome once
+    that flag is set."""
+    made = variants = pool_size = 0
+    requested = 5
+    assert _next_set_outcome(requested, made, variants, pool_size, top_up_failed=False) == \
+        NextSetOutcome.exhausted  # the bug: what a swallowed additive failure used to report
+    assert _next_set_outcome(requested, made, variants, pool_size, top_up_failed=True) == \
+        NextSetOutcome.partial_retryable  # the fix: additive_failed now forces this path
+    print("ok  _next_set_outcome: additive-failure signal flips exhausted -> partial_retryable")
+
+
+def check_regen_audit_detail_carries_partial_failure_reasons() -> None:
+    """A multi-target regen used to report ONLY what succeeded: _reconcile_targeted_regen computed
+    which excluded targets failed transiently vs. no longer qualify, but discarded both sets once
+    it returned — the audit trail and the client SSE carried no trace of them on a PARTIAL batch
+    (the all-fail batch already reported this correctly; only the partial case leaked it). Pins
+    that _build_regen_audit_detail's DetailJSON now carries both sets when given, and stays an
+    honest empty list — never null, so a consumer never needs a None-check — when it isn't."""
+    import json
+
+    detail = json.loads(_build_regen_audit_detail(
+        {"t1", "t2", "t3"}, ["o1", "o2", "o3"], epoch=5, user_note=None,
+        failed_threat_ids={"t2"}, rescored_threat_ids={"t3"}))
+    assert detail["failed_threat_ids"] == ["t2"], detail
+    assert detail["rescored_threat_ids"] == ["t3"], detail
+
+    bare = json.loads(_build_regen_audit_detail({"t1"}, ["o1"], epoch=1, user_note=None))
+    assert bare["failed_threat_ids"] == [], bare
+    assert bare["rescored_threat_ids"] == [], bare
+    print("ok  _build_regen_audit_detail carries partial-batch failed/rescored ids")
+
+
+def check_present_status_cutoff_is_caller_controlled() -> None:
+    """A board/register with several rows used to call treatment._stale_cutoff() FRESH inside
+    _present_status for every row, so rows evaluated later in the loop judged against a slightly
+    LATER instant than rows evaluated first — and the register additionally computed a second,
+    independent cutoff for its SQL filter, so a row could pass the filter as RUNNING while
+    rendering as ERROR in the same response. _present_status now takes the cutoff as an argument
+    instead of computing it, making it a pure function of its four inputs — this pins that: the
+    SAME (status, updated_at) pair must classify identically regardless of when the CALL happens,
+    only the passed-in cutoff decides it."""
+    from datetime import datetime, timedelta
+
+    from app.api.treatment import _present_status
+    from app.core.enums import StageStatus
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    fresh_updated_at = now - timedelta(seconds=10)
+    old_cutoff = now - timedelta(seconds=5)     # updated_at is BEFORE this -> stale
+    new_cutoff = now - timedelta(seconds=20)    # updated_at is AFTER this -> fresh
+
+    status, _err = _present_status(str(StageStatus.RUNNING), None, fresh_updated_at, old_cutoff)
+    assert status == str(StageStatus.ERROR), status  # stale relative to the caller's own cutoff
+
+    status2, _err2 = _present_status(str(StageStatus.RUNNING), None, fresh_updated_at, new_cutoff)
+    assert status2 == str(StageStatus.RUNNING), status2  # fresh relative to a DIFFERENT cutoff
+
+    # COMPLETE/ERROR rows are never subject to staleness at all, regardless of clock.
+    status3, _err3 = _present_status(str(StageStatus.COMPLETE), None, fresh_updated_at, old_cutoff)
+    assert status3 == str(StageStatus.COMPLETE), status3
+    print("ok  _present_status: staleness decided by the caller's cutoff, not an internal clock")
+
+
 def demo() -> None:
     check_usable_proposal()
     check_semantic_duplicates_same_category()
@@ -229,6 +301,9 @@ def demo() -> None:
     check_semantic_scan_failure_is_not_fatal()
     check_ranking_is_stable_and_meaningful()
     check_score_floor_still_reachable()
+    check_next_set_outcome_additive_failure_is_retryable()
+    check_regen_audit_detail_carries_partial_failure_reasons()
+    check_present_status_cutoff_is_caller_controlled()
     print("\nall pipeline guards pass")
 
 

@@ -973,7 +973,8 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
                             entity_id: str | None, user_id: str | None,
                             pairs: list, scenarios: dict, enriched: dict,
                             epoch: int, task_id: str, *, regen_mode: bool,
-                            failed_ids: set[str] | None = None) -> bool:
+                            failed_ids: set[str] | None = None,
+                            unresolved_targets: dict | None = None) -> bool:
     failed_ids = failed_ids or set()
     generated_ids = {sc.threat_id for sc, scoped_id, _t in pairs if scoped_id in scenarios}
     all_target_ids = {sc.threat_id for sc, _scoped_id, _t in pairs}
@@ -983,6 +984,13 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
     # genuinely rescored out of scope (terminal — gets a Selected=0 marker below). Reporting a
     # provider error as "no longer meets the scoping cutoff" sent support down the wrong path.
     rescored_ids = excluded_ids - failed_ids
+    # Handed back to the caller (run_regeneration) via this out-param — covers BOTH the all-fail
+    # path below (which already reports it via RegenerateConflict) and the PARTIAL-success path
+    # (which used to discard it here entirely: a batch where some targets landed and others didn't
+    # reported success with zero indication of which excluded targets are worth retrying).
+    if unresolved_targets is not None:
+        unresolved_targets["failed_ids"] = failed_ids
+        unresolved_targets["rescored_ids"] = rescored_ids
     if rescored_ids:
         log.warning("regen.target_no_longer_selected", session_id=sid, subsystem=ss,
                     threat_ids=sorted(rescored_ids))
@@ -1166,7 +1174,8 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
                 epoch: int = _EPOCH, target_threat_ids: set[str] | None = None,
                 *, require_lock: bool = False,
                 regen_targets: dict[str, RegenTarget] | None = None,
-                on_before_commit: Callable[[list[Provenance | None]], None] | None = None) -> list[Provenance | None]:
+                on_before_commit: Callable[[list[Provenance | None]], None] | None = None,
+                unresolved_targets: dict | None = None) -> list[Provenance | None]:
 
     sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
     entity_id, user_id = scenario_session["EntityID"], scenario_session.get("UserID")
@@ -1256,7 +1265,8 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     if targeted and not _reconcile_targeted_regen(
             sess, sid, ss, tenant, entity_id, user_id,
             pairs, scenarios, enriched, epoch, task_id,
-            regen_mode=regen_targets is not None, failed_ids=failed_ids):
+            regen_mode=regen_targets is not None, failed_ids=failed_ids,
+            unresolved_targets=unresolved_targets):
         return []
     partial_error = (f"{len(failures)} of {len(failures) + len(provs)} scenario(s) failed to "
                     f"generate: {'; '.join(failures)}") if failures else None

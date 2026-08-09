@@ -6,7 +6,7 @@ it is in the caller's authorized set — a valid token is not enough.
 from __future__ import annotations
 
 import json
-from typing import Literal
+from typing import Literal, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
@@ -31,7 +31,7 @@ from app.db import dal
 from app.db import models as m
 from app.db.dal import EntityForbidden, IdempotencyKeyConflict, RegenerateConflict, now
 from app.db.engine import db_session
-from app.pipeline import cascade
+from app.pipeline import cascade, tasks
 from app.pipeline.accept import accept_session, review_gate_reason
 from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
 from app.core import tuning
@@ -198,7 +198,21 @@ def create_session(
         set_up_progress_tracking(sess, sid, tenant, str(body.entity_id))
         dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant, EntityID=str(body.entity_id),
                         EventType=AuditEventType.session_started, ActorUserID=principal.user_id)
-    enqueue_pipeline(sid)
+    try:
+        enqueue_pipeline(sid)
+    except Exception as exc:  # noqa: BLE001 — broker unreachable must not orphan a committed session
+        # Pattern A (see app/api/treatment.py's request_treatment_plan): the row is already
+        # committed and holding the one-active-session-per-asset slot, so a bare re-raise would
+        # leave it stuck there — unreachable by the client (no session_id in a raw 500) — until
+        # the reaper's stale-grace window elapses. Cancel it now instead; releases the slot
+        # immediately and gives the client a clear signal to retry.
+        with db_session() as sess:
+            dal.cancel_session(sess, sid)
+        log.error("session.enqueue_failed", session_id=sid, error=repr(exc))
+        raise HTTPException(
+            status_code=503,
+            detail=f"session {sid} could not be queued for processing and was cancelled — retry",
+        ) from exc
     return CreateSessionResponse(session_id=sid, user_id=principal.user_id)
 
 
@@ -568,6 +582,33 @@ def _assert_regen_eligible(scenario_session: dict) -> None:
         raise RegenerateConflict(message, reason=reason)
 
 
+def _recover_from_enqueue_failure(session_id: str, subsystem_id: int, epoch: int,
+                                exc: Exception, log_event: str) -> NoReturn:
+    """Shared by _do_next_set/_do_regenerate: Pattern A, main-pipeline flavor (see
+    create_session's docstring-level comment for the treatment-plan original). SCENARIOS was
+    just reset to IDLE and committed by the caller before its broker call failed, so a bare
+    re-raise leaves it there — decide_session_outcome returns None for any IDLE row, wedging the
+    session out of REVIEW until the reaper's stale-grace window elapses.
+
+    claim_stage (not finish_stage directly) is required because reset_stage_for_regen does NOT
+    clear ActiveTaskID, so the row may still carry a prior attempt's stale claim id — a synthetic
+    task_id is fine since nothing else is racing for this exact claim right now.
+
+    Always raises HTTPException; never returns normally."""
+    with db_session() as sess:
+        fail_task_id = dal.guid()
+        if dal.claim_stage(sess, session_id, subsystem_id, SubsystemLevel.SCENARIOS, epoch, fail_task_id):
+            dal.finish_stage(sess, session_id, subsystem_id, SubsystemLevel.SCENARIOS,
+                            StageStatus.ERROR, epoch, fail_task_id,
+                            error="failed to queue generation — request it again")
+        reloaded = dal.load_session(sess, session_id)
+        if reloaded is not None:
+            tasks.decide_session_outcome(sess, dict(reloaded))
+    log.error(log_event, session_id=session_id, subsystem=subsystem_id, error=repr(exc))
+    raise HTTPException(status_code=503,
+                        detail="could not queue the request for processing — retry") from exc
+
+
 def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, granularity: RegenGranularity,
                 target_ids: list[str] | list[int] | None, user_note: str | None) -> RegenerateResponse:
     """Validates eligibility, guards against a concurrent regen/accept via a lock check plus a
@@ -605,7 +646,10 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
         epoch = dal.next_epoch(sess, session_id, subsystem_id, levels)
         dal.reset_stage_for_regen(sess, session_id, subsystem_id, levels, epoch)
 
-    enqueue_regeneration(session_id, subsystem_id, granularity, target_ids, epoch, user_note)
+    try:
+        enqueue_regeneration(session_id, subsystem_id, granularity, target_ids, epoch, user_note)
+    except Exception as exc:  # noqa: BLE001 — broker unreachable must not wedge SCENARIOS at IDLE
+        _recover_from_enqueue_failure(session_id, subsystem_id, epoch, exc, "regen.enqueue_failed")
     # `epoch` goes back to the caller: a 202 only says "accepted", and this is the token that
     # lets a client tell ITS request's completion from a previous one's (see RegenerateResponse).
     return RegenerateResponse(session_id=session_id, user_id=scenario_session["UserID"],
@@ -668,7 +712,10 @@ def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> Re
         dal.reset_stage_for_regen(sess, session_id, subsystem_id, cascade.NEXT_SET_LEVELS, epoch)
         threats_epoch = dal.next_epoch(sess, session_id, subsystem_id, (SubsystemLevel.THREATS,))
 
-    enqueue_next_set(session_id, subsystem_id, epoch, threats_epoch)
+    try:
+        enqueue_next_set(session_id, subsystem_id, epoch, threats_epoch)
+    except Exception as exc:  # noqa: BLE001 — broker unreachable must not wedge SCENARIOS at IDLE
+        _recover_from_enqueue_failure(session_id, subsystem_id, epoch, exc, "next_set.enqueue_failed")
     # The SCENARIOS epoch, not the THREATS one: it is the epoch run_next_set stamps on the
     # next_set_outcome audit row, so `last_next_set.epoch == this` is the client's exact
     # "my click landed" signal. Polling stage status instead cannot distinguish my click from

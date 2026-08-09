@@ -400,7 +400,7 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
             "moderation": {"checked": moderation.checked, "flagged": moderation.flagged,
                            "categories": moderation.categories, "error": moderation.error},
         })
-        if not dal.finish_plan(sess, plan_id, status=StageStatus.COMPLETE,
+        if not dal.finish_plan(sess, plan_id, status=StageStatus.COMPLETE, task_id=task_id,
                                plan_json=json.dumps(parsed), validation_json=validation_json):
             # Superseded mid-flight (a re-POST took over) — drop the result; the new row owns
             # the scenario now. Prompt_Log still records the spend (committed in _ask_ai).
@@ -425,7 +425,7 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
         # Fenced like the success path: if the CAS matched nothing (another delivery already
         # finished the row, or a re-POST superseded it), writing an ERROR audit row would
         # contradict the plan's real state — drop it instead.
-        if dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, error_message=client_msg):
+        if dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=task_id, error_message=client_msg):
             dal.append_audit(sess, AuditID=dal.guid(), **audit_cols,
                              SubsystemID=ASSET_UNIT_ID,
                              EventType=AuditEventType.treatment_plan_outcome,

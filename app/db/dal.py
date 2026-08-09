@@ -1619,15 +1619,22 @@ def touch_plan(sess: Session, plan_id: str) -> None:
     ).values(UpdatedAt=now()))
 
 
-def finish_plan(sess: Session, plan_id: str, *, status: StageStatus,
+def finish_plan(sess: Session, plan_id: str, *, status: StageStatus, task_id: str | None,
                 plan_json: str | None = None, validation_json: str | None = None,
                 error_message: str | None = None) -> bool:
     """Terminal CAS to COMPLETE or ERROR. Fenced on (RUNNING, not superseded), so a superseded or
     already-finished row matches 0 rows and the caller drops its result instead of resurrecting a
-    retired plan."""
+    retired plan. ALSO fenced on ActiveTaskID — a zombie worker's late result must not clobber a
+    claim that has since been taken over (claim_plan's stale-claim branch is what makes a
+    takeover possible). Required, not defaulted: every caller must consciously state who they
+    are, same discipline as claim_stage/finish_stage. `task_id=None` means "only if still
+    unclaimed" (ActiveTaskID IS NULL) — for a freshly-inserted row nothing has claimed yet, or a
+    caller re-asserting a value it just read off the row itself; a real task_id must match
+    exactly."""
     p = m.Risk_Treatment_Plan
     return execute_dml(sess, update(p).where(
         p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.RUNNING,
+        p.ActiveTaskID.is_(None) if task_id is None else p.ActiveTaskID == task_id,
     ).values(Status=status, PlanJSON=plan_json, ValidationJSON=validation_json,
              ErrorMessage=error_message, UpdatedAt=now(), CompletedAt=now())).rowcount == 1
 
@@ -1641,9 +1648,9 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
     p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
     return sess.execute(
         select(p.PlanID, p.SessionID, p.OutputID, p.TenantID, p.EntityID, p.Status,
-               p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON, p.ValidationJSON,
-               p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment, p.ReviewedBy,
-               p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt, out.ScenarioJSON)
+               p.ActiveTaskID, p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
+               p.ValidationJSON, p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment,
+               p.ReviewedBy, p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt, out.ScenarioJSON)
         .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID))
         .where(p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 0)
     ).mappings().first()

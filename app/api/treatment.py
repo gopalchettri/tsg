@@ -140,7 +140,9 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
         enqueue_treatment_plan(plan_id)
     except Exception:
         with db_session() as sess:
-            dal.finish_plan(sess, plan_id, status=StageStatus.ERROR,
+            # task_id=None: nothing has claimed this row yet (inserted with ActiveTaskID=None
+            # above), so only finish it if that's still true.
+            dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=None,
                             error_message="failed to queue generation — request it again")
         log.error("treatment.enqueue_failed", plan_id=plan_id)
         raise
@@ -161,7 +163,8 @@ def get_treatment_plan(session_id: str, output_id: str,
         if row is None:
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
 
-        status, error_message = _present_status(row["Status"], row["ErrorMessage"], row["UpdatedAt"])
+        status, error_message = _present_status(row["Status"], row["ErrorMessage"], row["UpdatedAt"],
+                                                treatment._stale_cutoff())
 
         plan = _safe_json_dict(row["PlanJSON"], row["PlanID"])
         if plan is not None:
@@ -209,14 +212,20 @@ def _naive_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
-def _present_status(status: str, error_message: str | None,
-                    updated_at: datetime | None) -> tuple[str, str | None]:
+def _present_status(status: str, error_message: str | None, updated_at: datetime | None,
+                    stale_cutoff: datetime) -> tuple[str, str | None]:
     """Read-time staleness projection shared by the single-plan GET, the board and the
     register: a RUNNING row whose progress clock stopped past treatment_stale_seconds
     presents as ERROR/timed-out; the stored row is never rewritten (D10 — the next POST
-    supersedes it, and a late finish still lands)."""
+    supersedes it, and a late finish still lands).
+
+    `stale_cutoff` is the CALLER's instant, not recomputed here — `treatment._stale_cutoff()`
+    returns `now() - treatment_stale_seconds` at call time, so calling it fresh per row (the
+    board loops over several) or a second time after an earlier SQL-side filter already used one
+    (the register) drifts the two apart by however long the round trip took. A row can then pass
+    one check and fail the other on the exact same request."""
     if status == str(StageStatus.RUNNING) and updated_at is not None \
-            and _naive_utc(updated_at) < _naive_utc(treatment._stale_cutoff()):
+            and _naive_utc(updated_at) < _naive_utc(stale_cutoff):
         return str(StageStatus.ERROR), _TIMED_OUT_MESSAGE
     return status, error_message
 
@@ -245,12 +254,15 @@ def get_treatment_board(session_id: str,
     with db_session() as sess:
         get_authorized_session(sess, session_id, principal)
         rows = dal.session_plan_board(sess, session_id)
+        # ONE cutoff for the whole board, not one per row (see _present_status) — a board with
+        # several plans must not judge the last row against a later instant than the first.
+        stale_cutoff = treatment._stale_cutoff()
         plans = []
         for r in rows:
             status: str | None = None
             err: str | None = None
             if r["PlanID"] is not None:
-                status, err = _present_status(r["Status"], r["ErrorMessage"], r["PlanUpdatedAt"])
+                status, err = _present_status(r["Status"], r["ErrorMessage"], r["PlanUpdatedAt"], stale_cutoff)
             plans.append(TreatmentBoardRow(
                 output_id=r["OutputID"], scenario_title=_scenario_title(r["ScenarioJSON"]),
                 plan_id=r["PlanID"], status=status, risk_level=r["RiskLevel"],
@@ -271,8 +283,11 @@ def post_cancel_treatment_plan(session_id: str, output_id: str,
         row = dal.active_plan_row(sess, session_id, output_id)
         if row is None:
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
+        # task_id=row["ActiveTaskID"]: whoever currently holds it, whatever that is — closes a
+        # TOCTOU window where a worker reclaims the row between this SELECT and the UPDATE below.
         if row["Status"] != str(StageStatus.RUNNING) or not dal.finish_plan(
-                sess, row["PlanID"], status=StageStatus.ERROR, error_message=_CANCELLED_MESSAGE):
+                sess, row["PlanID"], status=StageStatus.ERROR, task_id=row["ActiveTaskID"],
+                error_message=_CANCELLED_MESSAGE):
             raise treatment.TreatmentConflict(
                 "no generation is in progress for this scenario",
                 reason=TreatmentGateReason.not_in_progress)
@@ -337,12 +352,16 @@ def list_entity_treatment_plans(entity_id: str,
     with db_session() as sess:
         # Same cutoff instant for the SQL filter and the row presentation — the filter must
         # match what _present_status will show (a timed-out plan IS an ERROR to the operator).
-        rows = dal.entity_plan_rows(sess, entity_id, stale_cutoff=treatment._stale_cutoff(),
+        # ONE value, passed to both — previously each called treatment._stale_cutoff()
+        # independently, so a row landing between the two instants could pass the SQL filter as
+        # RUNNING while _present_status rendered it ERROR on the same response.
+        stale_cutoff = treatment._stale_cutoff()
+        rows = dal.entity_plan_rows(sess, entity_id, stale_cutoff=stale_cutoff,
                                     status=status, review_status=review_status,
                                     risk_level=risk_level, limit=limit, offset=offset)
         items = []
         for r in rows:
-            st, err = _present_status(r["Status"], r["ErrorMessage"], r["UpdatedAt"])
+            st, err = _present_status(r["Status"], r["ErrorMessage"], r["UpdatedAt"], stale_cutoff)
             items.append(TreatmentRegisterRow(
                 plan_id=r["PlanID"], session_id=r["SessionID"], output_id=r["OutputID"],
                 asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],

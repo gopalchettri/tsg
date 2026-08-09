@@ -797,6 +797,16 @@ class RegenResultEvent(BaseModel):
         description="old→new pairs. The two flat lists above cannot express the mapping when "
                     "several targets are regenerated at once; these can.",
     )
+    failed_threat_ids: list[str] = Field(
+        default_factory=list,
+        description="Threats in this batch whose generation call itself failed — transient, "
+                    "still Selected and re-servable; retrying the same regenerate is worth it.",
+    )
+    rescored_threat_ids: list[str] = Field(
+        default_factory=list,
+        description="Threats in this batch that no longer meet the current scoping cutoff — "
+                    "terminal; retrying will not change the outcome.",
+    )
     reason: ClickOutcomeReason | None = Field(default=None, description="Why the click was fruitless; null for the target-went-stale race.")
     detail: str | None = Field(default=None, description="Developer-facing explanation.")
     message: str | None = Field(default=None, description="End-user-safe sentence.")
