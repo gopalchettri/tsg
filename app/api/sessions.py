@@ -184,7 +184,8 @@ def create_session(
 
         ctx = gather_asset_details(sess, asset_id=body.asset_id, entity_id=body.entity_id,
                             sector_id=body.sector_id, user_id=principal.user_id,
-                            supporting_system_ids=body.supporting_system_id)
+                            supporting_system_ids=body.supporting_system_id,
+                            subsector_id=body.subsector_id)
         try:
             # Freeze the tuning rulebook NOW: a Config_Tuning row that breaks the scoring
             # invariants fails session creation with the curated message — it must surface to

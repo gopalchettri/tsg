@@ -149,6 +149,70 @@ def main() -> None:
         prompts._EXCLUDE_DB_KEY_TO_PROMPT = real
     print("8 OK  detection is real — emptying the constant leaks", sorted(leaked))
 
+    # 9 — PREFIX-CACHE INVARIANT. system_content must be byte-identical for every threat in a
+    #     batch. Providers cache a prompt PREFIX and stop at the first differing byte, and the
+    #     user message comes AFTER the whole system message — so ONE per-threat character here
+    #     ends the shared prefix before base_ctx begins and re-prefills it (~9k tokens at the
+    #     16-system design target) for every threat in the batch. Nothing pinned this before,
+    #     which is precisely why "emit only the matching STRIDE line" looked like a sane way to
+    #     build A2. Entry points are per-SESSION, so they are held constant across the batch.
+    batch = [
+        prompts.scenario_prompt(base, "Denial of Service", "Loss of availability of PGS",
+                                actors=["Sandworm"], intel_items=INTEL,
+                                entry_points=["SCADA System"], category="Denial of Service"),
+        prompts.scenario_prompt(base, "Records dispute", "Operator action cannot be attributed",
+                                actors=[], intel_items=None,
+                                entry_points=["SCADA System"], category="Repudiation"),
+        prompts.variant_scenario_prompt(base, "Data tampering", "Setpoint altered",
+                                        actors=["Malicious insider"], intel_items=INTEL,
+                                        existing=[(1, "An adversary disrupts SCADA control.")],
+                                        entry_points=["SCADA System"], sibling_k=3,
+                                        category="Tampering"),
+    ]
+    systems = {msgs[0]["content"] for msgs in batch}
+    assert len(systems) == 1, (
+        f"system_content differs across a batch ({len(systems)} distinct) — prefix cache "
+        "destroyed; something per-threat leaked into the system message")
+    print("9 OK  system_content byte-identical across threats, categories and variants")
+
+    # 10 — and the steering still ARRIVES: all six shapes static in the system message, this
+    #      threat's own category as DATA in the user message, no bleed between threats.
+    sys_msg = batch[1][0]["content"]
+    assert all(c in sys_msg for c in prompts._STRIDE_SCENARIO_SHAPES), "STRIDE shape block incomplete"
+    assert '"threat_category":"Repudiation"' in batch[1][1]["content"]
+    assert "Repudiation" not in batch[0][1]["content"], "category bled across threats"
+    print("10 OK all six STRIDE shapes static in system; threat_category carried per-threat")
+
+    # 11 — TWO-STAGE AGREEMENT. Stage 1 CHOOSES category, Stage 2 ACTS on it, so both must be
+    #      taught the SAME definitions. The coverage assertion is the offline half of the drift
+    #      guard: edit either list without the other and this fails at development time, instead
+    #      of Stage 2 silently falling back to RULE 4 for every threat in production.
+    t1 = prompts.threats_prompt("Power Generation System (PGS)", ASSET_CTX, SUBS,
+                                max_threats=5)[0]["content"]
+    for cat, shape in prompts._STRIDE_SCENARIO_SHAPES.items():
+        assert f"{cat} → {shape}" in t1, f"threats_prompt missing the shared definition for {cat}"
+    uncovered = [c for c in prompts._FALLBACK_STRIDE_CATEGORIES
+                 if c not in prompts._STRIDE_SCENARIO_SHAPES]
+    assert not uncovered, f"categories with no scenario shape — Stage 2 degrades silently: {uncovered}"
+    print("11 OK Stage 1 and Stage 2 share one category definition; fallback list fully covered")
+
+    # 12 — check 11 is not vacuous: drop a shape and BOTH halves must fail.
+    real_shapes = prompts._STRIDE_SCENARIO_SHAPES
+    try:
+        prompts._STRIDE_SCENARIO_SHAPES = {k: v for k, v in real_shapes.items()
+                                           if k != "Repudiation"}
+        stubbed = prompts.threats_prompt("Power Generation System (PGS)", ASSET_CTX, SUBS,
+                                         max_threats=5)[0]["content"]
+        # Key on the SHAPE text, not "Repudiation → " — the type: line renders _STRIDE_TYPE_HINTS
+        # with the same separator, so the prefix alone is present either way.
+        assert real_shapes["Repudiation"] not in stubbed, \
+            "definition survived removal — test proves nothing"
+        assert [c for c in prompts._FALLBACK_STRIDE_CATEGORIES
+                if c not in prompts._STRIDE_SCENARIO_SHAPES] == ["Repudiation"]
+    finally:
+        prompts._STRIDE_SCENARIO_SHAPES = real_shapes
+    print("12 OK drift detection is real — removing a shape drops it from Stage 1 and is flagged")
+
     print("\nprompt db-key self-check OK")
 
 

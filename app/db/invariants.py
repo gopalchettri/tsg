@@ -42,6 +42,25 @@ REQUIRED_INDEXES = [
     # a plain performance index and deliberately NOT listed: this check rejects non-unique
     # entries, and registering it would make every boot fail with the DDL correctly applied.
     ("UX_TreatmentPlan_ActiveOutput", "Risk_Treatment_Plan", ("OutputID",)),
+    # Four more the code relies on for CORRECTNESS, not performance. Each is created by the
+    # deployment scripts, but until now none was asserted here — so a database missing one
+    # booted cleanly and then corrupted data silently, the worst of both worlds.
+    # Every one backs an IntegrityError-driven upsert or a 409 translation: without the index
+    # there is no error to catch, so the duplicate is simply accepted.
+    #   * ConfigThreatRule — Threat_library.sql says it outright: "without it a duplicate
+    #     relevance_flag row would silently DOUBLE a threat's score boost" (scoping._apply_rules
+    #     sums fired weights additively). Silent mis-scoring of every future assessment.
+    #   * Session_IdempotencyKey — dal.create_session branches on this index FIRST when a key was
+    #     supplied; without it a retried POST /v1/sessions creates a second session for one asset.
+    #   * The two control-library keys — control_library_crud turns their IntegrityError into a
+    #     409; absent, a duplicate ControlCode is accepted and grounding gains a phantom control.
+    # Filtered/partial in the DDL, exactly like the entries above; the check compares name, table,
+    # ordered columns and uniqueness, so a filter drift still surfaces as a boot failure.
+    ("UX_ConfigThreatRule_NaturalKey", "Config_Threat_Rule",
+    ("ThreatTypeID", "RuleType", "RuleKey", "RuleValue")),
+    ("UX_Session_IdempotencyKey", "Scenario_Session", ("EntityID", "IdempotencyKey")),
+    ("UX_Control_Standard_Name", "Control_Standard", ("StandardName",)),
+    ("UX_Control_Library_Code", "Control_Library", ("ControlCode",)),
 ]
 
 # (A former CHECKLIST 6 verified the CRM Risk-module tables existed when risk_module_enabled.

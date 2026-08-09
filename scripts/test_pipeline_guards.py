@@ -142,6 +142,12 @@ def check_asset_name_stripping() -> None:
     got = asset_agnostic_name("Compromise of Widget Control System leading to outage",
                             "Widget Control System")
     assert got == "Compromise leading to outage", got
+    # The two preposition lists used to DISAGREE — the $-anchored tail cleanup lacked `from` and
+    # `at`, so a trailing one survived into the library name. Both passes now share one constant.
+    got = asset_agnostic_name("Data exfiltration from ACME Corp", "ACME Corp")
+    assert got == "Data exfiltration", got
+    got = asset_agnostic_name("Unauthorized access at ACME Corp", "ACME Corp")
+    assert got == "Unauthorized access", got
     # Nothing-but-the-asset still returns None, never the raw asset-embedded string.
     assert asset_agnostic_name("Widget Control System", "Widget Control System") is None
     print("ok  asset_agnostic_name handles punctuation, possessive, mid-string")

@@ -11,6 +11,18 @@
 -- Run with SSMS or sqlcmd, after Control_library.sql.
 -- ============================================================================
 
+-- REQUIRED, and this one fails SILENTLY at the application layer. Control_library.sql (which
+-- runs before this) creates the FILTERED unique indexes UX_Control_Standard_Name and
+-- UX_Control_Library_Code, and SQL Server requires QUOTED_IDENTIFIER ON for ANY insert/update
+-- against a table carrying a filtered index. sqlcmd defaults it OFF (SSMS defaults it ON), so
+-- under the install README.md prescribes this aborts on the very first INSERT with Msg 1934.
+-- Nothing downstream errors: the app boots fine, and Step-4 control mapping simply finds an
+-- empty library and attaches zero controls to every scenario, forever, with no signal.
+-- Same guard, same reason, as Seed_to_Threat_library.sql.
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_NULLS ON;
+GO
+
 IF NOT EXISTS (SELECT 1 FROM Control_Standard)
 BEGIN
     INSERT INTO Control_Standard (StandardName, CreatedBy) VALUES

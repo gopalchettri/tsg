@@ -547,7 +547,6 @@ class onboarding_sectors(Base):
     __tablename__ = "onboarding_sectors"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str | None] = mapped_column(Unicode(300))
-    sector_code: Mapped[str | None] = mapped_column(Unicode(100))
     parent_id: Mapped[int | None] = mapped_column(Integer)
     definition: Mapped[str | None] = mapped_column(UnicodeText)
 
@@ -557,7 +556,6 @@ class ctm_scan_entity(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     type: Mapped[str | None] = mapped_column(Unicode(200))
     name: Mapped[str | None] = mapped_column(Unicode(300))
-    ctm_category_id: Mapped[int | None] = mapped_column(Integer) # FK to ctm_scan_category.id
     description: Mapped[str | None] = mapped_column(UnicodeText)
     criticality: Mapped[int | None] = mapped_column(Integer)
     operating_system: Mapped[str | None] = mapped_column(Unicode(200))
@@ -566,13 +564,16 @@ class ctm_scan_entity(Base):
     target_rto_hours: Mapped[int | None] = mapped_column(Integer)
     target_rpo_hours: Mapped[int | None] = mapped_column(Integer)
     tier1_critical_service_id: Mapped[int | None] = mapped_column(Integer)
+    priority: Mapped[int | None] = mapped_column(Integer)
     data_handled: Mapped[str | None] = mapped_column(UnicodeText)  # types of data this asset processes/stores
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)  # soft-delete flag — real queries filter WHERE is_deleted = 0
 
-
-# The real, direct asset->entity link — one row per asset per owning business unit, so an asset
-# can have more than one row. tier1_critical_service_id above is NOT the ownership path: it is
-# unpopulated on current assets, and onboarding_service_entity below only ever mapped
-# service->entity, one indirection removed from the asset.
+# The real, direct asset->entity link, and the ONLY one: ctm_scan_entity itself carries no group
+# or entity column. Also the asset->service link — both foreign keys live on the same row, so the
+# entity is NOT reached by traversing the service (services 336 and 494 are each shared by two
+# entities, so that traversal is ambiguous anyway).
+#
+# tier1_critical_service_id above is NOT the ownership path: it is populated on 1 of 36 assets.
 class ctm_scan_entity_bu(Base):
     __tablename__ = "ctm_scan_entity_bu"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -581,11 +582,18 @@ class ctm_scan_entity_bu(Base):
     service_id: Mapped[int | None] = mapped_column(Integer)  # FK to onboarding_services.id — an asset can link to more than one
 
 
-class onboarding_service_entity(Base):  # maps a service to its owning entity/group
-    __tablename__ = "onboarding_service_entity"
-    sector_id: Mapped[int] = mapped_column(Integer, primary_key=True) # FK to onboarding_sectors.id
-    service_id: Mapped[int] = mapped_column(Integer, primary_key=True) # FK to onboarding_services.id
-    group_id: Mapped[int] = mapped_column(Integer, primary_key=True) # FK to group.id
+# Two service->sector tables are deliberately UNMODELLED, both removed 2026-08-09:
+#
+#   onboarding_sector_services (service_id, sector_id) — the platform's authoritative
+#     service -> sub-sector map.
+#   onboarding_service_entity  (sector_id, service_id, group_id) — the same fact denormalised
+#     onto the entity mapping. Was modelled but referenced by no file in app/.
+#
+# TSG reads NEITHER: the client supplies subsector_id directly on the session-create request,
+# and an id that resolves to nothing is a caller error (_load_sector raises NotFoundError).
+# Every mapped column is a column TSG demands of a database it does not own, so an ORM class
+# for a table nothing queries is a liability, not documentation. Model onboarding_sector_services
+# only if TSG ever needs to derive the sub-sector itself; prefer it over the denormalised copy.
 
 # asset <-> onboarding_supporting_systems junction (many-to-many)
 class ctm_scan_entity_supporting_system(Base):

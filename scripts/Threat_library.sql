@@ -12,6 +12,21 @@
 -- Run with SSMS or sqlcmd against the TSG database, after TSG_Core.sql.
 -- ============================================================================
 
+-- REQUIRED, and the failure is command-line-only. This script creates six FILTERED indexes
+-- (every UX_*_NaturalKey below carries WHERE IsActive = 1 AND IsDeleted = 0). SQL Server refuses
+-- CREATE INDEX with a filter unless QUOTED_IDENTIFIER is ON, and sqlcmd defaults it OFF while
+-- SSMS defaults it ON — so this file ran clean in SSMS and failed at the first index under the
+-- sqlcmd install README.md prescribes (Msg 1934).
+-- The blast radius is wider than the index itself: the CREATEs at the top of this file succeed,
+-- the script then aborts, and the guarded ALTERs that add Threat_Type.Source and
+-- Threat_Catalogue.Source further down NEVER RUN — so Seed_to_Threat_library.sql fails on every
+-- INSERT (it names Source explicitly) and the API refuses to boot, because four of these indexes
+-- are in invariants.REQUIRED_INDEXES.
+-- Same guard, same reason, as Control_library.sql / Seed_to_Threat_library.sql / TSG_Core.sql.
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_NULLS ON;
+GO
+
 -- ============================================================
 -- Threat-library MASTER tables (moved from scripts/TSG_Core.sql 2026-08-04).
 -- Type/Catalogue/Actor PKs are IDENTITY (R10 promote-on-accept inserts new

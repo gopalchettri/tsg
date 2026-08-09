@@ -16,7 +16,10 @@ from typing import Any
 
 from app.core.config import get_settings
 from app.core.enums import ActionPriority, ControlCoverage, ControlType, YesNo
+from app.core.logging import get_logger
 from app.core.security import redact, scrub_context
+
+log = get_logger(__name__)
 
 
 # Stays "1.0" for the whole development phase — prompts are still being reworked, so bumping per
@@ -50,6 +53,36 @@ _STRIDE_TYPE_HINTS = {
     "Denial of Service": "loss of availability",
     "Elevation of Privilege": "unauthorized elevation of access",
 }
+
+# [A2] What a scenario of each category should be ABOUT. Distinct from _STRIDE_TYPE_HINTS above,
+# which is a 3-5 word gloss shaping Stage 1's `type` FIELD and says nothing about narrative shape.
+#
+# EMITTED IN FULL, ALWAYS — every line, for every threat. The threat's own category rides in the
+# user message's JSON as `threat_category` and the model reads which line applies from there.
+# Emitting only the ONE matching line is the obvious implementation and is WRONG: it would make
+# system_content per-threat and end the shared prefix before base_ctx begins (see the boundary
+# comment in scenario_prompt), re-prefilling ~9k tokens of context for every threat in a batch.
+# Same static-all-cases trick as actor_clause and _VARIANT_INSTRUCTION.
+#
+# Keyed on the canonical STRIDE names, NOT read from live Threat_Category rows: the block is
+# static text, so it must not vary per session either. A renamed or custom category simply matches
+# no line and falls through to rule 4 — the same degradation _STRIDE_TYPE_HINTS.get(c, ...) takes.
+_STRIDE_SCENARIO_SHAPES = {
+    "Spoofing": "who or what is impersonated, how the asset is led to trust it, and what that "
+                "misplaced trust then permits",
+    "Tampering": "what data, configuration or control logic is altered, and what the asset does "
+                 "wrongly because the altered value is believed",
+    "Repudiation": "which action cannot be reliably attributed afterwards, why the available "
+                   "records cannot settle it, and what that unresolvable dispute costs",
+    "Information Disclosure": "what information is exposed, to whom, and the consequence of it "
+                              "being known — the exposure itself is the impact",
+    "Denial of Service": "what becomes unavailable or degraded, to whom, and for how long — the "
+                         "loss of service IS the threat",
+    "Elevation of Privilege": "which boundary is crossed, what the elevated access permits that "
+                              "ordinary access does not, and the impact of that reach",
+}
+
+_STRIDE_SHAPE_BLOCK = "".join(f"   - {c}: {s}\n" for c, s in _STRIDE_SCENARIO_SHAPES.items())
 
 # Data-plane framing: prefixes every user message so context values that happen to read
 # like instructions are not followed.
@@ -148,9 +181,24 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
                     max_threats: int, categories: list[str] | None = None,
                     actor_examples: list[str] | None = None,
                     exclude: list[str] | None = None) -> list[dict]:
-    
+    """The Stage 1 prompt: propose candidate threats to the asset, grounded in the context."""
     cats = categories or _FALLBACK_STRIDE_CATEGORIES
-    """ The Stage 1 prompt: propose candidate threats to the asset, grounded in the context."""
+
+    # Stage 1 CHOOSES the category; Stage 2 ACTS on it (_STRIDE_SCENARIO_SHAPES steers the
+    # scenario's narrative shape). Defining it here from the SAME dict is what stops the two
+    # stages drifting apart — a mislabel at Stage 1 now produces a confidently wrong Stage 2
+    # narrative, so "exactly one of <six bare names>" is no longer enough guidance.
+    # No prompt-cache constraint here: threats_prompt is called once per ROUND, not once per
+    # threat, so there is no batch sharing a prefix. `cats` may legitimately vary per session.
+    category_defs = [f"{c} → {_STRIDE_SCENARIO_SHAPES[c]}" for c in cats
+                    if c in _STRIDE_SCENARIO_SHAPES]
+    undefined = [c for c in cats if c not in _STRIDE_SCENARIO_SHAPES]
+    if undefined:
+        # A live Threat_Category renamed away from the canonical STRIDE names. Stage 1 can still
+        # emit it, but Stage 2 will match no shape line and silently fall back to its RULE 4 for
+        # every such threat — degradation with no other signal, so it is reported here.
+        log.warning("prompt.stride_categories_undefined", categories=undefined,
+                    defined=sorted(_STRIDE_SCENARIO_SHAPES))
     if actor_examples:
         actors_line = ("actors: labels chosen ONLY from this list: " + ", ".join(actor_examples)
                     + ". Empty list if none applies — never a label outside the list, never "
@@ -209,7 +257,9 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         "type: the generic impact in plain library terms, with no asset, product or technology "
         "names — " + "; ".join(
             f"{c} → {_STRIDE_TYPE_HINTS.get(c, 'impact on the asset')}" for c in cats) + ".\n"
-        "category: exactly one of " + ", ".join(cats) + ".\n"
+        "category: exactly one of " + ", ".join(cats) + ". Choose by what the threat is actually "
+        "ABOUT, not by how it might be carried out"
+        + (" — " + "; ".join(category_defs) if category_defs else "") + ".\n"
         + actors_line +
         "\nRULES\n"
         f"1) Propose at most {max_threats} unique threats, most contextually relevant first. "
@@ -304,7 +354,8 @@ def entry_point_vocabulary(subsystems: list[dict[str, Any]],
 def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_name: str | None,
                     actors: list[str] | None = None, intel_items: list[dict[str, Any]] | None = None,
                     *, entry_points: list[str] | None = None,
-                    existing: list[tuple[int, str]] | None = None) -> list[dict]:
+                    existing: list[tuple[int, str]] | None = None,
+                    category: str | None = None) -> list[dict]:
     """Stage 2: write one scenario for ONE verified threat against the asset.
 
     `base_ctx` comes from build_base_context(), built once by tasks.write_scenarios and reused for
@@ -375,8 +426,8 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
             "assumptions.\n"
             "\nFIELDS (return a JSON object)\n"
             "scenario_title: the asset and the impact against it.\n"
-            "scenario_statement: how the threat (cited by its threat_name) reaches and "
-            "compromises the asset, and what happens to its confidentiality, integrity, "
+            "scenario_statement: how the threat (cited by its threat_name) materializes "
+            "against the asset, and what happens to its confidentiality, integrity, "
             "availability or accountability. 1-3 sentences.\n"
             "risk_statement: the scenario, the asset, its critical service (only when the "
             "context names one — never invent a service), and the operational/security impact "
@@ -404,8 +455,23 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
             "a valid, complete value; never invent specifics to make a thin field look "
             "complete.\n"
             "2) No exploit instructions, payloads, tool commands or procedural attack steps — "
-            "describe only the general nature of the compromise and its consequences.\n"
+            "describe only the general nature of what occurs and its consequences.\n"
             "3) Exclude risk scores and evidence; those come from elsewhere.\n"
+            # A1: category-INDEPENDENT, so it needs no plumbing of the STRIDE category into this
+            # function (that is A2). Fixes availability/repudiation threats being written as
+            # break-in narratives. Static text — it must stay ABOVE the per-threat boundary below.
+            "4) Do not assume the threat requires compromising a system. A threat can also "
+            "materialize through misuse of legitimate access, loss or degradation of a service, "
+            "resource exhaustion, failure of a depended-on system, or the absence of reliable "
+            "records of who did what. Write the narrative this threat's own nature implies; open "
+            "with unauthorized access ONLY when gaining access is what the threat is about.\n"
+            # A2: the whole table, always. Per-threat selection happens in the model's head from
+            # threat_category in the user message — never here. See _STRIDE_SCENARIO_SHAPES.
+            "5) threat_category in the context names this threat's STRIDE category. Centre the "
+            "scenario_statement on what THAT category is concerned with, using only its matching "
+            "line below; the other lines do not apply to this threat. When threat_category is "
+            "absent or matches no line, rule 4 alone governs.\n"
+            + _STRIDE_SHAPE_BLOCK +
             "\n"
             # NOTHING PER-THREAT BELOW THIS LINE. sglang/vLLM cache a prompt PREFIX and stop at
             # the first byte that differs; because the user message comes AFTER the whole system
@@ -424,6 +490,11 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
 
     payload = {**base_ctx, "threat_type": redact(threat_type),
             "threat_name": redact(threat_name), "threat_actors": safe_actors}
+    if category:
+        # [A2] Stage 1's PROPOSED category, stored raw by tasks._build_threat_records — model
+        # output, so it crosses redacted like threat_type/threat_name. Omitted when absent, which
+        # keeps the payload byte-identical to the pre-A2 one (same fail-open contract as intel).
+        payload["threat_category"] = redact(category)
     if existing:  # sibling statements are DATA — inside the framed, redacted JSON, not prose
         payload["existing_scenarios"] = [
             {"scenario_number": n, "scenario_statement": redact(s)}
@@ -442,7 +513,8 @@ def variant_scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, t
                             actors: list[str] | None = None, intel_items: list[dict[str, Any]] | None = None,
                             *, existing: list[tuple[int, str]],
                             entry_points: list[str] | None = None,
-                            sibling_k: int | None = None) -> list[dict]:
+                            sibling_k: int | None = None,
+                            category: str | None = None) -> list[dict]:
     """scenario_prompt plus differentiation steering, for variants and regen-with-siblings.
 
     `existing` is [(ScenarioNumber, scenario_statement)] for the SAME threat's other active
@@ -470,8 +542,12 @@ def variant_scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, t
     if sibling_k is None:  # session-tuned when the caller carries a snapshot; config otherwise
         sibling_k = get_settings().variant_sibling_prompt_k
     recent = sorted(existing, key=lambda ns: ns[0], reverse=True)[:sibling_k]
+    # `category` MUST be forwarded: dropping it here would silently give variants a different
+    # (category-blind) scenario shape from their own primary — the same class of bug as the
+    # intel-vocabulary omission recorded at tasks.py's variant path.
     return scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
-                        intel_items=intel_items, entry_points=entry_points, existing=recent)
+                        intel_items=intel_items, entry_points=entry_points, existing=recent,
+                        category=category)
 
 
 def treatment_prompt(snapshot: dict[str, Any]) -> list[dict]:

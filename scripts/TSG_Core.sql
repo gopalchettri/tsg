@@ -521,37 +521,25 @@ CREATE INDEX IX_TreatmentPlan_SessionActive ON Risk_Treatment_Plan(SessionID) WH
 -- ============================================================
 
 -- ============================================================
--- SECTION 5 — Platform-table columns app code reads (ctm_scan_entity,
--- onboarding_supporting_systems). These are platform tables TSG reuses but
--- never creates (SDD §7.7); without these columns, real session creation
--- fails with "Invalid column name" (context.py selects them explicitly).
+-- SECTION 5 — (removed 2026-08-09) Platform tables are READ-ONLY to TSG.
+--
+-- This section used to ALTER ... ADD nine columns onto ctm_scan_entity and
+-- onboarding_supporting_systems so context.py's explicit SELECT list would
+-- resolve. That was written against a stripped-down dev copy. TSG must never
+-- issue DDL or DML against the platform (EyShield) database -- it reads, nothing
+-- more -- so the statements are gone rather than merely guarded.
+--
+-- They were also redundant: a full model-vs-UAT column diff across all 11
+-- platform tables found every mapped column already present, except
+-- ctm_scan_entity.system_managed_by, which no longer exists in models.py either
+-- (managed_by lives on onboarding_supporting_systems).
+--
+-- The need behind them was real: a missing platform column still breaks session
+-- creation with "Invalid column name". That check now lives in
+-- scripts/TSG_Preflight.sql, which REPORTS a missing column instead of creating
+-- one -- the correct shape for a database we do not own. Run Preflight first;
+-- a failure there is a conversation with the platform team, not a TSG migration.
 -- ============================================================
-
-IF OBJECT_ID('dbo.ctm_scan_entity', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.ctm_scan_entity', 'data_handled') IS NULL
-        ALTER TABLE ctm_scan_entity ADD data_handled ntext NULL;
-    IF COL_LENGTH('dbo.ctm_scan_entity', 'system_managed_by') IS NULL
-        ALTER TABLE ctm_scan_entity ADD system_managed_by nvarchar(100) NULL;
-    IF COL_LENGTH('dbo.ctm_scan_entity', 'operating_system') IS NULL
-        ALTER TABLE ctm_scan_entity ADD operating_system nvarchar(200) NULL;
-    IF COL_LENGTH('dbo.ctm_scan_entity', 'location') IS NULL
-        ALTER TABLE ctm_scan_entity ADD location nvarchar(200) NULL;
-    IF COL_LENGTH('dbo.ctm_scan_entity', 'target_rto_hours') IS NULL
-        ALTER TABLE ctm_scan_entity ADD target_rto_hours int NULL;
-    IF COL_LENGTH('dbo.ctm_scan_entity', 'target_rpo_hours') IS NULL
-        ALTER TABLE ctm_scan_entity ADD target_rpo_hours int NULL;
-END
-
-IF OBJECT_ID('dbo.onboarding_supporting_systems', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.onboarding_supporting_systems', 'technology_used') IS NULL
-        ALTER TABLE onboarding_supporting_systems ADD technology_used nvarchar(max) NULL;
-    IF COL_LENGTH('dbo.onboarding_supporting_systems', 'vendor_name') IS NULL
-        ALTER TABLE onboarding_supporting_systems ADD vendor_name nvarchar(200) NULL;
-    IF COL_LENGTH('dbo.onboarding_supporting_systems', 'database_platforms') IS NULL
-        ALTER TABLE onboarding_supporting_systems ADD database_platforms nvarchar(300) NULL;
-END
 
 -- ============================================================
 -- Config_Tuning: business-calibration overrides, editable at runtime (no restart).

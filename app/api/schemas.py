@@ -62,17 +62,27 @@ class CreateSessionBody(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "asset_id": 12345,
-                "entity_id": "ENT-001",
-                "sector_id": 7,
-                "supporting_system_id": [101, 102],
+                "entity_id": "78",
+                "service_id": 335,
+                "sector_id": 95,
+                "subsector_id": 111,
+                "asset_id": 103,
+                "supporting_system_id": [321, 322, 323, 324],
             }
         }
     )
 
     asset_id: int = Field(description="Primary key of the asset to generate threat scenarios for.")
     entity_id: str = Field(description="Tenant/business-unit code the asset belongs to; used for entity-scoped access control.")
-    sector_id: int | None = Field(default=None, description="Optional sector id, used to bias threat-catalogue matching. Omit if unknown.")
+    service_id: int | None = Field(default=None, description="Critical service the asset delivers (onboarding_services.id). With entity_id it resolves the sub-sector server-side.")
+    # SECTOR vs SUB-SECTOR — the distinction that produced a silent, months-long defect.
+    # In onboarding_sectors the PARENT row is the sector (95 Energy) and the CHILD is the
+    # sub-sector (110 Electricity, 111 Water). The pipeline needs the CHILD: it derives the
+    # parent itself via parent_id, and filters the threat library on both. Callers previously
+    # sent the parent in `sector_id`, so sub-sector-scoped library entries were invisible and
+    # grounding quietly matched against a smaller pool. Send `subsector_id`.
+    subsector_id: int | None = Field(default=None, description="Sub-sector id (onboarding_sectors child row, e.g. 111 Water). Preferred; its parent sector is derived server-side.")
+    sector_id: int | None = Field(default=None, description="Parent sector id (e.g. 95 Energy). Cross-check only — must be the parent of subsector_id. Not the source of truth.")
     # `user_id` deliberately REMOVED: the initiating user is taken from the authenticated
     # principal (JWT `sub`, or X-Dev-User in dev), the same source cancel/accept already audit
     # against. As a body field it was unverified text — a caller could send "user_id": "ceo" and
@@ -127,7 +137,7 @@ class AcceptBody(BaseModel):
     _canonicalize_output_ids = field_validator("output_ids")(_canonical_output_ids)
 
     @model_validator(mode="after")
-    def _mode_and_output_ids_agree(self) -> "AcceptBody":
+    def _mode_and_output_ids_agree(self) -> AcceptBody:
         # Length bounds live HERE, not as Field constraints: Pydantic runs field-level
         # min_length/max_length BEFORE any mode="after" validator, so a field failure would
         # skip this validator entirely — {"mode": "all", "output_ids": []} would then be told

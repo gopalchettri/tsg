@@ -26,11 +26,17 @@ log = get_logger(__name__)
 # onboarding_supporting_systems columns that store a single option_value code as a plain
 # int (not a JSON array) — same option/option_value resolution as the multiselect columns
 # above, just one code per row instead of a decoded array.
+#
+# The stored code is option_value.ID, not option_value.value. The CII Onboarding DDD says
+# these columns hold `value`; measured against UAT that is wrong for every populated column,
+# single- and multi-select alike (all 111 supporting-system rows match on id, none on value).
+# Keying on `value` silently resolved nothing and leaked raw ids into the prompt.
 _SINGLESELECT_OPTION_CODES = {
     "accessability_channel": "acc-channel",
     "hosting_location": "hosting-location",
     "network_connectivity_primary_dr": "network-connectivity",
     "dr_drill_frequency": "dr-drill",
+    "managed_by": "managed-by",  # In-house vs Outsourced: third-party exposure, not an owner name
 }
 
 # onboarding_supporting_systems columns that store their value as a JSON array of
@@ -134,23 +140,32 @@ def _load_supporting_systems(
     single/multi-value coded columns — see _load_category_lookup/
     _load_singleselect_lookup/_load_multiselect_lookup): every column that query
     resolves is covered here or by one of those three lookups, except
-    onboarding_supporting_systems.managed_by (owner name, not threat-relevant —
-    see _load_asset) and .url, still deliberately excluded, and the
+    onboarding_supporting_systems.url, still deliberately excluded, and the
     creation_date/created_by/date_updated/updated_by audit columns, never
-    modeled for any table in this codebase. min_no_of_transactions/
-    max_no_of_transactions are the one addition beyond that reference query —
-    real, non-audit, threat-relevant columns worth keeping even though that
-    particular report doesn't select them.
+    modeled for any table in this codebase.
+
+    managed_by WAS excluded here as an "owner name, not threat-relevant". That was
+    wrong: it is a single-select code resolving through option group `managed-by` to
+    In-house or Outsourced — a third-party-exposure signal that changes the actor
+    profile and who owns each control. Now resolved via _SINGLESELECT_OPTION_CODES.
+
+    min_no_of_transactions/max_no_of_transactions are the one addition beyond that
+    reference query — real, non-audit, threat-relevant columns worth keeping even
+    though that particular report doesn't select them.
     """
     ss_rows: dict[int, Mapping[str, Any]] = {
         r["id"]: dict(r) for r in sess.execute(
-            select(m.onboarding_supporting_systems.id, m.onboarding_supporting_systems.name,
+            select(m.onboarding_supporting_systems.id,
+                m.onboarding_supporting_systems.name,
                 m.onboarding_supporting_systems.asset_type,
                 m.onboarding_supporting_systems.min_no_of_transactions,
                 m.onboarding_supporting_systems.max_no_of_transactions,
+                m.onboarding_supporting_systems.url,                
                 m.onboarding_supporting_systems.accessability_channel,
                 m.onboarding_supporting_systems.technology_used,
                 m.onboarding_supporting_systems.user_base_count,
+                m.onboarding_supporting_systems.targeted_users,
+                m.onboarding_supporting_systems.managed_by,
                 m.onboarding_supporting_systems.vendor_name,
                 m.onboarding_supporting_systems.maintenance_contract_exists,
                 m.onboarding_supporting_systems.hosting_location,
@@ -173,7 +188,7 @@ def _load_supporting_systems(
                 m.onboarding_supporting_systems.rpo_target_mins,
                 m.onboarding_supporting_systems.data_loss_incident_last_3_years,
                 m.onboarding_supporting_systems.incident_description,
-                m.onboarding_supporting_systems.targeted_users)
+                )
             .join(m.ctm_scan_entity_supporting_system,
                 m.ctm_scan_entity_supporting_system.onboarding_supporting_system_id
                 == m.onboarding_supporting_systems.id)
@@ -262,19 +277,22 @@ def _load_multiselect_lookup(
     relevant_option_ids = {option_ids[_fold_code(_MULTISELECT_OPTION_CODES[col])] for col in codes_by_col}
     names_by_option: dict[int, dict[int, str]] = {}
     for r in sess.execute(
-        select(m.option_value.option_id, m.option_value.value, m.option_value.name)
+        select(m.option_value.option_id, m.option_value.id, m.option_value.name)
         .where(m.option_value.option_id.in_(relevant_option_ids))
     ).mappings():
-        names_by_option.setdefault(r["option_id"], {})[r["value"]] = r["name"]
+        names_by_option.setdefault(r["option_id"], {})[r["id"]] = r["name"]
     return {col: names_by_option.get(option_ids[_fold_code(_MULTISELECT_OPTION_CODES[col])], {}) for col in codes_by_col}
 
 
 def _resolve_multiselect(raw: str | None, lookup: dict[int, str]) -> list[str] | None:
-    """Decode one JSON-array-of-codes column value into human-readable names."""
-    codes = _decode_codes(raw)
-    return [lookup.get(code, str(code)) for code in codes] if codes else None
+    """Decode one JSON-array-of-codes column value into human-readable names.
 
-
+    Unresolvable codes are DROPPED, never stringified: a bare `1105` in the prompt is
+    noise the model may treat as a fact, and _scrub_db_keys exists to keep raw ids out.
+    All-unresolvable therefore yields None -- "we don't know" -- not ['1105'].
+    """
+    names = [lookup[code] for code in _decode_codes(raw) if code in lookup]
+    return names or None
 
 
 def _load_singleselect_lookup(
@@ -299,16 +317,20 @@ def _load_singleselect_lookup(
     relevant_option_ids = {option_ids[_fold_code(_SINGLESELECT_OPTION_CODES[c])] for c in resolvable_cols}
     names_by_option: dict[int, dict[int, str]] = {}
     for r in sess.execute(
-        select(m.option_value.option_id, m.option_value.value, m.option_value.name)
+        select(m.option_value.option_id, m.option_value.id, m.option_value.name)
         .where(m.option_value.option_id.in_(relevant_option_ids))
     ).mappings():
-        names_by_option.setdefault(r["option_id"], {})[r["value"]] = r["name"]
+        names_by_option.setdefault(r["option_id"], {})[r["id"]] = r["name"]
     return {c: names_by_option.get(option_ids[_fold_code(_SINGLESELECT_OPTION_CODES[c])], {}) for c in resolvable_cols}
 
 
 def _resolve_singleselect(raw: int | None, lookup: dict[int, str]) -> str | None:
-    """Decode one single-value option_value-code column into its human-readable name."""
-    return lookup.get(raw, str(raw)) if raw is not None else None
+    """Decode one single-value option_value-code column into its human-readable name.
+
+    Returns None for an unresolvable code -- see _resolve_multiselect for why raw codes
+    must never reach the prompt.
+    """
+    return lookup.get(raw) if raw is not None else None
 
 
 def _build_subsystems(
@@ -323,11 +345,20 @@ def _build_subsystems(
     last_dr_test_date/rto_target_mins/rpo_target_mins are converted to
     str/float here (not left as datetime/Decimal) — both go straight into
     json.dumps() below via subsystems_json, which can't serialize either type.
+
+    last_dr_test_date is additionally sentinel-checked: every one of the 111 UAT rows holds
+    1753-01-01, SQL Server's datetime minimum, which means "never tested" but reads to the model
+    as a real DR test in the 18th century. Emitted as None instead — an absent field is honest,
+    a fabricated date is not.
     """
     subsystems = []
     for ssid in supporting_system_ids:
         ss_row = ss_rows[ssid]
         last_dr_test_date = ss_row.get("last_dr_test_date")
+        # .year works on both date and datetime, so no type branch. 1753-01-01 is datetime's
+        # minimum and 1900-01-01 smalldatetime's; no real DR test predates either.
+        if last_dr_test_date is not None and last_dr_test_date.year <= 1900:
+            last_dr_test_date = None
         rto_target_mins = ss_row.get("rto_target_mins")
         rpo_target_mins = ss_row.get("rpo_target_mins")
         subsystems.append({
@@ -350,6 +381,7 @@ def _build_subsystems(
             "dr_location": ss_row.get("dr_location"),
             "network_connectivity_primary_dr": _resolve_singleselect(ss_row.get("network_connectivity_primary_dr"), singleselect_lookup.get("network_connectivity_primary_dr", {})),
             "dr_drill_frequency": _resolve_singleselect(ss_row.get("dr_drill_frequency"), singleselect_lookup.get("dr_drill_frequency", {})),
+            "managed_by": _resolve_singleselect(ss_row.get("managed_by"), singleselect_lookup.get("managed_by", {})),
             "maintenance_contract_exists": ss_row.get("maintenance_contract_exists"),
             "last_dr_test_date": last_dr_test_date.isoformat() if last_dr_test_date is not None else None,
             "backup_multi_site": ss_row.get("backup_multi_site"),
@@ -382,16 +414,22 @@ def _resolve_sector_names(
 
 def gather_asset_details(
     sess: Session, *, asset_id: int, entity_id: str, sector_id: int | None, user_id: str | None,
-    supporting_system_ids: list[int],
+    supporting_system_ids: list[int], subsector_id: int | None = None,
 ) -> dict[str, Any]:
     """Look up one asset plus its sector/parent-sector and the requested supporting
     systems, then package everything into a single dict — some fields shaped for the
     UI, plus JSON-encoded copies of the same data for the AI prompt.
+
+    `_load_sector` wants the SUB-SECTOR (the child row) and derives the parent sector itself, so
+    pass `subsector_id` — NOT `sector_id`, which is the parent and yields sub_sector=None plus a
+    one-element sector_ids. `sector_id` is accepted only as a fallback for callers predating
+    `subsector_id`. An id that resolves to nothing is a caller error: _load_sector raises
+    NotFoundError, which is the right answer — TSG does not second-guess the ids it is given.
     """
     _validate_supporting_system_ids(asset_id, supporting_system_ids)
 
     asset, critical_service = _load_asset(sess, asset_id)
-    sector, parent_sector = _load_sector(sess, sector_id)
+    sector, parent_sector = _load_sector(sess, subsector_id or sector_id)
     ss_rows = _load_supporting_systems(sess, asset_id, supporting_system_ids)
     category_lookup = _load_category_lookup(sess, ss_rows)
     multiselect_lookup = _load_multiselect_lookup(sess, ss_rows)

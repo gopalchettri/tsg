@@ -30,9 +30,32 @@ _EPOCH = 1
 _WORK_LEVELS = (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS)
 _SCENARIO_TEXT_FIELDS = ("scenario_title", "scenario_statement", "risk_statement")
 ASSET_UNIT_ID = 0
-# sibling-similarity ratio lives in config (Settings.sibling_similarity_ratio) and arrives as a
-# parameter on the _flag_* helpers, so a Config_Tuning session snapshot can override it.
 
+#: Prepositions that may sit in front of an asset name. ONE list, shared by BOTH passes in
+#: asset_agnostic_name — the mid-string consume and the $-anchored tail cleanup. They were written
+#: out twice and DISAGREED: the tail lacked `from` and `at`, so 'Data exfiltration from <asset>'
+#: stripped to 'Data exfiltration from', leaving the preposition dangling on the library name.
+_ASSET_PREPOSITIONS = "of|from|to|in|on|for|against|at"
+
+#: The subsystem-level technology-inventory fields intel search terms may come from.
+#: Deliberately WITHOUT the subsystem asset_type: it resolves to the IT/OT category strings,
+#: which are noise as product search terms — that field feeds only the is_ot preference. The
+#: ASSET-level asset_type (free text, e.g. 'Power Plant') does join the terms.
+_INTEL_TECH_FIELDS = ("technology_used", "vendor_name", "database_platforms",
+                    "saas_platform_list", "public_cloud_platforms")
+
+#: Filler the model emits when it has no real name — compared AFTER stripping brackets,
+#: quotes and punctuation and casefolding, so 'N/A', '["N/A"]', '(none)', 'NULL', '- ' all
+#: reduce to a member here. ONE list; extend it here, never at a call site.
+_JUNK_NAME_TOKENS = frozenset({
+    "", "na", "n a", "none", "null", "nil", "tbd", "unknown", "not applicable",
+    "not available", "no name", "no threat", "empty",
+})
+
+#: Ceiling on one proposal's grounding query text. Sits below llm._MAX_EMBED_CHARS (4000), which
+#: RAISES rather than truncates — and that raise escapes find_threats, losing EVERY threat in the
+#: round, not just the oversized one. A hard provider limit, so a constant and not a config knob.
+_MAX_PROPOSAL_CHARS = 3500
 
 class RegenTarget(NamedTuple):
     output_id: str
@@ -41,6 +64,27 @@ class RegenTarget(NamedTuple):
     scenario_number: int
     identity_hash: str | None
 
+class _ScenarioFold(NamedTuple):
+    rows: list
+    siblings_by_hash: dict
+    cross_pairs: list
+    frozen_by_hash: dict
+
+
+class _ScenarioBatch(NamedTuple):
+    base_ctx: dict
+    enriched: dict
+    deduped: int
+    pairs: list
+    scoped_count: int
+    fold: _ScenarioFold
+    entry_vocab: dict
+    intel_terms: list
+    intel_ot: bool
+
+
+def _normalize(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip().casefold()
 
 def _flag_sibling_similarity(report: dict, scenario: dict, sibling_texts: list[tuple[int, str]],
                             ratio: float) -> None:
@@ -179,13 +223,6 @@ def _statement_of(scenario_json: str | None) -> str:
         return str((json.loads(scenario_json) or {}).get("scenario_statement") or "")
     except (TypeError, ValueError):
         return ""
-
-
-class _ScenarioFold(NamedTuple):
-    rows: list
-    siblings_by_hash: dict
-    cross_pairs: list
-    frozen_by_hash: dict
 
 
 def _fold_scenario_rows(rows: list) -> _ScenarioFold:
@@ -337,11 +374,6 @@ def _build_threat_records(tid: str, sid: str, tenant: str, ss: int, ptype: str |
     }
     return row, summary
 
-
-def _normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip().casefold()
-
-
 def _asset_boundary_pattern(asset_name: str) -> re.Pattern | None:
     """One boundary-aware pattern for every asset-name check and strip. Lookarounds, not \\b —
     asset names may start/end with non-word characters ('(PGS)'). A raw substring/sub match
@@ -359,7 +391,6 @@ def _asset_boundary_pattern(asset_name: str) -> re.Pattern | None:
     body = r"\s+".join(re.escape(tok) for tok in a.split())
     return re.compile(r"(?<!\w)" + body + r"(?:'s)?(?!\w)", re.IGNORECASE)
 
-
 def asset_agnostic_name(name: str | None, asset_name: str) -> str | None:
     """Strip the (boundary-matched) asset name out of a threat label. Returns None — never the
     original — when nothing but the asset name remains: the old `stripped or name` tail handed
@@ -374,23 +405,13 @@ def asset_agnostic_name(name: str | None, asset_name: str) -> str | None:
         # removal doesn't leave it dangling: 'Compromise of X leading to outage' used to strip to
         # 'Compromise of leading to outage' — the old cleanup below is $-anchored and only ever
         # fixed the tail.
-        combined = re.compile(r"(?:\b(?:of|from|to|in|on|for|against|at)\s+)?" + pat.pattern,
-                            pat.flags)
+        combined = re.compile(rf"(?:\b(?:{_ASSET_PREPOSITIONS})\s+)?" + pat.pattern, pat.flags)
         stripped = combined.sub(" ", name)
     else:
         stripped = name
     stripped = re.sub(r"\s+", " ", stripped).strip(" ,;:-.'")
-    stripped = re.sub(r"\s+(of|to|on|in|for|against)$", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(rf"\s+({_ASSET_PREPOSITIONS})$", "", stripped, flags=re.IGNORECASE)
     return stripped or None
-
-
-#: Filler the model emits when it has no real name — compared AFTER stripping brackets,
-#: quotes and punctuation and casefolding, so 'N/A', '["N/A"]', '(none)', 'NULL', '- ' all
-#: reduce to a member here. ONE list; extend it here, never at a call site.
-_JUNK_NAME_TOKENS = frozenset({
-    "", "na", "n a", "none", "null", "nil", "tbd", "unknown", "not applicable",
-    "not available", "no name", "no threat", "empty",
-})
 
 
 def clean_library_name(name: str | None) -> str | None:
@@ -446,12 +467,6 @@ def _dedup_key(info: dict) -> str:
     if not key_type and not key_name:
         return "txt:tid:" + str(info.get("threat_id"))
     return "txt:" + key_type + "|" + key_name
-
-
-#: Ceiling on one proposal's grounding query text. Sits below llm._MAX_EMBED_CHARS (4000), which
-#: RAISES rather than truncates — and that raise escapes find_threats, losing EVERY threat in the
-#: round, not just the oversized one. A hard provider limit, so a constant and not a config knob.
-_MAX_PROPOSAL_CHARS = 3500
 
 
 def _usable_proposal(p: object) -> bool:
@@ -584,24 +599,12 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     return threats, prov
 
 
-
-
 def _moderation_report(scenario: dict) -> dict:  
     text = " ".join(str(scenario.get(f) or "") for f in _SCENARIO_TEXT_FIELDS)
     text = " ".join([text] + [f"{c.get('name') or ''} {c.get('why') or ''}".strip()
                             for c in (scenario.get("controls") or []) if isinstance(c, dict)])
     r = moderate(text)
     return {"checked": r.checked, "flagged": r.flagged, "categories": r.categories, "error": r.error}
-
-
-
-
-#: The subsystem-level technology-inventory fields intel search terms may come from.
-#: Deliberately WITHOUT the subsystem asset_type: it resolves to the IT/OT category strings,
-#: which are noise as product search terms — that field feeds only the is_ot preference. The
-#: ASSET-level asset_type (free text, e.g. 'Power Plant') does join the terms.
-_INTEL_TECH_FIELDS = ("technology_used", "vendor_name", "database_platforms",
-                    "saas_platform_list", "public_cloud_platforms")
 
 
 def _intel_vocabulary(subsystems: list[dict], asset_context: dict) -> tuple[list[str], bool]:
@@ -728,6 +731,9 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     threat_type = info.get("library_threat_type") or info.get("threat_type")
     threat_name = info.get("library_threat_name") or info.get("threat_name")
     actors = info.get("actors") or []
+    # [A2] STRIDE category, already carried by dal.active_threats/find_threats — no extra query.
+    # Steers the scenario's SHAPE (prompts._STRIDE_SCENARIO_SHAPES); absent → prompt unchanged.
+    category = info.get("category")
     tn = tuning.from_session(scenario_session)  # the session's frozen rulebook — never live config
     # If coverage is provided, use it; otherwise, create a new _Coverage with empty vocab and None for frozen and others.
     cov = coverage or _Coverage(vocab={}, frozen=None, others=None)
@@ -742,10 +748,12 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
         messages = prompts.variant_scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
                                                 intel_items=intel_items, existing=sibling_texts,
                                                 entry_points=entry_labels,
-                                                sibling_k=tn.variant_sibling_prompt_k)
+                                                sibling_k=tn.variant_sibling_prompt_k,
+                                                category=category)
     else:
         messages = prompts.scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
-                                        intel_items=intel_items, entry_points=entry_labels)
+                                        intel_items=intel_items, entry_points=entry_labels,
+                                        category=category)
     scenario, prov = _ask_ai(sess, llm, messages,
                             scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID, stage="scenario",
                             level=SubsystemLevel.SCENARIOS, epoch=epoch, task_id=task_id, expected_type=dict,
@@ -1075,17 +1083,6 @@ def _build_work_items(scoped_all: list[scoping.Scored],
 
     return pairs, scoped_threat_count
 
-
-class _ScenarioBatch(NamedTuple):
-    base_ctx: dict
-    enriched: dict
-    deduped: int
-    pairs: list
-    scoped_count: int
-    fold: _ScenarioFold
-    entry_vocab: dict
-    intel_terms: list
-    intel_ot: bool
 
 
 def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: dict,

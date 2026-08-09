@@ -105,8 +105,8 @@ def collect_control_queries(scenario_json: str | None, top_k: int) -> tuple[list
 
 
 def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
-                 subsystems: list[dict] | None, llm: LLMClient, subsystem_id: int,
-                 task_id: str, epoch: int) -> None:
+                subsystems: list[dict] | None, llm: LLMClient, subsystem_id: int,
+                task_id: str, epoch: int) -> None:
     """Map every not-yet-attempted active complete output of this session to library controls.
 
     Runs as a tail step of the SCENARIOS stage. Idempotency = `ControlsMappedAt IS NULL`:
@@ -142,10 +142,10 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         outputs = sess.execute(
             select(m.Threat_Scenario_Output.OutputID, m.Threat_Scenario_Output.ScenarioJSON)
             .where(m.Threat_Scenario_Output.SessionID == sid,
-                   m.Threat_Scenario_Output.Superseded == 0,
-                   m.Threat_Scenario_Output.Status == ScenarioStatus.complete,
-                   m.Threat_Scenario_Output.ControlsMappedAt.is_(None),
-                   ~already_mapped.exists())
+                m.Threat_Scenario_Output.Superseded == 0,
+                m.Threat_Scenario_Output.Status == ScenarioStatus.complete,
+                m.Threat_Scenario_Output.ControlsMappedAt.is_(None),
+                ~already_mapped.exists())
         ).all()
         if not outputs:
             return
@@ -206,7 +206,7 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                     cid = row["ControlLibraryID"]
                     if cid not in best or score > best[cid]["Score"]:
                         best[cid] = {"OutputID": output_id, "ControlLibraryID": cid, "SessionID": sid,
-                                     "Score": score, "SuggestedControl": suggested, "CreatedAt": now()}
+                                    "Score": score, "SuggestedControl": suggested, "CreatedAt": now()}
                 pos += len(queries)
                 keep = sorted(best.values(), key=lambda r: r["Score"], reverse=True)[: s.control_map_top_k]
                 for rank, rec in enumerate(keep, start=1):
@@ -218,24 +218,24 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         # zero-survivor ones — so none of them is ever re-scanned on a later run. Rides the
         # caller's transaction: a crash before commit rolls back stamps and map rows together.
         sess.execute(update(m.Threat_Scenario_Output)
-                     .where(m.Threat_Scenario_Output.OutputID.in_([oid for oid, _ in outputs]))
-                     .values(ControlsMappedAt=now()))
+                    .where(m.Threat_Scenario_Output.OutputID.in_([oid for oid, _ in outputs]))
+                    .values(ControlsMappedAt=now()))
         if not per_output:
             # No audit event: a controls_mapped row reporting 0 processed outputs reads as
             # work done. The stamp above still prevents any future re-scan of these outputs.
             log.warning("controls.nothing_groundable", session_id=sid, skipped=skipped)
             return
         dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
-                         EntityID=scenario_session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,
-                         SubsystemID=ss, EventType=AuditEventType.controls_mapped,
-                         DetailJSON=json.dumps({"outputs": len(per_output), "mapped": inserted,
+                        EntityID=scenario_session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,
+                        SubsystemID=ss, EventType=AuditEventType.controls_mapped,
+                        DetailJSON=json.dumps({"outputs": len(per_output), "mapped": inserted,
                                                 "dropped": dropped, "fallback_queries": fallbacks,
                                                 "skipped": skipped, "itot": itot or "",
                                                 "itot_filter_applied": itot is not None,
                                                 "min_score": min_score}))
         log.info("controls.mapped", session_id=sid, outputs=len(per_output), mapped=inserted,
-                 dropped=dropped, fallbacks=fallbacks, skipped=skipped, itot=itot,
-                 min_score=min_score)
+                dropped=dropped, fallbacks=fallbacks, skipped=skipped, itot=itot,
+                min_score=min_score)
     except Exception:  # noqa: BLE001
         # Unwind to the savepoint FIRST: a DBAPI error mid-write (deadlock, constraint conflict)
         # marks the failed statement's transaction inactive, and without this the caller's very
