@@ -17,13 +17,11 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from typing import Any
 
 from app.core.logging import get_logger
-
-# Same-package internals: the doc shape every feed normalizes to, and the size/timeout
-# bounded getter they all fetch through.
 from app.intel.fetchers import _doc, _get
 
 log = get_logger(__name__)
@@ -42,10 +40,10 @@ def _parse_dt(value: Any) -> datetime | None:
     if not value:
         return None
     try:
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(value))
     except ValueError:
         return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 def pulse_doc(p: dict) -> dict:

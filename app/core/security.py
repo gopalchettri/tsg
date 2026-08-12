@@ -1,8 +1,8 @@
 """AuthN/AuthZ + model-boundary input handling.
 
-Resource server only: we VALIDATE the platform/SSO JWT (signature + exp/iss/aud) and read its
-claims — never issue tokens. Entities the caller may act on come from the `entities[]` claim;
-missing/empty is a hard deny, never allow-all.
+AuthN is the header model: app/api/deps.get_principal verifies X-API-Key against API_Client and
+(optionally) the (X-User-Id, X-Entity-Id) pair against user_scope_assignment. This module keeps
+only the shared AuthError type and the data-plane redaction below.
 
 Data plane: free text runs through a secret/PII redaction pass before any model call, so
 secrets and other entities' data are structurally excluded rather than assumed absent.
@@ -10,14 +10,7 @@ secrets and other entities' data are structurally excluded rather than assumed a
 from __future__ import annotations
 
 import re
-from functools import lru_cache
 from typing import Any
-
-import jwt
-from jwt import PyJWKClient
-
-from app.core.config import Settings, get_settings
-
 
 # No-value tokens that reach us as curator-dropdown labels ("NA" is a real option in the
 # multiselect lookup tables — context._resolve_multiselect hands it over as a display name)
@@ -50,62 +43,8 @@ REDACTED = "[REDACTED]"
 
 
 class AuthError(Exception):
-    """Invalid/absent token or failed claim check (→ 401)."""
+    """Invalid/absent token or failed API-key/identity check (→ 401)."""
 
-
-@lru_cache
-def _jwks_client(url: str) -> PyJWKClient:
-    """Cached per JWKS URL so each validation doesn't refetch the issuer's key set."""
-    return PyJWKClient(url)
-
-
-def validate_jwt(token: str, settings: Settings | None = None) -> dict[str, Any]:
-    """Verify signature + exp/iss/aud against the issuer's JWKS; return claims."""
-    settings = settings or get_settings()
-    if not token:
-        raise AuthError("missing bearer token")
-    if not settings.jwt_issuer:
-        # PyJWT's issuer check no-ops entirely when issuer=None (it won't even require
-        # an 'iss' claim to be present, let alone match) -- unlike audience, which still
-        # rejects a token whose 'aud' claim is present when audience=None. Fail closed
-        # instead of silently accepting a token meant for some other issuer/app.
-        raise AuthError("TSG_JWT_ISSUER is not configured; refusing to skip issuer verification")
-    if not settings.jwt_audience:
-        # Same asymmetry as issuer above, other direction: audience=None only rejects a
-        # token that HAPPENS to carry an 'aud' claim -- one minted for a different
-        # first-party app that omits 'aud' would sail through unscoped. Fail closed.
-        raise AuthError("TSG_JWT_AUDIENCE is not configured; refusing to skip audience verification")
-    try:
-        if settings.jwt_secret:
-            # Shared-secret mode (HS256): the same key signs and verifies, no JWKS fetch.
-            key_material: Any = settings.jwt_secret
-        else:
-            # Find the public key (by "kid" in the token header) from the issuer's published key
-            # set, then verify the token's signature and required claims against it.
-            key_material = _jwks_client(settings.jwt_jwks_url).get_signing_key_from_jwt(token).key
-        return jwt.decode(
-            token,
-            key_material,
-            algorithms=list(settings.jwt_algorithms),
-            audience=settings.jwt_audience or None,
-            issuer=settings.jwt_issuer,
-            # Issuer tokens live ~5 minutes; a small clock difference between the issuing
-            # server and this one must not read as "expired"/"not yet valid".
-            leeway=30,
-            options={"require": ["exp"]},
-        )
-    except jwt.PyJWTError as exc:
-        raise AuthError(f"invalid token: {exc}") from exc
-
-def allowed_entities(claims: dict[str, Any], settings: Settings | None = None) -> set[str]:
-    """The `group.id` set the caller may act on. Empty/missing → empty set → every object-level
-    check must then deny."""
-    settings = settings or get_settings()
-    raw = claims.get(settings.jwt_entities_claim) or []
-    # The claim may arrive as a single value rather than a list.
-    if isinstance(raw, (str, int)):
-        raw = [raw]
-    return {str(e) for e in raw}
 
 def redact(text: str | None) -> str | None:
     """Strip secrets/PII from free text before it reaches a model (§10.3). Accepts and returns

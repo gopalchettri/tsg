@@ -17,10 +17,11 @@ import hashlib
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
 from functools import lru_cache
 from types import ModuleType
-from typing import Any, Sequence
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -42,6 +43,15 @@ from app.pipeline.llm import LLMClient, LLMSlotUnavailable, _slot_redis
 
 log = get_logger(__name__)
 
+# Stamped into each new Mongo doc's created_by (provenance only). Overwritten at the non-API
+# entrypoints (celery_app → "worker", scripts/refresh_embeddings.py → "cli").
+process_role = "api"
+
+# TTL lives in Settings.embedding_group_lock_ttl_seconds (default unchanged: 30). MUST stay an
+# int: redis-py rejects a float for SET's `ex=` and EXPIRE (DataError). As a float every acquire
+# raises, hits _group_lock's fail-open handler, and the mutex is silently inert against a real
+# Redis — the fake Redis in tests tolerates floats and never catches it.
+
 # Control embed text = name + description (the semantic payload lives in ControlDescription).
 # coalesce() because a NULL description would NULL the whole concat and silently drop the control
 # from the corpus. Shared by every reader — cache-key equality between the refresh and query paths
@@ -57,10 +67,6 @@ _GROUPS = {
     "threat_catalogue": (m.Threat_Catalogue, m.Threat_Catalogue.ThreatName),
     "control_library": (m.Control_Library, _CONTROL_TEXT),
 }
-
-# Stamped into each new Mongo doc's created_by (provenance only). Overwritten at the non-API
-# entrypoints (celery_app → "worker", scripts/refresh_embeddings.py → "cli").
-process_role = "api"
 
 
 class EmbeddingBusy(Exception):
@@ -79,10 +85,10 @@ _MATRIX: dict[tuple[str, str, str], tuple[str, Any, list[int]]] = {}
 # Circuit breaker around _vector_store(): @lru_cache never memoizes an exception, so
 # without this a sustained Mongo outage re-runs the full MongoClient+create_index
 # handshake (bounded by mongo_connect_timeout_ms) on every single get_vectors() call.
-# Once that handshake fails, skip retrying it until the cooldown elapses.
+# Once that handshake fails, skip retrying it until the cooldown elapses (Settings.
+# mongo_breaker_cooldown_seconds, default unchanged: 30.0).
 # ponytail: fixed cooldown, not exponential backoff — add growth only if outages are
 # routinely long enough that even one retry every 30s is a measurable cost.
-_BREAKER_COOLDOWN_S = 30.0
 _breaker_open_until = 0.0
 
 
@@ -117,8 +123,9 @@ def _store_if_healthy():
     try:
         col = _vector_store()
     except Exception:  # noqa: BLE001 — Mongo down → open the breaker, compute + L1
-        _breaker_open_until = now + _BREAKER_COOLDOWN_S
-        log.warning("embeddings.mongo_breaker_open", cooldown_seconds=_BREAKER_COOLDOWN_S, exc_info=True)
+        cooldown = get_settings().mongo_breaker_cooldown_seconds
+        _breaker_open_until = now + cooldown
+        log.warning("embeddings.mongo_breaker_open", cooldown_seconds=cooldown, exc_info=True)
         return None
     _breaker_open_until = 0.0
     return col
@@ -162,16 +169,18 @@ def _l2_read(l1: dict[str, list[float]], result: dict[str, list[float]], missing
         return False
 
 
-_MAX_EMBED_BATCH = 100  # bound one external call so a large recreate can't exceed a provider's
-                        # own batch-size limit and fail the whole group with zero progress
+# Batch size lives in Settings.embedding_batch_size (default unchanged: 100) — bounds one
+# external call so a large recreate can't exceed a provider's own batch-size limit and fail the
+# whole group with zero progress.
 
 
 def _embed_missing(llm: LLMClient, missing: list[str], kind: str) -> list[list[float]]:
     """External embedding-service tier: embed every text still missing after L1 + L2, in
-    `_MAX_EMBED_BATCH`-sized chunks."""
+    Settings.embedding_batch_size-sized chunks."""
+    batch = get_settings().embedding_batch_size
     vecs: list[list[float]] = []
-    for i in range(0, len(missing), _MAX_EMBED_BATCH):
-        chunk = missing[i:i + _MAX_EMBED_BATCH]
+    for i in range(0, len(missing), batch):
+        chunk = missing[i:i + batch]
         chunk_vecs = llm.embed(chunk, kind=kind)
         if len(chunk_vecs) != len(chunk):  # partial/short provider response → fail loud HERE,
             raise RuntimeError(             # not as an opaque KeyError at the return below.
@@ -450,21 +459,15 @@ def _active_names(sess: Session, table, name_col) -> list[str]:
         select(name_col).where(table.IsActive == True, table.IsDeleted == False)  # noqa: E712
     ).scalars().all())
 
-
-# int, not float: redis-py rejects a float for SET's `ex=` and EXPIRE (DataError). As a float
-# every acquire raises, hits _group_lock's fail-open handler, and the mutex is silently inert
-# against a real Redis — the fake Redis in tests tolerates floats and never catches it.
-_GROUP_LOCK_TTL_SECONDS = 30
-
-
-def _renew_group_lock_loop(r, key: str, token: str, interval: float, stop_event: threading.Event) -> None:
+def _renew_group_lock_loop(r, key: str, token: str, interval: float, ttl: int,
+                            stop_event: threading.Event) -> None:
     """Refreshes the held group lock's TTL every `interval` seconds, so a legitimately slow
     guarded operation (an embed call can run well past the lock's fixed TTL) never has its lock
     expire out from under it. Same 'duration vs. aliveness' fix as llm.py's _heartbeat_loop."""
     while not stop_event.wait(interval):
         try:
             if r.get(key) == token:  # only renew OUR OWN lock — never extend one a stale timeout
-                r.expire(key, _GROUP_LOCK_TTL_SECONDS)  # already let a different caller acquire
+                r.expire(key, ttl)  # already let a different caller acquire
         except Exception:  # noqa: BLE001 — a missed renewal self-heals next tick
             log.warning("embeddings.group_lock_renewal_failed", exc_info=True)
 
@@ -477,11 +480,12 @@ def _group_lock(group: str):
 
     Fails OPEN if Redis is unreachable (same posture as the LLM-slot limiter): this guards
     against redundant cost, not correctness, so availability wins."""
+    ttl = get_settings().embedding_group_lock_ttl_seconds
     key = f"tsg:embed-lock:{group}"
     token = str(uuid.uuid4())
     try:
         r = _slot_redis()
-        acquired = r.set(key, token, nx=True, ex=_GROUP_LOCK_TTL_SECONDS)
+        acquired = r.set(key, token, nx=True, ex=ttl)
     except Exception:  # noqa: BLE001 — Redis down → fail open, don't block an admin action on it
         log.warning("embeddings.group_lock_redis_unavailable_fail_open", group=group, exc_info=True)
         yield
@@ -491,7 +495,7 @@ def _group_lock(group: str):
     stop_event = threading.Event()
     # plain threading.Thread, not gevent.spawn — same portability reasoning as llm.py's _llm_slot
     hb_thread = threading.Thread(
-        target=_renew_group_lock_loop, args=(r, key, token, _GROUP_LOCK_TTL_SECONDS / 3, stop_event),
+        target=_renew_group_lock_loop, args=(r, key, token, ttl / 3, ttl, stop_event),
         daemon=True)
     hb_thread.start()
     try:
@@ -500,12 +504,12 @@ def _group_lock(group: str):
         # Stop the renewal thread BEFORE releasing: if release ran first, a renewal tick still
         # in flight could re-extend a lock we just deleted.
         stop_event.set()
-        hb_thread.join(timeout=_GROUP_LOCK_TTL_SECONDS)
+        hb_thread.join(timeout=ttl)
         try:
             if r.get(key) == token:  # only release OUR OWN lock, never one a retry-after-TTL-expiry took
                 r.delete(key)
-        except Exception:  # noqa: BLE001 — best-effort release; the TTL is the backstop
-            pass
+        except Exception:  # best-effort release; the TTL is the backstop
+            log.warning("embeddings.group_lock_release_failed", group=group, exc_info=True)
 
 
 def _for_each_group(group: str | None, fn) -> dict[str, int | str]:
@@ -581,7 +585,7 @@ def recreate_group(sess: Session, llm: LLMClient, group: str, names: list[str] |
 
 
 def delete_group(sess: Session, group: str, names: list[str] | None = None, *,
-                 strict: bool = True) -> int:
+                strict: bool = True) -> int:
     """Wipe cached vectors only — no re-embed. Serialized per group (see _group_lock).
 
     Named deletes resolve against the vectors that actually exist (a vector can outlive its master

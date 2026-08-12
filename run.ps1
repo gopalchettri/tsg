@@ -32,6 +32,12 @@
 .PARAMETER Reload
     Start uvicorn with --reload. Passed through to start.ps1.
 
+.PARAMETER NoFlower
+    Skip the Flower dashboard window. Passed through to start.ps1, where Flower starts by default.
+
+.PARAMETER FlowerPort
+    Port for the Flower dashboard. Passed through to start.ps1. Default 5555.
+
 .EXAMPLE
     .\run.ps1
 
@@ -47,7 +53,9 @@ param(
     [switch]$Check,
     [int]$Port = 8000,
     [int]$Concurrency = 50,
-    [switch]$Reload
+    [switch]$Reload,
+    [switch]$NoFlower,
+    [int]$FlowerPort = 5555
 )
 
 $ErrorActionPreference = 'Stop'
@@ -95,4 +103,5 @@ if ($Check.IsPresent) {
 }
 
 Write-Host ""
-& (Join-Path $PSScriptRoot 'start.ps1') -SkipDocker -Port $Port -Concurrency $Concurrency -Reload:$Reload
+& (Join-Path $PSScriptRoot 'start.ps1') -SkipDocker -Port $Port -Concurrency $Concurrency -Reload:$Reload `
+    -NoFlower:$NoFlower -FlowerPort $FlowerPort

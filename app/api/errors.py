@@ -9,16 +9,22 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.api.admin import AdminValidationError
+from app.api.sessions import SSEStreamCapacityExceeded
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.security import AuthError
 from app.db.dal import (
-    CancelConflict, CapacityExceeded, EntityForbidden, IdempotencyKeyConflict, NotFoundError,
-    RegenerateConflict, SessionConflict,
+    CancelConflict,
+    CapacityExceeded,
+    EntityForbidden,
+    IdempotencyKeyConflict,
+    NotFoundError,
+    RegenerateConflict,
+    SessionConflict,
 )
 from app.pipeline import cascade
 from app.pipeline.accept import AcceptConflict, MasterInactive
-from app.api.admin import AdminValidationError
 from app.pipeline.embeddings import EmbeddingBusy
 from app.pipeline.llm import LLMSlotUnavailable
 from app.pipeline.threat_library_import import ThreatLibraryImportError
@@ -113,6 +119,14 @@ async def _handle_llm_slot_unavailable(_: Request, exc: LLMSlotUnavailable):
                         "no free AI-call capacity right now, try again shortly"), headers={"Retry-After": retry_after})
 
 
+async def _handle_sse_capacity_exceeded(_: Request, exc: SSEStreamCapacityExceeded):
+    """SSE stream count is at sse_max_concurrent_streams (item 12) -> 503 with a Retry-After
+    (config-driven), same shape/setting as _handle_capacity_exceeded/_handle_llm_slot_unavailable."""
+    retry_after = str(get_settings().capacity_retry_after_seconds)
+    return JSONResponse(status_code=503, content=_env("sse_capacity_exceeded", str(exc)),
+                        headers={"Retry-After": retry_after})
+
+
 async def _handle_idempotency_conflict(_: Request, exc: IdempotencyKeyConflict):
     """Same Idempotency-Key reused with a different request body -> 409, returning the id of the session created by the original request."""
     return JSONResponse(status_code=409, content=_env(
@@ -196,6 +210,7 @@ def register_error_handlers(app: FastAPI) -> None:
     app.exception_handler(NotFoundError)(_handle_not_found)
     app.exception_handler(CapacityExceeded)(_handle_capacity_exceeded)
     app.exception_handler(LLMSlotUnavailable)(_handle_llm_slot_unavailable)
+    app.exception_handler(SSEStreamCapacityExceeded)(_handle_sse_capacity_exceeded)
     app.exception_handler(IdempotencyKeyConflict)(_handle_idempotency_conflict)
     app.exception_handler(RegenerateConflict)(_handle_regenerate_conflict)
     app.exception_handler(CancelConflict)(_handle_cancel_conflict)

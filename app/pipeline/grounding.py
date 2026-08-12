@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -46,6 +47,24 @@ except ImportError:  # pragma: no cover — exercised only in numpy-less deploym
 
 # Gives each grounding band a rank so two statuses can be compared (see pick_worse_of_two).
 _BAND_ORDER = {GroundingStatus.verified: 1, GroundingStatus.unverified: 0}
+
+
+# --- self-calibrating threshold ---------------------------------------------------------------
+# The match cutoff is MODEL-SPECIFIC: a different embedding+reranker pair scores the SAME
+# threat/library match differently, so a static number silently misclassifies after any model
+# change (a threat that verifies in dev can come back unverified in prod, with no error anywhere —
+# and unverified threats are what library promotion feeds on). The resolver below derives the
+# cutoff from the live models + live library, per model pair, so a stale threshold structurally
+# cannot recur.
+
+_RESOLVED_THRESHOLDS: dict[tuple[str, str], float] = {}
+
+# Sample size and paraphrases-per-name now live in Settings.calibration_sample_size /
+# Settings.calibration_paraphrases_per_name (defaults unchanged: 100 / 2).
+# The near-duplicate give-up score lives in config (Settings.near_duplicate_score): a "negative"
+# at/above it is a DUPLICATE catalogue entry, not an impostor — on the 0-100 rerank scale nothing
+# a paraphrase can score reliably clears it, so calibration is unwinnable until the library is
+# deduped. Measured: the real catalogue's worst pair scores 99.5. See _auto_calibrate.
 
 
 def how_similar(a: Sequence[float], b: Sequence[float]) -> float:
@@ -510,23 +529,6 @@ def prime_query_embeddings(llm: LLMClient, proposals: list[dict[str, Any]], cach
         cache[("qv", t)] = v
 
 
-# --- self-calibrating threshold ---------------------------------------------------------------
-# The match cutoff is MODEL-SPECIFIC: a different embedding+reranker pair scores the SAME
-# threat/library match differently, so a static number silently misclassifies after any model
-# change (a threat that verifies in dev can come back unverified in prod, with no error anywhere —
-# and unverified threats are what library promotion feeds on). The resolver below derives the
-# cutoff from the live models + live library, per model pair, so a stale threshold structurally
-# cannot recur.
-
-_RESOLVED_THRESHOLDS: dict[tuple[str, str], float] = {}
-_CALIBRATION_SAMPLE = 30
-# The near-duplicate give-up score lives in config (Settings.near_duplicate_score): a "negative"
-# at/above it is a DUPLICATE catalogue entry, not an impostor — on the 0-100 rerank scale nothing
-# a paraphrase can score reliably clears it, so calibration is unwinnable until the library is
-# deduped. Measured: the real catalogue's worst pair scores 99.5. See _auto_calibrate.
-_PARAPHRASES_PER_NAME = 2
-
-
 def boundary_between(below: list[float], above: list[float]) -> float | None:
     """Midpoint cutoff strictly between two score classes, or None when they overlap/are empty.
     Shared by _auto_calibrate and scripts/calibrate_grounding.py — a midpoint sits inside the
@@ -591,24 +593,25 @@ def resolve_thresholds(sess: Session | None, llm: LLMClient | None,
     return resolved
 
 
-def _paraphrase(llm: LLMClient, name: str) -> list[str]:
-    """Up to _PARAPHRASES_PER_NAME rewordings of a threat name — the auto-labelled POSITIVES
-    for calibration (a real-world query is a paraphrase, never the exact library string, so
-    exact-string self-matches would overstate what a genuine match scores). Best-effort: an
-    unparseable/failed reply contributes nothing rather than failing calibration."""
+def _paraphrase(llm: LLMClient, name: str, s: Settings) -> list[str]:
+    """Up to s.calibration_paraphrases_per_name rewordings of a threat name — the auto-labelled
+    POSITIVES for calibration (a real-world query is a paraphrase, never the exact library
+    string, so exact-string self-matches would overstate what a genuine match scores).
+    Best-effort: an unparseable/failed reply contributes nothing rather than failing calibration."""
+    n = s.calibration_paraphrases_per_name
     try:
         text, _prov = llm.chat([{
             "role": "user",
-            "content": (f"Reword this cybersecurity threat name {_PARAPHRASES_PER_NAME} different "
+            "content": (f"Reword this cybersecurity threat name {n} different "
                         f"ways, keeping the same meaning: {name!r}. "
-                        f"Reply with ONLY a json array of {_PARAPHRASES_PER_NAME} strings.")}],
+                        f"Reply with ONLY a json array of {n} strings.")}],
             # ARRAY, not object — without this, provider JSON mode would force json_object and
             # every paraphrase call would fail wherever TSG_LLM_JSON_MODE is enabled.
             expected_type=list)
         out = json.loads(text)
         if not isinstance(out, list):
             return []
-        return [p for p in out if isinstance(p, str) and p.strip()][:_PARAPHRASES_PER_NAME]
+        return [p for p in out if isinstance(p, str) and p.strip()][:n]
     except LLMSlotUnavailable:
         # NEVER swallowed — the codebase-wide contract (llm.py's own docstring; the explicit
         # re-raises in tasks/cascade/embeddings). Swallowed here it would turn a coordinated
@@ -636,7 +639,7 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
     names = embeddings._active_names(sess, table, name_col)  # noqa: SLF001
     if len(names) < 5:
         return None  # too little library to say anything meaningful
-    sample = names[:_CALIBRATION_SAMPLE]
+    sample = names[:s.calibration_sample_size]
     rows_all = [{"ThreatName": n} for n in names]
     negatives: list[float] = []
     collisions: list[tuple[float, str, str]] = []  # (score, name, nearest other) — see the warnings below
@@ -674,7 +677,7 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
 
     positives: list[float] = []
     for n in sample:
-        for p in _paraphrase(llm, n):
+        for p in _paraphrase(llm, n, s):
             _row, score = find_closest_match(llm, p, rows_all, "ThreatName", s, group="threat_catalogue")
             positives.append(score)
     match_th = boundary_between(negatives, positives)

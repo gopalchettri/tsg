@@ -1,6 +1,6 @@
 """Live threat-intel admin API — feed status and on-demand refresh.
 
-The second of TSG's two external-data channels. The threat-library import
+TSG's two external-data channels. The threat-library import
 (app/api/threat_library_import.py) loads DURABLE catalogue knowledge into SQL; these
 routes drive the PERISHABLE side — CISA KEV, CISA ICS advisories, OTX, URLhaus and any
 configured TAXII source — cached in Mongo with a TTL and injected into scenario prompts
@@ -22,7 +22,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.api.admin_jobs import FAMILY_INTEL, mark_admin_job
 from app.api.deps import Principal, get_principal, require_admin
 from app.api.schemas import (
-    IntelFeedsResponse, IntelFeedStatus, IntelItem, IntelItemsResponse, IntelRefreshAccepted,
+    IntelFeedsResponse,
+    IntelFeedStatus,
+    IntelItem,
+    IntelItemsResponse,
+    IntelRefreshAccepted,
 )
 from app.core.logging import get_logger
 from app.db.dal import NotFoundError
@@ -62,8 +66,8 @@ def list_feeds(_principal: Principal = Depends(get_principal)) -> IntelFeedsResp
 
 @router.get("/items", response_model=IntelItemsResponse)
 def list_items(source: str | None = None,
-               limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
-               _principal: Principal = Depends(get_principal)) -> IntelItemsResponse:
+            limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
+            _principal: Principal = Depends(get_principal)) -> IntelItemsResponse:
     """Browse the cached intel items themselves, newest first — `?source=otx` lists the
     OTX pulses with their `adversary`, `?source=cisa_kev` the exploited CVEs,
     `?source=cisa_ics` the OT advisories; no filter = every feed interleaved.

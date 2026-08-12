@@ -10,9 +10,11 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from app.core.config import get_settings
 from app.core.enums import SessionStatus
 from app.core.logging import get_logger
 from app.db import models as m
+from app.db.dal import API_MODULE
 
 log = get_logger(__name__)
 
@@ -120,7 +122,31 @@ def verify_startup(engine: Engine) -> None:
         _assert_mapped_columns_exist(engine)
         _assert_rcsi_enabled(engine)
         _warn_dead_context_field_config(engine)
+        _assert_api_client_configured(engine)
     _assert_no_duplicate_active(engine)
+
+
+def _assert_api_client_configured(engine: Engine) -> None:
+    """staging/prod must have at least one ACTIVE API_Client row, or the header auth model
+    (app/api/deps.get_principal) rejects EVERY request as 401 — a silent 100% outage that no
+    other check catches. Fail the boot loudly instead. Local/dev may run keyless (its callers
+    are the developer's own tools)."""
+    if get_settings().app_env not in ("staging", "prod"):
+        return
+    with engine.connect() as c:
+        active = c.execute(
+            text("SELECT COUNT(*) FROM API_Client WHERE Active = 1 AND Module = :module"),
+            {"module": API_MODULE},
+        ).scalar_one()
+    if not active:
+        raise StartupInvariantError(
+            f"APP_ENV is staging/prod but no ACTIVE API_Client row exists for module "
+            f"'{API_MODULE}' — every request would 401. Seed one (hash in Python, NOT SQL): "
+            "python -c \"import hashlib,secrets; s=secrets.token_hex(32); "
+            "print(s, hashlib.sha256(s.encode()).hexdigest())\"  then  INSERT INTO API_Client "
+            f"(ClientID, KeyHash, Name, Module) VALUES ('shield-<env>', '<keyhash>', 'Shield', "
+            f"'{API_MODULE}'). See scripts/TSG_Core.sql."
+        )
 
 
 def _assert_indexes(engine: Engine) -> None:
@@ -146,7 +172,7 @@ def _assert_indexes(engine: Engine) -> None:
             params,
         ).all()
     present = {r[0]: {"table": r[1], "disabled": bool(r[2]), "unique": bool(r[3]), "columns": tuple(r[4].split(","))}
-               for r in rows}
+            for r in rows}
     missing = [ix for ix in by_name if ix not in present]
     if missing:
         raise StartupInvariantError(

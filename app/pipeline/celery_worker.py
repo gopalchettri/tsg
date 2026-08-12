@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import sys
 
-
 # must run before any other import, or the patch lands too late
 if "pytest" not in sys.modules:
     from gevent import monkey  # type: ignore[import]

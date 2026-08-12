@@ -1,63 +1,109 @@
-"""API dependencies — JWT validation + object-level authorization ([R2], §10.1).
+"""API dependencies — header-model authentication + object-level authorization ([R2], §10.1).
 
-`get_principal` verifies the bearer token and reads the allowed-entity set from
-the JWT `entities[]` claim. Tests override `get_principal` via
-`app.dependency_overrides` to inject a Principal without a real IdP.
+`get_principal` verifies `X-API-Key` against a stored client-secret hash and takes the caller's
+identity from `X-User-Id`/`X-Entity-Id`/`X-Tenant-Id` — see docs/TSG_API_AUTHENTICATION_GUIDE.md
+for the full contract. Tests override `get_principal` via `app.dependency_overrides` to inject a
+Principal directly.
 """
 from __future__ import annotations
 
+import hashlib
 import secrets
 from dataclasses import dataclass
 
+import structlog
 from fastapi import Header
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.core.security import AuthError, allowed_entities, validate_jwt
+from app.core.security import AuthError
+from app.db import dal
 from app.db.dal import EntityForbidden
+from app.db.engine import db_session
 
 _log = get_logger(__name__)
 
 
 @dataclass
 class Principal:
-    """Holds the authenticated caller's JWT claims and the set of entity IDs they're allowed to access."""
+    """The authenticated caller: the acting user's id (as `sub`), the single verified entity
+    they act on, the tenant (customer org), and the API client that presented the request."""
     claims: dict
     entities: set[str]
+    client_id: str | None = None
+    tenant_id: str | None = None
 
     @property
     def user_id(self) -> str | None:
-        """Subject claim from the validated token; EY Shield tokens carry `userId` instead of
-        `sub`, so fall back to that. `None` in dev mode if `X-Dev-User` was omitted."""
-        uid = self.claims.get("sub") or self.claims.get("userId")
+        """The acting user id Shield sent in `X-User-Id`, carried as the `sub` claim."""
+        uid = self.claims.get("sub")
         return str(uid) if uid is not None else None
 
     def require_entity(self, entity_id) -> None:
-        """[R2] Deny unless the target entity is in the caller's authorized set."""
+        """ Deny unless the target entity is in the caller's authorized set."""
         # str(): entity_id may arrive as an int/UUID while self.entities holds strings
         if str(entity_id) not in self.entities:
             raise EntityForbidden(f"entity {entity_id} not authorized for caller")
 
 
-def get_principal(
-    authorization: str = Header(default=""),
-    x_dev_entities: str = Header(default=""),
-    x_dev_user: str = Header(default=""),
-) -> Principal:
-    """Resolves the caller's `Principal` from the bearer JWT (or `X-Dev-*` headers when
-    `AUTH_DEV_MODE` is on). [R2] downstream handlers still owe `require_entity`.
+# One opaque message for every auth failure — never leak which check failed (config oracle).
+_UNAUTHORIZED = "unauthorized"
 
-    `validate_jwt`'s `AuthError` is left to propagate rather than converted to an
-    `HTTPException`, so it reaches the [R9] envelope handler in app/api/errors.py."""
-    if get_settings().auth_dev_mode:  # DEV ONLY — no JWT; entities from a header
-        _log.warning("AUTH_DEV_MODE is ON — JWT validation is BYPASSED")
-        return Principal(
-            claims={"sub": x_dev_user or "dev"},
-            entities={e.strip() for e in x_dev_entities.split(",") if e.strip()},
-        )
-    token = authorization[7:] if authorization.lower().startswith("bearer ") else ""
-    claims = validate_jwt(token)
-    return Principal(claims=claims, entities=allowed_entities(claims))
+
+def verify_api_key(presented: str) -> str:
+    """Return the ClientID of the active API_Client whose secret hashes to `presented`, or raise
+    AuthError (-> 401). The stored value is a SHA-256 hex; we hash the presented secret and match.
+    A blank key, an unknown key, or a revoked key all raise the SAME message."""
+    key = presented.strip()
+    if not key:
+        raise AuthError(_UNAUTHORIZED)
+    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    with db_session() as sess:
+        client_id = dal.api_client_id_for_key_hash(sess, key_hash)
+    if client_id is None:
+        raise AuthError(_UNAUTHORIZED)
+    return client_id
+
+
+def get_principal(
+    x_api_key: str = Header(default="", alias="X-API-Key"),
+    x_user_id: str = Header(default="", alias="X-User-Id"),
+    x_entity_id: str = Header(default="", alias="X-Entity-Id"),
+    x_tenant_id: str = Header(default="", alias="X-Tenant-Id"),
+) -> Principal:
+    """Resolve the caller's `Principal` from the request headers (header auth model):
+
+      1. `X-API-Key` authenticates the caller (Shield) — bad/absent -> 401.
+      2. `X-User-Id` + `X-Entity-Id` carry the acting identity — absent -> 401.
+      3. If `verify_membership` is on, the (user, entity) pair is checked against
+         `user_scope_assignment` — not a real active Entity assignment -> 403. Default OFF:
+         the pair is taken on trust (Phase A), the API key is the security boundary.
+
+    downstream handlers still owe `require_entity`. AuthError/EntityForbidden propagate to
+    the [R9] envelope handler in app/api/errors.py."""
+    client_id = verify_api_key(x_api_key)
+    # X-User-Id, X-Entity-Id and X-Tenant-Id are all REQUIRED — absent/blank → 401. isinstance
+    # guard: on a real request these are str; when this dependency is called directly (tests)
+    # an unpassed Header param is FastAPI's sentinel, not a str.
+    tenant_id = x_tenant_id.strip() if isinstance(x_tenant_id, str) else ""
+    if not (x_user_id.strip() and x_entity_id.strip() and tenant_id):
+        raise AuthError(_UNAUTHORIZED)
+    user_id, entity_id = x_user_id.strip(), x_entity_id.strip()
+
+    if get_settings().verify_membership:
+        try:
+            with db_session() as sess:
+                allowed = dal.user_has_entity(sess, user_id, entity_id)
+        except Exception:  # noqa: BLE001 — fail CLOSED: any lookup error is a deny, not an allow
+            _log.warning("auth.membership_check_failed", user_id=user_id, entity_id=entity_id)
+            allowed = False
+        if not allowed:
+            raise EntityForbidden(f"user {user_id} is not authorized for entity {entity_id}")
+
+    structlog.contextvars.bind_contextvars(
+        sub=user_id, entity=entity_id, tenant=tenant_id, client_id=client_id)
+    return Principal(claims={"sub": user_id}, entities={entity_id},
+                    client_id=client_id, tenant_id=tenant_id)
 
 
 def require_admin(x_admin_key: str = Header(default="", alias="X-Admin-Key")) -> None:

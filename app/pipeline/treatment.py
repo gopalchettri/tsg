@@ -10,10 +10,14 @@ scenario/asset/threat/mapped-controls context — into InputSnapshotJSON at POST
 worker prompts from that snapshot and the GET serves it, so nothing external can skew a
 stored plan.
 
-Deliberately OUTSIDE the stage machinery: accepted scenarios exist only on COMPLETED
+OUTSIDE the stage machinery: accepted scenarios exist only on COMPLETED
 sessions, where dal.acquire_lock/claim_stage refuse to run — the Risk_Treatment_Plan row's
 own Status column is the state, fenced by the conditional-UPDATE helpers in dal.py
 (claim_plan / finish_plan / supersede_active_plan).
+
+The worker body also publishes an advisory SSE refetch hint after each COMMITTED finish
+(_publish_plan_result) — the module's only cross-cutting side effect. It is a hint, never a
+completion contract; see that function's docstring for the three outcomes that never publish.
 """
 from __future__ import annotations
 
@@ -25,17 +29,28 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.enums import (ActionPriority, AuditEventType, ControlCoverage, ControlType,
-                            StageStatus, TreatmentGateReason, TreatmentStrategy, YesNo)
+from app.core.enums import (
+    ActionPriority,
+    AuditEventType,
+    ControlCoverage,
+    ControlType,
+    SSEEventType,
+    StageStatus,
+    TreatmentGateReason,
+    TreatmentOutcomeReason,
+    TreatmentStrategy,
+    YesNo,
+)
 from app.core.logging import get_logger
 from app.core.security import redact
 from app.db import dal
 from app.db import models as m
-from app.pipeline import grounding
+from app.pipeline import grounding, prompts
 from app.pipeline import llm as llm_mod
-from app.pipeline import prompts
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 from app.pipeline.tasks import ASSET_UNIT_ID, _ask_ai, _failure_client_message
+from app.pipeline.validation import LLMResponseParseError
+from app.sse import bus
 
 log = get_logger(__name__)
 
@@ -48,8 +63,8 @@ _RESERVED_PLAN_KEYS = ("treatment_plan", "risk_identification_date",
 
 # Per-field cap applied to UI-supplied free text at snapshot time (house analog: intel items
 # truncate before entering the prompt). Pydantic max_length bounds reject oversized fields at
-# the boundary; this is defense-in-depth for anything that slips a path around them.
-_FREE_TEXT_CAP = 2000
+# the boundary; this is defense-in-depth for anything that slips a path around them. Lives in
+# Settings.treatment_free_text_cap now (default unchanged: 2000).
 
 
 class TreatmentConflict(Exception):
@@ -70,8 +85,9 @@ class TreatmentPlanInvalid(Exception):
 def _clip(text: str | None) -> str | None:
     """redact() + length cap for one UI-supplied free-text value crossing into the snapshot."""
     cleaned = redact(text)
-    if cleaned and len(cleaned) > _FREE_TEXT_CAP:
-        return cleaned[:_FREE_TEXT_CAP]
+    cap = get_settings().treatment_free_text_cap
+    if cleaned and len(cleaned) > cap:
+        return cleaned[:cap]
     return cleaned
 
 
@@ -97,7 +113,7 @@ def _library_map_stmt(output_id: str):
         select(cmap.MapRank, lib.ControlLibraryID, lib.ControlCode, lib.Domain, lib.ControlName)
         .join(lib, lib.ControlLibraryID == cmap.ControlLibraryID)
         .where(cmap.OutputID == output_id,
-               lib.IsActive == True, lib.IsDeleted == False)  # noqa: E712
+            lib.IsActive == True, lib.IsDeleted == False)  # noqa: E712
         .order_by(cmap.MapRank)
     )
 
@@ -108,7 +124,7 @@ def _standards_stmt(control_library_ids: list[int]):
         select(smap.ControlLibraryID, std.StandardName)
         .join(std, std.StandardID == smap.StandardID)
         .where(smap.ControlLibraryID.in_(control_library_ids),
-               std.IsActive == True, std.IsDeleted == False)  # noqa: E712
+            std.IsActive == True, std.IsDeleted == False)  # noqa: E712
         .order_by(std.StandardName)
     )
 
@@ -351,6 +367,66 @@ def _narrative_text(parsed: dict[str, Any]) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _classify_failure(exc: Exception) -> tuple[TreatmentOutcomeReason, str]:
+    """One terminal failure -> (reason a client switches on, message a human reads).
+
+    The reason is the contract; the message is never parsed. Both are derived here so the two can
+    never disagree, and so the wire carries no `repr(exc)` — `_failure_client_message` returns one
+    for a parse error, which is fine for the stage pipeline's logs but is an unstable Python
+    detail to publish. Here the reason already says "the model's reply was unusable", so the
+    message can be a fixed sentence."""
+    if isinstance(exc, TreatmentPlanInvalid):
+        # Its own message names the missing table — precise, client-safe, worth keeping.
+        return TreatmentOutcomeReason.invalid_plan, str(exc)
+    if isinstance(exc, LLMResponseParseError):
+        return TreatmentOutcomeReason.invalid_plan, "the model's reply was not usable JSON"
+    msg = _failure_client_message(exc)  # shared classifier: guardrail vs generic
+    if msg == "content blocked by a configured safety guardrail":
+        return TreatmentOutcomeReason.content_blocked, msg
+    return TreatmentOutcomeReason.generation_failed, msg
+
+
+def _plan_result_event(row, plan_id: str, status: StageStatus,
+                       reason: TreatmentOutcomeReason | None = None) -> dict:
+    """The advisory SSE payload for one finished plan. Split from the publish so the self-check
+    can assert it against TreatmentPlanResultEvent without a bus or a DB. StrEnum members serialize
+    as their value, so no str() conversion is needed here."""
+    event = {"type": SSEEventType.treatment_plan_result,
+             "session_id": row["SessionID"], "output_id": row["OutputID"],
+             "plan_id": plan_id, "status": status, "ts": dal.now().isoformat()}
+    if reason is not None:
+        event["reason"] = reason
+    return event
+
+
+def _publish_plan_result(row, plan_id: str, status: StageStatus,
+                         reason: TreatmentOutcomeReason | None = None) -> None:
+    """Tell any open SSE stream this plan finished, so the UI refetches now instead of on its next
+    poll. Three rules, each with a failure mode that is invisible until it bites:
+
+    AFTER the commit, never before. The bus has no replay log, so the durable row must be visible
+    first — publishing earlier makes the client refetch and read the OLD status, and the spinner
+    never clears (the ordering rule cascade.py:166-171 states for its own advisory events).
+
+    Channel from row["SessionID"], never a path param. Redis channel names are byte-exact and the
+    subscriber keys off the canonical row value (app/api/sessions.py:855-858); a differently-cased
+    id opens a channel nobody listens on, so the stream authorizes, reconciles, then delivers
+    nothing but heartbeats forever.
+
+    Never raises — bus.publish swallows everything behind its circuit breaker (app/sse/bus.py:82).
+    That is load-bearing here: the COMPLETE call site sits inside the worker's try/except, so a
+    raising publish would be caught by the terminal handler and try to park an already-finished
+    row, logging a contradictory finish_dropped.
+
+    A HINT, not a completion contract. Only a winning finish CAS publishes, so three outcomes are
+    silent: a dead worker (row stays RUNNING; only the GET's read-time projection calls it timed
+    out, and there is no reaper to fire one later), an LLMSlotUnavailable autoretry (which bumps
+    the progress clock every attempt, so the row never even goes stale), and cancel/review (written
+    in the API process). A publish failure additionally silences this whole worker process for a
+    cooldown window. Clients MUST keep a slow backstop poll."""
+    bus.publish(row["SessionID"], _plan_result_event(row, plan_id, status, reason))
+
+
 # ---------------------------------------------------------------------------
 # Worker body (Celery task delegate)
 # ---------------------------------------------------------------------------
@@ -414,25 +490,28 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
                                                 "status": str(StageStatus.COMPLETE),
                                                 "warnings": len(warnings)}))
         sess.commit()
+        _publish_plan_result(row, plan_id, StageStatus.COMPLETE)  # after the commit — see docstring
         log.info("treatment.complete", plan_id=plan_id, warnings=len(warnings))
     except LLMSlotUnavailable:
         sess.rollback()
         raise  # Celery autoretry; the claim's own-task branch resumes on the retry
     except Exception as exc:  # noqa: BLE001 — terminal: park the row, never crash the worker
         sess.rollback()  # discards only post-_ask_ai work; the Prompt_Log commit already landed
-        client_msg = (str(exc) if isinstance(exc, TreatmentPlanInvalid)
-                      else _failure_client_message(exc))
+        reason, client_msg = _classify_failure(exc)
         # Fenced like the success path: if the CAS matched nothing (another delivery already
         # finished the row, or a re-POST superseded it), writing an ERROR audit row would
         # contradict the plan's real state — drop it instead.
-        if dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=task_id, error_message=client_msg):
+        if dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=task_id,
+                           error_message=client_msg, error_reason=reason):
             dal.append_audit(sess, AuditID=dal.guid(), **audit_cols,
                              SubsystemID=ASSET_UNIT_ID,
                              EventType=AuditEventType.treatment_plan_outcome,
                              DetailJSON=json.dumps({"plan_id": plan_id,
                                                     "status": str(StageStatus.ERROR),
+                                                    "reason": str(reason),  # switchable in the audit feed too
                                                     "error": client_msg}))
             sess.commit()
+            _publish_plan_result(row, plan_id, StageStatus.ERROR, reason)  # after commit — see docstring
         else:
             sess.rollback()
             log.info("treatment.finish_dropped", plan_id=plan_id, error=client_msg)
@@ -446,6 +525,30 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     for _stmt in (_library_map_stmt("00000000-0000-0000-0000-000000000000"),
                   _standards_stmt([1])):
         _stmt.compile()
+
+    # The advisory SSE payload must satisfy the model the API publishes to /openapi.json — the one
+    # drift the manual two-terminal test cannot catch (a wrong key still "arrives", just unusable).
+    from app.api.schemas import TreatmentPlanResultEvent
+    _ev = _plan_result_event(
+        {"SessionID": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
+         "OutputID": "1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90"},
+        "b9fe2c07-4d3a-4a51-8e2f-6c1d90a7e4b3", StageStatus.COMPLETE)
+    assert TreatmentPlanResultEvent(**_ev).status == "COMPLETE"
+    assert _ev["type"] == "treatment_plan_result"
+    assert "reason" not in _ev, "COMPLETE carries no reason"
+    _err = _plan_result_event(
+        {"SessionID": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
+         "OutputID": "1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90"},
+        "b9fe2c07-4d3a-4a51-8e2f-6c1d90a7e4b3", StageStatus.ERROR,
+        TreatmentOutcomeReason.cancelled)
+    assert TreatmentPlanResultEvent(**_err).reason == "cancelled"
+
+    # _classify_failure: every terminal exception maps to a reason, and none leaks a repr().
+    assert _classify_failure(TreatmentPlanInvalid("missing table 'x'")) == (
+        TreatmentOutcomeReason.invalid_plan, "missing table 'x'")
+    _r, _m = _classify_failure(LLMResponseParseError("boom", dict))
+    assert _r is TreatmentOutcomeReason.invalid_plan and "LLMResponseParseError" not in _m
+    assert _classify_failure(RuntimeError("db down"))[0] is TreatmentOutcomeReason.generation_failed
 
     # validated_actors: the stored dict shape round-trips; corrupt/mis-shaped blobs -> [].
     assert grounding.validated_actors('{"actors": ["APT x"], "validated": true}') == ["APT x"]
@@ -510,7 +613,8 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     # snapshot path (_clip is the door body text enters through).
     leaked = _clip("apply patches. db_password=Hunter2SecretValue then reboot")
     assert leaked is not None and "Hunter2SecretValue" not in leaked
-    assert len(_clip("x" * (_FREE_TEXT_CAP + 500)) or "") == _FREE_TEXT_CAP
+    _cap = get_settings().treatment_free_text_cap
+    assert len(_clip("x" * (_cap + 500)) or "") == _cap
 
     # TreatmentConflict carries its wire reason.
     tc = TreatmentConflict("busy", reason=TreatmentGateReason.generation_in_progress)

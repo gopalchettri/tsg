@@ -20,7 +20,8 @@ from sqlalchemy.pool import QueuePool
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.db import dal, models as m
+from app.db import dal
+from app.db import models as m
 from app.db.engine import get_engine
 
 log = get_logger(__name__)

@@ -40,6 +40,16 @@ _RETIRED_SETTINGS: dict[str, str] = {
         "per threat by dal.variant_eligible_primaries — a 2-system asset finishes in two, an "
         "8-system one earns eight. Delete this variable. To bound retries when the model keeps "
         "re-using one entry point, set TSG_COVERAGE_ATTEMPT_SLACK instead."),
+    # Auth moved from JWT to the header model (X-API-Key + X-User-Id + X-Entity-Id). These no
+    # longer exist; a live value means the deployment still thinks it is doing JWT/dev-mode auth.
+    "AUTH_DEV_MODE": "the dev bypass is gone; the header model authenticates every request. Remove it.",
+    "TSG_AUTH_DEV_MODE": "the dev bypass is gone; the header model authenticates every request. Remove it.",
+    "TSG_JWT_ISSUER": "TSG no longer validates JWTs — it uses X-API-Key. Remove it.",
+    "TSG_JWT_AUDIENCE": "TSG no longer validates JWTs — it uses X-API-Key. Remove it.",
+    "TSG_JWT_JWKS_URL": "TSG no longer validates JWTs — it uses X-API-Key. Remove it.",
+    "TSG_JWT_SECRET": "TSG no longer validates JWTs — it uses X-API-Key. Remove it.",
+    "TSG_JWT_ALGORITHMS": "TSG no longer validates JWTs — it uses X-API-Key. Remove it.",
+    "TSG_JWT_ENTITIES_CLAIM": "TSG no longer reads a JWT entities claim — the entity is X-Entity-Id, verified in the DB. Remove it.",
 }
 
 
@@ -73,6 +83,13 @@ class Settings(BaseSettings):
     # --- Identity ---
     # The customer/organization this instance serves. TSG only supports one at a time.
     tenant_id: str = "DESC"
+
+    # This deployment's module identity. An API_Client key authenticates ONLY for its own Module
+    # (a 'chatbot' key can't open TSG). Fixed per deployment; the request never carries it — it is
+    # implied by which app receives the call. min_length guards a blank value that would silently
+    # 401 every request. See app/db/dal.API_MODULE and app/api/deps.verify_api_key.
+    api_module: str = Field(
+        "tsg", min_length=1, validation_alias=AliasChoices("API_MODULE", "TSG_API_MODULE"))
 
     # Blocks the dev-only login bypass from running in staging/prod.
     app_env: Literal["local", "dev", "staging", "prod"] = Field(
@@ -453,6 +470,30 @@ class Settings(BaseSettings):
 
     stage_max_attempts: int = 5
 
+    # --- Library-promotion retry (accept.py's isolated Phase 2 / reaper.py's promotion sweep) ---
+    promotion_retry_interval_seconds: float = 60.0
+
+    # A session stops being auto-retried after this many failed attempts, staying visible via the
+    # admin API for manual follow-up. Read ONLY by the sweep's candidate query — never inside
+    # retry_one_promotion itself, so a manual admin retry is never blocked by this cap.
+    promotion_max_attempts: int = 5
+
+    # True (default): the periodic sweep retries a failed promotion automatically. False: failures
+    # only wait for an admin to retry them via POST /v1/tsg/sessions/promotions/{id}/retry.
+    promotion_auto_retry_enabled: bool = True
+
+    # Max sessions one sweep pass retries — bounds a single pass's runtime; any remainder is
+    # picked up on the next scheduled tick rather than growing one pass unboundedly.
+    promotion_sweep_batch_limit: int = 200
+
+    # Also the admin list endpoint's default page size (bounded separately per-request up to
+    # promotion_list_max_limit) — same "don't return something unbounded" reasoning either way.
+    promotion_list_max_limit: int = 500
+
+    # False (default): a "genuinely novel" triage verdict queues for admin review instead of
+    # minting into the shared library immediately. True restores today's auto-mint behavior.
+    promotion_auto_approve_enabled: bool = False
+
     # --- Health monitoring / self-check ---
     self_check_interval_seconds: float = 300.0
     tempdb_version_store_warn_mb: int = 1024
@@ -461,31 +502,128 @@ class Settings(BaseSettings):
     pool_utilization_warn_ratio: float = 0.9
 
     # --- SSE (live session updates to the browser) ---
-    sse_ping_seconds: int = 15
+    sse_ping_seconds: int = Field(15, gt=0)  # 0 floods pings; negative 500s every connect
     sse_breaker_cooldown_seconds: float = 30.0
     sse_publish_timeout_seconds: float = 1.0
     sse_subscribe_connect_timeout_seconds: float = 2.0
+    # Sizes BOTH the shared Redis connection pool (bus.py) and the per-process semaphore gating
+    # session_events() — one value, not two, so the semaphore can never admit more streams than
+    # the pool has connections for.
+    sse_max_concurrent_streams: int = 180
+    # A stalled SSE consumer is force-closed within this long, not left open for ~15 minutes.
+    sse_send_timeout_seconds: float = 30.0
+    # Bounded drain window on shutdown — under gunicorn's 30s graceful-timeout (with margin), so
+    # open streams get a chance to close cleanly instead of an instant cut on every rollout.
+    sse_shutdown_grace_seconds: float = 25.0
+    # Read timeout / liveness check on the shared subscriber connection pool.
+    sse_subscriber_socket_timeout_seconds: float = 10.0
+    sse_subscriber_health_check_interval_seconds: float = 30.0
+
+    # --- CORS (browser-based external consumers) ---
+    # Empty (default) = no cross-origin browser access. Set per environment.
+    cors_allowed_origins: list[str] = Field(default_factory=list)
 
     # --- Admin API ---
     # Unlocks the admin-only threat-library endpoints. Empty (default) = disabled.
     admin_api_key: str = Field(
         "", validation_alias=AliasChoices("ADMIN_API_KEY", "TSG_ADMIN_API_KEY"))
 
-    # --- JWT: this app only checks login tokens issued elsewhere, never issues its own ---
-    jwt_issuer: str = ""
-    jwt_audience: str = ""
-    jwt_jwks_url: str = ""
+    # --- API authentication (Shield -> TSG, header model) ---
+    # Shield sends X-API-Key (authenticates the caller) + X-User-Id + X-Entity-Id on every call.
+    # When True, each request's (user, entity) pair is additionally verified against
+    # user_scope_assignment (defence-in-depth). Default False: authenticate the caller by
+    # X-API-Key only and take the identity headers on trust. Flip to True once the production
+    # user_scope_assignment / scope_type mapping is confirmed. See app/api/deps.get_principal.
+    verify_membership: bool = Field(
+        False, validation_alias=AliasChoices("VERIFY_MEMBERSHIP", "TSG_VERIFY_MEMBERSHIP"))
 
-    # Shared HS256 secret. When set, signatures are verified with it and the JWKS URL is not used
-    # (EY Shield WebAPI issues HS256 tokens with a shared key).
-    jwt_secret: str = ""
+    # --- Celery task dashboard (Flower) ---
+    # "user:password" for Flower's --basic-auth. Read by docker/compose.prod.yml and start.ps1,
+    # never by Python — Flower is a separate `celery flower` process, not part of this app. It
+    # lives here anyway so config stays discoverable in one surface and env_selfcheck enforces
+    # its presence in every .env template.
+    # Flower has NO auth by default and exposes task revoke/terminate, so the prod compose
+    # service refuses to start while this is empty. Local dev binds to 127.0.0.1 and may leave
+    # it unset.
+    flower_basic_auth: str = Field(
+        "", validation_alias=AliasChoices("FLOWER_BASIC_AUTH", "TSG_FLOWER_BASIC_AUTH"))
 
-    jwt_algorithms: tuple[str, ...] = ("RS256",)
-    # Token field listing which organizations the user can access.
-    jwt_entities_claim: str = "entities"
+    # (Auth is the header model — X-API-Key + X-User-Id + X-Entity-Id, see app/api/deps.py.
+    # The old jwt_* / auth_dev_mode settings are retired in _RETIRED_SETTINGS above.)
 
-    # DEV ONLY — skip login checks. The app refuses to start with this on in staging/prod.
-    auth_dev_mode: bool = Field(False, validation_alias=AliasChoices("AUTH_DEV_MODE", "TSG_AUTH_DEV_MODE"))
+    # --- Promoted from hardcoded module constants (each default is UNCHANGED from its former
+    # hardcoded value, so leaving these unset in env reproduces prior behaviour exactly) ---
+
+    # app/pipeline/grounding.py::_auto_calibrate — how many library entries the boot-time
+    # threshold auto-calibration samples. _auto_calibrate itself already requires >=5 to attempt
+    # anything.
+    calibration_sample_size: int = Field(100, ge=5)
+    # app/pipeline/grounding.py::_paraphrase — LLM rewordings generated per sampled name
+    # (the auto-labelled calibration POSITIVES).
+    calibration_paraphrases_per_name: int = Field(2, ge=1)
+
+    # app/pipeline/embeddings.py::_group_lock — Redis mutex TTL guarding a group's embedding
+    # cache rebuild. MUST stay an int: redis-py rejects a float for SET's ex=/EXPIRE (DataError).
+    embedding_group_lock_ttl_seconds: int = Field(30, ge=1)
+    # app/pipeline/embeddings.py::_store_if_healthy — circuit-breaker cooldown before retrying
+    # the Mongo vector store after a connection failure.
+    mongo_breaker_cooldown_seconds: float = Field(30.0, ge=0.0)
+    # app/pipeline/embeddings.py::_embed_missing (also app/pipeline/control_mapping.py's own
+    # query-priming loop) — max texts per external embed() call, so one oversized batch can't
+    # exceed a provider's own limit and fail an entire group with zero progress.
+    embedding_batch_size: int = Field(100, ge=1)
+
+    # app/pipeline/llm.py::_llm_slot — poll interval / jitter while waiting for a free LLM
+    # concurrency slot. Jitter avoids synchronized thundering-herd wakeups.
+    llm_slot_poll_seconds: float = Field(0.25, gt=0.0)
+    llm_slot_poll_jitter_seconds: float = Field(0.1, ge=0.0)
+    # app/pipeline/llm.py::embed()/chat() — safety caps against pathological input (e.g. a whole
+    # document routed into a short field). Not expected to trip on real text.
+    max_embed_chars: int = Field(4000, ge=1)
+    max_chat_chars: int = Field(60_000, ge=1)
+
+    # app/pipeline/treatment.py — per-field cap on UI-supplied free text at snapshot time.
+    # Defense-in-depth behind the Pydantic max_length bounds already enforced at the API boundary.
+    treatment_free_text_cap: int = Field(2000, ge=1)
+
+    # app/pipeline/reaper.py::_split_into_batches — max ids per SQL IN-list chunk when
+    # batch-processing crashed sessions. Bounded well under SQL Server's ~2100-param hard limit.
+    reaper_sql_in_chunk_size: int = Field(1000, ge=1, le=2000)
+
+    # app/pipeline/celery_app.py::_init_worker — retry count/backoff for the litellm-model and
+    # grounding-threshold warm-up checks at worker boot.
+    llm_verify_max_attempts: int = Field(3, ge=1)
+    llm_verify_retry_backoff_seconds: float = Field(5.0, ge=0.0)
+
+    # app/pipeline/accept.py::_unacceptable_subset — max offending ids named in the human-
+    # readable 404 message (details.unacceptable in the response always carries every one).
+    accept_named_in_message: int = Field(3, ge=1)
+
+    # app/pipeline/threat_library_import.py::_is_abandoned — window after which a "running"
+    # import row is treated as abandoned. Should match the Celery broker's visibility_timeout
+    # (currently 3600s, set directly in celery_app.py's conf.update) — past it, the message has
+    # already been redelivered or abandoned, so no live worker still holds the row.
+    library_import_stale_after_seconds: int = Field(3600, ge=1)
+    # app/pipeline/threat_library_import.py::run_import — max skipped-item entries returned in an
+    # import result payload (full counts are always reported; this only bounds a huge STIX bundle
+    # from ballooning the Celery result backend payload).
+    library_import_skipped_cap: int = Field(50, ge=0)
+
+    # app/pipeline/tasks.py::_usable_proposal — max combined type+name chars for an LLM-proposed
+    # threat to be usable. Kept <= max_embed_chars by the validator below: embed() errors (never
+    # truncates) over that limit, which would lose every threat in the batch, not just the long one.
+    max_proposal_chars: int = Field(3500, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_proposal_below_embed_cap(self) -> "Settings":
+        """max_proposal_chars must stay <= max_embed_chars: embed() errors (never truncates) on
+        an over-limit text, which would lose every threat in the batch, not just the long one."""
+        if self.max_proposal_chars > self.max_embed_chars:
+            raise ValueError(
+                f"max_proposal_chars ({self.max_proposal_chars}) must not exceed max_embed_chars "
+                f"({self.max_embed_chars}) — embed() errors on an over-limit text instead of "
+                "truncating it, which would lose every threat in the batch.")
+        return self
 
     @model_validator(mode="after")
     def _derive_embedding_reranker_provider(self) -> "Settings":
@@ -662,22 +800,48 @@ def get_settings() -> Settings:
 
 
 def assert_security_posture(settings: Settings | None = None) -> None:
-    """Startup safety check. AUTH_DEV_MODE on skips everything (there is no login to verify), so it
-    works as a deliberate opt-in outside dev too; off, staging/prod require full JWT config."""
+    """Startup safety check for the header auth model. The real gate — that at least one API key
+    is provisioned — is a DB check in db.invariants.verify_startup (it needs the engine). Here we
+    only surface the one silent-misconfiguration risk that has no other alarm: running in
+    staging/prod with the defence-in-depth (user, entity) DB check turned OFF."""
     s = settings or get_settings()
-    if s.auth_dev_mode:
-        return
-    prod_like = s.app_env in ("staging", "prod")
-    if prod_like:
-        # security.validate_jwt already fails closed per-request on a missing issuer/audience, but
-        # an unset JWKS URL only surfaces as every request 401-ing on a key fetch of "". Fail at
-        # boot instead, naming exactly which env vars are missing.
-        missing = [env for env, value in (("TSG_JWT_ISSUER", s.jwt_issuer),
-                                        ("TSG_JWT_AUDIENCE", s.jwt_audience)) if not value]
-        if not (s.jwt_jwks_url or s.jwt_secret):
-            # Either verification mode will do: JWKS (asymmetric) or shared secret (HS256).
-            missing.append("TSG_JWT_JWKS_URL or TSG_JWT_SECRET")
-        if missing:
-            raise RuntimeError(
-                f"APP_ENV={s.app_env} requires JWT verification to be fully configured; "
-                f"missing: {', '.join(missing)}. Refusing to start.")
+    if s.app_env in ("staging", "prod") and not s.verify_membership:
+        # Not fatal — Phase A (key-only) is a legitimate posture — but it must never be silent.
+        from app.core.logging import get_logger
+        get_logger(__name__).warning(
+            "auth.membership_check_disabled",
+            app_env=s.app_env,
+            note="TSG_VERIFY_MEMBERSHIP is OFF: X-User-Id/X-Entity-Id are trusted, not verified "
+                "against user_scope_assignment. Set TSG_VERIFY_MEMBERSHIP=true once the prod "
+                "scope table is confirmed.")
+
+
+def assert_sse_graceful_shutdown_wired(get_signal_handler=None) -> None:
+    """Startup safety check for item 21. sse_starlette's own graceful-shutdown fallback
+    (`_shutdown_watcher`/`_get_uvicorn_server` in sse_starlette/sse.py) is already correct given
+    the current server — it works by introspecting the LIVE SIGTERM handler,
+    `signal.getsignal(signal.SIGTERM).__self__`, to find the running uvicorn `Server` instance
+    when its own monkey-patch of `Server.handle_exit` hasn't taken. That introspection depends on
+    this process actually being driven by uvicorn's `Server.serve()` (bare uvicorn, or gunicorn
+    via `uvicorn.workers.UvicornWorker` — both install the SIGTERM handler in
+    `Server.capture_signals()` before the ASGI lifespan startup we run from ever fires). We run
+    the EXACT SAME introspection here, at boot, so a future switch away from that worker class
+    (e.g. a plain WSGI/sync gunicorn worker, or some other ASGI server) fails loudly instead of
+    silently losing graceful SSE shutdown.
+
+    Deliberately NOT "is uvicorn importable": uvicorn is a hard dependency of this app regardless
+    of which worker class actually drives the event loop (gunicorn's `-k` flag just names a
+    class), so an import check would pass even after the worker class drifted away from uvicorn —
+    exactly the silent failure this assertion exists to catch."""
+    import signal as _signal
+
+    handler = (get_signal_handler or _signal.getsignal)(_signal.SIGTERM)
+    server = getattr(handler, "__self__", None)
+    if server is None or not hasattr(server, "should_exit"):
+        raise RuntimeError(
+            "SSE graceful shutdown depends on sse_starlette's uvicorn signal-handler "
+            "introspection (sse_starlette.sse._get_uvicorn_server), but "
+            f"signal.getsignal(signal.SIGTERM) is not a bound uvicorn Server method (got "
+            f"{handler!r}). Open SSE streams will NOT drain gracefully on shutdown. Run under "
+            "uvicorn (bare `uvicorn app.main:app`, or gunicorn -k "
+            "uvicorn.workers.UvicornWorker) — see this function's docstring.")

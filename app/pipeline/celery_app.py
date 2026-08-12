@@ -25,15 +25,15 @@ from app.db.dal import guid
 from app.db.engine import db_session
 from app.pipeline import cascade, embeddings, treatment
 from app.pipeline.llm import LLMSlotUnavailable, get_llm
-from app.pipeline.reaper import clean_up_abandoned_sessions
+from app.pipeline.reaper import clean_up_abandoned_sessions, retry_failed_promotions
 from app.pipeline.selfcheck import run_self_checks
 from app.pipeline.tasks import _process_all_supporting_systems
 
 _s = get_settings()
 
 # Bounded retry for _init_worker's verify_litellm_models() call — see its own comment below.
-_LLM_VERIFY_MAX_ATTEMPTS = 3
-_LLM_VERIFY_RETRY_BACKOFF_SECONDS = 5.0
+# Lives in Settings.llm_verify_max_attempts / Settings.llm_verify_retry_backoff_seconds now
+# (defaults unchanged: 3 / 5.0).
 
 celery_app = Celery("tsg", broker=_s.celery_broker_url or _s.redis_url,
                     backend=_s.celery_result_backend or _s.redis_url)
@@ -41,6 +41,14 @@ celery_app.conf.update(
     result_expires=_s.result_expires_seconds,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+
+    # Task-lifecycle events. WITHOUT these a worker emits nothing, so Flower (or any other event
+    # consumer) shows live workers and an EMPTY task list — the dashboard looks broken when it is
+    # actually the producer that is silent. Set HERE, not as `-E` on each launch, so every path
+    # (compose.prod.yml, start.ps1, a bare `celery worker`) is covered by one source of truth.
+    # Cost is a few extra broker messages per task — negligible against minutes-long LLM stages.
+    worker_send_task_events=True,   # worker: task-received/started/succeeded/failed
+    task_send_sent_event=True,      # producer (the API): task-sent, so QUEUE latency is visible too
     # NO worker_pool="gevent" here, deliberately: the setting resolves too late for a
     # monkey-patch and celery warns (W_POOL_SETTING) on every boot. -P gevent is passed on every
     # launch path, and the prefork fail-fast in _init_worker covers a bare `celery worker`.
@@ -52,6 +60,8 @@ celery_app.conf.update(
     broker_transport_options={"visibility_timeout": 3600},
     beat_schedule={                    # the reaper must run on a schedule in production
         "reap-stuck-sessions": {"task": "tsg.reap", "schedule": _s.reaper_interval_seconds},
+        "retry-failed-promotions": {"task": "tsg.retry_promotions",
+                                    "schedule": _s.promotion_retry_interval_seconds},
         "operational-self-check": {"task": "tsg.self_check", "schedule": _s.self_check_interval_seconds},
         # live threat-intel refresh — opt-in (TSG_INTEL_ENABLED); absent entirely when off
         **({"intel-refresh": {"task": "tsg.intel_refresh", "schedule": _s.intel_refresh_interval_seconds}}
@@ -70,11 +80,11 @@ def _init_worker(sender=None, **_):
     verify_startup repeats the API's check because a worker can be deployed independently."""
     # worker-only setup: imported here so merely importing this module (e.g. from FastAPI)
     # doesn't drag it in
+    import gevent
+
     from app.core.config import assert_security_posture
     from app.db.engine import get_engine
     from app.db.invariants import verify_startup
-    import gevent
-
     from app.pipeline.llm import log_litellm_key_info, verify_litellm_models
     from app.pipeline.local_models import validate_local_models
 
@@ -98,17 +108,19 @@ def _init_worker(sender=None, **_):
     # validate_local_models warms the models, so the ceiling holds from the first call.
     gevent.get_hub().threadpool.size = get_settings().local_model_threadpool_size
     validate_local_models(warm=True)   # fail-fast + warm the local models so the 1st request is fast
+    verify_max_attempts = get_settings().llm_verify_max_attempts
+    verify_backoff = get_settings().llm_verify_retry_backoff_seconds
     # verify_litellm_models goes through the same _llm_slot limiter as a real task, but this
     # signal handler is not a @celery_app.task, so autoretry_for never applies — several replicas
     # booting at once would raise LLMSlotUnavailable straight out of worker startup.
-    for attempt in range(_LLM_VERIFY_MAX_ATTEMPTS):
+    for attempt in range(verify_max_attempts):
         try:
             verify_litellm_models()    # fail-fast: same discipline, for whichever models route through the proxy
             break
         except LLMSlotUnavailable:
-            if attempt == _LLM_VERIFY_MAX_ATTEMPTS - 1:
+            if attempt == verify_max_attempts - 1:
                 raise
-            time.sleep(_LLM_VERIFY_RETRY_BACKOFF_SECONDS * (attempt + 1))
+            time.sleep(verify_backoff * (attempt + 1))
     log_litellm_key_info()             # observability only, never raises
     # Warm the per-model-pair grounding thresholds OUTSIDE any stage lease: the first resolution
     # for a new embedding+reranker pair auto-calibrates (a bounded paraphrase+scoring pass), which
@@ -116,17 +128,17 @@ def _init_worker(sender=None, **_):
     # allow_calibration=True ONLY here, so the expensive pass can never run in a leased stage.
     # Best-effort: on failure workers resolve lazily later, at worst on the static defaults.
     from app.pipeline.grounding import resolve_thresholds
-    for attempt in range(_LLM_VERIFY_MAX_ATTEMPTS):
+    for attempt in range(verify_max_attempts):
         try:
             with db_session() as sess:
                 resolve_thresholds(sess, get_llm(), allow_calibration=True)
             break
         except LLMSlotUnavailable:
-            if attempt == _LLM_VERIFY_MAX_ATTEMPTS - 1:
+            if attempt == verify_max_attempts - 1:
                 from app.core.logging import get_logger
                 get_logger(__name__).warning("grounding.threshold_warmup_slots_exhausted")
                 break
-            time.sleep(_LLM_VERIFY_RETRY_BACKOFF_SECONDS * (attempt + 1))
+            time.sleep(verify_backoff * (attempt + 1))
         except Exception:  # noqa: BLE001 — warm-up only; never blocks worker boot
             from app.core.logging import get_logger
             get_logger(__name__).warning("grounding.threshold_warmup_failed", exc_info=True)
@@ -230,6 +242,15 @@ def reap_task() -> list[str]:
         return clean_up_abandoned_sessions(sess)
 
 
+@celery_app.task(name="tsg.retry_promotions")
+def retry_promotions_task() -> list[str]:
+    """Periodic library-promotion retry sweep; scheduled by `beat_schedule` above.
+    retry_failed_promotions() already logs what it retried (and no-ops, logging why, when
+    promotion_auto_retry_enabled is off)."""
+    with db_session() as sess:
+        return retry_failed_promotions(sess)
+
+
 @celery_app.task(name="tsg.intel_refresh")
 def intel_refresh_task() -> dict[str, str]:
     """Scheduled pull of the open threat-intel feeds into the Mongo `threat_intel` cache. Gated
@@ -238,11 +259,10 @@ def intel_refresh_task() -> dict[str, str]:
     DISPATCHER, not a worker: one `tsg.intel_refresh_feed` job per enabled feed, returning
     {feed: job_id}. The fan-out buys per-feed isolation — a slow or broken feed can't delay the
     others, and each records its own outcome for the per-feed status API."""
-    from app.intel.fetchers import enabled_feed_names  # local import, mirrors admin-task style
-
     # This module has no module-level logger; a bare `log` raises NameError on every scheduled run
     # AFTER the jobs are dispatched, so the feeds refresh but the dispatcher always ends FAILURE.
     from app.core.logging import get_logger
+    from app.intel.fetchers import enabled_feed_names  # local import, mirrors admin-task style
 
     jobs = {feed: intel_refresh_feed_task.delay(feed).id for feed in enabled_feed_names()}
     get_logger(__name__).info("intel.refresh_dispatched", feeds=list(jobs))

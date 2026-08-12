@@ -10,7 +10,9 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 *.egg-info/
+celerybeat-schedule
 celerybeat-schedule.*
+celerybeat-schedule-*
 
 # Ad hoc connectivity/permission test scripts - test_db_connectivity.py has
 # real MSSQL/Redis/MongoDB/Neo4j passwords hardcoded, never commit it.
@@ -19,8 +21,7 @@ scripts/redis_acl_check.py
 
 .claude/
 
-# Local run artifacts and duplicated schema copies — not part of the repo.
+# Local run artifacts — not part of the repo.
 # NOTE: the blobs committed in 3774a82 remain reachable in history; this only stops future churn.
 *.zip
 uvicorn_*.log
-scripts/share/

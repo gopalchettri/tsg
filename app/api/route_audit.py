@@ -33,6 +33,7 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     ("POST", "/v1/sessions"),
     ("GET", "/v1/sessions/{session_id}"),
     ("GET", "/v1/sessions/{session_id}/results"),
+    ("GET", "/v1/sessions/{session_id}/results.xlsx"),
     ("POST", "/v1/sessions/{session_id}/accept"),
     ("POST", "/v1/sessions/{session_id}/regenerate/scenarios"),
     ("POST", "/v1/sessions/{session_id}/scenarios/next-set"),
@@ -48,6 +49,7 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan"),
     ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan"),
     ("GET", "/v1/sessions/{session_id}/treatment-plans"),
+    ("GET", "/v1/sessions/{session_id}/treatment-plans.xlsx"),
     ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/cancel"),
     ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/review"),
     ("GET", "/v1/entities/{entity_id}/treatment-plans"),
@@ -62,6 +64,16 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
 _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("GET", "/healthz"): None,  # platform health check, no caller identity involved
     ("GET", "/readyz"): None,  # platform health check, no caller identity involved
+    # Static HTML only — a dev SSE test harness, mounted ONLY on a local/dev APP_ENV (see
+    # app/main.py). It carries no data: every API call the page makes is a separate, normally
+    # authenticated request. Nothing to entity-scope, because nothing is served from the DB.
+    ("GET", "/dev/sse-test"): None,
+    # API-client key management (app/api/api_clients.py) — admin-key gated (require_admin), NOT
+    # entity-scoped: it manages cross-tenant client keys. No get_principal by design (minting a
+    # key must not require already having one).
+    ("POST", "/v1/tsg/api-clients"): require_admin,
+    ("GET", "/v1/tsg/api-clients"): require_admin,
+    ("POST", "/v1/tsg/api-clients/{client_id}/revoke"): require_admin,
     ("POST", "/v1/tsg/threat-library/embeddings/create"): require_admin,
     ("POST", "/v1/tsg/threat-library/embeddings/update"): require_admin,
     ("POST", "/v1/tsg/threat-library/embeddings/recreate"): require_admin,
@@ -70,6 +82,14 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     # All 5 above: admin-key gated (router-level Depends(require_admin) in admin.py), shared
     # cross-tenant threat-library data — not one entity's data, so the per-entity JWT model
     # doesn't apply. Same rationale for every require_admin entry below.
+    ("GET", "/v1/tsg/sessions/promotions"): require_admin,
+    ("GET", "/v1/tsg/sessions/promotions/{session_id}"): require_admin,
+    ("POST", "/v1/tsg/sessions/promotions/{session_id}/retry"): require_admin,
+    ("DELETE", "/v1/tsg/sessions/promotions/{session_id}"): require_admin,
+    ("GET", "/v1/tsg/threat-library/candidates"): require_admin,
+    ("GET", "/v1/tsg/threat-library/candidates/{candidate_id}"): require_admin,
+    ("POST", "/v1/tsg/threat-library/candidates/{candidate_id}/approve"): require_admin,
+    ("POST", "/v1/tsg/threat-library/candidates/{candidate_id}/reject"): require_admin,
     ("GET", "/v1/tsg/threat-library/sources"): require_admin,
     ("POST", "/v1/tsg/threat-library/sources/{source}/import"): require_admin,
     ("GET", "/v1/tsg/threat-library/imports/{job_id}"): require_admin,

@@ -11,10 +11,51 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import JsonDict
 
+
+# --- API client key-management (admin) schemas ---
+class CreateApiClientBody(BaseModel):
+    """Provision a new API key. The secret is generated server-side; the caller supplies only
+    metadata."""
+    client_id: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=200)
+    module: str = Field(min_length=1, max_length=50)
+
+
+class ApiClientCreated(BaseModel):
+    """Returned ONCE at creation. `secret` is never stored and never retrievable again."""
+    client_id: str
+    module: str
+    secret: str
+
+
+class ApiClientInfo(BaseModel):
+    """One API client as listed — metadata only, never the hash or secret."""
+    client_id: str
+    name: str
+    module: str
+    active: bool
+    created_at: datetime | None = None
+    created_by: str | None = None
+    revoked_at: datetime | None = None
+    revoked_by: str | None = None
+
 # Typing the wire with these is what puts them in /openapi.json — the UI generates its own
 # string-literal unions from the spec instead of hand-copying codes out of the API guide.
-from app.core.enums import (ClickOutcomeReason, NextSetOutcome, ReviewGateReason, RiskLevel,
-                            SSEEventType, TreatmentGateReason, TreatmentReviewStatus, YesNo)
+from app.core.enums import (
+    CandidateStatus,
+    ClickOutcomeReason,
+    NextSetOutcome,
+    RetryOutcome,
+    ReviewGateReason,
+    RiskLevel,
+    SSEEventType,
+    StageStatus,
+    SubsystemLevel,
+    TreatmentGateReason,
+    TreatmentOutcomeReason,
+    TreatmentReviewStatus,
+    YesNo,
+)
 from app.db.dal import canonical_guid
 
 # Plan item 1b: bound every list-of-targets field so one HTTP request can't turn into an
@@ -84,7 +125,7 @@ class CreateSessionBody(BaseModel):
     subsector_id: int | None = Field(default=None, description="Sub-sector id (onboarding_sectors child row, e.g. 111 Water). Preferred; its parent sector is derived server-side.")
     sector_id: int | None = Field(default=None, description="Parent sector id (e.g. 95 Energy). Cross-check only — must be the parent of subsector_id. Not the source of truth.")
     # `user_id` deliberately REMOVED: the initiating user is taken from the authenticated
-    # principal (JWT `sub`, or X-Dev-User in dev), the same source cancel/accept already audit
+    # principal (X-User-Id, see docs/TSG_API_AUTHENTICATION_GUIDE.md), the same source cancel/accept already audit
     # against. As a body field it was unverified text — a caller could send "user_id": "ceo" and
     # Scenario_Audit.ActorUserID recorded ceo, so one column meant "verified identity" on some
     # rows and "whatever was typed" on others. Unknown keys are ignored by default, so a client
@@ -224,6 +265,47 @@ class NextSetSummary(BaseModel):
     )
 
 
+class RegenSummary(BaseModel):
+    """What the most recent scenario-regenerate request on this session did (plan item 3) — the
+    DURABLE mirror of the SSE `regen_result` event, same rationale as `NextSetSummary` above:
+    `regen_result` is best-effort behind a circuit breaker with no replay (app/sse/bus.py), so a
+    polling client, or one whose stream dropped, needs this to learn what a regenerate actually
+    changed. Built straight from the `regeneration_completed` audit row's DetailJSON
+    (app/pipeline/cascade.py::_build_regen_audit_detail), so the field names match that shape
+    exactly rather than the differently-named `regen_result` event fields."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "target_ids": ["b3fc2c96-3f66-4562-8fa6-5717afa63f66"],
+                "requested_ids": ["6ba7b810-9dad-11d1-80b4-00c04fd430c8"],
+                "replacements": [{"old": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                                "new": "b3fc2c96-3f66-4562-8fa6-5717afa63f66"}],
+                "failed_threat_ids": [], "rescored_threat_ids": [], "epoch": 4, "user_note": None,
+            }
+        }
+    )
+
+    target_ids: list[str] | None = Field(
+        default=None, description="ThreatIDs this regeneration actually resolved to and redid; "
+                                "null if none resolved.")
+    requested_ids: list[str] | None = Field(
+        default=None, description="OutputIDs the client asked to regenerate (the request body's "
+                                "`output_ids`); null for a request with no explicit targets.")
+    replacements: list[dict[str, str]] = Field(
+        default_factory=list, description="old->new OutputID pairs this regen actually committed.")
+    failed_threat_ids: list[str] = Field(
+        default_factory=list, description="Targets whose generation call itself failed — "
+                                        "transient, still worth retrying via the same request.")
+    rescored_threat_ids: list[str] = Field(
+        default_factory=list, description="Targets that no longer meet the current scoping "
+                                        "cutoff — terminal, retrying will not change the outcome.")
+    epoch: int = Field(
+        description="Generation epoch this summary describes — compare against the `epoch` "
+                    "returned by the POST that started the regenerate request.")
+    user_note: str | None = Field(
+        default=None, description="Free-text note the client supplied with the request, redacted.")
+
+
 class SessionProgress(BaseModel):
     """The session's asset-level progress: per-stage statuses plus a derived overall status. One
     flat object, not a list — the pipeline tracks the asset as a single unit of work (see
@@ -232,11 +314,12 @@ class SessionProgress(BaseModel):
         json_schema_extra={
             "example": {
                 "threats": "COMPLETE", "scenarios": "AWAITING_DECISION",
-                "overall": "awaiting_review", "error_message": None,
+                "overall": "awaiting_review", "error_message": {},
                 "last_next_set": {
                     "outcome": "partial_retryable", "requested": 5, "delivered": 3,
                     "variants": 0, "reason": None, "epoch": 4,
                 },
+                "last_regen": None,
             }
         }
     )
@@ -244,12 +327,22 @@ class SessionProgress(BaseModel):
     threats: str = Field(description="THREATS stage status: IDLE, RUNNING, AWAITING_DECISION, COMPLETE, ERROR, or CANCELLED.")
     scenarios: str = Field(description="SCENARIOS stage status: IDLE, RUNNING, AWAITING_DECISION, COMPLETE, ERROR, or CANCELLED.")
     overall: str = Field(description="Computed overall status: pending, in_progress, awaiting_review, complete, error, or cancelled.")
-    error_message: str | None = Field(
-        default=None,
+    # BREAKING REST API CHANGE (plan item 7, deliberately shipped last and separately from the
+    # rest of this file's changes): was `str | None`, last-row-wins across stages, so two
+    # simultaneous stage failures silently dropped one message. Now a dict keyed by stage
+    # ("threats"/"scenarios"), each entry that stage's own message — nothing is dropped. This
+    # reshapes SessionProgress on BOTH `GET /v1/sessions/{session_id}` (the polling endpoint) and
+    # every SSE `reconcile` event (also built from sessions.py::build_board): any existing typed
+    # consumer reading `error_message` as `Optional[str]` hard-fails to parse the response the
+    # moment this ships. See docs/SSE_SESSION_PROGRESS_CONTRACT_GUIDE.md for the migration note.
+    error_message: dict[str, str] = Field(
+        default_factory=dict,
         description=(
-            "Client-safe failure reason for the most recent stage error, if any. Non-null "
-            "on an awaiting_review board means the run failed mid-batch after generating "
-            "some scenarios — the review set may be PARTIAL, not a complete run."
+            "Client-safe failure reason(s) for the most recent stage error(s), keyed by stage "
+            "('threats'/'scenarios'). Empty on a clean board. A non-empty dict on an "
+            "awaiting_review board means the run failed mid-batch after generating some "
+            "scenarios — the review set may be PARTIAL, not a complete run. BREAKING CHANGE: "
+            "this was a single `str | None` before — see the SSE contract guide."
         ),
     )
     last_next_set: NextSetSummary | None = Field(
@@ -259,6 +352,14 @@ class SessionProgress(BaseModel):
             "Compare `last_next_set.epoch` against the `epoch` returned by the POST that "
             "started your click: while they differ, your click is still in flight and this "
             "summary describes an EARLIER one."
+        ),
+    )
+    last_regen: RegenSummary | None = Field(
+        default=None,
+        description=(
+            "Outcome of the most recent scenario-regenerate request, or null if none has run. "
+            "Same epoch-comparison pattern as `last_next_set`: compare `last_regen.epoch` "
+            "against the `epoch` RegenerateResponse returned for your request."
         ),
     )
 
@@ -277,7 +378,7 @@ class SessionBoard(BaseModel):
                 "stage_status": "AWAITING_DECISION",
                 "progress": {
                     "threats": "COMPLETE", "scenarios": "AWAITING_DECISION",
-                    "overall": "awaiting_review", "error_message": None,
+                    "overall": "awaiting_review", "error_message": {},
                 },
             }
         }
@@ -381,6 +482,10 @@ _MAPPED_CONTROL_EXAMPLE: JsonDict = {
 #: shows a scenario — the four hand-copied literals this replaces had all drifted to a
 #: `title`/`narrative` shape the API has never actually returned.
 _SCENARIO_EXAMPLE: JsonDict = {
+    "threat_category": "Tampering",
+    "threat_type": "unauthorized modification of firmware",
+    "threat_name": "Unauthorized firmware update of Remote Terminal Unit (RTU)",
+    "threat_actors": ["Nation-state/APT", "Malicious insider"],
     "scenario_title": "Remote Terminal Unit (RTU) — Unauthorized firmware push",
     "scenario_statement": (
         "An attacker with OT network access pushes unsigned firmware to the RTU, "
@@ -391,6 +496,12 @@ _SCENARIO_EXAMPLE: JsonDict = {
         "could cause a sustained outage."
     ),
     "controls": [_MAPPED_CONTROL_EXAMPLE],
+    "supporting_system_applicability": [
+        {"supporting_system": "OT Telecom Network", "applicable": True,
+         "justification": "The firmware push travels over this network to reach the RTU."},
+        {"supporting_system": "SCADA System", "applicable": False,
+         "justification": "The RTU accepts firmware updates directly; SCADA plays no role."},
+    ],
     # Two suggestions, only the first of which grounded — the second has no counterpart in
     # `controls` above, which is exactly the library-gap signal this field exists to show.
     "suggested_controls": [
@@ -451,6 +562,16 @@ class SuggestedControl(BaseModel):
     why: str | None = Field(default=None, description="The LLM's one-line rationale for it.")
 
 
+class SupportingSystemApplicability(BaseModel):
+    """The LLM's own judgment (prompts.py::scenario_prompt) of whether this scenario involves a
+    given supporting system in the session's scope, one entry per system. Rides straight through
+    from the LLM's own JSON, same treatment as entry_point: no DB enrichment, no separate
+    persistence (Threat_Scenario_Output.ScenarioJSON already stores the whole scenario dict)."""
+    supporting_system: str = Field(description="Supporting system name, copied exactly from the session's scope.")
+    applicable: bool = Field(description="Whether this scenario meaningfully involves or affects this system.")
+    justification: str = Field(description="One-sentence rationale for the applicable value.")
+
+
 class ScenarioNarrative(BaseModel):
     """The LLM's scenario JSON passed through verbatim, with `controls` replaced by the Step-4
     grounded library matches (sessions.py::_scenario_with_controls).
@@ -458,12 +579,23 @@ class ScenarioNarrative(BaseModel):
     `extra="allow"` is the point: scenario_title/scenario_statement/risk_statement — and anything
     else a future prompt adds — ride through unvalidated and unmodified, exactly as the bare dict
     this replaced did. Deliberately so: these are model-authored strings, and validating text the
-    code doesn't control just converts an odd LLM response into a 500. ONLY `controls` is declared,
-    which is what keeps MappedControl in the OpenAPI components so its fields are generated rather
-    than hand-copied into a prose description (a hand-copied one is exactly how the smoke guides
-    ended up documenting `title`/`narrative`, keys the API has never returned)."""
+    code doesn't control just converts an odd LLM response into a 500. `controls` and
+    `supporting_system_applicability` are declared because they're structured, not bare strings,
+    and benefit from typed OpenAPI components rather than a hand-copied prose description (a
+    hand-copied one is exactly how the smoke guides ended up documenting `title`/`narrative`, keys
+    the API has never returned).
+
+    threat_category/threat_type/threat_name/threat_actors are NOT LLM output — they come from the
+    Identified_Threat row this scenario was generated from, merged in at read time
+    (sessions.py::_scenario_with_controls) by every current caller. Default to None/[] anyway: no
+    enforced foreign key guarantees the join found a row (see _scenario_select's OUTER join), and
+    a scenario written before this field existed carries none either."""
     model_config = ConfigDict(extra="allow", json_schema_extra={"example": _SCENARIO_EXAMPLE})
 
+    threat_category: str | None = Field(default=None, description="This threat's STRIDE category, e.g. Spoofing, Tampering.")
+    threat_type: str | None = Field(default=None, description="STRIDE threat type this scenario was generated from.")
+    threat_name: str | None = Field(default=None, description="Human-readable threat name this scenario was generated from.")
+    threat_actors: list[str] = Field(default_factory=list, description="Adversary types proposed for the underlying threat.")
     controls: list[MappedControl] = Field(
         default_factory=list,
         description=(
@@ -487,6 +619,14 @@ class ScenarioNarrative(BaseModel):
             "signal precomputed for you, instead of diffing the two lists yourself. Null (not an "
             "empty list) when control mapping hasn't been attempted yet — see controls_mapped on "
             "the enclosing result; suggested_controls itself is still populated either way."
+        ),
+    )
+    supporting_system_applicability: list[SupportingSystemApplicability] = Field(
+        default_factory=list,
+        description=(
+            "The LLM's judgment of whether this scenario involves each supporting system in the "
+            "session's scope, one entry per system. Empty for scenarios written before this field "
+            "existed, or when the session has no supporting systems in scope."
         ),
     )
 
@@ -693,10 +833,16 @@ class RegenerateResponse(BaseModel):
     epoch: int = Field(
         description=(
             "Generation epoch reserved for THIS request. Poll GET /v1/sessions/{session_id} "
-            "until `progress.last_next_set.epoch` equals this value — that, not the stage "
-            "status, is the exact signal that your click landed. It stays correct when another "
-            "tab clicks concurrently (each waits for its own epoch) and it turns a stalled "
-            "worker into a diagnosable 'my epoch never arrived' rather than an endless wait."
+            "until the MATCHING progress field's epoch equals this value — that, not the stage "
+            "status, is the exact signal that your click landed. For a regenerate request "
+            "(status='regenerating') that field is `progress.last_regen.epoch`; for a next-set "
+            "request (status='generating') it is `progress.last_next_set.epoch` — the two never "
+            "share one field, since each is written from a different audit event. Plan item 3: "
+            "earlier this description pointed a regenerate caller at `last_next_set`, a field "
+            "regen never writes, so that poll could never observe a regen finishing. It stays "
+            "correct when another tab clicks concurrently (each waits for its own epoch) and it "
+            "turns a stalled worker into a diagnosable 'my epoch never arrived' rather than an "
+            "endless wait."
         ),
     )
 
@@ -763,7 +909,10 @@ class NextSetResultEvent(BaseModel):
     ADVISORY. Best-effort, behind a circuit breaker, never replayed (app/sse/bus.py), so treat it
     as a prompt to refresh rather than as the record. `SessionProgress.last_next_set` on the status
     board carries the same facts durably and is what a reconnecting client should trust."""
-    type: SSEEventType = Field(description="Always 'next_set_result'.")
+    # Literal, NOT the bare enum: these models are served as a UNION, and a field typed as the whole
+    # SSEEventType gives the union no discriminator — a generated client would validate ANY event
+    # type as a NextSetResultEvent. The Literal emits {"const": "next_set_result"} per member.
+    type: Literal[SSEEventType.next_set_result] = Field(description="Always 'next_set_result'.")
     session_id: str = Field(description="Session the click belonged to.")
     subsystem_id: int = Field(description="Unit of work; always 0 (the asset itself).")
     outcome: NextSetOutcome = Field(description="What the click achieved — see NextSetSummary.outcome.")
@@ -787,7 +936,7 @@ class RegenResultEvent(BaseModel):
 
     Deliberately carries NO outcome/requested fields: regenerate REPLACES rather than adds, so its
     scenario count never changes and a batch-size notion would be meaningless here."""
-    type: SSEEventType = Field(description="Always 'regen_result'.")
+    type: Literal[SSEEventType.regen_result] = Field(description="Always 'regen_result'.")  # see NextSetResultEvent.type
     session_id: str = Field(description="Session the click belonged to.")
     subsystem_id: int = Field(description="Unit of work; always 0 (the asset itself).")
     requested_output_ids: list[str] = Field(description="OutputIDs the client asked to regenerate.")
@@ -811,6 +960,154 @@ class RegenResultEvent(BaseModel):
     detail: str | None = Field(default=None, description="Developer-facing explanation.")
     message: str | None = Field(default=None, description="End-user-safe sentence.")
     ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
+
+
+class TreatmentPlanResultEvent(BaseModel):
+    """`treatment_plan_result` — one treatment plan reached a committed COMPLETE or ERROR.
+
+    ADVISORY, and weaker than the two above: it is a prompt to REFETCH, never a completion
+    contract. It is published only when the worker's finish CAS actually rewrote the row, so three
+    outcomes never emit one — a dead worker (the row stays RUNNING and only the GET's read-time
+    projection calls it timed out; there is no reaper), an LLMSlotUnavailable autoretry (which
+    keeps bumping the progress clock, so the row never even goes stale), and cancel/review (written
+    in the API process, not the worker). A publish failure additionally silences every event in
+    that worker process for a cooldown window. **A client MUST therefore keep a slow backstop poll**
+    — this event only makes the common case feel instant.
+
+    Match on `output_id`: a regeneration mints a NEW plan_id, so a client keyed on plan_id would
+    discard the very event it is waiting for."""
+    type: Literal[SSEEventType.treatment_plan_result] = Field(
+        description="Always 'treatment_plan_result'.")  # see NextSetResultEvent.type
+    session_id: str = Field(description="Session the plan belongs to.")
+    output_id: str = Field(
+        description="The accepted scenario this plan treats. MATCH ON THIS — it is stable across "
+                    "regenerations, unlike plan_id.")
+    plan_id: str = Field(
+        description="Informational: the Risk_Treatment_Plan row that finished. A regeneration "
+                    "produces a different one for the same output_id.")
+    status: Literal[StageStatus.COMPLETE, StageStatus.ERROR] = Field(
+        description="The committed status. Refetch for the detail.")
+    reason: TreatmentOutcomeReason | None = Field(
+        default=None,
+        description="Why, when status is ERROR — see TreatmentPlanStatus.reason. Null on COMPLETE.")
+    ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
+
+
+# Plan item 25: typed models for the 6 event kinds that previously reached the wire with no
+# schema at all (only NextSetResultEvent/RegenResultEvent/TreatmentPlanResultEvent existed).
+# Field shapes are taken directly from their publish call sites — tasks.py::_send_live_update for
+# the two stage events, and the three bus.publish() calls below it for subsystem_started/
+# session_entered_review/error (app/pipeline/tasks.py).
+class StageStartedEvent(BaseModel):
+    """`stage_started` — one (subsystem, level) work cell was just claimed and began running."""
+    type: Literal[SSEEventType.stage_started] = Field(description="Always 'stage_started'.")  # see NextSetResultEvent.type
+    session_id: str = Field(description="Session the stage belongs to.")
+    subsystem_id: int = Field(description="Unit of work; always 0 (the asset itself).")
+    stage: SubsystemLevel = Field(description="Which work cell started: THREATS or SCENARIOS.")
+    status: Literal[StageStatus.RUNNING] = Field(
+        description="Always 'RUNNING' — this event fires only at claim time, from the one call "
+                    "site that publishes it.")
+    generation_epoch: int = Field(description="Generation epoch this run is claimed at.")
+    ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
+
+
+class StageCompletedEvent(BaseModel):
+    """`stage_completed` — one (subsystem, level) work cell finished successfully; a failure
+    routes to `error` instead and never reaches this event.
+
+    TWO real values for `status`, not one, both published from the SAME call site
+    (tasks.py::_send_live_update): THREATS finishes `StageStatus.COMPLETE`; SCENARIOS finishes
+    `StageStatus.AWAITING_DECISION` — SCENARIOS reaching AWAITING_DECISION *is* the review
+    barrier, not an unfinished state. A single-value Literal (this file's usual convention for
+    every other event's discriminator-adjacent field) would reject half this event's real
+    traffic, so both values are declared here deliberately."""
+    type: Literal[SSEEventType.stage_completed] = Field(description="Always 'stage_completed'.")  # see NextSetResultEvent.type
+    session_id: str = Field(description="Session the stage belongs to.")
+    subsystem_id: int = Field(description="Unit of work; always 0 (the asset itself).")
+    stage: SubsystemLevel = Field(description="Which work cell finished: THREATS or SCENARIOS.")
+    status: Literal[StageStatus.COMPLETE, StageStatus.AWAITING_DECISION] = Field(
+        description="THREATS finishes COMPLETE; SCENARIOS finishes AWAITING_DECISION (the "
+                    "review barrier). Never any other value — a failure publishes `error`.")
+    generation_epoch: int = Field(description="Generation epoch this run finished at.")
+    ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
+
+
+class SubsystemStartedEvent(BaseModel):
+    """`subsystem_started` — fires BEFORE this subsystem's stages run. Subsystem-scoped, no
+    `stage` field: it precedes both THREATS and SCENARIOS for this subsystem."""
+    type: Literal[SSEEventType.subsystem_started] = Field(description="Always 'subsystem_started'.")  # see NextSetResultEvent.type
+    session_id: str = Field(description="Session the subsystem belongs to.")
+    subsystem_id: int = Field(description="Unit of work about to start; always 0 (the asset itself).")
+    generation_epoch: int = Field(description="Generation epoch this run starts at.")
+    ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
+
+
+class SessionEnteredReviewEvent(BaseModel):
+    """`session_entered_review` — every subsystem hit its review barrier; the session is now
+    parked at REVIEW waiting on a human decision. Session-wide: never carries subsystem_id."""
+    type: Literal[SSEEventType.session_entered_review] = Field(
+        description="Always 'session_entered_review'.")  # see NextSetResultEvent.type
+    session_id: str = Field(description="Session that entered review.")
+    status: Literal[StageStatus.AWAITING_DECISION] = Field(
+        description="Always 'SCENARIOS_AWAITING_DECISION' — the review-barrier value.")
+    generation_epoch: int = Field(description="Generation epoch active when the session entered review.")
+    ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
+
+
+class ErrorEvent(BaseModel):
+    """`error` — a stage failed, or the whole session failed. DUAL-scope by design (plan item
+    27); `scope` says which instead of leaving a client to infer it from whether `subsystem_id`
+    happens to be present:
+
+    - `scope="stage"` (tasks.py::_record_failure): one subsystem's stage errored.
+      `subsystem_id`/`generation_epoch` are present; the session may still recover (a live retry,
+      or the reviewer regenerating/next-setting once at REVIEW).
+    - `scope="session"` (tasks.py::_mark_session_failed): every subsystem errored and the session
+      was marked cancelled server-side. `subsystem_id`/`generation_epoch` are absent — there is
+      no single stage left to name, and no epoch to compare against.
+
+    KNOWN GAP, not closed by item 27: `error` also has THREE other publish sites, all in
+    app/pipeline/reaper.py (item 5's dead-worker sweep — a different, earlier phase), and none of
+    them set `scope` yet — two are stage-scoped (subsystem_id present) and one is session-scoped
+    (rowcount-gated, no subsystem_id), but the field itself is simply absent on the wire for all
+    three. `scope` is therefore OPTIONAL here rather than required: a client that only switches on
+    `scope` will silently miss a reaper-originated error. Until reaper.py is updated to match, a
+    robust client falls back to "subsystem_id present" (the pre-item-27 rule) whenever `scope` is
+    null. See docs/SSE_SESSION_PROGRESS_CONTRACT_GUIDE.md for the full gap list.
+
+    Plan item 28 — READ BEFORE WIRING UI TEARDOWN: a stage-scoped `error` is NOT necessarily
+    terminal for the session (the pipeline can still finish other subsystems, or a human can
+    regenerate). Clients MUST NOT tear down UI on `error` alone — wait for
+    `session_entered_review`, or a terminal `session_status` (`completed`/`cancelled`) from a
+    `reconcile` event or a `GET /v1/sessions/{session_id}` poll, before treating the session as
+    finished."""
+    type: Literal[SSEEventType.error] = Field(description="Always 'error'.")  # see NextSetResultEvent.type
+    session_id: str = Field(description="Session the error belongs to.")
+    scope: Literal["stage", "session"] | None = Field(
+        default=None,
+        description="'stage' = one subsystem's stage failed (subsystem_id/generation_epoch "
+                    "present, session not necessarily done); 'session' = every subsystem failed "
+                    "and the session was cancelled (subsystem_id/generation_epoch absent, "
+                    "terminal); null = published by the reaper's dead-worker sweep, which does "
+                    "not set this field yet (known gap) — fall back to whether subsystem_id is "
+                    "present.")
+    subsystem_id: int | None = Field(
+        default=None, description="Unit of work that failed; null when scope='session' (or when "
+                                "scope is null and no single stage applies).")
+    message: str = Field(description="Client-safe failure reason.")
+    generation_epoch: int | None = Field(
+        default=None, description="Epoch the failed stage was running at; null when scope='session' "
+                                "or not applicable.")
+    ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
+
+
+class HeartbeatEvent(BaseModel):
+    """`heartbeat` — keep-alive so proxies don't drop an idle SSE connection (sse_starlette's
+    `ping`, on `sse_ping_seconds`). Carries no progress information; a client should ignore its
+    content and only use its arrival to reset its own idle/liveness timer."""
+    type: Literal[SSEEventType.heartbeat] = Field(description="Always 'heartbeat'.")  # see NextSetResultEvent.type
+    session_id: str = Field(description="Session this heartbeat keeps alive.")
+    ts: datetime = Field(description="When the heartbeat was sent (UTC, ISO-8601).")
 
 
 #: Shared by AcceptedScenario and by the AcceptedScenariosResponse example that embeds one.
@@ -1187,6 +1484,113 @@ class EmbeddingJobStatus(EmbeddingActionResponse):
         description="Job's current state, mirrors Celery's AsyncResult.state: PENDING, STARTED, SUCCESS, FAILURE, or RETRY."
     )
     error: str | None = Field(default=None, description="Error message when state is FAILURE. Null otherwise.")
+
+
+# ---------------------------------------------------------------------------
+# Session-promotion admin (app/api/admin.py) — GET/retry/dismiss for sessions whose library
+# promotion (accept.py's isolated Phase 2) failed and is pending automatic or manual retry.
+# ---------------------------------------------------------------------------
+class PendingPromotion(BaseModel):
+    """One session currently stuck on a failed library promotion — a row of
+    GET /v1/tsg/sessions/promotions. The accept itself already succeeded for this session
+    (that's the whole point of the fix); only the "add novel threats to the shared library"
+    side-effect failed and is being tracked here."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                "entity_id": "ENT-001", "asset_id": "AST-042", "asset_name": "Payment Gateway",
+                "failed_at": "2026-08-10T09:15:00Z", "attempts": 2, "max_attempts": 5,
+                "exhausted": False, "error": "litellm.APIConnectionError: ...",
+                "user_id": "qa-user", "completed_at": "2026-08-10T09:14:55Z",
+            }
+        }
+    )
+    session_id: str = Field(description="Session whose library promotion failed.")
+    entity_id: str = Field(description="Entity the session belongs to.")
+    asset_id: str = Field(description="Asset the session was for.")
+    asset_name: str = Field(description="Asset's display name, for a human-readable admin list.")
+    failed_at: str = Field(description="When the most recent promotion attempt failed (ISO 8601).")
+    attempts: int = Field(description="Failed attempts so far, automatic and manual combined.")
+    max_attempts: int = Field(description="Automatic-retry cap (promotion_max_attempts). Manual retries ignore this.")
+    exhausted: bool = Field(
+        description="True once attempts >= max_attempts: the automatic sweep has stopped retrying "
+                    "this session (manual retry via POST is still always available)."
+    )
+    error: str | None = Field(description="Most recent attempt's error message.")
+    user_id: str | None = Field(description="Accepting user, for retry attribution — null for a system-triggered accept.")
+    completed_at: str | None = Field(description="When the session itself completed (the accept succeeded before this).")
+
+
+class PendingPromotionsResponse(BaseModel):
+    """GET /v1/tsg/sessions/promotions — every session currently pending or exhausted-pending a
+    library-promotion retry."""
+    promotions: list[PendingPromotion]
+    total: int = Field(description="Row count returned (bounded by the request's `limit`).")
+    auto_retry_enabled: bool = Field(
+        description="Current global promotion_auto_retry_enabled setting — read this to know "
+                    "whether `exhausted` above is meaningful (the sweep is actively retrying) or "
+                    "moot (auto-retry is off, so nothing here is being auto-retried regardless)."
+    )
+
+
+class PromotionRetryResult(BaseModel):
+    """Response of POST /v1/tsg/sessions/promotions/{session_id}/retry — synchronous, since one
+    retry is a single bounded operation, not a long-running bulk job."""
+    model_config = ConfigDict(json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                                                            "outcome": "succeeded"}})
+    session_id: str = Field(description="Session that was retried.")
+    outcome: RetryOutcome = Field(description="succeeded, failed (see the session's updated error via "
+                                    "GET .../promotions/{id}), or skipped (a live worker or another "
+                                    "retry currently holds this session's lock — try again shortly).")
+
+
+# ---------------------------------------------------------------------------
+# Threat-library candidate review (app/api/admin.py) — the curator workflow CandidateStatus's own
+# docstring calls "reserved... set by the curator workflow when it lands": list/approve/reject
+# for Threat_Candidate_Review rows queued by accept.py when promotion_auto_approve_enabled is off
+# (or the triage verdict was genuinely ambiguous, which always queues regardless of that setting).
+# ---------------------------------------------------------------------------
+class PendingCandidate(BaseModel):
+    """One threat awaiting curator review — a row of GET /v1/tsg/threat-library/candidates."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "candidate_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "entity_id": "ENT-001",
+                "proposed_category": "Spoofing", "proposed_type": "Vendor Update Tampering",
+                "proposed_name": "Payment Gateway vendor software update tampering",
+                "proposed_generic_name": "Vendor software update tampering",
+                "status": "pending", "created_at": "2026-08-10T09:15:00Z",
+            }
+        }
+    )
+    candidate_id: str = Field(description="Row's unique id — use it to approve or reject.")
+    session_id: str = Field(description="Session whose accept first proposed this threat.")
+    entity_id: str | None = Field(description="Entity the originating session belongs to.")
+    proposed_category: str = Field(description="AI-proposed STRIDE-style category.")
+    proposed_type: str = Field(description="AI-proposed threat type name.")
+    proposed_name: str = Field(description="AI-proposed name, asset-specific as originally written.")
+    proposed_generic_name: str | None = Field(description="Asset-agnostic form — what actually gets embedded/catalogued on approval.")
+    status: CandidateStatus = Field(description="pending, accepted, or rejected.")
+    created_at: str = Field(description="When this candidate was queued (ISO 8601).")
+
+
+class PendingCandidatesResponse(BaseModel):
+    """GET /v1/tsg/threat-library/candidates — every candidate awaiting curator review."""
+    candidates: list[PendingCandidate]
+    total: int = Field(description="Row count returned (bounded by the request's `limit`).")
+
+
+class CandidateResolutionResult(BaseModel):
+    """Response of POST .../candidates/{id}/approve or .../reject."""
+    model_config = ConfigDict(json_schema_extra={"example": {"candidate_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                                                            "status": "accepted", "threat_type_id": 210,
+                                                            "threat_catalogue_id": 4021}})
+    candidate_id: str = Field(description="Candidate that was resolved.")
+    status: CandidateStatus = Field(description="accepted or rejected — the status this candidate now has.")
+    threat_type_id: int | None = Field(description="Library Threat_Type id this candidate resolved to. Null on reject.")
+    threat_catalogue_id: int | None = Field(description="Library Threat_Catalogue id this candidate resolved to. Null on reject.")
 
 
 # ---------------------------------------------------------------------------
@@ -1605,7 +2009,16 @@ class TreatmentPlanAccepted(BaseModel):
     plan_id: str = Field(description="The new Risk_Treatment_Plan row's id.")
     session_id: str = Field(description="Echo of the session in the path.")
     output_id: str = Field(description="Echo of the scenario in the path.")
-    status: str = Field(description="Always RUNNING at accept time — poll the GET until COMPLETE or ERROR.")
+    # Narrowed because the ROUTE constructs this from an enum member — safe. The GET/board/register
+    # status fields are deliberately NOT narrowed: those come back from the database as free text,
+    # and one out-of-vocabulary row would 500 the whole page rather than degrade.
+    status: Literal[StageStatus.RUNNING] = Field(
+        description="Always RUNNING at accept time. Poll GET .../treatment-plan until it becomes "
+                    "COMPLETE or ERROR; that GET also serves the finished plan. For an instant "
+                    "hand-off the worker additionally publishes an advisory `treatment_plan_result` "
+                    "on GET /v1/sessions/{session_id}/events — listen with "
+                    "addEventListener('treatment_plan_result'), match on output_id (a regenerate "
+                    "mints a new plan_id), and KEEP the poll: several outcomes never publish.")
 
 
 class TreatmentPlanStatus(BaseModel):
@@ -1678,6 +2091,13 @@ class TreatmentPlanStatus(BaseModel):
         description="Advisory content-moderation flag for a human reviewer, when moderation ran.")
     error_message: str | None = Field(
         default=None, description="Client-safe failure reason when status is ERROR.")
+    reason: TreatmentOutcomeReason | None = Field(
+        default=None,
+        description="WHY it ended this way — switch on THIS, never on error_message. Set only when "
+                    "status is ERROR: cancelled (a human stopped it), timed_out (no progress; "
+                    "regenerate), enqueue_failed (broker was down; retry now), content_blocked "
+                    "(a safety guardrail refused it — do NOT auto-retry unchanged), invalid_plan / "
+                    "generation_failed (retryable). Null on RUNNING and COMPLETE.")
     created_at: datetime | None = Field(default=None, exclude=True, description="When this attempt was requested.")
     completed_at: datetime | None = Field(default=None, exclude=True, description="When it reached COMPLETE/ERROR.")
 
@@ -1692,6 +2112,9 @@ class TreatmentBoardRow(BaseModel):
     risk_level: str | None = Field(default=None)
     review_status: str | None = Field(default=None, description="approved / changes_requested / null.")
     error_message: str | None = Field(default=None)
+    reason: TreatmentOutcomeReason | None = Field(
+        default=None, description="Why it ended this way when status is ERROR — see "
+                                  "TreatmentPlanStatus.reason. Null otherwise.")
     created_at: datetime | None = Field(default=None)
     completed_at: datetime | None = Field(default=None)
 
@@ -1714,7 +2137,8 @@ class TreatmentBoard(BaseModel):
 class TreatmentCancelResponse(BaseModel):
     """POST .../treatment-plan/cancel — the stop button's receipt."""
     plan_id: str
-    status: str = Field(description="Always ERROR after a successful cancel.")
+    status: Literal[StageStatus.ERROR] = Field(  # route-constructed from the enum — safe to narrow
+        description="Always ERROR after a successful cancel.")
     error_message: str | None = Field(default=None, description="'cancelled by user'.")
 
 
@@ -1729,7 +2153,7 @@ class TreatmentReviewBody(BaseModel):
 
 class TreatmentReviewResponse(BaseModel):
     plan_id: str
-    review_status: str
+    review_status: TreatmentReviewStatus  # echoes the validated request body — safe to type
     reviewed_by: str | None = Field(default=None, description="From the reviewer's login token.")
     reviewed_at: datetime | None = None
 
@@ -1746,6 +2170,9 @@ class TreatmentRegisterRow(BaseModel):
     review_status: str | None = None
     reviewed_by: str | None = None
     error_message: str | None = None
+    reason: TreatmentOutcomeReason | None = Field(
+        default=None, description="Why it ended this way when status is ERROR — see "
+                                  "TreatmentPlanStatus.reason. Null otherwise.")
     created_at: datetime | None = None
     completed_at: datetime | None = None
 

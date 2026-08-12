@@ -1,8 +1,0 @@
-{"logger": "tsg", "event": "AUTH_DEV_MODE is ON \u2014 authentication is bypassed.", "level": "warning", "timestamp": "2026-08-06T09:43:57.853547Z"}
-{"logger": "app.core.middleware", "method": "GET", "path": "/healthz", "event": "http.request_started", "request_id": "91bcaa79-ece6-4a85-be74-509d09306158", "level": "info", "timestamp": "2026-08-06T09:44:01.994999Z"}
-{"logger": "app.core.middleware", "method": "GET", "path": "/healthz", "status_code": 200, "duration_ms": 0.0, "event": "http.request_finished", "request_id": "91bcaa79-ece6-4a85-be74-509d09306158", "level": "info", "timestamp": "2026-08-06T09:44:02.000073Z"}
-INFO:     127.0.0.1:54000 - "GET /healthz HTTP/1.1" 200 OK
-{"logger": "app.core.middleware", "method": "POST", "path": "/v1/sessions", "event": "http.request_started", "request_id": "9831c429-4559-4c31-9910-c4246018239e", "level": "info", "timestamp": "2026-08-06T09:44:09.806880Z"}
-{"logger": "app.api.deps", "event": "AUTH_DEV_MODE is ON \u2014 JWT validation is BYPASSED", "request_id": "9831c429-4559-4c31-9910-c4246018239e", "level": "warning", "timestamp": "2026-08-06T09:44:09.833027Z"}
-{"logger": "app.core.middleware", "method": "POST", "path": "/v1/sessions", "status_code": 409, "duration_ms": 734.0, "event": "http.request_finished", "request_id": "9831c429-4559-4c31-9910-c4246018239e", "level": "info", "timestamp": "2026-08-06T09:44:10.533260Z"}
-INFO:     127.0.0.1:54005 - "POST /v1/sessions HTTP/1.1" 409 Conflict

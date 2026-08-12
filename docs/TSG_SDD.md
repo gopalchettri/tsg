@@ -47,7 +47,7 @@ The product goal: give analysts a defensible, explainable starting point — eve
 |---|---|
 | **Analyst** (entity-scoped user) | Creates sessions, watches progress (SSE/polling), reviews and accepts scenarios, regenerates, requests next sets and treatment plans. |
 | **Curator / Administrator** (shared admin key) | Maintains the threat and control libraries, scoping rules, and the prompt-context allowlist; imports open-source libraries; manages embeddings and intel feeds. |
-| **Platform** | Supplies identity (JWT) and asset/entity onboarding data. (The risk register data treatment plans consume arrives in the request body — TSG reads no risk-module tables.) |
+| **Platform** | Supplies asset/entity onboarding data; caller identity for each request is asserted via the header model (see docs/TSG_API_AUTHENTICATION_GUIDE.md), not issued by the platform. (The risk register data treatment plans consume arrives in the request body — TSG reads no risk-module tables.) |
 | **Scheduler (Celery beat)** | Reaps stuck sessions, runs operational self-checks, refreshes threat-intel feeds daily. |
 
 ### 2.3 Technology stack
@@ -119,7 +119,7 @@ flowchart LR
 
 Both processes refuse to start unless the environment is provably safe (`app/main.py`, `app/pipeline/celery_app.py::_init_worker`):
 
-1. **Security posture** — in `staging`/`prod` (without the explicit dev-mode opt-in), JWT issuer, audience, and a key source must be configured, or boot fails with the missing names.
+1. **Security posture** — in `staging`/`prod`, at least one active `API_Client` row must exist, or boot fails loudly (see docs/TSG_API_AUTHENTICATION_GUIDE.md Part 1); a deployment that still sets a retired JWT/dev-mode setting also fails boot (`app/core/config.py::_RETIRED_SETTINGS`).
 2. **Database invariants** (`app/db/invariants.py`) — required unique indexes exist with the right columns, tenant-key columns are NOT NULL, no duplicate active rows exist, **RCSI (read-committed snapshot isolation) is ON**, and filtered-index literals still match the status enum. A failure raises `StartupInvariantError`: *refusing to start is the point*, because each guard protects an invariant whose silent loss is worse than downtime.
 3. **Route audit** (`app/api/route_audit.py`) — every registered route must be either registered as entity-scoped (and provably depend on `get_principal`) or explicitly exempted with the dependency its exemption cites. An unknown route, or an exemption that is "now a lie", fails the boot instead of shipping an IDOR.
 4. **Worker extras** — fail-fast if started on a prefork pool (the gevent monkey-patch makes forking unsafe), verify the chat provider actually answers, verify the embedding model returns the configured dimension count, and resolve (or calibrate) the grounding threshold (§9.5).
@@ -136,7 +136,7 @@ SQL Server holds everything with transactional or audit value: sessions, stage s
 |---|---|---|
 | `app/main.py` | App assembly: lifespan checks, middleware order, router registration, route audit. | — |
 | `app/api/` | HTTP boundary: request/response schemas, validation, authorization, error envelope. Contains **no business decisions** beyond gate checks; delegates to `dal`/pipeline. | `sessions.py`, `schemas.py`, `errors.py`, `deps.py`, `treatment.py`, admin routers |
-| `app/core/` | Cross-cutting: settings (with derivation/validation logic), JWT + redaction, middleware, structlog config, and the **enums that define every state machine** and wire contract. | `config.py`, `security.py`, `enums.py`, `middleware.py` |
+| `app/core/` | Cross-cutting: settings (with derivation/validation logic), redaction, middleware, structlog config, and the **enums that define every state machine** and wire contract. | `config.py`, `security.py`, `enums.py`, `middleware.py` |
 | `app/db/` | The **only** place isolation and concurrency guards live: engine/pool, ORM mirrors of the live schema, the data-access layer with every CAS primitive, and boot invariants. | `dal.py`, `models.py`, `invariants.py`, `engine.py` |
 | `app/pipeline/` | The generation pipeline: asset-context resolution, orchestration, prompts, grounding, scoping, dedup, control mapping, acceptance, treatment plans, LLM adapter, embeddings, imports, reaper, self-check. | `context.py`, `tasks.py`, `cascade.py`, `grounding.py`, `accept.py`, `prompts.py`, `llm.py`, `embeddings.py` |
 | `app/intel/` | Threat-intel ingestion: five feeds normalised into one MongoDB cache. | `fetchers.py`, `otx.py`, `taxii_client.py` |
@@ -192,7 +192,7 @@ sequenceDiagram
 
 ### 5.2 Session creation (API side)
 
-`POST /v1/sessions` performs, in order: entity authorization on the caller's JWT → **asset ownership proof** (the asset must belong to one of the caller's entities via the platform's `ctm_scan_entity_bu.group_id` link; an unproven owner is a denial, never an allow) → idempotency-key reservation → capacity check (cheap, before the expensive context gather) → context resolution and freeze (`app/pipeline/context.py` → `AssetContextJSON`) → session row + three `Subsystem_Stage_State` rows (`THREATS`, `SCENARIOS`, `_LOCK`) → audit row → **enqueue outside the transaction**. The response is `202` with the session id; an idempotent replay returns `200` with the original session.
+`POST /v1/sessions` performs, in order: entity authorization on the caller's principal (header model, see docs/TSG_API_AUTHENTICATION_GUIDE.md) → **asset ownership proof** (the asset must belong to one of the caller's entities via the platform's `ctm_scan_entity_bu.group_id` link; an unproven owner is a denial, never an allow) → idempotency-key reservation → capacity check (cheap, before the expensive context gather) → context resolution and freeze (`app/pipeline/context.py` → `AssetContextJSON`) → session row + three `Subsystem_Stage_State` rows (`THREATS`, `SCENARIOS`, `_LOCK`) → audit row → **enqueue outside the transaction**. The response is `202` with the session id; an idempotent replay returns `200` with the original session.
 
 Two boundary details worth knowing: the acting `user_id` always comes from the token, never the body (a body-supplied value would poison the audit trail's meaning), and the `Idempotency-Key` header is length-bounded to the column width so SQL truncation can never turn a duplicate into a 500.
 
@@ -535,7 +535,7 @@ The patterns above compose into a fixed sequence; missing a step fails *silently
 
 ## 11. API Overview
 
-All business routes require a JWT principal; admin routes additionally require the shared admin key (§12.2). Every error is the same envelope: `{"error_code", "message", "details"?}`.
+All business routes require a header-model principal (`X-API-Key`+`X-User-Id`+`X-Entity-Id`+`X-Tenant-Id`, see docs/TSG_API_AUTHENTICATION_GUIDE.md); admin routes additionally require the shared admin key (§12.2). Every error is the same envelope: `{"error_code", "message", "details"?}`.
 
 **Health probes — the only unauthenticated surface.** `GET /healthz` answers 200 unconditionally (process liveness). `GET /readyz` probes the dependencies actually needed *right now*, concurrently (so an outage costs the slowest timeout, not the sum): SQL Server, Redis, and MongoDB — the Mongo probe is reported `skipped` when the embedding store isn't Mongo, because probing an unused dependency would be a false alarm. Any failure returns 503 `not_ready` with per-dependency ok/error/skipped labels; failure detail is logged server-side and never returned. Both routes are explicit, verified exemptions in the boot route audit (§3.3).
 
@@ -578,7 +578,7 @@ Conflict responses are typed, not prose: `active_session_exists`, `idempotency_k
 
 ### 12.1 Authentication: fail-closed resource server
 
-TSG validates the platform's JWT and never issues tokens. Two asymmetries in the JWT library are closed deliberately: an unset issuer would silently skip issuer checking entirely, and an unset audience would accept any token that merely *omits* `aud` — so both unset states raise instead of degrading. Key material is either a shared secret (HS256) or JWKS by key id; 30 s clock-skew leeway; `exp` required. The caller's **entity set** comes from a configurable claim; an empty or missing claim yields an empty set, and an empty set **denies every object-level check** — never allow-all. Dev mode (`AUTH_DEV_MODE`, loudly warned) builds a principal from headers for local work and deliberately skips posture checks as an explicit opt-in.
+TSG authenticates every request via the header model, not a JWT: `X-API-Key` is matched against a SHA-256 hash stored on an active `API_Client` row (the plaintext secret never touches TSG's database); `X-User-Id`/`X-Entity-Id`/`X-Tenant-Id` carry the acting identity, required and taken on trust unless `TSG_VERIFY_MEMBERSHIP` is on, in which case the (user, entity) pair is additionally checked against `user_scope_assignment`. The caller's **entity set** is therefore exactly `{X-Entity-Id}` — a blank or missing identity header **denies every object-level check** — never allow-all. Full contract, key rotation, and response codes: docs/TSG_API_AUTHENTICATION_GUIDE.md. (The `jwt_*`/`auth_dev_mode` settings referenced by earlier revisions of this document are retired — `app/core/config.py::_RETIRED_SETTINGS` fails boot if any are still set.)
 
 ### 12.2 Authorization layers
 
@@ -619,8 +619,8 @@ Every 60 s: flip expired RUNNING stages to ERROR, free expired locks (both as ta
 
 | Fails open (availability wins) | Fails closed (correctness/security wins) |
 |---|---|
-| LLM slot limiter on Redis errors | JWT issuer/audience unset → 401 |
-| SSE publish (circuit breaker, events are advisory) | Empty entity claim → deny all object access |
+| LLM slot limiter on Redis errors | Unknown/revoked `X-API-Key` → 401 |
+| SSE publish (circuit breaker, events are advisory) | Blank `X-User-Id`/`X-Entity-Id`/`X-Tenant-Id` → deny all object access |
 | Intel queries (missing intel changes nothing) | Admin key unset → always deny |
 | Embedding-store outage (degrade to memory tier) | Job-status marker check on Redis error → deny |
 | Embedding-refresh dispatch after a committed CRUD write | Prompt-context allowlist empty → send nothing |
@@ -637,7 +637,7 @@ A beat task (every 300 s) watches the system's slow-drift failure modes — seve
 
 ## 14. Configuration
 
-Settings load from environment (`TSG_`-prefixed, `.env` supported; naming a missing env file is a hard error — silently falling back would run a deployment on another environment's config). Groups: identity/environment, database pool and timeouts, Redis/Celery, MongoDB, intel feeds, LLM (provider, model, timeouts, temperatures), embeddings/reranker, thresholds, volume caps, capacity, leases/reaper, SSE, self-check, JWT, admin key.
+Settings load from environment (`TSG_`-prefixed, `.env` supported; naming a missing env file is a hard error — silently falling back would run a deployment on another environment's config). Groups: identity/environment, database pool and timeouts, Redis/Celery, MongoDB, intel feeds, LLM (provider, model, timeouts, temperatures), embeddings/reranker, thresholds, volume caps, capacity, leases/reaper, SSE, self-check, admin key.
 
 ### 14.1 Derived and validated settings
 

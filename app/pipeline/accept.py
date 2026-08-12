@@ -10,14 +10,15 @@ enforced two ways: a positive state gate (accept only at the REVIEW barrier) and
 from __future__ import annotations
 
 import json
-from typing import Any, NamedTuple, Sequence, cast
+from collections.abc import Sequence
+from typing import Any, NamedTuple, cast
 
 from sqlalchemy import RowMapping, Table, bindparam, insert, or_, select, update
 from sqlalchemy.orm import Session
 
+from app.core import tuning
 from app.core.config import get_settings
 from app.core.enums import (
-    TriageVerdict,
     ActorType,
     AuditDecision,
     AuditEventType,
@@ -25,15 +26,17 @@ from app.core.enums import (
     SessionStatus,
     StageStatus,
     SubsystemLevel,
+    TriageVerdict,
     WorkflowStage,
 )
-from app.core import tuning
 from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
 from app.db.dal import EntityForbidden, NotFoundError, guid, now
 from app.pipeline import embeddings, grounding
 from app.pipeline.llm import get_llm
+from app.sse import bus
+
 # THE one asset-name strip (legacy-row fallback only; new rows carry the AI's GenericName)
 # and THE one junk-name gate — both defined beside their Stage-1 writers so the vocabulary
 # of what may enter the shared library lives in exactly one module.
@@ -43,7 +46,7 @@ log = get_logger(__name__)
 
 
 class AcceptConflict(Exception):
-    """Accept attempted off the REVIEW barrier or against a held lock → 409 ([R5]). `reason` is an
+    """Accept attempted off the REVIEW barrier or against a held lock → 409. `reason` is an
     optional machine-readable code surfaced as `details.reason`; raise sites without one omit it."""
 
     def __init__(self, message: str, reason: str | None = None):
@@ -51,9 +54,9 @@ class AcceptConflict(Exception):
         self.reason = reason
 
 
-#: How many offending ids to name in the human-readable message. `details.unacceptable` always
+#: How many offending ids to name in the human-readable message lives in
+#: Settings.accept_named_in_message now (default unchanged: 3). `details.unacceptable` always
 #: carries every one — this only stops a 50-id request producing an unreadable sentence.
-_NAMED_IN_MESSAGE = 3
 
 #: Sentence fragments, so "<id> <text>" reads as plain English. No internal vocabulary:
 #: "OutputID", "subset" and "superseded" mean nothing to whoever is reading the response.
@@ -70,7 +73,7 @@ def _unacceptable_subset(sess: Session, session_id: str, subset: list[str],
     """Build the partial-accept 404, naming each unacceptable id and why. Returns rather than
     raises so the call site still reads as `raise ...`."""
     reasons = dal.unacceptable_subset_reasons(sess, session_id, subset, good_subs)
-    named = list(reasons)[:_NAMED_IN_MESSAGE]
+    named = list(reasons)[:get_settings().accept_named_in_message]
     # Outcome FIRST — "nothing was accepted" is the fact the reader acts on, and burying it
     # mid-sentence invited "so did the other two go through?". Then what is wrong, then the one
     # thing to do. No `subset`/OutputID jargon, and no second aside competing with the action.
@@ -186,8 +189,13 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
                     "the session as reviewed-with-none",
                     reason="nothing_to_accept")
 
-        _add_unverified_threats_to_library(sess, scenario_session, good_subs, user_id)
-
+        # ---- PHASE 1: CORE ACCEPT — the caller's actual request; must survive no matter what
+        # happens in Phase 2 below. Library promotion used to run BEFORE complete_session/audit,
+        # sharing this same uncommitted transaction — so ANY promotion failure (a bug, a transient
+        # LLM/network error, anything) rolled this back too, leaving the session exactly as if
+        # accept had never been called. Moving promotion to its own phase AFTER this commit fixes
+        # that: the accept a caller asked for is now durable independent of the side-effect that
+        # follows it.
         # CAS-fenced: False means a concurrent writer (e.g. a cancel) already moved
         # the session off 'active' between our REVIEW-barrier check above and here —
         # surface that as a conflict rather than silently completing over it.
@@ -213,15 +221,29 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             dal.append_audit(sess, AuditID=guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
                             EntityID=str(entity_id), EventType=event, Decision=decision, ActorUserID=user_id,
                             DetailJSON=json.dumps({"subset": subset}) if subset is not None else None)
+        sess.commit()  # Phase 1 durable: mark_scenarios_accepted + complete_session + audit rows
         log.info("session.accepted", session_id=session_id, decision=str(decision),
                 accepted_count=matched, user=user_id)
+        # Fast path only (item 1/item 30's sentinel-tick status check in stream_events() is the
+        # actual close guarantee, and closes with or without this): an already-subscribed client
+        # hears about the accept near-instantly instead of waiting up to sse_ping_seconds for the
+        # next tick. `type` is deliberately NOT an SSEEventType member — accept/cancel have no
+        # typed contract in this plan (Section E enumerates only the 9 worker-driven kinds); this
+        # is an informal nudge, not a documented event.
+        bus.publish(session_id, {"type": "session_accepted", "session_id": session_id,
+                                "status": str(SessionStatus.completed), "ts": now().isoformat()})
+
+        # ---- PHASE 2: LIBRARY PROMOTION — isolated; its own failures never reach the outer
+        # except below, so they can never undo Phase 1 (see run_promotion_phase's own docstring).
+        run_promotion_phase(sess, scenario_session, good_subs, user_id, acquired)
         return matched
     except Exception:
         # The lock acquisitions above are already committed (see comment there); everything
-        # after them — validation, mark_scenarios_accepted, the promotion loop, complete_session,
-        # audit rows — is still one uncommitted unit of work. Roll THAT back explicitly (same
-        # discipline as tasks.py's _record_failure) so a failure here can never leave a partial
-        # accept committed once the `finally` block below commits the lock release.
+        # after them up to Phase 1's own commit above — validation, mark_scenarios_accepted,
+        # complete_session, audit rows — is still one uncommitted unit of work whenever this
+        # fires BEFORE that commit. Roll THAT back explicitly (same discipline as tasks.py's
+        # _record_failure) so a failure here can never leave a partial accept committed once the
+        # `finally` block below commits the lock release. Phase 2 never reaches here — see above.
         sess.rollback()
         raise
     finally:
@@ -232,8 +254,122 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             for ss in acquired:
                 dal.release_lock(sess, session_id, ss, task_id=session_id)
             sess.commit()
-        except Exception:
+        except Exception:  # noqa: BLE001 — logged, not re-raised, so it doesn't mask the original error
             log.warning("accept.lock_release_failed", session_id=session_id)
+
+
+def run_promotion_phase(sess: Session, scenario_session: RowMapping, good_subs: list[int],
+                        user_id: str | None, lock_subsystem_ids: list[int]) -> bool:
+    """Attempt library promotion exactly once, then record the outcome on `scenario_session`'s
+    4 promotion-tracking columns — clear on success, stamp on failure. NEVER raises: a promotion
+    failure must never propagate to a caller that has already durably committed the real accept.
+
+    Caller must already hold the session's `_LOCK` subsystem locks (accept_session holds them for
+    its whole duration; retry_one_promotion/dismiss_promotion acquire them before calling this) —
+    `lock_subsystem_ids` names exactly which ones, so this function can refresh their lease
+    before the potentially slow embedding work below. Same renew_lock_lease mechanism _ask_ai
+    already uses before every chat call elsewhere in the pipeline: without it, a promotion attempt
+    slow enough to outlast stage_lease_seconds could have its lock reclaimed by the reaper
+    mid-flight, letting a second concurrent attempt start on the same session. Shared by all
+    callers so there is exactly one place that decides what "promotion succeeded" or "promotion
+    failed" means for these columns, not two copies that could drift apart.
+
+    Returns True on success, False on failure — reaper.retry_one_promotion uses this to build its
+    own richer outcome; accept_session ignores it (a promotion failure never changes what accept
+    itself returns to its caller)."""
+    session_id = scenario_session["SessionID"]
+    for subsystem_id in lock_subsystem_ids:
+        if not dal.renew_lock_lease(sess, session_id, subsystem_id, task_id=session_id):
+            log.debug("promotion.lock_lease_renewal_skipped", session_id=session_id, subsystem_id=subsystem_id)
+    sess.commit()
+    try:
+        promoted_names = _add_unverified_threats_to_library(sess, scenario_session, good_subs, user_id)
+        dal.clear_promotion_failure(sess, session_id)
+        sess.commit()
+        # Eager-embed AFTER the commit above, never before: embedding writes go to Mongo, a
+        # separate system with no shared transaction, so embedding a name before its SQL row is
+        # durably committed could leave an orphan vector if this attempt later rolled back.
+        eager_embed_promoted(sess, get_llm(), promoted_names)
+        return True
+    except Exception as exc:
+        # Undoes the WHOLE attempt, not a partial one: _add_unverified_threats_to_library commits
+        # nothing internally, so everything it did this call is still uncommitted here.
+        sess.rollback()
+        try:
+            dal.stamp_promotion_failure(sess, session_id, error_message=str(exc), user_id=user_id)
+            sess.commit()
+        except Exception:  # noqa: BLE001 — logged, not re-raised, so it doesn't mask the real failure
+            sess.rollback()
+            log.warning("session.promotion_failure_stamp_failed", session_id=session_id, exc_info=True)
+        log.warning("session.promotion_failed", session_id=session_id, user_id=user_id, exc_info=True)
+        return False
+
+
+class CandidateResolution(NamedTuple):
+    """Outcome of one resolve_candidate() call — a small named result instead of a growing
+    positional tuple, so a call site reads `resolution.type_id` instead of counting positions."""
+    won: bool                          # False = lost the CAS race; caller should report 409
+    type_id: int | None                # library id this candidate resolved to; None on reject/loss
+    catalogue_id: int | None           # library id this candidate resolved to; None on reject/loss
+    promoted_names: list[tuple[str, str]]  # for the caller to eager-embed after its own commit
+
+
+def resolve_candidate(sess: Session, candidate: RowMapping, reviewer_user_id: str | None,
+                    *, approve: bool) -> CandidateResolution:
+    """Curator resolution of one Threat_Candidate_Review row — the workflow `CandidateStatus`'s
+    own docstring calls "reserved... set by the curator workflow when it lands". Reject just
+    closes the row; approve additionally mints/reuses its Threat_Type and Threat_Catalogue entry,
+    reusing the SAME race-safe upsert primitives auto-promotion uses.
+
+    No Identified_Threat row is touched and no actor names are linked: Threat_Candidate_Review
+    carries no ThreatID (a proposal can be deduplicated across many threats, even across
+    sessions, so there is no single "originating" row) and never stored actor names either — both
+    by this table's actual schema, not an oversight here.
+
+    `won` is False when a concurrent request already resolved this candidate first (CAS loss —
+    caller should report 409, never re-run this). Returns the resolved type/catalogue ids
+    directly (not just a bool) so the caller never needs a second round trip to learn what this
+    call already computed. `promoted_names` is the SAME (embedding_group, name) contract
+    `_add_unverified_threats_to_library` returns, for the caller to eager-embed after its own
+    commit; empty on reject or on a lost CAS."""
+    if not approve:
+        won = dal.close_candidate_review(sess, candidate["CandidateID"],
+                                        status=CandidateStatus.rejected, reviewer_user_id=reviewer_user_id)
+        if won:
+            dal.append_audit(sess, AuditID=guid(), SessionID=candidate["SessionID"],
+                            TenantID=candidate["TenantID"], EntityID=candidate["EntityID"],
+                            EventType=AuditEventType.candidate_reconciled, ActorUserID=reviewer_user_id,
+                            DetailJSON=json.dumps({"candidate_id": candidate["CandidateID"],
+                                                    "decision": str(CandidateStatus.rejected)}))
+        return CandidateResolution(won, None, None, [])
+
+    # Sector-agnostic (sector_id=None): a candidate carries no sector scoping of its own, unlike
+    # a live accept's scenario_session (which _pick_sector_for_promotion draws from).
+    category_id = grounding.find_category(sess, candidate["ProposedCategory"])
+    type_id = candidate["ThreatTypeID"]
+    if type_id is None:
+        type_id, _created = dal.upsert_threat_type(sess, candidate["ProposedType"], category_id,
+                                                    sector_id=None, created_by=reviewer_user_id)
+    generic = candidate["ProposedGenericName"] or candidate["ProposedName"]
+    catalogue_id = dal.upsert_threat_catalogue(sess, generic, type_id, sector_id=None,
+                                                created_by=reviewer_user_id)
+    dal.link_catalogue_category(sess, catalogue_id, category_id)
+    won = dal.close_candidate_review(sess, candidate["CandidateID"], status=CandidateStatus.accepted,
+                                    reviewer_user_id=reviewer_user_id, type_id=type_id,
+                                    catalogue_id=catalogue_id)
+    if not won:
+        # Lost the CAS: another request resolved this candidate first. The mint above is harmless
+        # (upsert_threat_type/upsert_threat_catalogue are race-safe by construction — see the
+        # design's gap #14/#15), just redundant this call — report the conflict, don't audit twice.
+        return CandidateResolution(False, None, None, [])
+    dal.append_audit(sess, AuditID=guid(), SessionID=candidate["SessionID"], TenantID=candidate["TenantID"],
+                    EntityID=candidate["EntityID"], EventType=AuditEventType.candidate_reconciled,
+                    ActorUserID=reviewer_user_id, ThreatTypeRefID=type_id,
+                    DetailJSON=json.dumps({"candidate_id": candidate["CandidateID"],
+                                            "decision": str(CandidateStatus.accepted),
+                                            "catalogue_id": catalogue_id}))
+    return CandidateResolution(True, type_id, catalogue_id,
+                                [("threat_type", candidate["ProposedType"]), ("threat_catalogue", generic)])
 
 
 def review_gate_reason(scenario_session: RowMapping | dict) -> tuple[str, str] | None:
@@ -251,16 +387,16 @@ def review_gate_reason(scenario_session: RowMapping | dict) -> tuple[str, str] |
     status = scenario_session["SessionStatus"]
     if status == SessionStatus.completed:
         return ("session_completed",
-                f"session already completed at {scenario_session['CompletedAt']} — the review "
+                (f"session already completed at {scenario_session['CompletedAt']} — the review "
                 f"decision is final; accepted scenarios are available via "
                 f"GET /v1/sessions/{scenario_session['SessionID']}/accepted-scenarios, "
-                f"and a new session for this asset can run a fresh review")
+                f"and a new session for this asset can run a fresh review"))
     if status == SessionStatus.cancelled:
         return ("session_cancelled",
                 f"session was cancelled — start a new session for asset {scenario_session['AssetID']}")
     return ("generation_in_progress",
-            f"session not at REVIEW yet (stage={scenario_session['CurrentStage']}, "
-            f"status={scenario_session['StageStatus']}) — generation still in progress")
+            (f"session not at REVIEW yet (stage={scenario_session['CurrentStage']}, "
+            f"status={scenario_session['StageStatus']}) — generation still in progress"))
 
 
 def _ensure_session_ready_to_accept(scenario_session: RowMapping) -> None:
@@ -490,9 +626,9 @@ def _triage_generic_name(qv: Sequence[float], cand_cat_id: int | None, sector_id
         if best_any is None or cos > best_any[0]:
             best_any = (cos, e["id"])
         if (cand_cat_id is not None and cand_cat_id in e["cats"]
-                and (e["sector_id"] is None or e["sector_id"] in sector_ids)):
-            if best_reject is None or cos > best_reject[0]:
-                best_reject = (cos, e["id"])
+                and (e["sector_id"] is None or e["sector_id"] in sector_ids)
+                and (best_reject is None or cos > best_reject[0])):
+            best_reject = (cos, e["id"])
     if best_any is None:  # empty/unembeddable library — a first entry is novel by definition
         return TriageVerdict.auto_approve, None, None
     if best_reject is not None and best_reject[0] >= tn.triage_auto_reject_cosine:
@@ -623,6 +759,14 @@ class _CandidateFate(NamedTuple):
     catalogue_id: int | None       # its Threat_Catalogue id after triage (None = none matched)
     matched_id: int | None         # the entry the cosine was measured against (audit/calibration)
     cosine: float | None
+    # (embedding_group, name) pairs THIS call genuinely inserted — never a name that merely got
+    # LINKED to an already-existing entry. An auto_reject match reuses an existing row under
+    # whatever name IT was originally stored as, which is not necessarily `row["ThreatType"]`/
+    # `generic` (those are this candidate's own proposed spelling, matched by cosine similarity,
+    # not exact identity) — eager-embedding those would either silently do nothing useful (best
+    # case) or spend a call resolving a name that matches no active master row (worst case, an
+    # avoidable warning on the single most common promotion outcome).
+    minted: list[tuple[str, str]]
 
 
 def _decide_candidate_fate(sess: Session, row: RowMapping, generic: str | None, sector_id: int | None,
@@ -665,6 +809,15 @@ def _decide_candidate_fate(sess: Session, row: RowMapping, generic: str | None, 
         # embeds far from everything, so it lands EXACTLY in the auto-approve band — the one
         # band no curator sees. Nothing enters the shared library without passing the gate.
         verdict = TriageVerdict.review
+    if verdict is TriageVerdict.auto_approve and not get_settings().promotion_auto_approve_enabled:
+        # Master-table writes are manual-by-default: a genuinely novel candidate still gets its
+        # type/catalogue resolved below like any other, but downgrading the verdict here routes
+        # it into the SAME curator queue as the ambiguous "review" band below, instead of minting
+        # an entry no human has seen. get_settings() (not `tn`, the per-session frozen tuning
+        # snapshot) deliberately: an admin flipping this is an operational policy that should
+        # apply to every promotion attempt from that moment on, including a retry of a session
+        # created before the flip — not something frozen at session-creation time.
+        verdict = TriageVerdict.review
     matched_entry = (next((e for e in triage.entries if e["id"] == matched_id), None)
                     if verdict is TriageVerdict.auto_reject else None)
     if verdict is TriageVerdict.auto_reject and matched_entry is None:
@@ -682,17 +835,22 @@ def _decide_candidate_fate(sess: Session, row: RowMapping, generic: str | None, 
         # the catalogue entry's OWNER defines the type — the invariant every other writer of a
         # stored (ThreatTypeID, ThreatCatalogueID) pair keeps (grounding's model)
         type_id = matched_entry["type_id"]
+        minted: list[tuple[str, str]] = []
         if type_id is None:  # ownerless legacy entry — resolve/mint as usual
             type_id, _ = _find_or_create_type_and_catalogue(sess, row, sector_id, resolved,
                                                             created_by=created_by)
-        return _CandidateFate(verdict, type_id, matched_id, matched_id, cosine)
+            if resolved.get(("minted_type", type_id)):
+                minted.append(("threat_type", row["ThreatType"]))
+        return _CandidateFate(verdict, type_id, matched_id, matched_id, cosine, minted)
 
     type_id, catalogue_id = _find_or_create_type_and_catalogue(sess, row, sector_id, resolved,
                                                             created_by=created_by)
+    minted = [("threat_type", row["ThreatType"])] if resolved.get(("minted_type", type_id)) else []
     if verdict is TriageVerdict.auto_approve:
         catalogue_id = dal.upsert_threat_catalogue(sess, generic, type_id, sector_id,
                                                 created_by=created_by)
         dal.link_catalogue_category(sess, catalogue_id, cand_cat)
+        minted.append(("threat_catalogue", generic))
         # Visible to the LATER candidates by construction: _pick_sector_for_promotion draws
         # sector_id from the session's own SectorIDsJSON — the same list _prepare_triage puts
         # in triage.sector_ids — so this entry passes _triage_generic_name's visibility test.
@@ -700,15 +858,20 @@ def _decide_candidate_fate(sess: Session, row: RowMapping, generic: str | None, 
         triage.entries.append({"id": catalogue_id, "name": generic, "type_id": type_id,
                             "sector_id": sector_id, "cats": frozenset({cand_cat})})
         triage.catalogue_vecs.setdefault(generic, qv)
-    return _CandidateFate(verdict, type_id, catalogue_id, matched_id, cosine)
+    return _CandidateFate(verdict, type_id, catalogue_id, matched_id, cosine, minted)
 
 
-def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMapping, good_subs: list[int], user_id: str | None) -> None:
+def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMapping, good_subs: list[int],
+                                        user_id: str | None) -> list[tuple[str, str]]:
     """Promote this accept's novel threats into the shared library: for each candidate, decide
     its catalogue fate by banded triage, create/reuse the matching Threat_Type and actor links,
     and accumulate the audit + candidate-review records. Reads are pre-resolved by
     `_promotion_candidates` / `_preload_actor_memo` / `_prepare_triage`; writes are batched at
     the bottom.
+
+    Returns every `(embedding_group, name)` pair actually promoted this call, for the caller to
+    eager-embed AFTER its own commit (see run_promotion_phase) — never computed here, since this
+    function's writes are not yet durable when it returns.
     """
     sector_id = _pick_sector_for_promotion(scenario_session)
     sid = scenario_session["SessionID"]
@@ -739,6 +902,7 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
     audit_rows: list[dict] = []
     candidate_rows: list[dict] = []
     triage_details: list[dict] = []
+    promoted_names: list[tuple[str, str]] = []  # (embedding_group, name) — see return docstring
     for row in rows:
         # Banded triage of the LIBRARY-SHAPED name FIRST (never the asset-embedded one) —
         # before any type resolution, so an auto-reject adopts the matched entry's owning type
@@ -753,7 +917,7 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
         generic = triage.generic_by_tid[row["ThreatID"]]
         fate = _decide_candidate_fate(sess, row, generic, sector_id, resolved, triage, tn,
                                     created_by=actor_id)
-        verdict, type_id, catalogue_id_new, matched_id, cosine = fate
+        verdict, type_id, catalogue_id_new, matched_id, cosine, minted = fate
 
         actors = parsed_actors[row["ThreatID"]]
         # TWO gates, closing two different loops:
@@ -799,6 +963,12 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
                                         "triage_verdict": verdict})))
             log.info("threat.promoted", session_id=sid, threat_id=row["ThreatID"],
                     type_id=type_id, catalogue_id=catalogue_id_new, sector_id=sector_id)
+            # `minted` (not row["ThreatType"]/generic unconditionally): an auto_reject LINKS to
+            # an EXISTING entry under whatever name it was actually stored as, which is not
+            # necessarily this candidate's own proposed spelling — eager-embedding the wrong
+            # name would either no-op uselessly or fail name resolution on the most common
+            # promotion outcome. _decide_candidate_fate already tracked exactly what it minted.
+            promoted_names.extend(minted)
 
         # ONLY the middle band reaches a human. `pending` is the honest status — nothing has
         # been reviewed, hence no ReviewedBy/ReviewedAt and no `candidate_reconciled` audit.
@@ -839,3 +1009,23 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
         sess.execute(insert(m.Threat_Candidate_Review), candidate_rows)
     if audit_rows:
         sess.execute(insert(m.Scenario_Audit), audit_rows)
+    return promoted_names
+
+
+def eager_embed_promoted(sess: Session, llm, promoted_names: list[tuple[str, str]]) -> None:
+    """Fingerprint every (embedding_group, name) pair promoted this call, right now, instead of
+    waiting for some later accept's triage to lazily compute it. Best-effort: a slow or
+    unreachable embedding/Mongo service must never fail an accept or a retry that already
+    succeeded on the DB side, so every failure here is only logged, never raised. The existing
+    lazy fallback in embeddings.get_vectors still covers this name if this call is skipped or
+    fails — no separate retry mechanism is needed for eager embedding itself."""
+    if not promoted_names:
+        return
+    names_by_group: dict[str, list[str]] = {}
+    for group, name in promoted_names:
+        names_by_group.setdefault(group, []).append(name)
+    for group, names in names_by_group.items():
+        try:
+            embeddings.create_items(sess, llm, group, names)
+        except Exception:  # noqa: BLE001 — best-effort; the lazy fallback self-heals this later
+            log.warning("session.eager_embed_failed", embedding_group=group, names=names, exc_info=True)

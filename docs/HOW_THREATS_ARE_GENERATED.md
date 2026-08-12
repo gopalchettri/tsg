@@ -517,12 +517,22 @@ The events it can send (`app/core/enums.py:207`):
 | `session_entered_review` | Everything is done; waiting on the human. |
 | `next_set_result` | A "generate next set" click landed — how many were added, and why if none. |
 | `regen_result` | A regenerate click landed — which outputs replaced which. |
+| `treatment_plan_result` | One risk treatment plan reached a committed COMPLETE/ERROR (§17). |
 | `error` | A stage failed (carries the stage) or the whole session died (doesn't). |
 | `heartbeat` | Periodic keep-alive so proxies don't drop an idle connection. |
 
-The last two "result" events are **advisory only**. Their durable counterparts are the audit row the
-status board serves as `last_next_set`, and the `generation_epoch` on the results rows — which is why
-the audit row is always written *before* the event is published.
+The three "result" events are **advisory only**. Their durable counterparts are the audit row the
+status board serves as `last_next_set`, the `generation_epoch` on the results rows, and — for
+treatment — `GET /v1/sessions/{id}/treatment-plans`. That is why the durable write always lands
+*before* the event is published.
+
+`treatment_plan_result` is weaker than the other two and must not be treated as a completion
+signal. It fires only when the worker's finish CAS actually rewrote the row, so three outcomes are
+silent: a dead worker (the row stays RUNNING and only the GET's read-time projection calls it timed
+out — there is no reaper), an `LLMSlotUnavailable` autoretry (which bumps the progress clock every
+attempt, so the row never even goes stale), and cancel/review (written in the API process, not the
+worker). A client keeps a slow backstop poll and matches on `output_id` — a regeneration mints a new
+`plan_id`.
 
 **Step 28 — Regenerate specific scenarios.** `POST .../regenerate/scenarios` with 1–50 `output_id`s.
 It targets **exact scenario rows, never threat ids** — because a threat can own two scenarios, so

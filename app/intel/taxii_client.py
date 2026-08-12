@@ -12,7 +12,7 @@ from typing import Any, Iterator
 MITRE_TAXII_ROOT = "https://attack-taxii.mitre.org/api/v21/"
 MITRE_COLLECTIONS = {
     "attack": "x-mitre-collection--1f5f1533-f617-4ca8-9ab4-6a02367fa019",      # Enterprise
-    "attack_ics": "x-mitre-collection--02c3ef24-9cd4-48f3-a99f-b74ce24f1d34",  # ICS
+    "attack_ics": "x-mitre-collection--90c00720-636b-4485-b342-8751d232bf09",  # ICS
 }
 
 

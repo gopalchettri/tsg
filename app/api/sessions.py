@@ -5,28 +5,61 @@ it is in the caller's authorized set — a valid token is not enough.
 """
 from __future__ import annotations
 
+import asyncio
+import io
 import json
+from functools import lru_cache
 from typing import Literal, NoReturn
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import exists, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from app.api.deps import Principal, get_principal
+from app.api.results_excel import build_results_workbook
 from app.api.schemas import (
-    AcceptBody, AcceptedScenario, AcceptedScenariosResponse, AcceptResponse, CancelResponse, CreateSessionBody,
-    CreateSessionResponse, ErrorResponse, MappedControl, NextSetResultEvent, RegenerateResponse,
-    RegenerateScenariosBody, RegenResultEvent, ScenarioListItem,
-    ScenarioResult, SessionBoard, SessionResults, ThreatResult,
+    AcceptBody,
+    AcceptedScenario,
+    AcceptedScenariosResponse,
+    AcceptResponse,
+    CancelResponse,
+    CreateSessionBody,
+    CreateSessionResponse,
+    ErrorEvent,
+    ErrorResponse,
+    HeartbeatEvent,
+    MappedControl,
+    NextSetResultEvent,
+    RegenerateResponse,
+    RegenerateScenariosBody,
+    RegenResultEvent,
+    ScenarioListItem,
+    ScenarioResult,
+    SessionBoard,
+    SessionEnteredReviewEvent,
+    SessionResults,
+    StageCompletedEvent,
+    StageStartedEvent,
+    SubsystemStartedEvent,
+    ThreatResult,
+    TreatmentPlanResultEvent,
 )
+from app.core import tuning
 from app.core.config import get_settings
-from app.core.logging import get_logger
 from app.core.enums import (
-    AuditEventType, RegenGranularity, SessionMode, SessionStatus, SSEEventType, StageStatus, SubsystemLevel,
-    SubsystemProgress, WorkflowStage,
+    AuditEventType,
+    RegenGranularity,
+    SessionMode,
+    SessionStatus,
+    SSEEventType,
+    StageStatus,
+    SubsystemLevel,
+    SubsystemProgress,
+    WorkflowStage,
 )
+from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
 from app.db.dal import EntityForbidden, IdempotencyKeyConflict, RegenerateConflict, now
@@ -34,10 +67,10 @@ from app.db.engine import db_session
 from app.pipeline import cascade, tasks
 from app.pipeline.accept import accept_session, review_gate_reason
 from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
-from app.core import tuning
 from app.pipeline.context import gather_asset_details
 from app.pipeline.grounding import stored_actors
 from app.pipeline.tasks import ASSET_UNIT_ID, set_up_progress_tracking
+from app.sse import bus
 
 log = get_logger(__name__)
 
@@ -84,14 +117,24 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
     One flat progress object, not a list: ASSET_UNIT_ID is the only subsystem id the
     pipeline ever writes."""
     stages: dict[str, str] = {}
-    error_message: str | None = None
+    # BREAKING REST API CHANGE (plan item 7 — shipped last, deliberately separate from every
+    # other change in this file): error_message used to be a single `str | None`, last-row-wins
+    # across stages — a THREATS error and a SCENARIOS error at the same time silently dropped
+    # one. Now a dict[str, str] keyed by stage ("threats"/"scenarios"), so each stage keeps its
+    # own message. This reshapes SessionProgress on BOTH the polling `GET
+    # /v1/sessions/{session_id}` response (this function's direct caller) and every SSE
+    # `reconcile` event (also built from this function) — any existing typed consumer reading
+    # `error_message` as `Optional[str]` hard-fails to parse the response the moment this ships.
+    # See docs/SSE_SESSION_PROGRESS_CONTRACT_GUIDE.md.
+    error_messages: dict[str, str] = {}
     for row in dal.stage_rows(sess, scenario_session["SessionID"]):
-        stages[str(row["Level"]).lower()] = str(row["Status"])
+        level = str(row["Level"]).lower()
+        stages[level] = str(row["Status"])
         if row["ErrorMessage"]:
             # Client-safe failure reason, deliberately kept on an AWAITING_DECISION row the
             # salvage path revived (dal.revive_errored_scenarios_to_review): it is the marker
             # that this review set may be PARTIAL, so a reviewer can tell it from a complete one.
-            error_message = str(row["ErrorMessage"])
+            error_messages[level] = str(row["ErrorMessage"])
     t = stages.get("threats", StageStatus.IDLE)
     sc = stages.get("scenarios", StageStatus.IDLE)
     return {
@@ -103,7 +146,7 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
         "progress": {
             "threats": t, "scenarios": sc,
             "overall": str(get_overall_status(t, sc, scenario_session["SessionStatus"])),
-            "error_message": error_message,
+            "error_message": error_messages,
             # The DURABLE answer to "what did my last 'generate next set' click do?". The SSE
             # next_set_result event says the same thing, but publishing is best-effort with no
             # replay (app/sse/bus.py), so a polling client — or one whose stream dropped — has
@@ -111,6 +154,11 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
             # client that missed the event learns the outcome the moment it reconnects.
             "last_next_set": dal.latest_next_set_outcome(sess, scenario_session["SessionID"],
                                                         ASSET_UNIT_ID),
+            # Plan item 3: same durable-mirror rationale as last_next_set above, for
+            # /regenerate/scenarios instead of /scenarios/next-set — built from the
+            # regeneration_completed audit row (app/pipeline/cascade.py::_stage_regen_audit).
+            "last_regen": dal.latest_regen_outcome(sess, scenario_session["SessionID"],
+                                                    ASSET_UNIT_ID),
         },
     }
 
@@ -167,7 +215,9 @@ def create_session(
     task; an `Idempotency-Key` short-circuits to the existing session on retry instead
     of creating a duplicate (200 + `JSONResponse`, not the 202 the decorator declares)."""
     principal.require_entity(body.entity_id)
-    tenant = get_settings().tenant_id
+    # Tenant comes from the caller's X-Tenant-Id — get_principal now requires it, so a real
+    # request always has one; only a Principal built by hand (tests) can arrive without one.
+    tenant = principal.tenant_id or get_settings().tenant_id
     sid = dal.guid()
     with db_session() as sess:
         dal.assert_asset_owned_by_entity(sess, body.asset_id, body.entity_id)
@@ -200,7 +250,7 @@ def create_session(
                         EventType=AuditEventType.session_started, ActorUserID=principal.user_id)
     try:
         enqueue_pipeline(sid)
-    except Exception as exc:  # noqa: BLE001 — broker unreachable must not orphan a committed session
+    except Exception as exc:
         # Pattern A (see app/api/treatment.py's request_treatment_plan): the row is already
         # committed and holding the one-active-session-per-asset slot, so a bare re-raise would
         # leave it stuck there — unreachable by the client (no session_id in a raw 500) — until
@@ -227,13 +277,16 @@ def get_session(session_id: str, principal: Principal = Depends(get_principal)) 
 
 def _scenario_select():
     """Scenario columns LEFT-joined via Scoped_Threat -> Identified_Threat (the chain
-    dal.accepted_scenarios uses) so every row carries the threat_id it was generated from.
-    ControlsMappedAt is NULL until Step-4 has been ATTEMPTED, which is what separates "still
-    generating" from "nothing in the library matched"."""
+    dal.accepted_scenarios uses) so every row carries the threat_id it was generated from — plus
+    the threat's own category/type/name/actors, so _scenario_with_controls can merge them into
+    the returned scenario body without a second query. ControlsMappedAt is NULL until Step-4 has
+    been ATTEMPTED, which is what separates "still generating" from "nothing in the library
+    matched"."""
     out, st, it = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
     return select(
         out.OutputID, out.ScenarioJSON, out.Accepted, out.ValidationJSON, out.GenerationEpoch,
         out.ScenarioNumber, out.ReplacesOutputID, out.ControlsMappedAt, it.ThreatID,
+        it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON,
     ).select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                 .outerjoin(it, st.ThreatID == it.ThreatID))
 
@@ -391,6 +444,32 @@ def get_results(
         )
 
 
+@router.get("/sessions/{session_id}/results.xlsx")
+def get_results_excel(
+    session_id: str,
+    include_replaced: bool = Query(
+        default=False,
+        description="Same as /results — also include the older scenario versions that "
+                    "regeneration replaced, as extra rows with is_replaced=true.",
+    ),
+    principal: Principal = Depends(get_principal),
+) -> Response:
+    """The same data as /results, as a single-sheet Excel workbook — one row per scenario.
+
+    Calls get_results() directly rather than re-querying: the JSON and Excel outputs can never
+    disagree on the underlying data, only presentation differs here. Authorization and
+    404-before-403 come along for free from that same call."""
+    results = get_results(session_id, include_replaced, principal)
+    workbook = build_results_workbook(results)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="session_{session_id}_results.xlsx"'},
+    )
+
+
 def _moderation_summary(validation_json: str | None) -> tuple[bool, bool | None, list[str]]:
     """Moderation flag out of a scenario's ValidationJSON, for a reviewer to see.
 
@@ -448,7 +527,7 @@ def _controls_by_output(sess: Session, output_ids: list[str]) -> dict[str, list[
     cmap, lib = m.Threat_Scenario_Control_Map, m.Control_Library
     try:
         return _query_controls(sess, output_ids, cmap, lib)
-    except Exception:  # noqa: BLE001 — controls are enrichment: a DB where Control_library.sql
+    except Exception:
         # hasn't run yet must degrade to controls=[] with a loud log, not 500 the core reads.
         sess.rollback()  # leave the session clean for the caller's remaining work/commit
         log.warning("controls.read_failed", exc_info=True)
@@ -461,7 +540,7 @@ def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str
             lib.ControlLibraryID, lib.ControlCode, lib.Domain, lib.ControlName)
         .join(lib, lib.ControlLibraryID == cmap.ControlLibraryID)
         .where(cmap.OutputID.in_(output_ids),
-            lib.IsActive == True, lib.IsDeleted == False)  # noqa: E712
+            lib.IsActive == True, lib.IsDeleted == False)
         .order_by(cmap.OutputID, cmap.MapRank)
     ).mappings().all()
     std_names: dict[int, list[str]] = {}
@@ -471,7 +550,7 @@ def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str
             select(smap.ControlLibraryID, std.StandardName)
             .join(std, std.StandardID == smap.StandardID)
             .where(smap.ControlLibraryID.in_({r["ControlLibraryID"] for r in rows}),
-                std.IsActive == True, std.IsDeleted == False)  # noqa: E712
+                std.IsActive == True, std.IsDeleted == False)
             .order_by(std.StandardName)
         ):
             std_names.setdefault(cid, []).append(name)
@@ -486,7 +565,7 @@ def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str
 
 
 def _scenario_with_controls(scenario_json: str | None, controls: list[MappedControl],
-                        controls_mapped: bool = True) -> dict | None:
+                        controls_mapped: bool = True, threat_row: dict | None = None) -> dict | None:
     """Projects one ScenarioJSON row for the API: `controls` becomes the Step-4 grounded
     Control_Library matches, and the LLM's raw `{name, why}` suggestions they replace move to
     `suggested_controls`. Presentation-layer merge only — Threat_Scenario_Control_Map stays the
@@ -499,10 +578,19 @@ def _scenario_with_controls(scenario_json: str | None, controls: list[MappedCont
 
     `controls_mapped` gates `unmatched_suggestions`: mid-stage, every suggestion would otherwise
     look unmatched before mapping had run. Defaults True for the accepted-scenarios caller,
-    where mapping is necessarily complete."""
+    where mapping is necessarily complete.
+
+    `threat_row` (a _scenario_select() row) carries the threat's own category/type/name/actors —
+    NOT part of the LLM's scenario JSON — merged in here so a caller only has one dict to read.
+    None for callers with no threat context (a scenario built for logging/preview, say)."""
     scenario = _safe_scenario_json(scenario_json)
     if scenario is None:
         return None
+    if threat_row is not None:
+        scenario["threat_category"] = threat_row.get("ThreatCategory")
+        scenario["threat_type"] = threat_row.get("ThreatType")
+        scenario["threat_name"] = threat_row.get("ThreatName")
+        scenario["threat_actors"] = stored_actors(threat_row.get("ThreatActorsJSON"))
     # Read the raw suggestions BEFORE overwriting the key they live under.
     raw = [c for c in (scenario.get("controls") or [])
         if isinstance(c, dict) and str(c.get("name") or "").strip()]
@@ -529,7 +617,8 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
     checked, flagged, categories = _moderation_summary(row["ValidationJSON"])
     validation_status, validation_errors = _validation_summary(row["ValidationJSON"])
     return ScenarioResult(output_id=row["OutputID"], threat_id=row["ThreatID"],
-                        scenario=_scenario_with_controls(row["ScenarioJSON"], controls or [], controls_mapped),
+                        scenario=_scenario_with_controls(row["ScenarioJSON"], controls or [],
+                                                        controls_mapped, row),
                         accepted=bool(row["Accepted"]),
                         moderation_checked=checked, moderation_flagged=flagged, moderation_categories=categories,
                         validation_status=validation_status, validation_errors=validation_errors,
@@ -748,6 +837,14 @@ def post_cancel(session_id: str, principal: Principal = Depends(get_principal)) 
         dal.append_audit(sess, AuditID=dal.guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
                         EntityID=scenario_session["EntityID"], EventType=AuditEventType.session_cancelled,
                         ActorUserID=principal.user_id)
+    # Fast path only (item 1/item 30's sentinel-tick status check in stream_events() is the
+    # actual close guarantee, and closes with or without this): an already-subscribed client
+    # hears about the cancel near-instantly instead of waiting up to sse_ping_seconds for the
+    # next tick. `type` is deliberately NOT an SSEEventType member — cancel/accept have no typed
+    # contract in this plan (Section E enumerates only the 9 worker-driven kinds); this is an
+    # informal nudge, not a documented event.
+    bus.publish(session_id, {"type": "session_cancelled", "session_id": session_id,
+                            "status": str(SessionStatus.cancelled), "ts": now().isoformat()})
     return CancelResponse(session_id=session_id, user_id=scenario_session["UserID"], status=str(SessionStatus.cancelled))
 
 
@@ -760,6 +857,46 @@ def _load_events_board(session_id: str, principal: Principal) -> dict:
         return build_board(sess, scenario_session)
 
 
+def _stream_still_open(session_id: str, principal: Principal, verify_membership: bool) -> bool:
+    """Item 1 + item 30's consolidated per-tick handler, run off the event loop (same reason as
+    `_load_events_board`). Called once per `bus.SUBSCRIBE_TICK`, never per real event — this is
+    the guarantee that closes the stream whether or not any `bus.publish` call ever arrives.
+
+    False means the caller must close the generator: either the session left `active` (item 1 —
+    `load_session_board` returning None also counts, a hard-deleted row being the only way a
+    valid session id stops resolving) or, when `verify_membership` is on, the (user, entity) pair
+    no longer resolves (item 30). One function, one DB round trip per check — not two independent
+    handlers racing their own queries."""
+    with db_session() as sess:
+        row = dal.load_session_board(sess, session_id)
+        if row is None or str(row["SessionStatus"]) != str(SessionStatus.active):
+            return False
+        if verify_membership and not dal.user_has_entity(sess, principal.user_id, row["EntityID"]):
+            return False
+        return True
+
+
+class SSEStreamCapacityExceeded(Exception):
+    """`session_events()` is at the `sse_max_concurrent_streams` cap -> 503. Same soft/racy
+    capacity-503 convention as `dal.CapacityExceeded`/`LLMSlotUnavailable` — see errors.py, which
+    imports this to register its handler."""
+
+
+@lru_cache
+def _sse_semaphore() -> asyncio.Semaphore:
+    """One per-process cap on concurrently open SSE streams, sized off the SAME setting
+    (`sse_max_concurrent_streams`) that bounds `bus.py`'s shared subscriber connection pool
+    (item 11) — so this semaphore can never admit a stream the pool has no connection for.
+    `@lru_cache`, same singleton pattern as `bus._subscriber_pool()`, for the same reason: one
+    instance for the life of this process, not one per request.
+
+    ponytail: a plain in-process asyncio.Semaphore, not a Redis-backed cross-replica limiter —
+    `sse_max_concurrent_streams` is documented (item 11) as a PER-PROCESS cap, matching the
+    connection pool it's paired with. Upgrade to a shared limiter only if streams need capping
+    across replicas, not just within one."""
+    return asyncio.Semaphore(get_settings().sse_max_concurrent_streams)
+
+
 # The stream has no response_model (it is not a single JSON body), so nothing about the events
 # would otherwise appear in the spec — leaving a UI to hand-copy event shapes and reason codes out
 # of the API guide. Declaring the payloads here puts them, and every enum they reference, into
@@ -767,12 +904,48 @@ def _load_events_board(session_id: str, principal: Principal) -> dict:
 # Declared via `model` (a union), NOT a hand-inlined model_json_schema(): FastAPI then registers
 # both payloads AND every enum they reference in components.schemas. Inlining instead produces
 # $defs-local refs that dangle once the spec is assembled.
+# TreatmentPlanResultEvent is declared here even on deployments where risk_module_enabled is off:
+# this router is always mounted, so gating a response-model union on a runtime flag would cost more
+# machinery than a documented-but-unreachable event type is worth. Same posture as the other
+# treatment schemas, which reach the spec through app/api/treatment.py's own models.
+# Plan item 26: SessionBoard is bound here for `reconcile` — the ONLY union member with no
+# `type: Literal[...]` discriminator field of its own (SessionBoard is shared with the polling
+# GET /v1/sessions/{session_id}, which never sends a "type" key, so adding one to the model would
+# misdescribe that response). The wire-level fix lives where the event is built, in
+# stream_events() below: the streamed payload gets an actual `"type": "reconcile"` key stitched
+# in, matching every other event's shape on the wire even though the schema here can't express it
+# as a Literal without corrupting the polling GET's own schema.
 _EVENT_STREAM_RESPONSES: dict[int | str, dict] = {
     200: {
-        "model": NextSetResultEvent | RegenResultEvent,
-        "description": "SSE stream; each `data:` line is one event, the advisory ones typed here. "
-                    "Advisory events are best-effort and never replayed — treat them as a prompt "
-                    "to refresh, and trust GET /v1/sessions/{session_id} for durable state.",
+        "model": (SessionBoard | StageStartedEvent | StageCompletedEvent | SubsystemStartedEvent
+                | SessionEnteredReviewEvent | ErrorEvent | NextSetResultEvent | RegenResultEvent
+                | TreatmentPlanResultEvent | HeartbeatEvent),
+        "description": "SSE stream; each `data:` line is one event, ALL 10 kinds typed here "
+                    "(reconcile + the 6 pipeline-lifecycle events + the 3 advisory result "
+                    "events). Plan item 24: this is a fetch()+ReadableStream stream, sent with "
+                    "the custom auth headers this API requires on every route — the native "
+                    "browser `EventSource` API cannot set those headers, so it cannot consume "
+                    "this endpoint; use fetch() with a ReadableStream reader (see "
+                    "app/static/sse_test.html for a worked example), not `new EventSource(...)`. "
+                    "`reconcile` is sent once per connect/reconnect, before any live event: the "
+                    "full current SessionBoard, so a client never has to guess what it missed — "
+                    "but it is a snapshot, not a delta, and it does NOT carry treatment-plan "
+                    "state (see treatment_plan_result below). The 6 pipeline-lifecycle events "
+                    "(stage_started/stage_completed/subsystem_started/session_entered_review/"
+                    "error/heartbeat) are best-effort live progress narration; `error` is "
+                    "dual-scope (see its `scope` field) and is NOT necessarily terminal on its "
+                    "own — do not tear down UI on `error` alone, wait for "
+                    "session_entered_review or a terminal session status. The 3 advisory result "
+                    "events are best-effort and never replayed — treat them as a prompt to "
+                    "refresh, and trust GET /v1/sessions/{session_id} for durable state. "
+                    "A publish failure opens a circuit breaker that suppresses ALL events from "
+                    "that worker process for a cooldown window, so a backstop poll is the recovery "
+                    "path. `treatment_plan_result` is weaker still: plan state is NOT carried by "
+                    "the `reconcile` event, and three outcomes never publish at all (dead worker, "
+                    "LLM-capacity autoretry, cancel/review) — recover with "
+                    "GET /v1/sessions/{session_id}/treatment-plans and keep a slow poll. "
+                    "Full field-by-field shapes and recovery paths: "
+                    "docs/SSE_SESSION_PROGRESS_CONTRACT_GUIDE.md.",
         "content": {"text/event-stream": {}},
     }
 }
@@ -787,9 +960,23 @@ async def session_events(session_id: str, principal: Principal = Depends(get_pri
     from sse_starlette.sse import EventSourceResponse
     from starlette.concurrency import run_in_threadpool
 
-    from app.sse import bus
-
-    board = await run_in_threadpool(_load_events_board, session_id, principal)
+    settings = get_settings()
+    # Item 12: gate BEFORE the threadpool board load — a non-blocking check (`.locked()` then an
+    # immediate `.acquire()`, with no `await` between them, so nothing else on this single-
+    # threaded event loop can interleave and steal the slot) rather than queuing behind a blocking
+    # `.acquire()`, which would turn "at capacity" into a hung connection instead of a clean 503.
+    sem = _sse_semaphore()
+    if sem.locked():
+        raise SSEStreamCapacityExceeded(
+            f"at the {settings.sse_max_concurrent_streams}-stream SSE concurrency cap")
+    await sem.acquire()
+    try:
+        board = await run_in_threadpool(_load_events_board, session_id, principal)
+    except Exception:
+        # Board load 404s/403s before the generator (and its own `finally`) ever starts —
+        # release here or every rejected connect attempt leaks one slot of the cap.
+        sem.release()
+        raise
     # Key off the BOARD's session id, never the raw path param. Every publisher derives its
     # channel from that same canonical (lowercase) row value, and Redis pub/sub channel names are
     # byte-exact — so subscribing on an uppercase (or dashless/braced) path param opens a stream
@@ -797,10 +984,27 @@ async def session_events(session_id: str, principal: Principal = Depends(get_pri
     canonical_session_id = board["session_id"]
 
     async def stream_events():
-        # [R4] reconcile from the DB first, then stream live deltas (no replay log).
-        yield {"event": "reconcile", "data": json.dumps(board)}
-        async for ev in bus.subscribe(canonical_session_id):
-            yield {"event": ev.get("type", "message"), "data": json.dumps(ev)}
+        try:
+            # [R4] reconcile from the DB first, then stream live deltas (no replay log).
+            # Item 26: stitch in "type": "reconcile" on the WIRE payload — `board` itself (also
+            # served verbatim by GET /v1/sessions/{session_id}) never carries a "type" key, so
+            # without this the reconcile event would be the only one on the stream with no
+            # discriminator field a client can switch on (see _EVENT_STREAM_RESPONSES above).
+            yield {"event": "reconcile", "data": json.dumps({**board, "type": str(SSEEventType.reconcile)})}
+            async for ev in bus.subscribe(canonical_session_id):
+                if ev is bus.SUBSCRIBE_TICK:
+                    # Items 1 + 30, consolidated: the guarantee that closes the stream whether or
+                    # not accept/cancel's own bus.publish (the fast path) ever arrives.
+                    still_open = await run_in_threadpool(
+                        _stream_still_open, canonical_session_id, principal, settings.verify_membership)
+                    if not still_open:
+                        return
+                    continue
+                yield {"event": ev.get("type", "message"), "data": json.dumps(ev)}
+        finally:
+            # Shielding isn't needed here the way bus.subscribe()'s own cleanup needs it (item
+            # 15) — release() is synchronous, not an await that cancellation can cut short.
+            sem.release()
 
     def _heartbeat() -> ServerSentEvent:
         return ServerSentEvent(
@@ -809,7 +1013,14 @@ async def session_events(session_id: str, principal: Principal = Depends(get_pri
             event=str(SSEEventType.heartbeat),
         )
 
-    return EventSourceResponse(stream_events(), ping=get_settings().sse_ping_seconds, ping_message_factory=_heartbeat)
+    return EventSourceResponse(
+        stream_events(), ping=settings.sse_ping_seconds, ping_message_factory=_heartbeat,
+        # Item 2: force-close a stalled consumer in seconds, not the ~15 minutes a dead TCP peer
+        # can otherwise take to surface. Item 20: bounded drain window on shutdown instead of an
+        # instant cut — sized (25s) under gunicorn's 30s graceful-timeout (docker/compose.prod.yml).
+        send_timeout=settings.sse_send_timeout_seconds,
+        shutdown_grace_period=settings.sse_shutdown_grace_seconds,
+    )
 
 
 @router.get("/sessions/{session_id}/accepted-scenarios", response_model=AcceptedScenariosResponse)
@@ -831,8 +1042,15 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
                 threat_type=r["LibraryThreatType"] or r["ThreatType"],
                 threat_name=r["LibraryThreatName"] or r["ThreatName"],
                 # controls_mapped=True: an accepted scenario has necessarily passed Stage 2's tail
-                # mapping step before the session could reach REVIEW/accept.
-                scenario=_scenario_with_controls(r["ScenarioJSON"], controls.get(r["OutputID"], []), True),
+                # mapping step before the session could reach REVIEW/accept. threat_row reuses the
+                # SAME library-preferred type/name computed above, so scenario.threat_type and the
+                # sibling threat_type field can never disagree.
+                scenario=_scenario_with_controls(
+                    r["ScenarioJSON"], controls.get(r["OutputID"], []), True,
+                    {"ThreatCategory": r["ThreatCategory"],
+                    "ThreatType": r["LibraryThreatType"] or r["ThreatType"],
+                    "ThreatName": r["LibraryThreatName"] or r["ThreatName"],
+                    "ThreatActorsJSON": r["ThreatActorsJSON"]}),
                 threat_actors=stored_actors(r["ThreatActorsJSON"]),
             ) for r in rows],
         )
@@ -857,13 +1075,18 @@ _SCN_SUPERSEDED = Query(
 def _scenario_list_item(row: dict, controls: list[MappedControl]) -> ScenarioListItem:
     """One dal.scenario_rows/scenario_row row → response item. Same catalogue-name fallback
     and controls merge as get_accepted_scenarios above."""
+    # Same library-preferred type/name as the sibling fields below, reused for the nested
+    # threat_row so scenario.threat_type can never disagree with the top-level threat_type.
+    threat_type = row["LibraryThreatType"] or row["ThreatType"]
+    threat_name = row["LibraryThreatName"] or row["ThreatName"]
     return ScenarioListItem(
         output_id=row["OutputID"], supporting_system_id=row["SubsystemID"],
         threat_type_id=row["ThreatTypeID"], threat_catalogue_id=row["ThreatCatalogueID"],
-        threat_type=row["LibraryThreatType"] or row["ThreatType"],
-        threat_name=row["LibraryThreatName"] or row["ThreatName"],
-        scenario=_scenario_with_controls(row["ScenarioJSON"], controls,
-                                        row["ControlsMappedAt"] is not None),
+        threat_type=threat_type, threat_name=threat_name,
+        scenario=_scenario_with_controls(
+            row["ScenarioJSON"], controls, row["ControlsMappedAt"] is not None,
+            {"ThreatCategory": row["ThreatCategory"], "ThreatType": threat_type,
+            "ThreatName": threat_name, "ThreatActorsJSON": row["ThreatActorsJSON"]}),
         session_id=row["SessionID"], entity_id=row["EntityID"], user_id=row["UserID"],
         session_status=row["SessionStatus"], scenario_number=row["ScenarioNumber"],
         accepted=bool(row["Accepted"]), superseded=bool(row["Superseded"]),

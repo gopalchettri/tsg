@@ -79,7 +79,8 @@ def embed(texts: Sequence[str]) -> list[list[float]]:
 
     def _run():
         model = _embedder(get_settings().embedding_model)
-        vectors = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        vectors = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True,
+                                show_progress_bar=False)
         return [v.tolist() for v in vectors]
 
     return _offload(_run)
@@ -105,7 +106,7 @@ def rerank_pairs(pairs: Sequence[tuple[str, str]]) -> list[float]:
 
     def _run():
         model = _reranker(get_settings().reranker_model)
-        scores = [float(x) for x in model.predict(pairs)]
+        scores = [float(x) for x in model.predict(pairs, show_progress_bar=False)]
         out_of_range = [x for x in scores if x < -0.05 or x > 1.05]
         if out_of_range:
             # RERANKER_MODEL is operator-configurable and this transform assumes a sigmoid-bounded

@@ -14,7 +14,12 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.enums import GroundingStatus, ScopingRejection, SelectionReason, ThreatRuleType
+from app.core.enums import (
+    GroundingStatus,
+    ScopingRejection,
+    SelectionReason,
+    ThreatRuleType,
+)
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
@@ -186,7 +191,9 @@ def score_threats(threats: list[dict[str, Any]], *, subsystems: list[dict] | Non
     config; the pipeline passes the session's resolved tuning so one assessment is never scored
     under two rulebooks. No `top_n` — see _apply_score_floor."""
     if base_score is None or default_rule_weight is None:
-        from app.core.config import get_settings  # lazy: keeps import-time coupling minimal
+        from app.core.config import (
+            get_settings,  # lazy: keeps import-time coupling minimal
+        )
         _s = get_settings()
         base_score = _s.base_score if base_score is None else base_score
         default_rule_weight = (_s.default_rule_weight if default_rule_weight is None

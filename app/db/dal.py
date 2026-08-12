@@ -7,22 +7,175 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping, cast
+from typing import Any, cast
 
-from sqlalchemy import Executable, RowMapping, and_, case, exists, func, insert, or_, select, update
+from sqlalchemy import (
+    Executable,
+    RowMapping,
+    and_,
+    case,
+    exists,
+    func,
+    insert,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.enums import (RESERVABLE_REJECTIONS, ActorType, AuditEventType, ScenarioStatus,
-                            SessionStatus, StageStatus, SubsystemLevel, WorkflowStage)
+from app.core.enums import (
+    RESERVABLE_REJECTIONS,
+    ActorType,
+    AuditEventType,
+    CandidateStatus,
+    ScenarioStatus,
+    SessionStatus,
+    StageStatus,
+    SubsystemLevel,
+    TreatmentOutcomeReason,
+    WorkflowStage,
+)
 from app.core.logging import get_logger
 from app.db import models as m
 
 log = get_logger(__name__)
+#: 48-bit millisecond clock, in the LAST 6 bytes of every generated GUID. See guid().
+_COMB_TS_MASK = (1 << 48) - 1
 
+# --- API authentication (header model, see app/api/deps.get_principal) ---
+#: user_scope_assignment.scope_type value that means "Entity" — option_value group 1010
+#: (1=Sector 2=Sub-Sector 3=Service 4=Entity 5=Asset). ref_id is then a group.id = EntityID.
+SCOPE_TYPE_ENTITY = 4
+
+#: This deployment's module name (config: TSG_API_MODULE, default 'tsg'). An API_Client key is
+#: valid ONLY for its own Module, so a leaked key is contained to one module (a 'chatbot' key can't
+#: authenticate TSG). Bound once at import — module identity is fixed per deployment, never changes
+#: at runtime. verify_api_key and the boot check (invariants.py) both filter on this value.
+API_MODULE = get_settings().api_module
+
+
+def user_has_entity(sess: Session, user_id: str | int, entity_id: str | int) -> bool:
+    """[R2] Does this user actually have an ACTIVE Entity-level assignment to this entity?
+
+    The (user, entity) pair arrives self-declared in request headers; this is the check that
+    makes it real. Fails CLOSED — the caller treats any exception as a deny.
+
+    scope_type is pinned to Entity (4), not optional: the same table holds Sub-Sector/Service/
+    Asset rows for the same user, and a non-entity ref_id could otherwise collide with an
+    entity id. We verify the supplied pair (never derive the entity from the user), so a user
+    with more than one entity assignment is handled correctly.
+    """
+    return sess.execute(
+        select(1).where(
+            m.user_scope_assignment.user_id == int(user_id),
+            m.user_scope_assignment.ref_id == int(entity_id),
+            m.user_scope_assignment.scope_type == SCOPE_TYPE_ENTITY,
+            m.user_scope_assignment.is_active == True,  # Core bit compare (renders `= 1`); MSSQL rejects `IS 1`
+        ).limit(1)
+    ).first() is not None
+
+
+def create_api_client(sess: Session, client_id: str, name: str, module: str,
+                      key_hash: str, created_by: str | None) -> None:
+    """Insert a new API client. Raises IntegrityError if `client_id` already exists (the caller
+    maps that to 409). The secret is NEVER stored — only its SHA-256 hex (`key_hash`)."""
+    sess.execute(insert(m.API_Client).values(
+        ClientID=client_id, KeyHash=key_hash, Name=name, Module=module,
+        Active=True, CreatedAt=now(), CreatedBy=created_by))
+
+
+def list_api_clients(sess: Session, module: str | None = None) -> list[dict[str, Any]]:
+    """API clients as metadata dicts (newest first) — NEVER includes KeyHash or the secret."""
+    c = m.API_Client
+    stmt = select(c.ClientID, c.Name, c.Module, c.Active, c.CreatedAt, c.CreatedBy,
+                c.RevokedAt, c.RevokedBy).order_by(c.CreatedAt.desc())
+    if module:
+        stmt = stmt.where(c.Module == module)
+    return [{"client_id": r[0], "name": r[1], "module": r[2], "active": bool(r[3]),
+            "created_at": r[4], "created_by": r[5], "revoked_at": r[6], "revoked_by": r[7]}
+            for r in sess.execute(stmt).all()]
+
+
+def revoke_api_client(sess: Session, client_id: str, revoked_by: str | None) -> bool:
+    """Deactivate an ACTIVE client (Active=0, RevokedAt, RevokedBy). Returns False if it does not
+    exist or is already inactive."""
+    res = execute_dml(sess, update(m.API_Client)
+        .where(m.API_Client.ClientID == client_id, m.API_Client.Active == True)  # Core bit compare
+        .values(Active=False, RevokedAt=now(), RevokedBy=revoked_by))
+    return res.rowcount == 1
+
+
+def api_client_id_for_key_hash(sess: Session, key_hash: str, module: str = API_MODULE) -> str | None:
+    """The ClientID of the single ACTIVE API_Client whose hash equals `key_hash` AND whose Module
+    is `module`, or None. The Module filter is what makes a key valid only for its own module —
+    a key provisioned for another module never authenticates here. The caller has already hashed
+    the presented secret; exact-match on the indexed SHA-256 column."""
+    return sess.execute(
+        select(m.API_Client.ClientID).where(
+            m.API_Client.KeyHash == key_hash,
+            m.API_Client.Module == module,
+            m.API_Client.Active == True,  # Core bit compare (renders `= 1`); MSSQL rejects `IS 1`
+        ).limit(1)
+    ).scalar_one_or_none()
+
+# --- exceptions mapped to HTTP by the API layer ---
+class SessionConflict(Exception):
+    """An active session already exists for this (entity, asset) → 409."""
+
+    def __init__(self, active_session_id: str):
+        """Carries the conflicting session's id for the 409 body; never None."""
+        self.active_session_id = active_session_id
+        super().__init__(active_session_id)
+
+class IdempotencyKeyConflict(Exception):
+    """Idempotency-Key reused against a different (entity, asset) → 409."""
+
+    def __init__(self, existing_session_id: str):
+        """Carries the session id the reused key is already bound to, for the 409 body."""
+        self.existing_session_id = existing_session_id
+        super().__init__(existing_session_id)
+
+class CapacityExceeded(Exception):
+    """Active-session ceiling reached → 503 (soft, deliberately racy)."""
+
+class RegenerateConflict(Exception):
+    """Regenerate rejected: wrong state, lock held, lost race, or no surviving target → 409.
+
+    `reason` is an optional machine-readable code surfaced as `details.reason`."""
+
+    def __init__(self, message: str, reason: str | None = None):
+        super().__init__(message)
+        self.reason = reason
+
+class CancelConflict(Exception):
+    """Cancel rejected: the session was already terminal when `cancel_session`'s CAS ran → 409."""
+
+class EntityForbidden(Exception):
+    """Requested object is outside the caller's entity scope → 403."""
+
+class NotFoundError(Exception):
+    """Requested entity does not exist → 404.
+
+    `details` rides through to the response envelope's `details` key."""
+
+    def __init__(self, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+# The columns the HTTP layer actually reads off a session row; the nvarchar(max) JSON blobs are
+# consumed ONLY by the pipeline and are deliberately absent.
+_SESSION_BOARD_COLS = (
+    m.Scenario_Session.SessionID, m.Scenario_Session.TenantID, m.Scenario_Session.EntityID,
+    m.Scenario_Session.UserID, m.Scenario_Session.AssetID, m.Scenario_Session.AssetName,
+    m.Scenario_Session.SessionStatus, m.Scenario_Session.CurrentStage,
+    m.Scenario_Session.StageStatus, m.Scenario_Session.CompletedAt,
+)
 
 def execute_dml(sess: Session, stmt: Executable) -> CursorResult[Any]:
     """INSERT/UPDATE/DELETE as `CursorResult` — the only `Result` carrying `.rowcount`.
@@ -30,7 +183,6 @@ def execute_dml(sess: Session, stmt: Executable) -> CursorResult[Any]:
     `.rowcount` is a trustworthy CAS signal only without `SET NOCOUNT ON` and without a trigger on
     the target table; either makes it -1 or inflated."""
     return cast("CursorResult[Any]", sess.execute(stmt))
-
 
 def inserted_pk(res: CursorResult[Any]) -> int:
     """First PK column of the row just inserted. Raises rather than returning None — the `upsert_*`
@@ -40,15 +192,9 @@ def inserted_pk(res: CursorResult[Any]) -> int:
         raise RuntimeError("INSERT yielded no primary key (not an IDENTITY table?)")
     return pk[0]
 
-
 def now() -> datetime:
     """Current UTC timestamp — one clock convention for every CreatedAt/UpdatedAt/LeaseExpiresAt."""
     return datetime.now(timezone.utc)
-
-
-#: 48-bit millisecond clock, in the LAST 6 bytes of every generated GUID. See guid().
-_COMB_TS_MASK = (1 << 48) - 1
-
 
 def guid() -> str:
     """Sequential (COMB) uuid, never uuid4: uniqueidentifier PKs are clustered, so a random key
@@ -61,58 +207,6 @@ def guid() -> str:
     b[6] = (b[6] & 0x0F) | 0x80   # version 8 — custom layout
     b[8] = (b[8] & 0x3F) | 0x80   # RFC 4122/9562 variant
     return str(uuid.UUID(bytes=bytes(b)))
-
-
-# --- exceptions mapped to HTTP by the API layer ---
-class SessionConflict(Exception):
-    """An active session already exists for this (entity, asset) → 409."""
-
-    def __init__(self, active_session_id: str):
-        """Carries the conflicting session's id for the 409 body; never None."""
-        self.active_session_id = active_session_id
-        super().__init__(active_session_id)
-
-
-class IdempotencyKeyConflict(Exception):
-    """Idempotency-Key reused against a different (entity, asset) → 409."""
-
-    def __init__(self, existing_session_id: str):
-        """Carries the session id the reused key is already bound to, for the 409 body."""
-        self.existing_session_id = existing_session_id
-        super().__init__(existing_session_id)
-
-
-class CapacityExceeded(Exception):
-    """Active-session ceiling reached → 503 (soft, deliberately racy)."""
-
-
-class RegenerateConflict(Exception):
-    """Regenerate rejected: wrong state, lock held, lost race, or no surviving target → 409.
-
-    `reason` is an optional machine-readable code surfaced as `details.reason`."""
-
-    def __init__(self, message: str, reason: str | None = None):
-        super().__init__(message)
-        self.reason = reason
-
-
-class CancelConflict(Exception):
-    """Cancel rejected: the session was already terminal when `cancel_session`'s CAS ran → 409."""
-
-
-class EntityForbidden(Exception):
-    """Requested object is outside the caller's entity scope → 403."""
-
-
-class NotFoundError(Exception):
-    """Requested entity does not exist → 404.
-
-    `details` rides through to the response envelope's `details` key."""
-
-    def __init__(self, message: str, details: dict | None = None):
-        super().__init__(message)
-        self.details = details or {}
-
 
 # ---------------------------------------------------------------------------
 # Object-level authz — asset ownership
@@ -133,7 +227,6 @@ def assert_asset_owned_by_entity(sess: Session, asset_id: Any, entity_id: Any) -
     asset_id — a plain IDOR."""
     if str(entity_id) not in asset_owning_entities(sess, asset_id):
         raise EntityForbidden(f"asset {asset_id} not owned by entity {entity_id}")
-
 
 # ---------------------------------------------------------------------------
 # Sessions (carry EntityID directly — filtered by it)
@@ -156,7 +249,6 @@ def active_tuning_overrides(sess: Session) -> dict[str, tuple[float | int, str |
             continue
         out[r.TuningKey] = (val, r.EmbeddingModel)
     return out
-
 
 def create_session(sess: Session, values: Mapping[str, Any]) -> str:
     """Insert a session; raises SessionConflict / IdempotencyKeyConflict on a unique-index clash.
@@ -190,13 +282,11 @@ def create_session(sess: Session, values: Mapping[str, Any]) -> str:
         raise SessionConflict(existing) from exc
     return values["SessionID"]
 
-
 def canonical_guid(value: str) -> str:
     """Canonical lowercase-dashed spelling of a client GUID; ValueError if malformed. `models.GUID`
     already normalizes SQL comparisons, but a PYTHON-side set/dict comparison does not, and
     silently reports a matched row as missing."""
     return str(uuid.UUID(str(value).strip()))
-
 
 def _valid_guid(value: str) -> bool:
     """True if `value` is UUID-shaped. A non-UUID reaching a `uniqueidentifier` WHERE clause makes
@@ -206,16 +296,6 @@ def _valid_guid(value: str) -> bool:
         return True
     except (ValueError, AttributeError, TypeError):
         return False
-
-
-# The columns the HTTP layer actually reads off a session row; the nvarchar(max) JSON blobs are
-# consumed ONLY by the pipeline and are deliberately absent.
-_SESSION_BOARD_COLS = (
-    m.Scenario_Session.SessionID, m.Scenario_Session.TenantID, m.Scenario_Session.EntityID,
-    m.Scenario_Session.UserID, m.Scenario_Session.AssetID, m.Scenario_Session.AssetName,
-    m.Scenario_Session.SessionStatus, m.Scenario_Session.CurrentStage,
-    m.Scenario_Session.StageStatus, m.Scenario_Session.CompletedAt,
-)
 
 
 def load_session_board(sess: Session, session_id: str) -> RowMapping | None:
@@ -288,6 +368,62 @@ def cancel_session(sess: Session, session_id: str) -> bool:
     )
     return res.rowcount == 1
 
+# ---------------------------------------------------------------------------
+# Library-promotion retry tracking (accept.py's run_promotion_phase / reaper.py's
+# retry_one_promotion) — 4 columns on Scenario_Session, written only while the caller holds that
+# session's `_LOCK` subsystem lock, so a plain by-PK UPDATE is all the safety these need.
+# ---------------------------------------------------------------------------
+def stamp_promotion_failure(sess: Session, session_id: str, *, error_message: str,
+                            user_id: str | None) -> None:
+    """Record a failed promotion attempt: sets PromotionFailedAt=now, increments the attempt
+    counter, stores the error, and stamps the accepting user so a LATER retry (automatic or
+    admin-triggered) attributes any resulting promotion to that same person."""
+    execute_dml(sess, update(m.Scenario_Session)
+                .where(m.Scenario_Session.SessionID == session_id)
+                .values(PromotionFailedAt=now(),
+                        PromotionAttempts=m.Scenario_Session.PromotionAttempts + 1,
+                        PromotionError=error_message, PromotionUserID=user_id))
+
+
+def clear_promotion_failure(sess: Session, session_id: str) -> None:
+    """A promotion attempt just succeeded: clear the 4 tracking columns back to their fresh-
+    session state. Leaves no PromotionAttempts history — this column tracks "does this session
+    currently need attention", not a permanent attempt log."""
+    execute_dml(sess, update(m.Scenario_Session)
+                .where(m.Scenario_Session.SessionID == session_id)
+                .values(PromotionFailedAt=None, PromotionAttempts=0,
+                        PromotionError=None, PromotionUserID=None))
+
+
+def list_pending_promotions(sess: Session, *, limit: int, include_exhausted: bool,
+                            max_attempts: int) -> list[RowMapping]:
+    """Sessions currently stuck on a failed promotion, oldest failure first — the admin API's
+    GET /v1/tsg/sessions/promotions. Uses IX_Session_PromotionFailed (filtered on
+    PromotionFailedAt IS NOT NULL), so this is a narrow lookup even at large table sizes, never a
+    full scan. `include_exhausted=False` hides sessions the sweep has already given up on
+    (PromotionAttempts >= max_attempts), showing only what the sweep is still actively retrying."""
+    ss = m.Scenario_Session
+    where = [ss.PromotionFailedAt.isnot(None)]
+    if not include_exhausted:
+        where.append(ss.PromotionAttempts < max_attempts)
+    return sess.execute(
+        select(ss.SessionID, ss.EntityID, ss.AssetID, ss.AssetName, ss.PromotionFailedAt,
+            ss.PromotionAttempts, ss.PromotionError, ss.PromotionUserID, ss.CompletedAt)
+        .where(*where)
+        .order_by(ss.PromotionFailedAt.asc())
+        .limit(limit)
+    ).mappings().all()
+
+
+def get_pending_promotion(sess: Session, session_id: str) -> RowMapping | None:
+    """One session's promotion-failure detail, or None if it isn't currently in a failed state —
+    the admin API's GET /v1/tsg/sessions/promotions/{session_id} and the 404 gate for retry/dismiss."""
+    ss = m.Scenario_Session
+    return sess.execute(
+        select(ss.SessionID, ss.EntityID, ss.AssetID, ss.AssetName, ss.PromotionFailedAt,
+            ss.PromotionAttempts, ss.PromotionError, ss.PromotionUserID, ss.CompletedAt)
+        .where(ss.SessionID == session_id, ss.PromotionFailedAt.isnot(None))
+    ).mappings().first()
 
 # ---------------------------------------------------------------------------
 # Admission control — backpressure + idempotent create
@@ -300,7 +436,6 @@ def count_active_sessions(sess: Session) -> int:
         .where(m.Scenario_Session.SessionStatus == SessionStatus.active)
     ).scalar() or 0
 
-
 def count_active_sessions_for_entity(sess: Session, entity_id: str) -> int:
     """Same racy soft count, scoped to one entity. Currently uncalled: `assert_capacity_available`
     does both counts in one round trip."""
@@ -309,7 +444,6 @@ def count_active_sessions_for_entity(sess: Session, entity_id: str) -> int:
         .where(m.Scenario_Session.SessionStatus == SessionStatus.active,
             m.Scenario_Session.EntityID == entity_id)
     ).scalar() or 0
-
 
 def assert_capacity_available(sess: Session, entity_id: str | None = None) -> None:
     """Raise CapacityExceeded at/over `max_active_sessions` and, with `entity_id`, the per-entity
@@ -333,7 +467,6 @@ def assert_capacity_available(sess: Session, entity_id: str | None = None) -> No
     if global_cap and count_active_sessions(sess) >= global_cap:
         raise CapacityExceeded()
 
-
 def reserve_idempotency_key_or_get_existing(
     sess: Session, entity_id: str, idempotency_key: str, asset_id: str,
 ) -> tuple[str | None, bool, str | None]:
@@ -352,7 +485,6 @@ def reserve_idempotency_key_or_get_existing(
     if row is None:
         return None, False, None
     return row["SessionID"], row["AssetID"] != asset_id, row["UserID"]
-
 
 # ---------------------------------------------------------------------------
 # Stage state — CAS primitives
@@ -451,6 +583,35 @@ def acquire_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str
         .values(
             Status=StageStatus.RUNNING, ActiveTaskID=task_id,
             LeaseExpiresAt=now() + timedelta(seconds=s.stage_lease_seconds), UpdatedAt=now(),
+        )
+    )
+    return res.rowcount == 1
+
+
+def acquire_promotion_retry_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
+    """Like acquire_lock, but WITHOUT its `SessionStatus == active` requirement — for
+    reaper.retry_one_promotion/dismiss_promotion, which only ever run on a session that has
+    ALREADY completed (a promotion failure can only exist after accept's own Phase 1 has already
+    completed the session). acquire_lock's active-only guard exists to stop a stale/redelivered
+    LIVE PIPELINE task (regenerate, next-set, threat identification) from resuming work on a
+    session that's no longer live — that scenario cannot happen here, since this caller's entire
+    premise is "the session is done; only its post-completion promotion side-effect needs
+    revisiting." Reusing acquire_lock unmodified here would make it CAS-fail on every single
+    call, since a completed session is never 'active' — that was a real, 100%-reproducible bug,
+    not a race, caught by live-testing the retry/dismiss admin endpoints against a real
+    completed session."""
+    res = execute_dml(
+        sess,
+        update(m.Subsystem_Stage_State)
+        .where(
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK,
+            m.Subsystem_Stage_State.Status == StageStatus.IDLE,
+        )
+        .values(
+            Status=StageStatus.RUNNING, ActiveTaskID=task_id,
+            LeaseExpiresAt=now() + timedelta(seconds=get_settings().stage_lease_seconds), UpdatedAt=now(),
         )
     )
     return res.rowcount == 1
@@ -838,12 +999,14 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
     return picked
 
 
-def active_identified_threat_identities(sess: Session, session_id: str, subsystem_id: int) -> set[str]:
-    """Folded identities of this (session, subsystem)'s ACTIVE Identified_Threat rows.
+def active_identified_threat_identities(sess: Session, session_id: str, subsystem_id: int) -> dict[str, str]:
+    """Folded identity -> ThreatID of this (session, subsystem)'s ACTIVE Identified_Threat rows.
     find_threats(supersede=False) skips an additive proposal matching one — otherwise a
     re-proposal leaks a never-scored dead threat row (the index still blocks the duplicate
-    scenario)."""
-    identities: set[str] = set()
+    scenario). The ThreatID rides along so a caught duplicate can record WHICH existing threat
+    it matched (Identified_Duplicate_Threat.DuplicateOfThreatID) — previously computed here and
+    discarded once the hash was folded."""
+    identities: dict[str, str] = {}
     for r in sess.execute(
         select(m.Identified_Threat.ThreatID, m.Identified_Threat.ThreatCatalogueID,
             m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName)
@@ -851,7 +1014,7 @@ def active_identified_threat_identities(sess: Session, session_id: str, subsyste
             m.Identified_Threat.SubsystemID == subsystem_id,
             m.Identified_Threat.Superseded == 0)
     ).mappings():
-        identities.add(identity_hash(session_id, subsystem_id, _row_to_dedup_info(r)))
+        identities[identity_hash(session_id, subsystem_id, _row_to_dedup_info(r))] = r["ThreatID"]
     return identities
 
 
@@ -913,7 +1076,7 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
     return [dict(r) for r in sess.execute(
         select(out.OutputID, out.SubsystemID, out.ScopedThreatID, out.ScenarioJSON,
             it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
-            it.LibraryThreatType, it.LibraryThreatName, it.ThreatActorsJSON)
+            it.LibraryThreatType, it.LibraryThreatName, it.ThreatCategory, it.ThreatActorsJSON)
         .select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
         .where(out.SessionID == session_id, out.Accepted == 1, out.Superseded == 0)
@@ -1364,6 +1527,29 @@ def latest_next_set_outcome(sess: Session, session_id: str, subsystem_id: int) -
     return parsed if isinstance(parsed, dict) else None
 
 
+def latest_regen_outcome(sess: Session, session_id: str, subsystem_id: int) -> dict | None:
+    """DetailJSON of the newest `regeneration_completed` audit row, backing
+    SessionProgress.last_regen — the durable mirror of the SSE `regen_result` event, same
+    rationale as `latest_next_set_outcome` above (plan item 3). Ordered the same way, for the
+    same reason: two rows of one fast regen click can share a clock tick."""
+    row = sess.execute(
+        select(m.Scenario_Audit.DetailJSON)
+        .where(m.Scenario_Audit.SessionID == session_id,
+            m.Scenario_Audit.SubsystemID == subsystem_id,
+            m.Scenario_Audit.EventType == AuditEventType.regeneration_completed)
+        .order_by(m.Scenario_Audit.CreatedAt.desc(), m.Scenario_Audit.AuditID.desc())
+        .limit(1)
+    ).scalar()
+    if not row:
+        return None
+    try:
+        parsed = json.loads(row)
+    except (TypeError, ValueError):  # a truncated/hand-edited row must not 500 a status poll
+        log.warning("audit.regen_outcome_unparseable", session_id=session_id)
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 # ---------------------------------------------------------------------------
 # Threat-library promotion — race-safe insert-if-not-exists guarded by the M2 natural-key UNIQUE
 # indexes. Same savepoint + catch-IntegrityError + select idiom as `create_session`: the loser of
@@ -1457,6 +1643,59 @@ def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promote
         if winner is None:  # see upsert_threat_type — only a real duplicate may resolve here
             raise
         return winner
+
+
+# ---------------------------------------------------------------------------
+# Threat_Candidate_Review — the curator queue CandidateStatus's own docstring calls "reserved...
+# set by the curator workflow when it lands". accept.py writes `pending` rows; these functions
+# are that workflow.
+# ---------------------------------------------------------------------------
+def list_pending_candidates(sess: Session, *, limit: int) -> list[RowMapping]:
+    """Every candidate awaiting curator review, oldest first — the admin API's
+    GET /v1/tsg/threat-library/candidates. No filtered index needed: unlike promotion failures,
+    `Status='pending'` is this table's own overwhelmingly common value while a row is unresolved,
+    so a plain index on Status already keeps this narrow."""
+    cr = m.Threat_Candidate_Review
+    return sess.execute(
+        select(cr.CandidateID, cr.TenantID, cr.EntityID, cr.SessionID, cr.ProposedCategory,
+            cr.ProposedType, cr.ProposedName, cr.ProposedGenericName, cr.Status,
+            cr.ThreatTypeID, cr.ThreatCatalogueID, cr.CreatedAt)
+        .where(cr.Status == CandidateStatus.pending)
+        .order_by(cr.CreatedAt.asc())
+        .limit(limit)
+    ).mappings().all()
+
+
+def get_candidate(sess: Session, candidate_id: str) -> RowMapping | None:
+    """One candidate's full detail, or None if the id doesn't exist — the admin API's
+    GET .../candidates/{id} and the 404 gate for approve/reject."""
+    cr = m.Threat_Candidate_Review
+    return sess.execute(
+        select(cr.CandidateID, cr.TenantID, cr.EntityID, cr.SessionID, cr.ProposedCategory,
+            cr.ProposedType, cr.ProposedName, cr.ProposedGenericName, cr.Status,
+            cr.ThreatTypeID, cr.ThreatCatalogueID, cr.ReviewedBy, cr.ReviewedAt, cr.CreatedAt)
+        .where(cr.CandidateID == candidate_id)
+    ).mappings().first()
+
+
+def close_candidate_review(sess: Session, candidate_id: str, *, status: str,
+                            reviewer_user_id: str | None, type_id: int | None = None,
+                            catalogue_id: int | None = None) -> bool:
+    """CAS-guarded resolution of one candidate: matches only a row still `pending`, so a second
+    concurrent approve/reject (two admins, or a double-click) matches 0 rows and returns False —
+    the caller reports 409 instead of re-running (or silently re-reporting) a mint that already
+    happened. `type_id`/`catalogue_id` are the library ids this candidate resolved to; left
+    unset (None → NULL columns unless already set) on a reject, since nothing was minted."""
+    cr = m.Threat_Candidate_Review
+    values: dict[str, Any] = {"Status": status, "ReviewedBy": reviewer_user_id, "ReviewedAt": now()}
+    if type_id is not None:
+        values["ThreatTypeID"] = type_id
+    if catalogue_id is not None:
+        values["ThreatCatalogueID"] = catalogue_id
+    res = execute_dml(sess, update(cr)
+                    .where(cr.CandidateID == candidate_id, cr.Status == CandidateStatus.pending)
+                    .values(**values))
+    return res.rowcount == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1621,7 +1860,8 @@ def touch_plan(sess: Session, plan_id: str) -> None:
 
 def finish_plan(sess: Session, plan_id: str, *, status: StageStatus, task_id: str | None,
                 plan_json: str | None = None, validation_json: str | None = None,
-                error_message: str | None = None) -> bool:
+                error_message: str | None = None,
+                error_reason: TreatmentOutcomeReason | None = None) -> bool:
     """Terminal CAS to COMPLETE or ERROR. Fenced on (RUNNING, not superseded), so a superseded or
     already-finished row matches 0 rows and the caller drops its result instead of resurrecting a
     retired plan. ALSO fenced on ActiveTaskID — a zombie worker's late result must not clobber a
@@ -1630,13 +1870,19 @@ def finish_plan(sess: Session, plan_id: str, *, status: StageStatus, task_id: st
     are, same discipline as claim_stage/finish_stage. `task_id=None` means "only if still
     unclaimed" (ActiveTaskID IS NULL) — for a freshly-inserted row nothing has claimed yet, or a
     caller re-asserting a value it just read off the row itself; a real task_id must match
-    exactly."""
+    exactly.
+
+    `error_reason` is the machine-readable half of an ERROR (TreatmentOutcomeReason) so no client
+    ever parses `error_message`. Pass it on EVERY ERROR path; leave it None for COMPLETE, where the
+    column is meaningless. It is deliberately not defaulted per-status — a silent NULL on a failure
+    is exactly the ambiguity this column exists to remove."""
     p = m.Risk_Treatment_Plan
     return execute_dml(sess, update(p).where(
         p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.RUNNING,
         p.ActiveTaskID.is_(None) if task_id is None else p.ActiveTaskID == task_id,
     ).values(Status=status, PlanJSON=plan_json, ValidationJSON=validation_json,
-             ErrorMessage=error_message, UpdatedAt=now(), CompletedAt=now())).rowcount == 1
+            ErrorMessage=error_message, ErrorReason=error_reason,
+            UpdatedAt=now(), CompletedAt=now())).rowcount == 1
 
 
 def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
@@ -1648,9 +1894,10 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
     p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
     return sess.execute(
         select(p.PlanID, p.SessionID, p.OutputID, p.TenantID, p.EntityID, p.Status,
-               p.ActiveTaskID, p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
-               p.ValidationJSON, p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment,
-               p.ReviewedBy, p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt, out.ScenarioJSON)
+            p.ActiveTaskID, p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
+            p.ValidationJSON, p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment,
+            p.ReviewedBy, p.ReviewedAt, p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt,
+               out.ScenarioJSON)
         .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID))
         .where(p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 0)
     ).mappings().first()
@@ -1666,7 +1913,7 @@ def review_plan(sess: Session, plan_id: str, *, status: str, comment: str | None
     return execute_dml(sess, update(p).where(
         p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.COMPLETE,
     ).values(ReviewStatus=status, ReviewComment=comment, ReviewedBy=reviewer,
-             ReviewedAt=reviewed_at, UpdatedAt=reviewed_at)).rowcount == 1
+            ReviewedAt=reviewed_at, UpdatedAt=reviewed_at)).rowcount == 1
 
 
 def session_plan_board(sess: Session, session_id: str) -> list[RowMapping]:
@@ -1676,9 +1923,9 @@ def session_plan_board(sess: Session, session_id: str) -> list[RowMapping]:
     out, p = m.Threat_Scenario_Output, m.Risk_Treatment_Plan
     return sess.execute(
         select(out.OutputID, out.ScenarioJSON,
-               p.PlanID, p.Status, p.RiskLevel, p.ReviewStatus, p.ErrorMessage,
-               p.CreatedAt.label("PlanCreatedAt"), p.UpdatedAt.label("PlanUpdatedAt"),
-               p.CompletedAt.label("PlanCompletedAt"))
+            p.PlanID, p.Status, p.RiskLevel, p.ReviewStatus, p.ErrorMessage, p.ErrorReason,
+            p.CreatedAt.label("PlanCreatedAt"), p.UpdatedAt.label("PlanUpdatedAt"),
+            p.CompletedAt.label("PlanCompletedAt"))
         .select_from(out.__table__.outerjoin(
             p, and_(p.OutputID == out.OutputID, p.Superseded == 0)))
         .where(out.SessionID == session_id, out.Accepted == 1, out.Superseded == 0)
@@ -1687,9 +1934,9 @@ def session_plan_board(sess: Session, session_id: str) -> list[RowMapping]:
 
 
 def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
-                     status: str | None = None, review_status: str | None = None,
-                     risk_level: str | None = None, limit: int = 100,
-                     offset: int = 0) -> list[RowMapping]:
+                    status: str | None = None, review_status: str | None = None,
+                    risk_level: str | None = None, limit: int = 100,
+                    offset: int = 0) -> list[RowMapping]:
     """Entity-wide remediation register: every active plan across the entity's sessions, newest
     first. Filters Scenario_Session.EntityID — the NOT NULL authz truth, never the nullable copy.
 
@@ -1700,17 +1947,17 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
     p, ss, out = m.Risk_Treatment_Plan, m.Scenario_Session, m.Threat_Scenario_Output
     stmt = (
         select(p.PlanID, p.SessionID, p.OutputID, p.Status, p.RiskLevel, p.ReviewStatus,
-               p.ReviewedBy, p.ReviewedAt, p.ErrorMessage, p.CreatedAt, p.UpdatedAt,
-               p.CompletedAt, ss.AssetName,
-               func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle"))
+            p.ReviewedBy, p.ReviewedAt, p.ErrorMessage, p.ErrorReason, p.CreatedAt, p.UpdatedAt,
+            p.CompletedAt, ss.AssetName,
+            func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle"))
         .select_from(p.__table__
             .join(ss, ss.SessionID == p.SessionID)
             .outerjoin(out, out.OutputID == p.OutputID))
         .where(ss.EntityID == entity_id, p.Superseded == 0))
     if status == str(StageStatus.ERROR):
         stmt = stmt.where(or_(p.Status == StageStatus.ERROR,
-                              and_(p.Status == StageStatus.RUNNING,
-                                   p.UpdatedAt < stale_cutoff)))
+                            and_(p.Status == StageStatus.RUNNING,
+                                p.UpdatedAt < stale_cutoff)))
     elif status == str(StageStatus.RUNNING):
         stmt = stmt.where(p.Status == StageStatus.RUNNING, p.UpdatedAt >= stale_cutoff)
     elif status is not None:
@@ -1732,7 +1979,7 @@ def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[Ro
     p = m.Risk_Treatment_Plan
     return sess.execute(
         select(p.PlanID, p.Status, p.Superseded, p.ErrorMessage, p.RiskLevel, p.ReviewStatus,
-               p.ReviewedBy, p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
+            p.ReviewedBy, p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
         .where(p.SessionID == session_id, p.OutputID == output_id)
         .order_by(p.CreatedAt)
     ).mappings().all()

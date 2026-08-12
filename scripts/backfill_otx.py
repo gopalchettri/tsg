@@ -52,7 +52,7 @@ def main() -> int:
         return 1
 
     print(f"Backfilling OTX into {s.mongo_db}.threat_intel — "
-          f"{s.intel_otx_sync_seconds}s per pass, resuming from page {_read_cursor(col)}.")
+        f"{s.intel_otx_sync_seconds}s per pass, resuming from page {_read_cursor(col)}.")
     started, passes = time.monotonic(), 0
     while True:
         passes += 1
@@ -67,7 +67,7 @@ def main() -> int:
         after_page = _read_cursor(col)
         total = col.count_documents({"source": "otx"})
         print(f"  pass {passes:>2}: pages {before_page}->{after_page}  "
-              f"stored {stored:>4}  total {total:>5}  ({time.monotonic() - t0:.0f}s)")
+            f"stored {stored:>4}  total {total:>5}  ({time.monotonic() - t0:.0f}s)")
         if after_page == 1:          # the walk wrapped: a full cycle is done
             break
 

@@ -11,6 +11,11 @@ from typing import Any
 
 from app.core.enums import ValidationStatus
 
+# Dropped before token overlap so a needle like "Compromised OT supply chain or hardware" isn't
+# "matched" just because the haystack also says "or".
+_STOPWORDS = frozenset({"the", "and", "or", "of", "to", "a", "an", "for", "with",
+                        "in", "on", "by", "at", "from", "that", "this"})
+
 
 class LLMResponseParseError(Exception):
     """Unparseable JSON or wrong top-level type. Deliberately excludes the raw response text —
@@ -56,7 +61,6 @@ def _result(errors: list[str]) -> dict[str, Any]:
     status = ValidationStatus.ok if not errors else ValidationStatus.warning
     return {"validation_status": str(status), "errors": errors}
 
-
 def _references(needle: str, haystack: str) -> bool:
     """Whole-phrase match, not raw characters inside an unrelated word — a plain `in` passes asset
     name "CAD" against "could cascade into".
@@ -69,12 +73,6 @@ def _references(needle: str, haystack: str) -> bool:
         return False
     h = " ".join(haystack.split()).lower()
     return re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])", h) is not None
-
-
-# Dropped before token overlap so a needle like "Compromised OT supply chain or hardware" isn't
-# "matched" just because the haystack also says "or".
-_STOPWORDS = frozenset({"the", "and", "or", "of", "to", "a", "an", "for", "with",
-                        "in", "on", "by", "at", "from", "that", "this"})
 
 
 def _mentions(needle: str, haystack: str) -> bool:

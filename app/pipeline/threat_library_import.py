@@ -18,9 +18,9 @@ import json
 import re
 import urllib.request
 from datetime import timedelta
-
 from typing import Any
 
+import yaml
 from sqlalchemy import func, insert, select, update
 
 from app.core.config import get_settings
@@ -32,6 +32,19 @@ from app.db.dal import guid, now
 
 log = get_logger(__name__)
 
+# A run is only closed by record_import_finished, which needs the worker to still be alive: a
+# SIGKILLed or permanently hung worker leaves its row at 'running' forever, and nothing sweeps
+# Threat_Library_Import_Run (the reaper handles sessions only). The inventory API then reports
+# that source as perpetually in-flight, and — because `loaded` for misp_actors requires the last
+# run to be 'success' — a killed actors import makes that source read as never-attempted for
+# good, destroying the "attempted vs never attempted" distinction the endpoint exists to draw.
+# Deriving the status on read costs nothing and cannot itself get stuck. The cutoff matches the
+# broker's visibility_timeout (celery_app.py): past it, the message has already been redelivered
+# or abandoned, so no live worker is still holding that row.
+# Stale-after window lives in Settings.library_import_stale_after_seconds now (default
+# unchanged: 3600s) — see the comment block above for why it should match the Celery broker's
+# visibility_timeout (celery_app.py's conf.update).
+_ATLAS_V6_PATH_RE = re.compile(r"^v6/ATLAS-[\w.]+\.yaml$")
 
 class ThreatLibraryImportError(Exception):
     """A structurally-valid but business-rule-invalid import request (unknown source,
@@ -54,12 +67,15 @@ URLS = {
     "attack_ics": "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/ics-attack/ics-attack.json",
     "emb3d": "https://raw.githubusercontent.com/mitre/emb3d/main/_data/threats.json",
     "misp_actors": "https://raw.githubusercontent.com/MISP/misp-galaxy/main/clusters/threat-actor.json",
+    "atlas": "https://raw.githubusercontent.com/mitre-atlas/atlas-data/main/dist/manifest.yaml",
+    "kev": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
 }
 OT_SOURCES = {"attack_ics", "emb3d"}
+YAML_SOURCES = {"atlas"}
 SOURCE_TAGS = {  # Threat_Type.Source / Threat_Catalogue.Source provenance values
     "pytm": "pytm", "threat_composer": "aws_threat_composer", "capec": "capec",
     "attack": "mitre_attack", "attack_ics": "mitre_attack_ics", "emb3d": "mitre_emb3d",
-    "misp_actors": "misp_galaxy",
+    "misp_actors": "misp_galaxy","atlas": "mitre_atlas", "kev": "cisa_kev",
 }
 
 # Weight for the auto-written OT relevance rules lives in config
@@ -68,8 +84,8 @@ SOURCE_TAGS = {  # Threat_Type.Source / Threat_Catalogue.Source provenance value
 
 # The result dict caps the skipped list it carries (full counts always reported) — a big
 # STIX bundle can skip hundreds of rows, and this dict travels through the Celery result
-# backend to an API response.
-_SKIPPED_CAP = 50
+# backend to an API response. Lives in Settings.library_import_skipped_cap now (default
+# unchanged: 50).
 
 # ---------------------------------------------------------------- STRIDE maps
 # pytm SID prefix -> (Threat_Type name, STRIDE categories)
@@ -136,6 +152,107 @@ TC_GOAL_STRIDE = {"confidentiality": INFO, "integrity": TAMPER, "availability": 
 # threats_prompt actor hint built from it — focused instead of 700+ rows)
 CII_KEYWORDS = ("critical infrastructure", "energy", "ics", "scada", "industrial",
                 "utilities", "banking", "financial", "government", "telecom", "water")
+
+
+
+# Per-source-family top-level JSON shape — the cheap pre-parse sniff the API handler runs
+# before dispatching (valid JSON of the WRONG shape would otherwise crash deep inside an
+# adapter with a meaningless AttributeError). (predicate, human-readable expectation).
+EXPECTED_SHAPES: dict[str, tuple] = {
+    "pytm": (lambda d: isinstance(d, list), "a JSON list of pytm threat objects"),
+    "threat_composer": (lambda d: isinstance(d, dict) and "threats" in d, 'a JSON object with a "threats" list'),
+    "capec": (lambda d: isinstance(d, dict) and "objects" in d, 'a STIX bundle object with an "objects" list'),
+    "attack": (lambda d: isinstance(d, dict) and "objects" in d, 'a STIX bundle object with an "objects" list'),
+    "attack_ics": (lambda d: isinstance(d, dict) and "objects" in d, 'a STIX bundle object with an "objects" list'),
+    "emb3d": (lambda d: isinstance(d, (dict, list)), 'a JSON object with a "threats" list (or a bare list)'),
+    "misp_actors": (lambda d: isinstance(d, dict) and "values" in d, 'a MISP galaxy object with a "values" list'),
+    "atlas": (lambda d: isinstance(d, dict) and isinstance(d.get("techniques"), dict) and bool(d["techniques"]),
+            'a YAML object with a non-empty "techniques" mapping (ATLAS format v6)'),
+    "kev": (lambda d: isinstance(d, dict) and isinstance(d.get("vulnerabilities"), list),
+            'a JSON object with a "vulnerabilities" list'),
+}
+
+# ATLAS tactic id (kill-chain phase) -> nearest STRIDE category. Defensible, not exact —
+# ATLAS's kill-chain phases and STRIDE's security-property categories aren't the same
+# taxonomy. Re-tag freely; a technique whose tactics are ALL absent from this map is skipped
+# (adapt_atlas), same as an unmappable ATT&CK tactic or CAPEC consequence above.
+ATLAS_TACTIC_STRIDE = {
+    "AML.TA0002": INFO,   # Reconnaissance
+    "AML.TA0003": TAMPER,  # Resource Development
+    "AML.TA0004": SPOOF,   # Initial Access
+    "AML.TA0000": ELEV,    # AI Model Access
+    "AML.TA0005": TAMPER,  # Execution
+    "AML.TA0006": ELEV,    # Persistence
+    "AML.TA0012": ELEV,    # Privilege Escalation
+    "AML.TA0007": REPUD,   # Defense Evasion
+    "AML.TA0013": SPOOF,   # Credential Access
+    "AML.TA0008": INFO,   # Discovery
+    "AML.TA0015": ELEV,    # Lateral Movement
+    "AML.TA0009": INFO,   # Collection
+    "AML.TA0001": TAMPER,  # AI Attack Staging
+    "AML.TA0014": TAMPER,  # Command and Control
+    "AML.TA0010": INFO,   # Exfiltration
+    "AML.TA0011": DOS,     # Impact
+}
+
+# CISA KEV entry's cweId -> (Threat_Type label, STRIDE categories). Same tuple-value shape
+# as PYTM_PREFIXES above. NOT exhaustive: the live feed carries 184 distinct CWE ids with a
+# long tail; this covers the ~45 most common ones (empirically ~72% of all entries, ~80% of
+# the ones that list a CWE at all). Deliberately excludes CWE-20/74/138/693 — those are CWE
+# "pillar" ids (Improper Input Validation, generic injection/neutralization parents,
+# Protection Mechanism Failure) too broad to imply any one STRIDE category; guessing one
+# would be worse than skipping, same discipline as the unmapped-tactic/consequence handling
+# in every adapter above. A CVE lists 0+ CWEs; the FIRST one present here wins (same
+# first-match rule as adapt_pytm's SID-prefix lookup) — add more rows freely.
+KEV_CWE_MAP = {
+    "CWE-78": ("OS Command Injection", [TAMPER]),
+    "CWE-77": ("Command Injection", [TAMPER]),
+    "CWE-94": ("Code Injection", [TAMPER, ELEV]),
+    "CWE-95": ("Eval Injection", [TAMPER, ELEV]),
+    "CWE-89": ("SQL Injection", [TAMPER]),
+    "CWE-79": ("Cross-Site Scripting", [TAMPER]),
+    "CWE-917": ("Expression Language Injection", [TAMPER, ELEV]),
+    "CWE-502": ("Deserialization of Untrusted Data", [TAMPER, ELEV]),
+    "CWE-787": ("Out-of-Bounds Write", [TAMPER, ELEV]),
+    "CWE-416": ("Use After Free", [TAMPER, ELEV]),
+    "CWE-119": ("Memory Buffer Bounds Violation", [TAMPER, ELEV]),
+    "CWE-122": ("Heap-Based Buffer Overflow", [TAMPER, ELEV]),
+    "CWE-121": ("Stack-Based Buffer Overflow", [TAMPER, ELEV]),
+    "CWE-120": ("Buffer Copy Without Size Check", [TAMPER, ELEV]),
+    "CWE-843": ("Type Confusion", [TAMPER, ELEV]),
+    "CWE-190": ("Integer Overflow", [TAMPER, ELEV]),
+    "CWE-189": ("Numeric Error", [TAMPER, ELEV]),
+    "CWE-822": ("Untrusted Pointer Dereference", [TAMPER, ELEV]),
+    "CWE-434": ("Unrestricted Dangerous File Upload", [TAMPER, ELEV]),
+    "CWE-362": ("Race Condition", [TAMPER]),
+    "CWE-367": ("TOCTOU Race Condition", [TAMPER]),
+    "CWE-494": ("Download of Code Without Integrity Check", [TAMPER]),
+    "CWE-506": ("Embedded Malicious Code", [TAMPER]),
+    "CWE-22": ("Path Traversal", [INFO, TAMPER]),
+    "CWE-23": ("Relative Path Traversal", [INFO, TAMPER]),
+    "CWE-36": ("Absolute Path Traversal", [INFO, TAMPER]),
+    "CWE-59": ("Link Following", [TAMPER]),
+    "CWE-200": ("Sensitive Information Exposure", [INFO]),
+    "CWE-522": ("Insufficiently Protected Credentials", [INFO]),
+    "CWE-611": ("XML External Entity Reference", [INFO]),
+    "CWE-918": ("Server-Side Request Forgery", [INFO]),
+    "CWE-125": ("Out-of-Bounds Read", [INFO]),
+    "CWE-287": ("Improper Authentication", [SPOOF]),
+    "CWE-288": ("Authentication Bypass via Alternate Path", [SPOOF]),
+    "CWE-290": ("Authentication Bypass by Spoofing", [SPOOF]),
+    "CWE-306": ("Missing Authentication for Critical Function", [SPOOF]),
+    "CWE-347": ("Improper Cryptographic Signature Verification", [SPOOF]),
+    "CWE-352": ("Cross-Site Request Forgery", [SPOOF]),
+    "CWE-798": ("Hard-Coded Credentials", [SPOOF]),
+    "CWE-264": ("Permissions, Privileges, and Access Control", [ELEV]),
+    "CWE-269": ("Improper Privilege Management", [ELEV]),
+    "CWE-284": ("Improper Access Control", [ELEV]),
+    "CWE-862": ("Missing Authorization", [ELEV]),
+    "CWE-863": ("Incorrect Authorization", [ELEV]),
+    "CWE-399": ("Resource Management Error", [DOS]),
+    "CWE-400": ("Uncontrolled Resource Consumption", [DOS]),
+    "CWE-404": ("Improper Resource Shutdown", [DOS]),
+}
 
 
 def _tidy(phase: str) -> str:
@@ -242,7 +359,7 @@ def adapt_capec(data) -> tuple[list[dict], list[dict]]:
         if obj.get("x_capec_status") in ("Deprecated", "Obsolete"):
             continue
         ext_id = _stix_ext_id(obj, {"capec"})
-        scopes = [s.lower() for s in (obj.get("x_capec_consequences") or {}).keys()]
+        scopes = [s.lower() for s in (obj.get("x_capec_consequences") or {})]
         cats = sorted({CAPEC_SCOPE_STRIDE[s] for s in scopes if s in CAPEC_SCOPE_STRIDE})
         if not cats:
             skipped.append({"reason": f"no mappable consequences: {scopes}", "item": f"{ext_id} {obj.get('name')}"})
@@ -289,6 +406,90 @@ def adapt_misp_actors(data, max_actors: int) -> tuple[list[str], list[dict]]:
     return actors, skipped
 
 
+def adapt_atlas(data) -> tuple[list[dict], list[dict]]:
+    """MITRE ATLAS (AI/ML attack techniques), format v6. Unlike the other sources, ATLAS is a
+    two-level hierarchy: a top-level technique becomes the Threat_Type, and either its
+    sub-techniques (if any) or the technique itself (if it has none) become one
+    Threat_Catalogue row each — so grounding.get_possible_names() always has >=1 name to
+    match against under every imported type.
+
+    v6 moved both the technique->tactic mapping and the sub-technique->parent mapping out of
+    the technique object into the top-level `relationships` map (keyed by technique id):
+    an `achieves` entry's target is a tactic id, a `specializes` entry's target is the parent
+    technique id. `techniques`/`relationships` are dicts keyed by id, not lists, in v6.
+
+    All ATLAS tactics a technique achieves resolve through ATLAS_TACTIC_STRIDE; a technique
+    with no mappable tactic is skipped entirely, same as an unmapped ATT&CK tactic or CAPEC
+    consequence above."""
+    techniques: dict[str, dict] = data["techniques"]
+    relationships: dict[str, dict] = data.get("relationships") or {}
+
+    sub_by_parent: dict[str, list[str]] = collections.defaultdict(list)
+    is_subtechnique: set[str] = set()
+    for tech_id, rels in relationships.items():
+        for rel in rels.get("specializes", []):
+            sub_by_parent[rel["target"]].append(rel["source"])
+            is_subtechnique.add(rel["source"])
+
+    records, skipped = [], []
+    for tech_id, tech in techniques.items():
+        if tech_id in is_subtechnique:
+            continue  # visited as a child of its parent below
+        tactic_ids = [rel["target"] for rel in relationships.get(tech_id, {}).get("achieves", [])]
+        cats = sorted({ATLAS_TACTIC_STRIDE[t] for t in tactic_ids if t in ATLAS_TACTIC_STRIDE})
+        if not cats:
+            skipped.append({"reason": f"unmapped tactic(s): {tactic_ids}",
+                            "item": f"{tech_id} {tech['name']}"})
+            continue
+        for entry_id in sub_by_parent.get(tech_id) or [tech_id]:
+            entry = techniques[entry_id]
+            records.append({
+                "type_name": tech["name"],
+                "threat_name": f"{entry_id} {entry['name']}".strip(),
+                "description": (entry.get("description") or "")[:1000] or None,
+                "categories": cats,
+            })
+    return records, skipped
+
+def adapt_kev(data) -> tuple[list[dict], list[dict]]:
+    """CISA Known Exploited Vulnerabilities catalog — a flat list of individually-exploited
+    CVEs, unlike every other source here which groups pre-classified technique/threat
+    entries. One Threat_Type per weakness CLASS (KEV_CWE_MAP, keyed by CWE id — the type
+    label + STRIDE categories both come from there), one Threat_Catalogue row per CVE. A CVE
+    lists 0+ CWEs (`cwes`); the first one present in KEV_CWE_MAP decides its type/category —
+    no CWEs, or none of them mapped, and it's skipped, never guessed."""
+    records, skipped = [], []
+    for v in data.get("vulnerabilities", []):
+        cwes = v.get("cwes") or []
+        entry = next((KEV_CWE_MAP[c] for c in cwes if c in KEV_CWE_MAP), None)
+        if entry is None:
+            skipped.append({"reason": f"no mappable CWE ({cwes or 'none listed'})",
+                            "item": f"{v.get('cveID')} {v.get('vulnerabilityName')}"})
+            continue
+        type_name, cats = entry
+        records.append({
+            "type_name": type_name,
+            "threat_name": f"{v.get('cveID')} {v.get('vulnerabilityName')}".strip(),
+            "description": (v.get("shortDescription") or "")[:1000] or None,
+            "categories": cats,
+        })
+    return records, skipped
+
+def _resolve_atlas_dataset_url(manifest) -> str:
+    """URLS["atlas"] points at dist/manifest.yaml (see its comment for why); this picks the
+    current v6 dataset path out of it — the newest release entry's format-version 6.x path —
+    and returns the downloadable URL for that file. The path is checked against a fixed
+    pattern before being used to build a URL: the manifest is remote, third-party content,
+    and this is the one place its contents steer an outgoing fetch."""
+    for release in manifest:
+        for version in release.get("versions", []):
+            path = version.get("path", "")
+            if str(version.get("format-version", "")).startswith("6.") and _ATLAS_V6_PATH_RE.match(path):
+                return f"https://raw.githubusercontent.com/mitre-atlas/atlas-data/main/dist/{path}"
+    raise ThreatLibraryImportError(
+        "could not find a v6 release in dist/manifest.yaml — MITRE ATLAS's release index "
+        "format may have changed")
+
 ADAPTERS = {
     "pytm": adapt_pytm,
     "threat_composer": adapt_threat_composer,
@@ -296,21 +497,9 @@ ADAPTERS = {
     "attack": adapt_attack,
     "attack_ics": adapt_attack_ics,
     "emb3d": adapt_emb3d,
+    "atlas": adapt_atlas,
+    "kev": adapt_kev,
 }
-
-# Per-source-family top-level JSON shape — the cheap pre-parse sniff the API handler runs
-# before dispatching (valid JSON of the WRONG shape would otherwise crash deep inside an
-# adapter with a meaningless AttributeError). (predicate, human-readable expectation).
-EXPECTED_SHAPES: dict[str, tuple] = {
-    "pytm": (lambda d: isinstance(d, list), "a JSON list of pytm threat objects"),
-    "threat_composer": (lambda d: isinstance(d, dict) and "threats" in d, 'a JSON object with a "threats" list'),
-    "capec": (lambda d: isinstance(d, dict) and "objects" in d, 'a STIX bundle object with an "objects" list'),
-    "attack": (lambda d: isinstance(d, dict) and "objects" in d, 'a STIX bundle object with an "objects" list'),
-    "attack_ics": (lambda d: isinstance(d, dict) and "objects" in d, 'a STIX bundle object with an "objects" list'),
-    "emb3d": (lambda d: isinstance(d, (dict, list)), 'a JSON object with a "threats" list (or a bare list)'),
-    "misp_actors": (lambda d: isinstance(d, dict) and "values" in d, 'a MISP galaxy object with a "values" list'),
-}
-
 
 def check_source_shape(source: str, data) -> None:
     """Raise ThreatLibraryImportError unless `data`'s top-level shape matches what
@@ -322,7 +511,6 @@ def check_source_shape(source: str, data) -> None:
         raise ThreatLibraryImportError(
             f"content does not match the {source!r} format — expected {expected}")
 
-
 # ---------------------------------------------------------------- IO + import
 def load(source: str, file_content: str | None, via_taxii: bool):
     """Resolve the raw data for one import: in-memory content (API upload or CLI --file,
@@ -331,11 +519,13 @@ def load(source: str, file_content: str | None, via_taxii: bool):
     SystemExit)."""
     if file_content is not None and via_taxii:
         raise ThreatLibraryImportError("provide file content OR via_taxii, not both")
+    is_yaml = source in YAML_SOURCES
     if file_content is not None:
         try:
-            data = json.loads(file_content)
-        except ValueError as exc:
-            raise ThreatLibraryImportError(f"file content is not valid JSON: {exc}") from exc
+            data = yaml.safe_load(file_content) if is_yaml else json.loads(file_content)
+        except (ValueError, yaml.YAMLError) as exc:
+            fmt = "YAML" if is_yaml else "JSON"
+            raise ThreatLibraryImportError(f"file content is not valid {fmt}: {exc}") from exc
     elif via_taxii:
         if source not in ("attack", "attack_ics"):
             raise ThreatLibraryImportError("via_taxii is only supported for attack / attack_ics")
@@ -345,7 +535,14 @@ def load(source: str, file_content: str | None, via_taxii: bool):
         url = URLS[source]
         log.info("threat_library_import.downloading", source=source, url=url)
         with urllib.request.urlopen(url, timeout=180) as resp:  # noqa: S310 — pinned https URLs above
-            data = json.load(resp)
+            data = yaml.safe_load(resp.read()) if is_yaml else json.load(resp)
+        if source == "atlas":
+            # URLS["atlas"] is dist/manifest.yaml, not the dataset itself — resolve the real
+            # current v6 file and fetch that before check_source_shape runs on it below.
+            dataset_url = _resolve_atlas_dataset_url(data)
+            log.info("threat_library_import.downloading", source=source, url=dataset_url)
+            with urllib.request.urlopen(dataset_url, timeout=180) as resp:  # noqa: S310 — path checked in _resolve_atlas_dataset_url
+                data = yaml.safe_load(resp.read())
     check_source_shape(source, data)
     return data
 
@@ -365,7 +562,7 @@ def source_count(sess, tag: str) -> int:
 
 
 def record_import_started(source: str, *, dry_run: bool, job_id: str | None,
-                          started_by: str | None = None) -> str:
+                        started_by: str | None = None) -> str:
     """Open a `running` row for this import and return its RunID.
 
     Its OWN session, deliberately separate from the import's: the row must survive the
@@ -405,28 +602,20 @@ def record_import_finished(run_id: str, *, stats: dict | None = None, error: str
     try:
         with db_session() as sess:
             sess.execute(update(m.Threat_Library_Import_Run)
-                         .where(m.Threat_Library_Import_Run.RunID == run_id)
-                         .values(**values))
+                        .where(m.Threat_Library_Import_Run.RunID == run_id)
+                        .values(**values))
     except Exception:  # noqa: BLE001
         log.warning("import.history_finish_failed", run_id=run_id, exc_info=True)
 
 
-# A run is only closed by record_import_finished, which needs the worker to still be alive: a
-# SIGKILLed or permanently hung worker leaves its row at 'running' forever, and nothing sweeps
-# Threat_Library_Import_Run (the reaper handles sessions only). The inventory API then reports
-# that source as perpetually in-flight, and — because `loaded` for misp_actors requires the last
-# run to be 'success' — a killed actors import makes that source read as never-attempted for
-# good, destroying the "attempted vs never attempted" distinction the endpoint exists to draw.
-# Deriving the status on read costs nothing and cannot itself get stuck. The cutoff matches the
-# broker's visibility_timeout (celery_app.py): past it, the message has already been redelivered
-# or abandoned, so no live worker is still holding that row.
-_RUN_STALE_AFTER = timedelta(seconds=3600)
+
 
 
 def _is_abandoned(row) -> bool:
     """True for a 'running' row older than the redelivery window — no live worker still holds it."""
+    stale_after = timedelta(seconds=get_settings().library_import_stale_after_seconds)
     return (row.Status == "running" and row.StartedAt is not None
-            and now() - row.StartedAt > _RUN_STALE_AFTER)
+            and now() - row.StartedAt > stale_after)
 
 
 def _settled_status(row) -> str:
@@ -449,7 +638,7 @@ def latest_runs_by_source(sess) -> dict[str, dict[str, Any]]:
     One query for every source, not one per source."""
     r = m.Threat_Library_Import_Run
     newest = (select(r.Source, func.max(r.StartedAt).label("started"))
-              .group_by(r.Source).subquery())
+            .group_by(r.Source).subquery())
     rows = sess.execute(
         select(r).join(newest, (r.Source == newest.c.Source) & (r.StartedAt == newest.c.started))
     ).scalars().all()
@@ -490,12 +679,12 @@ def import_records(sess, records: list[dict], tag: str, created_by: str | None =
         counts = collections.Counter(c for r in recs for c in r["categories"])
         default_cat = cat_ids[counts.most_common(1)[0][0]]
         type_id, _created = dal.upsert_threat_type(sess, type_name, default_cat, None, source=tag,
-                                         created_by=created_by)
+                                        created_by=created_by)
         type_ids[type_name] = type_id
         for r in recs:
             cat_id_ = dal.upsert_threat_catalogue(sess, r["threat_name"], type_id, None,
-                                                  description=r["description"], source=tag,
-                                                  created_by=created_by)
+                                                description=r["description"], source=tag,
+                                                created_by=created_by)
             for c in r["categories"]:
                 new_links += dal.link_catalogue_category(sess, cat_id_, cat_ids[c])
     return {"types": len(by_type), "threats": len(records), "new_category_links": new_links,
@@ -503,7 +692,7 @@ def import_records(sess, records: list[dict], tag: str, created_by: str | None =
 
 
 def apply_ot_rules(sess, records: list[dict], type_ids: dict[str, int], tag: str,
-                   dry_run: bool) -> list[dict]:
+                dry_run: bool) -> list[dict]:
     """Auto-write one BOOST-ONLY scoping rule per imported OT threat type: relevance_flag
     on asset_type='OT' (deliberately never tech_gate — a wrong auto-rule may only nudge
     ranking, never silently hide a threat). Replaces the old print-only suggest_ot_rules.
@@ -511,7 +700,7 @@ def apply_ot_rules(sess, records: list[dict], type_ids: dict[str, int], tag: str
     rules = []
     for type_name in sorted({r["type_name"] for r in records}):
         entry = {"threat_type_id": type_ids.get(type_name), "threat_type_name": type_name,
-                 "rule_key": "asset_type"}
+                "rule_key": "asset_type"}
         if not dry_run:
             entry["threat_rule_id"] = dal.upsert_threat_rule(
                 sess, type_ids[type_name], str(ThreatRuleType.relevance_flag), "asset_type",
@@ -521,7 +710,7 @@ def apply_ot_rules(sess, records: list[dict], type_ids: dict[str, int], tag: str
 
 
 def run_import(sess, source: str, *, file_content: str | None = None, via_taxii: bool = False,
-               max_actors: int = 40, dry_run: bool = False, started_by: str | None = None) -> dict:
+            max_actors: int = 40, dry_run: bool = False, started_by: str | None = None) -> dict:
     """The one entry point both front doors (CLI script, Celery task) call.
 
     `started_by` is the caller's user id when the import arrived over HTTP; it becomes CreatedBy
@@ -530,7 +719,7 @@ def run_import(sess, source: str, *, file_content: str | None = None, via_taxii:
     scoring rules — so "who added this" is never silently blank.
 
     Returns, for every source: {source, dry_run, skipped_count, skipped (first
-    _SKIPPED_CAP entries)}. Catalogue-shaped sources add {types, threats,
+    Settings.library_import_skipped_cap entries)}. Catalogue-shaped sources add {types, threats,
     new_category_links (None on dry_run — link newness is unknowable without writing),
     before_count, after_count, ot_rules} — ot_rules is [] for non-OT sources. misp_actors
     adds {actors_upserted} instead. A technically-valid file yielding zero usable records
@@ -580,11 +769,11 @@ def run_import(sess, source: str, *, file_content: str | None = None, via_taxii:
                 f"could not parse content as {source!r} data — check it matches the "
                 "expected format") from exc
         result.update({"types": len({r["type_name"] for r in records}), "threats": len(records),
-                       "new_category_links": None, "before_count": source_count(sess, tag),
-                       "after_count": None, "ot_rules": []})
+                    "new_category_links": None, "before_count": source_count(sess, tag),
+                    "after_count": None, "ot_rules": []})
         if not records:
             result["warning"] = (f"0 usable threats found for source {source!r} — check the "
-                                 "content matches the selected source")
+                                "content matches the selected source")
         elif dry_run:
             if source in OT_SOURCES:
                 result["ot_rules"] = apply_ot_rules(sess, records, {}, tag, dry_run=True)
@@ -598,5 +787,5 @@ def run_import(sess, source: str, *, file_content: str | None = None, via_taxii:
             result["after_count"] = source_count(sess, tag)
 
     result["skipped_count"] = len(skipped)
-    result["skipped"] = skipped[:_SKIPPED_CAP]
+    result["skipped"] = skipped[:get_settings().library_import_skipped_cap]
     return result

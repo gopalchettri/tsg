@@ -17,10 +17,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core.config import get_settings  # noqa: E402
 from app.pipeline import scoping  # noqa: E402
 from app.pipeline.cascade import (NextSetOutcome, _build_regen_audit_detail,  # noqa: E402
                                 _next_set_outcome)
-from app.pipeline.tasks import (_MAX_PROPOSAL_CHARS, _semantic_duplicates,  # noqa: E402
+from app.pipeline.tasks import (_semantic_duplicates,  # noqa: E402
                                 _usable_proposal, asset_agnostic_name, clean_library_name)
 
 ASSET = "Widget Control System"
@@ -68,7 +69,7 @@ def check_usable_proposal() -> None:
     assert _usable_proposal({"type": "Data tampering"}) is False
 
     # Over-long used to raise inside llm.embed and lose EVERY threat in the round, not just this one.
-    assert _usable_proposal({"type": "x" * (_MAX_PROPOSAL_CHARS + 1), "name": "n"}) is False
+    assert _usable_proposal({"type": "x" * (get_settings().max_proposal_chars + 1), "name": "n"}) is False
     assert _usable_proposal({"type": "x" * 10, "name": "y" * 10}) is True
 
     # Non-string values must not slip through as truthy.

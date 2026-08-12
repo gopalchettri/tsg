@@ -45,8 +45,15 @@ NOT PART OF THE INSTALL — do not run:
   * backfill_rejection_kind.sql -- one-off repair for databases created before 2026-08-03.
     Not needed for a fresh install; it self-guards and reports if it is not applicable.
 
-The copies in scripts/share/ are byte-identical to the canonical files in scripts/
-(refreshed together). If they ever differ, scripts/ is authoritative.
+scripts/eyshield_handoff/ is the numbered copy of these seven files for handing
+to someone without repo access (e.g. the EyShield DBA team). Unlike the old
+scripts/share/ (deleted 2026-08-09), it IS tracked in git, so it shows up in
+diffs and reviews when the canonical files below change — update it in the
+same change, the same way TSG_Core.sql and models.py are kept in sync. A
+gitignored, untracked copy of this same idea already caused a real problem
+once: it silently kept an ALTER TABLE against platform tables (ctm_scan_entity,
+onboarding_supporting_systems) for weeks after that was removed from here for
+violating the read-only rule below.
 
 ============================================================================
 NOTES FOR DEVELOPERS

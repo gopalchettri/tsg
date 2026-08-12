@@ -13,22 +13,44 @@ concurrent-POST arbiter.
 """
 from __future__ import annotations
 
+import io
 import json
 from datetime import datetime, timezone
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import Principal, get_principal
-from app.api.schemas import (ErrorResponse, TreatmentAuditEvent, TreatmentAuditTrail,
-                             TreatmentBoard, TreatmentBoardRow, TreatmentCancelResponse,
-                             TreatmentEntityAuditPage, TreatmentEvidence,
-                             TreatmentEvidenceAttempt, TreatmentPlanAccepted,
-                             TreatmentPlanBody, TreatmentPlanStatus, TreatmentRegisterPage,
-                             TreatmentRegisterRow, TreatmentReviewBody,
-                             TreatmentReviewResponse)
+from app.api.schemas import (
+    ErrorResponse,
+    TreatmentAuditEvent,
+    TreatmentAuditTrail,
+    TreatmentBoard,
+    TreatmentBoardRow,
+    TreatmentCancelResponse,
+    TreatmentEntityAuditPage,
+    TreatmentEvidence,
+    TreatmentEvidenceAttempt,
+    TreatmentPlanAccepted,
+    TreatmentPlanBody,
+    TreatmentPlanStatus,
+    TreatmentRegisterPage,
+    TreatmentRegisterRow,
+    TreatmentReviewBody,
+    TreatmentReviewResponse,
+)
 from app.api.sessions import get_authorized_session
-from app.core.enums import AuditEventType, StageStatus, TreatmentGateReason, TreatmentStrategy
+from app.api.treatment_plan_excel import build_treatment_plans_workbook
+from app.core.enums import (
+    AuditEventType,
+    RiskLevel,
+    StageStatus,
+    TreatmentGateReason,
+    TreatmentOutcomeReason,
+    TreatmentReviewStatus,
+    TreatmentStrategy,
+)
 from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
@@ -54,8 +76,8 @@ _TIMED_OUT_MESSAGE = "generation timed out — request it again"
 #: to unhide. Envelope fields are hidden the same way via exclude=True on TreatmentPlanStatus.
 _VISIBLE_PLAN_KEYS = (
     "title", "treatment_plan", "action_plan", "applicable_to_all_subsystems",
-    "controls_to_be_implemented", "mitigation_timeline", "mitigation_owner", "risk_owner",
-    "impacted_business_division")
+    "controls_to_be_implemented", "remediation_action_plan", "mitigation_timeline",
+    "mitigation_owner", "risk_owner", "impacted_business_division")
 
 
 def enqueue_treatment_plan(plan_id: str) -> None:
@@ -64,7 +86,7 @@ def enqueue_treatment_plan(plan_id: str) -> None:
 
 
 @router.post("/sessions/{session_id}/scenarios/{output_id}/treatment-plan", status_code=202,
-             response_model=TreatmentPlanAccepted, responses=_CONFLICT_RESPONSES)
+            response_model=TreatmentPlanAccepted, responses=_CONFLICT_RESPONSES)
 def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody,
                         principal: Principal = Depends(get_principal)) -> TreatmentPlanAccepted:
     """Generate (or regenerate) the Mitigate treatment plan for one ACCEPTED scenario.
@@ -143,7 +165,8 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
             # task_id=None: nothing has claimed this row yet (inserted with ActiveTaskID=None
             # above), so only finish it if that's still true.
             dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=None,
-                            error_message="failed to queue generation — request it again")
+                            error_message="failed to queue generation — request it again",
+                            error_reason=TreatmentOutcomeReason.enqueue_failed)
         log.error("treatment.enqueue_failed", plan_id=plan_id)
         raise
     return TreatmentPlanAccepted(plan_id=plan_id, session_id=session_id,
@@ -156,15 +179,23 @@ def get_treatment_plan(session_id: str, output_id: str,
                        principal: Principal = Depends(get_principal)) -> TreatmentPlanStatus:
     """The poll endpoint — the scenario's one active plan row. 404 when no plan has ever been
     requested for this scenario. A stale RUNNING row is PRESENTED as ERROR/timed-out; the
-    stored Status is not rewritten (no reaper — the next POST supersedes it instead)."""
+    stored Status is not rewritten (no reaper — the next POST supersedes it instead).
+
+    POLLING IS THE CONTRACT. The worker also emits an advisory `treatment_plan_result` on the
+    session's SSE stream (GET /v1/sessions/{id}/events) so a client can refetch immediately, but
+    that is a HINT: three outcomes never publish — a dead worker (the row stays RUNNING and only
+    the projection above calls it timed out), an LLM-capacity autoretry (which keeps bumping the
+    progress clock, so the row never goes stale either), and cancel/review (written here, in the
+    API process). Keep a slow backstop poll; the event only makes the common case feel instant."""
     with db_session() as sess:
         get_authorized_session(sess, session_id, principal)
         row = dal.active_plan_row(sess, session_id, output_id)
         if row is None:
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
 
-        status, error_message = _present_status(row["Status"], row["ErrorMessage"], row["UpdatedAt"],
-                                                treatment._stale_cutoff())
+        status, error_message, reason = _present_status(
+            row["Status"], row["ErrorMessage"], row["UpdatedAt"], treatment._stale_cutoff(),
+            row["ErrorReason"])
 
         plan = _safe_json_dict(row["PlanJSON"], row["PlanID"])
         if plan is not None:
@@ -186,7 +217,7 @@ def get_treatment_plan(session_id: str, output_id: str,
             plan=plan,
             warnings=[w for w in validation.get("warnings") or [] if isinstance(w, str)],
             moderation_flagged=bool(moderation.get("flagged")),
-            error_message=error_message,
+            error_message=error_message, reason=reason,
             created_at=row["CreatedAt"], completed_at=row["CompletedAt"])
 
 
@@ -213,11 +244,18 @@ def _naive_utc(dt: datetime) -> datetime:
 
 
 def _present_status(status: str, error_message: str | None, updated_at: datetime | None,
-                    stale_cutoff: datetime) -> tuple[str, str | None]:
+                    stale_cutoff: datetime,
+                    error_reason: str | None = None) -> tuple[str, str | None, str | None]:
     """Read-time staleness projection shared by the single-plan GET, the board and the
     register: a RUNNING row whose progress clock stopped past treatment_stale_seconds
     presents as ERROR/timed-out; the stored row is never rewritten (D10 — the next POST
     supersedes it, and a late finish still lands).
+
+    Returns (status, message, reason). The reason is the projection's whole point on this path:
+    `timed_out` has NO writer — it exists only here — so a client can distinguish a timeout from a
+    real failure without matching the English sentence. For a stored ERROR the row's own
+    ErrorReason passes through; NULL (a row that failed before the column existed) reads as
+    generation_failed, the historical catch-all.
 
     `stale_cutoff` is the CALLER's instant, not recomputed here — `treatment._stale_cutoff()`
     returns `now() - treatment_stale_seconds` at call time, so calling it fresh per row (the
@@ -226,8 +264,10 @@ def _present_status(status: str, error_message: str | None, updated_at: datetime
     one check and fail the other on the exact same request."""
     if status == str(StageStatus.RUNNING) and updated_at is not None \
             and _naive_utc(updated_at) < _naive_utc(stale_cutoff):
-        return str(StageStatus.ERROR), _TIMED_OUT_MESSAGE
-    return status, error_message
+        return str(StageStatus.ERROR), _TIMED_OUT_MESSAGE, str(TreatmentOutcomeReason.timed_out)
+    if status == str(StageStatus.ERROR):
+        return status, error_message, error_reason or str(TreatmentOutcomeReason.generation_failed)
+    return status, error_message, None  # RUNNING / COMPLETE carry no reason
 
 
 def _scenario_title(scenario_json: str | None) -> str | None:
@@ -259,16 +299,47 @@ def get_treatment_board(session_id: str,
         stale_cutoff = treatment._stale_cutoff()
         plans = []
         for r in rows:
+            # All three default to None together: a scenario with no plan yet leaves every one
+            # of them unset, and initializing only some of them makes the never-requested row
+            # raise UnboundLocalError instead of rendering the UI's "Generate" state.
             status: str | None = None
             err: str | None = None
+            reason: str | None = None
             if r["PlanID"] is not None:
-                status, err = _present_status(r["Status"], r["ErrorMessage"], r["PlanUpdatedAt"], stale_cutoff)
+                status, err, reason = _present_status(r["Status"], r["ErrorMessage"],
+                                                      r["PlanUpdatedAt"], stale_cutoff,
+                                                      r["ErrorReason"])
             plans.append(TreatmentBoardRow(
                 output_id=r["OutputID"], scenario_title=_scenario_title(r["ScenarioJSON"]),
                 plan_id=r["PlanID"], status=status, risk_level=r["RiskLevel"],
-                review_status=r["ReviewStatus"], error_message=err,
+                review_status=r["ReviewStatus"], error_message=err, reason=reason,
                 created_at=r["PlanCreatedAt"], completed_at=r["PlanCompletedAt"]))
     return TreatmentBoard(session_id=session_id, accepted_scenarios=len(rows), plans=plans)
+
+
+@router.get("/sessions/{session_id}/treatment-plans.xlsx")
+def get_treatment_plans_excel(session_id: str,
+                              principal: Principal = Depends(get_principal)) -> Response:
+    """The session's treatment-plan board, as a single-sheet Excel workbook — one row per
+    accepted scenario that has a generated plan.
+
+    Enumerates via session_plan_board, then calls get_treatment_plan() per scenario (accepted-
+    scenario counts are small) so this can never drift from the JSON poll's staleness
+    projection, trimming, or field rendering — same "call the JSON endpoint directly" contract
+    as sessions.py's results.xlsx."""
+    with db_session() as sess:
+        get_authorized_session(sess, session_id, principal)
+        rows = dal.session_plan_board(sess, session_id)
+    plans = [get_treatment_plan(session_id, r["OutputID"], principal)
+             for r in rows if r["PlanID"] is not None]
+    workbook = build_treatment_plans_workbook(session_id, plans)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="session_{session_id}_treatment_plans.xlsx"'},
+    )
 
 
 @router.post("/sessions/{session_id}/scenarios/{output_id}/treatment-plan/cancel",
@@ -287,7 +358,8 @@ def post_cancel_treatment_plan(session_id: str, output_id: str,
         # TOCTOU window where a worker reclaims the row between this SELECT and the UPDATE below.
         if row["Status"] != str(StageStatus.RUNNING) or not dal.finish_plan(
                 sess, row["PlanID"], status=StageStatus.ERROR, task_id=row["ActiveTaskID"],
-                error_message=_CANCELLED_MESSAGE):
+                error_message=_CANCELLED_MESSAGE,
+                error_reason=TreatmentOutcomeReason.cancelled):
             raise treatment.TreatmentConflict(
                 "no generation is in progress for this scenario",
                 reason=TreatmentGateReason.not_in_progress)
@@ -295,7 +367,8 @@ def post_cancel_treatment_plan(session_id: str, output_id: str,
             sess, AuditID=dal.guid(), SessionID=session_id, TenantID=row["TenantID"],
             EntityID=row["EntityID"], SubsystemID=ASSET_UNIT_ID,
             EventType=AuditEventType.treatment_plan_cancelled, ActorUserID=principal.user_id,
-            DetailJSON=json.dumps({"plan_id": row["PlanID"]}))
+            DetailJSON=json.dumps({"plan_id": row["PlanID"],
+                                   "reason": str(TreatmentOutcomeReason.cancelled)}))
     log.info("treatment.cancelled", plan_id=row["PlanID"], user=principal.user_id)
     return TreatmentCancelResponse(plan_id=row["PlanID"], status=str(StageStatus.ERROR),
                                    error_message=_CANCELLED_MESSAGE)
@@ -339,9 +412,15 @@ def post_review_treatment_plan(session_id: str, output_id: str, body: TreatmentR
 
 @router.get("/entities/{entity_id}/treatment-plans", response_model=TreatmentRegisterPage)
 def list_entity_treatment_plans(entity_id: str,
-                                status: str | None = Query(None, description="RUNNING | COMPLETE | ERROR"),
-                                review_status: str | None = Query(None, description="approved | changes_requested"),
-                                risk_level: str | None = Query(None, description="Low | Medium | High | Critical"),
+                                # Enum-typed, not str: an unrecognized value used to bind straight
+                                # into the WHERE and return an empty page, which reads as "no such
+                                # plans" rather than "you typed it wrong". Now a clean 422.
+                                status: Literal[StageStatus.RUNNING, StageStatus.COMPLETE,
+                                                StageStatus.ERROR] | None = Query(
+                                    None, description="Filter by presented status (a timed-out "
+                                                      "RUNNING plan counts as ERROR)."),
+                                review_status: TreatmentReviewStatus | None = Query(None),
+                                risk_level: RiskLevel | None = Query(None),
                                 limit: int = Query(100, ge=1, le=500),
                                 offset: int = Query(0, ge=0),
                                 principal: Principal = Depends(get_principal)) -> TreatmentRegisterPage:
@@ -361,12 +440,13 @@ def list_entity_treatment_plans(entity_id: str,
                                     risk_level=risk_level, limit=limit, offset=offset)
         items = []
         for r in rows:
-            st, err = _present_status(r["Status"], r["ErrorMessage"], r["UpdatedAt"], stale_cutoff)
+            st, err, reason = _present_status(r["Status"], r["ErrorMessage"], r["UpdatedAt"],
+                                              stale_cutoff, r["ErrorReason"])
             items.append(TreatmentRegisterRow(
                 plan_id=r["PlanID"], session_id=r["SessionID"], output_id=r["OutputID"],
                 asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
                 status=st, risk_level=r["RiskLevel"], review_status=r["ReviewStatus"],
-                reviewed_by=r["ReviewedBy"], error_message=err,
+                reviewed_by=r["ReviewedBy"], error_message=err, reason=reason,
                 created_at=r["CreatedAt"], completed_at=r["CompletedAt"]))
     return TreatmentRegisterPage(entity_id=entity_id, limit=limit, offset=offset, plans=items)
 

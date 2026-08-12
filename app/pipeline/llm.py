@@ -14,25 +14,25 @@ import random
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Protocol
-from collections.abc import Sequence
 from urllib.parse import urlparse
+
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
 
 _SLOTS_KEY = "tsg:llm:inflight"
-_POLL_SECONDS = 0.25
-_POLL_JITTER_SECONDS = 0.1
+# Poll interval/jitter now live in Settings.llm_slot_poll_seconds /
+# Settings.llm_slot_poll_jitter_seconds (defaults unchanged: 0.25 / 0.1).
 
-# Safety caps against pathological input (a document routed into a short field), never
-# expected to trip on real text — see the raise sites in embed()/chat() for each number.
-_MAX_EMBED_CHARS = 4000
-_MAX_CHAT_CHARS = 60_000
+# Safety caps against pathological input (a document routed into a short field), never expected
+# to trip on real text — see the raise sites in embed()/chat(). Now Settings.max_embed_chars /
+# Settings.max_chat_chars (defaults unchanged: 4000 / 60_000).
 
 # KEYS[1] = _SLOTS_KEY (a ZSET, one member per in-flight call); ARGV = now, stale_cutoff,
 # limit, token. Must stay ONE script: split into ZCARD-then-ZADD it has two bugs — (1) a
@@ -165,8 +165,8 @@ def _llm_slot(s: Settings):
         if waited >= s.llm_slot_wait_timeout_seconds:
             raise LLMSlotUnavailable(
                 f"no free LLM call slot after waiting {waited:.0f}s (limit={limit})")
-        time.sleep(_POLL_SECONDS + random.uniform(0, _POLL_JITTER_SECONDS))  # jitter avoids synchronized thundering-herd wakeups
-        waited += _POLL_SECONDS
+        time.sleep(s.llm_slot_poll_seconds + random.uniform(0, s.llm_slot_poll_jitter_seconds))  # jitter avoids synchronized thundering-herd wakeups
+        waited += s.llm_slot_poll_seconds
 
     stop_event = threading.Event()
     # plain threading.Thread, not gevent.spawn: under the gevent-patched worker, monkey-patched
@@ -198,6 +198,7 @@ def _db_key_scan_pattern():
     through it, where the distinctive `*_id` names carry effectively zero false-positive risk.
     Imported lazily: app.pipeline must not import app.db (via prompts) at module load."""
     import re
+
     from app.pipeline.prompts import _EXCLUDE_DB_KEY_TO_PROMPT
 
     names = sorted(k for k in _EXCLUDE_DB_KEY_TO_PROMPT if k != "id")
@@ -377,7 +378,7 @@ class LiteLLMClient:
         run never needs the package installed.
 
         Unlike embed()'s guard, a long chat prompt isn't inherently a bug — free-text context
-        fields can legitimately run long against a 131k-token window. `_MAX_CHAT_CHARS` sits far
+        fields can legitimately run long against a 131k-token window. `max_chat_chars` sits far
         above that, purely as a net for pathological input (a document landing in a field that
         expected a short value).
 
@@ -385,10 +386,11 @@ class LiteLLMClient:
         """
         import litellm
 
+        max_chat_chars = self.s.max_chat_chars
         total_chars = sum(len(m.get("content") or "") for m in messages)
-        if total_chars > _MAX_CHAT_CHARS:
+        if total_chars > max_chat_chars:
             raise ValueError(
-                f"chat() received a {total_chars}-char prompt, over the {_MAX_CHAT_CHARS}-char "
+                f"chat() received a {total_chars}-char prompt, over the {max_chat_chars}-char "
                 "safety cap — check for an unexpectedly large free-text field (e.g. "
                 "technology_used, incident_description, cii_asset_description)")
 
@@ -427,14 +429,15 @@ class LiteLLMClient:
         network timeout/retry settings simply don't apply there).
 
         Every real caller embeds a SHORT LABEL (a library name, or the model's proposed type
-        name), never a document. Anything over `_MAX_EMBED_CHARS` is a bug upstream, so reject
+        name), never a document. Anything over `max_embed_chars` is a bug upstream, so reject
         rather than truncate — a truncated name changes meaning with nobody noticing.
         """
+        max_embed_chars = self.s.max_embed_chars
         texts = _apply_embed_prefix(self.s, list(texts), kind)  # e5 prefixes, both providers
-        too_long = [t for t in texts if len(t) > _MAX_EMBED_CHARS]
+        too_long = [t for t in texts if len(t) > max_embed_chars]
         if too_long:
             raise ValueError(
-                f"embed() received {len(too_long)} text(s) over {_MAX_EMBED_CHARS} chars "
+                f"embed() received {len(too_long)} text(s) over {max_embed_chars} chars "
                 f"(longest {max(len(t) for t in too_long)}) — refusing to send to the embedding "
                 "model; this is never legitimate input for a short library-matching label")
         if self.s.embedding_provider == "local":

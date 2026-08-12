@@ -2,7 +2,7 @@
 
 One small fetcher per open feed, all normalizing to the same doc shape:
     {source, kind, external_id, title, description, url, tags[], raw,
-     fetched_at, published_at}
+    fetched_at, published_at}
 
 `fetched_at` is cache age (it drives the TTL); `published_at` is the item's own date at
 the source and is what both read paths RANK on — see query_intel. Retrieval that needs
@@ -26,9 +26,10 @@ import json
 import re
 import time
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
-from typing import Any, Iterator
+from typing import Any
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -83,8 +84,8 @@ def _intel_store():
     for superseded in ("kind_1_fetched_at_-1", "source_1_fetched_at_-1_external_id_1"):
         try:
             col.drop_index(superseded)
-        except Exception:  # noqa: BLE001 — never created here, or already gone: the normal case
-            pass
+        except Exception:  # never created here, or already gone: the normal case
+            log.debug("intel.superseded_index_drop_skipped", index=superseded, exc_info=True)
     col.create_index([("kind", 1), ("published_at", -1)])          # query_intel, per kind
     # list_intel's per-source page; the UNFILTERED listing still sorts in memory, which is
     # acceptable while the TTL caps the collection at low tens of thousands of docs.
@@ -172,7 +173,7 @@ def fetch_ics_advisories(s) -> list[dict]:
 
     base = s.intel_ics_advisories_url.rsplit("/", 1)[0]
     rows = csv.reader(io.StringIO(_get(s.intel_ics_advisories_url).decode("utf-8")))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=s.intel_ttl_days)
+    cutoff = datetime.now(UTC) - timedelta(days=s.intel_ttl_days)
     col = _store_if_healthy()
     known = ({d["external_id"] for d in col.find({"source": "cisa_ics"}, {"external_id": 1, "_id": 0})}
             if col is not None else set())
@@ -182,7 +183,7 @@ def fetch_ics_advisories(s) -> list[dict]:
             continue
         path, date_s = row
         try:
-            when = datetime.fromisoformat(date_s.replace("Z", "+00:00"))
+            when = datetime.fromisoformat(date_s)
         except ValueError:
             continue
         if when < cutoff:
@@ -236,7 +237,7 @@ def fetch_taxii(s) -> list[dict]:
     from app.intel.taxii_client import iter_objects  # lazy: optional dependency
 
     servers = json.loads(s.intel_taxii_servers) if s.intel_taxii_servers else []
-    added_after = (datetime.now(timezone.utc) - timedelta(days=s.intel_ttl_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    added_after = (datetime.now(UTC) - timedelta(days=s.intel_ttl_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     docs = []
     for server in servers:
         label = server.get("label", server.get("url", "taxii"))
@@ -280,7 +281,7 @@ def _record_feed_status(col, feed: str, *, items: int | None = None, error: str 
     result that reported it. Without this, a feed that failed at 03:00 is indistinguishable
     from one that was never switched on — the exact blind spot the status API exists to close.
     Best-effort: bookkeeping must never fail the refresh it is describing."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     update: dict[str, Any] = {"last_attempt_at": now, "last_error": error}
     if items is not None:
         # recorded on the FAILURE path too: writes are incremental, so a run that died
@@ -336,7 +337,7 @@ def refresh_one(feed: str) -> int:
     col = _store_if_healthy()
     if col is None:
         raise RuntimeError("intel refresh skipped: Mongo unavailable")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     stored, batch = 0, []
     try:
         for doc in fetcher(s):        # list or generator — both iterate
@@ -490,7 +491,7 @@ def list_intel(source: str | None = None, limit: int = 50, offset: int = 0) -> t
     q = {"source": source} if source else {}
     try:
         items = list(col.find(q, {"_id": 0, "raw": 0})
-                     .sort([("published_at", -1), ("external_id", 1)]).skip(offset).limit(limit))
+                    .sort([("published_at", -1), ("external_id", 1)]).skip(offset).limit(limit))
         return items, col.count_documents(q)
     except Exception:  # noqa: BLE001 — a mid-query blip is the same "store unavailable"
         # as a breaker-open connection: the route's one 503 path must cover both, never
@@ -499,13 +500,13 @@ def list_intel(source: str | None = None, limit: int = 50, offset: int = 0) -> t
         return None
 
 
-if __name__ == "__main__":
-    import argparse
+# if __name__ == "__main__":
+#     import argparse
 
-    parser = argparse.ArgumentParser(description="Refresh all enabled threat-intel feeds once.")
-    parser.add_argument("--once", action="store_true", help="run one refresh and exit (default behaviour)")
-    parser.parse_args()
-    from app.core.logging import configure_logging
+#     parser = argparse.ArgumentParser(description="Refresh all enabled threat-intel feeds once.")
+#     parser.add_argument("--once", action="store_true", help="run one refresh and exit (default behaviour)")
+#     parser.parse_args()
+#     from app.core.logging import configure_logging
 
-    configure_logging()
-    print(refresh_all())
+#     configure_logging()
+#     print(refresh_all())

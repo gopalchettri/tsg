@@ -26,7 +26,7 @@ class WorkflowStage(StrEnum):
     """`Scenario_Session.CurrentStage`. THREAT_IDENTIFICATION through APPROVED are ordered
     forward steps; CANCELLED is a terminal exit from any of them, not a step."""
     THREAT_IDENTIFICATION = "THREAT_IDENTIFICATION"  # Stage 1: AI proposes STRIDE threats, grounded against the library
-    SCENARIO_GENERATION = "SCENARIO_GENERATION"      # Stage 2: one scenario per selected threat
+    SCENARIO_GENERATION = "SCENARIO_GENERATION"      # Stage 2: scenario per selected threat
     REVIEW = "REVIEW"                                # every subsystem hit its review barrier; waiting on the human
     APPROVED = "APPROVED"                            # accepted — terminal, pairs with SessionStatus.completed
     CANCELLED = "CANCELLED"
@@ -35,12 +35,12 @@ class WorkflowStage(StrEnum):
 class StageStatus(StrEnum):
     """One (session, subsystem, level) cell's own status — not the session-wide `WorkflowStage`."""
     IDLE = "IDLE"
-    RUNNING = "RUNNING"                      # a worker holds this claim (ActiveTaskID + LeaseExpiresAt set)
-    AWAITING_DECISION = "AWAITING_DECISION"  # SCENARIOS only — NOT COMPLETE; this state IS the review barrier
-    COMPLETE = "COMPLETE"                    # a Celery redelivery treats this as a no-op
-    ERROR = "ERROR"                          # re-claimable up to stage_max_attempts, then poison-terminal
-    CANCELLED = "CANCELLED"                  # Scenario_Session-level only — never written to a
-                                             # Subsystem_Stage_State row
+    RUNNING = "RUNNING"                       # a worker holds this claim (ActiveTaskID + LeaseExpiresAt set)
+    AWAITING_DECISION = "SCENARIOS_AWAITING_DECISION"   # SCENARIOS only — NOT COMPLETE; this state IS the review barrier
+    COMPLETE = "COMPLETE"                     # a Celery redelivery treats this as a no-op
+    ERROR = "ERROR"                           # re-claimable up to stage_max_attempts, then poison-terminal
+    CANCELLED = "CANCELLED"                   # Scenario_Session-level only — never written to a
+                                        # Subsystem_Stage_State row
 
 
 class SubsystemLevel(StrEnum):
@@ -49,8 +49,8 @@ class SubsystemLevel(StrEnum):
     THREATS = "THREATS"      # mirrors WorkflowStage.THREAT_IDENTIFICATION
     SCENARIOS = "SCENARIOS"  # mirrors WorkflowStage.SCENARIO_GENERATION
     LOCK = "_LOCK"           # DB value is the literal "_LOCK". A per-subsystem CAS mutex sentinel
-                             # row, not a work stage — hence the `Level != LOCK` filter on every
-                             # stage query
+                            # row, not a work stage — hence the `Level != LOCK` filter on every
+                            # stage query
 
 
 class GroundingStatus(StrEnum):
@@ -59,6 +59,14 @@ class GroundingStatus(StrEnum):
     verified = "verified"       # >= threshold — ThreatTypeID/ThreatCatalogueID set to that master
     unverified = "unverified"   # < threshold — "novel", not "rejected": still gets a scenario, and
                                 # is what library promotion feeds on (accept.py)
+
+
+class DuplicateReason(StrEnum):
+    """`Identified_Duplicate_Threat.DuplicateReason` — why a proposed threat was diverted there
+    instead of Identified_Threat. See tasks.py::find_threats/_semantic_duplicates."""
+    identity = "identity"                                  # exact identity-hash match
+    semantic_same_category = "semantic_same_category"      # >= semantic_near_duplicate_threshold, same category
+    semantic_cross_category = "semantic_cross_category"    # >= semantic_cross_category_threshold, different category
 
 
 class ThreatRuleType(StrEnum):
@@ -106,8 +114,8 @@ class ScenarioStatus(StrEnum):
     """`Threat_Scenario_Output.Status` — one generated scenario row's outcome. Not StageStatus."""
     complete = "complete"
     error = "error"        # FAILURE CARD: a failed generation keeps a row (null scenario +
-                           # ErrorMessage) so /regenerate/scenarios can retry it individually.
-                           # Excluded from accept/salvage/resume by dal.py's `complete` filters
+                        # ErrorMessage) so /regenerate/scenarios can retry it individually.
+                        # Excluded from accept/salvage/resume by dal.py's `complete` filters
 
 
 class ActorType(StrEnum):
@@ -125,6 +133,15 @@ class CandidateStatus(StrEnum):
     pending = "pending"    # what accept.py writes — awaiting a curator to generalize the name
     accepted = "accepted"  # no writer: set by the curator workflow when it lands
     rejected = "rejected"  # no writer yet (curator workflow)
+
+
+class RetryOutcome(StrEnum):
+    """Result of one library-promotion retry or dismiss attempt (reaper.py's
+    retry_one_promotion/dismiss_promotion), surfaced verbatim on the admin API's
+    PromotionRetryResult.outcome."""
+    succeeded = "succeeded"  # the promotion attempt ran and committed cleanly
+    failed = "failed"        # the attempt ran but raised — see the session's PromotionError
+    skipped = "skipped"      # a live worker or another retry already holds this session's lock
 
 
 class ValidationStatus(StrEnum):
@@ -146,25 +163,25 @@ class AuditEventType(StrEnum):
     entered_review = "entered_review"                  # once, when every subsystem reaches the review barrier
     review_decision = "review_decision"                # the human's verdict at the review gate
     scenarios_accepted = "scenarios_accepted"          # Stage-2 outputs flipped Accepted=1 — NOT written on a
-                                                       # mode="none" reject (nothing flipped)
+                                                    # mode="none" reject (nothing flipped)
     regeneration_completed = "regeneration_completed"  # one regenerate request finished its stage re-runs
     threat_regrounded = "threat_regrounded"            # reserved — only `scenario` regen is implemented
     subsystem_advanced = "subsystem_advanced"          # written at the START of a subsystem's work
     auto_fanout_review = "auto_fanout_review"          # reserved — no current producer
     library_promoted = "library_promoted"              # on accept, per NEW Threat_Type master created from an
-                                                       # unverified threat (catalogue names go through triage)
+                                                    # unverified threat (catalogue names go through triage)
     promotion_triage = "promotion_triage"              # on accept, ONE row listing every candidate's
-                                                       # {generic_name, cosine, matched id, verdict} — the record
-                                                       # the triage bands are tightened from
+                                                    # {generic_name, cosine, matched id, verdict} — the record
+                                                    # the triage bands are tightened from
     candidate_reconciled = "candidate_reconciled"      # reserved — means a Threat_Candidate_Review row was CLOSED
-                                                       # as accepted, which only the curator workflow can do
+                                                    # as accepted, which only the curator workflow can do
     session_cancelled = "session_cancelled"            # explicit cancel, or _mark_session_failed's total-failure
-                                                       # path — either way releases the M4 lock
+                                                    # path — either way releases the M4 lock
     stage_error = "stage_error"                        # a stage failed after retries
     next_set_outcome = "next_set_outcome"              # per "generate next set" click; DetailJSON: {outcome,
-                                                       # requested, delivered, variants, reason, epoch}. A SEPARATE
-                                                       # row from the generation_complete rows one click can write
-                                                       # (those must be SUMMED); this is the authoritative summary
+                                                    # requested, delivered, variants, reason, epoch}. A SEPARATE
+                                                    # row from the generation_complete rows one click can write
+                                                    # (those must be SUMMED); this is the authoritative summary
     treatment_plan_requested = "treatment_plan_requested"  # {plan_id, output_id}; ActorType=user
     treatment_plan_outcome = "treatment_plan_outcome"      # one plan attempt finished; {plan_id, status}; system
     treatment_plan_cancelled = "treatment_plan_cancelled"  # {plan_id}; ActorType=user
@@ -193,7 +210,7 @@ class SubsystemProgress(StrEnum):
     in_progress = "in_progress"          # the fallback rollup
     awaiting_review = "awaiting_review"
     complete = "complete"                # from SessionStatus.completed — accept_session() never rewrites
-                                         # Subsystem_Stage_State, so SCENARIOS never reaches COMPLETE
+                                        # Subsystem_Stage_State, so SCENARIOS never reaches COMPLETE
     error = "error"
     cancelled = "cancelled"
 
@@ -201,20 +218,36 @@ class SubsystemProgress(StrEnum):
 class SSEEventType(StrEnum):
     """Three scopes: `stage_started`/`stage_completed` are one SubsystemLevel cell (subsystem_id
     + stage); `subsystem_started` is one subsystem (no stage); `session_entered_review`/
-    `heartbeat` are session-wide (never a subsystem_id). `error` is DUAL-scope by design —
-    subsystem_id present when one stage failed, omitted when the whole session died."""
+    `heartbeat`/`reconcile` are session-wide (never a subsystem_id). `error` is DUAL-scope by
+    design — an explicit `scope` field ("stage"/"session") says which, rather than relying on
+    whether subsystem_id is present."""
+    reconcile = "reconcile"                            # the one-time snapshot sent on (re)connect,
+                                                    # before live deltas — the full SessionBoard,
+                                                    # not a delta. Never published via bus.publish;
+                                                    # sessions.py::stream_events sends it directly.
     stage_started = "stage_started"
     stage_completed = "stage_completed"                # a failure routes to `error` instead
     subsystem_started = "subsystem_started"            # fires BEFORE this subsystem's stages run
     session_entered_review = "session_entered_review"
-    error = "error"
+    error = "error"                                    # DUAL-scope: carries an explicit "stage"/"session"
+                                                    # `scope` field (tasks.py) — never tear down UI on
+                                                    # this alone; wait for session_entered_review or a
+                                                    # terminal session status (see the typed ErrorEvent)
     next_set_result = "next_set_result"                # advisory: subsystem_id + new_scenarios/no_new, plus
-                                                       # reason/detail/message when no_new — reason is a stable
-                                                       # code, detail is log-facing, message is the user sentence
-                                                       # (cascade.py::_REASON_INFO)
+                                                    # reason/detail/message when no_new — reason is a stable
+                                                    # code, detail is log-facing, message is the user sentence
+                                                    # (cascade.py::_REASON_INFO)
     regen_result = "regen_result"                      # advisory: subsystem_id + requested_output_ids/
-                                                       # new_output_ids, same reason/detail/message shape.
-                                                       # new_output_ids=[] means every target rescored out
+                                                    # new_output_ids, same reason/detail/message shape.
+                                                    # new_output_ids=[] means every target rescored out
+    treatment_plan_result = "treatment_plan_result"    # advisory: one treatment plan reached a committed
+                                                    # COMPLETE/ERROR — carries output_id + plan_id + status,
+                                                    # no subsystem_id (plans are per-scenario) and no
+                                                    # error_message (the refetch carries it). A refetch HINT,
+                                                    # never a completion contract: a dead worker, an
+                                                    # LLMSlotUnavailable autoretry, and cancel/review (written
+                                                    # in the API process) never publish, so a client must keep
+                                                    # a slow backstop poll
     heartbeat = "heartbeat"                            # keep-alive so proxies don't drop an idle SSE connection
 
 
@@ -223,11 +256,11 @@ class NextSetOutcome(StrEnum):
     Retryability is stated, never inferred from a shortfall count."""
     complete = "complete"                    # delivered the full next_set_size
     partial_retryable = "partial_retryable"  # short because generation(s) FAILED. A failed target keeps
-                                             # Selected=1, so dal.next_unserved_unique_threats re-serves it —
-                                             # clicking again IS the retry
+                                            # Selected=1, so dal.next_unserved_unique_threats re-serves it —
+                                            # clicking again IS the retry
     exhausted = "exhausted"                  # short (possibly zero) because nothing further EXISTS: the pool is
-                                             # empty AND every identity has a scenario through every plausible
-                                             # entry point it declared (dal.variant_eligible_primaries)
+                                            # empty AND every identity has a scenario through every plausible
+                                            # entry point it declared (dal.variant_eligible_primaries)
 
 
 class ClickOutcomeReason(StrEnum):
@@ -245,10 +278,10 @@ class ClickOutcomeReason(StrEnum):
     no_target_ids = "no_target_ids"                                    # cascade.py: regen request with zero targets
     output_not_found_or_superseded = "output_not_found_or_superseded"  # cascade.py: stale/foreign OutputIDs
     generation_failed = "generation_failed"                            # the LLM call itself failed — targets stay
-                                                                       # Selected=1, the next click retries. A
-                                                                       # transient provider error is NOT a scoping
-                                                                       # rejection; reporting it as one sends
-                                                                       # support down the wrong path
+                                                                    # Selected=1, the next click retries. A
+                                                                    # transient provider error is NOT a scoping
+                                                                    # rejection; reporting it as one sends
+                                                                    # support down the wrong path
 
 
 class ReviewGateReason(StrEnum):
@@ -303,6 +336,36 @@ class YesNo(StrEnum):
     `applicable_to_all_subsystems`. Not bool: the toolkit columns say Yes/No verbatim."""
     yes = "Yes"
     no = "No"
+
+
+class TreatmentOutcomeReason(StrEnum):
+    """WHY a treatment plan ended the way it did — the machine-readable half of a terminal
+    outcome, so a client never has to match an English sentence to decide what to offer next.
+
+    `Status` alone is a seven-way overload: cancel, timeout, LLM failure, an unusable document, a
+    guardrail block and a dead broker ALL store `ERROR`. Same split as TreatmentGateReason
+    ("message for the human, reason for the client switch") and the NextSetOutcome/
+    ClickOutcomeReason pair — the English is DERIVED from the code, never parsed back out of it.
+
+    WIRE vocabulary, not a column domain: `Risk_Treatment_Plan.ErrorReason` can only ever hold
+    FIVE of these six. `timed_out` is computed by api.treatment._present_status at read time from
+    a RUNNING row whose progress clock stopped — there is no writer for it and no reaper to make
+    one (SDD D10). Do NOT add a CHECK constraint for all six, and do NOT "fix" its absence by
+    adding a sweeper. NULL on a COMPLETE row, and on ERROR rows written before the column existed
+    (read those as generation_failed — the historical catch-all).
+
+    Values are lowercase snake_case (name == value) because this is a switch code, not a label:
+    the display vocabularies (RiskLevel, TreatmentStrategy, ActionPriority) capitalize because the
+    toolkit renders them verbatim."""
+    generation_failed = "generation_failed"  # LLM/pipeline failure — retryable as-is
+    invalid_plan = "invalid_plan"            # model returned a document missing a required table —
+                                            # retryable; a fresh generation may well parse
+    content_blocked = "content_blocked"      # a configured safety guardrail refused it — the ONE
+                                            # reason a client must NOT auto-retry unchanged
+    cancelled = "cancelled"                  # a human stopped it (POST .../cancel), not a failure
+    timed_out = "timed_out"                  # PROJECTION ONLY, never stored — see the docstring
+    enqueue_failed = "enqueue_failed"        # the broker was unreachable; nothing ever ran, so
+                                            # retrying immediately is the right move
 
 
 class TreatmentReviewStatus(StrEnum):

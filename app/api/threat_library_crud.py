@@ -9,23 +9,59 @@ refuses to boot otherwise.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Path, Request
+import json as _json  # noqa: E402 — scoped alias; the module has no other json use
 
+from fastapi import APIRouter, Depends, Path, Request
+from fastapi import Query as _Query  # noqa: E402
+from sqlalchemy import insert as _sa_insert  # noqa: E402
+from sqlalchemy import select as _sa_select
+from sqlalchemy import update as _sa_update
+from sqlalchemy.exc import IntegrityError as _IntegrityError  # noqa: E402
+
+from app.api.admin import AdminValidationError  # noqa: E402
 from app.api.deps import Principal, get_principal, require_admin
-from app.api.library_crud import (
-    _DELETED, _LIMIT, _OFFSET, _RESOURCES, _audit, _create, _delete, _list, _row_out, _update,
+from app.api.library_crud import (  # noqa: E402
+    _DELETED,  # noqa: E402
+    _LIMIT,
+    _OFFSET,
+    _RESOURCES,
+    LibraryConflict,
+    _audit,
+    _create,
+    _delete,
+    _list,
+    _require_parent,
+    _row_out,
+    _update,
 )
+from app.api.library_crud import _DELETED as _RULE_DELETED
+from app.api.schemas import (  # noqa: E402
+    ThreatActorCreate,
+    ThreatActorRow,
+    ThreatActorUpdate,
+    ThreatCatalogueCreate,
+    ThreatCatalogueRow,
+    ThreatCatalogueUpdate,
+    ThreatCategoryCreate,
+    ThreatCategoryRow,
+    ThreatCategoryUpdate,
+    ThreatRuleCreate,
+    ThreatRuleRow,
+    ThreatRuleUpdate,
+    ThreatTypeCreate,
+    ThreatTypeRow,
+    ThreatTypeUpdate,
+)
+from app.core.enums import ThreatRuleType  # noqa: E402
 from app.core.logging import get_logger
 from app.db import dal
+from app.db import models as m  # noqa: E402
+from app.db.dal import NotFoundError, now  # noqa: E402
 from app.db.engine import db_session
+from app.pipeline.scoping import _RULE_KEY_FIELDS
 
 log = get_logger(__name__)
-from app.api.schemas import (
-    ThreatActorCreate, ThreatActorRow, ThreatActorUpdate,
-    ThreatCatalogueCreate, ThreatCatalogueRow, ThreatCatalogueUpdate,
-    ThreatCategoryCreate, ThreatCategoryRow, ThreatCategoryUpdate,
-    ThreatTypeCreate, ThreatTypeRow, ThreatTypeUpdate,
-)
+
 
 router = APIRouter(
     prefix="/v1/tsg/threat-library",
@@ -209,21 +245,6 @@ def delete_threat_actor(request: Request, threat_actor_id: int = Path(ge=1),
 # once, so a small dedicated set of routes is less machinery than teaching the framework three
 # exceptions. Until these routes existed, changing a scoping gate meant SQL against production.
 
-import json as _json  # noqa: E402 — scoped alias; the module has no other json use
-
-from fastapi import Query as _Query  # noqa: E402
-from sqlalchemy import insert as _sa_insert, select as _sa_select, update as _sa_update  # noqa: E402
-from sqlalchemy.exc import IntegrityError as _IntegrityError  # noqa: E402
-
-from app.api.admin import AdminValidationError  # noqa: E402
-from app.api.library_crud import _DELETED as _RULE_DELETED  # noqa: E402
-from app.api.library_crud import LibraryConflict, _require_parent  # noqa: E402
-from app.api.schemas import ThreatRuleCreate, ThreatRuleRow, ThreatRuleUpdate  # noqa: E402
-from app.core.enums import ThreatRuleType  # noqa: E402
-from app.db import models as m  # noqa: E402
-from app.db.dal import NotFoundError, now  # noqa: E402
-
-
 def _validate_rule_fields(rule_type: str, rule_key: str, weight: float | None) -> None:
     """The three ways a rule row can be VALID SQL and still broken in production, all rejected
     at the door. scoping._apply_rules deliberately no-ops (with a log) on an unknown key or
@@ -232,7 +253,7 @@ def _validate_rule_fields(rule_type: str, rule_key: str, weight: float | None) -
     if rule_type not in {str(v) for v in ThreatRuleType}:
         raise AdminValidationError(
             f"rule_type {rule_type!r} is not one of {sorted(str(v) for v in ThreatRuleType)}")
-    from app.pipeline.scoping import _RULE_KEY_FIELDS  # lazy: keep api->pipeline import cold
+    # lazy: keep api->pipeline import cold
     if rule_key not in _RULE_KEY_FIELDS:
         raise AdminValidationError(
             f"rule_key {rule_key!r} is not resolvable by scoping (allowlist: "

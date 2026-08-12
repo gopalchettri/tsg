@@ -67,10 +67,13 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
                 log.warning("http.request_failed", method=request.method, path=request.url.path,
                             duration_ms=round((time.monotonic() - start) * 1000, 1))
                 raise
-            if response.media_type == "text/event-stream":
-                # call_next() returns as soon as headers are available, long before a long-lived
-                # SSE body is closed, so a duration measured here would be a misleading near-zero.
-                # Log that the stream started, not a false "finished" duration.
+            if response.headers.get("content-type", "").startswith("text/event-stream"):
+                # response.media_type is always None here: BaseHTTPMiddleware's call_next() wraps
+                # the real response in a plain StreamingResponse, which never carries the original
+                # media_type through — the content-type HEADER is the only place the value
+                # survives. call_next() returns as soon as headers are available, long before a
+                # long-lived SSE body is closed, so a duration measured here would be a misleading
+                # near-zero. Log that the stream started, not a false "finished" duration.
                 # ponytail: real close-time tracking would need to wrap the ASGI __call__ that
                 # actually sends the stream — EventSourceResponse implements its own __call__
                 # rather than StreamingResponse's body_iterator, so BaseHTTPMiddleware can't hook

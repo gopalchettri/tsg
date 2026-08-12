@@ -213,6 +213,22 @@ def main() -> None:
         prompts._STRIDE_SCENARIO_SHAPES = real_shapes
     print("12 OK drift detection is real — removing a shape drops it from Stage 1 and is flagged")
 
+    # 13 — supporting_system_applicability FIELDS text lives in the SYSTEM message (like
+    #      entry_point_fields), not the user context — lists every in-scope system by name,
+    #      omitted when there are none, and (session-level, not per-threat) already covered by
+    #      check 9's byte-identical-batch assertion above.
+    sys_with_subs = prompts.scenario_prompt(base, "Denial of Service", "Loss of availability of PGS",
+                                            actors=["Sandworm"], intel_items=INTEL,
+                                            entry_points=["SCADA System"])[0]["content"]
+    assert "supporting_system_applicability" in sys_with_subs
+    assert "SCADA System" in sys_with_subs.split("supporting_system_applicability", 1)[1][:200]
+    empty_ctx = prompts.build_base_context("Asset with no subsystems", ASSET_CTX, [])
+    no_sub = prompts.scenario_prompt(empty_ctx, "Denial of Service", "Loss of availability of PGS",
+                                      actors=["Sandworm"])[0]["content"]
+    assert "supporting_system_applicability" not in no_sub, \
+        "field requested with no supporting systems to judge against"
+    print("13 OK supporting_system_applicability lists in-scope systems; omitted when none exist")
+
     print("\nprompt db-key self-check OK")
 
 

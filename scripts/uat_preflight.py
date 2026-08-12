@@ -88,7 +88,9 @@ def main() -> int:
     # loaded and the app is running your DEV settings (including the auth bypass).
     print("\nA. Configuration actually in effect")
     _line("INFO", "app_env", s.app_env)
-    _line("INFO", "auth_dev_mode", str(s.auth_dev_mode))
+    _line("INFO", "verify_membership",
+        str(s.verify_membership) + ("" if s.verify_membership
+                                    else "  <- (user,entity) taken on trust; key still required"))
     _line("INFO", "llm_provider", s.llm_provider)
     _line("INFO", "inference_model", s.inference_model)
     _line("INFO", "embedding_model / provider", f"{s.embedding_model}  ({s.embedding_provider})")
@@ -133,23 +135,24 @@ def main() -> int:
 
     @check("Redis reachable + INTEGER lock TTL accepted")
     def _redis():
-        from app.pipeline.embeddings import _GROUP_LOCK_TTL_SECONDS
+        from app.core.config import get_settings
         from app.pipeline.llm import _slot_redis
-        if not isinstance(_GROUP_LOCK_TTL_SECONDS, int):
-            raise RuntimeError(f"_GROUP_LOCK_TTL_SECONDS is {type(_GROUP_LOCK_TTL_SECONDS).__name__}, "
+        ttl = get_settings().embedding_group_lock_ttl_seconds
+        if not isinstance(ttl, int):
+            raise RuntimeError(f"embedding_group_lock_ttl_seconds is {type(ttl).__name__}, "
                             "must be int or redis-py rejects it and the mutex never engages")
         r = _slot_redis()
         key = f"tsg:preflight:{uuid.uuid4()}"
         try:
-            if not r.set(key, "1", nx=True, ex=_GROUP_LOCK_TTL_SECONDS):
+            if not r.set(key, "1", nx=True, ex=ttl):
                 raise RuntimeError("SET NX EX failed")
-            r.expire(key, _GROUP_LOCK_TTL_SECONDS)  # the call that raised on a float TTL
+            r.expire(key, ttl)  # the call that raised on a float TTL
         finally:
             try:
                 r.delete(key)
             except Exception:  # noqa: BLE001 — probe cleanup only
                 pass
-        return f"SET/EXPIRE accepted ex={_GROUP_LOCK_TTL_SECONDS}s"
+        return f"SET/EXPIRE accepted ex={ttl}s"
 
     @check("MongoDB reachable (vector + threshold store)")
     def _mongo():

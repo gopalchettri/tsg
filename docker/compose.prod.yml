@@ -20,6 +20,11 @@ services:
     ports: ["8000:8000"]
     depends_on:
       redis: { condition: service_healthy }
+    # Compose's 10s default (SIGTERM then SIGKILL) is well under gunicorn's own 30s
+    # --timeout/graceful-timeout, so Docker would SIGKILL the api container mid-drain, before
+    # gunicorn's own grace period (and, inside it, sse_shutdown_grace_seconds's SSE drain window)
+    # ever gets to finish. 40s gives gunicorn's 30s margin to complete before Docker escalates.
+    stop_grace_period: 40s
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/readyz').status==200 else 1)"]
       interval: 15s
@@ -98,6 +103,63 @@ services:
       retries: 3
       start_period: 60s
 
+  # Celery task dashboard. `-A` is app.pipeline.celery_app.celery_app, NOT celery_worker: the
+  # latter monkey-patches gevent at import, which would corrupt Flower's own tornado event loop.
+  # Same target beat and `inspect ping` already use. Tasks only appear here because
+  # celery_app.py sets worker_send_task_events/task_send_sent_event — without those this UI is
+  # live but empty.
+  #
+  # A MONITORING AID, NOT AN AUDIT TRAIL: history lives in flower.db and is capped/evictable.
+  # The authoritative record of what the pipeline did is Scenario_Audit in the database.
+  flower:
+    image: tsg:latest
+    # --basic-auth is REQUIRED: Flower has no auth by default and exposes task revoke/terminate
+    # to anyone who reaches the port. The guard lives HERE, in Flower's own startup, rather than
+    # in the app's assert_security_posture(): that runs in the api/worker processes, which would
+    # both force a Flower password onto deployments that never run this service AND still leave
+    # Flower itself unguarded. Fail where the risk actually is.
+    #
+    # `$$` escapes compose interpolation so the SHELL expands it from the container env
+    # (env_file, below) — this way the guard holds even if someone omits `--env-file` on the
+    # host, which plain `${VAR}` interpolation would silently resolve to an empty string.
+    command:
+      - sh
+      - -c
+      - |
+        test -n "$$TSG_FLOWER_BASIC_AUTH" || {
+          echo "REFUSING TO START: TSG_FLOWER_BASIC_AUTH is empty. Flower exposes task revoke/terminate with no authentication. Set it in .env.uat." >&2
+          exit 1
+        }
+        exec celery -A app.pipeline.celery_app.celery_app flower \
+          --address=0.0.0.0 --port=5555 \
+          --persistent=True --db=/data/flower.db \
+          --basic-auth="$$TSG_FLOWER_BASIC_AUTH" \
+          --logging=error
+    env_file: [../.env.uat]   # UAT and production share one file (.env.prod.example documents it)
+    depends_on:
+      redis: { condition: service_healthy }
+      # Without these, flower only waits on redis and starts the instant it's up -- racing the
+      # worker's own multi-second local-model warm-load (see worker's healthcheck comment above)
+      # and logging a burst of "Inspect method X failed" on every deploy. Waiting for the SAME
+      # healthcheck conditions as the rest of the stack means flower is the LAST thing to come up,
+      # so its first inspect round -- and the dashboard on first load -- has a fully-up stack.
+      worker: { condition: service_healthy }
+      beat: { condition: service_healthy }
+      api: { condition: service_healthy }
+    ports: ["5555:5555"]
+    volumes: ["flower-data:/data"]
+    healthcheck:
+      # A plain TCP connect, deliberately: an HTTP probe would have to treat 401 as healthy
+      # (auth is on and the probe sends no credentials), and encoding that exception handling
+      # inside a YAML scalar is more fragile than it is informative. Port accepting == serving.
+      # NOT `celery inspect ping` — this process is a broker CONSUMER, so that would report the
+      # WORKERS' health, not Flower's.
+      test: ["CMD-SHELL", "python -c \"import socket; socket.create_connection(('127.0.0.1', 5555), 4).close()\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
@@ -110,3 +172,4 @@ services:
 
 volumes:
   redis-data:
+  flower-data:

@@ -1,19 +1,22 @@
 <#
 .SYNOPSIS
-    Start the full local TSG stack (Docker deps + Celery worker + Celery beat + FastAPI).
+    Start the full local TSG stack (Docker deps + Celery worker + Celery beat + FastAPI + Flower).
 
 .DESCRIPTION
     Brings up docker/compose.yml's redis/mongo/litellm (mssql is skipped by default --
     this environment's .env points TSG_DB_DSN at a native SQL Server Express instance,
     not the dockerized one; pass -DockerServices to include it if your setup differs).
-    The Celery worker, Celery beat, and Uvicorn each open in a new PowerShell window so
-    their logs stay separate.
+    The Celery worker, Celery beat, Uvicorn, and Flower each open in a new PowerShell window
+    so their logs stay separate.
 
     The schema is NOT touched at startup. This project is database-first: the tables
     come from scripts/TSG_Core.sql, run by hand against the DB (see scripts/readme.txt).
 
-    Flower is intentionally not started -- it is not a TSG dependency yet (see
-    pyproject.toml / ROADMAP.md "Metrics/OpenTelemetry/Flower" = Pending).
+    Flower (the Celery task dashboard, http://127.0.0.1:5555) starts by default; pass
+    -NoFlower to skip it. It binds to 127.0.0.1 only, so a password is optional locally --
+    set TSG_FLOWER_BASIC_AUTH in .env (or as a session env var) to require one. Tasks appear
+    there only because app/pipeline/celery_app.py enables task events; without that config
+    Flower runs but its task list stays empty.
 
 .PARAMETER ProjectRoot
     Path to the tsg/ folder. Defaults to the directory this script lives in.
@@ -34,11 +37,20 @@
 .PARAMETER SkipDocker
     Skip the docker compose step entirely (e.g. if you manage those services yourself).
 
+.PARAMETER NoFlower
+    Skip the Flower dashboard window. Flower starts by default.
+
+.PARAMETER FlowerPort
+    Port for the Flower dashboard. Default 5555.
+
 .EXAMPLE
     .\start.ps1
 
 .EXAMPLE
     .\start.ps1 -Reload -Concurrency 10
+
+.EXAMPLE
+    .\start.ps1 -NoFlower
 #>
 
 [CmdletBinding()]
@@ -48,6 +60,8 @@ param(
     [int]$Concurrency = 50,
     [switch]$Reload,
     [switch]$SkipDocker,
+    [switch]$NoFlower,
+    [int]$FlowerPort = 5555,
     [string[]]$DockerServices = @('redis', 'mongo', 'litellm')
 )
 
@@ -253,9 +267,6 @@ Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
                   -InnerCommand $beatCmd -WindowTitle 'tsg-beat'
 Write-Host "Celery beat starting in a new window (title: tsg-beat)..." -ForegroundColor Green
 
-# skipped: flower isn't a TSG dependency yet (ROADMAP.md marks it Pending) --
-# add a -Flower switch once it lands (pyproject.toml would need celery[flower] too).
-
 # ---------------------------------------------------------------------------
 # Wait for the worker to register on the broker.
 # ---------------------------------------------------------------------------
@@ -316,6 +327,120 @@ if ($Reload.IsPresent) { $uvicornCmd += ' --reload' }
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
                   -InnerCommand $uvicornCmd -WindowTitle 'tsg-api'
 Write-Host "FastAPI server starting in a new window (title: tsg-api)..." -ForegroundColor Green
+
+# ---------------------------------------------------------------------------
+# Wait for the API to answer /readyz, mirroring the worker wait above.
+# ---------------------------------------------------------------------------
+
+function Test-ApiReady {
+    param([int]$TimeoutSec = 2)
+    try {
+        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/readyz" -TimeoutSec $TimeoutSec -UseBasicParsing
+        return $resp.StatusCode -eq 200
+    } catch {
+        return $false
+    }
+}
+
+# validate_local_models(warm=False) in main.py only checks the model PATH exists (the API never
+# holds the model in RAM), so this is import + DB-connectivity time, not a model load -- 60s is
+# generous, not measured against a real cold-start P99.
+$apiWaitSeconds = 60
+Write-Host "Waiting up to ${apiWaitSeconds}s for the API to answer /readyz..." -ForegroundColor Cyan
+$apiReady = $false
+$apiStarted = Get-Date
+$apiDeadline = $apiStarted.AddSeconds($apiWaitSeconds)
+while ((Get-Date) -lt $apiDeadline) {
+    if (Test-ApiReady) {
+        $apiReady = $true
+        $elapsed = [int]((Get-Date) - $apiStarted).TotalSeconds
+        Write-Host "API is ready (/readyz OK after ${elapsed}s)." -ForegroundColor Green
+        break
+    }
+    Start-Sleep -Milliseconds 500
+}
+if (-not $apiReady) {
+    Write-Warning "API not ready after ${apiWaitSeconds}s -- check the 'tsg-api' window. Continuing to launch Flower anyway."
+}
+
+# ---------------------------------------------------------------------------
+# 6. Flower -- the Celery task dashboard (new window, unless -NoFlower)
+# ---------------------------------------------------------------------------
+# Placement is deliberate: LAST, after both the worker-ready wait and the API-ready wait above.
+# Flower begins broadcasting inspect calls (stats/active/registered/...) about a second after it
+# starts, with a 1s timeout. Launched before the worker finishes _init_worker -- which loads local
+# models, verifies DB invariants and warms grounding thresholds, easily tens of seconds -- every
+# one of those calls times out and logs "Inspect method <x> failed". Harmless (the next poll
+# succeeds) but it reads exactly like a broken dashboard. Starting last, once the rest of the
+# stack has confirmed itself ready, means Flower's first inspect round -- and the dashboard the
+# operator opens right after start.ps1 finishes -- has a fully-up stack to talk to.
+#
+# beat has no readiness signal to wait on here: unlike the worker it does no local-model warm-load
+# or LLM verification, so it's alive within a couple seconds of its window opening with nothing
+# meaningful to poll for (compose.prod.yml's beat healthcheck only checks its schedule file's
+# mtime, which needs real elapsed run time to be informative -- not useful as a one-shot gate).
+#
+# Two more things that matter here:
+#   1. -A targets app.pipeline.celery_app.celery_app, NOT celery_worker: celery_worker
+#      monkey-patches gevent at import, which would corrupt Flower's tornado event loop.
+#      Same target beat and `inspect ping` already use.
+#   2. --address=127.0.0.1 keeps it off the network. Flower has NO auth by default and can
+#      revoke/terminate running tasks, so it must not be reachable beyond this machine unless
+#      TSG_FLOWER_BASIC_AUTH is set (docker/compose.prod.yml enforces that for real deployments).
+if (-not $NoFlower) {
+    # --logging=error: Flower logs a WARNING burst ("Inspect method X failed") every time its
+    # periodic inspect poll finds no worker to answer -- not just at boot (already guarded by the
+    # wait above) but any time the worker window is restarted by hand mid-session, which is
+    # routine during local dev. That's Flower self-healing, not a bug; -error keeps real failures
+    # visible while dropping the routine noise.
+    $flowerArgs = "-A app.pipeline.celery_app.celery_app flower --address=127.0.0.1 --port=$FlowerPort --logging=error"
+
+    # Session env var WINS, so an operator can override per-shell without editing .env; only
+    # fall back to the file when nothing is set. PowerShell does not auto-load .env, so without
+    # this fallback the committed TSG_FLOWER_BASIC_AUTH line would be silently inert locally.
+    $flowerAuth = $env:TSG_FLOWER_BASIC_AUTH
+    if (-not $flowerAuth) { $flowerAuth = $env:FLOWER_BASIC_AUTH }
+    if (-not $flowerAuth) {
+        # Deliberately parses ONE key, not a general dotenv loader: a broad loader here could
+        # shadow the app's own pydantic-settings resolution and make the two disagree.
+        # Honours TSG_ENV_FILE the same way app/core/config.py::_env_file() does.
+        $envName = $env:TSG_ENV_FILE
+        if (-not $envName) { $envName = '.env' }
+        $envPath = if ([System.IO.Path]::IsPathRooted($envName)) { $envName }
+                   else { Join-Path $ProjectRoot $envName }
+        if (Test-Path -LiteralPath $envPath) {
+            foreach ($line in (Get-Content -LiteralPath $envPath -ErrorAction SilentlyContinue)) {
+                $trimmed = $line.Trim()
+                if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { continue }
+                $eq = $trimmed.IndexOf('=')          # FIRST '=' only: a password may contain '='
+                if ($eq -lt 1) { continue }
+                $key = $trimmed.Substring(0, $eq).Trim()
+                if ($key -ne 'TSG_FLOWER_BASIC_AUTH' -and $key -ne 'FLOWER_BASIC_AUTH') { continue }
+                $flowerAuth = $trimmed.Substring($eq + 1).Trim().Trim('"', "'")
+                if ($flowerAuth) { break }           # keep scanning if the line was blank/empty
+            }
+        }
+    }
+
+    if ($flowerAuth) {
+        $flowerArgs += " --basic-auth=$flowerAuth"
+        Write-Host "Flower: basic auth enabled." -ForegroundColor Green
+    } else {
+        Write-Host "Flower: no TSG_FLOWER_BASIC_AUTH set (checked session env and .env) -- starting WITHOUT auth, bound to 127.0.0.1 only." -ForegroundColor DarkYellow
+    }
+
+    # Free the port first, exactly as the uvicorn launch above does. Flower now starts on EVERY
+    # run, so without this a second start.ps1 (or a leftover window from a previous one) makes
+    # tornado die on bind with "WinError 10048: Only one usage of each socket address ... is
+    # normally permitted" -- the dashboard silently never comes up.
+    # Deliberately INSIDE the -NoFlower guard: with -NoFlower we must not kill a Flower the
+    # operator started by hand on this port.
+    Stop-ProcessOnPort -Port $FlowerPort -Label 'flower (pre-existing)'
+
+    Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
+                      -InnerCommand "& '$celeryExe' $flowerArgs" -WindowTitle 'tsg-flower'
+    Write-Host "Flower starting in a new window (title: tsg-flower) -- http://127.0.0.1:$FlowerPort" -ForegroundColor Green
+}
 
 Write-Host ""
 Write-Host "All services launched. Verify with:" -ForegroundColor Cyan

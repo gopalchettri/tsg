@@ -167,8 +167,9 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
             qv_map: dict[str, list[float]] = {}
             try:  # best-effort batch prime, chunked so a big session can't exceed a remote
                 # provider's per-request batch limit — a failure just means per-query embeds below
-                for i in range(0, len(texts), embeddings._MAX_EMBED_BATCH):
-                    chunk = texts[i:i + embeddings._MAX_EMBED_BATCH]
+                batch = get_settings().embedding_batch_size
+                for i in range(0, len(texts), batch):
+                    chunk = texts[i:i + batch]
                     qv_map.update(zip(chunk, llm.embed(chunk, kind="query")))
             except Exception:  # noqa: BLE001
                 log.warning("controls.query_prime_failed", session_id=sid, exc_info=True)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 
+import yaml
 from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import func, select
@@ -26,8 +27,11 @@ from sqlalchemy import func, select
 from app.api.admin_jobs import FAMILY_IMPORT, admin_job_exists, mark_admin_job
 from app.api.deps import Principal, get_principal, require_admin
 from app.api.schemas import (
-    ImportJobStatus, SourceInventoryItem, SourcesInventoryResponse,
-    ThreatLibraryImportAccepted, ThreatLibraryImportBody,
+    ImportJobStatus,
+    SourceInventoryItem,
+    SourcesInventoryResponse,
+    ThreatLibraryImportAccepted,
+    ThreatLibraryImportBody,
 )
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -36,7 +40,12 @@ from app.db.dal import NotFoundError
 from app.db.engine import db_session
 from app.pipeline.celery_app import celery_app, import_threat_library_task
 from app.pipeline.threat_library_import import (
-    SOURCE_TAGS, URLS, ThreatLibraryImportError, check_source_shape, latest_runs_by_source,
+    SOURCE_TAGS,
+    URLS,
+    YAML_SOURCES,
+    ThreatLibraryImportError,
+    check_source_shape,
+    latest_runs_by_source,
 )
 
 router = APIRouter(
@@ -68,10 +77,12 @@ def _validate(source: str, body: ThreatLibraryImportBody) -> None:
         if len(body.file_content.encode("utf-8")) > max_mb * 1024 * 1024:
             raise ThreatLibraryImportError(
                 f"file_content exceeds the {max_mb} MB limit (threat_library_import_max_upload_mb)")
+        is_yaml = source in YAML_SOURCES
         try:
-            data = json.loads(body.file_content)
-        except ValueError as exc:
-            raise ThreatLibraryImportError(f"file_content is not valid JSON: {exc}") from exc
+            data = yaml.safe_load(body.file_content) if is_yaml else json.loads(body.file_content)
+        except (ValueError, yaml.YAMLError) as exc:
+            fmt = "YAML" if is_yaml else "JSON"
+            raise ThreatLibraryImportError(f"file_content is not valid {fmt}: {exc}") from exc
         check_source_shape(source, data)
 
 

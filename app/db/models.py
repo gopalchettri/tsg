@@ -11,16 +11,14 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, MetaData, TypeDecorator, Unicode, UnicodeText
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, MetaData, TypeDecorator, Unicode, UnicodeText
 from sqlalchemy.dialects import mssql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 metadata = MetaData()
 
-
 class Base(DeclarativeBase):
     metadata = metadata
-
 
 class GUID(TypeDecorator):
     impl = Unicode(36)
@@ -77,6 +75,14 @@ class Scenario_Session(Base):
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CompletedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    # Library-promotion retry tracking (accept.py's isolated Phase 2). NULL = never failed, or
+    # already resolved by a successful attempt/retry — this is the ONLY state a fresh session has.
+    PromotionFailedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    PromotionAttempts: Mapped[int] = mapped_column(Integer, default=0)
+    PromotionError: Mapped[str | None] = mapped_column(UnicodeText)
+    # The accepting user at the moment promotion first failed, so a later retry (automatic or
+    # admin-triggered) attributes promoted threats to that SAME person, never to a system identity.
+    PromotionUserID: Mapped[str | None] = mapped_column(Unicode(200))
 
 
 class Subsystem_Stage_State(Base):
@@ -86,8 +92,8 @@ class Subsystem_Stage_State(Base):
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
-    Level: Mapped[str] = mapped_column(Unicode(20))
-    Status: Mapped[str] = mapped_column(Unicode(20))
+    Level: Mapped[str] = mapped_column(Unicode(100))
+    Status: Mapped[str] = mapped_column(Unicode(100))
     GenerationEpoch: Mapped[int] = mapped_column(Integer)
     ActiveTaskID: Mapped[str | None] = mapped_column(GUID)
     LeaseExpiresAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -129,6 +135,29 @@ class Identified_Threat(Base):
     GroundingStatus: Mapped[str] = mapped_column(Unicode(20))
     GroundingScore: Mapped[float | None] = mapped_column(Float)
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class Identified_Duplicate_Threat(Base):
+    """Audit-only trail of AI-proposed threats DROPPED as duplicates during find_threats — never
+    read by scoping/scenario generation/next-set. See scripts/TSG_Core.sql for the full rationale;
+    Identified_Threat itself is untouched by this table's existence."""
+    __tablename__ = "Identified_Duplicate_Threat"
+    DuplicateThreatID: Mapped[str] = mapped_column(GUID, primary_key=True)
+    SessionID: Mapped[str] = mapped_column(GUID)
+    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
+    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
+    UserID: Mapped[str | None] = mapped_column(Unicode(200))
+    SubsystemID: Mapped[int] = mapped_column(Integer)
+    ThreatCategory: Mapped[str] = mapped_column(Unicode(200))
+    ThreatType: Mapped[str] = mapped_column(Unicode(300))
+    ThreatName: Mapped[str | None] = mapped_column(Unicode(500))
+    GenericName: Mapped[str | None] = mapped_column(Unicode(500))
+    ThreatActorsJSON: Mapped[str | None] = mapped_column(UnicodeText)
+    # Identified_Threat.ThreatID it matched, when known — best-effort, see the SQL comment.
+    DuplicateOfThreatID: Mapped[str | None] = mapped_column(GUID)
+    DuplicateReason: Mapped[str] = mapped_column(Unicode(30))  # DuplicateReason enum (app/core/enums.py)
+    SimilarityScore: Mapped[float | None] = mapped_column(Float)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
@@ -258,6 +287,11 @@ class Risk_Treatment_Plan(Base):
     ReviewComment: Mapped[str | None] = mapped_column(UnicodeText)
     ReviewedBy: Mapped[str | None] = mapped_column(Unicode(200))  # from the reviewer's login token
     ReviewedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    # TreatmentOutcomeReason — WHY a terminal row ended that way, so a client never parses
+    # ErrorMessage. NULL on COMPLETE and on rows that failed before the column existed (read those
+    # as generation_failed). Holds 5 of the enum's 6 values: 'timed_out' is projected at read time
+    # by api.treatment._present_status and has no writer.
+    ErrorReason: Mapped[str | None] = mapped_column(Unicode(30))
 
 # ---------------------------------------------------------------------------
 # Threat library masters (seeded; imported, promoted on accept, or curated via
@@ -542,6 +576,38 @@ class user_table(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(Unicode(255))
     email: Mapped[str] = mapped_column(Unicode(255))
+
+# Read-only mirror of the platform's user->scope table (owned by Shield, we never write it).
+# ref_id is polymorphic across scope levels; scope_type decodes via option_value group 1010:
+# 1=Sector 2=Sub-Sector 3=Service 4=Entity 5=Asset. For entity membership we read scope_type=4,
+# where ref_id = group.id = the EntityID TSG uses as its tenant key. See dal.user_has_entity.
+class user_scope_assignment(Base):
+    __tablename__ = "user_scope_assignment"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer)
+    scope_type: Mapped[int] = mapped_column(Integer)
+    ref_id: Mapped[int] = mapped_column(BigInteger)
+    is_active: Mapped[bool] = mapped_column(Boolean)
+
+# TSG-owned. One row per API caller (today: the Shield backend). The secret is never stored;
+# only its SHA-256 hex. Several Active rows may coexist for make-before-break key rotation.
+class API_Client(Base):
+    __tablename__ = "API_Client"
+    ClientID: Mapped[str] = mapped_column(Unicode(100), primary_key=True)
+    KeyHash: Mapped[str] = mapped_column(Unicode(64))          # SHA-256 hex of the 32-byte secret
+    Name: Mapped[str] = mapped_column(Unicode(200))
+    # Which module this key may authenticate ('tsg', 'chatbot', ...). A key is valid ONLY for its
+    # own Module, so one leaked key is contained to a single module. See dal.api_client_id_for_key_hash.
+    Module: Mapped[str] = mapped_column(Unicode(50), default="tsg")
+    Active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Audit trail — who provisioned / changed / revoked this key. NOT read by the auth path
+    # (verify_api_key uses only KeyHash/Module/Active); these exist for provenance in the register.
+    CreatedAt: Mapped[datetime] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    RevokedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    RevokedBy: Mapped[str | None] = mapped_column(Unicode(200))
 
 class onboarding_sectors(Base):
     __tablename__ = "onboarding_sectors"

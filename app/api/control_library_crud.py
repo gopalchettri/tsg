@@ -10,20 +10,32 @@ refuses to boot otherwise.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Path, Request
+from sqlalchemy import delete, insert, select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import Principal, get_principal, require_admin
-from app.api.library_crud import _DELETED, _LIMIT, _OFFSET, _create, _delete, _list, _update
-from sqlalchemy import delete, insert, select
-
-from app.api.library_crud import _audit
+from app.api.library_crud import (
+    _DELETED,
+    _LIMIT,
+    _OFFSET,
+    _audit,
+    _create,
+    _delete,
+    _list,
+    _update,
+)
 from app.api.schemas import (
-    ControlCreate, ControlRow, ControlStandardCreate, ControlStandardRow,
-    ControlStandardsResponse, ControlStandardUpdate, ControlUpdate,
+    ControlCreate,
+    ControlRow,
+    ControlStandardCreate,
+    ControlStandardRow,
+    ControlStandardsResponse,
+    ControlStandardUpdate,
+    ControlUpdate,
 )
 from app.db import dal
 from app.db import models as m
 from app.db.engine import db_session
-from sqlalchemy.exc import IntegrityError
 
 router = APIRouter(
     prefix="/v1/tsg/control-library",

@@ -12,8 +12,8 @@ epoch would destructively re-run the whole hop.
 from __future__ import annotations
 
 import json
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Iterator
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -21,7 +21,12 @@ from sqlalchemy.orm import Session
 from app.core import tuning
 from app.core.config import get_settings
 from app.core.enums import (
-    AuditEventType, NextSetOutcome, RegenGranularity, SSEEventType, StageStatus, SubsystemLevel,
+    AuditEventType,
+    NextSetOutcome,
+    RegenGranularity,
+    SSEEventType,
+    StageStatus,
+    SubsystemLevel,
     WorkflowStage,
 )
 from app.core.logging import get_logger
@@ -45,39 +50,6 @@ LEVELS_BY_GRANULARITY = {
 # The endpoint resets ONLY SCENARIOS for a next-set click; an additive find_threats, when
 # needed, resets THREATS itself (see run_next_set).
 NEXT_SET_LEVELS = (SubsystemLevel.SCENARIOS,)
-
-
-@contextmanager
-def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, kind: str) -> Iterator[bool]:
-    """Acquire the per-subsystem `_LOCK` and commit it durable BEFORE any work: a body exception
-    routes through tasks._record_failure's unconditional rollback, which would otherwise undo an
-    uncommitted acquire and make the release spuriously fail. Always releases + commits on exit,
-    logging (never raising) a release failure so it can't mask the body's own error. A
-    not-acquired body must bail without doing work — the caller checks the yielded flag."""
-    acquired = dal.acquire_lock(sess, sid, subsystem_id, task_id)
-    if acquired:
-        sess.commit()
-    try:
-        yield acquired
-    finally:
-        if acquired:
-            try:
-                if not dal.release_lock(sess, sid, subsystem_id, task_id):
-                    log.warning(f"{kind}.lock_lost", session_id=sid, subsystem=subsystem_id, task_id=task_id)
-                sess.commit()
-            except Exception:
-                log.warning(f"{kind}.lock_release_failed", session_id=sid, subsystem=subsystem_id)
-
-
-def _settle_or_raise(sess: Session, sid: str, subsystem_id: int, epoch: int,
-                    level: SubsystemLevel, kind: str) -> None:
-    """Shared 'write_scenarios returned [] without raising' check: a batch already landed at this
-    epoch (stage AWAITING_DECISION/COMPLETE) is a benign idempotent redelivery — log and fall
-    through; anything else is a genuine lost claim (reaped or superseded) — raise."""
-    if not dal.stage_settled_at_epoch(sess, sid, subsystem_id, level, epoch):
-        raise RuntimeError(f"{kind} claim lost mid-flight (stage reaped or superseded)")
-    log.info(f"{kind}.redelivery_already_landed", session_id=sid, subsystem=subsystem_id, epoch=epoch)
-
 
 # reason code -> (log-facing detail, end-user-facing message). ONE copy so the SSE payload, the
 # audit DetailJSON and every consumer say the same thing.
@@ -121,6 +93,37 @@ _REASON_INFO: dict[str, dict[str, str]] = {
     },
 }
 
+@contextmanager
+def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, kind: str) -> Generator[bool]:
+    """Acquire the per-subsystem `_LOCK` and commit it durable BEFORE any work: a body exception
+    routes through tasks._record_failure's unconditional rollback, which would otherwise undo an
+    uncommitted acquire and make the release spuriously fail. Always releases + commits on exit,
+    logging (never raising) a release failure so it can't mask the body's own error. A
+    not-acquired body must bail without doing work — the caller checks the yielded flag."""
+    acquired = dal.acquire_lock(sess, sid, subsystem_id, task_id)
+    if acquired:
+        sess.commit()
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                if not dal.release_lock(sess, sid, subsystem_id, task_id):
+                    log.warning(f"{kind}.lock_lost", session_id=sid, subsystem=subsystem_id, task_id=task_id)
+                sess.commit()
+            except Exception:  # noqa: BLE001 — logged, not re-raised, so it can't mask the body's own error
+                log.warning(f"{kind}.lock_release_failed", session_id=sid, subsystem=subsystem_id)
+
+
+def _settle_or_raise(sess: Session, sid: str, subsystem_id: int, epoch: int,
+                    level: SubsystemLevel, kind: str) -> None:
+    """Shared 'write_scenarios returned [] without raising' check: a batch already landed at this
+    epoch (stage AWAITING_DECISION/COMPLETE) is a benign idempotent redelivery — log and fall
+    through; anything else is a genuine lost claim (reaped or superseded) — raise."""
+    if not dal.stage_settled_at_epoch(sess, sid, subsystem_id, level, epoch):
+        raise RuntimeError(f"{kind} claim lost mid-flight (stage reaped or superseded)")
+    log.info(f"{kind}.redelivery_already_landed", session_id=sid, subsystem=subsystem_id, epoch=epoch)
+
 
 def _reason_info(reason: str | None) -> dict[str, str | None]:
     """detail + message for an advisory SSE/audit reason code. An unrecognized or absent code
@@ -152,7 +155,6 @@ def _next_set_outcome(requested: int, made: int, variants: int, pool_size: int, 
     if made < pool_size or top_up_failed:  # actionable case wins when both apply
         return NextSetOutcome.partial_retryable
     return NextSetOutcome.exhausted
-
 
 def _settle_next_set_click(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int, *,
                         requested: int, made: int, variants: int, pool_size: int,
@@ -220,7 +222,6 @@ def _publish_regen_result(sid: str, subsystem_id: int, requested_ids: list[str] 
                     "rescored_threat_ids": sorted(rescored_threat_ids or ()),
                     "ts": now().isoformat()})
 
-
 def _regen_replacements(sess: Session, sid: str, subsystem_id: int, epoch: int) -> list[dict]:
     """`[{"old", "new"}]` for the rows this epoch committed. The epoch is unique per hop
     (dal.next_epoch), so the active rows at it are exactly this call's replacements. ONE query
@@ -235,7 +236,6 @@ def _regen_replacements(sess: Session, sid: str, subsystem_id: int, epoch: int) 
             out.SessionID == sid, out.SubsystemID == subsystem_id,
             out.Superseded == 0, out.GenerationEpoch == epoch)
     ).all()]
-
 
 def _publish_regen_result_after_commit(sess: Session, sid: str, subsystem_id: int,
                                     target_ids: list[str] | list[int] | None, epoch: int,
@@ -359,7 +359,6 @@ def _build_regen_audit_detail(threat_ids: set[str] | None, target_ids: list[str]
         "rescored_threat_ids": sorted(rescored_threat_ids) if rescored_threat_ids else [],
         "epoch": epoch, "user_note": redact(user_note)})
 
-
 def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, granularity: RegenGranularity,
                     target_ids: list[str] | list[int] | None, epoch: int, llm: LLMClient, task_id: str,
                     user_note: str | None = None) -> str | None:
@@ -458,7 +457,6 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
 
     return tasks.decide_session_outcome(sess, scenario_session)
 
-
 def _coverage_exclusions(threats: list[dict], cap: int | None = None) -> list[str]:
     """Distinct labels of the threats already proposed for this subsystem, fed to the
     coverage-aware prompt so an additive round asks for genuinely NEW ones. Prefer the grounded
@@ -481,7 +479,6 @@ def _coverage_exclusions(threats: list[dict], cap: int | None = None) -> list[st
     labels = (tasks.threat_label(t) for t in threats)
     # dict.fromkeys, not set(): dedup while PRESERVING the newest-first order the cap slices.
     return list(dict.fromkeys(lbl for lbl in labels if lbl))[:cap]
-
 
 def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
                         subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
@@ -539,7 +536,6 @@ def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: i
             shortfall=shortfall, transient=transient, exc_info=True)
         return 0, True
 
-
 def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
                             exc: RegenerateConflict, subsystems: list[dict], asset_context: dict,
                             llm: LLMClient, task_id: str, next_set_size: int,
@@ -596,7 +592,16 @@ def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_i
                         top_up_failed=top_up_failed or retryable)
     return "generated" if created else "no_new_threats_this_round"
 
-
+# logic to get next set of threats and scenarios
+# Think of it like this:
+# Threat = a one-line idea of something bad that could happen (e.g. "power outage").
+# Scenario = the full write-up of how that could actually happen (a paragraph explaining the story, plus which controls would help).
+# When you first create a session, the system finds a batch of threats and writes one scenario for each. In your earlier example: 9 threats found, 9 scenarios written.
+# "Generate next set" = a button that says "give me 5 more scenarios." (5 is the default — configurable, but nobody's changed it here.)
+# To make 5 (configurable) new scenarios, it needs 5 threats to write them about. It gets those threats in one of two ways:
+# Reuse leftovers first — if any of the threats it already found don't have a scenario yet, it uses those. Free, no extra AI call needed.
+# Ask for more if it runs short — if there aren't 5 leftover threats sitting around, 
+# it asks the AI to come up with new threats (different from the ones already found) to make up the difference, then writes scenarios for those too.
 def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
                 threats_epoch: int, llm: LLMClient, task_id: str) -> str | None:
     """"Generate next set": add up to `next_set_size` MORE unique scenarios that ACCUMULATE onto
@@ -623,7 +628,10 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
         # Bound BEFORE the try: the generic handler below settles the click with
         # requested=next_set_size, and the failure it handles can fire before the session's
         # tuning snapshot resolves. The config default is only the fallback for that window.
+        
+        # get the Number of Threats required count from the config.py or env 
         next_set_size = get_settings().next_set_size
+        
         # True iff the additive find_threats call below raised rather than legitimately finding
         # nothing. Threaded into both outcomes it can reach (the generated branch's top-up, and
         # _settle_next_set_conflict's retryable check) so that failure can never collapse into a
@@ -632,29 +640,34 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
         try:
             tn = tuning.from_session(scenario_session)  # the session's frozen rulebook
             next_set_size = tn.next_set_size
+
+            # Reuse leftovers first — if any of the threats it already found don't have a scenario yet, it uses those. Free, no extra AI call needed.
             fresh = dal.next_unserved_unique_threats(sess, sid, subsystem_id, next_set_size)
+
+            # If the pool of unserved threats is too small, and the THREATS stage is not already COMPLETE at this epoch, 
+            # then it will ask the AI to come up with new threats (different from the ones already found) to make up the difference, then writes scenarios for those too.
             if len(fresh) < next_set_size and not dal.stage_completed_at_epoch_or_newer(
                     sess, sid, subsystem_id, SubsystemLevel.THREATS, threats_epoch):
-                # Pool can't fill the batch and this reserved THREATS epoch hasn't COMPLETED — ask
-                # the model for more, ONCE. supersede=False keeps every prior threat active (the
-                # accumulation invariant). The stage_completed_at_epoch_or_newer guard skips this
-                # branch on a redelivery whose THREATS actually COMPLETED at this epoch or has
-                # advanced past it, but deliberately does NOT skip a row left RUNNING by a prior
-                # failed attempt — the retry must re-enter so find_threats resumes it and drives it
-                # terminal, or THREATS stays RUNNING and decide_session_outcome wedges the session.
-                # The endpoint reserved the epoch but did NOT reset THREATS (an IDLE row would
-                # wedge decide_session_outcome), so the reset lives here, guarded.
-                # Read ONCE, used twice: the labels steer the prompt, and the rows themselves
-                # carry each threat's category so the semantic near-duplicate scan can gate on
-                # impact class rather than on similarity alone.
+                
+                # Get active threats for this session/subsystem from database 
                 prior_threats = dal.active_threats(sess, sid, subsystem_id)
+
+                # get list of threats to exclude from the AI call 
                 exclude = _coverage_exclusions(prior_threats, cap=tn.coverage_exclusions_max)
+
                 dal.reset_stage_for_regen(sess, sid, subsystem_id, (SubsystemLevel.THREATS,), threats_epoch)
                 new_threats: list[dict] = []
                 try:
+                    # get the new threats from the AI call, passing in the list of threats to exclude.
+                    # max_threats=the shortfall, NOT tn.max_threats_per_asset: this call exists to
+                    # fill next_set_size, not to re-run a full asset-level proposal round. Without
+                    # this override find_threats() over-fetches up to the full per-asset cap every
+                    # time it tops up, banking unused threats for a later click instead of asking
+                    # for exactly what THIS click needs.
                     new_threats, _prov = tasks.find_threats(sess, scenario_session, subsystems, asset_context, llm, task_id,
                                                         epoch=threats_epoch, supersede=False, exclude=exclude,
-                                                        prior_threats=prior_threats)
+                                                        prior_threats=prior_threats,
+                                                        max_threats=next_set_size - len(fresh))
                 except LLMSlotUnavailable:
                     raise  # retryable capacity squeeze — leave THREATS reclaimable so the retry re-runs it
                 except Exception as exc:  # noqa: BLE001 — a transient additive-threats failure must not wedge/cancel
@@ -690,7 +703,8 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
                                 EventType=AuditEventType.generation_complete,
                                 DetailJSON=json.dumps({"next_set": True, "subsystem_id": subsystem_id,
                                                     "new_scenarios": len(provs)}))
-
+                
+            # write scenario for the threats in the pool, and if the pool is too small, write scenario for the new threats generated by the AI call
             scen_provs = tasks.write_scenarios(sess, scenario_session, subsystems, asset_context, threats, llm, task_id,
                                             epoch=epoch, target_threat_ids=set(fresh), require_lock=True,
                                             on_before_commit=_stage_next_set_audit)
