@@ -174,10 +174,20 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
         return {}
     labels = [lbl for _tid, lbl, _c in entries]
     prior = [lbl for _tid, lbl, _c in prior_entries]
-    # this batch wins on a label clash
-    cat_of = {lbl: c for _tid, lbl, c in prior_entries + entries}
-    # same clash rule for the label -> threat_id used to populate DuplicateOfThreatID
-    tid_of = {lbl: tid for tid, lbl, _c in prior_entries + entries if tid}
+    # BOTH label-clash maps resolve to the FIRST holder — the SURVIVOR. On a label clash the
+    # survivor is the prior-round threat, or the first of two identical-label proposals; the
+    # later holder is the one that gets dropped as its duplicate. Last-writer-wins here had two
+    # audit corruptions: an identical-label duplicate's DuplicateOfThreatID pointed at ITSELF
+    # (a threat never inserted), and a byte-identical cross-category relabel read as
+    # same_category — the comparison must see the SURVIVING threat's own category and id, not
+    # whichever entry happened to write the label last.
+    cat_of: dict[str, str] = {}
+    tid_of: dict[str, str] = {}
+    for tid, lbl, c in prior_entries + entries:
+        if lbl not in cat_of:
+            cat_of[lbl] = c
+        if tid and lbl not in tid_of:
+            tid_of[lbl] = tid
     if threshold is None:  # use the caller's session-tuned value if given, otherwise fall back to config
         threshold = get_settings().semantic_near_duplicate_threshold
     # Threats with DIFFERENT categories are still compared, just against a stricter cutoff

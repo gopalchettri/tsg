@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.api.schemas import TreatmentPlanStatus  # noqa: E402
-from app.api.treatment import _normalize_plan_shape  # noqa: E402
+from app.api.treatment import _VISIBLE_PLAN_KEYS, _normalize_plan_shape  # noqa: E402
 from app.api.treatment_plan_excel import (  # noqa: E402
     _COLUMNS,
     _sanitize,
@@ -143,18 +143,24 @@ def main() -> None:
     norm = _normalize_plan_shape(legacy_plan)
     assert norm["controls_to_be_implemented"]["control_coverage"] == "gaps"
     assert norm["controls_to_be_implemented"]["controls"][0]["control_code"] == "CII-CID-070"
+    # Current shape: content unchanged — equality, not identity (identity is vacuously true
+    # for an in-place normalizer and would keep passing even if it double-wrapped).
     new_shape = {"controls_to_be_implemented": {"control_coverage": "covered", "controls": []}}
-    assert _normalize_plan_shape(new_shape) is new_shape          # current shape: pass-through
+    assert _normalize_plan_shape(dict(new_shape)) == new_shape
     assert _normalize_plan_shape(None) is None
-    legacy_status = TreatmentPlanStatus(
-        plan_id="plan-3", session_id=SESSION_ID, output_id="out-3", status="COMPLETE",
-        treatment_strategy="Mitigate", scenario=None, risk_level="High", review_status=None,
-        risk_identification_date=None, plan=norm, error_message=None, reason=None)
-    wb_legacy = build_treatment_plans_workbook(SESSION_ID, [legacy_status])
-    legacy_cell = wb_legacy["Treatment Plans"].cell(
-        row=2, column=_COLUMNS.index("controls_to_be_implemented") + 1).value
-    assert "CII-CID-070" in legacy_cell, legacy_cell
-    print("9 OK  legacy array-shaped plan normalizes to the nested shape and renders")
+    # Junk shapes coerce instead of crashing the export: non-list junk -> empty controls;
+    # non-dict rows inside a legacy list are dropped, dict rows kept.
+    assert _normalize_plan_shape({"controls_to_be_implemented": "junk"}
+                                 )["controls_to_be_implemented"]["controls"] == []
+    mixed = _normalize_plan_shape({"controls_to_be_implemented": [{"control_name": "A"}, "junk"]})
+    assert mixed["controls_to_be_implemented"]["controls"] == [{"control_name": "A"}]
+    # Endpoint ORDER pin: get_treatment_plan normalizes BEFORE the _VISIBLE_PLAN_KEYS trim.
+    # The trim drops the legacy top-level verdict, so trimming first would lose it forever —
+    # this replays the endpoint's two steps in order and proves the verdict survives nested.
+    projected = {k: norm[k] for k in _VISIBLE_PLAN_KEYS if k in norm}
+    assert "control_coverage" not in projected
+    assert projected["controls_to_be_implemented"]["control_coverage"] == "gaps"
+    print("9 OK  legacy/junk plan shapes normalize; endpoint trim-order contract holds")
 
     print("\nbuild_treatment_plans_workbook self-check OK")
 

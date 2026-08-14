@@ -252,14 +252,20 @@ def _normalize_plan_shape(plan: dict | None) -> dict | None:
     array with control_coverage as a top-level sibling; the current contract nests both as
     {control_coverage, controls[]}. Lifting old rows here — the ONE place PlanJSON is served
     (the board and register never select the column; the Excel export consumes this GET) —
-    means every consumer sees one shape regardless of when the plan was generated."""
+    means every consumer sees one shape regardless of when the plan was generated.
+
+    ANY non-dict value is coerced (list rows kept, junk dropped), so a corrupt or hand-edited
+    blob can never 500 the poll or the workbook — same defensive posture as _safe_json_dict.
+    Rows from the short-lived pre-v0.5 shape (AI table under `recommended_controls`) coerce to
+    an empty controls list rather than being recovered; the evidence endpoint still serves
+    their raw snapshot if that history is ever needed."""
     if plan is None:
         return None
     cti = plan.get("controls_to_be_implemented")
-    if isinstance(cti, list):
+    if not isinstance(cti, dict):
         plan["controls_to_be_implemented"] = {
             "control_coverage": plan.get("control_coverage"),
-            "controls": cti,
+            "controls": [c for c in cti if isinstance(c, dict)] if isinstance(cti, list) else [],
         }
     return plan
 

@@ -617,6 +617,11 @@ LEFT JOIN Threat_Scenario_Output o ON o.OutputID = p.OutputID
 WHERE  p.SessionID = '{S}' AND p.OutputID = '{O}' AND p.Superseded = 0;
 ```
 
+> **Legacy rows:** plans stored before the v0.12 nesting keep `control_coverage` at the TOP
+> level — the nested path above returns NULL for them (query `$.control_coverage` instead).
+> That NULL is not a bug: the API lifts the old shape at read time, so the GET shows the
+> nested value either way. Stored rows are never rewritten.
+
 Note the title here comes from SQL's JSON parser; the API parses the blob in Python and degrades a
 corrupt blob to `null` rather than erroring. They agree on well-formed JSON.
 
@@ -1091,6 +1096,10 @@ SELECT JSON_VALUE(PlanJSON, '$.controls_to_be_implemented.control_coverage') AS 
        JSON_QUERY(PlanJSON, '$.remediation_action_plan')             AS Actions
 FROM   Risk_Treatment_Plan WHERE PlanID = '{P5}';
 ```
+
+> `{P5}` is freshly generated, so the nested paths apply. For plans stored BEFORE the v0.12
+> nesting, these paths return NULL (the old shape keeps `control_coverage` top-level and the
+> controls table as a bare array) — the API lifts those at read time, SQL does not.
 
 Expect `covered` with an empty or near-empty control list, and a `remediation_action_plan` pivoted to
 verification actions (test effectiveness, evidence, monitor for drift) — never an empty action table.

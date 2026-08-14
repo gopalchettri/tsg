@@ -233,3 +233,18 @@ inherited by every later one). They are additive JSON keys inside the existing n
 column -- no DDL, and rows written before this simply lack them, which every reader treats as
 "no coverage signal". IX_ScenarioOutput_SessionSubActive is what serves the single
 dal.active_scenario_rows read that folds those out.
+
+2026-08-14: Scenario_Session.StageStatus and Subsystem_Stage_State.Status widened
+nvarchar(20) -> nvarchar(100) IN PLACE by new schema-qualified, width-guarded ALTER blocks in
+TSG_Core.sql (each in its own GO batch). Root cause of the review-barrier freeze: the enum
+value grew to 'SCENARIOS_AWAITING_DECISION' (27 chars) AFTER databases were provisioned, so
+re-running TSG_Core.sql IS the migration for existing DBs. SessionStatus / CurrentStage /
+Level are deliberately NOT altered: their longest values are original vocabulary (a database
+too narrow for them could never have completed a session), and SessionStatus sits in three
+filtered-index predicates where an in-place ALTER COLUMN raises Msg 5074.
+  Same date, no DDL: Risk_Treatment_Plan.PlanJSON rows written before the v0.12 nesting store
+controls_to_be_implemented as a bare array with control_coverage top-level.
+api.treatment._normalize_plan_shape lifts them to the nested {control_coverage, controls[]}
+shape at read time (stored rows never rewritten), so SQL JSON_VALUE queries against
+'$.controls_to_be_implemented.control_coverage' return NULL for those rows — use
+'$.control_coverage' when inspecting them directly.

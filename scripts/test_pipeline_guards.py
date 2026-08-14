@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import get_settings  # noqa: E402
+from app.core.enums import DuplicateReason  # noqa: E402
 from app.pipeline import scoping  # noqa: E402
 from app.pipeline.cascade import (NextSetOutcome, _build_regen_audit_detail,  # noqa: E402
                                 _next_set_outcome)
@@ -86,6 +87,7 @@ def check_semantic_duplicates_same_category() -> None:
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
     assert set(dupes) == {"t2"}, dupes  # first wins, later duplicate dropped
     assert dupes["t2"]["duplicate_of_threat_id"] == "t1", dupes  # linked to its survivor
+    assert dupes["t2"]["reason"] == DuplicateReason.semantic_same_category, dupes
     print("ok  _semantic_duplicates drops a same-meaning threat")
 
 
@@ -97,6 +99,10 @@ def check_semantic_duplicates_identical_labels() -> None:
     threats = [_threat("t1", "alpha disclosure"), _threat("t2", "alpha disclosure")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
     assert set(dupes) == {"t2"}, dupes
+    # The audit pointer must name the SURVIVOR — a label-keyed last-writer-wins map used to
+    # send an identical-label duplicate's DuplicateOfThreatID at itself (t2), a self-reference
+    # to a threat that was never inserted.
+    assert dupes["t2"]["duplicate_of_threat_id"] == "t1", dupes
     print("ok  _semantic_duplicates catches byte-identical labels")
 
 
@@ -116,6 +122,7 @@ def check_semantic_duplicates_category_gate() -> None:
                _threat("t2", "alpha disclosure", category="Tampering")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
     assert set(dupes) == {"t2"}, dupes
+    assert dupes["t2"]["reason"] == DuplicateReason.semantic_cross_category, dupes
     print("ok  _semantic_duplicates cross-category ceiling: trap survives, relabel caught")
 
 
@@ -291,6 +298,12 @@ def check_present_status_cutoff_is_caller_controlled() -> None:
     # COMPLETE/ERROR rows are never subject to staleness at all, regardless of clock.
     status3, _err3, _reason3 = _present_status(str(StageStatus.COMPLETE), None, fresh_updated_at, old_cutoff)
     assert status3 == str(StageStatus.COMPLETE), status3
+
+    # Stored-ERROR branch: a NULL ErrorReason (rows that failed before the column existed)
+    # reads as the historical catch-all, never as None — clients switch on `reason`.
+    status4, _msg4, reason4 = _present_status(str(StageStatus.ERROR), "boom", fresh_updated_at,
+                                              old_cutoff, None)
+    assert status4 == str(StageStatus.ERROR) and reason4 == "generation_failed", (status4, reason4)
     print("ok  _present_status: staleness decided by the caller's cutoff, not an internal clock")
 
 

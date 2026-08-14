@@ -4,6 +4,11 @@ accepted scenario that has a generated treatment plan.
 Pure transform: no DB, no FastAPI. Takes the SAME TreatmentPlanStatus objects
 get_treatment_plan() already returns (same trim, same staleness projection), so the Excel and
 JSON views can never disagree — only presentation differs here.
+
+That sourcing is load-bearing: get_treatment_plan's _normalize_plan_shape lifts legacy
+(pre-v0.12) PlanJSON rows into the nested controls_to_be_implemented shape this module's
+_row() unwraps. Feed it TreatmentPlanStatus objects from that GET — never hand-parsed
+PlanJSON, which may still be the old flat-array shape.
 """
 from __future__ import annotations
 

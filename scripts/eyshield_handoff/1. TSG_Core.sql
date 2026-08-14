@@ -13,7 +13,8 @@
 -- Keep in lockstep with models.py: a new column needs a CREATE TABLE entry
 -- (fresh DB) AND a guarded ALTER below it (existing DB).
 --
--- SSMS: run with `sqlcmd -S <server> -d <database> -E -i TSG_Core.sql`, not F5.
+-- SSMS: run with `sqlcmd -b -S <server> -d <database> -E -i TSG_Core.sql`, not F5.
+-- (-b: exit non-zero on any SQL error instead of burying it mid-output and reporting success.)
 -- ============================================================================
 
 SET QUOTED_IDENTIFIER ON;
@@ -87,27 +88,30 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Session', 'PromotionUserID') IS NULL
     ALTER TABLE Scenario_Session ADD PromotionUserID nvarchar(200) NULL;
 
--- Widen the enum-backed status columns on PRE-EXISTING databases (fresh installs already get
--- nvarchar(100) from the CREATE above). nvarchar(20) could not hold
--- 'SCENARIOS_AWAITING_DECISION' (27 chars) — the documented review-barrier freeze;
--- TSG_Verify.sql section 4 FAILs on any enum column narrower than its longest value.
--- Width-guarded so re-runs no-op; -1 (nvarchar(max)) excluded; NOT NULL restated because
--- ALTER COLUMN otherwise resets nullability. Length-only widening is legal in place: none of
--- these columns is in a PK, and CK_Session_Status tolerates variable-length widening.
-IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-           WHERE TABLE_NAME = 'Scenario_Session' AND COLUMN_NAME = 'SessionStatus'
-             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
-    ALTER TABLE Scenario_Session ALTER COLUMN SessionStatus nvarchar(100) NOT NULL;
+GO
 
+-- Widen StageStatus on PRE-EXISTING databases (fresh installs already get nvarchar(100) from
+-- the CREATE above). Only a value that GREW after databases were provisioned can be stuck
+-- narrow in a WORKING database — exactly this column: the rename to
+-- 'SCENARIOS_AWAITING_DECISION' (27 chars) overflowed the original nvarchar(20), the
+-- documented review-barrier freeze; TSG_Verify.sql section 4 FAILs on it. SessionStatus and
+-- CurrentStage are deliberately NOT altered: their longest values ('completed' 9,
+-- 'THREAT_IDENTIFICATION' 21) are original vocabulary — a database too narrow for them could
+-- never have finished a single session — and SessionStatus is referenced by three FILTERED
+-- index predicates (UX_Session_ActiveAsset / IX_Session_Active / IX_Session_CompletedByAsset),
+-- where an in-place ALTER COLUMN raises Msg 5074. Guard is schema-qualified (a same-named
+-- table in another schema must not trigger — or worse, narrow — the dbo column) and skips
+-- nvarchar(max) (-1). NOT NULL restated because ALTER COLUMN resets nullability. Widening
+-- nvarchar is metadata-only but takes a brief SCH-M lock on a hot table (RCSI does not exempt
+-- readers from SCH-S) — prefer a quiet window. Own GO batch: a failure here must not silently
+-- skip the rest of the migration, and vice versa.
 IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-           WHERE TABLE_NAME = 'Scenario_Session' AND COLUMN_NAME = 'CurrentStage'
+           WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Scenario_Session'
+             AND COLUMN_NAME = 'StageStatus'
              AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
-    ALTER TABLE Scenario_Session ALTER COLUMN CurrentStage nvarchar(100) NOT NULL;
+    ALTER TABLE dbo.Scenario_Session ALTER COLUMN StageStatus nvarchar(100) NOT NULL;
 
-IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-           WHERE TABLE_NAME = 'Scenario_Session' AND COLUMN_NAME = 'StageStatus'
-             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
-    ALTER TABLE Scenario_Session ALTER COLUMN StageStatus nvarchar(100) NOT NULL;
+GO
 
 IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NULL
 CREATE TABLE Subsystem_Stage_State (
@@ -133,18 +137,20 @@ IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Subsystem_Stage_State', 'CreatedAt') IS NULL
     ALTER TABLE Subsystem_Stage_State ADD CreatedAt datetime2 NULL CONSTRAINT DF_StageState_CreatedAt DEFAULT SYSUTCDATETIME();
 
--- Same pre-existing-database widening as Scenario_Session above: Status receives the same
--- StageStatus enum values (incl. the 27-char 'SCENARIOS_AWAITING_DECISION'); Level widened in
--- lockstep with the CREATE so models.py and the physical schema agree.
-IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-           WHERE TABLE_NAME = 'Subsystem_Stage_State' AND COLUMN_NAME = 'Level'
-             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
-    ALTER TABLE Subsystem_Stage_State ALTER COLUMN Level nvarchar(100) NOT NULL;
+GO
 
+-- Same pre-existing-database widening for Status, which receives the same StageStatus enum
+-- values (incl. the 27-char 'SCENARIOS_AWAITING_DECISION'). Level is deliberately NOT
+-- altered: its longest value ('SCENARIOS', 9) is original vocabulary — nothing to fix — and
+-- it is a key of UX_SubsystemStageState_SessionSubLevel, so there is no reason to touch it in
+-- place. Same guard posture as the Scenario_Session block above.
 IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-           WHERE TABLE_NAME = 'Subsystem_Stage_State' AND COLUMN_NAME = 'Status'
+           WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Subsystem_Stage_State'
+             AND COLUMN_NAME = 'Status'
              AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
-    ALTER TABLE Subsystem_Stage_State ALTER COLUMN Status nvarchar(100) NOT NULL;
+    ALTER TABLE dbo.Subsystem_Stage_State ALTER COLUMN Status nvarchar(100) NOT NULL;
+
+GO
 
 IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NULL
 CREATE TABLE Identified_Threat (
