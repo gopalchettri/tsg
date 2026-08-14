@@ -42,6 +42,17 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
 
+    # Reserve only what each slot can RUN, not 4x it. The default multiplier (4) times the
+    # `-c 50` every launch path uses (compose.prod.yml serves UAT+prod; start.ps1/run.ps1
+    # default to 50 locally) had ONE worker pocketing ~200 minutes-long messages: a
+    # scaled-out second worker sat idle behind the hoard, and anything still reserved past
+    # visibility_timeout (below) was redelivered to another worker — harmless for the
+    # CAS-fenced pipeline stages, real double-work for the two unfenced tasks
+    # (import_threat_library, intel_refresh_feed). =1 with task_acks_late is Celery's own
+    # documented posture for long-running tasks. Set HERE, like the events below — one
+    # source of truth so dev, UAT and prod can never diverge on it.
+    worker_prefetch_multiplier=1,
+
     # Task-lifecycle events. WITHOUT these a worker emits nothing, so Flower (or any other event
     # consumer) shows live workers and an EMPTY task list — the dashboard looks broken when it is
     # actually the producer that is silent. Set HERE, not as `-E` on each launch, so every path
