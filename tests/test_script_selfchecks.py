@@ -9,7 +9,6 @@ assertions and nothing noticed until a review ran the file by hand. This file ma
 self-check now fails CI/local runs instead of rotting.
 
 Only scripts that need no DB / LLM / network belong in the list.
-test_promotion_retry_flow.py is excluded until its hardcoded sys.path is made portable;
 test_db_connectivity.py and test_otx_feed.py need live services by design.
 """
 from __future__ import annotations
@@ -25,6 +24,7 @@ _SCRIPTS = [
     "test_build_treatment_plans_workbook.py",
     "test_next_set_overfetch.py",
     "test_pipeline_guards.py",
+    "test_promotion_retry_flow.py",
     "test_prompt_no_db_keys.py",
     "test_scenario_flatten.py",
 ]

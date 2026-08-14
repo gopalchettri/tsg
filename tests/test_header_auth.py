@@ -271,17 +271,20 @@ def test_admin_principal_needs_no_entity_header(db):
         p.require_entity("86")
 
 
-def test_admin_principal_still_requires_key_user_and_tenant(db):
-    """Dropping the entity must not drop anything else: the API key still authenticates, and
-    X-User-Id still gates (it is what lands in CreatedBy/UpdatedBy)."""
+def test_admin_principal_requires_key_and_user_but_not_tenant(db):
+    """Dropping the entity must not drop the REAL gates: the API key still authenticates and
+    X-User-Id still gates (it lands in CreatedBy/UpdatedBy). X-Tenant-Id is OPTIONAL here —
+    no admin route reads principal.tenant_id (shared cross-tenant master data, the same
+    rationale that dropped the entity header); absent it, the principal carries a blank."""
     for kwargs in (
         {"x_api_key": "", "x_user_id": "1138", "x_tenant_id": "DESC"},             # no key
         {"x_api_key": "not-the-key", "x_user_id": "1138", "x_tenant_id": "DESC"},  # wrong key
         {"x_api_key": SECRET, "x_user_id": "", "x_tenant_id": "DESC"},             # no audit identity
-        {"x_api_key": SECRET, "x_user_id": "1138", "x_tenant_id": ""},             # no tenant
     ):
         with pytest.raises(AuthError):
             deps.get_admin_principal(**kwargs)
+    p = deps.get_admin_principal(x_api_key=SECRET, x_user_id="1138", x_tenant_id="")
+    assert p.user_id == "1138" and p.tenant_id == ""
 
 
 def test_entity_header_requirement_is_admin_only():

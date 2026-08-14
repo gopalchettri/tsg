@@ -5,7 +5,7 @@
 -- Threat-library master tables live in Threat_library.sql; Threat_Scenario_
 -- Control_Map lives in Control_library.sql. Platform tables (ctm_scan_*,
 -- onboarding_*) already exist elsewhere — TSG only reads them, never creates
--- or alters them.
+-- or alters them (SDD §7.7). No FOREIGN KEYs, by design (SDD §7.7).
 --
 -- Uses GO batches: SQL Server must see a table created before a later batch
 -- can reference it.
@@ -587,6 +587,8 @@ CREATE TABLE Config_Tuning (
     IsActive        bit            NOT NULL CONSTRAINT DF_Config_Tuning_IsActive DEFAULT 1,
     IsDeleted       bit            NOT NULL CONSTRAINT DF_Config_Tuning_IsDeleted DEFAULT 0
 );
+
+GO
 
 -- ============================================================
 -- API_Client — API-key authentication for the header auth model (app/api/deps.get_principal).

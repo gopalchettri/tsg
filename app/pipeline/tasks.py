@@ -1436,16 +1436,25 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
     return created
 
 
-def _failure_client_message(exc: Exception) -> str:
+def _classify_llm_failure(exc: Exception) -> tuple[str, str]:
+    """One shared classification of a terminal LLM/stage failure: a stable token a caller can
+    switch on ('guardrail' | 'parse' | 'generic') plus the client-safe message. The TOKEN is
+    the contract — treatment._classify_failure maps it to a TreatmentOutcomeReason — so no
+    caller anywhere matches the English text (a rewording must never silently change a wire
+    reason)."""
     if isinstance(exc, validation.LLMResponseParseError):
-        return repr(exc)
+        return "parse", repr(exc)
     try:
         from litellm.exceptions import RejectedRequestError
     except ImportError:
-        return "stage processing failed"
+        return "generic", "stage processing failed"
     if isinstance(exc, RejectedRequestError):
-        return "content blocked by a configured safety guardrail"
-    return "stage processing failed"
+        return "guardrail", "content blocked by a configured safety guardrail"
+    return "generic", "stage processing failed"
+
+
+def _failure_client_message(exc: Exception) -> str:
+    return _classify_llm_failure(exc)[1]
 
 
 def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, exc: Exception, epoch: int = _EPOCH) -> None:

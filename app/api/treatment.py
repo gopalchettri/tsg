@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Response
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import Principal, get_principal
@@ -197,40 +198,47 @@ def get_treatment_plan(session_id: str, output_id: str,
         row = dal.active_plan_row(sess, session_id, output_id)
         if row is None:
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
+        return _plan_status_from_row(row, treatment._stale_cutoff())
 
-        status, error_message, reason = _present_status(
-            row["Status"], row["ErrorMessage"], row["UpdatedAt"], treatment._stale_cutoff(),
-            row["ErrorReason"])
 
-        plan = _normalize_plan_shape(_safe_json_dict(row["PlanJSON"], row["PlanID"]))
-        if plan is not None:
-            plan = {k: plan[k] for k in _VISIBLE_PLAN_KEYS if k in plan}
-        scenario_json = _safe_json_dict(row["ScenarioJSON"], row["PlanID"])
-        scenario = ({k: scenario_json.get(k) for k in
-                     ("scenario_title", "scenario_statement", "risk_statement")}
-                    if scenario_json else None)
-        if scenario is not None:
-            # The threat's identity comes from the joined Identified_Threat row, not the LLM's
-            # scenario JSON — same source split as sessions._build_scenario.
-            scenario["threat_category"] = row["ThreatCategory"]
-            scenario["threat_type"] = row["ThreatType"]
-            scenario["threat_name"] = row["ThreatName"]
-            scenario["threat_actors"] = stored_actors(row["ThreatActorsJSON"])
-        validation = _safe_json_dict(row["ValidationJSON"], row["PlanID"]) or {}
-        moderation = validation.get("moderation") or {}
-        return TreatmentPlanStatus(
-            plan_id=row["PlanID"], session_id=row["SessionID"], output_id=row["OutputID"],
-            status=status, treatment_strategy=row["TreatmentStrategy"],
-            scenario=scenario,
-            risk_level=row["RiskLevel"], review_status=row["ReviewStatus"],
-            review_comment=row["ReviewComment"], reviewed_by=row["ReviewedBy"],
-            reviewed_at=row["ReviewedAt"],
-            risk_identification_date=row["RiskIdentificationDate"],
-            plan=plan,
-            warnings=[w for w in validation.get("warnings") or [] if isinstance(w, str)],
-            moderation_flagged=bool(moderation.get("flagged")),
-            error_message=error_message, reason=reason,
-            created_at=row["CreatedAt"], completed_at=row["CompletedAt"])
+def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime) -> TreatmentPlanStatus:
+    """One active plan row -> the wire model. Shared by the single-plan GET and the Excel
+    export, so the two can never disagree — the guarantee the export used to buy by re-entering
+    the GET per scenario, now held by construction instead of by N extra authorization+fetch
+    round trips. `stale_cutoff` is the CALLER's single instant (_present_status's contract):
+    the Excel route passes one cutoff for every row of its response."""
+    status, error_message, reason = _present_status(
+        row["Status"], row["ErrorMessage"], row["UpdatedAt"], stale_cutoff, row["ErrorReason"])
+
+    plan = _normalize_plan_shape(_safe_json_dict(row["PlanJSON"], row["PlanID"]))
+    if plan is not None:
+        plan = {k: plan[k] for k in _VISIBLE_PLAN_KEYS if k in plan}
+    scenario_json = _safe_json_dict(row["ScenarioJSON"], row["PlanID"])
+    scenario = ({k: scenario_json.get(k) for k in
+                 ("scenario_title", "scenario_statement", "risk_statement")}
+                if scenario_json else None)
+    if scenario is not None:
+        # The threat's identity comes from the joined Identified_Threat row, not the LLM's
+        # scenario JSON — same source split as sessions._build_scenario.
+        scenario["threat_category"] = row["ThreatCategory"]
+        scenario["threat_type"] = row["ThreatType"]
+        scenario["threat_name"] = row["ThreatName"]
+        scenario["threat_actors"] = stored_actors(row["ThreatActorsJSON"])
+    validation = _safe_json_dict(row["ValidationJSON"], row["PlanID"]) or {}
+    moderation = validation.get("moderation") or {}
+    return TreatmentPlanStatus(
+        plan_id=row["PlanID"], session_id=row["SessionID"], output_id=row["OutputID"],
+        status=status, treatment_strategy=row["TreatmentStrategy"],
+        scenario=scenario,
+        risk_level=row["RiskLevel"], review_status=row["ReviewStatus"],
+        review_comment=row["ReviewComment"], reviewed_by=row["ReviewedBy"],
+        reviewed_at=row["ReviewedAt"],
+        risk_identification_date=row["RiskIdentificationDate"],
+        plan=plan,
+        warnings=[w for w in validation.get("warnings") or [] if isinstance(w, str)],
+        moderation_flagged=bool(moderation.get("flagged")),
+        error_message=error_message, reason=reason,
+        created_at=row["CreatedAt"], completed_at=row["CompletedAt"])
 
 
 def _safe_json_dict(blob: str | None, plan_id: str) -> dict | None:
@@ -359,15 +367,18 @@ def get_treatment_plans_excel(session_id: str,
     """The session's treatment-plan board, as a single-sheet Excel workbook — one row per
     accepted scenario that has a generated plan.
 
-    Enumerates via session_plan_board, then calls get_treatment_plan() per scenario (accepted-
-    scenario counts are small) so this can never drift from the JSON poll's staleness
-    projection, trimming, or field rendering — same "call the JSON endpoint directly" contract
-    as sessions.py's results.xlsx."""
+    Renders through _plan_status_from_row — the SAME presenter the JSON poll uses — so this
+    can never drift from its staleness projection, trimming, or field rendering. One batched
+    dal.active_plan_rows read replaces the former per-scenario GET reentry (1+2N round trips
+    → 3): one authorization, the board query (whose ORDER BY drives row order), one plan
+    fetch. A single stale cutoff serves every row, per _present_status's own contract."""
     with db_session() as sess:
         get_authorized_session(sess, session_id, principal)
         rows = dal.session_plan_board(sess, session_id)
-    plans = [get_treatment_plan(session_id, r["OutputID"], principal)
-             for r in rows if r["PlanID"] is not None]
+        plan_rows = {r["OutputID"]: r for r in dal.active_plan_rows(sess, session_id)}
+    stale_cutoff = treatment._stale_cutoff()
+    plans = [_plan_status_from_row(plan_rows[r["OutputID"]], stale_cutoff)
+             for r in rows if r["PlanID"] is not None and r["OutputID"] in plan_rows]
     workbook = build_treatment_plans_workbook(session_id, plans)
     buffer = io.BytesIO()
     workbook.save(buffer)

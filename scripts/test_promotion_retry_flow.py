@@ -7,8 +7,9 @@ Run: .venv/Scripts/python.exe scripts/test_promotion_retry_flow.py
 """
 import inspect
 import sys
+from pathlib import Path
 
-sys.path.insert(0, r"C:\Chettri_World\IT World\Development\DESC\TSG\tsg")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import get_settings
 from app.pipeline import accept, reaper

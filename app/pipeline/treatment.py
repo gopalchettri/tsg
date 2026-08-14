@@ -48,7 +48,7 @@ from app.db import models as m
 from app.pipeline import grounding, prompts
 from app.pipeline import llm as llm_mod
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
-from app.pipeline.tasks import ASSET_UNIT_ID, _ask_ai, _failure_client_message
+from app.pipeline.tasks import ASSET_UNIT_ID, _ask_ai, _classify_llm_failure
 from app.pipeline.validation import LLMResponseParseError
 from app.sse import bus
 
@@ -406,8 +406,10 @@ def _classify_failure(exc: Exception) -> tuple[TreatmentOutcomeReason, str]:
         return TreatmentOutcomeReason.invalid_plan, str(exc)
     if isinstance(exc, LLMResponseParseError):
         return TreatmentOutcomeReason.invalid_plan, "the model's reply was not usable JSON"
-    msg = _failure_client_message(exc)  # shared classifier: guardrail vs generic
-    if msg == "content blocked by a configured safety guardrail":
+    # Shared classifier: a stable TOKEN, never the English message — a rewording of the
+    # client text can no longer silently degrade content_blocked to generation_failed.
+    kind, msg = _classify_llm_failure(exc)
+    if kind == "guardrail":
         return TreatmentOutcomeReason.content_blocked, msg
     return TreatmentOutcomeReason.generation_failed, msg
 
@@ -575,6 +577,12 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     _r, _m = _classify_failure(LLMResponseParseError("boom", dict))
     assert _r is TreatmentOutcomeReason.invalid_plan and "LLMResponseParseError" not in _m
     assert _classify_failure(RuntimeError("db down"))[0] is TreatmentOutcomeReason.generation_failed
+    # Guardrail path — previously ZERO test signal, and previously matched by English text.
+    # __new__ skips the constructor: the classifier only isinstance-checks, never reads attrs.
+    from litellm.exceptions import RejectedRequestError as _RRE
+    assert _classify_failure(_RRE.__new__(_RRE)) == (
+        TreatmentOutcomeReason.content_blocked,
+        "content blocked by a configured safety guardrail")
 
     # validated_actors: the stored dict shape round-trips; corrupt/mis-shaped blobs -> [].
     assert grounding.validated_actors('{"actors": ["APT x"], "validated": true}') == ["APT x"]

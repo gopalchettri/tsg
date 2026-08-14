@@ -1910,6 +1910,29 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
     ).mappings().first()
 
 
+def active_plan_rows(sess: Session, session_id: str) -> list[RowMapping]:
+    """Set-based sibling of active_plan_row: every active plan row of the session in ONE round
+    trip — same columns, same PK-hop outer joins (no fan-out possible, see active_plan_row).
+    Serves the Excel export's batch read; presentation order is the caller's concern (the
+    board query drives it)."""
+    if not _valid_guid(session_id):
+        return []
+    p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
+    st, it = m.Scoped_Threat, m.Identified_Threat
+    return sess.execute(
+        select(p.PlanID, p.SessionID, p.OutputID, p.TenantID, p.EntityID, p.Status,
+            p.ActiveTaskID, p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
+            p.ValidationJSON, p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment,
+            p.ReviewedBy, p.ReviewedAt, p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt,
+               out.ScenarioJSON,
+            it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON)
+        .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID)
+                    .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
+                    .outerjoin(it, st.ThreatID == it.ThreatID))
+        .where(p.SessionID == session_id, p.Superseded == 0)
+    ).mappings().all()
+
+
 def review_plan(sess: Session, plan_id: str, *, status: str, comment: str | None,
                 reviewer: str | None, reviewed_at: datetime) -> bool:
     """Record the human adoption decision, CAS-fenced on (COMPLETE, not superseded): only a

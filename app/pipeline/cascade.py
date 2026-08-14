@@ -457,20 +457,39 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
 
     return tasks.decide_session_outcome(sess, scenario_session)
 
+# ponytail: fixed ceiling, not a Setting — any realistic session fits whole (300 threats is
+# roughly 12k chars); this only trims a RUNAWAY session's oldest labels. Truncation is safe by
+# the chain that already guards every proposal: the identity-fold dedup and the semantic
+# prior-scan drop a re-proposed threat before it becomes a row, and _buffered_ask's 2x headroom
+# absorbs the wasted slot — worst case is one spent proposal, never a duplicate or short click.
+_EXCLUSIONS_CHAR_BUDGET = 24_000
+
+
 def _coverage_exclusions(threats: list[dict]) -> list[str]:
     """Distinct labels of the threats already proposed for this subsystem, fed to the
     coverage-aware prompt so an additive round asks for genuinely NEW ones. Prefer the grounded
     library label, fall back to the raw proposal; drop blanks.
 
-    UNCAPPED — the full session history reaches the prompt, so the model can never re-propose a
-    threat it simply was not told about. At temperature 0 a repeat costs the whole slot (the
-    same question yields the same answer on a re-click), which is why completeness wins over the
-    prompt-size cap that used to truncate this list to the newest 50."""
+    NEWEST-FIRST under a character budget: dal.active_threats returns newest first and this
+    fold preserves that order, so a session past _EXCLUSIONS_CHAR_BUDGET drops only its OLDEST
+    labels — the ones least likely to be re-proposed — while every session under it sends its
+    full history (the completeness the uncapped version bought, now with an anti-runaway
+    ceiling instead of unbounded prompt growth)."""
     # tasks.threat_label is THE definition — the semantic near-duplicate scan measures against
     # the same string this list steers away from, so the two can never drift apart.
-    labels = (tasks.threat_label(t) for t in threats)
-    # dict.fromkeys, not set(): dedup while PRESERVING newest-first order.
-    return list(dict.fromkeys(lbl for lbl in labels if lbl))
+    out: list[str] = []
+    seen: set[str] = set()
+    used = 0
+    for t in threats:
+        lbl = tasks.threat_label(t)
+        if not lbl or lbl in seen:
+            continue
+        used += len(lbl) + 2  # '; ' the prompt join spends per label
+        if used > _EXCLUSIONS_CHAR_BUDGET:
+            break
+        seen.add(lbl)
+        out.append(lbl)
+    return out
 
 
 def _buffered_ask(shortfall: int, cap: int) -> int:

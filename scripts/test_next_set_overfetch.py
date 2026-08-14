@@ -17,7 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.pipeline.cascade import _buffered_ask, _coverage_exclusions  # noqa: E402
+from app.pipeline.cascade import (_EXCLUSIONS_CHAR_BUDGET, _buffered_ask,  # noqa: E402
+                                  _coverage_exclusions)
 
 
 def main() -> None:
@@ -27,6 +28,16 @@ def main() -> None:
     assert len(labels) == 120, f"expected 120 labels, got {len(labels)} — truncation is back"
     assert labels[0] == "Threat 0" and labels[-1] == "Threat 119", "input order not preserved"
     print("1 OK  120/120 labels pass through, order preserved — no truncation")
+
+    # 1b — anti-runaway ceiling: admission is newest-first under _EXCLUSIONS_CHAR_BUDGET, so a
+    # runaway session keeps its NEWEST labels (the list head) and drops only the oldest tail.
+    big = [{"threat_name": f"Threat {i:04d} " + "x" * 60} for i in range(600)]
+    capped = _coverage_exclusions(big)
+    assert 0 < len(capped) < 600, f"budget did not bind ({len(capped)})"
+    names = [t["threat_name"] for t in big]
+    assert capped == names[:len(capped)], "must keep the newest prefix, drop only the oldest"
+    assert sum(len(lbl) + 2 for lbl in capped) <= _EXCLUSIONS_CHAR_BUDGET
+    print(f"1b OK  600-threat runaway trimmed to newest {len(capped)} within the char budget")
 
     # 2 — dedup keeps first occurrence, blanks dropped, library label preferred (threat_label).
     mixed = [{"library_threat_name": "Lib A", "threat_name": "Raw A"},

@@ -65,6 +65,24 @@ def verify_api_key(presented: str) -> str:
     return client_id
 
 
+def _authenticate(x_api_key: str, x_user_id: str, x_tenant_id: str,
+                  *, tenant_required: bool) -> tuple[str, str, str]:
+    """The steps every header-auth principal shares: API-key verification, sentinel-safe
+    strip of the identity headers, and the fail-closed blank checks. Returns
+    (client_id, user_id, tenant_id). ONE implementation so a future auth change (a new header
+    rule, a hardening fix, a logging change) lands in exactly one place — the two dependencies
+    below only layer their own SCOPE on top.
+
+    isinstance guards: on a real request these are str; when a dependency is called directly
+    (tests) an unpassed Header param is FastAPI's sentinel, not a str."""
+    client_id = verify_api_key(x_api_key)
+    user_id = x_user_id.strip() if isinstance(x_user_id, str) else ""
+    tenant_id = x_tenant_id.strip() if isinstance(x_tenant_id, str) else ""
+    if not user_id or (tenant_required and not tenant_id):
+        raise AuthError(_UNAUTHORIZED)
+    return client_id, user_id, tenant_id
+
+
 def get_principal(
     x_api_key: str = Header(default="", alias="X-API-Key"),
     x_user_id: str = Header(default="", alias="X-User-Id"),
@@ -81,14 +99,11 @@ def get_principal(
 
     downstream handlers still owe `require_entity`. AuthError/EntityForbidden propagate to
     the [R9] envelope handler in app/api/errors.py."""
-    client_id = verify_api_key(x_api_key)
-    # X-User-Id, X-Entity-Id and X-Tenant-Id are all REQUIRED — absent/blank → 401. isinstance
-    # guard: on a real request these are str; when this dependency is called directly (tests)
-    # an unpassed Header param is FastAPI's sentinel, not a str.
-    tenant_id = x_tenant_id.strip() if isinstance(x_tenant_id, str) else ""
-    if not (x_user_id.strip() and x_entity_id.strip() and tenant_id):
+    client_id, user_id, tenant_id = _authenticate(
+        x_api_key, x_user_id, x_tenant_id, tenant_required=True)
+    entity_id = x_entity_id.strip() if isinstance(x_entity_id, str) else ""
+    if not entity_id:
         raise AuthError(_UNAUTHORIZED)
-    user_id, entity_id = x_user_id.strip(), x_entity_id.strip()
 
     if get_settings().verify_membership:
         try:
@@ -111,26 +126,27 @@ def get_admin_principal(
     x_user_id: str = Header(default="", alias="X-User-Id"),
     x_tenant_id: str = Header(default="", alias="X-Tenant-Id"),
 ) -> Principal:
-    """The admin routers' principal — `get_principal` minus the entity.
+    """The admin routers' principal — `get_principal` minus the entity AND the tenant
+    requirement.
 
     Admin routes touch shared cross-tenant master data (threat/control libraries, intel feeds),
-    so there is no entity to scope to and no admin handler reads `entities`. Requiring
-    `X-Entity-Id` there only forced callers to invent a value that was then discarded.
+    so there is no entity to scope to and no admin handler reads `entities` — requiring
+    `X-Entity-Id` only forced callers to invent a value that was then discarded. The same
+    holds for `X-Tenant-Id` (verified: no admin path reads `principal.tenant_id`), so it is
+    OPTIONAL here — accepted and bound to the log context when sent, never demanded.
 
     `X-User-Id` is still REQUIRED: it is the acting identity that lands in CreatedBy/UpdatedBy,
     so dropping it would silently blank the library audit trail. `entities` is empty, so
     `require_entity` DENIES on an admin principal — fail-closed if an entity-scoped route ever
     mounts this by mistake. `verify_membership` is skipped: it validates a (user, entity) pair
     and there is no entity."""
-    client_id = verify_api_key(x_api_key)
-    # isinstance guards mirror get_principal: called directly (tests), an unpassed Header param
-    # is FastAPI's sentinel, not a str.
-    user_id = x_user_id.strip() if isinstance(x_user_id, str) else ""
-    tenant_id = x_tenant_id.strip() if isinstance(x_tenant_id, str) else ""
-    if not (user_id and tenant_id):
-        raise AuthError(_UNAUTHORIZED)
+    client_id, user_id, tenant_id = _authenticate(
+        x_api_key, x_user_id, x_tenant_id, tenant_required=False)
 
-    structlog.contextvars.bind_contextvars(sub=user_id, tenant=tenant_id, client_id=client_id)
+    ctx = {"sub": user_id, "client_id": client_id}
+    if tenant_id:
+        ctx["tenant"] = tenant_id
+    structlog.contextvars.bind_contextvars(**ctx)
     return Principal(claims={"sub": user_id}, entities=set(),
                     client_id=client_id, tenant_id=tenant_id)
 
