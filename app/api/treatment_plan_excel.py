@@ -15,7 +15,9 @@ from openpyxl.worksheet.worksheet import Worksheet
 from app.api.schemas import TreatmentPlanStatus
 
 _COLUMNS = (
-    "session_id", "output_id", "plan_id", "scenario_title", "scenario_statement", "risk_statement",
+    "session_id", "output_id", "plan_id",
+    "threat_category", "threat_type", "threat_name", "threat_actors",
+    "scenario_title", "scenario_statement", "risk_statement",
     "status", "treatment_strategy", "risk_level", "review_status", "risk_identification_date",
     "plan_title", "treatment_plan", "action_plan", "applicable_to_all_subsystems",
     "controls_to_be_implemented", "remediation_action_plan",
@@ -32,7 +34,9 @@ _WRAP_COLUMNS = frozenset({
 #: Starting widths — narrow for ids/flags, wide for prose/list columns. Not load-bearing; a
 #: reviewer can resize in Excel same as any spreadsheet.
 _COLUMN_WIDTHS = {
-    "session_id": 24, "output_id": 24, "plan_id": 24, "scenario_title": 40,
+    "session_id": 24, "output_id": 24, "plan_id": 24,
+    "threat_category": 28, "threat_type": 28, "threat_name": 40, "threat_actors": 30,
+    "scenario_title": 40,
     "scenario_statement": 50, "risk_statement": 50,
     "status": 12, "treatment_strategy": 14, "risk_level": 12, "review_status": 16,
     "risk_identification_date": 20,
@@ -59,13 +63,23 @@ def _sanitize(value):
 
 
 def _controls_to_implement_cell(items: list[dict]) -> str:
-    """One '[{priority}] {control_type}: {control_name} — {description}' line per gap-analysis
-    entry."""
-    lines = []
+    """One labelled block per gap-analysis entry, carrying every field the plan JSON holds —
+    control_type, control_name, description, priority, control_code and control_library_id.
+
+    The code/library id matter to a reviewer working the sheet: they are the join back to the
+    control library, so a control can be looked up without re-opening the JSON response. Blocks
+    are separated by a blank line; the column is wrap_text so each stays readable in one cell."""
+    blocks = []
     for c in items:
-        lines.append(f"[{c.get('priority', '')}] {c.get('control_type', '')}: "
-                     f"{c.get('control_name', '')} — {c.get('description', '')}")
-    return "\n".join(lines)
+        blocks.append(
+            f"control_type: {c.get('control_type', '')}\n"
+            f"control_name: {c.get('control_name', '')}\n"
+            f"description: {c.get('description', '')}\n"
+            f"priority: {c.get('priority', '')}\n"
+            f"control_code: {c.get('control_code', '')}\n"
+            f"control_library_id: {c.get('control_library_id', '')}"
+        )
+    return "\n\n".join(blocks)
 
 
 def _remediation_actions_cell(items: list[dict]) -> str:
@@ -83,6 +97,10 @@ def _row(session_id: str, status: TreatmentPlanStatus) -> dict:
     plan = status.plan or {}
     return {
         "session_id": session_id, "output_id": status.output_id, "plan_id": status.plan_id,
+        "threat_category": scenario.get("threat_category"),
+        "threat_type": scenario.get("threat_type"),
+        "threat_name": scenario.get("threat_name"),
+        "threat_actors": "; ".join(scenario.get("threat_actors") or []),
         "scenario_title": scenario.get("scenario_title"),
         "scenario_statement": scenario.get("scenario_statement"),
         "risk_statement": scenario.get("risk_statement"),
@@ -94,7 +112,7 @@ def _row(session_id: str, status: TreatmentPlanStatus) -> dict:
         "action_plan": plan.get("action_plan"),
         "applicable_to_all_subsystems": plan.get("applicable_to_all_subsystems"),
         "controls_to_be_implemented": _controls_to_implement_cell(
-            plan.get("controls_to_be_implemented") or []),
+            (plan.get("controls_to_be_implemented") or {}).get("controls") or []),
         "remediation_action_plan": _remediation_actions_cell(
             plan.get("remediation_action_plan") or []),
         "mitigation_timeline": plan.get("mitigation_timeline"),

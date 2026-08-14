@@ -515,6 +515,10 @@ reconnect.
   "status": "COMPLETE",
   "treatment_strategy": "Mitigate",
   "scenario": {
+    "threat_category": "Elevation of Privilege",
+    "threat_type": "Credential Abuse",
+    "threat_name": "Stolen RDP credentials",
+    "threat_actors": ["Nation-state/APT", "Malicious insider"],
     "scenario_title": "Ransomware via exposed RDP",
     "scenario_statement": "A ransomware operator gains access through an internet-exposed RDP service…",
     "risk_statement": "Loss of treatment-plant availability for an extended outage window."
@@ -571,12 +575,16 @@ otherwise all read as a plain failure:
    `warnings`, `moderation_flagged`, `created_at`, `completed_at` are populated and stored but not
    serialized. Confirm them with SQL, not with this response.
 2. **The `plan` object is filtered to *at most* 10 keys** (the tuple above, in that order). Five are
-   always present — `treatment_plan`, `risk_owner`, `impacted_business_division`,
-   `controls_to_be_implemented`, `remediation_action_plan`; the other five come from the model and
-   are simply absent if it omits them. (`risk_owner` and `impacted_business_division` are present as
-   *keys* even when the POST omitted them — the value is then `null`.) `PlanJSON` in the database holds more keys still
-   (`treatment_objective`, `justification`, `control_coverage`, `residual_risk_assessment`,
-   `expected_security_improvements`, …). Missing keys here are **by design**.
+   structurally guaranteed by `_validate_plan` — `treatment_plan`, `risk_owner`,
+   `impacted_business_division` (server-injected, always present) and `controls_to_be_implemented`,
+   `remediation_action_plan` (AI-generated, but `_validate_plan` raises `TreatmentPlanInvalid` if
+   either is absent/malformed, so a COMPLETE row always has them); the other five come from the model
+   with no structural guarantee and are simply absent if it omits them. (`risk_owner` and
+   `impacted_business_division` are present as *keys* even when the POST omitted them — the value is
+   then `null`.) As of the 7-field AI schema (see revision history), `PlanJSON` in the database no
+   longer holds anything wider than these 10 keys — there is no hidden superset to go looking for in
+   SQL any more. `controls_to_be_implemented` is itself now an object, `{control_coverage,
+   controls[]}`, not a bare array — see N22 below.
 
 **Staleness:** a `RUNNING` row untouched for longer than the staleness window is *presented* as
 `ERROR` / `"generation timed out — request it again"`. The stored row is not changed — SQL will still
@@ -599,7 +607,8 @@ SELECT p.PlanID, p.Status, p.ErrorMessage, p.RiskLevel, p.ReviewStatus,
        p.RiskIdentificationDate, p.CreatedAt, p.CompletedAt,
        JSON_VALUE(o.ScenarioJSON, '$.scenario_title') AS ScenarioTitle,
        JSON_VALUE(p.PlanJSON, '$.mitigation_owner')   AS MitigationOwner,
-       JSON_VALUE(p.PlanJSON, '$.control_coverage')   AS ControlCoverage  -- stored, not returned
+       JSON_VALUE(p.PlanJSON, '$.controls_to_be_implemented.control_coverage')
+                                                       AS ControlCoverage  -- nested, but IS returned
 FROM   Risk_Treatment_Plan p
 LEFT JOIN Threat_Scenario_Output o ON o.OutputID = p.OutputID
 WHERE  p.SessionID = '{S}' AND p.OutputID = '{O}' AND p.Superseded = 0;
@@ -1068,12 +1077,15 @@ FROM   Threat_Scenario_Output WHERE OutputID = '{O}';
 ```
 
 Copy those names into `existing_controls` and POST. **Save this plan_id as `{P5}`.** Wait for
-`COMPLETE`, then check the **stored** document — `control_coverage` is not in the visible key set:
+`COMPLETE`, then check the document — `control_coverage` now lives nested under
+`controls_to_be_implemented`, not as its own top-level key (and unlike the old top-level field, it
+IS part of the visible `plan` object on the GET response, since `controls_to_be_implemented` is one
+of the 10 keys served):
 
 ```sql
-SELECT JSON_VALUE(PlanJSON, '$.control_coverage') AS Coverage,
-       JSON_QUERY(PlanJSON, '$.controls_to_be_implemented') AS Controls,
-       JSON_QUERY(PlanJSON, '$.remediation_action_plan')    AS Actions
+SELECT JSON_VALUE(PlanJSON, '$.controls_to_be_implemented.control_coverage') AS Coverage,
+       JSON_QUERY(PlanJSON, '$.controls_to_be_implemented.controls') AS Controls,
+       JSON_QUERY(PlanJSON, '$.remediation_action_plan')             AS Actions
 FROM   Risk_Treatment_Plan WHERE PlanID = '{P5}';
 ```
 

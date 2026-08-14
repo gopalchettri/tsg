@@ -2031,13 +2031,20 @@ class TreatmentPlanStatus(BaseModel):
     PRESENTATION TRIM (user request, 06 Aug 2026): the fields marked exclude=True below are
     HIDDEN from the response for now, not deleted — they are still populated and stored;
     remove the exclude flag to unhide. The `plan` document is trimmed the same way by
-    api.treatment._VISIBLE_PLAN_KEYS (the full document stays in PlanJSON)."""
+    api.treatment._VISIBLE_PLAN_KEYS — since the AI's own schema was narrowed to match (7
+    fields; see prompts.treatment_prompt), that filter now does no real trimming except for
+    risk_identification_date, which is surfaced once already as the sibling field above rather
+    than duplicated inside `plan`."""
     model_config = ConfigDict(json_schema_extra={"example": {
         "plan_id": "0f0e0d0c-0b0a-8988-8786-858483828180",
         "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
         "output_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
         "status": "COMPLETE", "treatment_strategy": "Mitigate",
-        "scenario": {"scenario_title": "Ransomware via exposed RDP",
+        "scenario": {"threat_category": "Elevation of Privilege",
+                     "threat_type": "Credential Abuse",
+                     "threat_name": "Stolen RDP credentials",
+                     "threat_actors": ["Nation-state/APT", "Malicious insider"],
+                     "scenario_title": "Ransomware via exposed RDP",
                      "scenario_statement": "A ransomware operator gains access through…",
                      "risk_statement": "Loss of treatment-plant availability…"},
         "risk_level": "Critical", "review_status": None,
@@ -2048,7 +2055,15 @@ class TreatmentPlanStatus(BaseModel):
         "plan": {"title": "Remote Access Hardening", "treatment_plan": "Mitigate",
                  "action_plan": "Harden remote access in three phases…",
                  "applicable_to_all_subsystems": "No",
-                 "controls_to_be_implemented": [],
+                 "controls_to_be_implemented": {
+                     "control_coverage": "gaps",
+                     "controls": [
+                         {"control_type": "preventive",
+                          "control_name": "Access Restriction For Change",
+                          "description": "Enforce role-based access control and least-privilege…",
+                          "priority": "Critical",
+                          "control_code": "CII-CID-070",
+                          "control_library_id": 70}]},
                  "mitigation_timeline": "90 days overall; critical actions within 30 days",
                  "mitigation_owner": "OT Security Team",
                  "risk_owner": "Head of OT Operations",
@@ -2062,8 +2077,11 @@ class TreatmentPlanStatus(BaseModel):
     scenario: dict[str, Any] | None = Field(
         default=None,
         description=("The accepted scenario this plan treats: scenario_title, "
-                     "scenario_statement, risk_statement. Null only if the scenario row is "
-                     "unreadable (defensive parse)."))
+                     "scenario_statement, risk_statement — plus the underlying threat's own "
+                     "identity (threat_category, threat_type, threat_name, threat_actors[]), "
+                     "which comes from the joined Identified_Threat row, NOT the LLM's scenario "
+                     "JSON. Threat fields are null/empty if the threat linkage is broken (outer "
+                     "join). Null only if the scenario row is unreadable (defensive parse)."))
     risk_level: str | None = Field(
         default=None, description="The register risk level this plan was generated against (from the request).")
     review_status: str | None = Field(
@@ -2076,13 +2094,13 @@ class TreatmentPlanStatus(BaseModel):
         description="Echo of the request's register date — record data, never AI-generated (spec). Null when not sent.")
     plan: dict[str, Any] | None = Field(
         default=None,
-        description=("The generated plan (SDD §7.3 contract): AI fields (title, objective, "
-                     "recommendation, justification, controls_to_be_implemented[] — the "
-                     "gap-analysis table, remediation_action_plan[], action_plan, "
-                     "mitigation_owner, control_coverage, ...), the server stamp "
-                     "(treatment_plan), and register echoes (risk_identification_date, "
-                     "risk_owner, impacted_business_division). JSON is the wire contract; "
-                     "markdown rendering is the client's job."))
+        description=("The generated plan (SDD §7.3 contract): AI fields (title, "
+                     "controls_to_be_implemented — {control_coverage, controls[]}, the "
+                     "gap-analysis object, remediation_action_plan[], action_plan, "
+                     "applicable_to_all_subsystems, mitigation_timeline, mitigation_owner), "
+                     "the server stamp (treatment_plan), and register echoes (risk_owner, "
+                     "impacted_business_division). JSON is the wire contract; markdown "
+                     "rendering is the client's job."))
     warnings: list[str] = Field(
         default_factory=list, exclude=True,
         description="Advisory validation warnings (vocabulary clamps, empty control map, ...). Never blocking.")

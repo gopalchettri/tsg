@@ -47,7 +47,14 @@ def snapshot(base):
             "threat": {"category": "Denial of Service", "type": "Service Disruption",
                        "name": "Loss of availability of PGS", "actors": ["External attacker"]},
             "scenario": {"scenario_title": "PGS outage", "scenario_statement": "s",
-                         "risk_statement": "r"},
+                         "risk_statement": "r",
+                         # One applicable, one not — check 14 pins that BOTH reach the model,
+                         # since the false verdict is what narrows applicable_to_all_subsystems.
+                         "supporting_system_applicability": [
+                             {"supporting_system": "SCADA System", "applicable": True,
+                              "justification": "Primary control path for the outage."},
+                             {"supporting_system": "Billing Portal", "applicable": False,
+                              "justification": "No control or data path to generation."}]},
             "existing_controls": {
                 "scenario_suggested": [{"name": "Network segmentation", "why": "Limits pivot."}],
                 "library_mapped": [                                    # depth 3: the second leak
@@ -110,10 +117,11 @@ def main() -> None:
     prompts.treatment_prompt(snap)
     assert snap["existing_controls"]["library_mapped"][0]["control_library_id"] == 28, \
         "treatment_prompt mutated the snapshot — _inject_reserved will resolve controls to None"
-    parsed = {"controls_to_be_implemented": [{"control_code": "CII-CID-028"},
-                                             {"control_code": "CII-CID-999"}, {}]}
+    parsed = {"controls_to_be_implemented": {"control_coverage": "gaps",
+        "controls": [{"control_code": "CII-CID-028"}, {"control_code": "CII-CID-999"}, {}]}}
     ids = [c.get("control_library_id")
-           for c in treatment._inject_reserved(parsed, snap)["controls_to_be_implemented"]]
+           for c in treatment._inject_reserved(parsed, snap)
+                    ["controls_to_be_implemented"]["controls"]]
     assert ids == [28, None, None], ids
     print("4 OK  snapshot unmutated; control_code -> control_library_id resolves", ids)
 
@@ -228,6 +236,23 @@ def main() -> None:
     assert "supporting_system_applicability" not in no_sub, \
         "field requested with no supporting systems to judge against"
     print("13 OK supporting_system_applicability lists in-scope systems; omitted when none exist")
+
+    # 14 — the three scenario-side context fields the TREATMENT prompt must carry. Each was a
+    #      real gap: actors arrived [] through validated_actors, applicability was never read
+    #      at all, and supporting_systems was only ever asserted for the scenario prompt
+    #      (check 2), so nothing proved it survived into this one.
+    treat = rendered["treatment"]
+    assert "External attacker" in treat, "threat.actors missing — plan is blind to the adversary"
+    assert "supporting_system_applicability" in treat
+    assert "Billing Portal" in treat, \
+        "the applicable=false verdict must reach the model — it is what narrows 'Yes'"
+    assert "No control or data path to generation." in treat
+    assert '"applicable":false' in treat, f"bool verdict lost: {treat[-400:]}"
+    assert "SCADA System" in treat, "supporting_systems dropped out of the treatment context"
+    # And the prompt must actually TELL the model to use it, else the key is inert payload.
+    assert "scenario.supporting_system_applicability" in prompts.treatment_prompt(
+        snapshot(base))[0]["content"]
+    print("14 OK treatment prompt carries actors + applicability (both verdicts) + systems")
 
     print("\nprompt db-key self-check OK")
 

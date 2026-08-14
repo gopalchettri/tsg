@@ -57,6 +57,7 @@ from app.db import models as m
 from app.db.engine import db_session
 from app.pipeline import treatment
 from app.pipeline.celery_app import generate_treatment_plan_task
+from app.pipeline.grounding import stored_actors
 from app.pipeline.tasks import ASSET_UNIT_ID
 
 log = get_logger(__name__)
@@ -70,10 +71,14 @@ _CONFLICT_RESPONSES: dict[int | str, dict] = {
 
 _TIMED_OUT_MESSAGE = "generation timed out — request it again"
 
-#: PRESENTATION TRIM (user request, 06 Aug 2026): the poll GET serves only these plan keys
-#: for now — the toolkit's output columns plus the title. The FULL document stays in
-#: PlanJSON (nothing is deleted); widen this tuple or drop the filter in get_treatment_plan
-#: to unhide. Envelope fields are hidden the same way via exclude=True on TreatmentPlanStatus.
+#: The poll GET serves these plan keys — the toolkit's output columns plus the title. Since the
+#: AI's own schema was narrowed to exactly this set (prompts.treatment_prompt; see
+#: docs/RISK_TREATMENT_PLAN_SDD.md §7.1/§7.3), PlanJSON no longer holds anything wider except
+#: risk_identification_date — kept out of `plan` here because it's already surfaced as its own
+#: top-level field on TreatmentPlanStatus, not to avoid duplicating it on the wire. This filter
+#: now also doubles as defense-in-depth: if the model ever echoes a dropped field name back, it
+#: is dropped here rather than reaching the client. Envelope fields are hidden the same way via
+#: exclude=True on TreatmentPlanStatus.
 _VISIBLE_PLAN_KEYS = (
     "title", "treatment_plan", "action_plan", "applicable_to_all_subsystems",
     "controls_to_be_implemented", "remediation_action_plan", "mitigation_timeline",
@@ -204,6 +209,13 @@ def get_treatment_plan(session_id: str, output_id: str,
         scenario = ({k: scenario_json.get(k) for k in
                      ("scenario_title", "scenario_statement", "risk_statement")}
                     if scenario_json else None)
+        if scenario is not None:
+            # The threat's identity comes from the joined Identified_Threat row, not the LLM's
+            # scenario JSON — same source split as sessions._build_scenario.
+            scenario["threat_category"] = row["ThreatCategory"]
+            scenario["threat_type"] = row["ThreatType"]
+            scenario["threat_name"] = row["ThreatName"]
+            scenario["threat_actors"] = stored_actors(row["ThreatActorsJSON"])
         validation = _safe_json_dict(row["ValidationJSON"], row["PlanID"]) or {}
         moderation = validation.get("moderation") or {}
         return TreatmentPlanStatus(

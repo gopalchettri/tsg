@@ -27,17 +27,24 @@ COMPLETE = TreatmentPlanStatus(
     plan_id="plan-1", session_id=SESSION_ID, output_id="out-1", status="COMPLETE",
     treatment_strategy="Mitigate",
     scenario={"scenario_title": "Ransomware via exposed RDP",
-             "scenario_statement": "s", "risk_statement": "r"},
+             "scenario_statement": "s", "risk_statement": "r",
+             "threat_category": "Elevation of Privilege", "threat_type": "Credential Abuse",
+             "threat_name": "Stolen RDP credentials",
+             "threat_actors": ["Nation-state/APT", "Malicious insider"]},
     risk_level="Critical", review_status="approved",
     risk_identification_date=None,
     plan={
         "title": "Remote Access Hardening", "treatment_plan": "Mitigate",
         "action_plan": "Harden remote access in three phases.",
         "applicable_to_all_subsystems": "No",
-        "controls_to_be_implemented": [
-            {"control_type": "Technical", "control_name": "MFA on RDP",
-             "description": "Require MFA for all remote sessions.", "priority": "High"},
-        ],
+        "controls_to_be_implemented": {
+            "control_coverage": "gaps",
+            "controls": [
+                {"control_type": "Technical", "control_name": "MFA on RDP",
+                 "description": "Require MFA for all remote sessions.", "priority": "High",
+                 "control_code": "CII-CID-070", "control_library_id": 70},
+            ],
+        },
         "remediation_action_plan": [
             {"action_id": "A1", "action": "Disable direct RDP exposure", "owner": "Network Team",
              "priority": "High", "timeline": "30 days"},
@@ -84,10 +91,22 @@ def main() -> None:
     assert row2[col["mitigation_owner"]] == "OT Security Team"
     print("4 OK  identifying/scenario/plan fields land in the right cells")
 
-    # 5 — controls_to_be_implemented flattened: one line per entry, priority/type/name/description
+    # 4b — the threat's own identity, joined from Identified_Threat (not the LLM scenario JSON)
+    assert row2[col["threat_category"]] == "Elevation of Privilege"
+    assert row2[col["threat_type"]] == "Credential Abuse"
+    assert row2[col["threat_name"]] == "Stolen RDP credentials"
+    assert row2[col["threat_actors"]] == "Nation-state/APT; Malicious insider"
+    print("4b OK threat_category/type/name/actors render per scenario")
+
+    # 5 — controls_to_be_implemented: every field of the gap-analysis entry, incl. the library join
     controls_cell = row2[col["controls_to_be_implemented"]]
-    assert controls_cell == "[High] Technical: MFA on RDP — Require MFA for all remote sessions."
-    print("5 OK  controls_to_be_implemented flattened to one line per gap-analysis entry")
+    assert controls_cell == ("control_type: Technical\n"
+                             "control_name: MFA on RDP\n"
+                             "description: Require MFA for all remote sessions.\n"
+                             "priority: High\n"
+                             "control_code: CII-CID-070\n"
+                             "control_library_id: 70")
+    print("5 OK  controls_to_be_implemented carries code + library id, not just prose")
 
     # 6 — remediation_action_plan flattened: one line per action
     actions_cell = row2[col["remediation_action_plan"]]

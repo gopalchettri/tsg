@@ -187,13 +187,16 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
 
     # Threat block — both hops to Identified_Threat are OUTER joins, so a broken linkage
     # nulls the columns; an explicit null + warning beats a silently empty block.
-    # Actors come through the ONE shared reader (the stored blob is a dict, not a list, and
-    # only `validated` actors may reach a register-bound document).
+    # Actors come through the ONE shared reader (the stored blob is a dict, not a list), and
+    # deliberately through the RAW one: this plan treats a scenario the model ALREADY wrote from
+    # that same raw list (dal.active_threats feeds scenario_prompt stored_actors), so a
+    # validated_actors gate would hand the treatment [] for every unverified threat and plan
+    # against adversaries the scenario it is treating names out loud.
     threat: dict[str, Any] | None = {
         "category": redact(scenario_row.get("ThreatCategory")),
         "type": redact(scenario_row.get("LibraryThreatType") or scenario_row.get("ThreatType")),
         "name": redact(scenario_row.get("LibraryThreatName") or scenario_row.get("ThreatName")),
-        "actors": [redact(a) for a in grounding.validated_actors(scenario_row.get("ThreatActorsJSON")) if a],
+        "actors": [redact(a) for a in grounding.stored_actors(scenario_row.get("ThreatActorsJSON")) if a],
     }
     if not threat["type"] and not threat["name"]:
         threat = None
@@ -225,6 +228,17 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
             "scenario_title": redact(scenario_json.get("scenario_title")),
             "scenario_statement": redact(scenario_json.get("scenario_statement")),
             "risk_statement": redact(scenario_json.get("risk_statement")),
+            # The scenario's OWN per-system verdicts. Without these the model must judge
+            # applicable_to_all_subsystems against `supporting_systems` — the session's whole
+            # raw scope — and so is asked to cover systems this scenario already ruled out.
+            # Empty for pre-v1.3 scenarios and for sessions with no supporting systems; the
+            # prompt names that fallback explicitly, so no warning is warranted.
+            "supporting_system_applicability": [
+                {"supporting_system": redact((a or {}).get("supporting_system")),
+                 "applicable": (a or {}).get("applicable"),
+                 "justification": redact((a or {}).get("justification"))}
+                for a in scenario_json.get("supporting_system_applicability") or []
+                if isinstance(a, dict)],
         },
         "existing_controls": {
             "scenario_suggested": suggested,
@@ -264,40 +278,50 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
 # Output validation + server-owned keys (worker)
 # ---------------------------------------------------------------------------
 def _validate_plan(parsed: dict[str, Any]) -> list[str]:
-    """Structural requirement + advisory vocabulary clamps (SDD §6.2 step 4). The two tables
-    MUST be lists of dicts — a plan without them is unusable, so that raises
+    """Structural requirement + advisory vocabulary clamps (SDD §6.2 step 4). Both tables MUST
+    be present — controls_to_be_implemented.controls (nested under the coverage verdict) and
+    remediation_action_plan — a plan without them is unusable, so that raises
     TreatmentPlanInvalid (→ ERROR row, client-safe message). Everything else flags, never
     blocks: out-of-vocab values are kept and reported in the returned warnings. Vocabularies
     come from the enums — the same members the prompt advertises and the API types."""
     warnings: list[str] = []
-    for key in ("controls_to_be_implemented", "remediation_action_plan"):
-        table = parsed.get(key)
-        if not isinstance(table, list) or not all(isinstance(r, dict) for r in table):
-            raise TreatmentPlanInvalid(f"LLM plan is missing required table '{key}'")
+    cti = parsed.get("controls_to_be_implemented")
+    if not isinstance(cti, dict):
+        raise TreatmentPlanInvalid(
+            "LLM plan is missing required object 'controls_to_be_implemented'")
+    controls = cti.get("controls")
+    if not isinstance(controls, list) or not all(isinstance(r, dict) for r in controls):
+        raise TreatmentPlanInvalid(
+            "LLM plan is missing required table 'controls_to_be_implemented.controls'")
+    actions = parsed.get("remediation_action_plan")
+    if not isinstance(actions, list) or not all(isinstance(r, dict) for r in actions):
+        raise TreatmentPlanInvalid("LLM plan is missing required table 'remediation_action_plan'")
     # Every clamp is an EXACT match against the vocabulary the prompt advertises (built from
-    # the same enums) — one posture for all five, so any case-variant draws a warning rather
+    # the same enums) — one posture for all four, so any case-variant draws a warning rather
     # than silently violating the wire vocabulary.
     control_types = {str(v) for v in ControlType}
     priorities = {str(v) for v in ActionPriority}
-    for i, ctl in enumerate(parsed["controls_to_be_implemented"]):
+    for i, ctl in enumerate(controls):
         if ctl.get("control_type") not in control_types:
-            warnings.append(f"controls_to_be_implemented[{i}].control_type out of vocabulary: "
-                            f"{ctl.get('control_type')!r}")
+            warnings.append(f"controls_to_be_implemented.controls[{i}].control_type out of "
+                            f"vocabulary: {ctl.get('control_type')!r}")
         if ctl.get("priority") not in priorities:
-            warnings.append(f"controls_to_be_implemented[{i}].priority out of vocabulary: "
-                            f"{ctl.get('priority')!r}")
-    for i, act in enumerate(parsed["remediation_action_plan"]):
+            warnings.append(f"controls_to_be_implemented.controls[{i}].priority out of "
+                            f"vocabulary: {ctl.get('priority')!r}")
+    for i, act in enumerate(actions):
         if act.get("priority") not in priorities:
             warnings.append(f"remediation_action_plan[{i}].priority out of vocabulary: "
                             f"{act.get('priority')!r}")
     if parsed.get("applicable_to_all_subsystems") not in {str(v) for v in YesNo}:
         warnings.append("applicable_to_all_subsystems is not Yes/No: "
                         f"{parsed.get('applicable_to_all_subsystems')!r}")
-    if parsed.get("control_coverage") not in {str(v) for v in ControlCoverage}:
-        warnings.append(f"control_coverage out of vocabulary: {parsed.get('control_coverage')!r}")
-    elif (parsed["control_coverage"] == str(ControlCoverage.covered)
-          and parsed["controls_to_be_implemented"]):
-        warnings.append("control_coverage says 'covered' but controls_to_be_implemented is non-empty")
+    coverage = cti.get("control_coverage")
+    if coverage not in {str(v) for v in ControlCoverage}:
+        warnings.append(f"controls_to_be_implemented.control_coverage out of vocabulary: "
+                        f"{coverage!r}")
+    elif coverage == str(ControlCoverage.covered) and controls:
+        warnings.append("controls_to_be_implemented.control_coverage says 'covered' but "
+                        "controls is non-empty")
     return warnings
 
 
@@ -323,7 +347,8 @@ def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any
                for c in ((snapshot.get("existing_controls") or {}).get("library_mapped") or [])
                if isinstance(c, dict) and c.get("control_code") and c.get("control_library_id")}
     unresolved: list[str] = []
-    for ctl in parsed.get("controls_to_be_implemented") or []:
+    controls = (parsed.get("controls_to_be_implemented") or {}).get("controls") or []
+    for ctl in controls:
         if not isinstance(ctl, dict):
             continue
         raw = str(ctl.get("control_code") or "").strip()
@@ -357,13 +382,14 @@ def _inject_reserved(parsed: dict[str, Any], snapshot: dict[str, Any]) -> dict[s
 
 
 def _narrative_text(parsed: dict[str, Any]) -> str:
-    """The plan's prose fields, concatenated for one moderation call."""
-    parts = [str(parsed.get(k) or "") for k in
-             ("title", "treatment_objective", "risk_treatment_recommendation", "justification",
-              "action_plan", "residual_risk_assessment", "expected_risk_reduction",
-              "mitigation_timeline")]
-    parts += [str(v) for v in parsed.get("expected_security_improvements") or []]
-    parts += [str(v) for v in parsed.get("risk_mitigation_activities") or []]
+    """The plan's prose fields, concatenated for one moderation call. Most of the model's free
+    text now lives in the two tables rather than in dedicated narrative fields, so their prose
+    columns (control description, action) feed in alongside the remaining scalars."""
+    parts = [str(parsed.get(k) or "") for k in ("title", "action_plan", "mitigation_timeline")]
+    controls = (parsed.get("controls_to_be_implemented") or {}).get("controls") or []
+    parts += [str(c.get("description") or "") for c in controls if isinstance(c, dict)]
+    parts += [str(a.get("action") or "") for a in parsed.get("remediation_action_plan") or []
+              if isinstance(a, dict)]
     return "\n".join(p for p in parts if p)
 
 
@@ -556,41 +582,61 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     assert grounding.validated_actors("not json") == []
     assert grounding.validated_actors(None) == []
 
+    # stored_actors is what build_treatment_input reads — the whole point is the UNVERIFIED
+    # case, where the gated reader would blind the plan to the scenario's own adversaries.
+    assert grounding.stored_actors('{"actors": ["APT x"], "validated": false}') == ["APT x"]
+    assert grounding.stored_actors("not json") == [] and grounding.stored_actors(None) == []
+
     # _validate_plan: structural violation raises; vocab violations warn but keep the row;
-    # covered-with-recommendations inconsistency is flagged.
+    # covered-with-recommendations inconsistency is flagged (now nested under
+    # controls_to_be_implemented.control_coverage rather than a top-level key).
     bad_vocab = {
-        "controls_to_be_implemented": [
-            {"control_type": "quantum", "control_name": "X", "description": "d",
-             "priority": "Urgent"}],
+        "controls_to_be_implemented": {
+            "control_coverage": "covered",
+            "controls": [{"control_type": "quantum", "control_name": "X", "description": "d",
+                         "priority": "Urgent"}]},
         "remediation_action_plan": [
             {"action_id": "A1", "action": "a", "owner": "SOC", "priority": "High"}],
-        "applicable_to_all_subsystems": "Maybe", "control_coverage": "covered",
+        "applicable_to_all_subsystems": "Maybe",
     }
     warns = _validate_plan(bad_vocab)
     assert any("control_type" in w for w in warns) and any("priority" in w for w in warns)
     assert any("applicable_to_all_subsystems" in w for w in warns)
-    assert any("covered" in w for w in warns)  # covered + non-empty recommendations flagged
-    assert _validate_plan({"controls_to_be_implemented": [], "remediation_action_plan": [],
-                           "applicable_to_all_subsystems": "Yes",
-                           "control_coverage": "covered"}) == []
+    assert any("covered" in w for w in warns)  # covered + non-empty controls flagged
+    assert _validate_plan({
+        "controls_to_be_implemented": {"control_coverage": "covered", "controls": []},
+        "remediation_action_plan": [], "applicable_to_all_subsystems": "Yes"}) == []
     try:
-        _validate_plan({"controls_to_be_implemented": "nope"})
+        _validate_plan({"controls_to_be_implemented": {"control_coverage": "gaps",
+                                                        "controls": "nope"}})
         raise AssertionError("missing table must raise")
     except TreatmentPlanInvalid as e:
-        assert "controls_to_be_implemented" in str(e) or "remediation_action_plan" in str(e)
+        assert "controls_to_be_implemented" in str(e)
+
+    # _narrative_text: 3 named scalars survive (not 8); table prose feeds moderation too, since
+    # that is most of what is left to check post-narrowing. mitigation_owner must NOT leak in
+    # (it never did — this function had no self-check before, worth closing that gap now).
+    narrative = _narrative_text({
+        "title": "T", "action_plan": "AP", "mitigation_timeline": "90 days",
+        "mitigation_owner": "SOC",
+        "controls_to_be_implemented": {"control_coverage": "gaps",
+                                       "controls": [{"description": "install MFA"}]},
+        "remediation_action_plan": [{"action": "rotate keys"}]})
+    assert {"T", "AP", "90 days", "install MFA", "rotate keys"} <= set(narrative.split("\n"))
+    assert "SOC" not in narrative
 
     # _inject_reserved: server keys overwrite AI-emitted impostors; register echoes come from
     # the prompt-hidden block; the AI's controls table is NOT rewritten. The drift-pin assert
     # makes adding a key to _RESERVED_PLAN_KEYS without teaching the injector fail here.
-    ai_table = [{"control_name": "MFA"}, {"control_name": "Backups"}]
+    ai_controls = [{"control_name": "MFA"}, {"control_name": "Backups"}]
     injected = _inject_reserved(
         {"treatment_plan": "Avoid", "risk_owner": "Dr. Evil",
-         "controls_to_be_implemented": ai_table},
+         "controls_to_be_implemented": {"control_coverage": "gaps", "controls": ai_controls}},
         {"register": {"risk_identification_date": "2026-06-14T08:31:00",
                       "risk_owner": "Head of OT Operations",
                       "impacted_business_division": "Water Treatment Operations"}})
     assert injected["treatment_plan"] == "Mitigate"
-    assert injected["controls_to_be_implemented"] is ai_table  # AI-owned, injector hands off
+    assert injected["controls_to_be_implemented"]["controls"] is ai_controls  # AI-owned hand-off
     assert injected["risk_owner"] == "Head of OT Operations"
     assert injected["impacted_business_division"] == "Water Treatment Operations"
     assert set(_RESERVED_PLAN_KEYS) <= set(injected.keys())  # drift pin

@@ -13,7 +13,9 @@
 | 0.10 | 11 Aug 2026 | — | **`TreatmentOutcomeReason` — the machine-readable WHY beside the status.** `Status='ERROR'` was a seven-way overload (cancel, timeout, LLM failure, unusable document, guardrail block, dead broker, generic) separable only by matching English — one of which was a raw `repr(exc)` on the public wire. New enum (6 members, house style: snake_case switch code like `TreatmentGateReason`), new nullable `Risk_Treatment_Plan.ErrorReason nvarchar(30)` written by `dal.finish_plan(error_reason=…)` from every ERROR path, and `_present_status` now returns `(status, message, reason)` so the GET, board and register cannot disagree. `timed_out` is **projection-only and never stored** — it has no writer, so the column holds five of the six values and must NOT get a CHECK for all six. Exposed as `reason` on the GET / board / register / SSE event, and added to the outcome + cancel audit `DetailJSON`. **DEPLOY THE DDL FIRST** — unlike every earlier treatment change this one is not safe code-before-DB; a guarded ALTER plus an idempotent backfill (mapping the three legacy message literals, retiring them) ships in `1. TSG_Core.sql`. Also: the register's `status`/`review_status`/`risk_level` query params are now enum-typed (a typo was a silent empty page, now a 422), and the three response fields the API constructs from enum members are narrowed to `Literal[...]` — DB-read fields deliberately stay `str`, since an out-of-vocabulary stored value would otherwise 500 the whole page. |
 | 0.9 | 11 Aug 2026 | — | Advisory SSE event `treatment_plan_result`, published by the worker after the committed finish on BOTH terminal branches (§6.2 step 10) on the existing per-session stream — no new route, no new authorization, no DB change. It is a REFETCH HINT, not a completion contract: three outcomes never publish (dead worker, `LLMSlotUnavailable` autoretry, cancel/review in the API process) and a publish failure silences the worker process for a cooldown window, so **clients keep a slow backstop poll** and match on `output_id` (a regeneration mints a new `plan_id`). Ships with two repairs to already-shipped code that the production audit surfaced: `app/sse/bus.py` `_redis()` retry 0 → 1 (a silently-dropped pooled connection was turning a lone publish into a dropped event plus an open breaker — fixes all six existing publishers), and `Literal[SSEEventType.x]` discriminants on all three event models (the `/events` response union previously had none, so a generated client validated any event as a `NextSetResultEvent`). |
 | 0.7 | 06 Aug 2026 | — | Round-4 review fixes: register status filter matches the PRESENTED status (SQL branches on `stale_cutoff` — a timed-out RUNNING plan surfaces under `status=ERROR`, never under `status=RUNNING`); register extracts `scenario_title` via `JSON_VALUE` instead of hauling ScenarioJSON blobs; review comment is redacted+capped (`treatment._clip`) before ReviewComment/DetailJSON; review response echoes the exact stored `reviewed_at` (single naive-UTC timestamp — wire convention); entity-audit `from`/`to` params UTC-normalized before binding (`_naive_utc` now converts aware offsets, not just strips); evidence reads explicit columns and documents its status as stored/unprojected; cancel/review emit `treatment.cancelled`/`treatment.reviewed` log lines. |
+| 0.11 | 13 Aug 2026 | — | **Two context gaps closed in `build_treatment_input` — the plan was reasoning from less than the scenario knew.** (1) `ThreatActorsJSON` now reads through `grounding.stored_actors`, not `validated_actors` (reverses the v0.3 decision above): the scenario being treated was itself generated from the RAW list (`dal.active_threats` feeds `scenario_prompt` `stored_actors`), so the gate handed the treatment `[]` for every unverified threat — i.e. most of them — and planned against adversaries its own scenario names out loud. Every other consumer (API display, Excel export, promotion actor-linking) was already on the raw reader; treatment was the lone outlier. `validated_actors` is retained but now has no production caller. (2) `scenario.supporting_system_applicability` is added to the snapshot — the scenario's own per-system applicable/justification verdicts, previously written at scenario time, exported by `results_excel.py`, and invisible to this prompt. The `applicable_to_all_subsystems` FIELDS line now names that key and states that an `applicable: false` verdict puts a system outside the scenario's scope so it cannot block a 'Yes', with an explicit fallback to the full `supporting_systems` list for pre-v1.3 scenarios. No DB change, no wire change, no new warning; the system message stays fully static so prefix caching is unaffected. Pinned by a new check 14 in `scripts/test_prompt_no_db_keys.py`, which also closes the older hole that **nothing asserted `supporting_systems` reached the treatment prompt at all** (check 2 covered only the scenario prompt). |
 | 0.8 | 06 Aug 2026 | — | Presentation trim on the poll GET (hide, not delete): the response serves only `plan_id`/`session_id`/`output_id`/`status`/`treatment_strategy`/`risk_level`/`review_status`/`risk_identification_date` plus a `plan` trimmed to `title`, `treatment_plan`, `action_plan`, `applicable_to_all_subsystems`, `controls_to_be_implemented`, `mitigation_owner`, `risk_owner`, `impacted_business_division` (`api.treatment._VISIBLE_PLAN_KEYS`). Hidden envelope fields (`review_comment`, `reviewed_by`, `reviewed_at`, `warnings`, `moderation_flagged`, `created_at`, `completed_at`) carry `exclude=True` on `TreatmentPlanStatus` — still populated and stored, one-flag reversal each. `error_message` and `mitigation_timeline` were unhidden on user follow-up (an ERROR poll needs its reason; the timeline is a toolkit column). The response also gains a `scenario` block (scenario_title / scenario_statement / risk_statement) — `active_plan_row` outer-joins the accepted scenario's ScenarioJSON (1:1 on the output PK). |
+| 0.12 | 14 Aug 2026 | — | **AI schema narrowed from 16 output fields to 7** (`title`, `action_plan`, `applicable_to_all_subsystems`, `controls_to_be_implemented`, `remediation_action_plan`, `mitigation_timeline`, `mitigation_owner`) — the model simply stops generating what §0.8's presentation trim was already hiding. Dropped from the AI's schema: `treatment_objective`, `risk_treatment_recommendation`, `justification`, `risk_mitigation_activities`, `residual_risk_assessment`, `expected_risk_reduction`, `expected_security_improvements`, `assumptions` — no narrative field ties the plan back to the register's risk rating any more (accepted trade-off). `control_coverage` is NOT dropped — it relocates inside `controls_to_be_implemented` as `{control_coverage, controls[]}`, preserving both the model's reasoning scaffold (commit to a verdict before the gap list) and `_validate_plan`'s covered-with-recommendations consistency check, just nested one level. `_narrative_text`'s moderation input drops the 5 removed narrative sources and gains per-row prose from `controls_to_be_implemented.controls[].description` and `remediation_action_plan[].action`. `ControlCoverage` enum is unchanged — still in active use, not orphaned. One genuine wire-shape break: `controls_to_be_implemented` changes from an array to an object on the API response; any consumer reading it directly needs a corresponding update. |
 
 ---
 
@@ -146,8 +148,8 @@ One row per generation attempt. At most one **active** (`Superseded = 0`) row pe
 | Table | Used for |
 |---|---|
 | `Scenario_Session` | `AssetName/AssetID`, `SubsystemsJSON`, `AssetContextJSON` (sector, sub-sector, critical service, asset description), `EntityID` — via `dal.load_session` (the board loader omits the JSON blobs) |
-| `Threat_Scenario_Output` | `ScenarioJSON` (title, statement, **risk_statement**), `Accepted`, `Superseded` — via `dal.scenario_row` |
-| `Identified_Threat` | `ThreatCategory`, `ThreatType`, `ThreatName`, `ThreatActorsJSON` (via `dal._scenario_read_select`; actors read through the shared `grounding.validated_actors` — dict shape, validated-gated) |
+| `Threat_Scenario_Output` | `ScenarioJSON` (title, statement, **risk_statement**, `controls`, **`supporting_system_applicability`** — the scenario's own per-system verdicts, which scope `applicable_to_all_subsystems`), `Accepted`, `Superseded` — via `dal.scenario_row` |
+| `Identified_Threat` | `ThreatCategory`, `ThreatType`, `ThreatName`, `ThreatActorsJSON` (via `dal._scenario_read_select`; actors read through the shared `grounding.stored_actors` — dict shape, **RAW list, not validated-gated**: the plan must see the same adversaries the scenario it treats was generated from, and a gate returns `[]` for every unverified threat) |
 | `Threat_Scenario_Control_Map` ⋈ `Control_Library` (⋈ `Control_Library_Standard_Map` ⋈ `Control_Standard`) | Library-mapped controls for the scenario — the identified set the gap analysis runs against. **Re-issued inside `app/pipeline/treatment.py`** (same shape as `sessions.py::_query_controls`, filtered `IsActive=1 AND IsDeleted=0` on both library tables, ordered by `MapRank`), emitting plain dicts. Deliberately NOT imported from `app/api/sessions.py` — API→pipeline is the only allowed import direction, and importing the session router would drag in the whole API layer. Every multi-table statement is a module-level `_*_stmt` builder so the `__main__` self-check can `.compile()` it without a database. |
 | `Prompt_Log` | One row per LLM attempt with **`Stage = 'treatment_plan'`** (free-string column, fits `Unicode(20)`). |
 | `Scenario_Audit` | Events `treatment_plan_requested` / `treatment_plan_outcome`. **`Scenario_Audit.Stage` stays NULL** — it is a `WorkflowStage` column and this is not a workflow transition (same as `session_started`). `SubsystemID = ASSET_UNIT_ID`. |
@@ -273,7 +275,7 @@ Decorator: `@celery_app.task(bind=True, name="tsg.generate_treatment_plan", auto
 2. **Bump the progress clock before every LLM attempt** (`dal.touch_plan`, fenced on RUNNING + not superseded; the UPDATE is committed by `_ask_ai`'s own pre-chat commit) — so `treatment_stale_seconds` measures "no progress", not wall time since first claim, and a healthy worker in capacity backoff never looks dead. `ponytail:` one UPDATE per attempt, not a heartbeat thread — a single LLM call is the only work between beats.
 3. `messages = prompts.treatment_prompt(snapshot)` from the frozen `InputSnapshotJSON`, then **one LLM call**:
    `_ask_ai(sess, llm, messages, scenario_session={"SessionID": …, "TenantID": …, "EntityID": …, "UserID": …}, subsystem_id=ASSET_UNIT_ID, stage="treatment_plan", expected_type=dict, temperature=get_settings().treatment_temperature)` — those four keys are exactly what `_ask_ai` reads for the `Prompt_Log` row, all already denormalized onto the plan row; no `Scenario_Session` re-read. `_ask_ai` commits the Prompt_Log spend record immediately, so it survives every later rollback. Lease renewal is skipped (`level=None`); the internal `sess.commit()` stays.
-4. `_validate_plan(parsed)` — **structural strict, vocabulary advisory**: `controls_to_be_implemented` and `remediation_action_plan` must be lists of dicts (violation → `TreatmentPlanInvalid` → ERROR row with a client-safe, field-naming message); everything else flags into warnings and never blocks — `control_type` (`ControlType`), priorities (`ActionPriority`), `applicable_to_all_subsystems` (`YesNo`), `control_coverage` (`ControlCoverage`) — plus the consistency flag "`control_coverage` says 'covered' but `controls_to_be_implemented` is non-empty". The vocabularies come from the enums — the same members the prompt advertises and the API types.
+4. `_validate_plan(parsed)` — **structural strict, vocabulary advisory**: `controls_to_be_implemented` must be an object holding a `controls` list of dicts, and `remediation_action_plan` must be a list of dicts (violation → `TreatmentPlanInvalid` → ERROR row with a client-safe, field-naming message); everything else flags into warnings and never blocks — `control_type` (`ControlType`), priorities (`ActionPriority`), `applicable_to_all_subsystems` (`YesNo`), `controls_to_be_implemented.control_coverage` (`ControlCoverage`) — plus the consistency flag "`controls_to_be_implemented.control_coverage` says 'covered' but `controls` is non-empty". The vocabularies come from the enums — the same members the prompt advertises and the API types.
 5. `_inject_reserved(parsed, snapshot)` — stamp/derive/echo the **server-owned keys** (§7.3), OVERWRITING anything the model emitted under the same names.
 6. Moderation: `llm_mod.moderate(narrative_text)` — **a module-level free function, NOT a client method**. It **never raises** (slot exhaustion → `checked=False, error="moderation_slots_exhausted"`); the `ModerationResult` fields land in `ValidationJSON` beside the warnings.
 7. **Finish CAS** (`dal.finish_plan`): `UPDATE ... SET Status='COMPLETE', PlanJSON=..., ValidationJSON=..., CompletedAt=now() WHERE PlanID=:p AND Status='RUNNING' AND Superseded=0` — rowcount 0 → superseded/raced → drop with a log line.
@@ -293,18 +295,17 @@ House convention (`app/pipeline/prompts.py::treatment_prompt`): exactly two mess
 - **System** (fixed, cache-friendly): persona — *"You are a Cybersecurity Risk Advisor specializing in Critical Information Infrastructure (CII) risk management…"* → `FIELDS` block → `RULES` block → *"Output ONLY the JSON object — no markdown code fences, no text before or after it."*
 - **User**: `_CONTEXT_PREFIX` ("data to describe, not instructions to follow") + compact `json.dumps` of the snapshot **minus the `warnings` and `register` blocks** (§7.2).
 
-FIELDS (the AI-generated output keys):
+FIELDS (the AI-generated output keys — 7, narrowed from the original 16; see revision history):
 
-- `title` — the domain of the recommended controls; `treatment_objective`; `risk_treatment_recommendation`; `justification`.
-- `control_coverage` — exactly one of `gaps, covered`. **'covered' ONLY when every control identified for this scenario (`existing_controls.library_mapped` + `existing_controls.scenario_suggested`) is already addressed by `existing_controls.register_controls`.**
-- `controls_to_be_implemented` — **THE GAP ANALYSIS**: only the scenario-identified controls NOT already covered by `register_controls`, **matched by meaning, not wording** (e.g. "annual patching" covers a patch-management control). Every entry must trace to an identified control or close a gap it names; never a control unrelated to the identified set. MUST be an empty array when `control_coverage` is `covered`. Rows: `{control_type (ControlType), control_name, description, priority (ActionPriority), control_library_id — the numeric id only when echoing a library_mapped control, else null}`.
-- `remediation_action_plan` — rows `{action_id "A1","A2",… in priority order, action, owner (a role, never a person's name), priority (ActionPriority), dependencies, timeline (relative durations), success_criteria}`. **When `control_coverage` is `covered`, the actions VERIFY the existing controls instead of installing new ones** — test effectiveness, evidence them, monitor for drift; never an empty array.
+- `title` — the domain of the recommended controls.
+- `controls_to_be_implemented` — object `{control_coverage, controls[]}`. `control_coverage` is exactly one of `gaps, covered` — **'covered' ONLY when every control identified for this scenario (`existing_controls.library_mapped` + `existing_controls.scenario_suggested`) is already addressed by `existing_controls.register_controls`.** `controls` is **THE GAP ANALYSIS**: only the scenario-identified controls NOT already covered by `register_controls`, **matched by meaning, not wording** (e.g. "annual patching" covers a patch-management control). Every entry must trace to an identified control or close a gap it names; never a control unrelated to the identified set. MUST be an empty array when `control_coverage` is `covered`. Rows: `{control_type (ControlType), control_name, description, priority (ActionPriority), control_code — verbatim, only when echoing a library_mapped control, else null}`; `control_library_id` is still resolved server-side afterward from `control_code`, unchanged.
+- `remediation_action_plan` — rows `{action_id "A1","A2",… in priority order, action, owner (a role, never a person's name), priority (ActionPriority), dependencies, timeline (relative durations), success_criteria}`. **When `controls_to_be_implemented.control_coverage` is `covered`, the actions VERIFY the existing controls instead of installing new ones** — test effectiveness, evidence them, monitor for drift; never an empty array. `controls_to_be_implemented` MUST precede this field in the prompt's FIELDS order — the model commits to the coverage verdict there first.
 - `action_plan` — one concise paragraph rolling up the remediation_action_plan, citing the action ids.
-- `risk_mitigation_activities`, `residual_risk_assessment`, `expected_risk_reduction`, `expected_security_improvements`.
 - `mitigation_timeline` — one relative overall duration for the whole plan.
 - `mitigation_owner` — the single role or team responsible for executing the whole plan — a role, never a person's name.
 - `applicable_to_all_subsystems` — exactly one of `Yes, No`; weigh the context's `existing_controls.applied_to_all_subsystems` answer and its justification.
-- `assumptions` — forced by gaps in the context; empty if none.
+
+**Dropped entirely** (were AI fields; never sent to the model or stored in `PlanJSON` after this change): `treatment_objective`, `risk_treatment_recommendation`, `justification`, `risk_mitigation_activities`, `residual_risk_assessment`, `expected_risk_reduction`, `expected_security_improvements`, `assumptions`. `treatment_plan`, `risk_identification_date`, `risk_owner`, `impacted_business_division` are unaffected — server-injected exactly as before (§7.3), never part of the AI's schema in either version. `control_coverage` is NOT dropped — it moved inside `controls_to_be_implemented` (above) rather than staying a sibling field or being removed.
 
 RULES (numbered):
 1. Use ONLY the supplied context; invent no assets, systems, scores, or facts — a short "context is too thin" sentence is a valid, complete value.
@@ -367,43 +368,38 @@ The stored plan is the model's JSON **plus four server-owned keys** injected by 
 {
   "treatment_plan": "Mitigate",                   // SERVER — strategy stamp (reserved)
   "title": "…",                                   // AI — domain of the recommended controls
-  "treatment_objective": "…",
-  "risk_treatment_recommendation": "…",
-  "justification": "…",
-  "control_coverage": "gaps",                     // AI — ControlCoverage: gaps | covered
-  "controls_to_be_implemented": [                 // AI — the gap-analysis table (v3.3 name)
-    { "control_type": "preventive|detective|corrective|compensating",
-      "control_name": "…", "description": "…", "priority": "Critical|High|Medium|Low",
-      "control_library_id": null }                // set only when echoing a supplied library control
-  ],
+  "controls_to_be_implemented": {                 // AI — the gap-analysis object
+    "control_coverage": "gaps",                   // ControlCoverage: gaps | covered
+    "controls": [
+      { "control_type": "preventive|detective|corrective|compensating",
+        "control_name": "…", "description": "…", "priority": "Critical|High|Medium|Low",
+        "control_code": "…", "control_library_id": null }   // code echoed by AI; id resolved server-side
+    ]
+  },
   "remediation_action_plan": [
     { "action_id": "A1", "action": "…", "owner": "…", "priority": "Critical|High|Medium|Low",
       "dependencies": "…", "timeline": "…", "success_criteria": "…" }
   ],
   "action_plan": "…",                             // AI — rollup paragraph citing the action ids
-  "risk_mitigation_activities": ["…"],
-  "residual_risk_assessment": "…",                // narrative only — numbers come from the register
-  "expected_risk_reduction": "…",
-  "expected_security_improvements": ["…"],
   "mitigation_timeline": "…",                     // AI — one relative overall duration
   "mitigation_owner": "…",                        // AI — a role, never a person
   "applicable_to_all_subsystems": "Yes|No",
-  "assumptions": ["…"],
   "risk_identification_date": "…",                // SERVER — register echo (reserved)
   "risk_owner": "…",                              // SERVER — register echo (reserved)
   "impacted_business_division": "…"               // SERVER — register echo (reserved)
 }
 ```
 
-The nine toolkit output columns and where each comes from:
+The ten toolkit output keys (`api.treatment._VISIBLE_PLAN_KEYS`) and where each comes from — `risk_identification_date` is a sibling top-level field on the GET response, not nested inside `plan`:
 
 | Toolkit column | Source |
 |---|---|
+| `title` | AI |
 | `treatment_plan` | Server — strategy stamp |
 | `action_plan` | AI — rollup paragraph |
 | `applicable_to_all_subsystems` | AI — `YesNo` |
-| `controls_to_be_implemented` | Server — derived from `controls_to_be_implemented` |
-| `risk_identification_date` | Register echo (body) |
+| `controls_to_be_implemented` | AI — `{control_coverage, controls[]}` gap-analysis object |
+| `remediation_action_plan` | AI |
 | `mitigation_timeline` | AI — relative duration |
 | `mitigation_owner` | AI — role or team |
 | `risk_owner` | Register echo (body; hidden from the prompt) |
