@@ -13,8 +13,9 @@ cancels sessions that are genuinely stuck (not just between stages).
 **When you need it:** always, in any environment where the pipeline runs. Without it, a crashed
 worker leaves a session's lock permanently `RUNNING` and it can never be worked on again.
 
-**How it runs:** automatically. `celery beat` fires task `tsg.reap` on a schedule — you don't
-call it directly. Start everything (API + worker + beat) with:
+**How it runs:** automatically. `celery beat` enqueues task `tsg.reap` on a schedule — you don't
+call it directly. The task executes ON the worker (beat only schedules it): with no live worker,
+the ticks queue up in the broker and nothing is reaped until the next worker boots and drains them. Start everything (API + worker + beat) with:
 
 ```powershell
 .\start.ps1

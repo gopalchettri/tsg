@@ -1,7 +1,7 @@
 """Liveness / readiness probes for production orchestrators (OpenShift / K8s).
 
 No authentication — these are called by the platform's health checks, not users.
-`/healthz` = the process is up. `/readyz` = every dependency the app actually
+`/health` = the process is up. `/readyz` = every dependency the app actually
 needs (database, Redis, and Mongo when it's in use) is reachable right now.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ router = APIRouter(tags=["Health"])
 logger = get_logger(__name__)
 
 
-@router.get("/healthz")
+@router.get("/health")
 def healthz() -> dict:
     """Liveness probe — returns 200 unconditionally, does not check DB reachability (that's readyz's job)."""
     return {"status": "ok"}

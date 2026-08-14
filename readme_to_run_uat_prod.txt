@@ -128,7 +128,7 @@ curl https://<uat-host>/v1/tsg/threat-library/embeddings/status/<job_id> \
 # =============================================================================================
 # STEP 5. VERIFY THE APPLICATION
 # =============================================================================================
-curl https://<uat-host>/healthz     # 200 {"status":"ok"} -- process is alive
+curl https://<uat-host>/health      # 200 {"status":"ok"} -- process is alive
 curl https://<uat-host>/readyz      # 200 {"status":"ready"} -- DB + Redis + Mongo all reachable
 
 # Then walk documents/API_Smoke_Testing_Guide.md (4-hour guide, P1 section first).

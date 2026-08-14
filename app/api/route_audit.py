@@ -62,7 +62,7 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
 # presence keeps the exemption true (`None` = legitimately no auth at all). Re-checked every
 # boot: if someone drops `require_admin`, the exemption is now a lie and this fails closed.
 _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
-    ("GET", "/healthz"): None,  # platform health check, no caller identity involved
+    ("GET", "/health"): None,  # platform health check, no caller identity involved
     ("GET", "/readyz"): None,  # platform health check, no caller identity involved
     # Static HTML only — a dev SSE test harness, mounted ONLY on a local/dev APP_ENV (see
     # app/main.py). It carries no data: every API call the page makes is a separate, normally

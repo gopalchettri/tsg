@@ -25,3 +25,4 @@ scripts/redis_acl_check.py
 # NOTE: the blobs committed in 3774a82 remain reachable in history; this only stops future churn.
 *.zip
 uvicorn_*.log
+logs/

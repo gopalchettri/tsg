@@ -156,7 +156,7 @@ curl -s -o /dev/null -w "%{http_code}\n" https://tsg.example.com/v1/entities/86/
 curl -s -o /dev/null -w "%{http_code}\n" https://tsg.example.com/v1/entities/86/scenarios \
   -H "X-API-Key: <SECRET>" -H "X-User-Id: 1138" -H "X-Entity-Id: 86"
 # Health probe (no auth) → 200
-curl -s -o /dev/null -w "%{http_code}\n" https://tsg.example.com/healthz
+curl -s -o /dev/null -w "%{http_code}\n" https://tsg.example.com/health
 ```
 
 ---

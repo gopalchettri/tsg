@@ -14,6 +14,10 @@
 services:
   api:
     image: tsg:latest
+    # restart on every service: healthchecks (below) only MARK a container unhealthy — nothing
+    # acted on a crash until this. Beat matters most: a dead beat = no reaper = a crashed
+    # session holds its per-asset lock (409) until a human notices.
+    restart: unless-stopped
     command: ["gunicorn", "app.main:app", "-k", "uvicorn.workers.UvicornWorker",
               "-w", "4", "-b", "0.0.0.0:8000", "--timeout", "120"]
     env_file: [../.env.uat]   # UAT and production share one file (.env.prod.example documents it)
@@ -40,6 +44,7 @@ services:
 
   worker:
     image: tsg:latest
+    restart: unless-stopped
     command: ["celery", "-A", "app.pipeline.celery_worker.celery_app", "worker",
               "-P", "gevent", "-c", "50", "-l", "info"]
     env_file: [../.env.uat]   # UAT and production share one file (.env.prod.example documents it)
@@ -56,7 +61,10 @@ services:
     # [REVIEW-FIX] worker previously had no healthcheck at all — a gevent greenlet deadlock
     # leaves the container process alive (Docker sees no crash) with nothing to restart it.
     # `inspect ping` only succeeds if the worker's event loop is actually responsive, not just
-    # that the process exists.
+    # that the process exists. KNOWN LIMIT: plain docker compose never auto-restarts an
+    # unhealthy-but-ALIVE container -- `restart: unless-stopped` acts on exits (crashes) only.
+    # A hung worker therefore surfaces as "unhealthy" for monitoring and needs an operator (or
+    # an autoheal sidecar / swarm, if that ever matters) to bounce it.
     # [REVIEW-FIX] start_period: `inspect ping` can't get a reply until Celery's Consumer
     # bootstep is up, which only happens AFTER the synchronous worker_init handler
     # (_init_worker, app/pipeline/celery_app.py) fully returns — a DB round-trip, a local
@@ -82,6 +90,7 @@ services:
 
   beat:
     image: tsg:latest
+    restart: unless-stopped
     command: ["celery", "-A", "app.pipeline.celery_app.celery_app", "beat", "-l", "info"]
     env_file: [../.env.uat]   # UAT and production share one file (.env.prod.example documents it)
     depends_on:
@@ -113,6 +122,7 @@ services:
   # The authoritative record of what the pipeline did is Scenario_Audit in the database.
   flower:
     image: tsg:latest
+    restart: unless-stopped
     # --basic-auth is REQUIRED: Flower has no auth by default and exposes task revoke/terminate
     # to anyone who reaches the port. The guard lives HERE, in Flower's own startup, rather than
     # in the app's assert_security_posture(): that runs in the api/worker processes, which would
@@ -162,6 +172,9 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Not in the original plan's four, but a crashed redis takes the whole stack down with it —
+    # same one-line fix, no reason to leave the broker as the one unprotected piece.
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes: ["redis-data:/data"]
     healthcheck:

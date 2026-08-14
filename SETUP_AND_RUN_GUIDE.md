@@ -29,7 +29,7 @@ ALTER DATABASE TSG SET READ_COMMITTED_SNAPSHOT ON;
 | Secrets             | `.env` file                     | **OpenShift Secrets / Vault** (never committed)   |
 | Embeddings/reranker | local in-process                  | **served on GPU via litellm/TEI** (recommended)   |
 | DB reads            | default                           | **RCSI on**, connection pools sized               |
-| Health              | none                              | **`/healthz`, `/readyz`** probes              |
+| Health              | none                              | **`/health`, `/readyz`** probes              |
 
 ---
 
@@ -127,7 +127,7 @@ This starts **api** (gunicorn + 4 uvicorn workers), **worker** (Celery, gevent, 
 (commands = the api/worker/beat commands in `compose.prod.yml`), a **Route** to the api on port 8000,
 a **Secret + ConfigMap** for the env, and health probes:
 
-- **liveness** → `GET /healthz`
+- **liveness** → `GET /health`
 - **readiness** → `GET /readyz`
 
 Scale the **api** and **worker** Deployments to add capacity (they're stateless; §concurrency).
@@ -137,7 +137,7 @@ Scale the **api** and **worker** Deployments to add capacity (they're stateless;
 ## 6. Verify it started healthy
 
 ```bash
-curl http://YOUR_HOST:8000/healthz    # {"status":"ok"}
+curl http://YOUR_HOST:8000/health     # {"status":"ok"}
 curl http://YOUR_HOST:8000/readyz     # {"status":"ready","checks":{"database":"ok","redis":"ok","mongo":"ok"}}
 ```
 

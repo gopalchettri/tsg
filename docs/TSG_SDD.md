@@ -48,7 +48,7 @@ The product goal: give analysts a defensible, explainable starting point — eve
 | **Analyst** (entity-scoped user) | Creates sessions, watches progress (SSE/polling), reviews and accepts scenarios, regenerates, requests next sets and treatment plans. |
 | **Curator / Administrator** (shared admin key) | Maintains the threat and control libraries, scoping rules, and the prompt-context allowlist; imports open-source libraries; manages embeddings and intel feeds. |
 | **Platform** | Supplies asset/entity onboarding data; caller identity for each request is asserted via the header model (see docs/TSG_API_AUTHENTICATION_GUIDE.md), not issued by the platform. (The risk register data treatment plans consume arrives in the request body — TSG reads no risk-module tables.) |
-| **Scheduler (Celery beat)** | Reaps stuck sessions, runs operational self-checks, refreshes threat-intel feeds daily. |
+| **Scheduler (Celery beat)** | Schedules the reaper, operational self-checks, and daily threat-intel refresh — the jobs themselves execute on the worker. |
 
 ### 2.3 Technology stack
 
@@ -238,7 +238,7 @@ Supporting rules, each learned from a real failure mode:
 - **Commit immediately after every acquire/claim.** An uncommitted lock is both invisible to others and held as a real SQL Server row lock that only the owning (possibly blocked) greenlet can release; and a later error-path rollback would silently undo the acquisition while the code believes it holds the lock.
 - **Leases + heartbeat renewal.** Every claim sets `LeaseExpiresAt`; the single AI choke point `_ask_ai` renews both the stage lease and the lock lease on every call, and loops without LLM calls renew explicitly. The lease floor is derived from the LLM timeout budget so the reaper can never kill a slow-but-alive call (§14).
 - **Epochs are reserved by the caller, never minted in the task.** The regenerate/next-set endpoints CAS-reserve the epoch and pass it in; a redelivered task re-executes at the same epoch, so its claims no-op against already-terminal rows instead of double-generating.
-- **The reaper** (beat, every 60 s) flips expired RUNNING stages to ERROR, frees expired locks, and closes out abandoned sessions using the same outcome rule the pipeline uses. A session sitting at REVIEW is a legitimate human wait and is never reaped.
+- **The reaper** (scheduled by beat every 60 s, executed on the worker) flips expired RUNNING stages to ERROR, frees expired locks, and closes out abandoned sessions using the same outcome rule the pipeline uses. A session sitting at REVIEW is a legitimate human wait and is never reaped. Because the reap task executes on the worker, a dead worker means no reaping until a worker returns — the deployment's worker restart policy is what guarantees recovery, not beat staying up.
 
 ### 6.4 Supersede, never delete
 
@@ -537,7 +537,7 @@ The patterns above compose into a fixed sequence; missing a step fails *silently
 
 All business routes require a header-model principal (`X-API-Key`+`X-User-Id`+`X-Entity-Id`+`X-Tenant-Id`, see docs/TSG_API_AUTHENTICATION_GUIDE.md); admin routes additionally require the shared admin key and drop `X-Entity-Id` — they act on shared cross-tenant master data, so they resolve `get_admin_principal` rather than `get_principal` (§12.2). Every error is the same envelope: `{"error_code", "message", "details"?}`.
 
-**Health probes — the only unauthenticated surface.** `GET /healthz` answers 200 unconditionally (process liveness). `GET /readyz` probes the dependencies actually needed *right now*, concurrently (so an outage costs the slowest timeout, not the sum): SQL Server, Redis, and MongoDB — the Mongo probe is reported `skipped` when the embedding store isn't Mongo, because probing an unused dependency would be a false alarm. Any failure returns 503 `not_ready` with per-dependency ok/error/skipped labels; failure detail is logged server-side and never returned. Both routes are explicit, verified exemptions in the boot route audit (§3.3).
+**Health probes — the only unauthenticated surface.** `GET /health` answers 200 unconditionally (process liveness). `GET /readyz` probes the dependencies actually needed *right now*, concurrently (so an outage costs the slowest timeout, not the sum): SQL Server, Redis, and MongoDB — the Mongo probe is reported `skipped` when the embedding store isn't Mongo, because probing an unused dependency would be a false alarm. Any failure returns 503 `not_ready` with per-dependency ok/error/skipped labels; failure detail is logged server-side and never returned. Both routes are explicit, verified exemptions in the boot route audit (§3.3).
 
 ### 11.1 Session & scenario routes (`/v1`)
 

@@ -88,6 +88,24 @@ if (-not (Test-Path $envFile)) {
     Write-Warning "$envFile not found. Copy .env.example to .env and fill in real values first."
 }
 
+# Refuse to double-launch. Two workers on one box race the same queue (and, before -n below,
+# under identical broker hostnames). NOTE: ONE healthy stack normally shows a celery.exe +
+# TWO python.exe chain per service (launcher parent + real process) -- matched python.exe
+# pairs are NOT evidence of a double launch; this guard checks before spawning, so it only
+# ever fires on a genuine second start.ps1 run (or a half-dead leftover window). The port
+# pre-flight below only protects uvicorn/flower; nothing guarded the worker until this.
+$existingWorkers = Get-CimInstance Win32_Process |
+    Where-Object { $_.CommandLine -like '*celery_worker.celery_app worker*' }
+if ($existingWorkers) {
+    $workerPids = ($existingWorkers | Select-Object -ExpandProperty ProcessId) -join ', '
+    throw "A TSG celery worker is already running (PID $workerPids) -- the stack is already up. Run .\stop.ps1 first."
+}
+
+# Worker/beat output is tee'd to files below so a dead worker's last words survive the window
+# closing (the 2026-08-14 "reaped: worker gone" incident was undiagnosable without this).
+$logsDir = Join-Path $ProjectRoot 'logs'
+New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
+
 Write-Host "Project root : $ProjectRoot" -ForegroundColor Cyan
 Write-Host "FastAPI port : $Port"        -ForegroundColor Cyan
 Write-Host "Concurrency  : $Concurrency" -ForegroundColor Cyan
@@ -212,7 +230,11 @@ function Start-InNewWindow {
 
     $parts = @(
         ("Set-Location -LiteralPath '" + $WorkDir + "'"),
-        ("& '" + $VenvActivate + "'")
+        ("& '" + $VenvActivate + "'"),
+        # Unbuffered stdout: the worker/beat windows pipe through Tee-Object, and Python
+        # block-buffers stdout into a pipe -- a hard-killed worker's final (most important)
+        # lines would die in the buffer instead of reaching the log file.
+        '$env:PYTHONUNBUFFERED = ''1'''
     )
     if ($WindowTitle) {
         $parts += ('$Host.UI.RawUI.WindowTitle = ''' + $WindowTitle + '''')
@@ -236,7 +258,18 @@ function Start-InNewWindow {
 # etc.), a bare `celery` silently falls through to whatever global Python is on
 # PATH, which has celery but not gevent -- reproduced live, worker crashes with
 # "ModuleNotFoundError: No module named 'gevent'" instead of starting.
-$celeryCmd = "& '$celeryExe' -A app.pipeline.celery_worker.celery_app worker -P gevent -c $Concurrency -l info"
+# -n gives this worker a unique broker identity. Celery's default is celery@<hostname>, so two
+# bare workers on one Windows box register under the IDENTICAL node name and the broker can't
+# tell them apart (heartbeat/ack ambiguity). ${PID} = this launcher shell's PID -- unique per
+# start.ps1 invocation; %h = celery's own hostname substitution.
+#
+# 2>&1 merges celery's stderr (its own logging) with stdout (the app's structlog JSON, which
+# bypasses celery logging -- see app/core/logging.py); ForEach ToString() flattens PS 5.1's
+# ErrorRecord-wrapped stderr lines back to plain text; Tee-Object -Append keeps the live window
+# AND a durable file, and never clobbers a previous run's evidence.
+# ponytail: no rotation -- logs/ grows unbounded; add size-capped rotation if it ever matters.
+$workerLog = Join-Path $logsDir 'celery.log'
+$celeryCmd = "& '$celeryExe' -A app.pipeline.celery_worker.celery_app worker -P gevent -c $Concurrency -l info -n tsg-worker-${PID}@%h 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$workerLog' -Append"
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
                   -InnerCommand $celeryCmd -WindowTitle 'tsg-celery'
 Write-Host "Celery worker starting in a new window (title: tsg-celery)..." -ForegroundColor Green
@@ -261,8 +294,10 @@ if ((Test-Path $beatScheduleDat) -and (Get-Item $beatScheduleDat).Length -eq 0) 
     Remove-Item -Path (Join-Path $ProjectRoot 'celerybeat-schedule.*') -Force -ErrorAction SilentlyContinue
 }
 
-# Full path -- same reason as $celeryCmd above.
-$beatCmd = "& '$celeryExe' -A app.pipeline.celery_app.celery_app beat -l info"
+# Full path -- same reason as $celeryCmd above. Same tee-to-file too: beat drives the reaper,
+# so its output is the other half of any worker-death post-mortem.
+$beatLog = Join-Path $logsDir 'beat.log'
+$beatCmd = "& '$celeryExe' -A app.pipeline.celery_app.celery_app beat -l info 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$beatLog' -Append"
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
                   -InnerCommand $beatCmd -WindowTitle 'tsg-beat'
 Write-Host "Celery beat starting in a new window (title: tsg-beat)..." -ForegroundColor Green
@@ -445,7 +480,7 @@ if (-not $NoFlower) {
 Write-Host ""
 Write-Host "All services launched. Verify with:" -ForegroundColor Cyan
 Write-Host "  Celery worker:  $(if ($workerReady) { 'ready (registered)' } else { 'NOT READY - see tsg-celery window' })" -ForegroundColor $(if ($workerReady) { 'Green' } else { 'Yellow' })
-Write-Host "  curl http://127.0.0.1:$Port/healthz" -ForegroundColor Cyan
+Write-Host "  curl http://127.0.0.1:$Port/health" -ForegroundColor Cyan
 Write-Host "  curl http://127.0.0.1:$Port/readyz"  -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Stop everything with: .\stop.ps1" -ForegroundColor Cyan
