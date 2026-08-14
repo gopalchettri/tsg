@@ -25,7 +25,13 @@
     HTTP port for the FastAPI server. Default 8000.
 
 .PARAMETER Concurrency
-    Celery gevent-pool concurrency. Default 50, matching docker/compose.prod.yml.
+    Celery gevent-pool concurrency (the worker's -c flag). Default 50, matching
+    docker/compose.prod.yml. This is how many tasks ONE worker runs in parallel — gevent
+    greenlets (cooperative threads in one process, right for IO-bound LLM/DB calls), not OS
+    processes. Since worker_prefetch_multiplier=1 (app/pipeline/celery_app.py), it is also
+    the most messages the worker may reserve from the queue — reservation can never exceed
+    what is actually running. Lower it (e.g. -Concurrency 10) on a laptop or when the LLM
+    endpoint rate-limits.
 
 .PARAMETER Reload
     Pass -Reload to start uvicorn with --reload.

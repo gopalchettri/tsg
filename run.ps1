@@ -27,7 +27,10 @@
     HTTP port for FastAPI. Passed through to start.ps1. Default 8000.
 
 .PARAMETER Concurrency
-    Celery gevent-pool concurrency. Passed through to start.ps1. Default 50.
+    Celery gevent-pool concurrency (the worker's -c flag: parallel task slots for one
+    worker, gevent greenlets not processes). Passed through to start.ps1. Default 50 —
+    see start.ps1's .PARAMETER Concurrency help for the full explanation and when to
+    lower it.
 
 .PARAMETER Reload
     Start uvicorn with --reload. Passed through to start.ps1.

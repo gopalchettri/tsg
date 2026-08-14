@@ -45,6 +45,12 @@ services:
   worker:
     image: tsg:latest
     restart: unless-stopped
+    # -c 50 = CONCURRENCY: this worker runs up to 50 tasks in parallel. With -P gevent those
+    # are greenlets (cheap cooperative threads inside ONE process — right for our IO-bound
+    # LLM/DB calls), not 50 OS processes. Because worker_prefetch_multiplier=1 is set in
+    # app/pipeline/celery_app.py, 50 is ALSO the most messages this worker may reserve from
+    # the queue — it can no longer hoard 4x that while others sit idle. Tune -c to LLM
+    # capacity; remember each extra replica adds another 50 parallel slots on the same queue.
     command: ["celery", "-A", "app.pipeline.celery_worker.celery_app", "worker",
               "-P", "gevent", "-c", "50", "-l", "info"]
     env_file: [../.env.uat]   # UAT and production share one file (.env.prod.example documents it)
