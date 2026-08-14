@@ -84,7 +84,8 @@ def check_semantic_duplicates_same_category() -> None:
     threats = [_threat("t1", "alpha disclosure of records"),
                _threat("t2", "alpha leakage of records")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
-    assert dupes == {"t2"}, dupes  # first wins, later duplicate dropped
+    assert set(dupes) == {"t2"}, dupes  # first wins, later duplicate dropped
+    assert dupes["t2"]["duplicate_of_threat_id"] == "t1", dupes  # linked to its survivor
     print("ok  _semantic_duplicates drops a same-meaning threat")
 
 
@@ -95,7 +96,7 @@ def check_semantic_duplicates_identical_labels() -> None:
     llm = _StubLLM()
     threats = [_threat("t1", "alpha disclosure"), _threat("t2", "alpha disclosure")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
-    assert dupes == {"t2"}, dupes
+    assert set(dupes) == {"t2"}, dupes
     print("ok  _semantic_duplicates catches byte-identical labels")
 
 
@@ -109,12 +110,12 @@ def check_semantic_duplicates_category_gate() -> None:
     threats = [_threat("t1", "alpha disclosure", category="Information Disclosure"),
                _threat("t2", "trapx modification", category="Tampering")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
-    assert dupes == set(), dupes
+    assert dupes == {}, dupes
     # cosine 1.0 (same first word) across categories -> at/above 0.98 -> relabel caught.
     threats = [_threat("t1", "alpha disclosure", category="Information Disclosure"),
                _threat("t2", "alpha disclosure", category="Tampering")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
-    assert dupes == {"t2"}, dupes
+    assert set(dupes) == {"t2"}, dupes
     print("ok  _semantic_duplicates cross-category ceiling: trap survives, relabel caught")
 
 
@@ -163,7 +164,7 @@ def check_semantic_duplicates_no_chain_drop() -> None:
     llm = _StubLLM()
     threats = [_threat("t1", "alpha one"), _threat("t2", "alpha two"), _threat("t3", "beta three")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
-    assert dupes == {"t2"}, dupes  # t3 is orthogonal to the survivor and must be kept
+    assert set(dupes) == {"t2"}, dupes  # t3 is orthogonal to the survivor and must be kept
     print("ok  _semantic_duplicates does not chain-drop")
 
 
@@ -173,7 +174,8 @@ def check_semantic_duplicates_against_priors() -> None:
     priors = [_threat("p1", "alpha disclosure of records")]
     threats = [_threat("t1", "alpha leakage of records"), _threat("t2", "beta outage")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, priors, ASSET, threshold=0.92)
-    assert dupes == {"t1"}, dupes
+    assert set(dupes) == {"t1"}, dupes
+    assert dupes["t1"]["duplicate_of_threat_id"] == "p1", dupes  # linked to the prior-round threat
     print("ok  _semantic_duplicates compares against prior rounds")
 
 
@@ -187,7 +189,7 @@ def check_semantic_scan_failure_is_not_fatal() -> None:
     dupes = _semantic_duplicates(_Boom(), "sess", 0,
                                  [_threat("t1", "alpha one"), _threat("t2", "alpha two")],
                                  None, ASSET, threshold=0.92)
-    assert dupes == set(), dupes
+    assert dupes == {}, dupes
     print("ok  _semantic_duplicates degrades safely on embed failure")
 
 
@@ -278,14 +280,16 @@ def check_present_status_cutoff_is_caller_controlled() -> None:
     old_cutoff = now - timedelta(seconds=5)     # updated_at is BEFORE this -> stale
     new_cutoff = now - timedelta(seconds=20)    # updated_at is AFTER this -> fresh
 
-    status, _err = _present_status(str(StageStatus.RUNNING), None, fresh_updated_at, old_cutoff)
+    status, _err, reason = _present_status(str(StageStatus.RUNNING), None, fresh_updated_at, old_cutoff)
     assert status == str(StageStatus.ERROR), status  # stale relative to the caller's own cutoff
+    assert reason == "timed_out", reason  # the projection-only reason, no other writer exists
 
-    status2, _err2 = _present_status(str(StageStatus.RUNNING), None, fresh_updated_at, new_cutoff)
+    status2, _err2, reason2 = _present_status(str(StageStatus.RUNNING), None, fresh_updated_at, new_cutoff)
     assert status2 == str(StageStatus.RUNNING), status2  # fresh relative to a DIFFERENT cutoff
+    assert reason2 is None, reason2
 
     # COMPLETE/ERROR rows are never subject to staleness at all, regardless of clock.
-    status3, _err3 = _present_status(str(StageStatus.COMPLETE), None, fresh_updated_at, old_cutoff)
+    status3, _err3, _reason3 = _present_status(str(StageStatus.COMPLETE), None, fresh_updated_at, old_cutoff)
     assert status3 == str(StageStatus.COMPLETE), status3
     print("ok  _present_status: staleness decided by the caller's cutoff, not an internal clock")
 

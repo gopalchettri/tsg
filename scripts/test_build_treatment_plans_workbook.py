@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.api.schemas import TreatmentPlanStatus  # noqa: E402
+from app.api.treatment import _normalize_plan_shape  # noqa: E402
 from app.api.treatment_plan_excel import (  # noqa: E402
     _COLUMNS,
     _sanitize,
@@ -128,6 +129,32 @@ def main() -> None:
     assert _sanitize("normal text") == "normal text"
     assert _sanitize(None) is None  # non-strings pass through untouched
     print("8 OK  formula-injection guard neutralizes a leading '=' / '+' without touching normal values")
+
+    # 9 — legacy PlanJSON shape (pre-v0.12): a bare controls array + top-level control_coverage
+    # must be lifted into the nested shape by the API's read-time normalizer, and the workbook
+    # must render the result — the exact pre-deploy-data crash the review surfaced.
+    legacy_plan = {
+        "title": "Legacy", "treatment_plan": "Mitigate", "control_coverage": "gaps",
+        "controls_to_be_implemented": [
+            {"control_type": "preventive", "control_name": "MFA on RDP", "description": "d",
+             "priority": "High", "control_code": "CII-CID-070", "control_library_id": 70}],
+        "remediation_action_plan": [],
+    }
+    norm = _normalize_plan_shape(legacy_plan)
+    assert norm["controls_to_be_implemented"]["control_coverage"] == "gaps"
+    assert norm["controls_to_be_implemented"]["controls"][0]["control_code"] == "CII-CID-070"
+    new_shape = {"controls_to_be_implemented": {"control_coverage": "covered", "controls": []}}
+    assert _normalize_plan_shape(new_shape) is new_shape          # current shape: pass-through
+    assert _normalize_plan_shape(None) is None
+    legacy_status = TreatmentPlanStatus(
+        plan_id="plan-3", session_id=SESSION_ID, output_id="out-3", status="COMPLETE",
+        treatment_strategy="Mitigate", scenario=None, risk_level="High", review_status=None,
+        risk_identification_date=None, plan=norm, error_message=None, reason=None)
+    wb_legacy = build_treatment_plans_workbook(SESSION_ID, [legacy_status])
+    legacy_cell = wb_legacy["Treatment Plans"].cell(
+        row=2, column=_COLUMNS.index("controls_to_be_implemented") + 1).value
+    assert "CII-CID-070" in legacy_cell, legacy_cell
+    print("9 OK  legacy array-shaped plan normalizes to the nested shape and renders")
 
     print("\nbuild_treatment_plans_workbook self-check OK")
 

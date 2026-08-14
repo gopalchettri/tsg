@@ -87,6 +87,28 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Session', 'PromotionUserID') IS NULL
     ALTER TABLE Scenario_Session ADD PromotionUserID nvarchar(200) NULL;
 
+-- Widen the enum-backed status columns on PRE-EXISTING databases (fresh installs already get
+-- nvarchar(100) from the CREATE above). nvarchar(20) could not hold
+-- 'SCENARIOS_AWAITING_DECISION' (27 chars) — the documented review-barrier freeze;
+-- TSG_Verify.sql section 4 FAILs on any enum column narrower than its longest value.
+-- Width-guarded so re-runs no-op; -1 (nvarchar(max)) excluded; NOT NULL restated because
+-- ALTER COLUMN otherwise resets nullability. Length-only widening is legal in place: none of
+-- these columns is in a PK, and CK_Session_Status tolerates variable-length widening.
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_NAME = 'Scenario_Session' AND COLUMN_NAME = 'SessionStatus'
+             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
+    ALTER TABLE Scenario_Session ALTER COLUMN SessionStatus nvarchar(100) NOT NULL;
+
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_NAME = 'Scenario_Session' AND COLUMN_NAME = 'CurrentStage'
+             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
+    ALTER TABLE Scenario_Session ALTER COLUMN CurrentStage nvarchar(100) NOT NULL;
+
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_NAME = 'Scenario_Session' AND COLUMN_NAME = 'StageStatus'
+             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
+    ALTER TABLE Scenario_Session ALTER COLUMN StageStatus nvarchar(100) NOT NULL;
+
 IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NULL
 CREATE TABLE Subsystem_Stage_State (
     StateID          uniqueidentifier NOT NULL CONSTRAINT PK_Subsystem_Stage_State PRIMARY KEY,
@@ -110,6 +132,19 @@ CREATE TABLE Subsystem_Stage_State (
 IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Subsystem_Stage_State', 'CreatedAt') IS NULL
     ALTER TABLE Subsystem_Stage_State ADD CreatedAt datetime2 NULL CONSTRAINT DF_StageState_CreatedAt DEFAULT SYSUTCDATETIME();
+
+-- Same pre-existing-database widening as Scenario_Session above: Status receives the same
+-- StageStatus enum values (incl. the 27-char 'SCENARIOS_AWAITING_DECISION'); Level widened in
+-- lockstep with the CREATE so models.py and the physical schema agree.
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_NAME = 'Subsystem_Stage_State' AND COLUMN_NAME = 'Level'
+             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
+    ALTER TABLE Subsystem_Stage_State ALTER COLUMN Level nvarchar(100) NOT NULL;
+
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_NAME = 'Subsystem_Stage_State' AND COLUMN_NAME = 'Status'
+             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
+    ALTER TABLE Subsystem_Stage_State ALTER COLUMN Status nvarchar(100) NOT NULL;
 
 IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NULL
 CREATE TABLE Identified_Threat (

@@ -377,14 +377,14 @@ class TreatmentReviewStatus(StrEnum):
 
 
 class ControlCoverage(StrEnum):
-    """`plan.control_coverage` — did the request's existing controls already cover every control
-    identified at scenario generation?"""
+    """`plan.controls_to_be_implemented.control_coverage` — did the request's existing controls
+    already cover every control identified at scenario generation?"""
     gaps = "gaps"          # at least one identified control is uncovered -> controls to implement
     covered = "covered"    # fully covered -> empty to-implement list; action plan pivots to verification
 
 
 class ControlType(StrEnum):
-    """`plan.controls_to_be_implemented[].control_type`."""
+    """`plan.controls_to_be_implemented.controls[].control_type`."""
     preventive = "preventive"
     detective = "detective"
     corrective = "corrective"

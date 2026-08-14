@@ -202,7 +202,7 @@ def get_treatment_plan(session_id: str, output_id: str,
             row["Status"], row["ErrorMessage"], row["UpdatedAt"], treatment._stale_cutoff(),
             row["ErrorReason"])
 
-        plan = _safe_json_dict(row["PlanJSON"], row["PlanID"])
+        plan = _normalize_plan_shape(_safe_json_dict(row["PlanJSON"], row["PlanID"]))
         if plan is not None:
             plan = {k: plan[k] for k in _VISIBLE_PLAN_KEYS if k in plan}
         scenario_json = _safe_json_dict(row["ScenarioJSON"], row["PlanID"])
@@ -244,6 +244,24 @@ def _safe_json_dict(blob: str | None, plan_id: str) -> dict | None:
         log.warning("treatment.stored_json_unparseable", plan_id=plan_id)
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_plan_shape(plan: dict | None) -> dict | None:
+    """Read-time projection for pre-v0.12 PlanJSON rows — stored rows are never rewritten (same
+    posture as _present_status). The old contract stored controls_to_be_implemented as a bare
+    array with control_coverage as a top-level sibling; the current contract nests both as
+    {control_coverage, controls[]}. Lifting old rows here — the ONE place PlanJSON is served
+    (the board and register never select the column; the Excel export consumes this GET) —
+    means every consumer sees one shape regardless of when the plan was generated."""
+    if plan is None:
+        return None
+    cti = plan.get("controls_to_be_implemented")
+    if isinstance(cti, list):
+        plan["controls_to_be_implemented"] = {
+            "control_coverage": plan.get("control_coverage"),
+            "controls": cti,
+        }
+    return plan
 
 
 def _naive_utc(dt: datetime) -> datetime:

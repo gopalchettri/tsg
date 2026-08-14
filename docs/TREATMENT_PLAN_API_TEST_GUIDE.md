@@ -531,11 +531,14 @@ reconnect.
     "treatment_plan": "Mitigate",
     "action_plan": "Actions A1–A4 remove direct RDP exposure and broker remote access behind MFA.",
     "applicable_to_all_subsystems": "No",
-    "controls_to_be_implemented": [
-      {"control_type":"preventive","control_name":"Brokered remote access with MFA",
-       "description":"Terminate remote engineering sessions on an MFA jump host.",
-       "priority":"Critical","control_code":"CII-CID-028","control_library_id":201}
-    ],
+    "controls_to_be_implemented": {
+      "control_coverage": "gaps",
+      "controls": [
+        {"control_type":"preventive","control_name":"Brokered remote access with MFA",
+         "description":"Terminate remote engineering sessions on an MFA jump host.",
+         "priority":"Critical","control_code":"CII-CID-028","control_library_id":201}
+      ]
+    },
     "remediation_action_plan": [
       {"action_id":"A1","action":"Remove the internet-facing RDP publication.",
        "owner":"Network Operations Team","priority":"Critical","dependencies":"None",
