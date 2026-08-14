@@ -481,15 +481,19 @@ def _actors_meta(threat_actors_json: str | None) -> dict:
 
 def stored_actors(threat_actors_json: str | None) -> list[str]:
     """The RAW stored actor list, regardless of the validated flag — for paths that must see
-    what Stage 1 proposed (scenario prompts, API display). Callers that may only see grounded
-    actors (treatment plans, VERIFIED-type promotion) use `validated_actors` instead."""
+    what Stage 1 proposed: scenario prompts, API display, actor linking on promotion
+    (`accept.py`), and treatment plans, which reason about a scenario the model already wrote
+    from this same raw list. Gating any of those returns [] for every unverified threat."""
     return ensure_actor_list(_actors_meta(threat_actors_json).get("actors", []))
 
 
 def validated_actors(threat_actors_json: str | None) -> list[str]:
     """`stored_actors` gated on the flag it is kept beside (`GroundingResult.actors_validated`):
-    actors are trusted only when `validated`; ungrounded proposals must not reach downstream
-    documents."""
+    actors are trusted only when `validated`.
+
+    Currently has no production caller — treatment plans moved to `stored_actors` so a plan
+    sees the adversaries its own scenario names. Kept as the one place expressing the trust
+    distinction, for any future path that may cite only grounded actors."""
     meta = _actors_meta(threat_actors_json)
     return ensure_actor_list(meta.get("actors", []) if meta.get("validated") else [])
 

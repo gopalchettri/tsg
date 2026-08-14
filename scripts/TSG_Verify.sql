@@ -30,10 +30,11 @@ CREATE TABLE #tsg_verify (
 );
 
 -- ---------------------------------------------------------------------------
--- 1. ALL 22 TSG TABLES EXIST
+-- 1. ALL 23 TSG TABLES EXIST
 -- ---------------------------------------------------------------------------
 DECLARE @tsg_tables TABLE (TableName sysname);
 INSERT INTO @tsg_tables (TableName) VALUES
+    (N'API_Client'),
     (N'Config_Threat_Rule'),
     (N'Config_Tuning'),
     (N'Control_Library'),
@@ -65,7 +66,7 @@ FROM @tsg_tables t
 WHERE NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES i WHERE i.TABLE_NAME = t.TableName);
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Tables', 'PASS', N'All 22 TSG tables present', N'Nothing missing.'
+SELECT 'Tables', 'PASS', N'All 23 TSG tables present', N'Nothing missing.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Tables');
 
 -- ---------------------------------------------------------------------------
@@ -159,7 +160,84 @@ SELECT 'Columns', 'PASS', N'Late-ALTER columns present (Threat_Type.Source, Thre
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Columns');
 
 -- ---------------------------------------------------------------------------
--- 4. SEED DATA ACTUALLY LANDED
+-- 4. ENUM COLUMNS ARE WIDE ENOUGH FOR THE VALUES THE APPLICATION WRITES
+-- ---------------------------------------------------------------------------
+-- The third silent failure mode. A column narrower than the longest value its
+-- enum can hold breaks ONLY when that one value is first written — every other
+-- value inserts fine, so the install looks clean, the application starts, and
+-- sessions run normally until they reach that one state.
+--
+-- This has shipped: Scenario_Session.StageStatus was nvarchar(20) and could not
+-- hold 'SCENARIOS_AWAITING_DECISION' (27 chars), the value that marks the review
+-- barrier. Threat and scenario generation completed correctly, then the session
+-- froze forever at the hand-off to review, and the truncation error was swallowed
+-- by the reaper's own per-session error handling. Nothing in this script would
+-- have caught it — tables and indexes were all present and correct.
+--
+-- NeedChars is the longest member of each enum in app/core/enums.py.
+-- CHARACTER_MAXIMUM_LENGTH is in CHARACTERS; COL_LENGTH would report bytes
+-- (2x for nvarchar) and is deliberately not used here.
+DECLARE @enum_cols TABLE (
+    TableName sysname, ColumnName sysname, NeedChars int,
+    EnumName nvarchar(40), LongestValue nvarchar(100));
+INSERT INTO @enum_cols (TableName, ColumnName, NeedChars, EnumName, LongestValue) VALUES
+    (N'Scenario_Session',            N'SessionStatus',      9, N'SessionStatus',          N'completed'),
+    (N'Scenario_Session',            N'CurrentStage',      21, N'WorkflowStage',          N'THREAT_IDENTIFICATION'),
+    (N'Scenario_Session',            N'StageStatus',       27, N'StageStatus',            N'SCENARIOS_AWAITING_DECISION'),
+    (N'Scenario_Session',            N'Mode',               4, N'SessionMode',            N'AUTO'),
+    (N'Subsystem_Stage_State',       N'Level',              9, N'SubsystemLevel',         N'SCENARIOS'),
+    (N'Subsystem_Stage_State',       N'Status',            27, N'StageStatus',            N'SCENARIOS_AWAITING_DECISION'),
+    (N'Identified_Threat',           N'GroundingStatus',   10, N'GroundingStatus',        N'unverified'),
+    (N'Identified_Duplicate_Threat', N'DuplicateReason',   23, N'DuplicateReason',        N'semantic_cross_category'),
+    (N'Threat_Scenario_Output',      N'Status',             8, N'ScenarioStatus',         N'complete'),
+    (N'Threat_Candidate_Review',     N'Status',             8, N'CandidateStatus',        N'accepted'),
+    (N'Threat_Library_Import_Run',   N'Status',             7, N'import run status',      N'running'),
+    (N'Config_Threat_Rule',          N'RuleType',          23, N'ThreatRuleType',         N'relevance_context_value'),
+    (N'Risk_Treatment_Plan',         N'Status',             8, N'StageStatus subset',     N'COMPLETE'),
+    (N'Risk_Treatment_Plan',         N'TreatmentStrategy',  8, N'TreatmentStrategy',      N'Mitigate'),
+    (N'Risk_Treatment_Plan',         N'RiskLevel',          8, N'RiskLevel',              N'Critical'),
+    (N'Risk_Treatment_Plan',         N'ReviewStatus',      17, N'TreatmentReviewStatus',  N'changes_requested'),
+    (N'Risk_Treatment_Plan',         N'ErrorReason',       17, N'TreatmentOutcomeReason', N'generation_failed'),
+    (N'Scenario_Audit',              N'Stage',             21, N'WorkflowStage',          N'THREAT_IDENTIFICATION'),
+    (N'Scenario_Audit',              N'EventType',         24, N'AuditEventType',         N'treatment_plan_requested'),
+    (N'Scenario_Audit',              N'Decision',          10, N'AuditDecision',          N'regenerate'),
+    (N'Scenario_Audit',              N'Granularity',        8, N'RegenGranularity',       N'scenario'),
+    (N'Scenario_Audit',              N'ActorType',          6, N'ActorType',              N'system');
+
+-- Too narrow: the application will fail on ONE value and work for all the others.
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Column width', 'FAIL', N'Too narrow: ' + e.TableName + N'.' + e.ColumnName,
+       N'Declared nvarchar(' + CAST(c.CHARACTER_MAXIMUM_LENGTH AS nvarchar(10)) + N') but '
+     + e.EnumName + N' can write ''' + e.LongestValue + N''' ('
+     + CAST(e.NeedChars AS nvarchar(10)) + N' chars). Every shorter value inserts normally, so the '
+     + N'application appears healthy until it first reaches that state — then that write fails and '
+     + N'the workflow stalls with no obvious cause. Widen to at least nvarchar('
+     + CAST(e.NeedChars AS nvarchar(10)) + N').'
+FROM @enum_cols e
+JOIN INFORMATION_SCHEMA.COLUMNS c
+  ON c.TABLE_NAME = e.TableName AND c.COLUMN_NAME = e.ColumnName
+WHERE c.CHARACTER_MAXIMUM_LENGTH <> -1          -- -1 = nvarchar(max): always sufficient
+  AND c.CHARACTER_MAXIMUM_LENGTH < e.NeedChars;
+
+-- Absent altogether — without this the JOIN above drops the row and passes silently.
+-- Guarded on the table existing, so a missing TABLE is still reported once, by section 1.
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Column width', 'FAIL', N'Column missing: ' + e.TableName + N'.' + e.ColumnName,
+       N'The application writes ' + e.EnumName + N' values here but the column does not exist. '
+     + N'The script that creates or alters ' + e.TableName + N' did not complete — re-run the '
+     + N'install scripts in order and review the output.'
+FROM @enum_cols e
+WHERE OBJECT_ID(N'dbo.' + e.TableName) IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS c
+                  WHERE c.TABLE_NAME = e.TableName AND c.COLUMN_NAME = e.ColumnName);
+
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Column width', 'PASS', N'All enum columns can hold their longest value',
+       N'No status, stage or reason column can silently truncate.'
+WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Column width');
+
+-- ---------------------------------------------------------------------------
+-- 5. SEED DATA ACTUALLY LANDED
 -- ---------------------------------------------------------------------------
 -- The failure this catches is entirely silent: if a seed script aborted, the
 -- application still starts normally and simply produces empty results forever.
@@ -217,7 +295,7 @@ FROM (SELECT COUNT(*) AS n FROM Control_Library_Standard_Map) c
 WHERE OBJECT_ID('dbo.Control_Library_Standard_Map') IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- 5. DATABASE CONFIGURATION AND KNOWN HAZARD (re-checked after install)
+-- 6. DATABASE CONFIGURATION AND KNOWN HAZARD (re-checked after install)
 -- ---------------------------------------------------------------------------
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Database',

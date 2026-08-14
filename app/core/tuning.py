@@ -35,7 +35,7 @@ log = get_logger(__name__)
 #: rather than a worse report.
 TUNABLE_KEYS: tuple[str, ...] = (
     "scoping_score_threshold", "base_score", "default_rule_weight", "max_threats_per_asset",
-    "next_set_size", "coverage_attempt_slack", "coverage_exclusions_max",
+    "next_set_size", "coverage_attempt_slack",
     "variant_sibling_prompt_k", "prompt_intel_limit", "sibling_similarity_ratio",
     "semantic_near_duplicate_threshold", "triage_auto_reject_cosine",
     "triage_auto_approve_cosine",
@@ -55,7 +55,7 @@ EMBEDDING_COUPLED_KEYS: frozenset[str] = frozenset({
 #: default has no type) — an explicit list, checked by the selfcheck below.
 _INT_KEYS: frozenset[str] = frozenset({
     "max_threats_per_asset", "next_set_size", "coverage_attempt_slack",
-    "coverage_exclusions_max", "variant_sibling_prompt_k", "prompt_intel_limit",
+    "variant_sibling_prompt_k", "prompt_intel_limit",
 })
 
 
@@ -90,7 +90,6 @@ class ResolvedTuning:
     max_threats_per_asset: int
     next_set_size: int
     coverage_attempt_slack: int
-    coverage_exclusions_max: int
     variant_sibling_prompt_k: int
     prompt_intel_limit: int
     sibling_similarity_ratio: float

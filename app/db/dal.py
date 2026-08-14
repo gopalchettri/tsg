@@ -1892,13 +1892,20 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
     if not _valid_guid(output_id):
         return None
     p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
+    st, it = m.Scoped_Threat, m.Identified_Threat
     return sess.execute(
         select(p.PlanID, p.SessionID, p.OutputID, p.TenantID, p.EntityID, p.Status,
             p.ActiveTaskID, p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
             p.ValidationJSON, p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment,
             p.ReviewedBy, p.ReviewedAt, p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt,
-               out.ScenarioJSON)
-        .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID))
+               out.ScenarioJSON,
+            # The threat's own identity — NOT part of the LLM's scenario JSON (same split as
+            # sessions._build_scenario). OUTER for the same reason as _scenario_read_select:
+            # no enforced FKs, so a broken linkage must null these, never drop the plan row.
+            it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON)
+        .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID)
+                    .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
+                    .outerjoin(it, st.ThreatID == it.ThreatID))
         .where(p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 0)
     ).mappings().first()
 

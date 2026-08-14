@@ -106,6 +106,35 @@ def get_principal(
                     client_id=client_id, tenant_id=tenant_id)
 
 
+def get_admin_principal(
+    x_api_key: str = Header(default="", alias="X-API-Key"),
+    x_user_id: str = Header(default="", alias="X-User-Id"),
+    x_tenant_id: str = Header(default="", alias="X-Tenant-Id"),
+) -> Principal:
+    """The admin routers' principal — `get_principal` minus the entity.
+
+    Admin routes touch shared cross-tenant master data (threat/control libraries, intel feeds),
+    so there is no entity to scope to and no admin handler reads `entities`. Requiring
+    `X-Entity-Id` there only forced callers to invent a value that was then discarded.
+
+    `X-User-Id` is still REQUIRED: it is the acting identity that lands in CreatedBy/UpdatedBy,
+    so dropping it would silently blank the library audit trail. `entities` is empty, so
+    `require_entity` DENIES on an admin principal — fail-closed if an entity-scoped route ever
+    mounts this by mistake. `verify_membership` is skipped: it validates a (user, entity) pair
+    and there is no entity."""
+    client_id = verify_api_key(x_api_key)
+    # isinstance guards mirror get_principal: called directly (tests), an unpassed Header param
+    # is FastAPI's sentinel, not a str.
+    user_id = x_user_id.strip() if isinstance(x_user_id, str) else ""
+    tenant_id = x_tenant_id.strip() if isinstance(x_tenant_id, str) else ""
+    if not (user_id and tenant_id):
+        raise AuthError(_UNAUTHORIZED)
+
+    structlog.contextvars.bind_contextvars(sub=user_id, tenant=tenant_id, client_id=client_id)
+    return Principal(claims={"sub": user_id}, entities=set(),
+                    client_id=client_id, tenant_id=tenant_id)
+
+
 def require_admin(x_admin_key: str = Header(default="", alias="X-Admin-Key")) -> None:
     """Gates the admin-only library/embedding endpoints. Deliberately NOT part of the JWT/entity
     model: TSG has no admin role, and these routes touch shared cross-tenant master data.

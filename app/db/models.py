@@ -60,9 +60,9 @@ class Scenario_Session(Base):
     UserID: Mapped[str | None] = mapped_column(Unicode(200))
     AssetName: Mapped[str] = mapped_column(Unicode(300))
     AssetID: Mapped[str] = mapped_column(Unicode(200))  
-    SessionStatus: Mapped[str] = mapped_column(Unicode(20))
-    CurrentStage: Mapped[str] = mapped_column(Unicode(32))
-    StageStatus: Mapped[str] = mapped_column(Unicode(20))
+    SessionStatus: Mapped[str] = mapped_column(Unicode(100))
+    CurrentStage: Mapped[str] = mapped_column(Unicode(100))
+    StageStatus: Mapped[str] = mapped_column(Unicode(100))
     Mode: Mapped[str] = mapped_column(Unicode(20))
     CurrentSubsystemIndex: Mapped[int | None] = mapped_column(Integer)
     SubsystemsJSON: Mapped[str] = mapped_column(UnicodeText)
@@ -600,12 +600,12 @@ class API_Client(Base):
     # own Module, so one leaked key is contained to a single module. See dal.api_client_id_for_key_hash.
     Module: Mapped[str] = mapped_column(Unicode(50), default="tsg")
     Active: Mapped[bool] = mapped_column(Boolean, default=True)
-    # Audit trail — who provisioned / changed / revoked this key. NOT read by the auth path
+    # Audit trail — who provisioned / revoked this key. NOT read by the auth path
     # (verify_api_key uses only KeyHash/Module/Active); these exist for provenance in the register.
+    # No Updated* pair: there is no update route — Name/Module are immutable and rotation is
+    # create-new + revoke-old, so the only mutation of an existing row is revoke.
     CreatedAt: Mapped[datetime] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
-    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
-    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
     RevokedAt: Mapped[datetime | None] = mapped_column(DateTime)
     RevokedBy: Mapped[str | None] = mapped_column(Unicode(200))
 

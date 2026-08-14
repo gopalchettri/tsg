@@ -99,10 +99,13 @@ stamped on it. From there:
 
 | Action | Endpoint | Auth |
 |---|---|---|
-| List all pending/failed promotions | `GET /v1/tsg/sessions/promotions` | `X-Admin-Key` |
-| One session's failure detail | `GET /v1/tsg/sessions/promotions/{session_id}` | `X-Admin-Key` |
-| Force a retry now | `POST /v1/tsg/sessions/promotions/{session_id}/retry` | `X-Admin-Key` |
-| Give up on it — its threats are never promoted after this | `DELETE /v1/tsg/sessions/promotions/{session_id}` | `X-Admin-Key` |
+| List all pending/failed promotions | `GET /v1/tsg/sessions/promotions` | Admin headers † |
+| One session's failure detail | `GET /v1/tsg/sessions/promotions/{session_id}` | Admin headers † |
+| Force a retry now | `POST /v1/tsg/sessions/promotions/{session_id}/retry` | Admin headers † |
+| Give up on it — its threats are never promoted after this | `DELETE /v1/tsg/sessions/promotions/{session_id}` | Admin headers † |
+
+† **Admin headers** = `X-Admin-Key` + `X-API-Key` + `X-User-Id` + `X-Tenant-Id`. No `X-Entity-Id` —
+admin routes are not entity-scoped (see docs/TSG_API_AUTHENTICATION_GUIDE.md §8).
 
 `list_promotions` takes `?include_exhausted=false` to hide sessions the sweep has given up on
 (they're still manually retryable either way).
@@ -123,10 +126,12 @@ library unless a human calls retry first.
 
 | Action | Endpoint | Auth |
 |---|---|---|
-| List pending candidates | `GET /v1/tsg/threat-library/candidates` | `X-Admin-Key` |
-| One candidate's detail | `GET /v1/tsg/threat-library/candidates/{candidate_id}` | `X-Admin-Key` |
-| Approve → mints into the catalogue | `POST /v1/tsg/threat-library/candidates/{candidate_id}/approve` | `X-Admin-Key` |
-| Reject → discarded, catalogue untouched | `POST /v1/tsg/threat-library/candidates/{candidate_id}/reject` | `X-Admin-Key` |
+| List pending candidates | `GET /v1/tsg/threat-library/candidates` | Admin headers † |
+| One candidate's detail | `GET /v1/tsg/threat-library/candidates/{candidate_id}` | Admin headers † |
+| Approve → mints into the catalogue | `POST /v1/tsg/threat-library/candidates/{candidate_id}/approve` | Admin headers † |
+| Reject → discarded, catalogue untouched | `POST /v1/tsg/threat-library/candidates/{candidate_id}/reject` | Admin headers † |
+
+† Same admin headers as above — `X-Admin-Key` + `X-API-Key` + `X-User-Id` + `X-Tenant-Id`.
 
 CAS-guarded: a candidate already resolved (by anyone) returns `409` on a second approve/reject —
 it never re-mints or double-processes.

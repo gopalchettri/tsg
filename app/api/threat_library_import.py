@@ -2,11 +2,11 @@
 scripts/import_threat_libraries.py runs from a shell, driving the same shared core
 (app/pipeline/threat_library_import.py), so the two front doors can never drift.
 
-Gated by the SAME two independent checks as admin.py (its module docstring is the
-canonical rationale): the static X-Admin-Key header (require_admin — the authorization
-gate; this touches shared cross-tenant threat-library data, not one entity's data) AND
-a valid bearer JWT (get_principal), whose `sub` claim attributes the audit line to a
-real caller.
+Gated by the SAME two independent checks as every other admin router: the static
+X-Admin-Key header (require_admin — the authorization gate; this touches shared
+cross-tenant threat-library data, not one entity's data) AND get_admin_principal, whose
+X-User-Id attributes the audit line to a real caller. No X-Entity-Id: there is no single
+entity to scope shared library data to (see app/api/deps.get_admin_principal).
 
 Runs ASYNCHRONOUSLY — dispatch-then-poll, same shape as the embeddings routes: POST
 validates everything it can BEFORE dispatching (a bad request never reaches the queue),
@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy import func, select
 
 from app.api.admin_jobs import FAMILY_IMPORT, admin_job_exists, mark_admin_job
-from app.api.deps import Principal, get_principal, require_admin
+from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.schemas import (
     ImportJobStatus,
     SourceInventoryItem,
@@ -105,7 +105,7 @@ def _enqueue(source: str, body: ThreatLibraryImportBody,
 
 
 @router.get("/sources", response_model=SourcesInventoryResponse)
-def list_sources(_principal: Principal = Depends(get_principal)) -> SourcesInventoryResponse:
+def list_sources(_principal: Principal = Depends(get_admin_principal)) -> SourcesInventoryResponse:
     """What is actually in the threat library, per source — the "which are imported, which
     are still pending?" answer in one call.
 
@@ -146,7 +146,7 @@ def list_sources(_principal: Principal = Depends(get_principal)) -> SourcesInven
 
 @router.post("/sources/{source}/import", response_model=ThreatLibraryImportAccepted, status_code=202)
 def start_import(source: str, body: ThreatLibraryImportBody, request: Request,
-                principal: Principal = Depends(get_principal)) -> ThreatLibraryImportAccepted:
+                principal: Principal = Depends(get_admin_principal)) -> ThreatLibraryImportAccepted:
     """Queue an import of ONE source (or a dry-run preview). Poll `GET ../imports/{job_id}`
     for the outcome — including, on an OT-source real run, the auto-written boost-only
     scoring rules (`ot_rules`) and the follow-up embeddings job id (`embeddings_job_id`).
@@ -167,7 +167,7 @@ def start_import(source: str, body: ThreatLibraryImportBody, request: Request,
 
 
 @router.get("/imports/{job_id}", response_model=ImportJobStatus)
-def get_import_status(job_id: str, _principal: Principal = Depends(get_principal)) -> ImportJobStatus:
+def get_import_status(job_id: str, _principal: Principal = Depends(get_admin_principal)) -> ImportJobStatus:
     """Polls Celery's AsyncResult for a job the POST above queued. The family-scoped
     marker check FIRST — it is the authorization boundary (admin.py's get_status
     docstring is the canonical rationale); an id this router never queued (or whose

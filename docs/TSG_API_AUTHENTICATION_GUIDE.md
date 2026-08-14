@@ -72,7 +72,6 @@ TSG_VERIFY_MEMBERSHIP enabled?
 | `Module` | Module scope (`tsg`, `chatbot`, …) |
 | `Active` | Key status (1 = valid) |
 | `CreatedAt` / `CreatedBy` | Provisioning audit |
-| `UpdatedAt` / `UpdatedBy` | Change audit |
 | `RevokedAt` / `RevokedBy` | Revocation audit |
 
 > Generate the SHA-256 hash in **Python (UTF-8)**, the same representation TSG uses. Do **not** substitute SQL `HASHBYTES` on a parameter or `N'…'` literal — it hashes UTF-16 and never matches, causing silent `401`s.
@@ -134,11 +133,17 @@ curl https://tsg.example.com/v1/entities/86/scenarios \
 
 ## 8. Admin / Library APIs
 
-Admin/library routes require the admin key **in addition to** the three standard headers:
+Admin/library routes require the admin key **in addition to** the standard headers:
 ```text
-X-Admin-Key   +   X-API-Key   +   X-User-Id   +   X-Entity-Id
+X-Admin-Key   +   X-API-Key   +   X-User-Id   +   X-Tenant-Id
 ```
 `X-Admin-Key` is **additional** — it does not replace `X-API-Key`.
+
+**No `X-Entity-Id`.** Admin routes operate on shared cross-tenant master data (threat library,
+control library, intel feeds), so there is no single entity to scope to — they resolve
+`get_admin_principal` instead of `get_principal` (`app/api/deps.py`). `X-User-Id` is still
+required: it is the identity recorded in `CreatedBy`/`UpdatedBy`. Sending `X-Entity-Id` anyway is
+harmless; it is ignored.
 
 ---
 

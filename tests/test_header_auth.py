@@ -237,6 +237,7 @@ def test_key_is_scoped_to_its_module(db):
                            Module="chatbot", Active=True, CreatedAt=datetime.now(timezone.utc)))
         s.commit()
         assert dal.api_client_id_for_key_hash(s, cb_hash, "chatbot") == "cb"
+        assert dal.api_client_id_for_key_hash(s, cb_hash, "tsg") is None
 
 
 # --- module identity is a deployment setting, not a source literal ---
@@ -252,4 +253,59 @@ def test_api_module_comes_from_settings():
     assert Settings(api_module="chatbot").api_module == "chatbot"
     with pytest.raises(ValidationError):                     # blank module rejected (silent-401 guard)
         Settings(api_module="")
-        assert dal.api_client_id_for_key_hash(s, cb_hash, "tsg") is None
+
+
+# --- admin principal: get_principal minus the entity (app/api/deps.get_admin_principal) ---
+
+def test_admin_principal_needs_no_entity_header(db):
+    """The point of the whole thing: an admin caller authenticates WITHOUT X-Entity-Id.
+
+    `entities` comes back empty, so require_entity denies — an admin principal can never be
+    mistaken for an entity-scoped one."""
+    p = deps.get_admin_principal(x_api_key=SECRET, x_user_id="1138", x_tenant_id="DESC")
+    assert p.user_id == "1138"
+    assert p.tenant_id == "DESC"
+    assert p.client_id == "shield"
+    assert p.entities == set()
+    with pytest.raises(EntityForbidden):
+        p.require_entity("86")
+
+
+def test_admin_principal_still_requires_key_user_and_tenant(db):
+    """Dropping the entity must not drop anything else: the API key still authenticates, and
+    X-User-Id still gates (it is what lands in CreatedBy/UpdatedBy)."""
+    for kwargs in (
+        {"x_api_key": "", "x_user_id": "1138", "x_tenant_id": "DESC"},             # no key
+        {"x_api_key": "not-the-key", "x_user_id": "1138", "x_tenant_id": "DESC"},  # wrong key
+        {"x_api_key": SECRET, "x_user_id": "", "x_tenant_id": "DESC"},             # no audit identity
+        {"x_api_key": SECRET, "x_user_id": "1138", "x_tenant_id": ""},             # no tenant
+    ):
+        with pytest.raises(AuthError):
+            deps.get_admin_principal(**kwargs)
+
+
+def test_entity_header_requirement_is_admin_only():
+    """The scope guard for the 50-site dependency swap, checked BOTH ways.
+
+    Admin routes must no longer pull in get_principal (that is what required X-Entity-Id), and
+    the entity-scoped routers must still pull it in — a swap that leaked into sessions/treatment
+    would silently remove an IDOR guard. Reuses route_audit's own dependency walker so this sees
+    router-level dependencies too, not just per-handler ones."""
+    from app.api import (admin, api_clients, control_library_crud, sessions, threat_intel,
+                         threat_library_crud, threat_library_import, treatment)
+    from app.api.route_audit import _all_dependency_calls
+
+    admin_routers = [admin.router, admin.promotions_router, admin.candidates_router,
+                     api_clients.router, threat_library_crud.router, control_library_crud.router,
+                     threat_intel.router, threat_library_import.router]
+    for router in admin_routers:
+        for route in router.routes:
+            calls = _all_dependency_calls(route.dependant)
+            assert deps.require_admin in calls, f"{route.path} lost its admin gate"
+            assert deps.get_principal not in calls, f"{route.path} still demands X-Entity-Id"
+
+    for router in (sessions.router, treatment.router):
+        for route in router.routes:
+            calls = _all_dependency_calls(route.dependant)
+            assert deps.get_principal in calls, f"{route.path} lost its entity scoping"
+            assert deps.get_admin_principal not in calls, f"{route.path} got the admin principal"

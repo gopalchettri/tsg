@@ -9,7 +9,7 @@ from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.admin_jobs import FAMILY_EMBEDDINGS, admin_job_exists, mark_admin_job
-from app.api.deps import Principal, get_principal, require_admin
+from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.schemas import (
     CandidateResolutionResult,
     EmbeddingActionBody,
@@ -77,7 +77,7 @@ def _enqueue(action: str, body: EmbeddingActionBody) -> EmbeddingJobAccepted:
 
 @router.post("/create", response_model=EmbeddingJobAccepted, status_code=202)
 def create(body: EmbeddingActionBody, request: Request,
-        principal: Principal = Depends(get_principal)) -> EmbeddingJobAccepted:
+        principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobAccepted:
     """Fingerprint specific NEW item(s) you name — for right after a threat is added."""
     if not body.group or not body.names:
         raise AdminValidationError("create requires both group and names")
@@ -88,7 +88,7 @@ def create(body: EmbeddingActionBody, request: Request,
 
 @router.post("/update", response_model=EmbeddingJobAccepted, status_code=202)
 def update(body: EmbeddingActionBody, request: Request,
-        principal: Principal = Depends(get_principal)) -> EmbeddingJobAccepted:
+        principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobAccepted:
     """Whole-group sync: embed whatever's missing across every active row (`group=None` =
     every group). `names` isn't part of this action's contract — see /create for targeted
     embedding of specific items."""
@@ -99,7 +99,7 @@ def update(body: EmbeddingActionBody, request: Request,
 
 @router.post("/recreate", response_model=EmbeddingJobAccepted, status_code=202)
 def recreate(body: EmbeddingActionBody, request: Request,
-        principal: Principal = Depends(get_principal)) -> EmbeddingJobAccepted:
+        principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobAccepted:
     """Wipe a group's (or named items') cached vectors, then re-embed them from scratch."""
     _require_group_when_names_given(body)
     accepted = _enqueue("recreate", body)
@@ -109,7 +109,7 @@ def recreate(body: EmbeddingActionBody, request: Request,
 
 @router.post("/delete", response_model=EmbeddingJobAccepted, status_code=202)
 def delete(body: EmbeddingActionBody, request: Request,
-        principal: Principal = Depends(get_principal)) -> EmbeddingJobAccepted:
+        principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobAccepted:
     """Wipe a group's (or named items') cached vectors — no re-embed.
 
     `group` and `names` cannot BOTH be omitted: unlike update/recreate (which rebuild and so
@@ -124,7 +124,7 @@ def delete(body: EmbeddingActionBody, request: Request,
 
 
 @router.get("/status/{job_id}", response_model=EmbeddingJobStatus)
-def get_status(job_id: str, _principal: Principal = Depends(get_principal)) -> EmbeddingJobStatus:
+def get_status(job_id: str, _principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobStatus:
     """Polls Celery's AsyncResult for a job one of the four routes above queued.
 
     The provenance marker is checked FIRST: this route never calls require_entity, so without it
@@ -175,7 +175,7 @@ def list_promotions(
     include_exhausted: bool = Query(
         default=True,
         description="Include sessions the automatic sweep has already given up on (still manually retryable)."),
-    _principal: Principal = Depends(get_principal),
+    _principal: Principal = Depends(get_admin_principal),
 ) -> PendingPromotionsResponse:
     """Every session currently stuck on a failed library promotion, oldest failure first."""
     settings = get_settings()
@@ -190,7 +190,7 @@ def list_promotions(
 
 
 @promotions_router.get("/promotions/{session_id}", response_model=PendingPromotion)
-def get_promotion(session_id: str, _principal: Principal = Depends(get_principal)) -> PendingPromotion:
+def get_promotion(session_id: str, _principal: Principal = Depends(get_admin_principal)) -> PendingPromotion:
     """One session's promotion-failure detail. 404 if it isn't currently in a failed state."""
     settings = get_settings()
     with db_session() as sess:
@@ -201,7 +201,7 @@ def get_promotion(session_id: str, _principal: Principal = Depends(get_principal
 
 
 @promotions_router.post("/promotions/{session_id}/retry", response_model=PromotionRetryResult)
-def retry_promotion(session_id: str, principal: Principal = Depends(get_principal)) -> PromotionRetryResult:
+def retry_promotion(session_id: str, principal: Principal = Depends(get_admin_principal)) -> PromotionRetryResult:
     """Force a retry now, instead of waiting for the next scheduled sweep. Synchronous: one
     retry is a single bounded operation (unlike the embeddings actions above, which can re-embed
     a whole group), so there is no need for the async job/poll pattern those use. Always
@@ -217,7 +217,7 @@ def retry_promotion(session_id: str, principal: Principal = Depends(get_principa
 
 
 @promotions_router.delete("/promotions/{session_id}", response_model=PromotionRetryResult)
-def dismiss_promotion_route(session_id: str, principal: Principal = Depends(get_principal)) -> PromotionRetryResult:
+def dismiss_promotion_route(session_id: str, principal: Principal = Depends(get_admin_principal)) -> PromotionRetryResult:
     """Dismiss — stop tracking/retrying this session's failed promotion, without attempting it
     again. Serialized against any in-flight retry via the same per-session lock, so a dismiss can
     never be silently undone by a retry that was already mid-flight."""
@@ -256,7 +256,7 @@ def _to_pending_candidate(row) -> PendingCandidate:
 @candidates_router.get("", response_model=PendingCandidatesResponse)
 def list_candidates(
     limit: int = Query(default=100, ge=1, description="Max rows to return."),
-    _principal: Principal = Depends(get_principal),
+    _principal: Principal = Depends(get_admin_principal),
 ) -> PendingCandidatesResponse:
     """Every threat awaiting curator review, oldest first."""
     settings = get_settings()
@@ -268,7 +268,7 @@ def list_candidates(
 
 
 @candidates_router.get("/{candidate_id}", response_model=PendingCandidate)
-def get_candidate_route(candidate_id: str, _principal: Principal = Depends(get_principal)) -> PendingCandidate:
+def get_candidate_route(candidate_id: str, _principal: Principal = Depends(get_admin_principal)) -> PendingCandidate:
     """One candidate's full detail. 404 if the id doesn't exist."""
     with db_session() as sess:
         row = dal.get_candidate(sess, candidate_id)
@@ -304,7 +304,7 @@ def _resolve_and_respond(candidate_id: str, principal: Principal, *, approve: bo
 
 
 @candidates_router.post("/{candidate_id}/approve", response_model=CandidateResolutionResult)
-def approve_candidate(candidate_id: str, principal: Principal = Depends(get_principal)) -> CandidateResolutionResult:
+def approve_candidate(candidate_id: str, principal: Principal = Depends(get_admin_principal)) -> CandidateResolutionResult:
     """Approve — mint (or reuse) this candidate's Threat_Type/Threat_Catalogue entry into the
     shared library now. CAS-guarded: a candidate already reviewed by someone else returns 409,
     never re-runs the mint."""
@@ -312,7 +312,7 @@ def approve_candidate(candidate_id: str, principal: Principal = Depends(get_prin
 
 
 @candidates_router.post("/{candidate_id}/reject", response_model=CandidateResolutionResult)
-def reject_candidate(candidate_id: str, principal: Principal = Depends(get_principal)) -> CandidateResolutionResult:
+def reject_candidate(candidate_id: str, principal: Principal = Depends(get_admin_principal)) -> CandidateResolutionResult:
     """Reject — close this candidate without adding anything to the shared library. Same
     CAS guard as approve."""
     return _resolve_and_respond(candidate_id, principal, approve=False)

@@ -46,9 +46,9 @@ CREATE TABLE Scenario_Session (
     UserID                nvarchar(200)  NULL,
     AssetName             nvarchar(300)  NOT NULL,
     AssetID               nvarchar(200)  NOT NULL,          -- [R7] isolation key
-    SessionStatus         nvarchar(20)   NOT NULL,
-    CurrentStage          nvarchar(32)   NOT NULL,
-    StageStatus           nvarchar(20)   NOT NULL,
+    SessionStatus         nvarchar(100)   NOT NULL,
+    CurrentStage          nvarchar(100)   NOT NULL,
+    StageStatus           nvarchar(100)   NOT NULL,
     Mode                  nvarchar(20)   NOT NULL,
     CurrentSubsystemIndex int            NULL,
     SubsystemsJSON        nvarchar(max)  NOT NULL,
@@ -561,7 +561,8 @@ GO
 --                python -c "import hashlib,secrets; s=secrets.token_hex(32); print(s, hashlib.sha256(s.encode()).hexdigest())"
 --              INSERT INTO API_Client (ClientID, KeyHash, Name, Module) VALUES ('shield-prod', '<keyhash>', 'Shield', 'tsg');
 -- Module scopes a key to ONE module ('tsg', 'chatbot', ...): a key authenticates only for its own
--- Module, so a leaked key is contained to one module. Default 'tsg' keeps existing rows valid.
+-- Module, so a leaked key is contained to one module. Default 'tsg' applies if a manual INSERT
+-- omits Module (the app always sets it explicitly — dal.create_api_client).
 -- ============================================================
 IF OBJECT_ID('dbo.API_Client', 'U') IS NULL
 CREATE TABLE API_Client (
@@ -573,18 +574,9 @@ CREATE TABLE API_Client (
     -- Audit trail (provenance only; the auth path reads none of these):
     CreatedAt   datetime2(3)  NOT NULL CONSTRAINT DF_API_Client_CreatedAt DEFAULT SYSUTCDATETIME(),
     CreatedBy   nvarchar(200) NULL,   -- who provisioned the key
-    UpdatedAt   datetime2(3)  NULL,   -- last change (name/module/etc.)
-    UpdatedBy   nvarchar(200) NULL,
     RevokedAt   datetime2(3)  NULL,   -- when it was deactivated
     RevokedBy   nvarchar(200) NULL    -- who revoked it
 );
-
--- Existing DBs: add each column if the table predates it (guarded, idempotent).
-IF COL_LENGTH('dbo.API_Client', 'Module')    IS NULL ALTER TABLE API_Client ADD Module nvarchar(50) NOT NULL CONSTRAINT DF_API_Client_Module DEFAULT 'tsg';
-IF COL_LENGTH('dbo.API_Client', 'CreatedBy') IS NULL ALTER TABLE API_Client ADD CreatedBy nvarchar(200) NULL;
-IF COL_LENGTH('dbo.API_Client', 'UpdatedAt') IS NULL ALTER TABLE API_Client ADD UpdatedAt datetime2(3) NULL;
-IF COL_LENGTH('dbo.API_Client', 'UpdatedBy') IS NULL ALTER TABLE API_Client ADD UpdatedBy nvarchar(200) NULL;
-IF COL_LENGTH('dbo.API_Client', 'RevokedBy') IS NULL ALTER TABLE API_Client ADD RevokedBy nvarchar(200) NULL;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_API_Client_KeyHash' AND object_id = OBJECT_ID('dbo.API_Client'))
 CREATE UNIQUE INDEX UX_API_Client_KeyHash ON API_Client (KeyHash) WHERE Active = 1;

@@ -357,12 +357,6 @@ class Settings(BaseSettings):
     # Batch size of one "generate next set" click (scenarios served/generated per call).
     next_set_size: int = Field(5, ge=1)
 
-    # Ceiling on the already-covered threat names fed to the additive find_threats prompt — the one
-    # prompt input that GROWS with every accumulated next-set round. Steering only, never
-    # enforcement: tasks.py's identity-fold dedup silently drops any re-proposed active threat, so
-    # truncating this list can cost a wasted proposal but never admits a duplicate row.
-    coverage_exclusions_max: int = Field(50, ge=1)
-
     # Cosine at or above which a proposed threat is DROPPED as a paraphrase of one the session
     # already has. This is the definition of "unique" for a threat: unique in MEANING. The identity
     # fold above it is exact/ID-only, so without this gate the same threat in different words
@@ -685,7 +679,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_coverage_knobs(self) -> "Settings":
-        """Two coverage knobs have settings that are valid but operationally useless. Warn only."""
+        """A coverage knob setting can be valid but operationally useless. Warn only."""
         from app.core.logging import get_logger  # lazy: logging imports config
         if self.semantic_near_duplicate_threshold < 0.5:
             get_logger(__name__).warning(
@@ -693,13 +687,6 @@ class Settings(BaseSettings):
                 semantic_near_duplicate_threshold=self.semantic_near_duplicate_threshold,
                 note="below ~0.5 nearly every threat pair matches — the near-duplicate log stops "
                     "being a signal and cannot be used to calibrate a real cutoff")
-        if self.variant_sibling_prompt_k > self.coverage_exclusions_max:
-            get_logger(__name__).warning(
-                "config.sibling_prompt_width_exceeds_coverage",
-                variant_sibling_prompt_k=self.variant_sibling_prompt_k,
-                coverage_exclusions_max=self.coverage_exclusions_max,
-                note="the variant prompt quotes more sibling scenarios than the threat prompt is "
-                    "steered away from — tokens spent with no coverage behind them")
         return self
 
     @model_validator(mode="after")

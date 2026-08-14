@@ -549,7 +549,11 @@ order:
 
 1. Serve threats that were already scored but never got a scenario — **no AI call needed**.
 2. Only if that pool can't fill the batch, run **one** additive threat-identification round, told
-   which threats are already covered so it proposes genuinely new ones.
+   the session's **full** history of already-covered threats (uncapped) so it proposes genuinely
+   new ones. The round asks for **2× the shortfall** (capped at `max_threats_per_asset`, floored
+   at the shortfall) so normal dedup loss still leaves enough survivors to fill the click;
+   surplus survivors stay banked as unserved threats and a later click serves them via step 1
+   with no AI call at all.
 3. If still short, top up with **variants**: a deliberately different scenario for a threat that
    already has one — through a supporting system it has not been written about yet.
 
@@ -966,7 +970,6 @@ code, and will go stale silently.
 | `coverage_attempt_slack` | **2** | Extra attempts beyond a threat's own coverage target. Scenario depth itself is *derived* — one per plausible entry point — never configured. |
 | `variant_sibling_prompt_k` | **3** | How many of a threat's existing scenarios are quoted back into the variant prompt. Prompt width only, not depth. |
 | `semantic_near_duplicate_threshold` | **0.92** | Cosine at which a proposed threat is *logged* as a probable paraphrase. Observation only — nothing is rejected on it, and the value is embedding-model-specific. |
-| `coverage_exclusions_max` | **50** | Cap on the already-covered list fed to an additive round (most recent kept). |
 | `max_active_sessions` | **100** | Global concurrent-session ceiling. |
 | `max_active_sessions_per_entity` | **0** (off) | Per-organisation ceiling. |
 | `llm_timeout_seconds` | **90** | How long to wait for one AI reply. |

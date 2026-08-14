@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, Path, Request
 from sqlalchemy import delete, insert, select
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import Principal, get_principal, require_admin
+from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.library_crud import (
     _DELETED,
     _LIMIT,
@@ -49,7 +49,7 @@ router = APIRouter(
 # ---------------------------------------------------------------------------
 @router.get("/standards", response_model=list[ControlStandardRow], tags=["Standards Admin"])
 def list_standards(limit: int = _LIMIT, offset: int = _OFFSET, include_deleted: bool = _DELETED,
-                _principal: Principal = Depends(get_principal)):
+                _principal: Principal = Depends(get_admin_principal)):
     """Named standards (ISO, NIST, DESC ISR, ...). Start here for the `standard_id` the link
     routes need."""
     return _list("standards", limit, offset, include_deleted)
@@ -57,21 +57,21 @@ def list_standards(limit: int = _LIMIT, offset: int = _OFFSET, include_deleted: 
 
 @router.post("/standards", response_model=ControlStandardRow, status_code=201, tags=["Standards Admin"])
 def create_standard(body: ControlStandardCreate, request: Request,
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Create a standard. Standards are not embedded, so no refresh job is returned."""
     return _create("standards", body, principal, request)
 
 
 @router.patch("/standards/{standard_id}", response_model=ControlStandardRow, tags=["Standards Admin"])
 def update_standard(body: ControlStandardUpdate, request: Request, standard_id: int = Path(ge=1),
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Partial update. Omitted fields keep their current value."""
     return _update("standards", standard_id, body, principal, request)
 
 
 @router.delete("/standards/{standard_id}", response_model=ControlStandardRow, tags=["Standards Admin"])
 def delete_standard(request: Request, standard_id: int = Path(ge=1),
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Soft delete. Existing control-to-standard links are left in place; the standard simply
     stops being reported, so no scenario loses a control over it."""
     return _delete("standards", standard_id, principal, request)
@@ -79,7 +79,7 @@ def delete_standard(request: Request, standard_id: int = Path(ge=1),
 
 @router.get("/controls", response_model=list[ControlRow], tags=["Controls Admin"])
 def list_controls(limit: int = _LIMIT, offset: int = _OFFSET, include_deleted: bool = _DELETED,
-                _principal: Principal = Depends(get_principal)):
+                _principal: Principal = Depends(get_admin_principal)):
     """The control library — 1,288 seeded rows plus anything curated here. Each row's
     `control_library_id` is the value the link routes' `{control_id}` (and `{control_id}` on
     the update/delete routes) expects — the field name and the URL segment name differ on
@@ -89,7 +89,7 @@ def list_controls(limit: int = _LIMIT, offset: int = _OFFSET, include_deleted: b
 
 @router.post("/controls", response_model=ControlRow, status_code=201, tags=["Controls Admin"])
 def create_control(body: ControlCreate, request: Request,
-                principal: Principal = Depends(get_principal)):
+                principal: Principal = Depends(get_admin_principal)):
     """Create a control. Returns `embeddings_job_id` — until it completes the new control cannot
     be matched to a scenario. Link its standards next, or `standards[]` stays empty."""
     return _create("controls", body, principal, request)
@@ -97,7 +97,7 @@ def create_control(body: ControlCreate, request: Request,
 
 @router.patch("/controls/{control_id}", response_model=ControlRow, tags=["Controls Admin"])
 def update_control(body: ControlUpdate, request: Request, control_id: int = Path(ge=1),
-                principal: Principal = Depends(get_principal)):
+                principal: Principal = Depends(get_admin_principal)):
     """Partial update. Changing `control_name` OR `control_description` re-embeds the row — both
     are part of the text grounding matches against."""
     return _update("controls", control_id, body, principal, request)
@@ -105,7 +105,7 @@ def update_control(body: ControlUpdate, request: Request, control_id: int = Path
 
 @router.delete("/controls/{control_id}", response_model=ControlRow, tags=["Controls Admin"])
 def delete_control(request: Request, control_id: int = Path(ge=1),
-                principal: Principal = Depends(get_principal)):
+                principal: Principal = Depends(get_admin_principal)):
     """Soft delete. Also drops the control's embedding so it stops being mapped to scenarios.
 
     Threat_Scenario_Control_Map rows that already reference it are untouched, but the results
@@ -132,7 +132,7 @@ def _standards_of(sess, control_id: int) -> ControlStandardsResponse:
 @router.post("/controls/{control_id}/standards/{standard_id}",
                     response_model=ControlStandardsResponse, status_code=201, tags=["Controls Admin"])
 def attach_standard(request: Request, control_id: int = Path(ge=1), standard_id: int = Path(ge=1),
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Link a control to a standard. Idempotent: re-linking an existing pair returns 201 with the
     unchanged list rather than 409 — the map's composite PK already guarantees one row per pair,
     and a client replaying a request should not have to tell the two apart."""
@@ -160,7 +160,7 @@ def attach_standard(request: Request, control_id: int = Path(ge=1), standard_id:
 @router.delete("/controls/{control_id}/standards/{standard_id}",
                     response_model=ControlStandardsResponse, tags=["Controls Admin"])
 def detach_standard(request: Request, control_id: int = Path(ge=1), standard_id: int = Path(ge=1),
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Unlink a control from a standard — a HARD delete, unlike every other DELETE here. The map
     is a pure link: it has no audit columns to soft-delete into and nothing references it, so
     there is no history to preserve. 404s when the pair was not linked, so a caller can tell

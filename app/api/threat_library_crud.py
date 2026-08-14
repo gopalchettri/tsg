@@ -19,7 +19,7 @@ from sqlalchemy import update as _sa_update
 from sqlalchemy.exc import IntegrityError as _IntegrityError  # noqa: E402
 
 from app.api.admin import AdminValidationError  # noqa: E402
-from app.api.deps import Principal, get_principal, require_admin
+from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.library_crud import (  # noqa: E402
     _DELETED,  # noqa: E402
     _LIMIT,
@@ -70,7 +70,7 @@ router = APIRouter(
 
 @router.get("/threat-categories", response_model=list[ThreatCategoryRow], tags=["Threat Categories Admin"])
 def list_threat_categories(limit: int = _LIMIT, offset: int = _OFFSET, include_deleted: bool = _DELETED,
-                        _principal: Principal = Depends(get_principal)):
+                        _principal: Principal = Depends(get_admin_principal)):
     """STRIDE categories. Read this first — nothing else in the API returns row ids, so this is
     where the id each resource's PATCH/DELETE routes need comes from: `threat_category_id` here,
     and `threat_type_id`/`threat_catalogue_id`/`threat_actor_id` on the other three list routes
@@ -80,28 +80,28 @@ def list_threat_categories(limit: int = _LIMIT, offset: int = _OFFSET, include_d
 
 @router.post("/threat-categories", response_model=ThreatCategoryRow, status_code=201, tags=["Threat Categories Admin"])
 def create_threat_category(body: ThreatCategoryCreate, request: Request,
-                        principal: Principal = Depends(get_principal)):
+                        principal: Principal = Depends(get_admin_principal)):
     """Create a category. The id is caller-supplied — this table's PK is not IDENTITY."""
     return _create("threat-categories", body, principal, request)
 
 
 @router.patch("/threat-categories/{threat_category_id}", response_model=ThreatCategoryRow, tags=["Threat Categories Admin"])
 def update_threat_category(body: ThreatCategoryUpdate, request: Request, threat_category_id: int = Path(ge=1),
-                        principal: Principal = Depends(get_principal)):
+                        principal: Principal = Depends(get_admin_principal)):
     """Partial update. Omitted fields keep their current value."""
     return _update("threat-categories", threat_category_id, body, principal, request)
 
 
 @router.delete("/threat-categories/{threat_category_id}", response_model=ThreatCategoryRow, tags=["Threat Categories Admin"])
 def delete_threat_category(request: Request, threat_category_id: int = Path(ge=1),
-                        principal: Principal = Depends(get_principal)):
+                        principal: Principal = Depends(get_admin_principal)):
     """Soft delete (IsDeleted=1). Returns the deleted row so the caller can see the who/when."""
     return _delete("threat-categories", threat_category_id, principal, request)
 
 
 @router.get("/threat-types", response_model=list[ThreatTypeRow], tags=["Threat Types Admin"])
 def list_threat_types(limit: int = _LIMIT, offset: int = _OFFSET, include_deleted: bool = _DELETED,
-                    _principal: Principal = Depends(get_principal)):
+                    _principal: Principal = Depends(get_admin_principal)):
     """Threat families."""
     return _list("threat-types", limit, offset, include_deleted)
 
@@ -143,7 +143,7 @@ def _threat_type_row(type_id: int) -> dict:
 
 @router.post("/threat-types", response_model=ThreatTypeRow, status_code=201, tags=["Threat Types Admin"])
 def create_threat_type(body: ThreatTypeCreate, request: Request,
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Create a family, linking any supplied `actor_names` to it. Returns
     `embeddings_job_id` — poll it on `/embeddings/status/{job_id}` to know when the AI can
     match the new name."""
@@ -155,7 +155,7 @@ def create_threat_type(body: ThreatTypeCreate, request: Request,
 
 @router.patch("/threat-types/{threat_type_id}", response_model=ThreatTypeRow, tags=["Threat Types Admin"])
 def update_threat_type(body: ThreatTypeUpdate, request: Request, threat_type_id: int = Path(ge=1),
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Partial update. A rename re-embeds the row and returns the new job's id.
     `actor_names` links ADDITIVELY (idempotent) — the repair path for a create whose actor
     linking failed after the family committed; existing links are never removed here."""
@@ -177,63 +177,63 @@ def update_threat_type(body: ThreatTypeUpdate, request: Request, threat_type_id:
 
 @router.delete("/threat-types/{threat_type_id}", response_model=ThreatTypeRow, tags=["Threat Types Admin"])
 def delete_threat_type(request: Request, threat_type_id: int = Path(ge=1),
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Soft delete. Also drops the row's embedding so grounding stops matching it."""
     return _delete("threat-types", threat_type_id, principal, request)
 
 
 @router.get("/threat-catalogue", response_model=list[ThreatCatalogueRow], tags=["Threat Catalogue Admin"])
 def list_threat_catalogue(limit: int = _LIMIT, offset: int = _OFFSET, include_deleted: bool = _DELETED,
-                        _principal: Principal = Depends(get_principal)):
+                        _principal: Principal = Depends(get_admin_principal)):
     """Exact threats."""
     return _list("threat-catalogue", limit, offset, include_deleted)
 
 
 @router.post("/threat-catalogue", response_model=ThreatCatalogueRow, status_code=201, tags=["Threat Catalogue Admin"])
 def create_threat_catalogue(body: ThreatCatalogueCreate, request: Request,
-                            principal: Principal = Depends(get_principal)):
+                            principal: Principal = Depends(get_admin_principal)):
     """Create an exact threat under a family. 404s if the family doesn't exist."""
     return _create("threat-catalogue", body, principal, request)
 
 
 @router.patch("/threat-catalogue/{threat_catalogue_id}", response_model=ThreatCatalogueRow, tags=["Threat Catalogue Admin"])
 def update_threat_catalogue(body: ThreatCatalogueUpdate, request: Request, threat_catalogue_id: int = Path(ge=1),
-                            principal: Principal = Depends(get_principal)):
+                            principal: Principal = Depends(get_admin_principal)):
     """Partial update. A rename re-embeds the row and returns the new job's id."""
     return _update("threat-catalogue", threat_catalogue_id, body, principal, request)
 
 
 @router.delete("/threat-catalogue/{threat_catalogue_id}", response_model=ThreatCatalogueRow, tags=["Threat Catalogue Admin"])
 def delete_threat_catalogue(request: Request, threat_catalogue_id: int = Path(ge=1),
-                            principal: Principal = Depends(get_principal)):
+                            principal: Principal = Depends(get_admin_principal)):
     """Soft delete. Also drops the row's embedding so grounding stops matching it."""
     return _delete("threat-catalogue", threat_catalogue_id, principal, request)
 
 
 @router.get("/threat-actors", response_model=list[ThreatActorRow], tags=["Threat Actors Admin"])
 def list_threat_actors(limit: int = _LIMIT, offset: int = _OFFSET, include_deleted: bool = _DELETED,
-                    _principal: Principal = Depends(get_principal)):
+                    _principal: Principal = Depends(get_admin_principal)):
     """Threat actors."""
     return _list("threat-actors", limit, offset, include_deleted)
 
 
 @router.post("/threat-actors", response_model=ThreatActorRow, status_code=201, tags=["Threat Actors Admin"])
 def create_threat_actor(body: ThreatActorCreate, request: Request,
-                        principal: Principal = Depends(get_principal)):
+                        principal: Principal = Depends(get_admin_principal)):
     """Create an actor. Actors are not embedded, so no refresh job is returned."""
     return _create("threat-actors", body, principal, request)
 
 
 @router.patch("/threat-actors/{threat_actor_id}", response_model=ThreatActorRow, tags=["Threat Actors Admin"])
 def update_threat_actor(body: ThreatActorUpdate, request: Request, threat_actor_id: int = Path(ge=1),
-                        principal: Principal = Depends(get_principal)):
+                        principal: Principal = Depends(get_admin_principal)):
     """Partial update. Omitted fields keep their current value."""
     return _update("threat-actors", threat_actor_id, body, principal, request)
 
 
 @router.delete("/threat-actors/{threat_actor_id}", response_model=ThreatActorRow, tags=["Threat Actors Admin"])
 def delete_threat_actor(request: Request, threat_actor_id: int = Path(ge=1),
-                        principal: Principal = Depends(get_principal)):
+                        principal: Principal = Depends(get_admin_principal)):
     """Soft delete (IsDeleted=1). Returns the deleted row so the caller can see the who/when."""
     return _delete("threat-actors", threat_actor_id, principal, request)
 
@@ -294,7 +294,7 @@ def list_threat_rules(limit: int = _LIMIT, offset: int = _OFFSET,
                     include_deleted: bool = _RULE_DELETED,
                     threat_type_id: int | None = _Query(default=None, ge=1,
                                                         description="Only this family's rules."),
-                    _principal: Principal = Depends(get_principal)):
+                    _principal: Principal = Depends(get_admin_principal)):
     """Scoping rules. tech_gate = hard include/exclude by asset context; relevance_* = score
     weights. A rule whose parent Threat_Type is soft-deleted still lists here but no longer
     fires (dal.active_threat_rules re-asserts the parent)."""
@@ -311,7 +311,7 @@ def list_threat_rules(limit: int = _LIMIT, offset: int = _OFFSET,
 
 @router.post("/threat-rules", response_model=ThreatRuleRow, status_code=201, tags=["Threat Rules Admin"])
 def create_threat_rule(body: ThreatRuleCreate, request: Request,
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Create a scoping rule. 404s if the family doesn't exist; 409s on the live
     (threat_type_id, rule_type, rule_key, rule_value) natural key."""
     _validate_rule_fields(body.rule_type, body.rule_key, body.weight)
@@ -339,7 +339,7 @@ def create_threat_rule(body: ThreatRuleCreate, request: Request,
 
 @router.patch("/threat-rules/{threat_rule_id}", response_model=ThreatRuleRow, tags=["Threat Rules Admin"])
 def update_threat_rule(body: ThreatRuleUpdate, request: Request, threat_rule_id: int = Path(ge=1),
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Partial update of rule_value / weight / is_active. rule_type, rule_key and
     threat_type_id are immutable — retire and recreate instead, so the audit trail stays honest.
     An explicit `"weight": null` clears the override back to the configured default."""
@@ -377,7 +377,7 @@ def update_threat_rule(body: ThreatRuleUpdate, request: Request, threat_rule_id:
 
 @router.delete("/threat-rules/{threat_rule_id}", response_model=ThreatRuleRow, tags=["Threat Rules Admin"])
 def delete_threat_rule(request: Request, threat_rule_id: int = Path(ge=1),
-                    principal: Principal = Depends(get_principal)):
+                    principal: Principal = Depends(get_admin_principal)):
     """Soft delete (IsDeleted=1) — same convention as every other library table: ids may be
     referenced by history, so nothing is ever hard-deleted. Returns the row with its who/when."""
     with db_session() as sess:

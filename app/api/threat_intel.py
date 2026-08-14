@@ -20,7 +20,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.api.admin_jobs import FAMILY_INTEL, mark_admin_job
-from app.api.deps import Principal, get_principal, require_admin
+from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.schemas import (
     IntelFeedsResponse,
     IntelFeedStatus,
@@ -53,7 +53,7 @@ def _dispatch(feeds: list[str]) -> IntelRefreshAccepted:
 
 
 @router.get("/feeds", response_model=IntelFeedsResponse)
-def list_feeds(_principal: Principal = Depends(get_principal)) -> IntelFeedsResponse:
+def list_feeds(_principal: Principal = Depends(get_admin_principal)) -> IntelFeedsResponse:
     """Every known feed with its cached volume, freshness and last outcome.
 
     Deliberately reports disabled feeds too: "switched off", "enabled but never run" and
@@ -67,7 +67,7 @@ def list_feeds(_principal: Principal = Depends(get_principal)) -> IntelFeedsResp
 @router.get("/items", response_model=IntelItemsResponse)
 def list_items(source: str | None = None,
             limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
-            _principal: Principal = Depends(get_principal)) -> IntelItemsResponse:
+            _principal: Principal = Depends(get_admin_principal)) -> IntelItemsResponse:
     """Browse the cached intel items themselves, newest first — `?source=otx` lists the
     OTX pulses with their `adversary`, `?source=cisa_kev` the exploited CVEs,
     `?source=cisa_ics` the OT advisories; no filter = every feed interleaved.
@@ -86,7 +86,7 @@ def list_items(source: str | None = None,
 
 @router.post("/feeds/refresh", response_model=IntelRefreshAccepted, status_code=202)
 def refresh_all_feeds(request: Request,
-                    principal: Principal = Depends(get_principal)) -> IntelRefreshAccepted:
+                    principal: Principal = Depends(get_admin_principal)) -> IntelRefreshAccepted:
     """Refresh every ENABLED feed now, without waiting for the daily schedule.
 
     Fans out to one job per feed rather than one job doing all of them, so a slow or
@@ -102,7 +102,7 @@ def refresh_all_feeds(request: Request,
 
 @router.post("/feeds/{feed}/refresh", response_model=IntelRefreshAccepted, status_code=202)
 def refresh_feed(feed: str, request: Request,
-                principal: Principal = Depends(get_principal)) -> IntelRefreshAccepted:
+                principal: Principal = Depends(get_admin_principal)) -> IntelRefreshAccepted:
     """Refresh ONE feed — the targeted retry after a failure, instead of re-pulling
     everything. Unknown feed → 404 (it is the addressed resource); a known but disabled
     feed → 404 as well, with a message naming it as disabled, since there is nothing to

@@ -191,6 +191,9 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                     or dal.stage_settled_at_epoch(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch)):
                 log.warning("controls.lease_lost", session_id=sid)
                 return
+            sess.commit()  # close the renew_lease txn before the slow grounding call below —
+            # otherwise the snapshot transaction stays open for however long grounding takes
+            # (rerank / remote calls), which is what selfcheck.tempdb_long_running_txn catches
             flat = [(q, qv_map.get(q)) for _, qs in per_output for q, _ in qs]
             matches = grounding.ground_control_queries(llm, flat, candidates, s)
             pos = 0

@@ -46,9 +46,9 @@ CREATE TABLE Scenario_Session (
     UserID                nvarchar(200)  NULL,
     AssetName             nvarchar(300)  NOT NULL,
     AssetID               nvarchar(200)  NOT NULL,          -- [R7] isolation key
-    SessionStatus         nvarchar(20)   NOT NULL,
-    CurrentStage          nvarchar(32)   NOT NULL,
-    StageStatus           nvarchar(20)   NOT NULL,
+    SessionStatus         nvarchar(100)   NOT NULL,
+    CurrentStage          nvarchar(100)   NOT NULL,
+    StageStatus           nvarchar(100)   NOT NULL,
     Mode                  nvarchar(20)   NOT NULL,
     CurrentSubsystemIndex int            NULL,
     SubsystemsJSON        nvarchar(max)  NOT NULL,
@@ -547,6 +547,38 @@ CREATE TABLE Config_Tuning (
     IsDeleted       bit            NOT NULL CONSTRAINT DF_Config_Tuning_IsDeleted DEFAULT 0
 );
 
+-- ============================================================
+-- API_Client — API-key authentication for the header auth model (app/api/deps.get_principal).
+-- TSG-owned. One row per caller (today: the Shield backend). The secret is NEVER stored, only
+-- its SHA-256 hex (KeyHash). SHA-256, not bcrypt: the secret is a 32-byte RANDOM value
+-- (python -c "import secrets; print(secrets.token_hex(32))"), so there is no dictionary to
+-- stretch. Several Active rows may coexist for make-before-break rotation; revoke = one UPDATE.
+-- Seed a key:  compute the hash in PYTHON (UTF-8), then insert the literal. Do NOT use HASHBYTES
+--              in SQL: given a parameter or an N'...' literal it hashes UTF-16 and never matches
+--              the app's UTF-8 SHA-256 (silent 401s).
+--                python -c "import hashlib,secrets; s=secrets.token_hex(32); print(s, hashlib.sha256(s.encode()).hexdigest())"
+--              INSERT INTO API_Client (ClientID, KeyHash, Name, Module) VALUES ('shield-prod', '<keyhash>', 'Shield', 'tsg');
+-- Module scopes a key to ONE module ('tsg', 'chatbot', ...): a key authenticates only for its own
+-- Module, so a leaked key is contained to one module. Default 'tsg' applies if a manual INSERT
+-- omits Module (the app always sets it explicitly — dal.create_api_client).
+-- ============================================================
+IF OBJECT_ID('dbo.API_Client', 'U') IS NULL
+CREATE TABLE API_Client (
+    ClientID    nvarchar(100) NOT NULL CONSTRAINT PK_API_Client PRIMARY KEY,
+    KeyHash     nvarchar(64)  NOT NULL,
+    Name        nvarchar(200) NOT NULL,
+    Module      nvarchar(50)  NOT NULL CONSTRAINT DF_API_Client_Module   DEFAULT 'tsg',
+    Active      bit           NOT NULL CONSTRAINT DF_API_Client_Active    DEFAULT 1,
+    -- Audit trail (provenance only; the auth path reads none of these):
+    CreatedAt   datetime2(3)  NOT NULL CONSTRAINT DF_API_Client_CreatedAt DEFAULT SYSUTCDATETIME(),
+    CreatedBy   nvarchar(200) NULL,   -- who provisioned the key
+    RevokedAt   datetime2(3)  NULL,   -- when it was deactivated
+    RevokedBy   nvarchar(200) NULL    -- who revoked it
+);
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_API_Client_KeyHash' AND object_id = OBJECT_ID('dbo.API_Client'))
+CREATE UNIQUE INDEX UX_API_Client_KeyHash ON API_Client (KeyHash) WHERE Active = 1;
+
 GO
 
 -- Verify
@@ -555,4 +587,4 @@ UNION ALL
 SELECT TABLE_NAME, 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME IN (
     'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Scoped_Threat',
     'Threat_Scenario_Output','Threat_Library_Import_Run','Scenario_Audit','Prompt_Log',
-    'Threat_Candidate_Review','Risk_Treatment_Plan');
+    'Threat_Candidate_Review','Risk_Treatment_Plan','API_Client');

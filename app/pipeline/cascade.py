@@ -457,28 +457,29 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
 
     return tasks.decide_session_outcome(sess, scenario_session)
 
-def _coverage_exclusions(threats: list[dict], cap: int | None = None) -> list[str]:
+def _coverage_exclusions(threats: list[dict]) -> list[str]:
     """Distinct labels of the threats already proposed for this subsystem, fed to the
     coverage-aware prompt so an additive round asks for genuinely NEW ones. Prefer the grounded
     library label, fall back to the raw proposal; drop blanks.
 
-    Capped by `coverage_exclusions_max` — the one prompt input that GROWS with every accumulated
-    next-set round. Truncation keeps the MOST RECENT labels: `dal.active_threats` returns newest
-    first and the fold below preserves that order, so a session past the cap drops the threats
-    least likely to be re-proposed. This previously sorted ALPHABETICALLY before truncating, which
-    froze the list on an arbitrary prefix — past the cap the newest threats never reached the
-    prompt at all, and the additive round kept re-proposing exactly the ones it had just found.
-    # ponytail: the exclusion list is steering, not enforcement — tasks.py's identity-fold dedup
-    # silently drops any re-proposed already-active threat, so truncation can only ever cost one
-    # wasted proposal, never a duplicate row. Configurable so a long-running session that starts
-    # burning proposals on threats it already has can be tuned without a code change."""
+    UNCAPPED — the full session history reaches the prompt, so the model can never re-propose a
+    threat it simply was not told about. At temperature 0 a repeat costs the whole slot (the
+    same question yields the same answer on a re-click), which is why completeness wins over the
+    prompt-size cap that used to truncate this list to the newest 50."""
     # tasks.threat_label is THE definition — the semantic near-duplicate scan measures against
     # the same string this list steers away from, so the two can never drift apart.
-    if cap is None:  # session-tuned when the caller carries a snapshot; config otherwise
-        cap = get_settings().coverage_exclusions_max
     labels = (tasks.threat_label(t) for t in threats)
-    # dict.fromkeys, not set(): dedup while PRESERVING the newest-first order the cap slices.
-    return list(dict.fromkeys(lbl for lbl in labels if lbl))[:cap]
+    # dict.fromkeys, not set(): dedup while PRESERVING newest-first order.
+    return list(dict.fromkeys(lbl for lbl in labels if lbl))
+
+
+def _buffered_ask(shortfall: int, cap: int) -> int:
+    """How many threats the additive next-set call asks for: 2x the shortfall, so normal dedup
+    loss still leaves enough survivors to fill the click. Capped at max_threats_per_asset (the
+    per-round proposal ceiling), floored at the shortfall so no tuning combination can ever ask
+    for LESS than the exact ask did.
+    # ponytail: fixed 2x, not a tuning knob — add one only if real sessions still come up short."""
+    return max(shortfall, min(shortfall * 2, cap))
 
 def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
                         subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
@@ -652,22 +653,24 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
                 # Get active threats for this session/subsystem from database 
                 prior_threats = dal.active_threats(sess, sid, subsystem_id)
 
-                # get list of threats to exclude from the AI call 
-                exclude = _coverage_exclusions(prior_threats, cap=tn.coverage_exclusions_max)
+                # get list of threats to exclude from the AI call
+                exclude = _coverage_exclusions(prior_threats)
 
                 dal.reset_stage_for_regen(sess, sid, subsystem_id, (SubsystemLevel.THREATS,), threats_epoch)
                 new_threats: list[dict] = []
                 try:
                     # get the new threats from the AI call, passing in the list of threats to exclude.
-                    # max_threats=the shortfall, NOT tn.max_threats_per_asset: this call exists to
-                    # fill next_set_size, not to re-run a full asset-level proposal round. Without
-                    # this override find_threats() over-fetches up to the full per-asset cap every
-                    # time it tops up, banking unused threats for a later click instead of asking
-                    # for exactly what THIS click needs.
+                    # max_threats=_buffered_ask(shortfall), NOT the bare shortfall: dedup drops any
+                    # proposal colliding with an existing threat BEFORE it counts, so an exact ask
+                    # has zero headroom — one duplicate already leaves the click short, and at
+                    # temperature 0 a re-click re-asks the same question and gets the same answer.
+                    # Survivors beyond this click's need are not waste: they stay banked as
+                    # unserved threats and a FUTURE click serves them with no AI call at all.
                     new_threats, _prov = tasks.find_threats(sess, scenario_session, subsystems, asset_context, llm, task_id,
                                                         epoch=threats_epoch, supersede=False, exclude=exclude,
                                                         prior_threats=prior_threats,
-                                                        max_threats=next_set_size - len(fresh))
+                                                        max_threats=_buffered_ask(next_set_size - len(fresh),
+                                                                                tn.max_threats_per_asset))
                 except LLMSlotUnavailable:
                     raise  # retryable capacity squeeze — leave THREATS reclaimable so the retry re-runs it
                 except Exception as exc:  # noqa: BLE001 — a transient additive-threats failure must not wedge/cancel
