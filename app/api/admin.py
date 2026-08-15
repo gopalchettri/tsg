@@ -1,14 +1,16 @@
 """Admin API — threat-library embedding cache maintenance (create/update/recreate/delete).
 
 Asynchronous: each POST validates, audits, queues admin_embedding_action_task and returns 202 +
-a job_id. GET .../status/{job_id} polls Celery's own AsyncResult.
+a job_id. GET .../status/{job_id} polls Celery's own AsyncResult; GET .../events/{job_id}
+streams the worker's live embedding_job_update hints over SSE.
 """
 from __future__ import annotations
 
 from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, Query, Request
 
-from app.api.admin_jobs import FAMILY_EMBEDDINGS, admin_job_exists, mark_admin_job
+from app.api.admin_jobs import FAMILY_EMBEDDINGS, admin_job_exists, emb_job_channel_key, mark_admin_job
+from app.api.admin_sse import admin_job_event_stream
 from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.schemas import (
     CandidateResolutionResult,
@@ -22,7 +24,7 @@ from app.api.schemas import (
     PromotionRetryResult,
 )
 from app.core.config import get_settings
-from app.core.enums import CandidateStatus
+from app.core.enums import CandidateStatus, CeleryJobState, SSEEventType
 from app.core.logging import get_logger
 from app.db import dal
 from app.db.dal import NotFoundError
@@ -137,11 +139,28 @@ def get_status(job_id: str, _principal: Principal = Depends(get_admin_principal)
     if not admin_job_exists(job_id, FAMILY_EMBEDDINGS):
         raise NotFoundError(f"unknown or expired job_id: {job_id!r}")
     result = AsyncResult(job_id, app=celery_app)
-    if result.state == "FAILURE":
-        return EmbeddingJobStatus(state=result.state, error=str(result.result))
-    if result.state == "SUCCESS":
-        return EmbeddingJobStatus(state=result.state, **(result.result or {}))
-    return EmbeddingJobStatus(state=result.state)
+    state = CeleryJobState(result.state)  # total over Celery's vocabulary — see the enum
+    if state is CeleryJobState.FAILURE:
+        return EmbeddingJobStatus(state=state, error=str(result.result))
+    if state is CeleryJobState.SUCCESS:
+        return EmbeddingJobStatus(state=state, **(result.result or {}))
+    return EmbeddingJobStatus(state=state)
+
+
+@router.get("/events/{job_id}", responses={200: {"content": {"text/event-stream": {}}}})
+async def job_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
+    """SSE stream for one queued embedding action: a state snapshot on connect (a late
+    subscriber to a finished job gets the terminal state immediately and the stream closes),
+    then the worker's live `embedding_job_update` hints (STARTED, per-group progress,
+    terminal). The marker gate is the same authorization boundary as get_status above.
+
+    SSE stays a HINT layer (the session-stream contract applies here too): a dead worker or an
+    open publish breaker sends nothing, so the shared implementation's tick backstop re-reads
+    the real AsyncResult state on a fixed cadence and closes the stream itself once terminal —
+    get_status remains the durable truth. Streaming mechanics live in admin_sse.py, shared with
+    the import and intel-refresh job-events routes."""
+    return await admin_job_event_stream(
+        job_id, FAMILY_EMBEDDINGS, emb_job_channel_key, str(SSEEventType.embedding_job_update))
 
 
 # ---------------------------------------------------------------------------

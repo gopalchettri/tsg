@@ -81,7 +81,7 @@ Confirm before testing:
 .\.venv\Scripts\celery.exe -A app.pipeline.celery_app.celery_app inspect ping -t 5
 ```
 
-Expect `pong`, plus `GET /health` and `GET /readyz` returning OK.
+Expect `pong`, plus `GET /health` and `GET /ready` returning OK.
 
 **The worker is mandatory.** The POST only queues work — with no worker the plan stays `RUNNING`
 until it passes the staleness window and then reads as timed out.

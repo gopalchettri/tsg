@@ -43,6 +43,7 @@ class ApiClientInfo(BaseModel):
 # string-literal unions from the spec instead of hand-copying codes out of the API guide.
 from app.core.enums import (
     CandidateStatus,
+    CeleryJobState,
     ClickOutcomeReason,
     NextSetOutcome,
     RetryOutcome,
@@ -1449,7 +1450,7 @@ class ImportJobStatus(BaseModel):
         }
     )
 
-    state: str = Field(description="Celery AsyncResult state: PENDING/STARTED/SUCCESS/FAILURE/RETRY/...")
+    state: CeleryJobState = Field(description="Celery AsyncResult state — see CeleryJobState (app/core/enums.py).")
     result: dict | None = Field(default=None, description="run_import's stats dict, once SUCCESS.")
     error: str | None = Field(default=None, description="Bounded error message, once FAILURE.")
 
@@ -1480,8 +1481,8 @@ class EmbeddingJobStatus(EmbeddingActionResponse):
         }
     )
 
-    state: str = Field(
-        description="Job's current state, mirrors Celery's AsyncResult.state: PENDING, STARTED, SUCCESS, FAILURE, or RETRY."
+    state: CeleryJobState = Field(
+        description="Job's current state, mirrors Celery's AsyncResult.state — see CeleryJobState (app/core/enums.py)."
     )
     error: str | None = Field(default=None, description="Error message when state is FAILURE. Null otherwise.")
 

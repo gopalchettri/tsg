@@ -29,7 +29,7 @@ ALTER DATABASE TSG SET READ_COMMITTED_SNAPSHOT ON;
 | Secrets             | `.env` file                     | **OpenShift Secrets / Vault** (never committed)   |
 | Embeddings/reranker | local in-process                  | **served on GPU via litellm/TEI** (recommended)   |
 | DB reads            | default                           | **RCSI on**, connection pools sized               |
-| Health              | none                              | **`/health`, `/readyz`** probes              |
+| Health              | none                              | **`/health`, `/ready`** probes              |
 
 ---
 
@@ -128,7 +128,7 @@ This starts **api** (gunicorn + 4 uvicorn workers), **worker** (Celery, gevent, 
 a **Secret + ConfigMap** for the env, and health probes:
 
 - **liveness** → `GET /health`
-- **readiness** → `GET /readyz`
+- **readiness** → `GET /ready`
 
 Scale the **api** and **worker** Deployments to add capacity (they're stateless; §concurrency).
 
@@ -138,7 +138,7 @@ Scale the **api** and **worker** Deployments to add capacity (they're stateless;
 
 ```bash
 curl http://YOUR_HOST:8000/health     # {"status":"ok"}
-curl http://YOUR_HOST:8000/readyz     # {"status":"ready","checks":{"database":"ok","redis":"ok","mongo":"ok"}}
+curl http://YOUR_HOST:8000/ready     # {"status":"ready","checks":{"database":"ok","redis":"ok","mongo":"ok"}}
 ```
 
 `checks.mongo` reads `"skipped"` instead of `"ok"`/`"error"` when `EMBEDDING_STORE=memory` — a valid
@@ -278,7 +278,7 @@ these hardening items (Milestones 2–4 in the plan):
   `503` backpressure signal (M2).
 - **Observability & scale proof** — Prometheus metrics, OpenTelemetry traces, Flower, and a load test
   to size GPU/worker capacity; full OpenShift manifests (M4). (A dependency-free stopgap already exists —
-  see §9's `tsg.self_check` task and `/readyz`'s per-dependency status — so this isn't zero signal until
+  see §9's `tsg.self_check` task and `/ready`'s per-dependency status — so this isn't zero signal until
   M4 ships, just not real metrics/alerting infrastructure yet.)
 
 ---
@@ -290,7 +290,7 @@ docker build -t tsg:latest .
 cp .env.prod.example .env.uat                                   # then fill in real values
 sqlcmd -S <server> -d <database> -i scripts/TSG_Core.sql          # schema, database-first
 docker compose -f docker/compose.prod.yml --env-file .env.uat up -d
-curl http://YOUR_HOST:8000/readyz                                # ready?
+curl http://YOUR_HOST:8000/ready                                # ready?
 TOKEN=... (Section 7)                                            # real JWT with entities claim
 # create → events → status → results → accept (Section 8)
 ```

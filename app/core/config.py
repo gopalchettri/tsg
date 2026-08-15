@@ -357,25 +357,22 @@ class Settings(BaseSettings):
     # Batch size of one "generate next set" click (scenarios served/generated per call).
     next_set_size: int = Field(5, ge=1)
 
-    # Cosine at or above which a proposed threat is DROPPED as a paraphrase of one the session
-    # already has. This is the definition of "unique" for a threat: unique in MEANING. The identity
-    # fold above it is exact/ID-only, so without this gate the same threat in different words
-    # survives as two rows and costs two paid generations.
-    #
-    # Measured on real CII data at this value for the same-category case: 4/4 paraphrases caught,
-    # 0/5 false positives. Set to 1.0 to disable the gate without a deploy — new sessions snapshot
-    # it, running ones keep the value they started with. tasks._semantic_duplicates carries why the
-    # STRIDE-category gate beside this threshold is mandatory rather than an optimisation.
+    # Session-tunable FLOOR into the single semantic-dedup bar. The effective cutoff every pair is
+    # judged at is max(semantic_cross_category_threshold, this) — category-blind by design: a shared
+    # STRIDE category is a ~1-in-6 coincidence, and judging same-category pairs at a lower bar
+    # merged distinct threats that merely share vocabulary. Set to 1.0 to disable the gate without
+    # a deploy — new sessions snapshot it, running ones keep the value they started with.
     # EMBEDDING-MODEL-SPECIFIC: a value tuned for e5-large@1024 means nothing on qwen3-8b@4096.
     semantic_near_duplicate_threshold: float = Field(0.92, ge=0.0, le=1.0)
 
-    # SECOND, much stricter ceiling for threats in DIFFERENT STRIDE categories. The category gate
-    # exists because 'Unauthorized disclosure of X' vs 'Unauthorized modification of X' measures
-    # 0.969 — above every true paraphrase — so cross-class pairs must never be judged at the normal
-    # threshold. But the category label is the MODEL'S choice among ~6 values, so the same threat
-    # relabelled between rounds could bypass dedup entirely. 0.98 sits safely above the 0.969 trap
-    # (both real threats survive) while catching relabelled restatements. Must stay ABOVE both 0.969
-    # and the same-category threshold — the validator below enforces the ordering at boot.
+    # BASE of that same bar: cosine at or above which a proposed threat is DROPPED as a restatement
+    # of one the session already has, whatever the categories involved. The identity fold above it
+    # is exact/ID-only, so without this gate the same threat in different words survives as two
+    # rows and costs two paid generations. 0.98 sits safely above the measured 0.969 trap —
+    # 'Unauthorized disclosure of X' vs 'Unauthorized modification of X', two REAL threats one word
+    # apart (embeddings weigh shared words heavily) — while still catching true paraphrases and
+    # relabelled restatements. Must stay ABOVE both 0.969 and the tunable floor above — the
+    # validator below enforces the ordering at boot.
     semantic_cross_category_threshold: float = Field(0.98, ge=0.0, le=1.0)
 
     # --- Threat-scoping selection cutoff ---
@@ -687,6 +684,15 @@ class Settings(BaseSettings):
                 semantic_near_duplicate_threshold=self.semantic_near_duplicate_threshold,
                 note="below ~0.5 nearly every threat pair matches — the near-duplicate log stops "
                     "being a signal and cannot be used to calibrate a real cutoff")
+        # Same 1.25 headroom rule the scoping_top_n validator applies. Warning, never a raise:
+        # a config that boots today must keep booting.
+        if self.max_threats_per_asset < self.next_set_size * 1.25:
+            get_logger(__name__).warning(
+                "config.thin_next_set_headroom",
+                next_set_size=self.next_set_size,
+                max_threats_per_asset=self.max_threats_per_asset,
+                note="cascade._buffered_ask caps the additive ask at max_threats_per_asset, so a "
+                    "next-set click loses its 2x dedup cushion and will under-deliver more often")
         return self
 
     @model_validator(mode="after")

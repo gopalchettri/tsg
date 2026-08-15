@@ -390,7 +390,7 @@ for a human. It did not gain an asset-named near-duplicate, and it did not gain 
 | Promotion threshold | **75** | Below this score, an accepted threat becomes a library candidate. Cannot exceed the match cutoff. |
 | Auto-reject band | **0.95** | At or above this, a proposed name is treated as an existing entry reworded. |
 | Auto-approve band | **0.80** | Below this against *every* entry, a proposed name is treated as genuinely novel. Must stay below the auto-reject band. |
-| Near-duplicate logging | **0.92** | Where a probable reworded proposal is logged. **Observation only** — nothing is rejected on it. |
+| Duplicate-meaning cutoff | **0.98** | At or above this similarity, a proposed threat is treated as a restatement of one already in the session and set aside (recorded for audit, not saved as a second threat). Sharing a category or type never lowers this bar. |
 
 ---
 

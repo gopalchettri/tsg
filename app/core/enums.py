@@ -65,8 +65,14 @@ class DuplicateReason(StrEnum):
     """`Identified_Duplicate_Threat.DuplicateReason` — why a proposed threat was diverted there
     instead of Identified_Threat. See tasks.py::find_threats/_semantic_duplicates."""
     identity = "identity"                                  # exact identity-hash match
-    semantic_same_category = "semantic_same_category"      # >= semantic_near_duplicate_threshold, same category
-    semantic_cross_category = "semantic_cross_category"    # >= semantic_cross_category_threshold, different category
+    # HISTORICAL, no longer written: rows from before the drop rule went category-blind split
+    # the reason by category. Kept so existing Identified_Duplicate_Threat rows stay readable.
+    semantic_same_category = "semantic_same_category"
+    semantic_cross_category = "semantic_cross_category"
+    semantic_similarity = "semantic_same_threat"           # THE reason for every semantic drop now:
+                                                        # cosine >= max(semantic_cross_category_threshold,
+                                                        # session threshold), whatever the categories
+                                                        # (tasks.py::_semantic_duplicates)
 
 
 class ThreatRuleType(StrEnum):
@@ -220,7 +226,9 @@ class SSEEventType(StrEnum):
     + stage); `subsystem_started` is one subsystem (no stage); `session_entered_review`/
     `heartbeat`/`reconcile` are session-wide (never a subsystem_id). `error` is DUAL-scope by
     design — an explicit `scope` field ("stage"/"session") says which, rather than relying on
-    whether subsystem_id is present."""
+    whether subsystem_id is present. `embedding_job_update` is the one ADMIN-scope member:
+    published on a per-job admin channel (admin_jobs.py::emb_job_channel_key), never on a
+    session channel, so a session subscriber can never receive it."""
     reconcile = "reconcile"                            # the one-time snapshot sent on (re)connect,
                                                     # before live deltas — the full SessionBoard,
                                                     # not a delta. Never published via bus.publish;
@@ -249,6 +257,46 @@ class SSEEventType(StrEnum):
                                                     # in the API process) never publish, so a client must keep
                                                     # a slow backstop poll
     heartbeat = "heartbeat"                            # keep-alive so proxies don't drop an idle SSE connection
+    embedding_job_update = "embedding_job_update"      # ADMIN-scope: one embeddings job's state change on its
+                                                    # own job channel — payload carries job_id + a
+                                                    # CeleryJobState `state`, per-group progress
+                                                    # (group/rows), and the terminal result fields
+                                                    # (rows_processed/vectors_deleted or error)
+    import_job_update = "import_job_update"            # ADMIN-scope: one threat-library-import job's state
+                                                    # change on its own job channel (admin_jobs.py::
+                                                    # import_job_channel_key) — payload carries job_id + a
+                                                    # CeleryJobState `state`, and on SUCCESS the same stats
+                                                    # dict ImportJobStatus.result exposes (ot_rules,
+                                                    # embeddings_job_id, etc.) or `error` on FAILURE
+    intel_job_update = "intel_job_update"              # ADMIN-scope: one threat-intel feed-refresh job's state
+                                                    # change on its own job channel (admin_jobs.py::
+                                                    # intel_job_channel_key) — payload carries job_id + feed +
+                                                    # a CeleryJobState `state` (RETRY is non-terminal, since
+                                                    # this task retries on any exception up to max_retries),
+                                                    # item_count on SUCCESS or error on terminal FAILURE
+
+
+class CeleryJobState(StrEnum):
+    """Celery's own AsyncResult.state vocabulary — the one enum here that is NOT DB-stored.
+    Exists so the admin job-status routes (embeddings + library import) and the job SSE events
+    never compare or emit a bare state string (this module's own rule). Members are the complete
+    set Celery reports, so `CeleryJobState(result.state)` is total — no fallback branch. With
+    `task_track_started` on (celery_app.py) a picked-up task reports STARTED, so PENDING means
+    "queued (or unknown id)", never "running"."""
+    PENDING = "PENDING"      # queued, not yet picked up — or an id the result backend never saw
+    RECEIVED = "RECEIVED"
+    STARTED = "STARTED"      # a worker is executing it right now (requires task_track_started)
+    RETRY = "RETRY"          # autoretry scheduled (e.g. LLMSlotUnavailable) — it WILL run again
+    SUCCESS = "SUCCESS"      # terminal
+    FAILURE = "FAILURE"      # terminal
+    REVOKED = "REVOKED"      # terminal
+    REJECTED = "REJECTED"
+    IGNORED = "IGNORED"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True once the state can never change again — the SSE job stream closes on these."""
+        return self in (CeleryJobState.SUCCESS, CeleryJobState.FAILURE, CeleryJobState.REVOKED)
 
 
 class NextSetOutcome(StrEnum):

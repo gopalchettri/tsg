@@ -17,9 +17,11 @@ principal) and cross-tenant by nature: the intel cache is shared, not entity-sco
 """
 from __future__ import annotations
 
+from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from app.api.admin_jobs import FAMILY_INTEL, mark_admin_job
+from app.api.admin_jobs import FAMILY_INTEL, intel_job_channel_key, mark_admin_job
+from app.api.admin_sse import admin_job_event_stream
 from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.schemas import (
     IntelFeedsResponse,
@@ -28,6 +30,7 @@ from app.api.schemas import (
     IntelItemsResponse,
     IntelRefreshAccepted,
 )
+from app.core.enums import SSEEventType
 from app.core.logging import get_logger
 from app.db.dal import NotFoundError
 from app.intel.fetchers import ALL_FEEDS, enabled_feed_names, feed_status, list_intel
@@ -116,3 +119,26 @@ def refresh_feed(feed: str, request: Request,
                 user_id=principal.user_id,
                 source_ip=request.client.host if request.client else None)
     return accepted
+
+
+def _extend_intel_terminal(result: AsyncResult) -> dict:
+    """intel_refresh_feed_task returns a bare item count, not a dict (unlike import/embeddings)
+    — map it to a named field instead of the shared default's dict-spread, which would do
+    nothing for a plain int."""
+    return {"item_count": result.result} if isinstance(result.result, int) else {}
+
+
+@router.get("/feeds/events/{job_id}", responses={200: {"content": {"text/event-stream": {}}}})
+async def job_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
+    """SSE stream for one queued per-feed refresh job (one of the ids in
+    IntelRefreshAccepted.jobs): a state snapshot on connect, then the worker's live
+    `intel_job_update` hints (STARTED, then either terminal SUCCESS/FAILURE or a non-terminal
+    RETRY — see intel_refresh_feed_task's docstring for why RETRY must stay non-terminal here) —
+    same hint-layer/AsyncResult-backstop contract as admin.py::job_events. GET /feeds (per-feed
+    last_success_at/last_error) remains the durable truth; there is no separate per-job GET
+    status route for intel today, so this stream reads AsyncResult directly, same as it does.
+    Streaming mechanics live in admin_sse.py, shared with the embeddings and import job-events
+    routes."""
+    return await admin_job_event_stream(
+        job_id, FAMILY_INTEL, intel_job_channel_key, str(SSEEventType.intel_job_update),
+        extend_terminal=_extend_intel_terminal)

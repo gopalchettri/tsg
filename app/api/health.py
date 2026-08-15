@@ -1,7 +1,7 @@
 """Liveness / readiness probes for production orchestrators (OpenShift / K8s).
 
 No authentication — these are called by the platform's health checks, not users.
-`/health` = the process is up. `/readyz` = every dependency the app actually
+`/health` = the process is up. `/ready` = every dependency the app actually
 needs (database, Redis, and Mongo when it's in use) is reachable right now.
 """
 from __future__ import annotations
@@ -87,7 +87,7 @@ def _check_mongo() -> bool | None:
         return False
 
 
-@router.get("/readyz")
+@router.get("/ready")
 def readyz():
     """Readiness probe — checks every dependency this app actually needs. Any one of
     them being unreachable (except Mongo when this deployment doesn't use it) returns

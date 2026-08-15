@@ -24,6 +24,28 @@ def _key(job_id: str, family: str) -> str:
     return f"{_JOB_KEY_PREFIX}{family}:{job_id}"
 
 
+def emb_job_channel_key(job_id: str) -> str:
+    """SSE bus channel id for one embeddings job — the ONE convention the worker publisher
+    (celery_app.py::admin_embedding_action_task) and the API subscriber (admin.py::job_events)
+    share, mirroring bus.channel()'s role for sessions. Namespaced so it can never collide
+    with a session channel (session ids are bare UUIDs)."""
+    return f"admin-emb:{job_id}"
+
+
+def import_job_channel_key(job_id: str) -> str:
+    """Same convention as emb_job_channel_key, for one threat-library-import job — shared by
+    celery_app.py::import_threat_library_task (publisher) and
+    threat_library_import.py::job_events (subscriber)."""
+    return f"admin-import:{job_id}"
+
+
+def intel_job_channel_key(job_id: str) -> str:
+    """Same convention as emb_job_channel_key, for one threat-intel feed-refresh job — shared
+    by celery_app.py::intel_refresh_feed_task (publisher) and threat_intel.py::job_events
+    (subscriber)."""
+    return f"admin-intel:{job_id}"
+
+
 def mark_admin_job(job_id: str, family: str) -> None:
     """Best-effort marker write (same TTL as the Celery result backend, so marker and
     result expire together). Fails open on the QUEUE side — a Redis blip must not block

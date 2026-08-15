@@ -17,8 +17,9 @@ import time
 from celery import Celery, current_task  # type: ignore[import-untyped]
 from celery.signals import worker_init, worker_process_init  # type: ignore[import-untyped]
 
+from app.api.admin_jobs import emb_job_channel_key, import_job_channel_key, intel_job_channel_key
 from app.core.config import get_settings
-from app.core.enums import RegenGranularity
+from app.core.enums import CeleryJobState, RegenGranularity, SSEEventType
 from app.core.logging import configure_logging
 from app.db import dal
 from app.db.dal import guid
@@ -28,6 +29,7 @@ from app.pipeline.llm import LLMSlotUnavailable, get_llm
 from app.pipeline.reaper import clean_up_abandoned_sessions, retry_failed_promotions
 from app.pipeline.selfcheck import run_self_checks
 from app.pipeline.tasks import _process_all_supporting_systems
+from app.sse import bus
 
 _s = get_settings()
 
@@ -41,6 +43,12 @@ celery_app.conf.update(
     result_expires=_s.result_expires_seconds,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+
+    # Without this a task a worker is ACTIVELY RUNNING still reports PENDING — a 13-minute
+    # embeddings re-embed reads exactly like "nothing ever consumed it" to the status routes
+    # (observed live: job f8dd33f8 ran 791s while its poller saw PENDING throughout). One
+    # backend write per task start; the STARTED state CeleryJobState documents becomes real.
+    task_track_started=True,
 
     # Reserve only what each slot can RUN, not 4x it. The default multiplier (4) times the
     # `-c 50` every launch path uses (compose.prod.yml serves UAT+prod; start.ps1/run.ps1
@@ -211,38 +219,84 @@ def generate_treatment_plan_task(self, plan_id: str) -> None:
         treatment.run_treatment_generation(sess, plan_id, get_llm(), self.request.id or guid())
 
 
-@celery_app.task(name="tsg.admin_embedding_action",
+def _publish_emb_job_event(job_id: str | None, state: CeleryJobState, **fields) -> None:
+    """Best-effort SSE hint for admin.py::job_events subscribers — bus.publish's breaker
+    applies, and the endpoint's own AsyncResult backstop covers a publish that never arrives,
+    so a lost event costs one poll interval, never correctness. No-op without a job id: the
+    task body is callable synchronously (tests) where no Celery request id exists."""
+    if not job_id:
+        return
+    bus.publish(emb_job_channel_key(job_id),
+                {"type": str(SSEEventType.embedding_job_update), "job_id": job_id,
+                "state": str(state), **fields})
+
+
+@celery_app.task(bind=True, name="tsg.admin_embedding_action",
                 autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
-def admin_embedding_action_task(action: str, group: str | None, names: list[str] | None,
+def admin_embedding_action_task(self, action: str, group: str | None, names: list[str] | None,
                                 strict: bool = True) -> dict:
     """Background counterpart to app/api/admin.py's four embedding-cache routes; the caller polls
-    GET .../status/{job_id}.
+    GET .../status/{job_id} (durable truth) or streams GET .../events/{job_id} (live hints:
+    STARTED, per-group progress, terminal state — published here, per-job channel).
 
     `create`/`update` are idempotent on retry (they only embed what's missing). `recreate`
     re-wipes and re-embeds every group in scope from scratch — wasted work, not a correctness bug.
     ponytail: accepted; revisit only if recreate is ever run against a much larger library.
     """
-    if action == "delete":
-        # `strict` stays ON for the admin route (a typed name CAN be a typo) and is turned OFF by
-        # library_crud.py, whose names come from a row it just renamed or soft-deleted — no longer
-        # ACTIVE, so strict made every such edit report FAILURE for a delete with nothing to do.
-        with db_session() as sess:
-            return {"vectors_deleted": embeddings._for_each_group(
-                group, lambda g: embeddings.delete_group(sess, g, names, strict=strict))}
-    llm = get_llm()
-    with db_session() as sess:
-        if action == "create":
+    job_id = self.request.id
+    _publish_emb_job_event(job_id, CeleryJobState.STARTED, action=action)
+
+    def _done(g: str, rows: int) -> int:
+        # Fires as soon as fn(g) RETURNS, not once its write is durable — a multi-group sweep
+        # (group=None) shares ONE db_session() across every group, committed once at the very
+        # end, so a LATER group hitting EmbeddingBusy (a real per-group lock conflict,
+        # _for_each_group re-raises it) rolls back everything, including a group this already
+        # announced as done. Safe to leave as-is: this is a STARTED-scoped progress tick, never
+        # the terminal event — the SAME hint-layer contract SSEEventType documents for
+        # next_set_result/regen_result/treatment_plan_result applies here. The one claim that
+        # must be durable, the terminal SUCCESS below, IS: it only fires after its db_session()
+        # block has already exited (committed).
+        _publish_emb_job_event(job_id, CeleryJobState.STARTED, action=action, group=g, rows=rows)
+        return rows
+
+    try:
+        if action == "delete":
+            # `strict` stays ON for the admin route (a typed name CAN be a typo) and is turned OFF by
+            # library_crud.py, whose names come from a row it just renamed or soft-deleted — no longer
+            # ACTIVE, so strict made every such edit report FAILURE for a delete with nothing to do.
+            with db_session() as sess:
+                out = {"vectors_deleted": embeddings._for_each_group(
+                    group, lambda g: _done(g, embeddings.delete_group(sess, g, names, strict=strict)))}
+        elif action == "create":
             # create_items can't fan out over "every group" like its siblings. The API route
             # enforces this too, but the task is reachable outside it (Flower, tests).
             if not group or not names:
                 raise ValueError("create requires both group and names")
-            return {"rows_processed": {group: embeddings.create_items(sess, llm, group, names)}}
-        if action == "update":
-            return {"rows_processed": embeddings._for_each_group(group, lambda g: embeddings.update_group(sess, llm, g))}
-        if action == "recreate":
-            return {"rows_processed": embeddings._for_each_group(
-                group, lambda g: embeddings.recreate_group(sess, llm, g, names))}
-    raise ValueError(f"unknown admin embedding action: {action!r}")
+            with db_session() as sess:
+                out = {"rows_processed": {group: _done(group, embeddings.create_items(
+                    sess, get_llm(), group, names))}}
+        elif action == "update":
+            llm = get_llm()
+            with db_session() as sess:
+                out = {"rows_processed": embeddings._for_each_group(
+                    group, lambda g: _done(g, embeddings.update_group(sess, llm, g)))}
+        elif action == "recreate":
+            llm = get_llm()
+            with db_session() as sess:
+                out = {"rows_processed": embeddings._for_each_group(
+                    group, lambda g: _done(g, embeddings.recreate_group(sess, llm, g, names)))}
+        else:
+            raise ValueError(f"unknown admin embedding action: {action!r}")
+    except LLMSlotUnavailable:
+        # autoretry path — the SAME task id runs again; RETRY, never FAILURE, or a subscriber
+        # would tear down on a job that is merely waiting for an LLM slot.
+        _publish_emb_job_event(job_id, CeleryJobState.RETRY, action=action)
+        raise
+    except Exception as e:  # noqa: BLE001 — publish the terminal hint, then let Celery record FAILURE
+        _publish_emb_job_event(job_id, CeleryJobState.FAILURE, action=action, error=str(e)[:500])
+        raise
+    _publish_emb_job_event(job_id, CeleryJobState.SUCCESS, action=action, **out)
+    return out
 
 
 @celery_app.task(name="tsg.reap")
@@ -280,7 +334,19 @@ def intel_refresh_task() -> dict[str, str]:
     return jobs
 
 
+def _publish_intel_job_event(job_id: str | None, state: CeleryJobState, **fields) -> None:
+    """Best-effort SSE hint for threat_intel.py::job_events subscribers — same hint-layer
+    contract as _publish_emb_job_event above. No-op without a job id: the task body is callable
+    synchronously (tests) where no Celery request id exists."""
+    if not job_id:
+        return
+    bus.publish(intel_job_channel_key(job_id),
+                {"type": str(SSEEventType.intel_job_update), "job_id": job_id,
+                "state": str(state), **fields})
+
+
 @celery_app.task(
+    bind=True,
     name="tsg.intel_refresh_feed",
     autoretry_for=(Exception,),
     retry_backoff=True,          # 1s, 2s, 4s … so a transient 5xx recovers on its own
@@ -294,15 +360,32 @@ def intel_refresh_task() -> dict[str, str]:
     soft_time_limit=600,         # raises SoftTimeLimitExceeded — refresh_one records it per feed
     time_limit=660,              # hard backstop if a fetch ignores the soft signal
 )
-def intel_refresh_feed_task(feed: str) -> int:
+def intel_refresh_feed_task(self, feed: str) -> int:
     """Refresh exactly ONE intel feed; returns the item count.
 
     Deliberately allowed to RAISE (unlike most tasks here) — the retry policy above is the point.
     `refresh_one` records the failure to the feed's status doc BEFORE re-raising, so the outcome
-    survives an exhausted retry chain and an expired Celery result."""
+    survives an exhausted retry chain and an expired Celery result.
+
+    `bind=True` only to read self.request.retries below — autoretry_for=(Exception,) means
+    EVERY exception here is retried up to max_retries, so a flat except-publish-FAILURE would
+    publish a false terminal state on a transient attempt that later succeeds, closing a
+    subscriber's SSE stream early (job_events' terminal check). retries >= max_retries is the
+    one case Celery's own autoretry wrapper will NOT retry again after this exception, so only
+    THAT case is the real terminal FAILURE; every earlier attempt is a non-terminal RETRY hint,
+    same distinction admin_embedding_action_task draws for LLMSlotUnavailable above."""
     from app.intel.fetchers import refresh_one
 
-    return refresh_one(feed)
+    job_id = self.request.id
+    _publish_intel_job_event(job_id, CeleryJobState.STARTED, feed=feed)
+    try:
+        count = refresh_one(feed)
+    except Exception as exc:  # noqa: BLE001 — publish a hint, then let autoretry_for decide
+        state = CeleryJobState.FAILURE if self.request.retries >= self.max_retries else CeleryJobState.RETRY
+        _publish_intel_job_event(job_id, state, feed=feed, error=str(exc)[:500])
+        raise
+    _publish_intel_job_event(job_id, CeleryJobState.SUCCESS, feed=feed, item_count=count)
+    return count
 
 
 @celery_app.task(name="tsg.self_check")
@@ -311,6 +394,18 @@ def self_check_task() -> list[str]:
     scheduled by `beat_schedule` above. run_self_checks() already logs every check that fires."""
     with db_session() as sess:
         return run_self_checks(sess)
+
+
+def _publish_import_job_event(job_id: str | None, state: CeleryJobState, **fields) -> None:
+    """Best-effort SSE hint for threat_library_import.py::job_events subscribers — same
+    hint-layer contract as _publish_emb_job_event above (bus.publish's breaker applies, the
+    endpoint's own AsyncResult backstop covers a lost publish). No-op without a job id: the
+    task body is callable synchronously (tests) where no Celery request id exists."""
+    if not job_id:
+        return
+    bus.publish(import_job_channel_key(job_id),
+                {"type": str(SSEEventType.import_job_update), "job_id": job_id,
+                "state": str(state), **fields})
 
 
 @celery_app.task(name="tsg.import_threat_library")
@@ -332,6 +427,7 @@ def import_threat_library_task(source: str, file_content: str | None, via_taxii:
 
     # ties the history row to the job the status route polls; None when called directly
     job_id = getattr(getattr(current_task, "request", None), "id", None)
+    _publish_import_job_event(job_id, CeleryJobState.STARTED, source=source)
     # started_by lands in Threat_Library_Import_Run.StartedBy AND CreatedBy on every row this run
     # creates; run_import falls back to 'auto:<tag>' when there is no caller.
     run_id = threat_library_import.record_import_started(source, dry_run=dry_run, job_id=job_id,
@@ -345,6 +441,8 @@ def import_threat_library_task(source: str, file_content: str | None, via_taxii:
         # Own transaction, outside the rolled-back import session: a failed import that left no
         # trace is the case an operator most needs to see.
         threat_library_import.record_import_finished(run_id, error=f"{type(exc).__name__}: {exc}")
+        _publish_import_job_event(job_id, CeleryJobState.FAILURE, source=source,
+                                error=f"{type(exc).__name__}: {exc}"[:500])
         raise
     threat_library_import.record_import_finished(run_id, stats=stats)
     if not dry_run and source != "misp_actors":
@@ -366,4 +464,7 @@ def import_threat_library_task(source: str, file_content: str | None, via_taxii:
                 "import committed, but the follow-up embeddings refresh could not be queued — "
                 "run POST /v1/tsg/threat-library/embeddings/update, or the new rows stay "
                 "unmatchable by grounding")
+    # stats already carries "source" (run_import sets it) — no source= kwarg here, or this
+    # collides as a duplicate keyword argument.
+    _publish_import_job_event(job_id, CeleryJobState.SUCCESS, **stats)
     return stats

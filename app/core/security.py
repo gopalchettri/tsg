@@ -38,6 +38,11 @@ _SECRET_PATTERNS = [
     re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),        # access key id (near-zero false positives)
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),                 # long hex (keys/hashes)
     re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),         # email (PII)
+    # Internal hostnames (.local/.internal TLD convention only — no org domains hardcoded).
+    # Secret-shaped patterns above can't catch these, yet they're the most realistic echo of
+    # infrastructure detail into model output [gap-8]. Shared list, so inbound context stops
+    # leaking them to the provider too.
+    re.compile(r"(?i)\b[\w][\w-]*(?:\.[\w-]+)*\.(?:local|internal)\b"),
 ]
 REDACTED = "[REDACTED]"
 

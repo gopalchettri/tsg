@@ -22,7 +22,7 @@ from app.core.enums import DuplicateReason  # noqa: E402
 from app.pipeline import scoping  # noqa: E402
 from app.pipeline.cascade import (NextSetOutcome, _build_regen_audit_detail,  # noqa: E402
                                 _next_set_outcome)
-from app.pipeline.tasks import (_semantic_duplicates,  # noqa: E402
+from app.pipeline.tasks import (_scrub_model_output, _semantic_duplicates,  # noqa: E402
                                 _usable_proposal, asset_agnostic_name, clean_library_name)
 
 ASSET = "Widget Control System"
@@ -87,7 +87,7 @@ def check_semantic_duplicates_same_category() -> None:
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
     assert set(dupes) == {"t2"}, dupes  # first wins, later duplicate dropped
     assert dupes["t2"]["duplicate_of_threat_id"] == "t1", dupes  # linked to its survivor
-    assert dupes["t2"]["reason"] == DuplicateReason.semantic_same_category, dupes
+    assert dupes["t2"]["reason"] == DuplicateReason.semantic_similarity, dupes
     print("ok  _semantic_duplicates drops a same-meaning threat")
 
 
@@ -107,12 +107,12 @@ def check_semantic_duplicates_identical_labels() -> None:
 
 
 def check_semantic_duplicates_category_gate() -> None:
-    """Cross-category pairs are judged at the STRICTER cross ceiling (0.98), not skipped and not
-    the normal threshold. Two contracts pinned at once: the measured 0.969 disclosure/modification
-    trap (two REAL threats, different impact classes) must survive, while a byte-identical label
-    the model merely relabelled into another category must be dropped."""
+    """Every pair is judged at the single 0.98 bar. Two contracts pinned at once: the measured
+    0.969 disclosure/modification trap (two REAL threats, different impact classes) must survive,
+    while a byte-identical label the model merely relabelled into another category must be dropped
+    — recorded with the single unified semantic_similarity reason (category no longer splits it)."""
     llm = _StubLLM()
-    # cosine(alpha, trapx) = 0.969 -> below the 0.98 cross ceiling -> both survive.
+    # cosine(alpha, trapx) = 0.969 -> below the 0.98 bar -> both survive.
     threats = [_threat("t1", "alpha disclosure", category="Information Disclosure"),
                _threat("t2", "trapx modification", category="Tampering")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
@@ -122,8 +122,43 @@ def check_semantic_duplicates_category_gate() -> None:
                _threat("t2", "alpha disclosure", category="Tampering")]
     dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
     assert set(dupes) == {"t2"}, dupes
-    assert dupes["t2"]["reason"] == DuplicateReason.semantic_cross_category, dupes
+    assert dupes["t2"]["reason"] == DuplicateReason.semantic_similarity, dupes
     print("ok  _semantic_duplicates cross-category ceiling: trap survives, relabel caught")
+
+
+def check_semantic_duplicates_category_never_lowers_bar() -> None:
+    """THE fix this check pins: a shared STRIDE category must not discount the drop bar. The same
+    0.969 pair as above, now BOTH in one category — under the old category-gated design they were
+    judged at the session threshold (0.92) and silently merged as semantic_same_category, which
+    collapsed a real asset run to 6 surviving threats. Category-blind, both must survive."""
+    llm = _StubLLM()
+    threats = [_threat("t1", "alpha disclosure", category="Information Disclosure"),
+               _threat("t2", "trapx modification", category="Information Disclosure")]
+    dupes = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET, threshold=0.92)
+    assert dupes == {}, dupes
+    print("ok  _semantic_duplicates same-category pair below the meaning bar survives")
+
+
+def check_scrub_model_output() -> None:
+    """Gap-8 guard: model output is scrubbed through _SECRET_PATTERNS before persistence, with
+    structure intact. If this fails, /results, the Excel export and the audit trail all serve
+    whatever the model echoed back — hostnames, labeled creds — verbatim and forever."""
+    scenario = {
+        "scenario_title": "Telemetry tampering via historian access",
+        "scenario_statement": "Reach hist-pgs-01.dewa.local with db_password=Hunter2",
+        "other_plausible_entry_points": ["via ops@example.com phishing", "via USB"],
+        "coverage": {"depth": 2},  # non-string scalar must pass through untouched
+    }
+    out = _scrub_model_output(dict(scenario), "sess", "t1")
+    assert set(out) == set(scenario), out                      # keys preserved
+    assert "hist-pgs-01.dewa.local" not in out["scenario_statement"], out
+    assert "db_password" not in out["scenario_statement"], out
+    assert "[REDACTED]" in out["scenario_statement"], out
+    assert out["scenario_title"] == scenario["scenario_title"], out  # clean text untouched
+    assert len(out["other_plausible_entry_points"]) == 2, out        # list shape preserved
+    assert "ops@example.com" not in out["other_plausible_entry_points"][0], out
+    assert out["coverage"] == {"depth": 2}, out
+    print("ok  _scrub_model_output masks secrets, keeps structure")
 
 
 def check_clean_library_name() -> None:
@@ -312,6 +347,8 @@ def demo() -> None:
     check_semantic_duplicates_same_category()
     check_semantic_duplicates_identical_labels()
     check_semantic_duplicates_category_gate()
+    check_semantic_duplicates_category_never_lowers_bar()
+    check_scrub_model_output()
     check_clean_library_name()
     check_asset_name_stripping()
     check_semantic_duplicates_no_chain_drop()

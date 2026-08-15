@@ -193,9 +193,9 @@ independent patches** — implementing them separately or out of order breaks th
     using the codebase's existing capacity-503 convention (`Retry-After`,
     [errors.py:105-118](../app/api/errors.py)) rather than a bare 503 — add `app/api/errors.py` to
     Files Touched for this item.
-13. **`/readyz` shares the same Redis, cascading to a full outage** — item 12's cap closes the
+13. **`/ready` shares the same Redis, cascading to a full outage** — item 12's cap closes the
     SSE-attributable path to this. No separate code fix; add a metric so an approaching cap is
-    visible before `/readyz` would ever trip.
+    visible before `/ready` would ever trip.
 14. **Subscriber has no read timeout / health check** — add `socket_timeout` (new setting
     `sse_subscriber_socket_timeout_seconds`, default 10s) and `health_check_interval` (new setting
     `sse_subscriber_health_check_interval_seconds`, default 30s). **Correction: the fix site moves
@@ -353,7 +353,7 @@ independent patches** — implementing them separately or out of order breaks th
 4. **Reaper (5):** kill a worker mid-stage, wait for the reaper sweep — an `error` event fires
    without waiting for a manual board refetch.
 5. **Redis budget (11, 12, 13):** open streams past the configured cap — clean 503, not a Redis
-   connection error; `/readyz` stays green throughout.
+   connection error; `/ready` stays green throughout.
 6. **Subscriber health (14, 15):** kill the Redis connection under a live subscriber — the stream
    detects it within `socket_timeout`, not indefinitely; confirm the finally-block cleanup actually
    runs on client disconnect (repeat the earlier repro).

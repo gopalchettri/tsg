@@ -142,9 +142,11 @@ def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_
     The proxy is TOKEN OVERLAP via `_mentions`, not whole-phrase containment. `critical_service` is
     a list and passing ANY one suffices — the model writes about one threat, not every service.
 
-    Redaction is one-directional: prompts.py redacts inbound context, but the LLM's OUTPUT is
-    persisted and served as-is. A model echoing something sensitive back is not caught here or by
-    any later stage. Documented residual risk."""
+    Redaction is now two-directional: prompts.py redacts inbound context, and tasks.py's
+    _scrub_model_output runs the LLM's OUTPUT through the same _SECRET_PATTERNS before
+    persistence. Residual risk (documented): unlabeled prose credentials and invented person
+    names have no reliable pattern shape and are not auto-scrubbed — compensating control is
+    periodic sampling of stored scenarios."""
     errors = _check_fields(
         scenario, ("scenario_title", "scenario_statement", "risk_statement"))
     statement = str(scenario.get("scenario_statement") or "")

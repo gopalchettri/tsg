@@ -63,7 +63,7 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
 # boot: if someone drops `require_admin`, the exemption is now a lie and this fails closed.
 _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("GET", "/health"): None,  # platform health check, no caller identity involved
-    ("GET", "/readyz"): None,  # platform health check, no caller identity involved
+    ("GET", "/ready"): None,  # platform health check, no caller identity involved
     # Static HTML only — a dev SSE test harness, mounted ONLY on a local/dev APP_ENV (see
     # app/main.py). It carries no data: every API call the page makes is a separate, normally
     # authenticated request. Nothing to entity-scope, because nothing is served from the DB.
@@ -79,7 +79,8 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("POST", "/v1/tsg/threat-library/embeddings/recreate"): require_admin,
     ("POST", "/v1/tsg/threat-library/embeddings/delete"): require_admin,
     ("GET", "/v1/tsg/threat-library/embeddings/status/{job_id}"): require_admin,
-    # All 5 above: admin-key gated (router-level Depends(require_admin) in admin.py), shared
+    ("GET", "/v1/tsg/threat-library/embeddings/events/{job_id}"): require_admin,
+    # All 6 above: admin-key gated (router-level Depends(require_admin) in admin.py), shared
     # cross-tenant threat-library data — not one entity's data, so the per-entity JWT model
     # doesn't apply. Same rationale for every require_admin entry below.
     ("GET", "/v1/tsg/sessions/promotions"): require_admin,
@@ -93,10 +94,12 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("GET", "/v1/tsg/threat-library/sources"): require_admin,
     ("POST", "/v1/tsg/threat-library/sources/{source}/import"): require_admin,
     ("GET", "/v1/tsg/threat-library/imports/{job_id}"): require_admin,
+    ("GET", "/v1/tsg/threat-library/imports/events/{job_id}"): require_admin,
     ("GET", "/v1/tsg/threat-intel/feeds"): require_admin,
     ("GET", "/v1/tsg/threat-intel/items"): require_admin,
     ("POST", "/v1/tsg/threat-intel/feeds/refresh"): require_admin,
     ("POST", "/v1/tsg/threat-intel/feeds/{feed}/refresh"): require_admin,
+    ("GET", "/v1/tsg/threat-intel/feeds/events/{job_id}"): require_admin,
     # Threat-library master CRUD (routers in app/api/threat_library_crud.py; shared impl in library_crud.py). One entry PER VERB; a missing one
     # fails the boot, not a request.
     ("GET", "/v1/tsg/threat-library/threat-categories"): require_admin,

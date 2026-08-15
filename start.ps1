@@ -370,13 +370,13 @@ Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
 Write-Host "FastAPI server starting in a new window (title: tsg-api)..." -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
-# Wait for the API to answer /readyz, mirroring the worker wait above.
+# Wait for the API to answer /ready, mirroring the worker wait above.
 # ---------------------------------------------------------------------------
 
 function Test-ApiReady {
     param([int]$TimeoutSec = 2)
     try {
-        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/readyz" -TimeoutSec $TimeoutSec -UseBasicParsing
+        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/ready" -TimeoutSec $TimeoutSec -UseBasicParsing
         return $resp.StatusCode -eq 200
     } catch {
         return $false
@@ -387,7 +387,7 @@ function Test-ApiReady {
 # holds the model in RAM), so this is import + DB-connectivity time, not a model load -- 60s is
 # generous, not measured against a real cold-start P99.
 $apiWaitSeconds = 60
-Write-Host "Waiting up to ${apiWaitSeconds}s for the API to answer /readyz..." -ForegroundColor Cyan
+Write-Host "Waiting up to ${apiWaitSeconds}s for the API to answer /ready..." -ForegroundColor Cyan
 $apiReady = $false
 $apiStarted = Get-Date
 $apiDeadline = $apiStarted.AddSeconds($apiWaitSeconds)
@@ -395,7 +395,7 @@ while ((Get-Date) -lt $apiDeadline) {
     if (Test-ApiReady) {
         $apiReady = $true
         $elapsed = [int]((Get-Date) - $apiStarted).TotalSeconds
-        Write-Host "API is ready (/readyz OK after ${elapsed}s)." -ForegroundColor Green
+        Write-Host "API is ready (/ready OK after ${elapsed}s)." -ForegroundColor Green
         break
     }
     Start-Sleep -Milliseconds 500
@@ -487,6 +487,6 @@ Write-Host ""
 Write-Host "All services launched. Verify with:" -ForegroundColor Cyan
 Write-Host "  Celery worker:  $(if ($workerReady) { 'ready (registered)' } else { 'NOT READY - see tsg-celery window' })" -ForegroundColor $(if ($workerReady) { 'Green' } else { 'Yellow' })
 Write-Host "  curl http://127.0.0.1:$Port/health" -ForegroundColor Cyan
-Write-Host "  curl http://127.0.0.1:$Port/readyz"  -ForegroundColor Cyan
+Write-Host "  curl http://127.0.0.1:$Port/ready"  -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Stop everything with: .\stop.ps1" -ForegroundColor Cyan

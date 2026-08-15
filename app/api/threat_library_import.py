@@ -24,7 +24,8 @@ from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import func, select
 
-from app.api.admin_jobs import FAMILY_IMPORT, admin_job_exists, mark_admin_job
+from app.api.admin_jobs import FAMILY_IMPORT, admin_job_exists, import_job_channel_key, mark_admin_job
+from app.api.admin_sse import admin_job_event_stream
 from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.schemas import (
     ImportJobStatus,
@@ -34,6 +35,7 @@ from app.api.schemas import (
     ThreatLibraryImportBody,
 )
 from app.core.config import get_settings
+from app.core.enums import CeleryJobState, SSEEventType
 from app.core.logging import get_logger
 from app.db import models as m
 from app.db.dal import NotFoundError
@@ -175,8 +177,22 @@ def get_import_status(job_id: str, _principal: Principal = Depends(get_admin_pri
     if not admin_job_exists(job_id, FAMILY_IMPORT):
         raise NotFoundError(f"unknown or expired job_id: {job_id!r}")
     result = AsyncResult(job_id, app=celery_app)
-    if result.state == "FAILURE":
-        return ImportJobStatus(state=result.state, error=str(result.result))
-    if result.state == "SUCCESS":
-        return ImportJobStatus(state=result.state, result=result.result)
-    return ImportJobStatus(state=result.state)
+    state = CeleryJobState(result.state)  # total over Celery's vocabulary — see the enum
+    if state is CeleryJobState.FAILURE:
+        return ImportJobStatus(state=state, error=str(result.result))
+    if state is CeleryJobState.SUCCESS:
+        return ImportJobStatus(state=state, result=result.result)
+    return ImportJobStatus(state=state)
+
+
+@router.get("/imports/events/{job_id}", responses={200: {"content": {"text/event-stream": {}}}})
+async def job_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
+    """SSE stream for one queued threat-library import: a state snapshot on connect (a late
+    subscriber to a finished job gets the terminal state immediately and the stream closes),
+    then the worker's live `import_job_update` hints (STARTED, terminal SUCCESS/FAILURE) — same
+    hint-layer/AsyncResult-backstop contract as admin.py::job_events, and the same family-scoped
+    marker as the authorization boundary (get_import_status's docstring is the canonical
+    rationale). get_import_status remains the durable truth. Streaming mechanics live in
+    admin_sse.py, shared with the embeddings and intel-refresh job-events routes."""
+    return await admin_job_event_stream(
+        job_id, FAMILY_IMPORT, import_job_channel_key, str(SSEEventType.import_job_update))

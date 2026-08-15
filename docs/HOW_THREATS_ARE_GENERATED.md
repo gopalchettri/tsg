@@ -858,22 +858,15 @@ Everything below was confirmed by reading the cited source.
 
 ### A. Defects — behaviour does not match its own stated contract
 
-**A1. Threat actors are lost on every path except the first run.**
-`find_threats` builds each threat summary with an `actors` key (`app/pipeline/tasks.py:179`). But
-`dal.active_threats` — the threat source for **regeneration, generate-next-set, variants and every
-resumed attempt** — returns eight keys and **no `actors`** (`app/db/dal.py:752`), despite its own
-docstring claiming *"Same dict shape `find_threats` returns, so `write_scenarios` consumes both
-sources identically"* (`app/db/dal.py:750`).
-
-Because the scenario builder reads `info.get("actors") or []` (`app/pipeline/tasks.py:416`), **every
-regenerated, variant and resumed scenario is written with the no-actor clause** — *"No specific actor
-was identified for this threat — do not invent or assume one."* — even when the threat has validated
-library actors. The reserved actor-matched intel pulse can never fire on those paths either. The
-actors *are* persisted in `Identified_Threat.ThreatActorsJSON`; nothing but the accept path ever reads
-them back.
-
-Net effect: a regenerated scenario is prompted differently from the original, and generally with less
-information.
+**A1. [FIXED] Threat actors used to be lost on every path except the first run.**
+`dal.active_threats` — the threat source for regeneration, generate-next-set, variants and every
+resumed attempt — used to return no `actors` key, so the scenario builder's
+`info.get("actors") or []` handed every regenerated/variant/resumed scenario the no-actor clause
+even when validated library actors existed. It now returns
+`"actors": stored_actors(r["ThreatActorsJSON"])` (`app/db/dal.py:837`) — the RAW stored list,
+deliberately not gated on `validated` (that gate would blank every unverified threat's actors on
+reload, reproducing the bug). Regenerated scenarios are now prompted with the same actor
+information as originals, and the actor-matched intel pulse fires on all paths.
 
 **A2. [FIXED] A completed session's status board used to contradict itself.**
 `complete_session` used to set `CurrentStage = APPROVED` without touching `StageStatus`
@@ -969,7 +962,8 @@ code, and will go stale silently.
 | `next_set_size` | **5** | Scenarios per "generate next set" click. |
 | `coverage_attempt_slack` | **2** | Extra attempts beyond a threat's own coverage target. Scenario depth itself is *derived* — one per plausible entry point — never configured. |
 | `variant_sibling_prompt_k` | **3** | How many of a threat's existing scenarios are quoted back into the variant prompt. Prompt width only, not depth. |
-| `semantic_near_duplicate_threshold` | **0.92** | Cosine at which a proposed threat is *logged* as a probable paraphrase. Observation only — nothing is rejected on it, and the value is embedding-model-specific. |
+| `semantic_near_duplicate_threshold` | **0.92** | Session-tunable floor into the semantic-dedup bar: every pair is judged at `max(semantic_cross_category_threshold, this)`, so it can only raise the 0.98 base, never lower it. Set to 1.0 to disable the gate. Embedding-model-specific. |
+| `semantic_cross_category_threshold` | **0.98** | Base of that same bar — cosine at or above which a proposed threat is **dropped** as a restatement of one the session already has, whatever the categories involved (diverted to `Identified_Duplicate_Threat` for audit). |
 | `max_active_sessions` | **100** | Global concurrent-session ceiling. |
 | `max_active_sessions_per_entity` | **0** (off) | Per-organisation ceiling. |
 | `llm_timeout_seconds` | **90** | How long to wait for one AI reply. |

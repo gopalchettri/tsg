@@ -30,7 +30,7 @@ services:
     # ever gets to finish. 40s gives gunicorn's 30s margin to complete before Docker escalates.
     stop_grace_period: 40s
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/readyz').status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/ready').status==200 else 1)"]
       interval: 15s
       timeout: 5s
       retries: 5

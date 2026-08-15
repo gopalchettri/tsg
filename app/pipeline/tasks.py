@@ -25,7 +25,7 @@ from app.core.enums import (
     WorkflowStage,
 )
 from app.core.logging import get_logger
-from app.core.security import is_placeholder
+from app.core.security import _redact_value, is_placeholder
 from app.db import dal
 from app.db import models as m
 from app.db.dal import execute_dml, guid, now
@@ -152,14 +152,13 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
     # "same asset" rather than "same threat" — stripping it raised the median similarity
     # score from 0.814 to 0.899 in testing.
     #
-    # Similarity alone isn't enough: real near-duplicates can score LOWER than two
-    # genuinely different threats. "Unauthorized disclosure of X" vs "Unauthorized
-    # modification of X" scored 0.969 in testing — higher than actual paraphrases — because
-    # embeddings weigh shared words heavily and these differ by only one word. So we only
-    # compare threats that share the same STRIDE category; that alone separated the two
-    # cases cleanly in testing (caught all real duplicates, zero false matches). If a
-    # category is missing on either side, we still compare — better to log one extra
-    # maybe-duplicate than silently miss a real one.
+    # The drop decision is CATEGORY-BLIND. A shared STRIDE category is a ~1-in-6 coincidence
+    # that says nothing about two threats meaning the same thing, and an earlier design that
+    # judged same-category pairs at a lower bar merged distinct threats that merely share
+    # vocabulary (one real asset run collapsed to 6 survivors, all reasoned
+    # semantic_same_category). Category affects NEITHER the decision NOR the record now:
+    # every semantic drop is written as DuplicateReason.semantic_similarity — the old
+    # same/cross-category reasons survive only as historical row values (enums.py).
     def _cat(t: dict) -> str:
         return str(t.get("category") or "").strip().casefold()
 
@@ -174,29 +173,25 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
         return {}
     labels = [lbl for _tid, lbl, _c in entries]
     prior = [lbl for _tid, lbl, _c in prior_entries]
-    # BOTH label-clash maps resolve to the FIRST holder — the SURVIVOR. On a label clash the
+    # The label-clash map resolves to the FIRST holder — the SURVIVOR. On a label clash the
     # survivor is the prior-round threat, or the first of two identical-label proposals; the
-    # later holder is the one that gets dropped as its duplicate. Last-writer-wins here had two
-    # audit corruptions: an identical-label duplicate's DuplicateOfThreatID pointed at ITSELF
-    # (a threat never inserted), and a byte-identical cross-category relabel read as
-    # same_category — the comparison must see the SURVIVING threat's own category and id, not
+    # later holder is the one that gets dropped as its duplicate. Last-writer-wins here
+    # corrupted the audit trail: an identical-label duplicate's DuplicateOfThreatID pointed at
+    # ITSELF (a threat never inserted) — the map must name the SURVIVING threat's id, not
     # whichever entry happened to write the label last.
-    cat_of: dict[str, str] = {}
     tid_of: dict[str, str] = {}
-    for tid, lbl, c in prior_entries + entries:
-        if lbl not in cat_of:
-            cat_of[lbl] = c
+    for tid, lbl, _c in prior_entries + entries:
         if tid and lbl not in tid_of:
             tid_of[lbl] = tid
     if threshold is None:  # use the caller's session-tuned value if given, otherwise fall back to config
         threshold = get_settings().semantic_near_duplicate_threshold
-    # Threats with DIFFERENT categories are still compared, just against a stricter cutoff
-    # instead of being skipped. Categories come from the model, so the same threat can get
-    # relabeled between rounds ("Tampering" vs "Information Disclosure") and would otherwise
-    # dodge dedup entirely. A 0.98 cutoff still lets the genuinely-different 0.969 case above
-    # through, while catching a near-identical threat that just got relabeled. Fixed value,
-    # not adjustable per session.
-    cross_threshold = max(get_settings().semantic_cross_category_threshold, threshold)
+    # ONE bar for every pair, whatever the categories: real near-duplicates can score LOWER
+    # than two genuinely different threats ("Unauthorized disclosure of X" vs "Unauthorized
+    # modification of X" measured 0.969 — two REAL threats one word apart), so the bar must sit
+    # above that trap for ALL pairs, not just cross-category ones. The session-tuned threshold
+    # can only RAISE it (set it to 1.0 to disable the gate without a deploy), never lower it
+    # below the config base.
+    drop_threshold = max(get_settings().semantic_cross_category_threshold, threshold)
     try:
         # `texts` is just the unique strings to embed, so we don't pay to embed the same
         # label twice. It is NOT a count of how many threats there are — several threats can
@@ -233,22 +228,13 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
             # strongest possible duplicate signal, silently ignored.)
             if ov is None or len(ov) != len(qv):
                 continue
-            other_cat = cat_of.get(other, "")
-            # Same category -> normal threshold. Different categories -> the stricter
-            # cross_threshold (see above), never skipped outright. If either side has no
-            # category, just use the normal threshold — missing a duplicate only costs one
-            # extra paid generation.
-            cross_category = bool(cat and other_cat and cat != other_cat)
-            eff_threshold = cross_threshold if cross_category else threshold
             score = sum(x * y for x, y in zip(qv, ov)) / (norms[label] * norms[other])
-            if score >= eff_threshold:
-                reason = (DuplicateReason.semantic_cross_category if cross_category
-                        else DuplicateReason.semantic_same_category)
-                dupes[tid] = {"reason": reason, "score": score,
+            if score >= drop_threshold:
+                dupes[tid] = {"reason": DuplicateReason.semantic_similarity, "score": score,
                             "duplicate_of_threat_id": tid_of.get(other)}
                 log.info("threats.semantic_near_duplicate", session_id=sid, subsystem=ss,
                         proposed=label, matched=other, category=cat or None,
-                        cosine=round(score, 4), threshold=threshold)
+                        cosine=round(score, 4), threshold=drop_threshold)
                 break
         else:
             kept.append(label)
@@ -921,10 +907,29 @@ def _build_scoped_threat_row(scoped_id: str, sid: str, tenant: str, ss: int, sc:
     }
 
 
+def _scrub_model_output(scenario: dict, sid: str, threat_id: str | None) -> dict:
+    """Outbound twin of the inbound redaction [gap-8]: the model's own text runs through the same
+    _SECRET_PATTERNS before persistence, so /results, the Excel export and the audit trail all
+    inherit the scrub from this one write-side point. Residual risk (unlabeled prose credentials,
+    invented person names) stays documented in validation.validate_scenario.
+
+    MUST NEVER RAISE: a paid generation is never lost to cleanup — on any error the original is
+    stored and the failure logged (same advisory-tail discipline as _publish_regen_result)."""
+    try:
+        cleaned = _redact_value(scenario)
+        if cleaned != scenario:
+            log.info("scenario.output_redacted", session_id=sid, threat_id=threat_id)
+        return cleaned
+    except Exception:  # noqa: BLE001 — see docstring
+        log.error("scenario.output_scrub_failed", session_id=sid, threat_id=threat_id, exc_info=True)
+        return scenario
+
+
 def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, scenario: dict, report: dict,
                             epoch: int, entity_id: str | None, user_id: str | None, info: dict,
                             scenario_number: int = 1, replaces_output_id: str | None = None) -> dict:
 
+    scenario = _scrub_model_output(scenario, sid, info.get("threat_id"))
     identity = dal.identity_hash(sid, ss, info)
     return {
         "OutputID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
