@@ -403,8 +403,8 @@ CREATE TABLE Risk_Treatment_Plan (
     EntityID                nvarchar(200) NULL,         -- copied from the session (authz boundary)
     UserID                  nvarchar(200) NULL,         -- requesting principal (provenance)
     CrmRiskIdentificationID int           NULL,         -- reserved; unused (no register lookup)
-    TreatmentStrategy       nvarchar(30)  NOT NULL,     -- 'Mitigate' only in v1
-    Status                  nvarchar(20)  NOT NULL,     -- StageStatus subset: RUNNING | COMPLETE | ERROR
+    TreatmentStrategy       nvarchar(100) NOT NULL,     -- 'Mitigate' only in v1
+    Status                  nvarchar(100) NOT NULL,     -- StageStatus subset: RUNNING | COMPLETE | ERROR
     ActiveTaskID            nvarchar(100) NULL,         -- Celery claim / redelivery fence
     RiskIdentificationDate  datetime2     NULL,         -- crm creation_date; never AI-generated
     InputSnapshotJSON       nvarchar(max) NULL,         -- exact redacted context sent to the LLM
@@ -415,12 +415,12 @@ CREATE TABLE Risk_Treatment_Plan (
     CreatedAt               datetime2     NULL,
     UpdatedAt               datetime2     NULL,         -- progress clock: claim + each LLM attempt bump it
     CompletedAt             datetime2     NULL,
-    RiskLevel               nvarchar(10)  NULL,         -- register risk level from the request (filterable)
+    RiskLevel               nvarchar(100) NULL,         -- register risk level from the request (filterable)
     ReviewStatus            nvarchar(100) NULL,         -- TreatmentReviewStatus; NULL = not reviewed
     ReviewComment           nvarchar(max) NULL,
     ReviewedBy              nvarchar(200) NULL,         -- from the reviewer's login token
     ReviewedAt              datetime2     NULL,
-    ErrorReason             nvarchar(30)  NULL          -- TreatmentOutcomeReason: WHY it ended that
+    ErrorReason             nvarchar(max) NULL          -- TreatmentOutcomeReason: WHY it ended that
                                                         -- way. NULL on COMPLETE. Holds 5 of the
                                                         -- enum's 6 values — 'timed_out' is a
                                                         -- read-time projection with no writer, so
@@ -431,7 +431,7 @@ GO
 -- Adds review/register columns for pre-2026-08-06 databases.
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'RiskLevel') IS NULL
 BEGIN
-    ALTER TABLE Risk_Treatment_Plan ADD RiskLevel nvarchar(10) NULL;
+    ALTER TABLE Risk_Treatment_Plan ADD RiskLevel nvarchar(100) NULL;
     ALTER TABLE Risk_Treatment_Plan ADD ReviewStatus nvarchar(100) NULL;
     ALTER TABLE Risk_Treatment_Plan ADD ReviewComment nvarchar(max) NULL;
     ALTER TABLE Risk_Treatment_Plan ADD ReviewedBy nvarchar(200) NULL;
@@ -454,12 +454,55 @@ IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
     ALTER TABLE dbo.Risk_Treatment_Plan ALTER COLUMN ReviewStatus nvarchar(100) NULL;
 GO
 
+-- Widen Status the same way (fresh installs get nvarchar(100) from the CREATE above). Same
+-- conventions as the two widens above; NOT NULL restated because ALTER COLUMN resets
+-- nullability. Status is in no index key or filtered-index predicate (both indexes filter on
+-- Superseded only), so there is no Msg 5074 risk.
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Risk_Treatment_Plan'
+             AND COLUMN_NAME = 'Status'
+             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
+    ALTER TABLE dbo.Risk_Treatment_Plan ALTER COLUMN Status nvarchar(100) NOT NULL;
+GO
+
 -- Adds the machine-readable terminal reason for pre-2026-08-11 databases.
 -- DEPLOY THIS BEFORE THE CODE: unlike every earlier treatment change this one is NOT safe in the
 -- other order — the worker writes ErrorReason on every failure path, so code-before-DB fails every
 -- plan. Run this script, then deploy.
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'ErrorReason') IS NULL
-    ALTER TABLE Risk_Treatment_Plan ADD ErrorReason nvarchar(30) NULL;
+    ALTER TABLE Risk_Treatment_Plan ADD ErrorReason nvarchar(max) NULL;
+GO
+
+-- Widen TreatmentStrategy / RiskLevel the same way as the two widens above (fresh installs
+-- get nvarchar(100) from the CREATE; the guarded ADD above also creates RiskLevel at 100).
+-- Same conventions: schema-qualified guard, BETWEEN skips nvarchar(max) (-1), nullability
+-- restated per column, one GO batch each so a failure cannot silently skip the rest. Neither
+-- is in an index key or filtered-index predicate (both indexes filter on Superseded only) —
+-- no Msg 5074 risk. ErrorReason has its own to-max block below.
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Risk_Treatment_Plan'
+             AND COLUMN_NAME = 'TreatmentStrategy'
+             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
+    ALTER TABLE dbo.Risk_Treatment_Plan ALTER COLUMN TreatmentStrategy nvarchar(100) NOT NULL;
+GO
+
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Risk_Treatment_Plan'
+             AND COLUMN_NAME = 'RiskLevel'
+             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
+    ALTER TABLE dbo.Risk_Treatment_Plan ALTER COLUMN RiskLevel nvarchar(100) NULL;
+GO
+
+-- ErrorReason goes all the way to nvarchar(max) (user request): fire on ANY bounded width
+-- (-1 = already max). Values are short reason codes stored in-row, so this costs nothing at
+-- rest; the column is in no index (nvarchar(max) could not be an index key anyway). The
+-- Verify width row for ErrorReason stays — the width check skips max columns and re-arms if
+-- the column is ever re-narrowed.
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Risk_Treatment_Plan'
+             AND COLUMN_NAME = 'ErrorReason'
+             AND CHARACTER_MAXIMUM_LENGTH <> -1)
+    ALTER TABLE dbo.Risk_Treatment_Plan ALTER COLUMN ErrorReason nvarchar(max) NULL;
 GO
 
 -- One-time backfill so rows that failed before the column existed are switchable too. Idempotent

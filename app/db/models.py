@@ -270,8 +270,8 @@ class Risk_Treatment_Plan(Base):
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))  # copied from the session (authz boundary)
     UserID: Mapped[str | None] = mapped_column(Unicode(200))    # requesting principal (provenance)
     CrmRiskIdentificationID: Mapped[int | None] = mapped_column(Integer)  # reserved; unused — the register sends risk data in the request body, no lookup
-    TreatmentStrategy: Mapped[str] = mapped_column(Unicode(30))    # 'Mitigate' only in v1
-    Status: Mapped[str] = mapped_column(Unicode(20))          # StageStatus subset: RUNNING | COMPLETE | ERROR
+    TreatmentStrategy: Mapped[str] = mapped_column(Unicode(100))   # 'Mitigate' only in v1
+    Status: Mapped[str] = mapped_column(Unicode(100))         # StageStatus subset: RUNNING | COMPLETE | ERROR
     ActiveTaskID: Mapped[str | None] = mapped_column(Unicode(100))  # Celery claim / redelivery fence
     RiskIdentificationDate: Mapped[datetime | None] = mapped_column(DateTime)  # crm creation_date; never AI-generated
     InputSnapshotJSON: Mapped[str | None] = mapped_column(UnicodeText)  # exact redacted context sent to the LLM
@@ -282,7 +282,7 @@ class Risk_Treatment_Plan(Base):
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)  # progress clock: claim + each LLM attempt bump it
     CompletedAt: Mapped[datetime | None] = mapped_column(DateTime)
-    RiskLevel: Mapped[str | None] = mapped_column(Unicode(10))    # register risk level from the request (filterable)
+    RiskLevel: Mapped[str | None] = mapped_column(Unicode(100))   # register risk level from the request (filterable)
     ReviewStatus: Mapped[str | None] = mapped_column(Unicode(100))  # TreatmentReviewStatus; NULL = not reviewed
     ReviewComment: Mapped[str | None] = mapped_column(UnicodeText)
     ReviewedBy: Mapped[str | None] = mapped_column(Unicode(200))  # from the reviewer's login token
@@ -291,7 +291,7 @@ class Risk_Treatment_Plan(Base):
     # ErrorMessage. NULL on COMPLETE and on rows that failed before the column existed (read those
     # as generation_failed). Holds 5 of the enum's 6 values: 'timed_out' is projected at read time
     # by api.treatment._present_status and has no writer.
-    ErrorReason: Mapped[str | None] = mapped_column(Unicode(30))
+    ErrorReason: Mapped[str | None] = mapped_column(UnicodeText)
 
 # ---------------------------------------------------------------------------
 # Threat library masters (seeded; imported, promoted on accept, or curated via

@@ -258,3 +258,14 @@ ALTER pattern as the 2026-08-14 StageStatus widen (own GO batch; BETWEEN 1 AND 9
 nvarchar(max); ReviewStatus is in no filtered-index predicate, so no Msg 5074 concern).
 TSG_Verify.sql's width row now checks 'approved' (8 chars), the longest remaining
 TreatmentReviewStatus member.
+  Same date: Risk_Treatment_Plan.Status also widened nvarchar(20) -> nvarchar(100) by the same
+width-guarded pattern (NOT NULL restated; Status is in no index key or filtered-index
+predicate, so no Msg 5074 concern). Its Verify width row is unchanged: 'COMPLETE' (8 chars)
+remains the longest stored value.
+  Same date: TreatmentStrategy (30 -> 100, NOT NULL restated) and RiskLevel (10 -> 100)
+widened the same way — one width-guarded GO batch each; the guarded ADD block now also creates
+RiskLevel at 100. ErrorReason goes further: nvarchar(max) (guard fires on ANY bounded width,
+<> -1; the ADD creates it at max). Values are short reason codes stored in-row, so max costs
+nothing at rest, and the column is in no index. Verify width rows unchanged — the width check
+skips nvarchar(max) columns and re-arms if one is ever re-narrowed; the bounded columns'
+longest stored values still fit ('Mitigate' 8, 'Critical' 8).
