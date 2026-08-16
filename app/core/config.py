@@ -586,6 +586,15 @@ class Settings(BaseSettings):
     llm_verify_max_attempts: int = Field(3, ge=1)
     llm_verify_retry_backoff_seconds: float = Field(5.0, ge=0.0)
 
+    # app/pipeline/celery_app.py::admin_embedding_action_task — how many times an embedding
+    # admin job retries on LLMSlotUnavailable before it is marked FAILURE. Bounded on purpose,
+    # unlike the pipeline tasks' max_retries=None: those have AttemptCount's poison-terminal
+    # cap as their real ceiling; this task has no such fence, so unbounded would retry a
+    # permanent slot exhaustion forever. 0 = fail on the first slot shortage, no retries.
+    # Read once at import (the task decorator), like every other worker setting — changing it
+    # requires a worker restart.
+    admin_embedding_max_retries: int = Field(10, ge=0)
+
     # app/pipeline/accept.py::_unacceptable_subset — max offending ids named in the human-
     # readable 404 message (details.unacceptable in the response always carries every one).
     accept_named_in_message: int = Field(3, ge=1)

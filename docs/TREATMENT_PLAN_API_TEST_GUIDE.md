@@ -63,15 +63,16 @@ existed). All blocks are guarded, so it is safe to re-run.
 | Setting | Value | Note |
 |---|---|---|
 | `TSG_RISK_MODULE_ENABLED` | `true` | With it off, **all 9 operations return 404 by absence** — the router is never mounted. |
-| `TSG_AUTH_DEV_MODE` | `true` | Local test boxes only — see the warning below. |
 
-> **Both settings are read once at process start** (`get_settings()` is cached) and the router is
+> **The setting is read once at process start** (`get_settings()` is cached) and the router is
 > mounted at import. Editing `.env` while the stack is running changes nothing. Edit first, or
 > restart **both** the API and the worker afterwards.
 
-> ⚠️ **`AUTH_DEV_MODE` has no environment guard.** `config.assert_security_posture` returns
-> immediately when it is on, *before* the staging/prod JWT checks run — so it bypasses token
-> validation in **every** `APP_ENV`, including production. Never set it outside a local box.
+> ⚠️ **The dev auth bypass is retired — do NOT set `TSG_AUTH_DEV_MODE`.** Setting it now
+> **fails boot** (`config.py::_RETIRED_SETTINGS`); no bypass exists in the code. Every request,
+> local boxes included, authenticates with real headers: `X-API-Key` (matched against an active
+> `API_Client` row) plus `X-User-Id` and `X-Entity-Id` (`X-Tenant-Id` optional). Seeding a local
+> key and the full contract: `docs/TSG_API_AUTHENTICATION_GUIDE.md`.
 
 ### 0.3 Start the stack
 

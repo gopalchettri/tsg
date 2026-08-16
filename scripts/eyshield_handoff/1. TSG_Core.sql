@@ -13,8 +13,12 @@
 -- Keep in lockstep with models.py: a new column needs a CREATE TABLE entry
 -- (fresh DB) AND a guarded ALTER below it (existing DB).
 --
--- SSMS: run with `sqlcmd -b -S <server> -d <database> -E -i TSG_Core.sql`, not F5.
--- (-b: exit non-zero on any SQL error instead of burying it mid-output and reporting success.)
+-- UAT/PROD: paste this WHOLE file into an SSMS query window connected to the TSG
+-- database and run (F5), then read the Messages pane top to bottom — an error there
+-- means that batch did not apply. CLI alternative:
+--   sqlcmd -b -S <server> -d <database> -E -i TSG_Core.sql
+-- (-b: exit non-zero on any SQL error instead of burying it mid-output and reporting
+-- success. -E = Windows auth; use -U/-P where those environments use SQL logins.)
 -- ============================================================================
 
 SET QUOTED_IDENTIFIER ON;
@@ -97,8 +101,8 @@ GO
 -- documented review-barrier freeze; TSG_Verify.sql section 4 FAILs on it. SessionStatus and
 -- CurrentStage are deliberately NOT altered: their longest values ('completed' 9,
 -- 'THREAT_IDENTIFICATION' 21) are original vocabulary — a database too narrow for them could
--- never have finished a single session — and SessionStatus is referenced by three FILTERED
--- index predicates (UX_Session_ActiveAsset / IX_Session_Active / IX_Session_CompletedByAsset),
+-- never have finished a single session — and SessionStatus is referenced by two FILTERED
+-- index predicates (UX_Session_ActiveAsset / IX_Session_Active),
 -- where an in-place ALTER COLUMN raises Msg 5074. Guard is schema-qualified (a same-named
 -- table in another schema must not trigger — or worse, narrow — the dbo column) and skips
 -- nvarchar(max) (-1). NOT NULL restated because ALTER COLUMN resets nullability. Widening
@@ -580,9 +584,12 @@ IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_SubsystemStageState_Sessio
     AND EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_SubsystemStageState_SessionSubLevel' AND object_id = OBJECT_ID('dbo.Subsystem_Stage_State'))
     DROP INDEX IX_SubsystemStageState_SessionSubLevel ON Subsystem_Stage_State;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Session_CompletedByAsset' AND object_id = OBJECT_ID('dbo.Scenario_Session'))
-CREATE INDEX IX_Session_CompletedByAsset ON Scenario_Session(EntityID, AssetID, CompletedAt DESC) WHERE SessionStatus = 'completed';
--- GET /assets/{id}/accepted-scenarios hot path.
+-- IX_Session_CompletedByAsset dropped: built for a GET /assets/{id}/accepted-scenarios route
+-- that never shipped (accepted scenarios are served per-session); no query reads it, it only
+-- taxed Scenario_Session writes. Re-add it WITH that route, and query via the literal_execute
+-- pattern (see dal.session_active) or the filtered predicate cannot serve the plan.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Session_CompletedByAsset' AND object_id = OBJECT_ID('dbo.Scenario_Session'))
+    DROP INDEX IX_Session_CompletedByAsset ON Scenario_Session;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_IdentifiedThreat_SessionSubActive' AND object_id = OBJECT_ID('dbo.Identified_Threat'))
 CREATE INDEX IX_IdentifiedThreat_SessionSubActive ON Identified_Threat(SessionID, SubsystemID) WHERE Superseded = 0;

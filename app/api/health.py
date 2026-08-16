@@ -87,6 +87,24 @@ def _check_mongo() -> bool | None:
         return False
 
 
+def _check_workers() -> bool:
+    """Broadcast ping for live Celery workers over the broker. ADVISORY ONLY — reported in
+    the payload and logs but never fails readiness: with no workers the API still serves
+    every synchronous route and queued jobs simply wait, so evicting API pods here would
+    turn a delay into a full outage. Monitoring alerts on checks.workers / the log events.
+    limit=1 returns on the first reply, so the healthy path never waits out the timeout."""
+    try:
+        from app.pipeline.celery_app import celery_app  # local import, same pattern as redis/pymongo above
+
+        if celery_app.control.ping(timeout=1.0, limit=1):
+            return True
+        logger.warning("readyz.workers_absent")
+        return False
+    except Exception:  # noqa: BLE001 — report degraded; log the detail SERVER-SIDE only
+        logger.exception("readyz.workers_check_failed")
+        return False
+
+
 @router.get("/ready")
 def readyz():
     """Readiness probe — checks every dependency this app actually needs. Any one of
@@ -99,13 +117,16 @@ def readyz():
     # with its own timeout; sequential execution would block for close to the SUM of the three
     # timeouts during a multi-dependency outage instead of the MAX, right when fast probe
     # turnaround matters most for the orchestrator to evict the pod from rotation.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         db_f = pool.submit(_check_database)
         redis_f = pool.submit(_check_redis)
         mongo_f = pool.submit(_check_mongo)
-        results = {"database": db_f.result(), "redis": redis_f.result(), "mongo": mongo_f.result()}
+        workers_f = pool.submit(_check_workers)
+        results = {"database": db_f.result(), "redis": redis_f.result(), "mongo": mongo_f.result(),
+                "workers": workers_f.result()}
     checks = {name: ("skipped" if ok is None else "ok" if ok else "error") for name, ok in results.items()}
-    failing = [name for name, ok in results.items() if ok is False]
+    # workers excluded on purpose — advisory, see _check_workers
+    failing = [name for name, ok in results.items() if ok is False and name != "workers"]
     if failing:
         logger.warning("readyz.not_ready", failing=failing)
         return JSONResponse(status_code=503, content={"status": "not_ready", "checks": checks})

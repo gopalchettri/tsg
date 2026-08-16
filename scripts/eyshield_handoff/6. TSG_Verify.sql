@@ -18,6 +18,10 @@
 -- and the application's own boot-time assertion list — not a hand-written copy.
 -- ============================================================================
 
+-- QI ON is required by the FOR XML column-list checks below (XML data type methods err
+-- Msg 1934 under QI OFF) — set here so the script runs identically from SSMS (QI defaults
+-- ON) and from `sqlcmd` (defaults OFF unless -I), same posture as TSG_Core.sql.
+SET QUOTED_IDENTIFIER ON;
 SET NOCOUNT ON;
 
 IF OBJECT_ID('tempdb..#tsg_verify') IS NOT NULL DROP TABLE #tsg_verify;

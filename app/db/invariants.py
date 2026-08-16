@@ -94,7 +94,7 @@ ACTIVE_UNIQUE = [
 # nothing crashes; readers and writers just start blocking each other under load, which is
 # near-undiagnosable after the fact.
 
-# CHECKLIST 5 — these filtered indexes bake a raw 'active'/'completed' literal into their
+# CHECKLIST 5 — these filtered indexes bake a raw 'active' literal into their
 # WHERE clause against Scenario_Session.SessionStatus, and nothing in the DB ties that text to
 # the SessionStatus enum. Rename the enum without updating the DDL and the index silently stops
 # matching any row the app writes — the one-active-session lock degrades with no error anywhere.
@@ -103,7 +103,6 @@ ACTIVE_UNIQUE = [
 FILTERED_INDEX_LITERALS = [
     ("UX_Session_ActiveAsset", SessionStatus.active),
     ("IX_Session_Active", SessionStatus.active),
-    ("IX_Session_CompletedByAsset", SessionStatus.completed),
 ]
 
 

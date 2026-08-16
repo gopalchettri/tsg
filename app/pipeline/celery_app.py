@@ -77,6 +77,16 @@ celery_app.conf.update(
     # sequentially). Too short redelivers a still-running task (wasteful; claim_stage's CAS
     # prevents actual double-work), too long leaves an orphaned message idle.
     broker_transport_options={"visibility_timeout": 3600},
+
+    # Global runaway backstop for EVERY task (per-task limits like intel_refresh_feed's 600/660
+    # still override). Hard limit = visibility_timeout on purpose: past 3600s the broker
+    # redelivers the message anyway, so the original attempt is killed right when its successor
+    # becomes possible instead of both running. A killed pipeline task is recoverable by design —
+    # claim_stage's CAS + the reaper treat it exactly like a crashed worker, and COMPLETE stages
+    # are skipped on the retry. Enforced under gevent via gevent.Timeout (the -P gevent pool's
+    # time-limit mechanism); the soft limit fires 5 minutes early where the pool honors it.
+    task_soft_time_limit=3300,
+    task_time_limit=3600,
     beat_schedule={                    # the reaper must run on a schedule in production
         "reap-stuck-sessions": {"task": "tsg.reap", "schedule": _s.reaper_interval_seconds},
         "retry-failed-promotions": {"task": "tsg.retry_promotions",
@@ -231,8 +241,15 @@ def _publish_emb_job_event(job_id: str | None, state: CeleryJobState, **fields) 
                 "state": str(state), **fields})
 
 
+# max_retries: bounded (TSG_ADMIN_EMBEDDING_MAX_RETRIES, default 10 — see config.py), NOT None
+# like the pipeline tasks above: those have AttemptCount's poison-terminal cap as their real
+# ceiling — this task has no such fence, so a permanent slot exhaustion would otherwise retry
+# forever. Once the cap is spent Celery re-raises and the job goes FAILURE, which the status
+# route's AsyncResult backstop surfaces to the poller. Decorator-time read, like the beat
+# schedule's _s.* intervals above — a changed .env needs a worker restart to take effect.
 @celery_app.task(bind=True, name="tsg.admin_embedding_action",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True,
+                max_retries=_s.admin_embedding_max_retries)
 def admin_embedding_action_task(self, action: str, group: str | None, names: list[str] | None,
                                 strict: bool = True) -> dict:
     """Background counterpart to app/api/admin.py's four embedding-cache routes; the caller polls
