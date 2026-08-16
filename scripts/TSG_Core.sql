@@ -416,7 +416,7 @@ CREATE TABLE Risk_Treatment_Plan (
     UpdatedAt               datetime2     NULL,         -- progress clock: claim + each LLM attempt bump it
     CompletedAt             datetime2     NULL,
     RiskLevel               nvarchar(10)  NULL,         -- register risk level from the request (filterable)
-    ReviewStatus            nvarchar(20)  NULL,         -- TreatmentReviewStatus; NULL = not reviewed
+    ReviewStatus            nvarchar(100) NULL,         -- TreatmentReviewStatus; NULL = not reviewed
     ReviewComment           nvarchar(max) NULL,
     ReviewedBy              nvarchar(200) NULL,         -- from the reviewer's login token
     ReviewedAt              datetime2     NULL,
@@ -432,11 +432,26 @@ GO
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'RiskLevel') IS NULL
 BEGIN
     ALTER TABLE Risk_Treatment_Plan ADD RiskLevel nvarchar(10) NULL;
-    ALTER TABLE Risk_Treatment_Plan ADD ReviewStatus nvarchar(20) NULL;
+    ALTER TABLE Risk_Treatment_Plan ADD ReviewStatus nvarchar(100) NULL;
     ALTER TABLE Risk_Treatment_Plan ADD ReviewComment nvarchar(max) NULL;
     ALTER TABLE Risk_Treatment_Plan ADD ReviewedBy nvarchar(200) NULL;
     ALTER TABLE Risk_Treatment_Plan ADD ReviewedAt datetime2 NULL;
 END
+GO
+
+-- Widen ReviewStatus on PRE-EXISTING databases (fresh installs get nvarchar(100) from the
+-- CREATE above, and the guarded ADD block now also creates it at 100). Headroom (v0.14) so a
+-- future verdict value can never repeat the StageStatus truncation freeze documented earlier
+-- in this file. Same conventions as that widen: guard schema-qualified, BETWEEN skips
+-- nvarchar(max) (-1) so a max column can never be narrowed, NULL restated because ALTER COLUMN
+-- resets nullability, metadata-only, own GO batch. ReviewStatus sits in no index key or
+-- filtered-index predicate (both Risk_Treatment_Plan indexes filter on Superseded only), so
+-- there is no Msg 5074 risk.
+IF EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'Risk_Treatment_Plan'
+             AND COLUMN_NAME = 'ReviewStatus'
+             AND CHARACTER_MAXIMUM_LENGTH BETWEEN 1 AND 99)
+    ALTER TABLE dbo.Risk_Treatment_Plan ALTER COLUMN ReviewStatus nvarchar(100) NULL;
 GO
 
 -- Adds the machine-readable terminal reason for pre-2026-08-11 databases.
@@ -459,6 +474,14 @@ IF COL_LENGTH('dbo.Risk_Treatment_Plan', 'ErrorReason') IS NOT NULL
                ELSE N'generation_failed'   -- the historical catch-all for everything else
            END
     WHERE  Status = 'ERROR' AND ErrorReason IS NULL;
+GO
+
+-- Renames the review verdict 'changes_requested' -> 'rejected'. Idempotent (a re-run matches
+-- nothing). Safe in either order relative to the code deploy — stored values are read back as
+-- raw text, never 500 — but run it WITH the deploy so review_status=rejected filters match
+-- pre-rename rows. Audit DetailJSON history keeps the old literal: records as written.
+IF COL_LENGTH('dbo.Risk_Treatment_Plan', 'ReviewStatus') IS NOT NULL
+    UPDATE Risk_Treatment_Plan SET ReviewStatus = N'rejected' WHERE ReviewStatus = N'changes_requested';
 GO
 
 -- Relaxes CrmRiskIdentificationID to nullable — unused since the request-body redesign.

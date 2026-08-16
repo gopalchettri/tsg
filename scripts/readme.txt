@@ -248,3 +248,13 @@ api.treatment._normalize_plan_shape lifts them to the nested {control_coverage, 
 shape at read time (stored rows never rewritten), so SQL JSON_VALUE queries against
 '$.controls_to_be_implemented.control_coverage' return NULL for those rows — use
 '$.control_coverage' when inspecting them directly.
+
+2026-08-16: Risk_Treatment_Plan.ReviewStatus — two changes, both carried by re-running
+TSG_Core.sql. (1) Verdict value renamed 'changes_requested' -> 'rejected': idempotent backfill
+UPDATE (audit DetailJSON history keeps the old literal — records as written); the API rejects
+the old literal with a 422 after the code deploy, so run this WITH that deploy. (2) Column
+widened nvarchar(20) -> nvarchar(100) IN PLACE by the same schema-qualified, width-guarded
+ALTER pattern as the 2026-08-14 StageStatus widen (own GO batch; BETWEEN 1 AND 99 skips
+nvarchar(max); ReviewStatus is in no filtered-index predicate, so no Msg 5074 concern).
+TSG_Verify.sql's width row now checks 'approved' (8 chars), the longest remaining
+TreatmentReviewStatus member.

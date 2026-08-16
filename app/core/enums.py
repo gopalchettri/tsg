@@ -421,7 +421,8 @@ class TreatmentReviewStatus(StrEnum):
     = not reviewed; a re-review overwrites (latest wins); a regenerate supersedes the row, so the
     new version starts unreviewed — approval never silently carries across versions."""
     approved = "approved"
-    changes_requested = "changes_requested"    # reviewer wants a different plan (regenerate with a note)
+    rejected = "rejected"    # reviewer rejected the plan — regenerate with a note. Renamed from
+                             # 'changes_requested' (v0.13); stored rows backfilled in 1. TSG_Core.sql.
 
 
 class ControlCoverage(StrEnum):

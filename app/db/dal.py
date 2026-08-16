@@ -1912,17 +1912,21 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
 
 def active_plan_rows(sess: Session, session_id: str) -> list[RowMapping]:
     """Set-based sibling of active_plan_row: every active plan row of the session in ONE round
-    trip — same columns, same PK-hop outer joins (no fan-out possible, see active_plan_row).
-    Serves the Excel export's batch read; presentation order is the caller's concern (the
-    board query drives it)."""
+    trip — same PK-hop outer joins (no fan-out possible, see active_plan_row). Serves the Excel
+    export's batch read; presentation order is the caller's concern (the board query drives it).
+    Batch-read column rule (shared with entity_plan_rows/superseded_plan_rows): no blobs that
+    feed only wire-hidden fields — ValidationJSON/ReviewComment are omitted (the Excel columns
+    render neither, and the presenter reads them with .get), as are TenantID/EntityID/
+    ActiveTaskID, which this function's one consumer never touches. Only the single-row
+    active_plan_row still hauls them, for the poll GET's one-flag-unhide contract."""
     if not _valid_guid(session_id):
         return []
     p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
     st, it = m.Scoped_Threat, m.Identified_Threat
     return sess.execute(
-        select(p.PlanID, p.SessionID, p.OutputID, p.TenantID, p.EntityID, p.Status,
-            p.ActiveTaskID, p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
-            p.ValidationJSON, p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment,
+        select(p.PlanID, p.SessionID, p.OutputID, p.Status,
+            p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
+            p.ErrorMessage, p.RiskLevel, p.ReviewStatus,
             p.ReviewedBy, p.ReviewedAt, p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt,
                out.ScenarioJSON,
             it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON)
@@ -1946,16 +1950,24 @@ def review_plan(sess: Session, plan_id: str, *, status: str, comment: str | None
             ReviewedAt=reviewed_at, UpdatedAt=reviewed_at)).rowcount == 1
 
 
-def session_plan_board(sess: Session, session_id: str) -> list[RowMapping]:
+def session_plan_board(sess: Session, session_id: str, *,
+                       include_plan: bool = False) -> list[RowMapping]:
     """One row per accepted, active scenario of the session, LEFT-joined to its active plan (NULL
-    plan columns = never requested). Excludes PlanJSON — the board is a glance, the single-plan
-    GET is the document; ScenarioJSON rides along only because the title lives inside it."""
+    plan columns = never requested). Excludes PlanJSON by default — the board is a glance, the
+    single-plan GET is the document; `include_plan` appends it, the same opt-in blob haul as
+    entity_plan_rows. The scenario title comes from JSON_VALUE server-side (entity_plan_rows
+    precedent) — the board is polled, and hauling every multi-KB ScenarioJSON per cycle to keep
+    one short string was the query's whole IO cost."""
     out, p = m.Threat_Scenario_Output, m.Risk_Treatment_Plan
-    return sess.execute(
-        select(out.OutputID, out.ScenarioJSON,
+    cols = [out.OutputID,
+            func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle"),
             p.PlanID, p.Status, p.RiskLevel, p.ReviewStatus, p.ErrorMessage, p.ErrorReason,
             p.CreatedAt.label("PlanCreatedAt"), p.UpdatedAt.label("PlanUpdatedAt"),
-            p.CompletedAt.label("PlanCompletedAt"))
+            p.CompletedAt.label("PlanCompletedAt")]
+    if include_plan:
+        cols.append(p.PlanJSON)
+    return sess.execute(
+        select(*cols)
         .select_from(out.__table__.outerjoin(
             p, and_(p.OutputID == out.OutputID, p.Superseded == 0)))
         .where(out.SessionID == session_id, out.Accepted == 1, out.Superseded == 0)
@@ -1974,20 +1986,32 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
     must surface under status=ERROR and stay out of status=RUNNING. Branched in SQL, not
     post-filtered in Python, which would under-fill pages. ScenarioTitle comes from JSON_VALUE
     server-side rather than hauling every multi-KB blob; malformed JSON yields NULL.
-    `include_plan` appends PlanJSON to the select — a deliberate, opt-in blob haul
-    (?include_plan=true), bounded by the page limit; off keeps today's byte-stable SQL."""
+    `include_plan` widens the select to everything _plan_status_from_row reads (plan/scenario
+    blobs + the threat-identity joins, same set as active_plan_row) so the detailed register
+    row is rendered by the poll GET's own presenter — a deliberate, opt-in haul
+    (?include_plan=true), bounded by the page limit, and NOT redundant here: every register row
+    is a different scenario. Off keeps today's byte-stable SQL."""
     p, ss, out = m.Risk_Treatment_Plan, m.Scenario_Session, m.Threat_Scenario_Output
     cols = [p.PlanID, p.SessionID, p.OutputID, p.Status, p.RiskLevel, p.ReviewStatus,
             p.ReviewedBy, p.ReviewedAt, p.ErrorMessage, p.ErrorReason, p.CreatedAt, p.UpdatedAt,
             p.CompletedAt, ss.AssetName,
             func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle")]
+    joined = (p.__table__
+              .join(ss, ss.SessionID == p.SessionID)
+              .outerjoin(out, out.OutputID == p.OutputID))
     if include_plan:
-        cols.append(p.PlanJSON)
+        st, it = m.Scoped_Threat, m.Identified_Threat
+        # No ValidationJSON/ReviewComment: they feed only wire-hidden (exclude=True) fields —
+        # a blob per row for bytes nobody can see. The presenter reads them with .get.
+        cols += [p.PlanJSON, p.TreatmentStrategy, p.RiskIdentificationDate,
+                 out.ScenarioJSON,
+                 it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON]
+        joined = (joined
+                  .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
+                  .outerjoin(it, st.ThreatID == it.ThreatID))
     stmt = (
         select(*cols)
-        .select_from(p.__table__
-            .join(ss, ss.SessionID == p.SessionID)
-            .outerjoin(out, out.OutputID == p.OutputID))
+        .select_from(joined)
         .where(ss.EntityID == entity_id, p.Superseded == 0))
     if status == str(StageStatus.ERROR):
         stmt = stmt.where(or_(p.Status == StageStatus.ERROR,
@@ -2027,14 +2051,16 @@ def superseded_plan_rows(sess: Session, session_id: str, output_id: str) -> list
     caller already serves them once on the top-level (active) object, and re-hauling the same
     multi-KB ScenarioJSON per history row would multiply the DB read and the response for zero
     information (history rows therefore present scenario=null). InputSnapshotJSON stays excluded
-    too — tens of KB per version; that is the evidence endpoint's job."""
+    too — tens of KB per version; that is the evidence endpoint's job. ValidationJSON and
+    ReviewComment are excluded as well: they feed only wire-hidden (exclude=True) fields, so a
+    blob per history row would buy nothing — the presenter reads them with .get."""
     if not _valid_guid(output_id):
         return []
     p = m.Risk_Treatment_Plan
     return sess.execute(
         select(p.PlanID, p.SessionID, p.OutputID, p.Status, p.TreatmentStrategy,
-            p.RiskIdentificationDate, p.PlanJSON, p.ValidationJSON, p.ErrorMessage,
-            p.RiskLevel, p.ReviewStatus, p.ReviewComment, p.ReviewedBy, p.ReviewedAt,
+            p.RiskIdentificationDate, p.PlanJSON, p.ErrorMessage,
+            p.RiskLevel, p.ReviewStatus, p.ReviewedBy, p.ReviewedAt,
             p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
         .where(p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 1)
         .order_by(p.CreatedAt.desc(), p.PlanID)

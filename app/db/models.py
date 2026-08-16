@@ -283,7 +283,7 @@ class Risk_Treatment_Plan(Base):
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)  # progress clock: claim + each LLM attempt bump it
     CompletedAt: Mapped[datetime | None] = mapped_column(DateTime)
     RiskLevel: Mapped[str | None] = mapped_column(Unicode(10))    # register risk level from the request (filterable)
-    ReviewStatus: Mapped[str | None] = mapped_column(Unicode(20))  # TreatmentReviewStatus; NULL = not reviewed
+    ReviewStatus: Mapped[str | None] = mapped_column(Unicode(100))  # TreatmentReviewStatus; NULL = not reviewed
     ReviewComment: Mapped[str | None] = mapped_column(UnicodeText)
     ReviewedBy: Mapped[str | None] = mapped_column(Unicode(200))  # from the reviewer's login token
     ReviewedAt: Mapped[datetime | None] = mapped_column(DateTime)

@@ -196,7 +196,7 @@ INSERT INTO @enum_cols (TableName, ColumnName, NeedChars, EnumName, LongestValue
     (N'Risk_Treatment_Plan',         N'Status',             8, N'StageStatus subset',     N'COMPLETE'),
     (N'Risk_Treatment_Plan',         N'TreatmentStrategy',  8, N'TreatmentStrategy',      N'Mitigate'),
     (N'Risk_Treatment_Plan',         N'RiskLevel',          8, N'RiskLevel',              N'Critical'),
-    (N'Risk_Treatment_Plan',         N'ReviewStatus',      17, N'TreatmentReviewStatus',  N'changes_requested'),
+    (N'Risk_Treatment_Plan',         N'ReviewStatus',       8, N'TreatmentReviewStatus',  N'approved'),
     (N'Risk_Treatment_Plan',         N'ErrorReason',       17, N'TreatmentOutcomeReason', N'generation_failed'),
     (N'Scenario_Audit',              N'Stage',             21, N'WorkflowStage',          N'THREAT_IDENTIFICATION'),
     (N'Scenario_Audit',              N'EventType',         24, N'AuditEventType',         N'treatment_plan_requested'),

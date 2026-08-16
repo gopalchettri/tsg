@@ -2086,7 +2086,7 @@ class TreatmentPlanStatus(BaseModel):
     risk_level: str | None = Field(
         default=None, description="The register risk level this plan was generated against (from the request).")
     review_status: str | None = Field(
-        default=None, description="TreatmentReviewStatus (approved / changes_requested) — null until a human reviews.")
+        default=None, description="TreatmentReviewStatus (approved / rejected) — null until a human reviews.")
     review_comment: str | None = Field(default=None, exclude=True, description="The reviewer's comment, if any.")
     reviewed_by: str | None = Field(default=None, exclude=True, description="Who recorded the decision (from their login token).")
     reviewed_at: datetime | None = Field(default=None, exclude=True, description="When the decision was recorded.")
@@ -2137,11 +2137,16 @@ class TreatmentBoardRow(BaseModel):
     plan_id: str | None = Field(default=None, description="Active plan id; null = never requested.")
     status: str | None = Field(default=None, description="RUNNING | COMPLETE | ERROR (stale RUNNING projects as ERROR).")
     risk_level: str | None = Field(default=None)
-    review_status: str | None = Field(default=None, description="approved / changes_requested / null.")
+    review_status: str | None = Field(default=None, description="approved / rejected / null.")
     error_message: str | None = Field(default=None)
     reason: TreatmentOutcomeReason | None = Field(
         default=None, description="Why it ended this way when status is ERROR — see "
                                   "TreatmentPlanStatus.reason. Null otherwise.")
+    plan: dict[str, Any] | None = Field(
+        default=None,
+        description="The plan's content — the same trimmed object as TreatmentPlanStatus.plan. "
+                    "Populated only with ?include_plan=true; null when not requested, and null "
+                    "on rows with no generated content (RUNNING/ERROR or never requested).")
     created_at: datetime | None = Field(default=None)
     completed_at: datetime | None = Field(default=None)
 
@@ -2174,7 +2179,7 @@ class TreatmentReviewBody(BaseModel):
     plan. The reviewer's identity comes from the login token, never from this body."""
     model_config = ConfigDict(json_schema_extra={"example": {
         "decision": "approved", "comment": "A3 timeline extended per operations."}})
-    decision: TreatmentReviewStatus = Field(description="approved | changes_requested.")
+    decision: TreatmentReviewStatus = Field(description="approved | rejected.")
     comment: str | None = Field(default=None, max_length=2000, description="Optional reviewer comment.")
 
 
@@ -2200,11 +2205,26 @@ class TreatmentRegisterRow(BaseModel):
     reason: TreatmentOutcomeReason | None = Field(
         default=None, description="Why it ended this way when status is ERROR — see "
                                   "TreatmentPlanStatus.reason. Null otherwise.")
+    scenario: dict[str, Any] | None = Field(
+        default=None,
+        description="Same block as TreatmentPlanStatus.scenario (scenario_title / "
+                    "scenario_statement / risk_statement + threat identity). Populated only "
+                    "with ?include_plan=true.")
+    treatment_strategy: str | None = Field(
+        default=None,
+        description="Server-stamped 'Mitigate' — see TreatmentPlanStatus. Populated only with "
+                    "?include_plan=true.")
+    risk_identification_date: datetime | None = Field(
+        default=None,
+        description="Register echo — see TreatmentPlanStatus. Populated only with "
+                    "?include_plan=true.")
     plan: dict[str, Any] | None = Field(
         default=None,
-        description="The plan's content — the same trimmed object as TreatmentPlanStatus.plan. "
-                    "Populated only with ?include_plan=true; null when not requested, and null "
-                    "on rows with no generated content (RUNNING/ERROR).")
+        description="The plan's content — the same trimmed object as TreatmentPlanStatus.plan, "
+                    "rendered by the same presenter: with ?include_plan=true a register row "
+                    "mirrors the single-plan GET's response (minus `superseded`, plus "
+                    "asset_name/scenario_title). Null when not requested, and null on rows "
+                    "with no generated content (RUNNING/ERROR).")
     created_at: datetime | None = None
     completed_at: datetime | None = None
 

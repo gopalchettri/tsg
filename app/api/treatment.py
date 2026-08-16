@@ -223,11 +223,15 @@ def get_treatment_plan(session_id: str, output_id: str,
 
 def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
                           superseded: list[TreatmentPlanStatus] | None = None) -> TreatmentPlanStatus:
-    """One active plan row -> the wire model. Shared by the single-plan GET and the Excel
-    export, so the two can never disagree — the guarantee the export used to buy by re-entering
-    the GET per scenario, now held by construction instead of by N extra authorization+fetch
-    round trips. `stale_cutoff` is the CALLER's single instant (_present_status's contract):
-    the Excel route passes one cutoff for every row of its response."""
+    """One plan row -> the wire model. Shared by the single-plan GET, the Excel export, the
+    versions history (?include_superseded) and the detailed register (?include_plan), so no
+    two views can ever disagree — the guarantee the export used to buy by re-entering the GET
+    per scenario, now held by construction. `stale_cutoff` is the CALLER's single instant
+    (_present_status's contract): batch routes pass one cutoff for every row of a response.
+    Blob columns that feed only wire-hidden fields (ValidationJSON, ReviewComment — exclude=True
+    on the model) are read with .get: every batch query deliberately omits them, and only the
+    single-row active_plan_row still hauls them so the poll GET keeps its one-flag-unhide
+    contract."""
     status, error_message, reason = _present_status(
         row["Status"], row["ErrorMessage"], row["UpdatedAt"], stale_cutoff, row["ErrorReason"])
 
@@ -245,14 +249,14 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
         scenario["threat_type"] = row["ThreatType"]
         scenario["threat_name"] = row["ThreatName"]
         scenario["threat_actors"] = stored_actors(row["ThreatActorsJSON"])
-    validation = _safe_json_dict(row["ValidationJSON"], row["PlanID"]) or {}
+    validation = _safe_json_dict(row.get("ValidationJSON"), row["PlanID"]) or {}
     moderation = validation.get("moderation") or {}
     return TreatmentPlanStatus(
         plan_id=row["PlanID"], session_id=row["SessionID"], output_id=row["OutputID"],
         status=status, treatment_strategy=row["TreatmentStrategy"],
         scenario=scenario,
         risk_level=row["RiskLevel"], review_status=row["ReviewStatus"],
-        review_comment=row["ReviewComment"], reviewed_by=row["ReviewedBy"],
+        review_comment=row.get("ReviewComment"), reviewed_by=row["ReviewedBy"],
         reviewed_at=row["ReviewedAt"],
         risk_identification_date=row["RiskIdentificationDate"],
         plan=plan,
@@ -346,11 +350,6 @@ def _present_status(status: str, error_message: str | None, updated_at: datetime
     return status, error_message, None  # RUNNING / COMPLETE carry no reason
 
 
-def _scenario_title(scenario_json: str | None) -> str | None:
-    """Display title from a ScenarioJSON blob — defensive, a corrupt blob yields None."""
-    return (_safe_json_dict(scenario_json, "-") or {}).get("scenario_title")
-
-
 _CANCELLED_MESSAGE = "cancelled by user"
 
 #: Wire labels for the audit feeds — short verbs, not internal enum names.
@@ -364,12 +363,19 @@ _EVENT_LABELS = {
 
 @router.get("/sessions/{session_id}/treatment-plans", response_model=TreatmentBoard)
 def get_treatment_board(session_id: str,
+                        include_plan: bool = Query(
+                            False, description="Also return each plan's content — the "
+                                               "same trimmed object as the single-plan "
+                                               "GET. Null on rows with no generated "
+                                               "content (RUNNING/ERROR or never "
+                                               "requested)."),
                         principal: Principal = Depends(get_principal)) -> TreatmentBoard:
     """The session plan board — every ACCEPTED scenario's plan state in one call (replaces N
-    per-scenario polls). Null plan fields = never requested (UI shows Generate)."""
+    per-scenario polls). Null plan fields = never requested (UI shows Generate).
+    ?include_plan=true adds each COMPLETE plan's content, same projection as the register."""
     with db_session() as sess:
         get_authorized_session(sess, session_id, principal)
-        rows = dal.session_plan_board(sess, session_id)
+        rows = dal.session_plan_board(sess, session_id, include_plan=include_plan)
         # ONE cutoff for the whole board, not one per row (see _present_status) — a board with
         # several plans must not judge the last row against a later instant than the first.
         stale_cutoff = treatment._stale_cutoff()
@@ -386,9 +392,13 @@ def get_treatment_board(session_id: str,
                                                       r["PlanUpdatedAt"], stale_cutoff,
                                                       r["ErrorReason"])
             plans.append(TreatmentBoardRow(
-                output_id=r["OutputID"], scenario_title=_scenario_title(r["ScenarioJSON"]),
+                output_id=r["OutputID"], scenario_title=r["ScenarioTitle"],
                 plan_id=r["PlanID"], status=status, risk_level=r["RiskLevel"],
                 review_status=r["ReviewStatus"], error_message=err, reason=reason,
+                # PlanID guard: never-requested rows have NULL plan columns (and without the
+                # flag the row carries no PlanJSON key at all).
+                plan=(_visible_plan(r["PlanJSON"], r["PlanID"])
+                      if include_plan and r["PlanID"] is not None else None),
                 created_at=r["PlanCreatedAt"], completed_at=r["PlanCompletedAt"]))
     return TreatmentBoard(session_id=session_id, accepted_scenarios=len(rows), plans=plans)
 
@@ -525,6 +535,20 @@ def list_entity_treatment_plans(entity_id: str,
                                     limit=limit, offset=offset)
         items = []
         for r in rows:
+            if include_plan:
+                # The poll GET's own presenter renders the detail — one projection, two pages,
+                # so the register can never disagree with GET .../treatment-plan.
+                ps = _plan_status_from_row(r, stale_cutoff)
+                items.append(TreatmentRegisterRow(
+                    plan_id=ps.plan_id, session_id=ps.session_id, output_id=ps.output_id,
+                    asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
+                    status=ps.status, risk_level=ps.risk_level,
+                    review_status=ps.review_status, reviewed_by=ps.reviewed_by,
+                    error_message=ps.error_message, reason=ps.reason,
+                    scenario=ps.scenario, treatment_strategy=ps.treatment_strategy,
+                    risk_identification_date=ps.risk_identification_date, plan=ps.plan,
+                    created_at=ps.created_at, completed_at=ps.completed_at))
+                continue
             st, err, reason = _present_status(r["Status"], r["ErrorMessage"], r["UpdatedAt"],
                                               stale_cutoff, r["ErrorReason"])
             items.append(TreatmentRegisterRow(
@@ -532,7 +556,6 @@ def list_entity_treatment_plans(entity_id: str,
                 asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
                 status=st, risk_level=r["RiskLevel"], review_status=r["ReviewStatus"],
                 reviewed_by=r["ReviewedBy"], error_message=err, reason=reason,
-                plan=_visible_plan(r["PlanJSON"], r["PlanID"]) if include_plan else None,
                 created_at=r["CreatedAt"], completed_at=r["CompletedAt"]))
     return TreatmentRegisterPage(entity_id=entity_id, limit=limit, offset=offset, plans=items)
 

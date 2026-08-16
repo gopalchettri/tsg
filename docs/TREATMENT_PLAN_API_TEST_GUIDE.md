@@ -22,7 +22,7 @@ AI see and say*. In plain English:
 | Regenerate it (new version, old one kept) | the **same POST** again — there is no separate route | §3.1 |
 | Check whether the plan is ready, and read it | `GET /v1/sessions/{s}/scenarios/{o}/treatment-plan` | §3.2 |
 | See the current plan **and** every regenerated version | the same GET with `?include_superseded=true` | §3.2 |
-| List every scenario's plan in one session | `GET /v1/sessions/{s}/treatment-plans` | §3.3 |
+| List every scenario's plan in one session | `GET /v1/sessions/{s}/treatment-plans` (add `?include_plan=true` for full content) | §3.3 |
 | Download the session's plans as an Excel file | `GET /v1/sessions/{s}/treatment-plans.xlsx` | §3.10 |
 | Stop a generation I started by mistake | `POST …/scenarios/{o}/treatment-plan/cancel` | §3.4 |
 | Approve or reject a finished plan | `POST …/scenarios/{o}/treatment-plan/review` | §3.5 |
@@ -222,7 +222,7 @@ This index, not any SELECT, is what makes a duplicate POST return 409. The app r
 **Stored vocabularies** (use these exact strings in SQL):
 
 - `Risk_Treatment_Plan.Status` → `RUNNING` | `COMPLETE` | `ERROR`
-- `Risk_Treatment_Plan.ReviewStatus` → `approved` | `changes_requested` | NULL (not reviewed)
+- `Risk_Treatment_Plan.ReviewStatus` → `approved` | `rejected` | NULL (not reviewed)
 - `Risk_Treatment_Plan.TreatmentStrategy` → always `Mitigate`
 - `Risk_Treatment_Plan.RiskLevel` → `Low` | `Medium` | `High` | `Critical`
 - `Scenario_Audit.EventType` → `treatment_plan_requested` | `treatment_plan_outcome` | `treatment_plan_cancelled` | `treatment_plan_reviewed`
@@ -706,7 +706,11 @@ the audit trail (§3.7); for a version's frozen AI input use evidence (§3.9).
 
 **Why it exists:** with 12 accepted scenarios the UI would otherwise fire 12 requests every poll cycle.
 
-**Request:** none.
+**Request:** no body. One optional query param:
+
+| Param | Default | Bounds | Note |
+|---|---|---|---|
+| `include_plan` | `false` | bool | Adds each row's `plan` content — see below. |
 
 **Response 200:**
 
@@ -723,6 +727,19 @@ the audit trail (§3.7); for a version's frozen AI input use evidence (§3.9).
 
 `plan_id: null` means no plan was ever requested — the UI shows a Generate button.
 A session with no accepted scenarios returns `accepted_scenarios: 0`, **not** a 404 (see N24).
+
+**Detailed rows — `?include_plan=true`.** By default the board is a summary (`plan` is `null`);
+add the flag to get each row's full plan content — **the same trimmed `plan` object the poll
+GET (§3.2) serves**, produced by the same projection, so the two views cannot disagree:
+
+```bash
+curl -s "http://127.0.0.1:8000/v1/sessions/{S}/treatment-plans?include_plan=true" \
+  -H "X-API-Key: <API_KEY>" -H "X-User-Id: tester1" -H "X-Entity-Id: {E}" -H "X-Tenant-Id: DESC"
+```
+
+Rows with no generated content (RUNNING, ERROR, never requested) keep `plan: null` even with
+the flag on. The per-scenario page stays §3.2; this flag serves a whole-session report or
+export in one call instead of one poll per plan (the entity-wide sibling is §3.6).
 
 **Tables:** reads `Threat_Scenario_Output` LEFT JOIN `Risk_Treatment_Plan`, plus `Scenario_Session`.
 
@@ -753,7 +770,7 @@ stopped **now** rather than waiting out the staleness window.
 The conditional update either wins cleanly or reports 409 — it can never half-cancel.
 
 **Scope limit:** cancel works **only while `Status='RUNNING'`**. A finished plan cannot be cancelled —
-use review (`changes_requested`) or regenerate instead.
+use review (`rejected`) or regenerate instead.
 
 **What it does not do:** it does not revoke the Celery task. See the note at Step 10.
 
@@ -788,7 +805,7 @@ Use `{P3}` — the plan Step 10 cancelled — not `{P2}`, which Step 10's POST s
 
 ### 3.5 POST `…/treatment-plan/review` — accept **or** reject
 
-**When to use:** a human has read the plan and decides. `approved` = adopt it. `changes_requested` = reject it.
+**When to use:** a human has read the plan and decides. `approved` = adopt it. `rejected` = reject it (a different plan is wanted — regenerate with a note).
 
 **Why the reviewer is not in the body:** an identity sent in JSON is unverified text. The name recorded
 in `ReviewedBy` comes from the login token, so the audit record is evidence rather than a claim.
@@ -802,10 +819,11 @@ in `ReviewedBy` comes from the login token, so the audit record is evidence rath
 or
 
 ```json
-{"decision":"changes_requested","comment":"7-day timeline impossible for OT. Phase around the maintenance window."}
+{"decision":"rejected","comment":"7-day timeline impossible for OT. Phase around the maintenance window."}
 ```
 
-`decision` is required and must be exactly `approved` or `changes_requested`. `comment` is optional,
+`decision` is required and must be exactly `approved` or `rejected` (renamed from
+`changes_requested` in v0.13 — the old literal is now a `422`). `comment` is optional,
 ≤2000 chars, redacted before storage (see N18).
 
 **Response 200:**
@@ -855,13 +873,13 @@ This is the only endpoint that spans assets and sessions.
 | Param | Default | Bounds | Note |
 |---|---|---|---|
 | `status` | none | enum | `RUNNING` / `COMPLETE` / `ERROR`. Matches the **displayed** status: a timed-out RUNNING plan is returned by `status=ERROR` and excluded from `status=RUNNING`. Enum-typed since v0.10 — a typo is a clean `422`, not an empty page. |
-| `review_status` | none | enum | `approved` / `changes_requested` — typo = `422` |
+| `review_status` | none | enum | `approved` / `rejected` — typo = `422` |
 | `risk_level` | none | enum | `Low` / `Medium` / `High` / `Critical` — typo = `422` |
 | `include_plan` | `false` | bool | Adds each row's `plan` content — see below. |
 | `limit` | 100 | 1–500 | |
 | `offset` | 0 | ≥0 | |
 
-Example: `?risk_level=Critical&review_status=changes_requested&limit=50`
+Example: `?risk_level=Critical&review_status=rejected&limit=50`
 
 **Response 200:**
 
@@ -874,20 +892,23 @@ Example: `?risk_level=Critical&review_status=changes_requested&limit=50`
    "created_at":"2026-08-10T09:12:44","completed_at":"2026-08-10T09:14:02"}]}
 ```
 
-**Detailed rows — `?include_plan=true`.** By default the register is a summary (`plan` is
-`null`); add the flag to get each row's full plan content — **the same trimmed `plan` object
-the poll GET (§3.2) serves**, produced by the same projection, so the two views cannot
-disagree:
+**Detailed rows — `?include_plan=true`.** By default the register is a summary (`plan`,
+`scenario`, `treatment_strategy` and `risk_identification_date` are all `null`); add the flag
+and each row carries **the same detailed output as the poll GET (§3.2)** — the trimmed `plan`
+object, the `scenario` block (statements + threat identity), `treatment_strategy` and
+`risk_identification_date` — rendered by the poll GET's own presenter, so a detailed register
+row mirrors that response exactly (minus `superseded`, plus `asset_name`/`scenario_title`):
 
 ```bash
 curl -s "http://127.0.0.1:8000/v1/entities/{E}/treatment-plans?include_plan=true&status=COMPLETE&limit=50" \
   -H "X-API-Key: <API_KEY>" -H "X-User-Id: tester1" -H "X-Entity-Id: {E}" -H "X-Tenant-Id: DESC"
 ```
 
-Rows with no generated content (RUNNING, ERROR) keep `plan: null` even with the flag on —
-combine with `status=COMPLETE` (as above) so every returned row actually carries content. The
-per-scenario page stays §3.2; this flag is for feeding a report or export with one bounded call
-(the page `limit` caps the payload) instead of one poll per plan.
+Rows with no generated content (RUNNING, ERROR) keep `plan: null` even with the flag on (their
+`scenario`/`treatment_strategy` still fill) — combine with `status=COMPLETE` (as above) so every
+returned row carries a plan. The per-scenario page stays §3.2; this flag is for feeding a
+report or export with one bounded call (the page `limit` caps the payload) instead of one poll
+per plan.
 
 **Tables:** reads `Risk_Treatment_Plan` JOIN `Scenario_Session` LEFT JOIN `Threat_Scenario_Output`.
 Note it filters `Scenario_Session.EntityID` (the authorization truth), not the plan's own copy.
@@ -1126,7 +1147,7 @@ query. Self-check: `scripts/test_build_treatment_plans_workbook.py`.
 | N9 | GET before any POST | `404` · "no treatment plan has been requested for this scenario" |
 | N10 | Cancel a `COMPLETE` plan | `409` · `not_in_progress` |
 | N11 | Review a `RUNNING` plan | `409` · `not_complete` |
-| N12 | Review with `"decision":"rejected"` | `422` — only `approved` / `changes_requested` |
+| N12 | Review with `"decision":"changes_requested"` | `422` — the pre-v0.13 literal; only `approved` / `rejected` are valid |
 | N13 | Evidence without `?version=` | `422` |
 | N14 | Evidence with `?version=not-a-guid` | `404` (never a 500) |
 | N15 | Register with `?limit=501` | `422` |
