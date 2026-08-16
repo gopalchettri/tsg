@@ -2117,6 +2117,14 @@ class TreatmentPlanStatus(BaseModel):
                     "regenerate), enqueue_failed (broker was down; retry now), content_blocked "
                     "(a safety guardrail refused it — do NOT auto-retry unchanged), invalid_plan / "
                     "generation_failed (retryable). Null on RUNNING and COMPLETE.")
+    superseded: list["TreatmentPlanStatus"] | None = Field(
+        default=None,
+        description="Regeneration history — every replaced version, newest first, each with its "
+                    "own plan_id, status, review verdict and plan content. Populated only on "
+                    "GET .../treatment-plan?include_superseded=true: null when not requested, "
+                    "[] when requested and the plan was never regenerated. History items carry "
+                    "scenario=null (the scenario is version-independent — read it once from the "
+                    "top level) and never nest their own history (one level deep).")
     created_at: datetime | None = Field(default=None, exclude=True, description="When this attempt was requested.")
     completed_at: datetime | None = Field(default=None, exclude=True, description="When it reached COMPLETE/ERROR.")
 
@@ -2192,6 +2200,11 @@ class TreatmentRegisterRow(BaseModel):
     reason: TreatmentOutcomeReason | None = Field(
         default=None, description="Why it ended this way when status is ERROR — see "
                                   "TreatmentPlanStatus.reason. Null otherwise.")
+    plan: dict[str, Any] | None = Field(
+        default=None,
+        description="The plan's content — the same trimmed object as TreatmentPlanStatus.plan. "
+                    "Populated only with ?include_plan=true; null when not requested, and null "
+                    "on rows with no generated content (RUNNING/ERROR).")
     created_at: datetime | None = None
     completed_at: datetime | None = None
 

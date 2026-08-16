@@ -4,7 +4,32 @@ For developers and testers. Every payload, table and query below is taken from t
 (`app/api/treatment.py`, `app/api/schemas.py`, `app/db/dal.py`, `scripts/TSG_Core.sql`).
 Design rationale lives in `docs/RISK_TREATMENT_PLAN_SDD.md` — this file is only how to test.
 
-**9 operations across 8 paths.** All are entity-scoped and mounted only when the feature flag is on.
+**10 operations across 9 paths.** All are entity-scoped and mounted only when the feature flag is on.
+
+---
+
+## Which API for what?
+
+The normal life of a plan is three calls: **generate** it (§3.1), **poll** the same path until it
+is ready (§3.2), then a human **approves or rejects** it (§3.5). Everything else is a view over
+that lifecycle: the **board** shows one session, the **register** shows the whole entity. For
+history, **audit** answers *who did what, when* while **evidence** answers *what exactly did the
+AI see and say*. In plain English:
+
+| I want to… | Call | Details |
+|---|---|---|
+| Generate a plan for one accepted scenario | `POST /v1/sessions/{s}/scenarios/{o}/treatment-plan` | §3.1 |
+| Regenerate it (new version, old one kept) | the **same POST** again — there is no separate route | §3.1 |
+| Check whether the plan is ready, and read it | `GET /v1/sessions/{s}/scenarios/{o}/treatment-plan` | §3.2 |
+| See the current plan **and** every regenerated version | the same GET with `?include_superseded=true` | §3.2 |
+| List every scenario's plan in one session | `GET /v1/sessions/{s}/treatment-plans` | §3.3 |
+| Download the session's plans as an Excel file | `GET /v1/sessions/{s}/treatment-plans.xlsx` | §3.10 |
+| Stop a generation I started by mistake | `POST …/scenarios/{o}/treatment-plan/cancel` | §3.4 |
+| Approve or reject a finished plan | `POST …/scenarios/{o}/treatment-plan/review` | §3.5 |
+| See every plan across the whole entity, filterable | `GET /v1/entities/{e}/treatment-plans` (add `?include_plan=true` for full content) | §3.6 |
+| See one scenario's full plan history (all versions) | `GET …/scenarios/{o}/treatment-plan/audit` | §3.7 |
+| See all treatment-plan activity across the entity | `GET /v1/entities/{e}/treatment-plans/audit` | §3.8 |
+| See exactly what the AI was given and answered | `GET …/treatment-plan/evidence?version={plan_id}` | §3.9 |
 
 ---
 
@@ -288,6 +313,17 @@ curl -s "http://127.0.0.1:8000/v1/sessions/{S}/treatment-plans" \
 
 Your scenario shows `status: "COMPLETE"`; scenarios with no plan show `plan_id: null`.
 
+### Step 4b — Download the board as Excel
+
+```bash
+curl -s "http://127.0.0.1:8000/v1/sessions/{S}/treatment-plans.xlsx" \
+  -H "X-API-Key: <API_KEY>" -H "X-User-Id: tester1" -H "X-Entity-Id: {E}" -H "X-Tenant-Id: DESC" \
+  -o treatment_plans.xlsx
+```
+
+Open `treatment_plans.xlsx`: one row per scenario that has a plan, same values as Step 3's JSON
+(see §3.10).
+
 ### Step 5 — Approve it
 
 ```bash
@@ -503,9 +539,10 @@ nothing — and match on **`output_id`**, because a regeneration mints a new `pl
 also absent from the stream's `reconcile` payload, so fetch the board (§3.3) on connect and on every
 reconnect.
 
-**Request:** none.
+**Request:** no body. One optional query parameter: `include_superseded=true` — see
+*Regeneration history* at the end of this section.
 
-**Response 200** — exactly these 11 keys:
+**Response 200** — exactly these 12 keys (`superseded` is `null` unless requested — see below):
 
 ```json
 {
@@ -549,7 +586,8 @@ reconnect.
     "risk_owner": "Head of OT Operations",
     "impacted_business_division": "Water Treatment Operations"
   },
-  "error_message": null
+  "error_message": null,
+  "superseded": null
 }
 ```
 
@@ -626,6 +664,39 @@ Note the title here comes from SQL's JSON parser; the API parses the blob in Pyt
 corrupt blob to `null` rather than erroring. They agree on well-formed JSON.
 
 **Failures:** `404` no plan ever requested (or it is superseded — use evidence instead) · `403` · `404` unknown session.
+
+**Regeneration history — `?include_superseded=true`.** Each regeneration mints a NEW `plan_id`
+and retires the old row (marked superseded, never deleted). The plain GET returns only the
+current version; add the flag to also get every replaced version, with content:
+
+```bash
+curl -s "http://127.0.0.1:8000/v1/sessions/{S}/scenarios/{O}/treatment-plan?include_superseded=true" \
+  -H "X-API-Key: <API_KEY>" -H "X-User-Id: tester1" -H "X-Entity-Id: {E}" -H "X-Tenant-Id: DESC"
+```
+
+The response is the same object with `superseded` filled: the top level IS the current plan, and
+`superseded` lists the replaced versions **newest first** — regenerated three times → three
+entries. Each entry carries the same 12 keys as the top level (its own `plan_id`, `status`,
+`review_status`, `plan`, …) with two deliberate nulls: `scenario` (version-independent — read it
+once from the top level, it is not re-sent per version) and its own `superseded` (history is one
+level deep):
+
+```json
+{
+  "plan_id": "{P2}", "status": "COMPLETE", "review_status": null, "scenario": {"…": "…"},
+  "superseded": [
+    { "plan_id": "{P1}", "status": "COMPLETE", "review_status": "approved",
+      "scenario": null, "superseded": null, "…": "…" }
+  ]
+}
+```
+
+Reading it: `superseded.length` **is** the regeneration count. A review never carries across
+versions — the old `approved` on `{P1}` beside the current `null` shows the new version still
+awaits review. Version statuses get the same read-time projection as everywhere else (a version
+that was still RUNNING when taken over reads `ERROR`/`timed_out`). Without the flag the field is
+`null`; with the flag on a never-regenerated plan it is `[]`. For the who/when event view use
+the audit trail (§3.7); for a version's frozen AI input use evidence (§3.9).
 
 ---
 
@@ -783,9 +854,10 @@ This is the only endpoint that spans assets and sessions.
 
 | Param | Default | Bounds | Note |
 |---|---|---|---|
-| `status` | none | free string | `RUNNING` / `COMPLETE` / `ERROR`. Matches the **displayed** status: a timed-out RUNNING plan is returned by `status=ERROR` and excluded from `status=RUNNING`. A typo returns an empty page, not a 422. |
-| `review_status` | none | free string | `approved` / `changes_requested` |
-| `risk_level` | none | free string | `Low` / `Medium` / `High` / `Critical` |
+| `status` | none | enum | `RUNNING` / `COMPLETE` / `ERROR`. Matches the **displayed** status: a timed-out RUNNING plan is returned by `status=ERROR` and excluded from `status=RUNNING`. Enum-typed since v0.10 — a typo is a clean `422`, not an empty page. |
+| `review_status` | none | enum | `approved` / `changes_requested` — typo = `422` |
+| `risk_level` | none | enum | `Low` / `Medium` / `High` / `Critical` — typo = `422` |
+| `include_plan` | `false` | bool | Adds each row's `plan` content — see below. |
 | `limit` | 100 | 1–500 | |
 | `offset` | 0 | ≥0 | |
 
@@ -798,9 +870,24 @@ Example: `?risk_level=Critical&review_status=changes_requested&limit=50`
  "plans":[{"plan_id":"b9fe…","session_id":"5b7c…","output_id":"1a2b…",
    "asset_name":"Water Treatment SCADA","scenario_title":"Ransomware via exposed RDP",
    "status":"COMPLETE","risk_level":"Critical","review_status":"approved",
-   "reviewed_by":"tester1","error_message":null,
+   "reviewed_by":"tester1","error_message":null,"plan":null,
    "created_at":"2026-08-10T09:12:44","completed_at":"2026-08-10T09:14:02"}]}
 ```
+
+**Detailed rows — `?include_plan=true`.** By default the register is a summary (`plan` is
+`null`); add the flag to get each row's full plan content — **the same trimmed `plan` object
+the poll GET (§3.2) serves**, produced by the same projection, so the two views cannot
+disagree:
+
+```bash
+curl -s "http://127.0.0.1:8000/v1/entities/{E}/treatment-plans?include_plan=true&status=COMPLETE&limit=50" \
+  -H "X-API-Key: <API_KEY>" -H "X-User-Id: tester1" -H "X-Entity-Id: {E}" -H "X-Tenant-Id: DESC"
+```
+
+Rows with no generated content (RUNNING, ERROR) keep `plan: null` even with the flag on —
+combine with `status=COMPLETE` (as above) so every returned row actually carries content. The
+per-scenario page stays §3.2; this flag is for feeding a report or export with one bounded call
+(the page `limit` caps the payload) instead of one poll per plan.
 
 **Tables:** reads `Risk_Treatment_Plan` JOIN `Scenario_Session` LEFT JOIN `Threat_Scenario_Output`.
 Note it filters `Scenario_Session.EntityID` (the authorization truth), not the plan's own copy.
@@ -990,6 +1077,40 @@ The second query's row count must equal `attempts.length`.
 
 ---
 
+### 3.10 GET `/v1/sessions/{session_id}/treatment-plans.xlsx` — the board as Excel
+
+**When to use:** hand the session's plans to someone who works in Excel, not in an API client —
+a reviewer, a report, an offline meeting. Same data as the board (§3.3) and the poll (§3.2), as
+a downloadable workbook.
+
+```bash
+curl -s "http://127.0.0.1:8000/v1/sessions/{S}/treatment-plans.xlsx" \
+  -H "X-API-Key: <API_KEY>" -H "X-User-Id: tester1" -H "X-Entity-Id: {E}" -H "X-Tenant-Id: DESC" \
+  -o treatment_plans.xlsx
+```
+
+**Response 200:** an `.xlsx` file (`Content-Disposition: attachment;
+filename="session_{S}_treatment_plans.xlsx"`) with one sheet, *Treatment Plans*: a frozen bold
+header row and **one row per accepted scenario that has a plan** — any status, including ERROR
+rows (their `error_message`/`reason` columns are filled). Scenarios where a plan was never
+requested are omitted; a session with no plans at all yields a header-only sheet. 27 columns:
+ids, the threat block, the scenario/risk statements, status/strategy/risk level/review state,
+every plan field (controls and remediation actions rendered as labelled text blocks), and
+`error_message`/`reason`.
+
+**It can never disagree with the JSON.** Rows are rendered by the *same* presenter as the poll
+GET (`_plan_status_from_row`) — same field trim, same staleness projection (a timed-out RUNNING
+plan shows `ERROR`/`timed_out` here too), same legacy-shape lifting.
+
+**Formula injection is sanitized.** Plan text originates from LLM output, so any cell value
+starting with `=`, `+`, `-`, `@`, tab or CR is prefixed with `'` — Excel shows it as literal
+text instead of executing it. A leading apostrophe in a cell is that guard, not corruption.
+
+**Tables:** same reads as §3.3 plus the full plan rows — no extra authorization, one batched
+query. Self-check: `scripts/test_build_treatment_plans_workbook.py`.
+
+---
+
 ## 4. Negative tests
 
 | # | Test | Expected |
@@ -1167,6 +1288,7 @@ active row while keeping the history.
 | 7 | GET | `/v1/sessions/{s}/scenarios/{o}/treatment-plan/audit` | — | 200 |
 | 8 | GET | `/v1/entities/{e}/treatment-plans/audit` | — | 200 |
 | 9 | GET | `/v1/sessions/{s}/scenarios/{o}/treatment-plan/evidence?version={p}` | — | 200 |
+| 10 | GET | `/v1/sessions/{s}/treatment-plans.xlsx` | — | 200 |
 
 ---
 

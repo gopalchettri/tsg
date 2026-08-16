@@ -182,10 +182,20 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
 @router.get("/sessions/{session_id}/scenarios/{output_id}/treatment-plan",
             response_model=TreatmentPlanStatus)
 def get_treatment_plan(session_id: str, output_id: str,
+                       include_superseded: bool = Query(
+                           False, description="Also return every regenerated-away version of "
+                                              "this plan under `superseded`, newest first."),
                        principal: Principal = Depends(get_principal)) -> TreatmentPlanStatus:
     """The poll endpoint — the scenario's one active plan row. 404 when no plan has ever been
     requested for this scenario. A stale RUNNING row is PRESENTED as ERROR/timed-out; the
     stored Status is not rewritten (no reaper — the next POST supersedes it instead).
+
+    ?include_superseded=true additionally serves the regeneration history: the same top-level
+    response (the current plan) plus `superseded` — every replaced version, newest first,
+    rendered by the same presenter (same trim, same staleness projection). History items carry
+    scenario=null: the scenario hangs off the OutputID, identical for every version, so it is
+    served once on the top level instead of N+1 times. Default off keeps the hot polling
+    path's single-row query untouched.
 
     POLLING IS THE CONTRACT. The worker also emits an advisory `treatment_plan_result` on the
     session's SSE stream (GET /v1/sessions/{id}/events) so a client can refetch immediately, but
@@ -198,10 +208,21 @@ def get_treatment_plan(session_id: str, output_id: str,
         row = dal.active_plan_row(sess, session_id, output_id)
         if row is None:
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
-        return _plan_status_from_row(row, treatment._stale_cutoff())
+        # ONE cutoff for the current row and every history row (see _present_status).
+        stale_cutoff = treatment._stale_cutoff()
+        older = None
+        if include_superseded:
+            # PlanID guard: two SELECTs under READ COMMITTED — a regeneration committing
+            # between them would supersede the row just read as current, making it show up in
+            # BOTH places on one response. Dropping it here keeps the reply self-consistent.
+            older = [_plan_status_from_row(r, stale_cutoff)
+                     for r in dal.superseded_plan_rows(sess, session_id, output_id)
+                     if r["PlanID"] != row["PlanID"]]
+        return _plan_status_from_row(row, stale_cutoff, superseded=older)
 
 
-def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime) -> TreatmentPlanStatus:
+def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
+                          superseded: list[TreatmentPlanStatus] | None = None) -> TreatmentPlanStatus:
     """One active plan row -> the wire model. Shared by the single-plan GET and the Excel
     export, so the two can never disagree — the guarantee the export used to buy by re-entering
     the GET per scenario, now held by construction instead of by N extra authorization+fetch
@@ -210,10 +231,10 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime) -> TreatmentP
     status, error_message, reason = _present_status(
         row["Status"], row["ErrorMessage"], row["UpdatedAt"], stale_cutoff, row["ErrorReason"])
 
-    plan = _normalize_plan_shape(_safe_json_dict(row["PlanJSON"], row["PlanID"]))
-    if plan is not None:
-        plan = {k: plan[k] for k in _VISIBLE_PLAN_KEYS if k in plan}
-    scenario_json = _safe_json_dict(row["ScenarioJSON"], row["PlanID"])
+    plan = _visible_plan(row["PlanJSON"], row["PlanID"])
+    # .get, not []: history rows (dal.superseded_plan_rows) carry no scenario/threat join —
+    # the scenario is version-independent, served once on the top-level object.
+    scenario_json = _safe_json_dict(row.get("ScenarioJSON"), row["PlanID"])
     scenario = ({k: scenario_json.get(k) for k in
                  ("scenario_title", "scenario_statement", "risk_statement")}
                 if scenario_json else None)
@@ -237,7 +258,7 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime) -> TreatmentP
         plan=plan,
         warnings=[w for w in validation.get("warnings") or [] if isinstance(w, str)],
         moderation_flagged=bool(moderation.get("flagged")),
-        error_message=error_message, reason=reason,
+        error_message=error_message, reason=reason, superseded=superseded,
         created_at=row["CreatedAt"], completed_at=row["CompletedAt"])
 
 
@@ -275,6 +296,17 @@ def _normalize_plan_shape(plan: dict | None) -> dict | None:
             "control_coverage": plan.get("control_coverage"),
             "controls": [c for c in cti if isinstance(c, dict)] if isinstance(cti, list) else [],
         }
+    return plan
+
+
+def _visible_plan(plan_json: str | None, plan_id: str) -> dict | None:
+    """Stored PlanJSON -> the served plan object: defensive parse, legacy-shape lift, then the
+    _VISIBLE_PLAN_KEYS trim. THE one projection — the poll GET (via _plan_status_from_row) and
+    the register's ?include_plan=true both serve exactly this, so the two views can never
+    disagree on what a plan looks like."""
+    plan = _normalize_plan_shape(_safe_json_dict(plan_json, plan_id))
+    if plan is not None:
+        plan = {k: plan[k] for k in _VISIBLE_PLAN_KEYS if k in plan}
     return plan
 
 
@@ -468,6 +500,11 @@ def list_entity_treatment_plans(entity_id: str,
                                                       "RUNNING plan counts as ERROR)."),
                                 review_status: TreatmentReviewStatus | None = Query(None),
                                 risk_level: RiskLevel | None = Query(None),
+                                include_plan: bool = Query(
+                                    False, description="Also return each plan's content — the "
+                                                       "same trimmed object as the single-plan "
+                                                       "GET. Null on rows with no generated "
+                                                       "content (RUNNING/ERROR)."),
                                 limit: int = Query(100, ge=1, le=500),
                                 offset: int = Query(0, ge=0),
                                 principal: Principal = Depends(get_principal)) -> TreatmentRegisterPage:
@@ -484,7 +521,8 @@ def list_entity_treatment_plans(entity_id: str,
         stale_cutoff = treatment._stale_cutoff()
         rows = dal.entity_plan_rows(sess, entity_id, stale_cutoff=stale_cutoff,
                                     status=status, review_status=review_status,
-                                    risk_level=risk_level, limit=limit, offset=offset)
+                                    risk_level=risk_level, include_plan=include_plan,
+                                    limit=limit, offset=offset)
         items = []
         for r in rows:
             st, err, reason = _present_status(r["Status"], r["ErrorMessage"], r["UpdatedAt"],
@@ -494,6 +532,7 @@ def list_entity_treatment_plans(entity_id: str,
                 asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
                 status=st, risk_level=r["RiskLevel"], review_status=r["ReviewStatus"],
                 reviewed_by=r["ReviewedBy"], error_message=err, reason=reason,
+                plan=_visible_plan(r["PlanJSON"], r["PlanID"]) if include_plan else None,
                 created_at=r["CreatedAt"], completed_at=r["CompletedAt"]))
     return TreatmentRegisterPage(entity_id=entity_id, limit=limit, offset=offset, plans=items)
 

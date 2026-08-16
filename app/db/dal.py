@@ -1965,21 +1965,26 @@ def session_plan_board(sess: Session, session_id: str) -> list[RowMapping]:
 
 def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
                     status: str | None = None, review_status: str | None = None,
-                    risk_level: str | None = None, limit: int = 100,
-                    offset: int = 0) -> list[RowMapping]:
+                    risk_level: str | None = None, include_plan: bool = False,
+                    limit: int = 100, offset: int = 0) -> list[RowMapping]:
     """Entity-wide remediation register: every active plan across the entity's sessions, newest
     first. Filters Scenario_Session.EntityID — the NOT NULL authz truth, never the nullable copy.
 
     `status` matches the PRESENTED status: a stale RUNNING row projects to ERROR at read time, so it
     must surface under status=ERROR and stay out of status=RUNNING. Branched in SQL, not
     post-filtered in Python, which would under-fill pages. ScenarioTitle comes from JSON_VALUE
-    server-side rather than hauling every multi-KB blob; malformed JSON yields NULL."""
+    server-side rather than hauling every multi-KB blob; malformed JSON yields NULL.
+    `include_plan` appends PlanJSON to the select — a deliberate, opt-in blob haul
+    (?include_plan=true), bounded by the page limit; off keeps today's byte-stable SQL."""
     p, ss, out = m.Risk_Treatment_Plan, m.Scenario_Session, m.Threat_Scenario_Output
-    stmt = (
-        select(p.PlanID, p.SessionID, p.OutputID, p.Status, p.RiskLevel, p.ReviewStatus,
+    cols = [p.PlanID, p.SessionID, p.OutputID, p.Status, p.RiskLevel, p.ReviewStatus,
             p.ReviewedBy, p.ReviewedAt, p.ErrorMessage, p.ErrorReason, p.CreatedAt, p.UpdatedAt,
             p.CompletedAt, ss.AssetName,
-            func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle"))
+            func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle")]
+    if include_plan:
+        cols.append(p.PlanJSON)
+    stmt = (
+        select(*cols)
         .select_from(p.__table__
             .join(ss, ss.SessionID == p.SessionID)
             .outerjoin(out, out.OutputID == p.OutputID))
@@ -2012,6 +2017,27 @@ def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[Ro
             p.ReviewedBy, p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
         .where(p.SessionID == session_id, p.OutputID == output_id)
         .order_by(p.CreatedAt)
+    ).mappings().all()
+
+
+def superseded_plan_rows(sess: Session, session_id: str, output_id: str) -> list[RowMapping]:
+    """The regeneration history behind the poll GET's ?include_superseded=true: every RETIRED
+    version of one scenario's plan, newest first. Plan-table columns only — deliberately no
+    scenario/threat joins: those hang off the OutputID and are identical for every version, the
+    caller already serves them once on the top-level (active) object, and re-hauling the same
+    multi-KB ScenarioJSON per history row would multiply the DB read and the response for zero
+    information (history rows therefore present scenario=null). InputSnapshotJSON stays excluded
+    too — tens of KB per version; that is the evidence endpoint's job."""
+    if not _valid_guid(output_id):
+        return []
+    p = m.Risk_Treatment_Plan
+    return sess.execute(
+        select(p.PlanID, p.SessionID, p.OutputID, p.Status, p.TreatmentStrategy,
+            p.RiskIdentificationDate, p.PlanJSON, p.ValidationJSON, p.ErrorMessage,
+            p.RiskLevel, p.ReviewStatus, p.ReviewComment, p.ReviewedBy, p.ReviewedAt,
+            p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
+        .where(p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 1)
+        .order_by(p.CreatedAt.desc(), p.PlanID)
     ).mappings().all()
 
 
