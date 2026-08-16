@@ -22,7 +22,7 @@ AI see and say*. In plain English:
 | Regenerate it (new version, old one kept) | the **same POST** again — there is no separate route | §3.1 |
 | Check whether the plan is ready, and read it | `GET /v1/sessions/{s}/scenarios/{o}/treatment-plan` | §3.2 |
 | See the current plan **and** every regenerated version | the same GET with `?include_superseded=true` | §3.2 |
-| List every scenario's plan in one session | `GET /v1/sessions/{s}/treatment-plans` (add `?include_plan=true` for full content) | §3.3 |
+| List every scenario's plan in one session | `GET /v1/sessions/{s}/treatment-plans` (`?include_plan=true` for full content, `?include_superseded=true` for regeneration history) | §3.3 |
 | Download the session's plans as an Excel file | `GET /v1/sessions/{s}/treatment-plans.xlsx` | §3.10 |
 | Stop a generation I started by mistake | `POST …/scenarios/{o}/treatment-plan/cancel` | §3.4 |
 | Approve or reject a finished plan | `POST …/scenarios/{o}/treatment-plan/review` | §3.5 |
@@ -706,11 +706,12 @@ the audit trail (§3.7); for a version's frozen AI input use evidence (§3.9).
 
 **Why it exists:** with 12 accepted scenarios the UI would otherwise fire 12 requests every poll cycle.
 
-**Request:** no body. One optional query param:
+**Request:** no body. Two optional query params:
 
 | Param | Default | Bounds | Note |
 |---|---|---|---|
 | `include_plan` | `false` | bool | Adds each row's `plan` content — see below. |
+| `include_superseded` | `false` | bool | Adds each row's `superseded` regeneration history — see below. |
 
 **Response 200:**
 
@@ -740,6 +741,19 @@ curl -s "http://127.0.0.1:8000/v1/sessions/{S}/treatment-plans?include_plan=true
 Rows with no generated content (RUNNING, ERROR, never requested) keep `plan: null` even with
 the flag on. The per-scenario page stays §3.2; this flag serves a whole-session report or
 export in one call instead of one poll per plan (the entity-wide sibling is §3.6).
+
+**Regeneration history — `?include_superseded=true`.** Adds `superseded` to every row: each
+scenario's replaced plan versions, newest first — **the same entries §3.2's
+`?include_superseded=true` serves**, rendered by the same presenter (full plan content, own
+status and review verdict per version; `scenario` is null on history entries — the title is on
+the row). `null` when not requested, `[]` for a plan never regenerated. One session-wide query
+serves every row's history — not one query per scenario. Combine both flags for the complete
+session document:
+
+```bash
+curl -s "http://127.0.0.1:8000/v1/sessions/{S}/treatment-plans?include_plan=true&include_superseded=true" \
+  -H "X-API-Key: <API_KEY>" -H "X-User-Id: tester1" -H "X-Entity-Id: {E}" -H "X-Tenant-Id: DESC"
+```
 
 **Tables:** reads `Threat_Scenario_Output` LEFT JOIN `Risk_Treatment_Plan`, plus `Scenario_Session`.
 

@@ -142,7 +142,7 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         outputs = sess.execute(
             select(m.Threat_Scenario_Output.OutputID, m.Threat_Scenario_Output.ScenarioJSON)
             .where(m.Threat_Scenario_Output.SessionID == sid,
-                m.Threat_Scenario_Output.Superseded == 0,
+                dal.active(m.Threat_Scenario_Output.Superseded),
                 m.Threat_Scenario_Output.Status == ScenarioStatus.complete,
                 m.Threat_Scenario_Output.ControlsMappedAt.is_(None),
                 ~already_mapped.exists())

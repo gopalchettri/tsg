@@ -416,7 +416,7 @@ def _ensure_threat_data_still_active(sess: Session, session_id: str, good_subs: 
         select(m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatCatalogueID)
         .where(
             m.Identified_Threat.SessionID == session_id,
-            m.Identified_Threat.Superseded == 0,
+            dal.active(m.Identified_Threat.Superseded),
             m.Identified_Threat.SubsystemID.in_(good_subs),
         )
     ).all()
@@ -657,9 +657,9 @@ def _promotion_candidates(sess: Session, sid: str, good_subs: list[int]) -> list
     scenario_accepted = (
         select(1)
         .where(st.SessionID == sid, st.ThreatID == m.Identified_Threat.ThreatID,
-            st.Superseded == 0,
+            dal.active(st.Superseded),
             out.SessionID == sid, out.ScopedThreatID == st.ScopedThreatID,
-            out.Superseded == 0, out.Accepted == 1)
+            dal.active(out.Superseded), out.Accepted == 1)
         .exists()
     )
     return sess.execute(
@@ -669,7 +669,7 @@ def _promotion_candidates(sess: Session, sid: str, good_subs: list[int]) -> list
             m.Identified_Threat.ThreatActorsJSON, m.Identified_Threat.ThreatTypeID,
             m.Identified_Threat.ThreatCatalogueID)
         .where(m.Identified_Threat.SessionID == sid,
-            m.Identified_Threat.Superseded == 0,
+            dal.active(m.Identified_Threat.Superseded),
             m.Identified_Threat.SubsystemID.in_(good_subs),
             or_(m.Identified_Threat.GroundingScore.is_(None),
                 m.Identified_Threat.GroundingScore < get_settings().library_promotion_threshold),

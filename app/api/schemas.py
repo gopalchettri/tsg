@@ -2147,6 +2147,14 @@ class TreatmentBoardRow(BaseModel):
         description="The plan's content — the same trimmed object as TreatmentPlanStatus.plan. "
                     "Populated only with ?include_plan=true; null when not requested, and null "
                     "on rows with no generated content (RUNNING/ERROR or never requested).")
+    superseded: list[TreatmentPlanStatus] | None = Field(
+        default=None,
+        description="Regeneration history — every replaced version of this scenario's plan, "
+                    "newest first, the same entries the single-plan GET serves under "
+                    "?include_superseded=true (full plan content, own status/review verdict; "
+                    "scenario=null — read the title from this row). Populated only with "
+                    "?include_superseded=true: null when not requested, [] when requested "
+                    "and never regenerated.")
     created_at: datetime | None = Field(default=None)
     completed_at: datetime | None = Field(default=None)
 

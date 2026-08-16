@@ -27,7 +27,6 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.enums import (
     RetryOutcome,
-    SessionStatus,
     SSEEventType,
     StageStatus,
     SubsystemLevel,
@@ -135,7 +134,7 @@ def _find_abandoned_sessions(sess: Session, _now: datetime, proven_dead: set[str
                 .where(ss.SessionID == m.Scenario_Session.SessionID, ss.LeaseExpiresAt > _now)
                 .exists())
     base = (select(m.Scenario_Session.SessionID, m.Scenario_Session.TenantID, m.Scenario_Session.EntityID)
-            .where(m.Scenario_Session.SessionStatus == SessionStatus.active,
+            .where(dal.session_active(),  # literal — only IX_Session_Active makes this sweep O(active)
                 m.Scenario_Session.CurrentStage != WorkflowStage.REVIEW,
                 ~live_lease))
     # The two abandonment branches run separately and dedupe by SessionID so `proven_dead` can be

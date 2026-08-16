@@ -371,7 +371,7 @@ def get_results(
             """Columns for this session, excluding rows a prior regeneration superseded.
             `extra` predicates narrow further."""
             return [dict(r) for r in sess.execute(
-                select(*cols).where(table.SessionID == sid, table.Superseded == 0, *extra)
+                select(*cols).where(table.SessionID == sid, dal.active(table.Superseded), *extra)
             ).mappings()]
 
         st, out, it = m.Scoped_Threat, m.Threat_Scenario_Output, m.Identified_Threat
@@ -388,13 +388,13 @@ def get_results(
                         # exist. This comment used to claim failed threats were excluded — the
                         # code never did that, and the claim was the drift, not the behaviour.
                         exists().where(st.ThreatID == it.ThreatID,
-                                    st.SessionID == sid, st.Superseded == 0,
+                                    st.SessionID == sid, dal.active(st.Superseded),
                                     out.ScopedThreatID == st.ScopedThreatID,
-                                    out.SessionID == sid, out.Superseded == 0))
+                                    out.SessionID == sid, dal.active(out.Superseded)))
         # One grouped round trip — never a join, which would fan out per variant row.
         scores = dal.threat_scores(sess, sid)
         scenarios = [dict(r) for r in sess.execute(
-            _scenario_select().where(out.SessionID == sid, out.Superseded == 0)
+            _scenario_select().where(out.SessionID == sid, dal.active(out.Superseded))
         ).mappings()]
         # Only needed to fetch and order the retired bodies, so a polled /results issues no
         # ancestry query at all — however deep the session's regeneration history runs.

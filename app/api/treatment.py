@@ -369,16 +369,30 @@ def get_treatment_board(session_id: str,
                                                "GET. Null on rows with no generated "
                                                "content (RUNNING/ERROR or never "
                                                "requested)."),
+                        include_superseded: bool = Query(
+                            False, description="Also return each scenario's regeneration "
+                                               "history under `superseded` — every replaced "
+                                               "version, newest first, rendered like the "
+                                               "single-plan GET's history entries."),
                         principal: Principal = Depends(get_principal)) -> TreatmentBoard:
     """The session plan board — every ACCEPTED scenario's plan state in one call (replaces N
     per-scenario polls). Null plan fields = never requested (UI shows Generate).
-    ?include_plan=true adds each COMPLETE plan's content, same projection as the register."""
+    ?include_plan=true adds each COMPLETE plan's content, same projection as the register;
+    ?include_superseded=true adds each scenario's regeneration history, same entries as the
+    single-plan GET's (one session-wide query, not one per scenario)."""
     with db_session() as sess:
         get_authorized_session(sess, session_id, principal)
         rows = dal.session_plan_board(sess, session_id, include_plan=include_plan)
         # ONE cutoff for the whole board, not one per row (see _present_status) — a board with
         # several plans must not judge the last row against a later instant than the first.
         stale_cutoff = treatment._stale_cutoff()
+        # Whole-session history in ONE round trip, bucketed by scenario — the query's global
+        # newest-first order keeps every bucket newest-first.
+        history: dict[str, list[TreatmentPlanStatus]] = {}
+        if include_superseded:
+            for h in dal.superseded_plan_rows(sess, session_id):
+                history.setdefault(h["OutputID"], []).append(
+                    _plan_status_from_row(h, stale_cutoff))
         plans = []
         for r in rows:
             # All three default to None together: a scenario with no plan yet leaves every one
@@ -399,6 +413,11 @@ def get_treatment_board(session_id: str,
                 # flag the row carries no PlanJSON key at all).
                 plan=(_visible_plan(r["PlanJSON"], r["PlanID"])
                       if include_plan and r["PlanID"] is not None else None),
+                # Same READ-COMMITTED guard as the single GET: a regeneration committing
+                # between the two SELECTs must not list one PlanID as both current and history.
+                superseded=([e for e in history.get(r["OutputID"], [])
+                             if e.plan_id != r["PlanID"]]
+                            if include_superseded else None),
                 created_at=r["PlanCreatedAt"], completed_at=r["PlanCompletedAt"]))
     return TreatmentBoard(session_id=session_id, accepted_scenarios=len(rows), plans=plans)
 

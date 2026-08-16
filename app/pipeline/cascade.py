@@ -234,7 +234,7 @@ def _regen_replacements(sess: Session, sid: str, subsystem_id: int, epoch: int) 
     return [{"old": str(old) if old else None, "new": str(new)} for new, old in sess.execute(
         select(out.OutputID, out.ReplacesOutputID).where(
             out.SessionID == sid, out.SubsystemID == subsystem_id,
-            out.Superseded == 0, out.GenerationEpoch == epoch)
+            dal.active(out.Superseded), out.GenerationEpoch == epoch)
     ).all()]
 
 def _publish_regen_result_after_commit(sess: Session, sid: str, subsystem_id: int,

@@ -625,6 +625,14 @@ CREATE UNIQUE INDEX UX_TreatmentPlan_ActiveOutput ON Risk_Treatment_Plan(OutputI
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_TreatmentPlan_SessionActive' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
 CREATE INDEX IX_TreatmentPlan_SessionActive ON Risk_Treatment_Plan(SessionID) WHERE Superseded = 0;
 
+-- Regeneration-history reads (?include_superseded=true on the single-plan GET and the session
+-- board). The two indexes above are filtered Superseded = 0 and serve no Superseded = 1
+-- predicate, so without this every history read scans the whole plan table — a cost that grows
+-- with every plan ever generated, tenant-wide. Seeks by SessionID (board form) or
+-- SessionID+OutputID (single-plan form); CreatedAt keyed for the newest-first ORDER BY.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_TreatmentPlan_SessionHistory' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
+CREATE INDEX IX_TreatmentPlan_SessionHistory ON Risk_Treatment_Plan(SessionID, OutputID, CreatedAt) WHERE Superseded = 1;
+
 -- ============================================================
 -- SECTION 4 — Threat-library guard indexes now live in Threat_library.sql.
 -- ============================================================

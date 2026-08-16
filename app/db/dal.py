@@ -15,6 +15,7 @@ from sqlalchemy import (
     Executable,
     RowMapping,
     and_,
+    bindparam,
     case,
     exists,
     func,
@@ -274,7 +275,7 @@ def create_session(sess: Session, values: Mapping[str, Any]) -> str:
             select(m.Scenario_Session.SessionID).where(
                 m.Scenario_Session.EntityID == values["EntityID"],
                 m.Scenario_Session.AssetID == values["AssetID"],
-                m.Scenario_Session.SessionStatus == SessionStatus.active,
+                session_active(),  # literal — the UX_Session_ActiveAsset seek needs it
             )
         ).scalar()
         if existing is None:
@@ -296,6 +297,33 @@ def _valid_guid(value: str) -> bool:
         return True
     except (ValueError, AttributeError, TypeError):
         return False
+
+
+def active(col) -> Any:
+    """`col = 0` rendered INLINE (literal_execute): SQL Server cannot match a parameterized
+    `Superseded = @P` against a `WHERE Superseded = 0` filtered index — the cached plan must hold
+    for every parameter value, so FORCESEEK errors 8622 on the bound form — and the scenario/threat/
+    plan tables have NO unfiltered session index to fall back to (their PKs are the GUID id
+    columns), so the bound form silently scans the whole table. The literal is a constant, so
+    statements still cache and reuse plans. Sibling of superseded_plan_rows' `hist` literal — same
+    fix, opposite constant. NOT needed where the row is already located by a PK/unfiltered seek
+    (PlanID/OutputID fences, threat_scores via IX_ScopedThreat_SessionActiveScores) — there
+    Superseded is a residual predicate and a plain bind is fine."""
+    return col == bindparam("act", 0, literal_execute=True)
+
+
+def session_active() -> Any:
+    """`SessionStatus = 'active'` rendered INLINE — the SessionStatus analog of `active()`: the
+    same cached-plan rule means a parameterized `SessionStatus = @P` can never match the filtered
+    UX_Session_ActiveAsset / IX_Session_Active indexes (FORCESEEK errors 8622 on the bound form),
+    so the bound form falls back to reading an UNFILTERED index over ALL sessions
+    (IX_Session_EntityUser INCLUDE (SessionStatus)) — wrong asymptotics, not wrong answers, so it
+    shows up as growth-proportional latency, never as a test failure. NOT needed where SessionID
+    (the PK) already locates the row and SessionStatus is a residual predicate: complete_session /
+    cancel_session, acquire_lock's EXISTS, tasks/sessions.py's REVIEW CAS updates. Also not
+    scenario_rows' dynamic status filter — a variable status can never match a filtered index."""
+    return m.Scenario_Session.SessionStatus == bindparam("st", SessionStatus.active.value,
+                                                        literal_execute=True)
 
 
 def load_session_board(sess: Session, session_id: str) -> RowMapping | None:
@@ -433,7 +461,7 @@ def count_active_sessions(sess: Session) -> int:
     soft backpressure ceiling, unlike the M4 per-asset lock, which is a correctness invariant."""
     return sess.execute(
         select(func.count()).select_from(m.Scenario_Session)
-        .where(m.Scenario_Session.SessionStatus == SessionStatus.active)
+        .where(session_active())
     ).scalar() or 0
 
 def count_active_sessions_for_entity(sess: Session, entity_id: str) -> int:
@@ -441,7 +469,7 @@ def count_active_sessions_for_entity(sess: Session, entity_id: str) -> int:
     does both counts in one round trip."""
     return sess.execute(
         select(func.count()).select_from(m.Scenario_Session)
-        .where(m.Scenario_Session.SessionStatus == SessionStatus.active,
+        .where(session_active(),
             m.Scenario_Session.EntityID == entity_id)
     ).scalar() or 0
 
@@ -457,7 +485,7 @@ def assert_capacity_available(sess: Session, entity_id: str | None = None) -> No
                 func.count(),
                 func.sum(case((m.Scenario_Session.EntityID == entity_id, 1), else_=0)),
             ).select_from(m.Scenario_Session)
-            .where(m.Scenario_Session.SessionStatus == SessionStatus.active)
+            .where(session_active())
         ).one()
         if global_cap and total >= global_cap:
             raise CapacityExceeded()
@@ -845,7 +873,7 @@ def active_threats(sess: Session, session_id: str, subsystem_id: int) -> list[di
                 m.Identified_Threat.ThreatActorsJSON).where(
                 m.Identified_Threat.SessionID == session_id,
                 m.Identified_Threat.SubsystemID == subsystem_id,
-                m.Identified_Threat.Superseded == 0,
+                active(m.Identified_Threat.Superseded),
             ).order_by(m.Identified_Threat.CreatedAt.desc(), m.Identified_Threat.ThreatID.desc())
         ).mappings()
     ]
@@ -874,7 +902,7 @@ def has_active_scenarios(sess: Session, session_id: str) -> bool:
     return sess.execute(
         select(1).select_from(m.Threat_Scenario_Output).where(
             m.Threat_Scenario_Output.SessionID == session_id,
-            m.Threat_Scenario_Output.Superseded == 0,
+            active(m.Threat_Scenario_Output.Superseded),
             # complete only: a FAILURE CARD (Status=error, null scenario) is retryable, not
             # reviewable; counting it would salvage a session that has nothing to review.
             m.Threat_Scenario_Output.Status == ScenarioStatus.complete,
@@ -893,7 +921,7 @@ def revive_errored_scenarios_to_review(sess: Session, session_id: str) -> int:
     active_subs = (
         select(m.Threat_Scenario_Output.SubsystemID)
         .where(m.Threat_Scenario_Output.SessionID == session_id,
-            m.Threat_Scenario_Output.Superseded == 0,
+            active(m.Threat_Scenario_Output.Superseded),
             # complete only — a subsystem holding nothing but failure cards has nothing to
             # review, so reviving its stage would break the very invariant this restores
             m.Threat_Scenario_Output.Status == ScenarioStatus.complete)
@@ -919,7 +947,7 @@ def subsystems_with_active_scenarios(sess: Session, session_id: str) -> set[int]
     return set(sess.execute(
         select(m.Threat_Scenario_Output.SubsystemID)
         .where(m.Threat_Scenario_Output.SessionID == session_id,
-            m.Threat_Scenario_Output.Superseded == 0,
+            active(m.Threat_Scenario_Output.Superseded),
             # complete only — accept-all's completeness check must not demand coverage of a
             # subsystem whose only active rows are unreviewable failure cards
             m.Threat_Scenario_Output.Status == ScenarioStatus.complete)
@@ -954,7 +982,7 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
         select(m.Threat_Scenario_Output.IdentityHash).where(
             m.Threat_Scenario_Output.SessionID == session_id,
             m.Threat_Scenario_Output.SubsystemID == subsystem_id,
-            m.Threat_Scenario_Output.Superseded == 0,
+            active(m.Threat_Scenario_Output.Superseded),
             # complete ONLY — the same contract threats_with_active_scenario states: a threat
             # whose only active row is a FAILURE CARD has NOT been served, and the next-set sweep
             # must treat it as unserved. Without this predicate a failed generation stamps a real
@@ -970,9 +998,9 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
         .select_from(it.__table__.join(
             st.__table__,
             and_(st.ThreatID == it.ThreatID, st.SessionID == session_id,
-                st.SubsystemID == subsystem_id, st.Superseded == 0),
+                st.SubsystemID == subsystem_id, active(st.Superseded)),
             isouter=True))
-        .where(it.SessionID == session_id, it.SubsystemID == subsystem_id, it.Superseded == 0,
+        .where(it.SessionID == session_id, it.SubsystemID == subsystem_id, active(it.Superseded),
             # A rejected active Scoped_Threat is re-servable ONLY if it was demoted by the top-N
             # cutoff — target-mode re-scoring will re-select it. A tech_gate / below-threshold /
             # duplicate rejection is PERMANENT (re-scoring fails the same way), so re-serving it
@@ -1012,7 +1040,7 @@ def active_identified_threat_identities(sess: Session, session_id: str, subsyste
             m.Identified_Threat.ThreatTypeID, m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName)
         .where(m.Identified_Threat.SessionID == session_id,
             m.Identified_Threat.SubsystemID == subsystem_id,
-            m.Identified_Threat.Superseded == 0)
+            active(m.Identified_Threat.Superseded))
     ).mappings():
         identities[identity_hash(session_id, subsystem_id, _row_to_dedup_info(r))] = r["ThreatID"]
     return identities
@@ -1079,7 +1107,7 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
             it.LibraryThreatType, it.LibraryThreatName, it.ThreatCategory, it.ThreatActorsJSON)
         .select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
-        .where(out.SessionID == session_id, out.Accepted == 1, out.Superseded == 0)
+        .where(out.SessionID == session_id, out.Accepted == 1, active(out.Superseded))
         .order_by(out.SubsystemID, out.OutputID)
     ).mappings()]
 
@@ -1125,7 +1153,7 @@ def scenario_rows(sess: Session, *, entity_ids: set[str], user_id: str | None = 
         out.Status == ScenarioStatus.complete,
     )
     if not include_superseded:
-        stmt = stmt.where(out.Superseded == 0)
+        stmt = stmt.where(active(out.Superseded))
     if user_id is not None:
         stmt = stmt.where(ss.UserID == user_id)
     if status == "accepted":
@@ -1162,7 +1190,8 @@ def mark_scenarios_accepted(
 
     Returns rows actually flipped, so the caller can tell "N requested, M<N matched" from a clean
     accept — otherwise a subset id naming a wrong/superseded row vanishes silently."""
-    where = [m.Threat_Scenario_Output.SessionID == session_id, m.Threat_Scenario_Output.Superseded == 0,
+    where = [m.Threat_Scenario_Output.SessionID == session_id,
+            active(m.Threat_Scenario_Output.Superseded),
             m.Threat_Scenario_Output.SubsystemID.in_(subsystem_ids),
             # complete only: a FAILURE CARD (null scenario) must never be marked Accepted — it
             # would reach downstream consumers as an accepted scenario with no content. A subset
@@ -1223,7 +1252,7 @@ def supersede(sess: Session, table, session_id: str, subsystem_id: int) -> None:
         .where(
             table.SessionID == session_id,
             table.SubsystemID == subsystem_id,
-            table.Superseded == 0,
+            active(table.Superseded),
         )
         .values(Superseded=1)
     )
@@ -1240,7 +1269,7 @@ def active_scoped_threat_ids(sess: Session, session_id: str, subsystem_id: int, 
             m.Scoped_Threat.SessionID == session_id,
             m.Scoped_Threat.SubsystemID == subsystem_id,
             m.Scoped_Threat.ThreatID.in_(threat_ids),
-            m.Scoped_Threat.Superseded == 0,
+            active(m.Scoped_Threat.Superseded),
         )
     ).scalars().all())
 
@@ -1263,7 +1292,7 @@ def threats_with_active_scenario(sess: Session, session_id: str, subsystem_id: i
         .select_from(st.__table__.join(out, out.ScopedThreatID == st.ScopedThreatID))
         .where(st.SessionID == session_id, st.SubsystemID == subsystem_id,
             st.ThreatID.in_(threat_ids),
-            out.SessionID == session_id, out.SubsystemID == subsystem_id, out.Superseded == 0,
+            out.SessionID == session_id, out.SubsystemID == subsystem_id, active(out.Superseded),
             # complete only: a threat whose only active row is a FAILURE CARD is NOT "done" — a
             # resumed attempt must retry it, and the next-set sweep must treat it as unserved
             out.Status == ScenarioStatus.complete)
@@ -1281,7 +1310,7 @@ def supersede_by_threats(sess: Session, table, session_id: str, subsystem_id: in
             table.SessionID == session_id,
             table.SubsystemID == subsystem_id,
             table.ThreatID.in_(threat_ids),
-            table.Superseded == 0,
+            active(table.Superseded),
         )
         .values(Superseded=1)
     )
@@ -1300,7 +1329,7 @@ def supersede_outputs_for_threats(sess: Session, session_id: str, subsystem_id: 
         m.Scoped_Threat.SessionID == session_id,
         m.Scoped_Threat.SubsystemID == subsystem_id,
         m.Scoped_Threat.ThreatID.in_(threat_ids),
-        m.Scoped_Threat.Superseded == 0,
+        active(m.Scoped_Threat.Superseded),
     )
     sess.execute(
         update(m.Threat_Scenario_Output)
@@ -1308,7 +1337,7 @@ def supersede_outputs_for_threats(sess: Session, session_id: str, subsystem_id: 
             m.Threat_Scenario_Output.SessionID == session_id,
             m.Threat_Scenario_Output.SubsystemID == subsystem_id,
             m.Threat_Scenario_Output.ScopedThreatID.in_(scoped),
-            m.Threat_Scenario_Output.Superseded == 0,
+            active(m.Threat_Scenario_Output.Superseded),
         )
         .values(Superseded=1)
     )
@@ -1339,7 +1368,7 @@ def supersede_by_scoped_threats(sess: Session, session_id: str, subsystem_id: in
             m.Threat_Scenario_Output.SessionID == session_id,
             m.Threat_Scenario_Output.SubsystemID == subsystem_id,
             m.Threat_Scenario_Output.ScopedThreatID.in_(scoped_threat_ids),
-            m.Threat_Scenario_Output.Superseded == 0,
+            active(m.Threat_Scenario_Output.Superseded),
         )
         .values(Superseded=1)
     )
@@ -1367,7 +1396,7 @@ def supersede_by_identity_hashes(sess: Session, session_id: str, subsystem_id: i
             m.Threat_Scenario_Output.SubsystemID == subsystem_id,
             m.Threat_Scenario_Output.IdentityHash.in_(identity_hashes),
             m.Threat_Scenario_Output.ScenarioNumber == scenario_number,
-            m.Threat_Scenario_Output.Superseded == 0,
+            active(m.Threat_Scenario_Output.Superseded),
         )
         .values(Superseded=1)
         .returning(m.Threat_Scenario_Output.OutputID, m.Threat_Scenario_Output.IdentityHash)
@@ -1472,7 +1501,7 @@ def active_scenario_rows(sess: Session, session_id: str, subsystem_id: int) -> l
         select(out.OutputID, out.IdentityHash, out.ScenarioNumber, out.Status,
             out.ScopedThreatID, out.ScenarioJSON)
         .where(out.SessionID == session_id, out.SubsystemID == subsystem_id,
-            out.Superseded == 0, out.IdentityHash.is_not(None))
+            active(out.Superseded), out.IdentityHash.is_not(None))
     ).all())
 
 
@@ -1830,7 +1859,7 @@ def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime)
     RUNNING row matches nothing, so the insert hits UX_TreatmentPlan_ActiveOutput → 409."""
     p = m.Risk_Treatment_Plan
     return execute_dml(sess, update(p).where(
-        p.OutputID == output_id, p.Superseded == 0,
+        p.OutputID == output_id, active(p.Superseded),
         or_(p.Status.in_([StageStatus.COMPLETE, StageStatus.ERROR]),
             and_(p.Status == StageStatus.RUNNING, p.UpdatedAt < stale_cutoff)),
     ).values(Superseded=1, UpdatedAt=now())).rowcount
@@ -1906,7 +1935,7 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
         .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID)
                     .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
-        .where(p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 0)
+        .where(p.SessionID == session_id, p.OutputID == output_id, active(p.Superseded))
     ).mappings().first()
 
 
@@ -1933,7 +1962,7 @@ def active_plan_rows(sess: Session, session_id: str) -> list[RowMapping]:
         .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID)
                     .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
-        .where(p.SessionID == session_id, p.Superseded == 0)
+        .where(p.SessionID == session_id, active(p.Superseded))
     ).mappings().all()
 
 
@@ -1969,8 +1998,8 @@ def session_plan_board(sess: Session, session_id: str, *,
     return sess.execute(
         select(*cols)
         .select_from(out.__table__.outerjoin(
-            p, and_(p.OutputID == out.OutputID, p.Superseded == 0)))
-        .where(out.SessionID == session_id, out.Accepted == 1, out.Superseded == 0)
+            p, and_(p.OutputID == out.OutputID, active(p.Superseded))))
+        .where(out.SessionID == session_id, out.Accepted == 1, active(out.Superseded))
         .order_by(out.CreatedAt, out.OutputID)
     ).mappings().all()
 
@@ -2012,7 +2041,7 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
     stmt = (
         select(*cols)
         .select_from(joined)
-        .where(ss.EntityID == entity_id, p.Superseded == 0))
+        .where(ss.EntityID == entity_id, active(p.Superseded)))
     if status == str(StageStatus.ERROR):
         stmt = stmt.where(or_(p.Status == StageStatus.ERROR,
                             and_(p.Status == StageStatus.RUNNING,
@@ -2044,9 +2073,14 @@ def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[Ro
     ).mappings().all()
 
 
-def superseded_plan_rows(sess: Session, session_id: str, output_id: str) -> list[RowMapping]:
+def superseded_plan_rows(sess: Session, session_id: str,
+                         output_id: str | None = None) -> list[RowMapping]:
     """The regeneration history behind the poll GET's ?include_superseded=true: every RETIRED
-    version of one scenario's plan, newest first. Plan-table columns only — deliberately no
+    version of one scenario's plan — or, with output_id=None, of the WHOLE session in one round
+    trip (the board's ?include_superseded=true; global newest-first order keeps each scenario's
+    group newest-first after the caller buckets by OutputID). Both forms seek
+    IX_TreatmentPlan_SessionHistory — the table's other two indexes are filtered Superseded = 0
+    and serve no history predicate (the sessions._ancestry trap). Plan-table columns only — deliberately no
     scenario/threat joins: those hang off the OutputID and are identical for every version, the
     caller already serves them once on the top-level (active) object, and re-hauling the same
     multi-KB ScenarioJSON per history row would multiply the DB read and the response for zero
@@ -2054,17 +2088,32 @@ def superseded_plan_rows(sess: Session, session_id: str, output_id: str) -> list
     too — tens of KB per version; that is the evidence endpoint's job. ValidationJSON and
     ReviewComment are excluded as well: they feed only wire-hidden (exclude=True) fields, so a
     blob per history row would buy nothing — the presenter reads them with .get."""
-    if not _valid_guid(output_id):
+    if output_id is not None and not _valid_guid(output_id):
         return []
     p = m.Risk_Treatment_Plan
-    return sess.execute(
+    stmt = (
         select(p.PlanID, p.SessionID, p.OutputID, p.Status, p.TreatmentStrategy,
             p.RiskIdentificationDate, p.PlanJSON, p.ErrorMessage,
             p.RiskLevel, p.ReviewStatus, p.ReviewedBy, p.ReviewedAt,
             p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
-        .where(p.SessionID == session_id, p.OutputID == output_id, p.Superseded == 1)
-        .order_by(p.CreatedAt.desc(), p.PlanID)
-    ).mappings().all()
+        # literal_execute renders `Superseded = 1` INLINE: SQL Server cannot match a
+        # parameterized predicate against the filtered IX_TreatmentPlan_SessionHistory (the
+        # cached plan must hold for every parameter value — FORCESEEK errors 8622 on the
+        # bound form), so `== 1` as a normal bind would silently scan the whole plan table.
+        # The ids stay bound — the literal is a constant, so plans still cache and reuse.
+        .where(p.SessionID == session_id,
+               p.Superseded == bindparam("hist", 1, literal_execute=True))
+        .order_by(p.CreatedAt.desc(), p.PlanID))
+    if output_id is not None:
+        stmt = stmt.where(p.OutputID == output_id)
+    else:
+        # Board form: gate on board-visible scenarios. A scenario superseded AFTER its plan was
+        # generated leaves retired plan rows no board row can attach to — without this PK-hop
+        # join their PlanJSON blobs would be hauled and rendered only to be thrown away.
+        out = m.Threat_Scenario_Output
+        stmt = (stmt.join(out, out.OutputID == p.OutputID)
+                    .where(out.Accepted == 1, out.Superseded == 0))
+    return sess.execute(stmt).mappings().all()
 
 
 def plan_row_by_id(sess: Session, session_id: str, output_id: str, plan_id: str) -> RowMapping | None:
