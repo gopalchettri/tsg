@@ -1,26 +1,42 @@
 -- ============================================================================
--- TSG_Core — creates/updates TSG's own tables. Safe to re-run any time: enables
--- RCSI once, adds any missing table/column/index, never touches row data.
+-- TSG_Core_UAT — upgrades an ALREADY-DEPLOYED UAT/PROD TSG database to the
+-- current schema. The body below is the current TSG_Core.sql, verbatim: every
+-- statement is guarded against the live catalog, so whatever this database is
+-- missing gets applied and everything already in place no-ops. Safe to re-run
+-- any time; never drops tables or columns; never touches row data beyond the
+-- two guarded fixups noted below.
 --
--- Threat-library master tables live in Threat_library.sql; Threat_Scenario_
--- Control_Map lives in Control_library.sql. Platform tables (ctm_scan_*,
--- onboarding_*) already exist elsewhere — TSG only reads them, never creates
--- or alters them (SDD §7.7). No FOREIGN KEYs, by design (SDD §7.7).
+-- On a UAT database that already has the TSG tables, this run will:
+--   * widen Risk_Treatment_Plan Status / TreatmentStrategy / RiskLevel /
+--     ReviewStatus to nvarchar(100), and ErrorReason to nvarchar(max)
+--   * create any table / column added since the last run (guarded CREATEs/ADDs)
+--   * create index IX_TreatmentPlan_SessionHistory (superseded-plan history)
+--   * DROP the retired index IX_Session_CompletedByAsset if present
+--   * fix up data: backfill Risk_Treatment_Plan.ErrorReason on legacy ERROR
+--     rows, and rename review verdict 'changes_requested' -> 'rejected'
+--   * on OLDER databases also: widen Scenario_Session.StageStatus and
+--     Subsystem_Stage_State.Status, rebuild UX_Scenario_ActiveIdentity to
+--     include ScenarioNumber, drop the legacy non-unique
+--     IX_SubsystemStageState_SessionSubLevel, and relax
+--     CrmRiskIdentificationID to nullable
 --
--- Uses GO batches: SQL Server must see a table created before a later batch
--- can reference it.
+-- SECTION 0 (RCSI) no-ops when RCSI is already ON (true of any working TSG
+-- database). If it is somehow OFF, enabling it forces every other session off
+-- the database — run in a quiet window.
 --
--- Keep in lockstep with models.py: a new column needs a CREATE TABLE entry
--- (fresh DB) AND a guarded ALTER below it (existing DB).
+-- HOW TO RUN: paste this WHOLE file into an SSMS query window connected to the
+-- TSG database and run (F5), then read the Messages pane top to bottom — an
+-- error there means that batch did not apply. CLI alternative:
+--   sqlcmd -b -I -S <server> -d <database> -E -i TSG_Core_UAT.sql
+-- (-b: exit non-zero on any SQL error. -I: QUOTED_IDENTIFIER ON, required by
+--  the filtered indexes. -E = Windows auth; use -U/-P where SQL logins apply.)
+-- AFTERWARDS: run TSG_Verify.sql — section 2 confirms indexes, section 3 the
+-- ALTER-added columns, section 4 the enum column widths.
 --
--- UAT/PROD: paste this WHOLE file into an SSMS query window connected to the TSG
--- database and run (F5), then read the Messages pane top to bottom — an error there
--- means that batch did not apply. CLI alternative:
---   sqlcmd -b -S <server> -d <database> -E -i TSG_Core.sql
--- (-b: exit non-zero on any SQL error instead of burying it mid-output and reporting
--- success. -E = Windows auth; use -U/-P where those environments use SQL logins.)
+-- KEEP IN LOCKSTEP with TSG_Core.sql: on the next schema change, regenerate
+-- this file (this header + verbatim TSG_Core.sql body). Re-running the
+-- canonical TSG_Core.sql itself is equivalent — it carries the same guards.
 -- ============================================================================
-
 SET QUOTED_IDENTIFIER ON;
 SET ANSI_NULLS ON;
 

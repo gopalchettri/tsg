@@ -445,9 +445,11 @@ If the worker beat you to it, expect `409 not_in_progress` — also correct.
 
 ### 3.1 POST `/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan`
 
-**When to use:** the user clicks *Generate plan* on an accepted scenario — and again for *Regenerate*.
-The same endpoint does both; there is no separate regenerate route, because a regeneration **is** a new
-version of the same thing.
+**When to use:** the user clicks *Generate plan* on an accepted scenario — the FIRST time only
+(2026-08-18 revision). If any plan already exists → `409 plan_already_exists`. *Regenerate* is its
+own route now: `POST .../treatment-plan/regenerate`, body `{"user_note": "..."}` (optional, the
+only field — register data is reused from the active version's frozen snapshot). Approving an
+older COMPLETE version via the review route's optional `plan_id` switches it back in atomically.
 
 **Why it returns 202, not the plan:** an LLM call takes tens of seconds. Holding an HTTP request open
 that long fails behind load balancers, so the work is queued and the GET is the observation point.
@@ -510,7 +512,9 @@ ORDER  BY p.CreatedAt DESC;
 ```
 
 **Failures:** `404` session/scenario unknown · `403` session outside your entities ·
-`409 scenario_superseded` · `409 scenario_not_accepted` · `409 generation_in_progress` · `422` bad body.
+`409 plan_already_exists` (a plan exists — use `/regenerate`) · `409 scenario_not_accepted` ·
+`409 generation_in_progress` · `422` bad body. (`scenario_superseded` is HISTORICAL — never raised
+since scenario acceptance was decoupled from recency.)
 
 ---
 
@@ -1152,8 +1156,10 @@ query. Self-check: `scripts/test_build_treatment_plans_workbook.py`.
 | # | Test | Expected |
 |---|---|---|
 | N1 | POST on a **non-accepted** scenario | `409` · `details.reason = scenario_not_accepted` |
-| N2 | POST on a **superseded** scenario | `409` · `scenario_superseded` |
-| N3 | Two POSTs back-to-back | 2nd → `409` · `generation_in_progress`, and only one row exists |
+| N2 | POST when **any plan already exists** | `409` · `plan_already_exists` (a superseded scenario is NOT a rejection anymore — an accepted-but-superseded version is a valid target) |
+| N3 | Two POSTs back-to-back | 2nd → `409` · `plan_already_exists` (simultaneous → the unique index arbitrates: `generation_in_progress`), and only one row exists |
+| N2b | `/regenerate` with no plan ever generated | `404` |
+| N2c | Review with historical `plan_id` + `decision=rejected` | `409` · `version_not_active` |
 | N4 | POST with `"likelihood_rating": 9` | `422` |
 | N5 | POST with `"risk_level": "critical"` (lowercase) | `422` — values are case-exact |
 | N6 | POST omitting `existing_controls` entirely | `422` — `[]` is legal, absent is not |

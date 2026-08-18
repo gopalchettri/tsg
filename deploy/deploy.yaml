@@ -1,0 +1,266 @@
+# TSG on OpenShift — api + worker + beat + Service.
+# Mirrors docker/compose.prod.yml (the documented deployment contract): entrypoint modules,
+# gevent pool, -c 50, grace periods, and both healthcheck recipes come from there.
+# Env comes from ONE Secret (deploy/secrets.yaml -> tsg-uat-env). No ConfigMap exists yet;
+# if you split non-secret tuning out later, add a configMapRef alongside the secretRef.
+#
+# NOTE on image tag: :latest + Always repulls on every pod start. Better: have CI push
+# immutable tags (git SHA) and set them here — then IfNotPresent is safe again.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tsg-api
+  namespace: ai-threatgen
+  labels:
+    app: tsg-api
+    component: fastapi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tsg-api
+      component: fastapi
+  template:
+    metadata:
+      labels:
+        app: tsg-api
+        component: fastapi
+    spec:
+      imagePullSecrets:
+        - name: quay-pull
+      containers:
+        - name: fastapi
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
+          imagePullPolicy: Always
+          # No `command:` — the image CMD (gunicorn) is the single source of truth, and the
+          # base image's container-entrypoint (arbitrary-UID handling) stays in place.
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: tsg-uat-env
+          # Boot runs the same posture/DB/litellm verification as the worker — allow up to
+          # 60s before liveness may kill the pod.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 5
+            failureThreshold: 12
+          # /health = process up, unconditional 200 (app/api/health.py).
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # /ready = DB + Redis (+ Mongo when used) actually reachable; workers advisory only.
+          # Checks run concurrently with their own timeouts (~5s worst case) — 8s covers it.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 8
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              # 2 gunicorn workers x (litellm + numpy) — 1Gi invites OOMKill; 1 CPU invites
+              # throttling. Watch real usage and tighten later.
+              cpu: "2"
+              memory: "2Gi"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker
+  namespace: ai-threatgen
+  labels:
+    app: tsg-api
+    component: celery
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: tsg-api
+      component: celery
+  template:
+    metadata:
+      labels:
+        app: tsg-api
+        component: celery
+    spec:
+      # compose stop_grace_period: 300s — covers one full LLM-call retry cycle on warm shutdown.
+      terminationGracePeriodSeconds: 300
+      imagePullSecrets:
+        - name: quay-pull
+      containers:
+        - name: celery-worker
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
+          imagePullPolicy: Always
+          # compose.prod.yml:54 verbatim. celery_worker = the REQUIRED patch-first entrypoint
+          # (gevent monkey-patch before other imports; prefork fail-fasts in _init_worker).
+          # -c 50 = gevent greenlets in ONE process, sized to IO-bound LLM/DB stages; with
+          # worker_prefetch_multiplier=1 (set in celery_app.py) it also caps reserved messages.
+          # No --queues (producers publish to the default "celery" queue), no time-limit /
+          # prefetch flags (celery_app.conf is the single source of truth), no
+          # --max-tasks-per-child (prefork-only, ignored by gevent).
+          command:
+            - celery
+            - -A
+            - app.pipeline.celery_worker.celery_app
+            - worker
+            - -P
+            - gevent
+            - -c
+            - "50"
+            - -l
+            - info
+          envFrom:
+            - secretRef:
+                name: tsg-uat-env
+          # _init_worker blocks the Consumer bootstep: DB verify, litellm verify, threshold
+          # warmup — routinely >30s (compose start_period: 240s). 12 x 30s = 360s allowance.
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - celery -A app.pipeline.celery_worker.celery_app inspect ping -d celery@$HOSTNAME
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 12
+          # -d celery@$HOSTNAME pings THIS worker over the broker — without it any live
+          # replica answering would mask a hung local one. Only succeeds if the gevent event
+          # loop is actually responsive, which is exactly the hang mode worth restarting.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - celery -A app.pipeline.celery_worker.celery_app inspect ping -d celery@$HOSTNAME
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              # gevent = ONE Python process: >1 core is mostly unusable (GIL). Memory sized
+              # for litellm_proxy providers (no local models loaded).
+              cpu: "1"
+              memory: "4Gi"
+            limits:
+              cpu: "2"
+              memory: "8Gi"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tsg-beat
+  namespace: ai-threatgen
+  labels:
+    app: tsg-api
+    component: beat
+spec:
+  replicas: 1
+  # Two concurrent beats double-fire every scheduled task — Recreate guarantees the old pod
+  # is gone before the new one starts. Never scale this above 1.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tsg-api
+      component: beat
+  template:
+    metadata:
+      labels:
+        app: tsg-api
+        component: beat
+    spec:
+      imagePullSecrets:
+        - name: quay-pull
+      containers:
+        - name: beat
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
+          imagePullPolicy: Always
+          # compose.prod.yml:100 verbatim — celery_app, NOT celery_worker: beat runs on plain
+          # asyncio and must never be monkey-patched (celery_app.py module docstring).
+          command:
+            - celery
+            - -A
+            - app.pipeline.celery_app.celery_app
+            - beat
+            - -l
+            - info
+          envFrom:
+            - secretRef:
+                name: tsg-uat-env
+          # compose.prod.yml:115 — beat has no ping; check the schedule file's mtime instead.
+          # Real sync cadence is ~180-240s (PersistentScheduler.sync_every), so 360s is the
+          # tightest honest threshold. Schedule file lands in /app (group-writable, ephemeral —
+          # fine: the schedule is interval-based, nothing to persist).
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - find /app -maxdepth 1 -name 'celerybeat-schedule*' -newermt '-360 seconds' | grep -q .
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tsg-api
+  namespace: ai-threatgen
+  labels:
+    app: tsg-api
+spec:
+  selector:
+    app: tsg-api
+    component: fastapi
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+
+# --- Route: uncomment if the API must be reachable from outside the cluster. If EYShield
+# --- calls it in-cluster, the Service above is enough and no Route should exist.
+# ---
+# apiVersion: route.openshift.io/v1
+# kind: Route
+# metadata:
+#   name: tsg-api
+#   namespace: ai-threatgen
+# spec:
+#   to:
+#     kind: Service
+#     name: tsg-api
+#   port:
+#     targetPort: http
+#   tls:
+#     termination: edge
+#     insecureEdgeTerminationPolicy: Redirect

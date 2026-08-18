@@ -5,6 +5,8 @@ __pycache__/
 .env
 .env*
 !.env*.example
+# Real UAT/prod credentials as k8s Secret manifests — never commit.
+deploy/secrets.yaml
 *.db
 .pytest_cache/
 .ruff_cache/

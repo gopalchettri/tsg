@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.enums import (
     RESERVABLE_REJECTIONS,
+    AcceptSubsetReason,
     ActorType,
     AuditEventType,
     CandidateStatus,
@@ -310,6 +311,24 @@ def active(col) -> Any:
     (PlanID/OutputID fences, threat_scores via IX_ScopedThreat_SessionActiveScores) — there
     Superseded is a residual predicate and a plain bind is fine."""
     return col == bindparam("act", 0, literal_execute=True)
+
+
+def accepted(col) -> Any:
+    """`Accepted = 1 AND IdentityHash IS NOT NULL` rendered INLINE — the Accepted analog of
+    `active()`, for the same cached-plan rule, against the filtered UX_Scenario_ActiveAccepted
+    index whose filter is exactly `WHERE Accepted = 1 AND IdentityHash IS NOT NULL`. BOTH
+    conjuncts are load-bearing: MSSQL matches a filtered index only when the query predicate
+    implies the WHOLE filter, so emitting `Accepted = 1` alone makes every call site ineligible
+    and (Threat_Scenario_Output having no unfiltered SessionID index) silently scans the table
+    on polled endpoints. Semantically safe: both scenario-row writers always stamp a sha256
+    IdentityHash (tasks.py's two row builders), so the extra conjunct excludes nothing real —
+    and hypothetical pre-IdentityHash legacy rows sit outside the one-accepted-version rule by
+    design (the index exempts them for SQL Server's NULLs-compare-equal semantics; accept's
+    pre-flight guard skips them the same way). Distinct bind key from active()'s: the two appear
+    together in one statement (e.g. session_plan_board), and one key can't carry two values.
+    Derives the IdentityHash column from `col`'s own table, so an aliased table stays correct."""
+    hash_col = col.class_.IdentityHash if hasattr(col, "class_") else col.table.c.IdentityHash
+    return and_(col == bindparam("acc", 1, literal_execute=True), hash_col.is_not(None))
 
 
 def session_active() -> Any:
@@ -1092,9 +1111,11 @@ def active_actor_names(sess: Session) -> list[str]:
 
 
 def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
-    """Accepted, non-superseded scenarios for one session, joined to their grounded threat so every
-    row carries the [R13] join ids. One ordered query; a completed session's rows are immutable, so
-    the joined tables need no Superseded filter.
+    """Accepted scenarios for one session, joined to their grounded threat so every row carries
+    the [R13] join ids. Accepted==1 alone — no Superseded filter: the accepted version may be an
+    older, superseded one (Accepted is the human's pick, decoupled from generation recency).
+    One ordered query; a completed session's rows are immutable, so the joined tables need no
+    Superseded filter either.
 
     OUTER, not INNER: with no enforced foreign keys the ScopedThreatID/ThreatID linkage isn't
     guaranteed, and accept flipped Accepted=1 regardless. INNER would silently drop an
@@ -1107,7 +1128,7 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
             it.LibraryThreatType, it.LibraryThreatName, it.ThreatCategory, it.ThreatActorsJSON)
         .select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
-        .where(out.SessionID == session_id, out.Accepted == 1, active(out.Superseded))
+        .where(out.SessionID == session_id, accepted(out.Accepted))
         .order_by(out.SubsystemID, out.OutputID)
     ).mappings()]
 
@@ -1152,12 +1173,15 @@ def scenario_rows(sess: Session, *, entity_ids: set[str], user_id: str | None = 
         ss.EntityID.in_({str(e) for e in entity_ids}),
         out.Status == ScenarioStatus.complete,
     )
-    if not include_superseded:
+    if not include_superseded and status != "accepted":
+        # status="accepted" skips the recency filter entirely: the accepted version may be an
+        # older, superseded one (Accepted is decoupled from Superseded), and hiding it here
+        # would silently drop a legitimately accepted scenario from the accepted listing.
         stmt = stmt.where(active(out.Superseded))
     if user_id is not None:
         stmt = stmt.where(ss.UserID == user_id)
     if status == "accepted":
-        stmt = stmt.where(out.Accepted == 1)
+        stmt = stmt.where(accepted(out.Accepted))
     elif status is not None:
         stmt = stmt.where(ss.SessionStatus == status)
     # ponytail: OFFSET paging is O(offset) on deep pages — fine at limit<=500 over per-entity
@@ -1182,16 +1206,22 @@ def scenario_row(sess: Session, session_id: str, output_id: str) -> RowMapping |
 def mark_scenarios_accepted(
     sess: Session, session_id: str, subsystem_ids: list[int], subset: list[str] | None = None,
 ) -> int:
-    """Accepted=1 on every non-superseded scenario for these subsystems (§5.7), optionally narrowed
+    """Accepted=1 on the chosen scenarios for these subsystems (§5.7), optionally narrowed
     to `subset` OutputIDs — `subset=[]` means "accept none", `subset=None` means "accept all".
+
+    Accepted is DECOUPLED from Superseded: an explicit subset may name ANY version of a
+    scenario, current or superseded — the human's pick, not generation recency, is what
+    Accepted records (UX_Scenario_ActiveAccepted enforces one accepted version per identity;
+    accept.py's pre-flight duplicate-identity guard rejects a subset naming two versions of
+    one scenario before this runs). Accept-all still means "the current version of everything"
+    and keeps the Superseded=0 predicate. This function never writes Superseded.
 
     Stamps `AcceptedSubsetJSON` only for a partial accept, so non-NULL means precisely "part of an
     explicit partial pick" and a reviewer needs no Scenario_Audit join.
 
     Returns rows actually flipped, so the caller can tell "N requested, M<N matched" from a clean
-    accept — otherwise a subset id naming a wrong/superseded row vanishes silently."""
+    accept — otherwise a subset id naming a wrong row vanishes silently."""
     where = [m.Threat_Scenario_Output.SessionID == session_id,
-            active(m.Threat_Scenario_Output.Superseded),
             m.Threat_Scenario_Output.SubsystemID.in_(subsystem_ids),
             # complete only: a FAILURE CARD (null scenario) must never be marked Accepted — it
             # would reach downstream consumers as an accepted scenario with no content. A subset
@@ -1199,6 +1229,8 @@ def mark_scenarios_accepted(
             m.Threat_Scenario_Output.Status == ScenarioStatus.complete]
     if subset is not None:
         where.append(m.Threat_Scenario_Output.OutputID.in_(subset))
+    else:
+        where.append(active(m.Threat_Scenario_Output.Superseded))
     accepted_subset_json = json.dumps(subset) if subset is not None else None
     res = execute_dml(sess, update(m.Threat_Scenario_Output).where(*where)
                     .values(Accepted=1, AcceptedSubsetJSON=accepted_subset_json))
@@ -1207,9 +1239,10 @@ def mark_scenarios_accepted(
 
 def unacceptable_subset_reasons(
     sess: Session, session_id: str, subset: list[str], subsystem_ids: list[int],
-) -> dict[str, str]:
-    """Why each requested OutputID could not be accepted — one code per id mark_scenarios_accepted
-    would reject, mirroring its four predicates. Accepted ids are absent.
+) -> dict[str, AcceptSubsetReason]:
+    """Why each requested OutputID could not be accepted — one AcceptSubsetReason per id
+    mark_scenarios_accepted would reject, mirroring its predicates. Accepted ids are absent.
+    No `superseded` reason: an explicitly named older version is a legitimate accept now.
 
     FAILURE-PATH ONLY: run it once the counts already disagree, since that request is about to 404
     and roll back anyway.
@@ -1219,21 +1252,32 @@ def unacceptable_subset_reasons(
     unauthenticated guess."""
     out = m.Threat_Scenario_Output
     rows = {str(r["OutputID"]): r for r in sess.execute(
-        select(out.OutputID, out.SubsystemID, out.Status, out.Superseded)
+        select(out.OutputID, out.SubsystemID, out.Status)
         .where(out.SessionID == session_id, out.OutputID.in_(subset))
     ).mappings()}
-    reasons: dict[str, str] = {}
+    reasons: dict[str, AcceptSubsetReason] = {}
     for oid in subset:
         row = rows.get(oid)
         if row is None:
-            reasons[oid] = "unknown"                      # absent here, or another session's
-        elif row["Superseded"]:
-            reasons[oid] = "superseded"                   # an older version; regen replaced it
+            reasons[oid] = AcceptSubsetReason.unknown     # absent here, or another session's
         elif row["Status"] != ScenarioStatus.complete:
-            reasons[oid] = "failure_card"                 # no content, must never be accepted
+            reasons[oid] = AcceptSubsetReason.failure_card  # no content, must never be accepted
         elif row["SubsystemID"] not in subsystem_ids:
-            reasons[oid] = "subsystem_not_awaiting_decision"
+            reasons[oid] = AcceptSubsetReason.subsystem_not_awaiting_decision
     return reasons
+
+
+def scenario_identity_pairs(sess: Session, session_id: str, output_ids: list[str]) -> dict[str, tuple[str | None, int]]:
+    """OutputID -> (IdentityHash, ScenarioNumber) for accept.py's pre-flight duplicate-identity
+    guard: a subset naming two versions of ONE scenario must be rejected BEFORE any write —
+    after mark_scenarios_accepted, the only thing left to catch it would be the
+    UX_Scenario_ActiveAccepted unique index surfacing as a raw IntegrityError.
+    Session-scoped for the same tenant-boundary reason as unacceptable_subset_reasons."""
+    out = m.Threat_Scenario_Output
+    return {str(r["OutputID"]): (r["IdentityHash"], r["ScenarioNumber"]) for r in sess.execute(
+        select(out.OutputID, out.IdentityHash, out.ScenarioNumber)
+        .where(out.SessionID == session_id, out.OutputID.in_(output_ids))
+    ).mappings()}
 
 
 # ---------------------------------------------------------------------------
@@ -1853,16 +1897,63 @@ def link_catalogue_category(sess: Session, catalogue_id: int, category_id: int) 
 # acquire_lock refuses to run. Every conditional-UPDATE fence lives here; treatment.py and
 # api/treatment.py never build their own SQL.
 # ---------------------------------------------------------------------------
-def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime) -> int:
+def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime,
+                          plan_id: str | None = None) -> int:
     """Retire the scenario's active plan row so a new attempt can insert; returns rowcount. Matches
     only replaceable rows: finished, or a RUNNING claim stalled before `stale_cutoff`. A FRESH
-    RUNNING row matches nothing, so the insert hits UX_TreatmentPlan_ActiveOutput → 409."""
+    RUNNING row matches nothing, so the insert hits UX_TreatmentPlan_ActiveOutput → 409.
+
+    `plan_id` is a TOCTOU fence for callers that first READ the active row (regenerate carries its
+    snapshot; the review swap branches on it): the retire then targets exactly the row that was
+    read — a racing swap/regenerate that changed the active row in between misses the CAS
+    (rowcount 0 → the caller 409s) instead of retiring, and acting on, the wrong version."""
+    p = m.Risk_Treatment_Plan
+    where = [p.OutputID == output_id, active(p.Superseded),
+             or_(p.Status.in_([StageStatus.COMPLETE, StageStatus.ERROR]),
+                 and_(p.Status == StageStatus.RUNNING, p.UpdatedAt < stale_cutoff))]
+    if plan_id is not None:
+        where.append(p.PlanID == plan_id)
+    return execute_dml(sess, update(p).where(*where)
+                       .values(Superseded=1, UpdatedAt=now())).rowcount
+
+
+def active_plan_baseline(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
+    """Regenerate's one-read baseline: the ACTIVE row's id, the two column stamps the new
+    version copies, and the frozen snapshot — exactly the four fields needed, in ONE query.
+    Replaces the active_plan_row + plan_row_by_id pair, which hauled the scenario/threat joins
+    and ValidationJSON this path never uses."""
+    if not _valid_guid(output_id):
+        return None
+    p = m.Risk_Treatment_Plan
+    return sess.execute(
+        select(p.PlanID, p.RiskLevel, p.RiskIdentificationDate, p.InputSnapshotJSON)
+        .where(p.SessionID == session_id, p.OutputID == output_id, active(p.Superseded))
+    ).mappings().first()
+
+
+def plan_version_exists(sess: Session, session_id: str, output_id: str, plan_id: str) -> bool:
+    """Tenant-fenced existence probe for the review swap's 404 — a bare SELECT of the PK,
+    because plan_row_by_id would haul InputSnapshotJSON (tens of KB) for a pure `is None` test."""
+    if not (_valid_guid(output_id) and _valid_guid(plan_id)):
+        return False
+    p = m.Risk_Treatment_Plan
+    return sess.execute(select(p.PlanID).where(
+        p.PlanID == plan_id, p.SessionID == session_id, p.OutputID == output_id)).first() is not None
+
+
+def reactivate_plan_version(sess: Session, session_id: str, output_id: str, plan_id: str) -> bool:
+    """Make a historical COMPLETE plan version the active one; True iff exactly this row flipped.
+    CAS-fenced on (Superseded=1, COMPLETE): a non-COMPLETE historical row must never come back —
+    a reactivated RUNNING row would be zombie-claimable via claim_plan's stale branch. The
+    session/output predicates keep a foreign plan id a no-op (caller 404s), not a leak. The caller
+    MUST have retired the current active row in the SAME transaction first (supersede_active_plan
+    with its plan_id fence) and must roll everything back unless BOTH rowcounts are 1 — this pair
+    is the only writer that could otherwise leave a scenario with zero active plan rows."""
     p = m.Risk_Treatment_Plan
     return execute_dml(sess, update(p).where(
-        p.OutputID == output_id, active(p.Superseded),
-        or_(p.Status.in_([StageStatus.COMPLETE, StageStatus.ERROR]),
-            and_(p.Status == StageStatus.RUNNING, p.UpdatedAt < stale_cutoff)),
-    ).values(Superseded=1, UpdatedAt=now())).rowcount
+        p.PlanID == plan_id, p.SessionID == session_id, p.OutputID == output_id,
+        p.Superseded == 1, p.Status == StageStatus.COMPLETE,
+    ).values(Superseded=0, UpdatedAt=now())).rowcount == 1
 
 
 def claim_plan(sess: Session, plan_id: str, task_id: str, stale_cutoff: datetime) -> bool:
@@ -1981,10 +2072,10 @@ def review_plan(sess: Session, plan_id: str, *, status: str, comment: str | None
 
 def session_plan_board(sess: Session, session_id: str, *,
                        include_plan: bool = False) -> list[RowMapping]:
-    """One row per accepted, active scenario of the session, LEFT-joined to its active plan (NULL
-    plan columns = never requested). Excludes PlanJSON by default — the board is a glance, the
-    single-plan GET is the document; `include_plan` appends it, the same opt-in blob haul as
-    entity_plan_rows. The scenario title comes from JSON_VALUE server-side (entity_plan_rows
+    """One row per accepted scenario of the session (whichever version was accepted — possibly a
+    superseded one), LEFT-joined to its active plan (NULL plan columns = never requested).
+    Excludes PlanJSON by default — the board is a glance, the single-plan GET is the document;
+    `include_plan` appends it, the same opt-in blob haul as entity_plan_rows. The scenario title comes from JSON_VALUE server-side (entity_plan_rows
     precedent) — the board is polled, and hauling every multi-KB ScenarioJSON per cycle to keep
     one short string was the query's whole IO cost."""
     out, p = m.Threat_Scenario_Output, m.Risk_Treatment_Plan
@@ -1999,7 +2090,8 @@ def session_plan_board(sess: Session, session_id: str, *,
         select(*cols)
         .select_from(out.__table__.outerjoin(
             p, and_(p.OutputID == out.OutputID, active(p.Superseded))))
-        .where(out.SessionID == session_id, out.Accepted == 1, active(out.Superseded))
+        # Accepted alone — the accepted version may be superseded (decoupled flags).
+        .where(out.SessionID == session_id, accepted(out.Accepted))
         .order_by(out.CreatedAt, out.OutputID)
     ).mappings().all()
 
@@ -2111,8 +2203,9 @@ def superseded_plan_rows(sess: Session, session_id: str,
         # generated leaves retired plan rows no board row can attach to — without this PK-hop
         # join their PlanJSON blobs would be hauled and rendered only to be thrown away.
         out = m.Threat_Scenario_Output
+        # Accepted alone — board visibility follows acceptance, not generation recency.
         stmt = (stmt.join(out, out.OutputID == p.OutputID)
-                    .where(out.Accepted == 1, out.Superseded == 0))
+                    .where(accepted(out.Accepted)))
     return sess.execute(stmt).mappings().all()
 
 
@@ -2132,7 +2225,8 @@ def plan_row_by_id(sess: Session, session_id: str, output_id: str, plan_id: str)
 #: The treatment-plan lifecycle events. A tuple, not a set — byte-stable SQL for the plan cache.
 _TREATMENT_EVENTS = (
     AuditEventType.treatment_plan_requested, AuditEventType.treatment_plan_outcome,
-    AuditEventType.treatment_plan_cancelled, AuditEventType.treatment_plan_reviewed)
+    AuditEventType.treatment_plan_cancelled, AuditEventType.treatment_plan_reviewed,
+    AuditEventType.treatment_plan_version_restored)
 
 
 def treatment_audit_rows(sess: Session, session_id: str) -> list[RowMapping]:

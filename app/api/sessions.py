@@ -13,7 +13,7 @@ from typing import Literal, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import exists, select, update
+from sqlalchemy import exists, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
@@ -393,9 +393,21 @@ def get_results(
                                     out.SessionID == sid, dal.active(out.Superseded)))
         # One grouped round trip — never a join, which would fan out per variant row.
         scores = dal.threat_scores(sess, sid)
+        threats_by_id = {t["ThreatID"]: t for t in threats}
+        # Current rows PLUS the accepted one: the accepted version may be superseded
+        # (Accepted is decoupled from generation recency), and the default view must never
+        # hide the very row the reviewer accepted. TWO statements, not one OR: this table's
+        # only SessionID-leading indexes are all filtered (Superseded=0 / Accepted=1), an OR
+        # implies neither filter, and _ancestry's docstring already outlaws the resulting
+        # full-scan on a polled endpoint. Each half seeks its own filtered index; the second
+        # is a near-free zero-row seek until an accept happens.
         scenarios = [dict(r) for r in sess.execute(
             _scenario_select().where(out.SessionID == sid, dal.active(out.Superseded))
         ).mappings()]
+        seen_output_ids = {s["OutputID"] for s in scenarios}
+        scenarios += [dict(r) for r in sess.execute(
+            _scenario_select().where(out.SessionID == sid, dal.accepted(out.Accepted))
+        ).mappings() if r["OutputID"] not in seen_output_ids]
         # Only needed to fetch and order the retired bodies, so a polled /results issues no
         # ancestry query at all — however deep the session's regeneration history runs.
         chains = _ancestry(sess, sid, scenarios) if include_replaced else {}
@@ -408,6 +420,19 @@ def get_results(
                 replaced = [dict(r) for r in sess.execute(
                     _scenario_select().where(out.OutputID.in_(wanted), out.SessionID == sid)
                 ).mappings()]
+        # Response invariant: threats[] must cover every ThreatID a returned card carries — a
+        # card must never "reference a threat this same response says does not exist" (the
+        # threats query's own comment). The accepted card may reference a threat the active-work
+        # exists above no longer matches (e.g. its scoped/output chain was fully superseded
+        # after the accepted version was generated), so backfill those by PK. Zero extra
+        # queries in the common case (the set is empty).
+        missing_tids = {s["ThreatID"] for s in scenarios if s["ThreatID"]} - set(threats_by_id)
+        if missing_tids:
+            threats += [dict(r) for r in sess.execute(
+                select(it.ThreatID, it.ThreatType, it.ThreatName, it.GroundingStatus,
+                       it.ThreatCatalogueID, it.ThreatActorsJSON, it.GroundingScore)
+                .where(it.SessionID == sid, it.ThreatID.in_(missing_tids))
+            ).mappings()]
         controls = _controls_by_output(sess, [s["OutputID"] for s in scenarios]
                                             + [r["OutputID"] for r in replaced])
         by_id = {r["OutputID"]: r for r in replaced}
@@ -942,7 +967,9 @@ _EVENT_STREAM_RESPONSES: dict[int | str, dict] = {
                     "that worker process for a cooldown window, so a backstop poll is the recovery "
                     "path. `treatment_plan_result` is weaker still: plan state is NOT carried by "
                     "the `reconcile` event, and three outcomes never publish at all (dead worker, "
-                    "LLM-capacity autoretry, cancel/review) — recover with "
+                    "LLM-capacity autoretry, cancel or a plain review verdict) — though an "
+                    "approve that switches the active plan version DOES publish one after its "
+                    "commit — recover with "
                     "GET /v1/sessions/{session_id}/treatment-plans and keep a slow poll. "
                     "Full field-by-field shapes and recovery paths: "
                     "docs/SSE_SESSION_PROGRESS_CONTRACT_GUIDE.md.",

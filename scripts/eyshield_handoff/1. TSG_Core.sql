@@ -379,7 +379,7 @@ CREATE TABLE Threat_Candidate_Review (
 );
 
 -- Speeds up the curator queue's "list pending" read. Non-unique: names can legitimately recur.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_Session_Status')
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_Session_Status' AND object_id = OBJECT_ID('dbo.Threat_Candidate_Review'))
     CREATE INDEX IX_ThreatCandidateReview_Session_Status
         ON Threat_Candidate_Review (SessionID, Status);
 
@@ -390,7 +390,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_
 -- and SQL Server can't match a filtered index against a parameterized predicate (same reasoning
 -- IX_ScopedThreat_SessionActiveScores below documents) — Status leads as a plain key column
 -- instead, with CreatedAt trailing so the ORDER BY is satisfied by the same seek, no extra sort.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_Status_Created')
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_Status_Created' AND object_id = OBJECT_ID('dbo.Threat_Candidate_Review'))
     CREATE INDEX IX_ThreatCandidateReview_Status_Created
         ON Threat_Candidate_Review (Status, CreatedAt);
 
@@ -432,15 +432,20 @@ CREATE TABLE Risk_Treatment_Plan (
 );
 GO
 
--- Adds review/register columns for pre-2026-08-06 databases.
+-- Adds review/register columns for pre-2026-08-06 databases. Guarded PER COLUMN, not on
+-- RiskLevel alone: an abort between the ALTERs (lock timeout, killed session) must not let
+-- the re-run see RiskLevel present and skip the rest — ReviewComment/ReviewedBy/ReviewedAt
+-- are in no TSG_Verify width check, so that miss would be permanent and silent.
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'RiskLevel') IS NULL
-BEGIN
     ALTER TABLE Risk_Treatment_Plan ADD RiskLevel nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'ReviewStatus') IS NULL
     ALTER TABLE Risk_Treatment_Plan ADD ReviewStatus nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'ReviewComment') IS NULL
     ALTER TABLE Risk_Treatment_Plan ADD ReviewComment nvarchar(max) NULL;
+IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'ReviewedBy') IS NULL
     ALTER TABLE Risk_Treatment_Plan ADD ReviewedBy nvarchar(200) NULL;
+IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'ReviewedAt') IS NULL
     ALTER TABLE Risk_Treatment_Plan ADD ReviewedAt datetime2 NULL;
-END
 GO
 
 -- Widen ReviewStatus on PRE-EXISTING databases (fresh installs get nvarchar(100) from the
@@ -513,11 +518,15 @@ GO
 -- (the ErrorReason IS NULL predicate means a re-run touches nothing) and it is the LAST legitimate
 -- read of these message literals — after this the reason code carries the meaning, not the English.
 -- 'timed_out' is absent by construction: it is a read-time projection and is never stored.
+-- The enqueue match is a LIKE on the ASCII prefix, NOT the full stored literal: that message
+-- contains an em dash, and legacy sqlcmd reads a BOM-less UTF-8 file in the ANSI codepage,
+-- mangling the dash client-side — an equality match would then silently fall to the catch-all
+-- (and the ErrorReason IS NULL guard would make that misfile permanent).
 IF COL_LENGTH('dbo.Risk_Treatment_Plan', 'ErrorReason') IS NOT NULL
     UPDATE Risk_Treatment_Plan
     SET    ErrorReason = CASE
                WHEN ErrorMessage = N'cancelled by user' THEN N'cancelled'
-               WHEN ErrorMessage = N'failed to queue generation — request it again' THEN N'enqueue_failed'
+               WHEN ErrorMessage LIKE N'failed to queue generation%' THEN N'enqueue_failed'
                ELSE N'generation_failed'   -- the historical catch-all for everything else
            END
     WHERE  Status = 'ERROR' AND ErrorReason IS NULL;
@@ -569,6 +578,15 @@ IF EXISTS (SELECT 1 FROM sys.indexes i
     DROP INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output;
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveIdentity' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
 CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output(SessionID, IdentityHash, ScenarioNumber) WHERE Superseded = 0;
+
+-- One ACCEPTED scenario per (session, threat identity, ScenarioNumber). Accepted is decoupled
+-- from Superseded (a reviewer may accept an older, superseded version), so the active-identity
+-- index above no longer implies this rule — the database, not app code, is the arbiter.
+-- IdentityHash IS NOT NULL: a NULL hash means identity unknown (pre-IdentityHash legacy rows) —
+-- unknown identities are distinct scenarios, and SQL Server's NULLs-compare-equal unique
+-- semantics would falsely collide two of them; those rows are covered by accept's app guard only.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveAccepted' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
+CREATE UNIQUE INDEX UX_Scenario_ActiveAccepted ON Threat_Scenario_Output(SessionID, IdentityHash, ScenarioNumber) WHERE Accepted = 1 AND IdentityHash IS NOT NULL;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
 CREATE INDEX IX_PromptLog_Session ON Prompt_Log(SessionID, SubsystemID);
@@ -708,7 +726,8 @@ GO
 -- Verify
 SELECT 'RCSI' AS what, CAST(is_read_committed_snapshot_on AS int) AS ok FROM sys.databases WHERE database_id = DB_ID()
 UNION ALL
-SELECT TABLE_NAME, 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME IN (
-    'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Scoped_Threat',
-    'Threat_Scenario_Output','Threat_Library_Import_Run','Scenario_Audit','Prompt_Log',
-    'Threat_Candidate_Review','Risk_Treatment_Plan','API_Client');
+SELECT TABLE_NAME, 1 FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME IN (
+    'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Identified_Duplicate_Threat',
+    'Scoped_Threat','Threat_Scenario_Output','Threat_Library_Import_Run','Scenario_Audit',
+    'Prompt_Log','Threat_Candidate_Review','Risk_Treatment_Plan','Config_Tuning','API_Client');

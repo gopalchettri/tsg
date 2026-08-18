@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.core import tuning
 from app.core.config import get_settings
 from app.core.enums import (
+    AcceptSubsetReason,
     ActorType,
     AuditDecision,
     AuditEventType,
@@ -59,12 +60,15 @@ class AcceptConflict(Exception):
 #: carries every one — this only stops a 50-id request producing an unreadable sentence.
 
 #: Sentence fragments, so "<id> <text>" reads as plain English. No internal vocabulary:
-#: "OutputID", "subset" and "superseded" mean nothing to whoever is reading the response.
+#: "OutputID" and "subset" mean nothing to whoever is reading the response. Keyed on
+#: AcceptSubsetReason (the one typed vocabulary for these codes) — a test pins every member
+#: to an entry here. No `superseded` entry: naming an older version is a legitimate accept now.
 _REASON_TEXT = {
-    "superseded": "is an older version that a regeneration replaced",
-    "failure_card": "failed to generate, so it has no content to accept",
-    "subsystem_not_awaiting_decision": "is not ready for review yet",
-    "unknown": "is not a scenario in this session",
+    AcceptSubsetReason.failure_card: "failed to generate, so it has no content to accept",
+    AcceptSubsetReason.subsystem_not_awaiting_decision: "is not ready for review yet",
+    AcceptSubsetReason.unknown: "is not a scenario in this session",
+    AcceptSubsetReason.duplicate_identity: ("names the same scenario as another selected id — "
+                                            "accept only one version of each scenario"),
 }
 
 
@@ -90,6 +94,29 @@ def _unacceptable_subset(sess: Session, session_id: str, subset: list[str],
 
 class MasterInactive(Exception):
     """A grounded master id was deactivated since Stage 2 → block accept ([R6])."""
+
+
+def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: list[str]) -> None:
+    """Pre-flight duplicate-identity guard, BEFORE any write: with Accepted decoupled from
+    Superseded, a subset naming two versions of ONE scenario has no natural collision left to
+    stop it — both rows would flip Accepted=1 and only the UX_Scenario_ActiveAccepted unique
+    index would object, as a raw IntegrityError mid-transaction. Reject it here, cleanly, with
+    a typed reason instead. `subset` must already be canonicalized (the caller's own rule)."""
+    pairs = dal.scenario_identity_pairs(sess, session_id, subset)
+    seen_identity: dict[tuple, str] = {}
+    for oid in dict.fromkeys(subset):  # preserve order, collapse repeats of the SAME id
+        pair = pairs.get(oid)
+        if pair is None or pair[0] is None:
+            continue  # unknown ids get their 404 later; a NULL-hash row has no version twin
+        if pair in seen_identity:
+            # Message body comes from _REASON_TEXT so this reason has ONE wording source,
+            # same "<id> <text>" shape as the 404's per-id fragments.
+            raise AcceptConflict(
+                f"Nothing was accepted. {oid} "
+                f"{_REASON_TEXT[AcceptSubsetReason.duplicate_identity]} "
+                f"(the other selected version: {seen_identity[pair]}).",
+                reason=AcceptSubsetReason.duplicate_identity)
+        seen_identity[pair] = oid
 
 
 def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str | None,
@@ -146,6 +173,7 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             # what AcceptedSubsetJSON / the audit DetailJSON persist, so those stay joinable to
             # the OutputIDs the API actually returns.
             subset = [dal.canonical_guid(s) for s in subset]
+            _assert_one_version_per_scenario(sess, session_id, subset)
         # subset=None means "accept all"
         matched = dal.mark_scenarios_accepted(sess, session_id, good_subs, subset=subset)
         if subset is not None:
@@ -657,9 +685,13 @@ def _promotion_candidates(sess: Session, sid: str, good_subs: list[int]) -> list
     scenario_accepted = (
         select(1)
         .where(st.SessionID == sid, st.ThreatID == m.Identified_Threat.ThreatID,
-            dal.active(st.Superseded),
             out.SessionID == sid, out.ScopedThreatID == st.ScopedThreatID,
-            dal.active(out.Superseded), out.Accepted == 1)
+            # Accepted alone, and NO Superseded filter on EITHER hop: an accepted older
+            # version's ScopedThreatID always points at a SUPERSEDED scoped row (regen
+            # supersedes the scoped row and mints a new ScopedThreatID for the replacement,
+            # tasks.py), so requiring st or out active here silently starves promotion of
+            # that threat. The outer query still requires the Identified_Threat itself active.
+            dal.accepted(out.Accepted))
         .exists()
     )
     return sess.execute(

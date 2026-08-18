@@ -192,6 +192,11 @@ class AuditEventType(StrEnum):
     treatment_plan_outcome = "treatment_plan_outcome"      # one plan attempt finished; {plan_id, status}; system
     treatment_plan_cancelled = "treatment_plan_cancelled"  # {plan_id}; ActorType=user
     treatment_plan_reviewed = "treatment_plan_reviewed"    # {plan_id, decision, comment?}; ActorType=user
+    treatment_plan_version_restored = "treatment_plan_version_restored"  # approve-swap made a historical
+                                                           # version active; {plan_id: restored id,
+                                                           # retired_plan_id, output_id}; ActorType=user.
+                                                           # plan_id key REQUIRED — the per-scenario trail
+                                                           # filters on it (api/treatment.py)
 
 
 class AuditDecision(StrEnum):
@@ -253,9 +258,10 @@ class SSEEventType(StrEnum):
                                                     # no subsystem_id (plans are per-scenario) and no
                                                     # error_message (the refetch carries it). A refetch HINT,
                                                     # never a completion contract: a dead worker, an
-                                                    # LLMSlotUnavailable autoretry, and cancel/review (written
-                                                    # in the API process) never publish, so a client must keep
-                                                    # a slow backstop poll
+                                                    # LLMSlotUnavailable autoretry, and cancel plus a plain
+                                                    # review verdict never publish (an approve that SWITCHES
+                                                    # the active version does, post-commit, from the API
+                                                    # process), so a client must keep a slow backstop poll
     heartbeat = "heartbeat"                            # keep-alive so proxies don't drop an idle SSE connection
     embedding_job_update = "embedding_job_update"      # ADMIN-scope: one embeddings job's state change on its
                                                     # own job channel — payload carries job_id + a
@@ -345,6 +351,23 @@ class ReviewGateReason(StrEnum):
     generation_in_progress = "generation_in_progress"    # transient: not at the REVIEW barrier yet
 
 
+class AcceptSubsetReason(StrEnum):
+    """Why one OutputID in a partial-accept subset could not be accepted. The first three are
+    per-id codes inside the accept 404's `details.unacceptable` (produced by
+    dal.unacceptable_subset_reasons); `duplicate_identity` instead rides the accept 409's
+    `details.reason`, raised pre-flight by accept.py::_assert_one_version_per_scenario —
+    ClickOutcomeReason-style, one vocabulary across two channels. All are worded for humans
+    by accept.py::_REASON_TEXT (a test pins the two in step). Formerly bare string literals,
+    contrary to this module's one-source-of-truth rule.
+
+    No `superseded` member: since Accepted was decoupled from Superseded, naming an older
+    version is a legitimate accept, not a rejection cause."""
+    unknown = "unknown"                                                # not a scenario in this session
+    failure_card = "failure_card"                                      # generation failed; no content to accept
+    subsystem_not_awaiting_decision = "subsystem_not_awaiting_decision"  # its stage isn't at the review barrier
+    duplicate_identity = "duplicate_identity"                          # subset names 2+ versions of ONE scenario
+
+
 class TreatmentGateReason(StrEnum):
     """Why a treatment-plan request is refused — HTTP 409 `details.reason` (see
     docs/RISK_TREATMENT_PLAN_SDD.md §5.3). Separate from ReviewGateReason because treatment runs
@@ -353,10 +376,14 @@ class TreatmentGateReason(StrEnum):
     `generation_in_progress` deliberately shares its value with the ReviewGateReason member —
     same meaning, different route family; clients may switch on the string either way."""
     scenario_not_accepted = "scenario_not_accepted"      # only accepted scenarios get treatment plans
-    scenario_superseded = "scenario_superseded"          # target scenario was replaced by a regeneration
+    scenario_superseded = "scenario_superseded"          # HISTORICAL, never raised since Accepted was
+                                                         # decoupled from Superseded; kept for wire-compat
     generation_in_progress = "generation_in_progress"    # a fresh RUNNING plan row exists for this scenario
     not_in_progress = "not_in_progress"                  # cancel refused: no RUNNING generation to stop
     not_complete = "not_complete"                        # review refused: only a COMPLETE plan can be adopted
+    plan_already_exists = "plan_already_exists"          # create refused: a plan exists — use /regenerate
+    version_not_active = "version_not_active"            # reject refused: target is a history version,
+                                                         # already not the plan — rejecting it is meaningless
 
 
 # --- Risk Treatment Plan vocabularies (docs/RISK_TREATMENT_PLAN_SDD.md) -------------------

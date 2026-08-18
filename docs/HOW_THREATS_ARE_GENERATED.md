@@ -530,9 +530,10 @@ treatment — `GET /v1/sessions/{id}/treatment-plans`. That is why the durable w
 signal. It fires only when the worker's finish CAS actually rewrote the row, so three outcomes are
 silent: a dead worker (the row stays RUNNING and only the GET's read-time projection calls it timed
 out — there is no reaper), an `LLMSlotUnavailable` autoretry (which bumps the progress clock every
-attempt, so the row never even goes stale), and cancel/review (written in the API process, not the
-worker). A client keeps a slow backstop poll and matches on `output_id` — a regeneration mints a new
-`plan_id`.
+attempt, so the row never even goes stale), and cancel plus a plain review verdict (written in the
+API process, not the worker). One API-side action DOES publish: an approve that switches the active
+plan version (review with a historical `plan_id`) emits this event after its commit. A client keeps
+a slow backstop poll and matches on `output_id` — a regeneration mints a new `plan_id`.
 
 **Step 28 — Regenerate specific scenarios.** `POST .../regenerate/scenarios` with 1–50 `output_id`s.
 It targets **exact scenario rows, never threat ids** — because a threat can own two scenarios, so
@@ -1035,7 +1036,11 @@ never blocking), then overwrites the server-owned keys — `treatment_plan`,
 `controls_to_be_implemented` (derived), and the register echoes incl. `risk_owner`, which the
 model never sees — so the stored plan carries the toolkit's nine output columns split
 AI/derived/echo, and lands `COMPLETE` — or a client-safe `ERROR`. The GET on the same path is
-the poll endpoint. Re-POST = regenerate (old row `Superseded=1`, history kept). Deliberately
+the poll endpoint. Later versions come from `POST .../treatment-plan/regenerate` (body: just an
+optional `user_note`; register data reused from the active version's snapshot; old row
+`Superseded=1`, history kept) — re-POSTing the create route now 409s `plan_already_exists`.
+Approving a historical COMPLETE version via the review route's optional `plan_id` switches it
+back in atomically. Deliberately
 NO stage rows, locks, leases or epochs: `dal.acquire_lock` refuses completed sessions by
 design, so the plan row's own `Status` column plus the filtered unique index
 `UX_TreatmentPlan_ActiveOutput` carry all the concurrency safety (claim CAS for Celery

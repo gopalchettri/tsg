@@ -95,6 +95,20 @@ def _canonical_output_ids(v: list[str] | None) -> list[str] | None:
     return out
 
 
+def _canonical_guid_or_none(v: str | None) -> str | None:
+    """Scalar sibling of _canonical_output_ids — same trust-boundary rule for single-id fields
+    (TreatmentReviewBody.plan_id): MSSQL returns uppercase GUIDs, dal.guid() stores lowercase,
+    Python compares case-sensitively — an un-canonicalized id would silently flip a branch
+    decision (e.g. 'is this the active plan version?'). Malformed input dies here as a clean
+    422, never a driver-level 500."""
+    if v is None:
+        return None
+    try:
+        return canonical_guid(v)
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(f"not a valid GUID: {v!r}") from None
+
+
 class CreateSessionBody(BaseModel):
     """Ids only — asset/subsystem/sector descriptive context is resolved server-side,
     authoritatively, from the DB (`app.pipeline.context.gather_asset_details`), never
@@ -173,7 +187,13 @@ class AcceptBody(BaseModel):
     )
     output_ids: list[str] | None = Field(
         default=None,
-        description=f"Output ids to accept. Required (non-empty, max {_MAX_BATCH}) when mode='subset'; must be omitted otherwise.",
+        description=(
+            f"Output ids to accept. Required (non-empty, max {_MAX_BATCH}) when mode='subset'; "
+            "must be omitted otherwise. An id may name ANY version of a scenario — including an "
+            "older one that a regeneration replaced (see replaced_scenarios in GET /results"
+            "?include_replaced=true); the named version becomes the accepted one. Naming two "
+            "versions of the same scenario is rejected (409, reason 'duplicate_identity')."
+        ),
     )
 
     _canonicalize_output_ids = field_validator("output_ids")(_canonical_output_ids)
@@ -751,7 +771,11 @@ class ScenarioResult(BaseModel):
             "text and the controls it had mapped, so a reviewer can compare against the version "
             "that superseded it. The list is FLAT — the whole history is here and these entries' "
             "own `replaced_scenarios` are always empty, so never recurse. len() is how many "
-            "times this scenario has been regenerated: 2 entries means it is version 3."
+            "times this scenario has been regenerated: 2 entries means it is version 3. "
+            "NOT disjoint from the top-level cards: an accepted-but-superseded version appears "
+            "BOTH as its own top-level card (flagged accepted) and inside its successor's "
+            "history — the history is complete, deliberately; dedupe by output_id if rendering "
+            "both."
         ),
     )
 
@@ -970,8 +994,10 @@ class TreatmentPlanResultEvent(BaseModel):
     contract. It is published only when the worker's finish CAS actually rewrote the row, so three
     outcomes never emit one — a dead worker (the row stays RUNNING and only the GET's read-time
     projection calls it timed out; there is no reaper), an LLMSlotUnavailable autoretry (which
-    keeps bumping the progress clock, so the row never even goes stale), and cancel/review (written
-    in the API process, not the worker). A publish failure additionally silences every event in
+    keeps bumping the progress clock, so the row never even goes stale), and cancel plus a plain
+    review verdict (written in the API process, not the worker). One API-side action DOES emit it:
+    an approve that switches the active plan version publishes after its commit, so a watching
+    client refetches the swapped-in plan. A publish failure additionally silences every event in
     that worker process for a cooldown window. **A client MUST therefore keep a slow backstop poll**
     — this event only makes the common case feel instant.
 
@@ -1152,10 +1178,10 @@ class AcceptedScenario(BaseModel):
 
 
 class AcceptedScenariosResponse(BaseModel):
-    """The accepted, non-superseded scenarios for one session, identified solely by the
-    session_id in the URL path. asset_id and entity_id are read off that session (not
-    separate inputs) and returned here so a caller with only a session_id can still learn
-    which asset/entity it belongs to."""
+    """The accepted scenarios for one session (whichever version was accepted — possibly one
+    a regeneration superseded), identified solely by the session_id in the URL path. asset_id
+    and entity_id are read off that session (not separate inputs) and returned here so a
+    caller with only a session_id can still learn which asset/entity it belongs to."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
@@ -1177,7 +1203,7 @@ class AcceptedScenariosResponse(BaseModel):
         description="UTC timestamp the session was completed. Null if the session hasn't completed yet "
                     "(scenarios == [] in that case, since acceptance only happens at completion)."
     )
-    scenarios: list[AcceptedScenario] = Field(description="Accepted, non-superseded scenarios for this session.")
+    scenarios: list[AcceptedScenario] = Field(description="Accepted scenarios for this session (whichever version was accepted — possibly one a regeneration superseded).")
 
 
 #: ScenarioListItem's example — the shared AcceptedScenario example plus the cross-session
@@ -1977,9 +2003,10 @@ class TreatmentPlanBody(BaseModel):
         description="Free-text justification for the Yes/No above (redacted before reaching the AI).")
     user_note: str | None = Field(
         default=None, max_length=1000,
-        description=("Steering for a regenerate — e.g. 'vendor owns the network; prefer "
-                     "host-level controls'. Redacted, then shown to the AI as reviewer_note "
-                     "(prompt RULE 6). Omit on a first generation unless you want to steer it."))
+        description=("Optional steering for the first generation — e.g. 'vendor owns the "
+                     "network; prefer host-level controls'. Redacted, then shown to the AI as "
+                     "reviewer_note (prompt RULE 6). Later versions are steered via "
+                     "POST .../treatment-plan/regenerate's own user_note."))
 
     @field_validator("existing_controls")
     @classmethod
@@ -1997,6 +2024,22 @@ class TreatmentPlanBody(BaseModel):
         if v is None or v.tzinfo is None:
             return v
         return v.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+class TreatmentPlanRegenerateBody(BaseModel):
+    """POST .../treatment-plan/regenerate — mint a new plan version. ONLY the note travels:
+    the register risk data was frozen into the active version's InputSnapshotJSON at first
+    generation and is reused from there (the client never resends it; changed register data
+    cannot be resubmitted after first generation — a documented limitation of this shape).
+    The baseline is the ACTIVE version — the one a human last chose — never simply the
+    newest, so regenerating after a version switch builds on the switched-to plan."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "user_note": "focus on database encryption; vendor owns the network"}})
+    user_note: str | None = Field(
+        default=None, max_length=1000,
+        description=("Optional steering for this regeneration — replaces the previous "
+                     "version's note entirely (omit for none). Redacted, then shown to the "
+                     "AI as reviewer_note."))
 
 
 class TreatmentPlanAccepted(BaseModel):
@@ -2189,6 +2232,23 @@ class TreatmentReviewBody(BaseModel):
         "decision": "approved", "comment": "A3 timeline extended per operations."}})
     decision: TreatmentReviewStatus = Field(description="approved | rejected.")
     comment: str | None = Field(default=None, max_length=2000, description="Optional reviewer comment.")
+    plan_id: str | None = Field(
+        default=None,
+        description=(
+            "Which plan version the decision targets. Omit (or pass the active version's id) to "
+            "review the current plan — today's behavior. Pass a HISTORICAL version's plan_id "
+            "(from GET .../treatment-plan?include_superseded=true) with decision='approved' to "
+            "make that version the current plan AND approve it, atomically — approving an older "
+            "version IS choosing it. Only COMPLETE versions can be adopted (409 not_complete "
+            "otherwise); rejecting a historical version is refused (409 version_not_active); a "
+            "running regeneration blocks the switch (409 generation_in_progress). Last human "
+            "decision wins: a later approval of another version displaces the operative plan; "
+            "the displaced version keeps its own verdict in history and every switch is audited. "
+            "Note: the entity register lists plans by original creation date, so a switched-to "
+            "older version keeps its original position, not the top."
+        ))
+
+    _canonicalize_plan_id = field_validator("plan_id")(_canonical_guid_or_none)
 
 
 class TreatmentReviewResponse(BaseModel):
@@ -2250,7 +2310,7 @@ class TreatmentAuditEvent(BaseModel):
     """One entry in a treatment-plan audit trail. `detail` is the event's DetailJSON verbatim
     (plan_id, status, decision, note… depending on the event type)."""
     at: datetime | None = Field(default=None, description="When it happened (UTC).")
-    event: str = Field(description="requested | outcome | cancelled | reviewed | superseded.")
+    event: str = Field(description="requested | outcome | cancelled | reviewed | version restored | superseded.")
     actor: str | None = Field(default=None, description="The person (null on system events).")
     actor_type: str | None = Field(default=None, description="user | system.")
     session_id: str | None = Field(default=None, description="Present on the entity-wide feed.")

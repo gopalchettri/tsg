@@ -160,6 +160,39 @@ def _loads(blob: str | None, default):
     return parsed if isinstance(parsed, type(default)) else default
 
 
+def regen_risk_input_from_snapshot(snapshot: dict[str, Any], user_note: str | None) -> dict[str, Any]:
+    """The regenerate route's register half: rebuild the `risk_input` dict from the ACTIVE plan's
+    frozen InputSnapshotJSON, so `/regenerate` needs only a user_note and build_treatment_input
+    stays the ONE snapshot recipe (fresh TSG-derived half every time — honors a restored scenario
+    version).
+
+    Reverse-maps exactly the register-sourced keys, named exhaustively because the
+    `existing_controls` block MIXES register data with TSG-derived data (scenario_suggested/
+    library_mapped/_count must be rebuilt fresh, never carried): `register_controls`,
+    `applied_to_all_subsystems`, `applied_to_all_subsystems_justification`, the whole
+    `risk_assessment` block, and the echo-only `register` block. Carried values are already
+    clipped/redacted; build_treatment_input re-applies both, which is idempotent, so the stored
+    bytes survive the round trip. `reviewer_note` is NOT carried — the new note replaces it
+    (None → key absent → no note), which is the whole point of a steered regenerate."""
+    controls = snapshot.get("existing_controls") or {}
+    assessment = snapshot.get("risk_assessment") or {}
+    register = snapshot.get("register") or {}
+    return {
+        "existing_controls": controls.get("register_controls") or [],
+        "existing_controls_all_subsystems": controls.get("applied_to_all_subsystems"),
+        "existing_controls_all_subsystems_justification":
+            controls.get("applied_to_all_subsystems_justification"),
+        "likelihood_rating": assessment.get("likelihood_rating"),
+        "impact_rating": assessment.get("impact_rating"),
+        "final_risk_rating": assessment.get("final_risk_rating"),
+        "risk_level": assessment.get("risk_level"),
+        "impacted_business_division": assessment.get("impacted_business_division"),
+        "risk_identification_date": register.get("risk_identification_date"),
+        "risk_owner": register.get("risk_owner"),
+        "user_note": user_note,
+    }
+
+
 def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
                           risk_input: dict[str, Any]) -> dict[str, Any]:
     """The frozen LLM context (SDD §7.2), persisted verbatim as InputSnapshotJSON.
@@ -449,9 +482,12 @@ def _publish_plan_result(row, plan_id: str, status: StageStatus,
     A HINT, not a completion contract. Only a winning finish CAS publishes, so three outcomes are
     silent: a dead worker (row stays RUNNING; only the GET's read-time projection calls it timed
     out, and there is no reaper to fire one later), an LLMSlotUnavailable autoretry (which bumps
-    the progress clock every attempt, so the row never even goes stale), and cancel/review (written
-    in the API process). A publish failure additionally silences this whole worker process for a
-    cooldown window. Clients MUST keep a slow backstop poll."""
+    the progress clock every attempt, so the row never even goes stale), and cancel plus a plain
+    review verdict (written in the API process). One API-side action DOES publish: an approve that
+    switches the active version (review with a historical plan_id) emits this same event shape
+    after its commit, so watching clients refetch the swapped-in plan. A publish failure
+    additionally silences this whole worker process for a cooldown window. Clients MUST keep a
+    slow backstop poll."""
     bus.publish(row["SessionID"], _plan_result_event(row, plan_id, status, reason))
 
 
@@ -506,7 +542,7 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
         })
         if not dal.finish_plan(sess, plan_id, status=StageStatus.COMPLETE, task_id=task_id,
                                plan_json=json.dumps(parsed), validation_json=validation_json):
-            # Superseded mid-flight (a re-POST took over) — drop the result; the new row owns
+            # Superseded mid-flight (a regenerate/version-switch took over) — drop the result; the new row owns
             # the scenario now. Prompt_Log still records the spend (committed in _ask_ai).
             sess.rollback()
             log.info("treatment.finish_dropped", plan_id=plan_id)
@@ -527,7 +563,7 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
         sess.rollback()  # discards only post-_ask_ai work; the Prompt_Log commit already landed
         reason, client_msg = _classify_failure(exc)
         # Fenced like the success path: if the CAS matched nothing (another delivery already
-        # finished the row, or a re-POST superseded it), writing an ERROR audit row would
+        # finished the row, or a regenerate superseded it), writing an ERROR audit row would
         # contradict the plan's real state — drop it instead.
         if dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=task_id,
                            error_message=client_msg, error_reason=reason):

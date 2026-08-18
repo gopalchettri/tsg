@@ -29,6 +29,10 @@ REQUIRED_INDEXES = [
     # duplicate "current" rows from a retried or racing request.
     ("UX_Session_ActiveAsset", "Scenario_Session", ("EntityID", "AssetID")),
     ("UX_Scenario_ActiveIdentity", "Threat_Scenario_Output", ("SessionID", "IdentityHash", "ScenarioNumber")),
+    # One ACCEPTED version per scenario identity. Accepted is decoupled from Superseded (an
+    # older, superseded version may be the accepted one), so the active-identity index above
+    # no longer implies this — filtered WHERE Accepted = 1.
+    ("UX_Scenario_ActiveAccepted", "Threat_Scenario_Output", ("SessionID", "IdentityHash", "ScenarioNumber")),
     # Master-library natural keys — makes concurrent promote-on-accept safe: two sessions
     # accepting at once can't both create the same library master.
     ("UX_ThreatType_NaturalKey", "Threat_Type", ("ThreatTypeName", "ThreatCategoryID", "SectorID")),

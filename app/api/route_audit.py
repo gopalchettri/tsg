@@ -50,6 +50,7 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan"),
     ("GET", "/v1/sessions/{session_id}/treatment-plans"),
     ("GET", "/v1/sessions/{session_id}/treatment-plans.xlsx"),
+    ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/regenerate"),
     ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/cancel"),
     ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/review"),
     ("GET", "/v1/entities/{entity_id}/treatment-plans"),

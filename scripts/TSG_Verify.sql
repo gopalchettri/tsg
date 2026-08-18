@@ -34,7 +34,7 @@ CREATE TABLE #tsg_verify (
 );
 
 -- ---------------------------------------------------------------------------
--- 1. ALL 23 TSG TABLES EXIST
+-- 1. ALL 24 TSG TABLES EXIST
 -- ---------------------------------------------------------------------------
 DECLARE @tsg_tables TABLE (TableName sysname);
 INSERT INTO @tsg_tables (TableName) VALUES
@@ -44,6 +44,7 @@ INSERT INTO @tsg_tables (TableName) VALUES
     (N'Control_Library'),
     (N'Control_Library_Standard_Map'),
     (N'Control_Standard'),
+    (N'Identified_Duplicate_Threat'),
     (N'Identified_Threat'),
     (N'Prompt_Log'),
     (N'Risk_Treatment_Plan'),
@@ -70,7 +71,7 @@ FROM @tsg_tables t
 WHERE NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES i WHERE i.TABLE_NAME = t.TableName);
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Tables', 'PASS', N'All 23 TSG tables present', N'Nothing missing.'
+SELECT 'Tables', 'PASS', N'All 24 TSG tables present', N'Nothing missing.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Tables');
 
 -- ---------------------------------------------------------------------------

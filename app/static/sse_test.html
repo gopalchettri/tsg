@@ -262,6 +262,8 @@ $(function () {
   // ---- actions -------------------------------------------------------------------------------
   $("#board").on("click", ".gen", function () {
     const o = $(this).data("o");
+    // Create is FIRST-generation-only now; a plan_already_exists 409 means "use /regenerate"
+    // (which takes only an optional user_note — the register data is reused server-side).
     $.ajax({ url: base() + "/v1/sessions/" + sid() + "/scenarios/" + o + "/treatment-plan",
              method: "POST", headers: headers(), contentType: "application/json",
              data: JSON.stringify({ existing_controls: [], likelihood_rating: 2, impact_rating: 3,
@@ -270,7 +272,21 @@ $(function () {
         log("POST accepted — plan " + r.plan_id.slice(0, 8) + "... RUNNING", "log-ev");
         refreshOne(o, false);
       })
-      .fail(function (x) { log("POST failed: HTTP " + x.status + " " + x.responseText, "log-err"); });
+      .fail(function (x) {
+        var reason = (x.responseJSON && x.responseJSON.details || {}).reason;
+        if (x.status === 409 && reason === "plan_already_exists") {
+          $.ajax({ url: base() + "/v1/sessions/" + sid() + "/scenarios/" + o + "/treatment-plan/regenerate",
+                   method: "POST", headers: headers(), contentType: "application/json",
+                   data: JSON.stringify({}) })
+            .done(function (r) {
+              log("regenerated — plan " + r.plan_id.slice(0, 8) + "... RUNNING", "log-ev");
+              refreshOne(o, false);
+            })
+            .fail(function (x2) { log("regenerate failed: HTTP " + x2.status + " " + x2.responseText, "log-err"); });
+          return;
+        }
+        log("POST failed: HTTP " + x.status + " " + x.responseText, "log-err");
+      });
   });
 
   $("#board").on("click", ".cancel", function () {

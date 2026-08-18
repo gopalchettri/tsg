@@ -35,6 +35,7 @@ from app.api.schemas import (
     TreatmentEvidenceAttempt,
     TreatmentPlanAccepted,
     TreatmentPlanBody,
+    TreatmentPlanRegenerateBody,
     TreatmentPlanStatus,
     TreatmentRegisterPage,
     TreatmentRegisterRow,
@@ -70,7 +71,34 @@ router = APIRouter(prefix="/v1", tags=["Treatment Plans"])
 _CONFLICT_RESPONSES: dict[int | str, dict] = {
     409: {"model": ErrorResponse, "description": "Conflict — see details.reason."}}
 
-_TIMED_OUT_MESSAGE = "generation timed out — request it again"
+_TIMED_OUT_MESSAGE = "generation timed out — regenerate it (POST .../treatment-plan/regenerate)"
+
+#: The ONE wording source for every treatment-route 409 (accept.py::_REASON_TEXT's analog):
+#: raise sites carry no prose of their own, so a reason can never ship two spellings. A test
+#: pins every raisable TreatmentGateReason member to an entry (scenario_superseded is
+#: HISTORICAL — never raised — and deliberately absent).
+_GATE_TEXT: dict[TreatmentGateReason, str] = {
+    TreatmentGateReason.scenario_not_accepted:
+        "treatment plans are generated for accepted scenarios only",
+    TreatmentGateReason.generation_in_progress:
+        "a treatment plan is already being generated for this scenario",
+    TreatmentGateReason.not_in_progress:
+        "no generation is in progress for this scenario",
+    TreatmentGateReason.not_complete:
+        "only a COMPLETE plan can be reviewed or adopted — wait for generation to finish, "
+        "or regenerate first",
+    TreatmentGateReason.plan_already_exists:
+        "a treatment plan already exists for this scenario — use "
+        "POST .../treatment-plan/regenerate to create a new version",
+    TreatmentGateReason.version_not_active:
+        "this plan version is not the current one — approving it would make it current, "
+        "but rejecting a historical version changes nothing",
+}
+
+
+def _conflict(reason: TreatmentGateReason) -> treatment.TreatmentConflict:
+    """The only way this module builds a 409 — wording resolved from _GATE_TEXT, never inline."""
+    return treatment.TreatmentConflict(_GATE_TEXT[reason], reason=reason)
 
 #: The poll GET serves these plan keys — the toolkit's output columns plus the title. Since the
 #: AI's own schema was narrowed to exactly this set (prompts.treatment_prompt; see
@@ -95,13 +123,60 @@ def enqueue_treatment_plan(plan_id: str) -> None:
             response_model=TreatmentPlanAccepted, responses=_CONFLICT_RESPONSES)
 def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody,
                         principal: Principal = Depends(get_principal)) -> TreatmentPlanAccepted:
-    """Generate (or regenerate) the Mitigate treatment plan for one ACCEPTED scenario.
+    """FIRST generation of the Mitigate treatment plan for one ACCEPTED scenario. The register's
+    risk data arrives IN the body (TSG reads no risk-module tables); everything is frozen into
+    the snapshot at insert — the worker and the GET only ever see that snapshot.
 
-    Re-POST semantics: COMPLETE/ERROR plan → superseded and regenerated; fresh RUNNING plan →
-    409 generation_in_progress; stale RUNNING plan (progress clock older than
-    treatment_stale_seconds) → taken over. The register's risk data arrives IN the body (TSG
-    reads no risk-module tables); everything is frozen into the snapshot HERE — the worker
-    and the GET only ever see that snapshot."""
+    If ANY plan already exists for the scenario (whatever its status) → 409 plan_already_exists:
+    every later version is minted by POST .../treatment-plan/regenerate, which reuses the frozen
+    register data and takes only a user_note. (BREAKING wire change from the old re-POST
+    semantics — see docs/TSG_UI_API_INTEGRATION.md.) Two concurrent first-creates both pass the
+    read below; UX_TreatmentPlan_ActiveOutput arbitrates the insert race (loser → 409, same as
+    always)."""
+    return _launch_generation(
+        session_id, output_id, principal,
+        risk_input=body.model_dump(mode="json"),
+        risk_level=str(body.risk_level), risk_identification_date=body.risk_identification_date,
+        user_note=body.user_note, first_generation=True, fence_plan_id=None)
+
+
+@router.post("/sessions/{session_id}/scenarios/{output_id}/treatment-plan/regenerate",
+             status_code=202, response_model=TreatmentPlanAccepted, responses=_CONFLICT_RESPONSES)
+def post_regenerate_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanRegenerateBody,
+                                   principal: Principal = Depends(get_principal)) -> TreatmentPlanAccepted:
+    """Regenerate the plan: retire the ACTIVE version, generate a new one. Body is ONLY an
+    optional user_note — the register risk data is reused from the active version's frozen
+    snapshot (the client never resends it; if the register itself changed, that is a documented
+    limitation of this shape). Baseline is the ACTIVE row, never newest-by-CreatedAt, so a
+    version switched back in by an approve is what a later regenerate builds on. Fresh RUNNING →
+    409 generation_in_progress; no plan ever generated → 404."""
+    with db_session() as sess:
+        get_authorized_session(sess, session_id, principal)
+        # One narrow read: id + the two column stamps + the snapshot. The fence_plan_id below
+        # makes a stale read harmless — a racing switch/regenerate between this read and the
+        # retire misses the CAS instead of using the wrong version's data.
+        row = dal.active_plan_baseline(sess, session_id, output_id)
+        if row is None:
+            raise dal.NotFoundError("no treatment plan has been requested for this scenario")
+        snapshot = treatment._loads(row["InputSnapshotJSON"], {})
+        risk_input = treatment.regen_risk_input_from_snapshot(snapshot, body.user_note)
+        risk_level, risk_date = row["RiskLevel"], row["RiskIdentificationDate"]
+        fence_plan_id = str(row["PlanID"])
+    return _launch_generation(
+        session_id, output_id, principal, risk_input=risk_input,
+        risk_level=risk_level, risk_identification_date=risk_date,
+        user_note=body.user_note, first_generation=False, fence_plan_id=fence_plan_id)
+
+
+def _launch_generation(session_id: str, output_id: str, principal: Principal, *,
+                       risk_input: dict, risk_level: str | None, risk_identification_date,
+                       user_note: str | None, first_generation: bool,
+                       fence_plan_id: str | None) -> TreatmentPlanAccepted:
+    """Shared create/regenerate implementation — the split is at the route layer only.
+
+    `first_generation` gates on "no plan rows exist" (the exactly-one-active invariant makes
+    the active-row read a complete existence check); `fence_plan_id` is regenerate's TOCTOU
+    fence: the retire targets exactly the row whose snapshot was read, or fails the CAS."""
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
 
@@ -114,23 +189,31 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
         scn = dal.scenario_row(sess, session_id, output_id)
         if scn is None:
             raise dal.NotFoundError("scenario not found in this session")
-        if scn["Superseded"]:
-            raise treatment.TreatmentConflict(
-                "this scenario was superseded by a regeneration — request the current one",
-                reason=TreatmentGateReason.scenario_superseded)
+        # No Superseded gate: the accepted version may be an older, superseded one (Accepted is
+        # decoupled from generation recency). TreatmentGateReason.scenario_superseded is retired
+        # — kept in the enum for wire-compat, never raised.
         if scn["Accepted"] != 1:
-            raise treatment.TreatmentConflict(
-                "treatment plans are generated for accepted scenarios only",
-                reason=TreatmentGateReason.scenario_not_accepted)
+            raise _conflict(TreatmentGateReason.scenario_not_accepted)
 
-        # The register's half of the context is the validated body — no external reads. The
+        if first_generation and dal.active_plan_row(sess, session_id, output_id) is not None:
+            raise _conflict(TreatmentGateReason.plan_already_exists)
+
+        # The register's half of the context is `risk_input` (the validated body on create; the
+        # active version's frozen snapshot on regenerate) — no external reads. The
         # session-entity check above (get_authorized_session) is THE authorization boundary.
         snapshot = treatment.build_treatment_input(
-            sess, dict(session_row), dict(scn), body.model_dump(mode="json"))
+            sess, dict(session_row), dict(scn), risk_input)
 
         plan_id = dal.guid()
         stale_cutoff = treatment._stale_cutoff()
-        dal.supersede_active_plan(sess, scn["OutputID"], stale_cutoff)
+        if not first_generation:
+            # First generation skips the retire entirely — the gate above just proved no rows
+            # exist, so the UPDATE would be a guaranteed no-op round trip.
+            if dal.supersede_active_plan(sess, scn["OutputID"], stale_cutoff,
+                                         plan_id=fence_plan_id) == 0:
+                # Fresh RUNNING generation, or the active row changed since the route read it
+                # (fence miss) — either way, generation state moved; this request must not act.
+                raise _conflict(TreatmentGateReason.generation_in_progress)
         try:
             dal.insert_row(sess, m.Risk_Treatment_Plan, {
                 "PlanID": plan_id, "SessionID": session_id, "OutputID": scn["OutputID"],
@@ -138,9 +221,9 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
                 "UserID": principal.user_id,
                 "CrmRiskIdentificationID": None,  # reserved — no register lookup in this design
                 "TreatmentStrategy": str(TreatmentStrategy.mitigate),  # server stamp, not a body field
-                "RiskLevel": str(body.risk_level),  # denormalized for the register's SQL filter
+                "RiskLevel": risk_level,  # denormalized for the register's SQL filter
                 "Status": str(StageStatus.RUNNING), "ActiveTaskID": None,
-                "RiskIdentificationDate": body.risk_identification_date,
+                "RiskIdentificationDate": risk_identification_date,
                 "InputSnapshotJSON": json.dumps(snapshot, default=str),
                 "Superseded": 0, "CreatedAt": dal.now(), "UpdatedAt": dal.now(),
             })
@@ -149,17 +232,15 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
             sess.flush()
         except IntegrityError:
             sess.rollback()
-            raise treatment.TreatmentConflict(
-                "a treatment plan is already being generated for this scenario",
-                reason=TreatmentGateReason.generation_in_progress) from None
+            raise _conflict(TreatmentGateReason.generation_in_progress) from None
         dal.append_audit(
             sess, AuditID=dal.guid(), SessionID=session_id,
             TenantID=session_row["TenantID"], EntityID=session_row["EntityID"],
             SubsystemID=ASSET_UNIT_ID, EventType=AuditEventType.treatment_plan_requested,
             ActorUserID=principal.user_id,
             DetailJSON=json.dumps({"plan_id": plan_id, "output_id": scn["OutputID"],
-                                   **({"note": treatment._clip(body.user_note)}
-                                      if body.user_note else {})}))
+                                   **({"note": treatment._clip(user_note)}
+                                      if user_note else {})}))
 
     # Enqueue OUTSIDE the db_session block (Pattern A). A failed enqueue must not wedge the
     # OutputID behind the staleness window: park the committed RUNNING row in ERROR, re-raise
@@ -171,7 +252,8 @@ def post_treatment_plan(session_id: str, output_id: str, body: TreatmentPlanBody
             # task_id=None: nothing has claimed this row yet (inserted with ActiveTaskID=None
             # above), so only finish it if that's still true.
             dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=None,
-                            error_message="failed to queue generation — request it again",
+                            error_message="failed to queue generation — regenerate it "
+                                          "(POST .../treatment-plan/regenerate)",
                             error_reason=TreatmentOutcomeReason.enqueue_failed)
         log.error("treatment.enqueue_failed", plan_id=plan_id)
         raise
@@ -201,8 +283,10 @@ def get_treatment_plan(session_id: str, output_id: str,
     session's SSE stream (GET /v1/sessions/{id}/events) so a client can refetch immediately, but
     that is a HINT: three outcomes never publish — a dead worker (the row stays RUNNING and only
     the projection above calls it timed out), an LLM-capacity autoretry (which keeps bumping the
-    progress clock, so the row never goes stale either), and cancel/review (written here, in the
-    API process). Keep a slow backstop poll; the event only makes the common case feel instant."""
+    progress clock, so the row never goes stale either), and cancel plus a plain review verdict
+    (written here, in the API process). One API-side action DOES publish: an approve that
+    switches the active version emits the same event after its commit. Keep a slow backstop
+    poll; the event only makes the common case feel instant."""
     with db_session() as sess:
         get_authorized_session(sess, session_id, principal)
         row = dal.active_plan_row(sess, session_id, output_id)
@@ -358,6 +442,7 @@ _EVENT_LABELS = {
     str(AuditEventType.treatment_plan_outcome): "outcome",
     str(AuditEventType.treatment_plan_cancelled): "cancelled",
     str(AuditEventType.treatment_plan_reviewed): "reviewed",
+    str(AuditEventType.treatment_plan_version_restored): "version restored",
 }
 
 
@@ -468,9 +553,7 @@ def post_cancel_treatment_plan(session_id: str, output_id: str,
                 sess, row["PlanID"], status=StageStatus.ERROR, task_id=row["ActiveTaskID"],
                 error_message=_CANCELLED_MESSAGE,
                 error_reason=TreatmentOutcomeReason.cancelled):
-            raise treatment.TreatmentConflict(
-                "no generation is in progress for this scenario",
-                reason=TreatmentGateReason.not_in_progress)
+            raise _conflict(TreatmentGateReason.not_in_progress)
         dal.append_audit(
             sess, AuditID=dal.guid(), SessionID=session_id, TenantID=row["TenantID"],
             EntityID=row["EntityID"], SubsystemID=ASSET_UNIT_ID,
@@ -486,35 +569,87 @@ def post_cancel_treatment_plan(session_id: str, output_id: str,
              response_model=TreatmentReviewResponse, responses=_CONFLICT_RESPONSES)
 def post_review_treatment_plan(session_id: str, output_id: str, body: TreatmentReviewBody,
                                principal: Principal = Depends(get_principal)) -> TreatmentReviewResponse:
-    """Record the human adoption decision on the ACTIVE, COMPLETE plan. The reviewer's
-    identity comes from the login token (never the body); a re-review overwrites (latest
-    wins); regenerating supersedes the row, so a new version always starts unreviewed."""
+    """Record the human adoption decision. Default (no plan_id, or the active plan's id): the
+    verdict lands on the ACTIVE, COMPLETE plan — a re-review overwrites (latest wins), and a
+    regenerated plan always starts unreviewed. With a HISTORICAL plan_id and decision=approved:
+    the atomic version switch — retire the active row, reactivate the target, stamp the verdict,
+    all-or-nothing — approving an older version IS making it the plan (last human decision
+    wins; the displaced version keeps its own verdict in history). Rejecting a historical
+    version is refused (version_not_active): it is already not the plan. The reviewer's
+    identity comes from the login token, never the body."""
     # Reviewer free text is redacted+capped like every other client string that lands in a
     # persistent store (user_note precedent) — a pasted secret must not reach ReviewComment
     # or the compliance feed's DetailJSON. One timestamp, naive UTC: stored AND echoed, so
     # the POST receipt matches the next GET byte-for-byte (wire convention: no offset).
     comment = treatment._clip(body.comment)
     reviewed_at = _naive_utc(dal.now())
+    swapped = False
     with db_session() as sess:
         get_authorized_session(sess, session_id, principal)
         row = dal.active_plan_row(sess, session_id, output_id)
         if row is None:
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
-        if not dal.review_plan(sess, row["PlanID"], status=str(body.decision),
+
+        target_id = body.plan_id  # canonicalized at the schema boundary; row ids canonical too
+        if target_id is not None and target_id != str(row["PlanID"]):
+            # --- Version-switch branch: verdict targets a historical version ---
+            if not dal.plan_version_exists(sess, session_id, output_id, target_id):
+                raise dal.NotFoundError("no such plan version for this scenario")
+            if body.decision != TreatmentReviewStatus.approved:
+                raise _conflict(TreatmentGateReason.version_not_active)
+            # Retire the active row, fenced to the exact row read above — a racing
+            # regenerate/switch misses the CAS; a fresh RUNNING generation matches nothing.
+            if not dal.supersede_active_plan(sess, output_id, treatment._stale_cutoff(),
+                                             plan_id=str(row["PlanID"])):
+                raise _conflict(TreatmentGateReason.generation_in_progress)
+            # Reactivate the target (CAS: Superseded=1 AND COMPLETE). A miss rolls the retire
+            # back too — this pair is the only writer that could otherwise leave the scenario
+            # with ZERO active rows. The UPDATE executes immediately (execute_dml), so a
+            # filtered-unique violation would raise HERE, not at a later flush — though the
+            # plan_id-fenced retire above already precludes it (any concurrent activator must
+            # first win that same retire), so the except is belt-and-braces, not the guard.
+            try:
+                reactivated = dal.reactivate_plan_version(sess, session_id, output_id, target_id)
+            except IntegrityError:
+                sess.rollback()
+                raise _conflict(TreatmentGateReason.generation_in_progress) from None
+            if not reactivated:
+                sess.rollback()
+                raise _conflict(TreatmentGateReason.not_complete)
+            plan_id = target_id
+            dal.append_audit(
+                sess, AuditID=dal.guid(), SessionID=session_id, TenantID=row["TenantID"],
+                EntityID=row["EntityID"], SubsystemID=ASSET_UNIT_ID,
+                EventType=AuditEventType.treatment_plan_version_restored,
+                ActorUserID=principal.user_id,
+                # `plan_id` key REQUIRED: the per-scenario trail filters on it.
+                DetailJSON=json.dumps({"plan_id": plan_id,
+                                       "retired_plan_id": str(row["PlanID"]),
+                                       "output_id": output_id}))
+            swapped = True
+        else:
+            plan_id = str(row["PlanID"])
+
+        if not dal.review_plan(sess, plan_id, status=str(body.decision),
                                comment=comment, reviewer=principal.user_id,
                                reviewed_at=reviewed_at):
-            raise treatment.TreatmentConflict(
-                "only a COMPLETE plan can be reviewed — wait for generation to finish, or "
-                "regenerate first", reason=TreatmentGateReason.not_complete)
+            sess.rollback()  # on the swap branch this also undoes the swap — all-or-nothing
+            raise _conflict(TreatmentGateReason.not_complete)
         dal.append_audit(
             sess, AuditID=dal.guid(), SessionID=session_id, TenantID=row["TenantID"],
             EntityID=row["EntityID"], SubsystemID=ASSET_UNIT_ID,
             EventType=AuditEventType.treatment_plan_reviewed, ActorUserID=principal.user_id,
-            DetailJSON=json.dumps({"plan_id": row["PlanID"], "decision": str(body.decision),
+            DetailJSON=json.dumps({"plan_id": plan_id, "decision": str(body.decision),
                                    **({"comment": comment} if comment else {})}))
-    log.info("treatment.reviewed", plan_id=row["PlanID"], decision=str(body.decision),
-             user=principal.user_id)
-    return TreatmentReviewResponse(plan_id=row["PlanID"], review_status=str(body.decision),
+    if swapped:
+        # After the commit, never before (the bus has no replay log): tell watching clients the
+        # operative plan changed so they refetch the swapped-in version. Same advisory shape the
+        # worker publishes; _publish_plan_result never raises.
+        treatment._publish_plan_result({"SessionID": session_id, "OutputID": output_id},
+                                       plan_id, StageStatus.COMPLETE)
+    log.info("treatment.reviewed", plan_id=plan_id, decision=str(body.decision),
+             swapped=swapped, user=principal.user_id)
+    return TreatmentReviewResponse(plan_id=plan_id, review_status=str(body.decision),
                                    reviewed_by=principal.user_id, reviewed_at=reviewed_at)
 
 
