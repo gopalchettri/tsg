@@ -11,6 +11,7 @@ what `bus.publish` was handed.
 """
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 import app.pipeline.tasks as tasks_mod
@@ -38,6 +39,26 @@ def test_record_failure_publishes_epoch_and_stage_scope(monkeypatch):
     assert calls[0]["scope"] == "stage"
     assert calls[0]["type"] == str(SSEEventType.error)
     assert calls[0]["subsystem_id"] == 0
+
+
+def test_record_failure_merges_extra_into_detail_json(monkeypatch):
+    """`extra` (regen's redacted user_note) must land in the stage_error audit row's DetailJSON
+    alongside the existing error/subsystem_id keys -- confirms _record_failure's new opaque-merge
+    param actually reaches the persisted row, not just the in-memory dict."""
+    monkeypatch.setattr(bus, "publish", lambda sid, ev: None)
+    audit_calls: list[dict] = []
+    monkeypatch.setattr(dal, "append_audit", lambda sess, **cols: audit_calls.append(cols))
+    sess = MagicMock()
+    ss = {"SessionID": "s1", "TenantID": "t", "EntityID": "e"}
+
+    tasks_mod._record_failure(sess, ss, subsystem_id=0, exc=RuntimeError("boom"), epoch=7,
+                            extra={"user_note": "x"})
+
+    assert len(audit_calls) == 1
+    detail = json.loads(audit_calls[0]["DetailJSON"])
+    assert detail["user_note"] == "x"
+    assert detail["subsystem_id"] == 0
+    assert "error" in detail
 
 
 def test_send_to_review_publishes_epoch(monkeypatch):

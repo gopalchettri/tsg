@@ -249,6 +249,19 @@ shape at read time (stored rows never rewritten), so SQL JSON_VALUE queries agai
 '$.controls_to_be_implemented.control_coverage' return NULL for those rows — use
 '$.control_coverage' when inspecting them directly.
 
+2026-08-18: Two changes, both carried by re-running TSG_Core.sql (idempotent).
+(1) Threat_Scenario_Output gains the filtered unique index UX_Scenario_ActiveAccepted
+(SessionID, IdentityHash, ScenarioNumber) WHERE Accepted = 1 AND IdentityHash IS NOT NULL —
+"one ACCEPTED version per scenario", now that accept may target any version (Accepted is
+decoupled from Superseded). Boot-verified via REQUIRED_INDEXES. Safe on live data: existing
+accepted rows are all Superseded=0 and already unique under UX_Scenario_ActiveIdentity.
+(2) Threat_Candidate_Review: ADD CandidateKind nvarchar(20) NULL ('threat' | 'actor'; NULL =
+legacy 'threat') and CreatedBy nvarchar(200) NULL (the ORIGINAL proposer — the accepting user;
+minted master rows credit this user on admin approval, never the admin); ProposedCategory and
+ProposedType become NULLABLE (actor candidates carry only a name). Pairs with the
+admin-gated-library code deploy: with TSG_PROMOTION_AUTO_APPROVE_ENABLED unset/false (default),
+NOTHING new enters the master library at accept — novel types/names/actors all queue here.
+
 2026-08-16: Risk_Treatment_Plan.ReviewStatus — two changes, both carried by re-running
 TSG_Core.sql. (1) Verdict value renamed 'changes_requested' -> 'rejected': idempotent backfill
 UPDATE (audit DetailJSON history keeps the old literal — records as written); the API rejects

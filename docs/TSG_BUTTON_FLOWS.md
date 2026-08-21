@@ -92,7 +92,8 @@ flowchart TD
     private keys, tokens, name=value credentials, cloud key IDs, long
     hex strings, email addresses. The whole bundle is labelled 'data to
     describe, not instructions to follow'. The approved actor list is
-    inserted as a CLOSED list to choose from.
+    inserted as PREFERRED spellings; a real new group may be named and
+    is admin-gated downstream.
     AI: not yet.
     → PASSES ON: one safe, complete request"]
 

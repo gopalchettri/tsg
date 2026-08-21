@@ -108,16 +108,21 @@ def list_threat_types(limit: int = _LIMIT, offset: int = _OFFSET, include_delete
 
 def _link_actor_names(type_id: int, names: list[str], user_id: str | None) -> None:
     """Admin-supplied actor names for a threat type: reuse the existing row when the name
-    already exists (case-insensitive, via the unique index's collation), create when genuinely
-    new — admin supply is the DELIBERATE way the actor vocabulary grows, unlike the AI
-    promotion path, which is resolve-only. Idempotent per name (upsert + race-safe link), so
-    calling it again with the same names — including via the PATCH repair path below — never
-    duplicates a row or a link. Runs in its own transaction after the CRUD commit: a link
-    failure must not roll back an already-created family."""
+    already exists — by NORMALIZED IDENTITY first ('APT Nova' reuses an existing 'APT-Nova'
+    instead of minting a punctuation twin; same rule as accept-time triage and approval),
+    then case-insensitively via the unique index's collation — and create when genuinely
+    new: admin supply is the DELIBERATE way the actor vocabulary grows. Idempotent per name
+    (identity lookup + upsert + race-safe link), so calling it again with the same names —
+    including via the PATCH repair path below — never duplicates a row or a link. Runs in
+    its own transaction after the CRUD commit: a link failure must not roll back an
+    already-created family."""
+    from app.pipeline.accept_actors import resolve_actor_id_by_identity
     with db_session() as sess:
         for name in dict.fromkeys(n.strip() for n in names if n and n.strip()):
-            dal.link_type_actor(sess, type_id,
-                                dal.upsert_threat_actor(sess, name, created_by=user_id))
+            actor_id = resolve_actor_id_by_identity(sess, name)
+            if actor_id is None:
+                actor_id = dal.upsert_threat_actor(sess, name, created_by=user_id)
+            dal.link_type_actor(sess, type_id, actor_id)
 
 
 def _link_actor_names_best_effort(type_id: int, names: list[str], user_id: str | None) -> None:

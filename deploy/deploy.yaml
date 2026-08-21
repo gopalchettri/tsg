@@ -1,11 +1,11 @@
 # TSG on OpenShift — api + worker + beat + Service.
-# Mirrors docker/compose.prod.yml (the documented deployment contract): entrypoint modules,
-# gevent pool, -c 50, grace periods, and both healthcheck recipes come from there.
-# Env comes from ONE Secret (deploy/secrets.yaml -> tsg-uat-env). No ConfigMap exists yet;
-# if you split non-secret tuning out later, add a configMapRef alongside the secretRef.
+# tsg-api and celery-worker are reconciled to match what's actually live in UAT (envFrom via
+# tsg-api-config ConfigMap + tsg-api-secrets Secret, concurrency=2, single readinessProbe, no
+# startup/liveness probes) — see deploy/secrets.yaml comment for why. tsg-beat and the Service
+# below were not part of that reconciliation and still reflect the prior single-Secret design.
 #
-# NOTE on image tag: :latest + Always repulls on every pod start. Better: have CI push
-# immutable tags (git SHA) and set them here — then IfNotPresent is safe again.
+# NOTE on image tag: :latest + IfNotPresent only repulls when the tag is missing locally. Better:
+# have CI push immutable tags (git SHA) and set them here.
 
 apiVersion: apps/v1
 kind: Deployment
@@ -27,54 +27,60 @@ spec:
         app: tsg-api
         component: fastapi
     spec:
+      # Cluster DNS can't resolve this UAT LLM gateway host — pin it directly. Traffic still goes
+      # through HTTP_PROXY/HTTPS_PROXY below (TSG_LITELLM_BYPASS_PROXY=false in the Secret makes
+      # the app actually use them for this host instead of self-forcing a direct connection).
+      hostAliases:
+        - ip: "10.231.255.253"
+          hostnames:
+            - "llmapi.govai.ae"
       imagePullSecrets:
         - name: quay-pull
       containers:
         - name: fastapi
-          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
-          imagePullPolicy: Always
-          # No `command:` — the image CMD (gunicorn) is the single source of truth, and the
-          # base image's container-entrypoint (arbitrary-UID handling) stays in place.
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - gunicorn
+            - app.main:app
+            - -k
+            - uvicorn.workers.UvicornWorker
+            - --bind
+            - 0.0.0.0:8000
+            - --workers
+            - "2"
+            - --timeout
+            - "240"
           ports:
             - containerPort: 8000
               protocol: TCP
+          # Corporate proxy required for external egress in this cluster (network support).
+          env:
+            - name: HTTP_PROXY
+              value: "http://10.61.192.2:8080"
+            - name: HTTPS_PROXY
+              value: "http://10.61.192.2:8080"
           envFrom:
+            - configMapRef:
+                name: tsg-api-config
             - secretRef:
-                name: tsg-uat-env
-          # Boot runs the same posture/DB/litellm verification as the worker — allow up to
-          # 60s before liveness may kill the pod.
-          startupProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            periodSeconds: 5
-            failureThreshold: 12
+                name: tsg-api-secrets
           # /health = process up, unconditional 200 (app/api/health.py).
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            periodSeconds: 20
-            timeoutSeconds: 5
-            failureThreshold: 3
-          # /ready = DB + Redis (+ Mongo when used) actually reachable; workers advisory only.
-          # Checks run concurrently with their own timeouts (~5s worst case) — 8s covers it.
           readinessProbe:
             httpGet:
-              path: /ready
+              path: /health
               port: 8000
+            initialDelaySeconds: 20
             periodSeconds: 10
-            timeoutSeconds: 8
+            timeoutSeconds: 5
             failureThreshold: 3
           resources:
             requests:
               cpu: "250m"
               memory: "512Mi"
             limits:
-              # 2 gunicorn workers x (litellm + numpy) — 1Gi invites OOMKill; 1 CPU invites
-              # throttling. Watch real usage and tighten later.
-              cpu: "2"
-              memory: "2Gi"
+              cpu: "1"
+              memory: "1Gi"
 
 ---
 apiVersion: apps/v1
@@ -102,67 +108,57 @@ spec:
         app: tsg-api
         component: celery
     spec:
+      # Cluster DNS can't resolve this UAT LLM gateway host — pin it directly. Traffic still goes
+      # through HTTP_PROXY/HTTPS_PROXY below (TSG_LITELLM_BYPASS_PROXY=false in the Secret makes
+      # the app actually use them for this host instead of self-forcing a direct connection).
+      hostAliases:
+        - ip: "10.231.255.253"
+          hostnames:
+            - "llmapi.govai.ae"
       # compose stop_grace_period: 300s — covers one full LLM-call retry cycle on warm shutdown.
       terminationGracePeriodSeconds: 300
       imagePullSecrets:
         - name: quay-pull
       containers:
         - name: celery-worker
-          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
-          imagePullPolicy: Always
-          # compose.prod.yml:54 verbatim. celery_worker = the REQUIRED patch-first entrypoint
-          # (gevent monkey-patch before other imports; prefork fail-fasts in _init_worker).
-          # -c 50 = gevent greenlets in ONE process, sized to IO-bound LLM/DB stages; with
-          # worker_prefetch_multiplier=1 (set in celery_app.py) it also caps reserved messages.
-          # No --queues (producers publish to the default "celery" queue), no time-limit /
-          # prefetch flags (celery_app.conf is the single source of truth), no
-          # --max-tasks-per-child (prefork-only, ignored by gevent).
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
+          imagePullPolicy: IfNotPresent
           command:
             - celery
             - -A
-            - app.pipeline.celery_worker.celery_app
+            - app.pipeline.celery_worker:celery_app
             - worker
-            - -P
-            - gevent
-            - -c
-            - "50"
-            - -l
-            - info
+            - --loglevel=INFO
+            - --concurrency=2
+            - --prefetch-multiplier=1
+            - --soft-time-limit=3300
+            - --time-limit=3600
+            - --pool=gevent
+          # Corporate proxy required for external egress in this cluster (network support).
+          env:
+            - name: HTTP_PROXY
+              value: "http://10.61.192.2:8080"
+            - name: HTTPS_PROXY
+              value: "http://10.61.192.2:8080"
           envFrom:
+            - configMapRef:
+                name: tsg-api-config
             - secretRef:
-                name: tsg-uat-env
-          # _init_worker blocks the Consumer bootstep: DB verify, litellm verify, threshold
-          # warmup — routinely >30s (compose start_period: 240s). 12 x 30s = 360s allowance.
-          startupProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                - celery -A app.pipeline.celery_worker.celery_app inspect ping -d celery@$HOSTNAME
-            periodSeconds: 30
-            timeoutSeconds: 10
-            failureThreshold: 12
-          # -d celery@$HOSTNAME pings THIS worker over the broker — without it any live
-          # replica answering would mask a hung local one. Only succeeds if the gevent event
-          # loop is actually responsive, which is exactly the hang mode worth restarting.
-          livenessProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                - celery -A app.pipeline.celery_worker.celery_app inspect ping -d celery@$HOSTNAME
-            periodSeconds: 30
-            timeoutSeconds: 10
-            failureThreshold: 3
+                name: tsg-api-secrets
           resources:
             requests:
-              # gevent = ONE Python process: >1 core is mostly unusable (GIL). Memory sized
-              # for litellm_proxy providers (no local models loaded).
-              cpu: "1"
+              cpu: "2"
               memory: "4Gi"
             limits:
-              cpu: "2"
+              cpu: "4"
               memory: "8Gi"
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "sleep 10"
 
 ---
 apiVersion: apps/v1
@@ -193,8 +189,14 @@ spec:
         - name: quay-pull
       containers:
         - name: beat
-          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
-          imagePullPolicy: Always
+          # SAME image AND pull policy as the api and celery-worker Deployments above — beat
+          # schedules the sweeps the workers execute, so a different repo/tag/policy here means
+          # the scheduler and the executors can run different builds (Always would repull the
+          # mutable :latest on every beat restart while the executors keep their cached one).
+          # Confirm the live repo spelling ('tsg-apii') against the cluster registry before
+          # applying.
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
+          imagePullPolicy: IfNotPresent
           # compose.prod.yml:100 verbatim — celery_app, NOT celery_worker: beat runs on plain
           # asyncio and must never be monkey-patched (celery_app.py module docstring).
           command:

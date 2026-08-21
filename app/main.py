@@ -1,11 +1,4 @@
-"""FastAPI application entrypoint.
-
-Startup runs the DB invariant checks (INV-*) — the app refuses to start against a
-schema missing its guards (index-existence, NOT-NULL keys, no duplicate active
-rows) — and, in `create_app()`, the [R2] route audit (every route must be an
-explicitly-classified, correctly-authenticated entity-scoped route or a genuine
-exemption — see app/api/route_audit.py). Run with: `uvicorn app.main:app`.
-"""
+# FastAPI entrypoint. Run with: uvicorn app.main:app
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -32,12 +25,8 @@ from app.core.middleware import BodySizeLimitMiddleware, RequestIDMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown hook: enforces fail-closed boot (security posture, DB invariants,
-    local-model path) before the app accepts traffic, so a broken deployment never
-    silently serves requests against an unsafe config.
-    """
-    # Note: the `app` parameter above is required by FastAPI's lifespan signature but
-    # isn't used in the body below — all the checks operate on global settings/engine.
+    # Fail-closed startup: refuse to serve traffic if security posture, DB invariants,
+    # or the local-model path aren't sane.
     from app.core.config import assert_security_posture, assert_sse_graceful_shutdown_wired
     from app.core.logging import configure_logging
     from app.db.engine import get_engine
@@ -45,21 +34,19 @@ async def lifespan(app: FastAPI):
     from app.pipeline.local_models import validate_local_models
 
     configure_logging()
-    assert_security_posture()  # header auth: warn if the (user,entity) DB check is off in prod
-    verify_startup(get_engine())  # fail-fast if a required DB guard is missing (incl. >=1 API key)
-    validate_local_models(warm=False)  # fail-fast on a bad local-model path (API doesn't hold the model)
-    assert_sse_graceful_shutdown_wired()  # item 21: fail loudly if the worker class drifted from uvicorn
+    assert_security_posture()  # warn if the (user,entity) DB check is off in prod
+    verify_startup(get_engine())  # fail-fast if a required DB guard is missing
+    validate_local_models(warm=False)  # fail-fast on a bad local-model path
+    assert_sse_graceful_shutdown_wired()  # fail loudly if the worker class drifted from uvicorn
     yield
 
 
 def create_app() -> FastAPI:
-    """Builds the FastAPI app with error handlers and routers wired in; factored out
-    from the module-level `app` so tests can construct fresh instances.
-    """
+    # Factored out from the module-level `app` so tests can construct fresh instances.
     app = FastAPI(
-        title="Threat Scenario Generator",
-        version="1.1",
-        description="AI-assisted STRIDE threat identification and scenario generation for OT/ICS assets.",
+        title=get_settings().application_name,
+        version=get_settings().application_version,
+        description=get_settings().application_description,
         openapi_tags=[
             {"name": "Health", "description": "Liveness/readiness probes for orchestrators. No authentication required."},
             {
@@ -76,6 +63,15 @@ def create_app() -> FastAPI:
                     "Cross-session scenario reads: list everything one user created, list "
                     "everything under one entity, or fetch a single scenario by id. Results "
                     "are always restricted to the caller's authorized entities."
+                ),
+            },
+            {
+                "name": "Remediation Plans",
+                "description": (
+                    "AI-generated Risk Treatment (Mitigate) plans for accepted scenarios. "
+                    "The register's risk data (ratings, level, existing controls) is sent in "
+                    "the request body. Present only when RISK_MODULE_ENABLED is on. POST to "
+                    "generate/regenerate, poll the GET on the same path."
                 ),
             },
             {
@@ -153,10 +149,12 @@ def create_app() -> FastAPI:
             {
                 "name": "Threat Library Candidates",
                 "description": (
-                    "Curator review queue for AI-proposed threats too ambiguous to auto-file, "
-                    "or routed here instead of auto-minting because "
-                    "promotion_auto_approve_enabled is off: list pending candidates, approve "
-                    "(mints into the shared library) or reject. Requires the admin key."
+                    "Admin review queue for EVERYTHING new the AI pipeline proposes — threat "
+                    "types, threat names, and actors (kind='threat' | 'actor'). With "
+                    "promotion_auto_approve_enabled off (the default), nothing enters the "
+                    "shared library without an approval here; approve mints the entry "
+                    "(crediting the ORIGINAL proposer as CreatedBy) or reject closes the card. "
+                    "Requires the admin key."
                 ),
             },
             {
@@ -175,39 +173,21 @@ def create_app() -> FastAPI:
                     "feed the threats-prompt hint. Requires the admin key."
                 ),
             },
-            {
-                "name": "Treatment Plans",
-                "description": (
-                    "AI-generated Risk Treatment (Mitigate) plans for accepted scenarios. "
-                    "The register's risk data (ratings, level, existing controls) is sent in "
-                    "the request body. Present only when RISK_MODULE_ENABLED is on. POST to "
-                    "generate/regenerate, poll the GET on the same path."
-                ),
-            },
+
         ],
         lifespan=lifespan,
     )
-    app.add_middleware(RequestIDMiddleware)  # [REVIEW-FIX] request correlation ID + access logs
-    # Added LAST so it runs FIRST (Starlette wraps outward): the body-size guard has to reject an
-    # over-sized upload before anything buffers or json-parses it — that work happens before
-    # dependencies resolve, i.e. before require_admin runs, so a per-route cap cannot prevent it.
+    app.add_middleware(RequestIDMiddleware)  # request correlation ID + access logs
+    # Added last so it runs first (Starlette wraps outward): reject oversized uploads
+    # before anything buffers or parses the body.
     app.add_middleware(BodySizeLimitMiddleware)
-    # Item 31: added LAST of the three, so it's outermost (Starlette wraps outward) — a CORS
-    # preflight (OPTIONS) is answered before the body-size guard or request-ID logging ever run,
-    # and every response, including error responses, carries the CORS headers. allow_origins is
-    # empty by default (cors_allowed_origins, app/core/config.py) -- no cross-origin browser
-    # access until an environment sets it. allow_headers MUST list every real auth header
-    # explicitly: X-API-Key/X-User-Id/X-Entity-Id/X-Tenant-Id (app/api/deps.get_principal) and
-    # X-Admin-Key (app/api/deps.require_admin) are non-simple headers that trigger a browser
-    # preflight, and CORSMiddleware rejects any header not in this allowlist by default -- an
-    # origin allowlist alone leaves a browser consumer blocked at the preflight stage, not
-    # connected. allow_methods must be explicit too: Starlette defaults to GET-only, which would
-    # silently block every POST/PATCH/DELETE from a cross-origin caller.
+    # Added last of the three so it's outermost: preflight is answered, and every
+    # response carries CORS headers, before the other middleware ever runs.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=get_settings().cors_allowed_origins,
         allow_headers=["X-API-Key", "X-User-Id", "X-Entity-Id", "X-Tenant-Id", "X-Admin-Key",
-                       "Content-Type", "Idempotency-Key"],
+                    "Content-Type", "Idempotency-Key"],
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
     )
     register_error_handlers(app)
@@ -222,16 +202,10 @@ def create_app() -> FastAPI:
     app.include_router(threat_library_crud_router)
     app.include_router(control_library_crud_router)
     app.include_router(threat_intel_router)
-    # Feature-flagged: flag off -> the treatment-plan paths 404 by absence (no handler code
-    # runs). Flag on -> routes mount; nothing else is armed — the register's risk data arrives
-    # in the request body, so no external tables are required (docs/RISK_TREATMENT_PLAN_SDD.md).
+    # Feature-flagged: routes only mount, and only 404-by-absence otherwise
     if get_settings().risk_module_enabled:
         app.include_router(treatment_router)
-    # DEV ONLY — an SSE test harness for the treatment-plan events. Gated on a local/dev APP_ENV
-    # so it cannot appear on a staging/prod deployment. It has to be served BY the API rather than
-    # opened from disk: there is no CORS middleware, so a file:// page could not call these
-    # endpoints at all, and EventSource cannot send the auth headers the stream requires (the page
-    # uses fetch + ReadableStream instead).
+    # Dev-only SSE test harness, served by the API itself so auth headers/CORS work
     if get_settings().app_env in ("local", "dev"):
         from pathlib import Path
 
@@ -243,9 +217,7 @@ def create_app() -> FastAPI:
         def _dev_sse_test() -> FileResponse:  # pragma: no cover - dev tooling
             return FileResponse(_sse_page, media_type="text/html")
 
-    # [R2 remainder] fail-closed: refuse to boot if any route is missing its entity-scoping
-    # dependency, or was never triaged at all — see app/api/route_audit.py. Audits `app`
-    # itself (not a hand-maintained router list) so a future router can't ship unaudited.
+    # Fail-closed: refuse to boot if any route is missing entity-scoping or was never audited
     assert_routes_authenticated(app)
     return app
 

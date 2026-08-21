@@ -34,6 +34,7 @@ from app.core.enums import (
     AcceptSubsetReason,
     ActorType,
     AuditEventType,
+    CandidateKind,
     CandidateStatus,
     ScenarioStatus,
     SessionStatus,
@@ -1098,15 +1099,89 @@ def active_category_names(sess: Session) -> list[str]:
     )]
 
 
-def active_actor_names(sess: Session) -> list[str]:
-    """Real Threat_Actor names, read live so prompts.threats_prompt never drifts from the
-    table grounding.get_allowed_actor_names matches proposed actors against by exact string.
-    Empty result means the table isn't seeded yet; the caller falls back to a hardcoded default."""
-    ta = m.Threat_Actor
+# Process-local cache for active_actor_names — (names, fetched_at) or None before the first
+# successful fill. ONE module-level name reassigned as a single atomic replace (`global` +
+# one `=`), not a dict with two keys written by two separate statements: this codebase's
+# gevent+pyodbc pairing (app/pipeline/celery_worker.py) means a blocking DB call already
+# can't be preempted mid-function today, but a two-write cache would silently stop being
+# safe the moment that ever changes (e.g. a future move to a threadpool-offloaded DB call,
+# as that module's own docstring flags as the eventual escape hatch). One atomic write has
+# no such hidden dependency. Same freshness-check IDEA as embeddings._MATRIX's
+# `{key: (digest, mat, row_indexes)}` — one key, one value, one write — applied here to a
+# TTL instead of a content digest because this wraps a periodically-refetched DB query, not
+# a content-addressed model computation.
+_actor_vocab_cache: tuple[list[str], float] | None = None
+
+
+def _query_active_actor_names(sess: Session, cap: int) -> list[str]:
+    """The live query: active actors ordered by RELEVANCE — most-linked-to-a-threat-type
+    first (an actor with zero links, e.g. one just approved, ties at 0 and falls back to
+    CreatedAt), never alphabetical. Alphabetical was rejected: it would permanently exclude
+    every actor whose name starts late in the alphabet AND every brand-new actor, once the
+    table exceeds `cap` — an arbitrary bias, not a defensible default. `ThreatActorID` is a
+    REQUIRED trailing tiebreak: Stage 1 runs at creativity=0 specifically so repeated calls
+    are reproducible, so two actors tied on both count and timestamp must still resolve to
+    the same top-`cap` set every time, not one that depends on undefined tie order."""
+    ta, tm = m.Threat_Actor, m.ThreatType_ThreatActor_Map
+    link_count = func.count(tm.ThreatTypeID)
     return [r[0] for r in sess.execute(
         select(ta.ThreatActorName)
+        .select_from(ta)
+        .outerjoin(tm, tm.ThreatActorID == ta.ThreatActorID)
         .where(ta.IsActive == True, ta.IsDeleted == False)  # noqa: E712
-        .order_by(ta.ThreatActorName)
+        .group_by(ta.ThreatActorID, ta.ThreatActorName, ta.CreatedAt)
+        .order_by(link_count.desc(), ta.CreatedAt.desc(), ta.ThreatActorID)
+        .limit(cap)
+    )]
+
+
+def active_actor_names(sess: Session) -> list[str]:
+    """The capped, relevance-ordered PROMPT HINT list (up to TSG_ACTOR_VOCABULARY_CAP names,
+    cached TSG_ACTOR_VOCABULARY_CACHE_SECONDS) — read so prompts.threats_prompt shows
+    preferred spellings without drifting from the table. This is a hint, never a gate: a real
+    actor outside this list is still fully handled by grounding + accept-time triage
+    (accept_actors.py), so capping/caching risks nothing but the freshness of a wording hint.
+    Empty result means the table isn't seeded yet (or a cold-start refresh failure below);
+    either way the caller falls back to a hardcoded generic-role-label default.
+
+    Caching is a plain TTL, not a change-digest: the data changes rarely (admin approval),
+    the consumer tolerates staleness by design, and self-healing every TTL window is simpler
+    than tracking a version signal for no measurable benefit at this call frequency.
+    RESILIENCE: a refresh that raises (transient DB hiccup) serves the last successfully
+    cached list instead of propagating — a hint-list refresh blip must never fail an entire
+    threat-identification call. Only on a cold start (nothing ever cached yet) is there
+    nothing to fall back to; degrading to [] there is exactly the existing "unseeded table"
+    input the caller already handles, not a new failure mode."""
+    global _actor_vocab_cache
+    s = get_settings()
+    ttl = s.actor_vocabulary_cache_seconds
+    now = time.monotonic()
+    cached = _actor_vocab_cache
+    if ttl > 0 and cached is not None and (now - cached[1]) < ttl:
+        return cached[0]
+    try:
+        names = _query_active_actor_names(sess, s.actor_vocabulary_cap)
+    except Exception:
+        if cached is not None:
+            log.warning("dal.actor_vocabulary_refresh_failed_stale", exc_info=True,
+                        age_seconds=round(now - cached[1], 1), ttl=ttl)
+            return cached[0]
+        log.warning("dal.actor_vocabulary_refresh_failed_cold", exc_info=True, ttl=ttl)
+        return []
+    if ttl > 0:
+        _actor_vocab_cache = (names, now)  # ONE atomic replace — see the cache's own comment
+    return names
+
+
+def active_actors(sess: Session) -> list[tuple[int, str]]:
+    """(id, name) of every active Threat_Actor — the full-table comparison set for accept's
+    banded actor-name triage AND the seed for its in-accept memo (active_actor_names above
+    covers the prompt, which needs names only). One bounded read of a small table."""
+    ta = m.Threat_Actor
+    return [(r[0], r[1]) for r in sess.execute(
+        select(ta.ThreatActorID, ta.ThreatActorName)
+        .where(ta.IsActive == True, ta.IsDeleted == False)  # noqa: E712
+        .order_by(ta.ThreatActorID)
     )]
 
 
@@ -1699,8 +1774,13 @@ def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promote
     """Insert-if-not-exists keyed by `UX_ThreatActor_NaturalKey` (ThreatActorName, no sector);
     returns the winning ThreatActorID either way. Same first-writer provenance as
     upsert_threat_type."""
-    # See upsert_threat_type — ThreatActorName's real column width is Unicode(200).
-    name = name[:200]
+    # Width per upsert_threat_type (ThreatActorName is Unicode(200)); the strip is
+    # defense-in-depth for EVERY caller: a leading space defeats MSSQL name equality, so an
+    # unstripped variant would mint a duplicate master actor even if some future path skips
+    # the accept-side normalization boundary (_extract_actor_names_per_threat). strip ->
+    # bound -> rstrip, EXACTLY that boundary's shape: a slice ending on a space would store a
+    # name the accept memo's exact/casefold keys can never match (casefold doesn't strip).
+    name = name.strip()[:200].rstrip()
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Actor).values(
@@ -1719,23 +1799,88 @@ def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promote
 
 
 # ---------------------------------------------------------------------------
-# Threat_Candidate_Review — the curator queue CandidateStatus's own docstring calls "reserved...
-# set by the curator workflow when it lands". accept.py writes `pending` rows; these functions
-# are that workflow.
+# Threat_Candidate_Review — the curator queue. accept.py writes `pending` rows; these functions
+# are the workflow CandidateStatus's accepted/rejected comments name as their writer
+# (close_candidate_review, driven by accept.resolve_candidate).
 # ---------------------------------------------------------------------------
-def list_pending_candidates(sess: Session, *, limit: int) -> list[RowMapping]:
-    """Every candidate awaiting curator review, oldest first — the admin API's
-    GET /v1/tsg/threat-library/candidates. No filtered index needed: unlike promotion failures,
-    `Status='pending'` is this table's own overwhelmingly common value while a row is unresolved,
-    so a plain index on Status already keeps this narrow."""
+def candidate_identity_rows(sess: Session) -> list:
+    """RAW (CandidateKind, ProposedGenericName, ProposedName) of every PENDING and REJECTED
+    curation card, in ONE query — the input for accept_actors.pending_card_identities, which
+    owns the identity-folding rules (both fold conventions live beside their accept-side
+    writers, not down here). Rejected rows are included deliberately: an admin's "no" must
+    stick, so accepts suppress those identities too; accepted rows are excluded (their
+    identity lives in the master tables). Served by IX_ThreatCandidateReview_Status_Created
+    (Status leading); reject history grows monotonically but each row is three short columns —
+    revisit with a time bound or a covering INCLUDE only if it ever measurably bites.
+
+    Known, accepted window (NEW with the batched preload — the old memo-only guard had no
+    cross-session check at all): two accepts in the same instant can each read before either
+    inserts, so BOTH may queue one card for the same novelty (the table deliberately has no
+    unique index over free text). Cost: one duplicate admin card; close_candidate_review's
+    CAS makes resolving both safe."""
     cr = m.Threat_Candidate_Review
     return sess.execute(
-        select(cr.CandidateID, cr.TenantID, cr.EntityID, cr.SessionID, cr.ProposedCategory,
+        select(cr.CandidateKind, cr.ProposedGenericName, cr.ProposedName)
+        .where(cr.Status.in_((CandidateStatus.pending, CandidateStatus.rejected)))
+    ).all()
+
+
+def threat_type_active(sess: Session, type_id: int) -> bool:
+    """Liveness check for a queue-time grounded type id (resolve_candidate): is this
+    Threat_Type still active and not soft-deleted? A curator can retire a type between an
+    actor/threat card being queued and its approval; trusting the stale id would link an
+    actor to (or mint a catalogue entry under) a retired type while the audit reports
+    success. Same predicate as find_active_type_id_by_name, keyed by PK."""
+    return sess.execute(
+        select(m.Threat_Type.ThreatTypeID).where(
+            m.Threat_Type.ThreatTypeID == type_id,
+            m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
+    ).first() is not None
+
+
+def find_active_type_id_by_name(sess: Session, name: str | None) -> int | None:
+    """Find-only Threat_Type lookup by name, for actor-card approval (resolve_candidate): the
+    card stores the proposing threat's TYPE TEXT, and approval links only to a type that
+    actually exists by then. Returns an id ONLY on an unambiguous single active match: the
+    natural key is (name, category, sector), so one name can legally belong to several types —
+    master-data links are never guessed, so >1 match (or a NULL/blank name, e.g. a legacy card
+    predating the ProposedType stamp) returns None and the caller skips the link. Never mints."""
+    if not (name or "").strip():
+        return None
+    ids = sess.execute(
+        select(m.Threat_Type.ThreatTypeID).where(
+            # [:300] mirrors upsert_threat_type's width-bound mint, so an over-long card text
+            # still matches the (truncated) name the approval actually stored.
+            m.Threat_Type.ThreatTypeName == name[:300],
+            m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
+        .limit(2)
+    ).scalars().all()
+    return ids[0] if len(ids) == 1 else None
+
+
+def list_pending_candidates(sess: Session, *, limit: int, kind: str | None = None,
+                            status: str = CandidateStatus.pending) -> list[RowMapping]:
+    """Every candidate in one review state (default: awaiting curator review), oldest first —
+    the admin API's GET /v1/tsg/threat-library/candidates. `status='rejected'` enumerates the
+    standing identity blacklist (rejected cards permanently suppress re-queuing of their
+    identity, so without this the blacklist is invisible). Both `kind` and `status` filter IN
+    SQL, before the LIMIT — filtering after it would let one matching card hide forever behind
+    a page of older non-matching cards. NULL
+    CandidateKind counts as 'threat' (legacy rows). No filtered index needed: unlike promotion
+    failures, `Status='pending'` is this table's own overwhelmingly common value while a row is
+    unresolved, so a plain index on Status already keeps this narrow."""
+    cr = m.Threat_Candidate_Review
+    stmt = select(cr.CandidateID, cr.TenantID, cr.EntityID, cr.SessionID, cr.ProposedCategory,
             cr.ProposedType, cr.ProposedName, cr.ProposedGenericName, cr.Status,
-            cr.ThreatTypeID, cr.ThreatCatalogueID, cr.CreatedAt)
-        .where(cr.Status == CandidateStatus.pending)
-        .order_by(cr.CreatedAt.asc())
-        .limit(limit)
+            cr.ThreatTypeID, cr.ThreatCatalogueID, cr.CreatedAt, cr.CandidateKind, cr.CreatedBy
+        ).where(cr.Status == status)
+    if kind is not None:
+        if str(kind) == CandidateKind.actor:
+            stmt = stmt.where(cr.CandidateKind == CandidateKind.actor)
+        else:
+            stmt = stmt.where(or_(cr.CandidateKind == CandidateKind.threat, cr.CandidateKind.is_(None)))
+    return sess.execute(
+        stmt.order_by(cr.CreatedAt.asc()).limit(limit)
     ).mappings().all()
 
 
@@ -1746,23 +1891,31 @@ def get_candidate(sess: Session, candidate_id: str) -> RowMapping | None:
     return sess.execute(
         select(cr.CandidateID, cr.TenantID, cr.EntityID, cr.SessionID, cr.ProposedCategory,
             cr.ProposedType, cr.ProposedName, cr.ProposedGenericName, cr.Status,
-            cr.ThreatTypeID, cr.ThreatCatalogueID, cr.ReviewedBy, cr.ReviewedAt, cr.CreatedAt)
+            cr.ThreatTypeID, cr.ThreatCatalogueID, cr.ReviewedBy, cr.ReviewedAt, cr.CreatedAt,
+            cr.CandidateKind, cr.CreatedBy)
         .where(cr.CandidateID == candidate_id)
     ).mappings().first()
 
 
 def close_candidate_review(sess: Session, candidate_id: str, *, status: str,
                             reviewer_user_id: str | None, type_id: int | None = None,
-                            catalogue_id: int | None = None) -> bool:
+                            catalogue_id: int | None = None,
+                            clear_type_id: bool = False) -> bool:
     """CAS-guarded resolution of one candidate: matches only a row still `pending`, so a second
     concurrent approve/reject (two admins, or a double-click) matches 0 rows and returns False —
     the caller reports 409 instead of re-running (or silently re-reporting) a mint that already
     happened. `type_id`/`catalogue_id` are the library ids this candidate resolved to; left
-    unset (None → NULL columns unless already set) on a reject, since nothing was minted."""
+    unset (None → column untouched) on a reject, since nothing was minted. `clear_type_id`
+    (actor approve only): a resolved card's ThreatTypeID must record the LINK OUTCOME, and
+    None-means-untouched would leave a stale queue-time grounding (possibly a soft-deleted
+    type) on an accepted-but-unlinked card — set True to write NULL explicitly when type_id
+    is None, so the card, the audit, and the API response all agree."""
     cr = m.Threat_Candidate_Review
     values: dict[str, Any] = {"Status": status, "ReviewedBy": reviewer_user_id, "ReviewedAt": now()}
     if type_id is not None:
         values["ThreatTypeID"] = type_id
+    elif clear_type_id:
+        values["ThreatTypeID"] = None
     if catalogue_id is not None:
         values["ThreatCatalogueID"] = catalogue_id
     res = execute_dml(sess, update(cr)

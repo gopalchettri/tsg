@@ -307,7 +307,7 @@ independent patches** — implementing them separately or out of order breaks th
     actual request the page sends**: `headers()` ([sse_test.html:119](../app/static/sse_test.html))
     sends `X-Dev-User`/`X-Dev-Entities`, which `get_principal` never reads and which omits
     `X-API-Key` entirely — leftover from the retired dev-auth model
-    ([config.py:36-53](../app/core/config.py) `_RETIRED_SETTINGS`). As written, items 18+32 fix this
+    (those settings no longer exist in config.py and are ignored if set). As written, items 18+32 fix this
     file's parser bug and one comment but leave it 401ing on every connection — add an `X-API-Key`
     field and rename the two header keys to `X-User-Id`/`X-Entity-Id`, so the repo's one shipped SSE
     client can actually connect after this plan lands.

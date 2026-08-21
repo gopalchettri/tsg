@@ -391,7 +391,8 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
         # message, publishes the error SSE, and writes the audit row — the same discipline every
         # other generic-exception handler in this file already has (see the in-lock handler below,
         # and run_next_set's outer handler).
-        tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch)
+        tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch,
+                            extra={"user_note": redact(user_note)} if user_note else None)
         sess.commit()
         return tasks.decide_session_outcome(sess, scenario_session)
 
@@ -452,7 +453,8 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
             # autoretry_for retries instead of recording a permanent ERROR.
             raise
         except Exception as exc:  # noqa: BLE001 — capture, don't swallow ([R8], same discipline as _process_all_supporting_systems)
-            tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch)
+            tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch,
+                                extra={"user_note": redact(user_note)} if user_note else None)
             sess.commit()
 
     return tasks.decide_session_outcome(sess, scenario_session)

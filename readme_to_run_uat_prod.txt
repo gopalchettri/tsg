@@ -166,6 +166,12 @@ curl https://<uat-host>/ready      # 200 {"status":"ready"} -- DB + Redis + Mong
 #   The app self-applies a NO_PROXY bypass for the litellm host at boot. To confirm by hand:
 #     export NO_PROXY="$NO_PROXY,llmapi.govai.ae"
 #
+# Litellm calls still time out even with HTTP_PROXY/HTTPS_PROXY set (opposite case)
+#   If network support says the proxy is REQUIRED to reach the litellm host (not broken), the
+#   self-heal above is working against you -- it forces a direct connection every time. Set
+#   TSG_LITELLM_BYPASS_PROXY=false to disable it and let HTTP_PROXY/HTTPS_PROXY actually route
+#   litellm traffic through the proxy.
+#
 # App starts but behaves like dev
 #   .env.uat was not loaded. Re-run the STEP 0 confirmation command.
 #
@@ -181,3 +187,12 @@ curl https://<uat-host>/ready      # 200 {"status":"ready"} -- DB + Redis + Mong
 # Worker container restarts repeatedly, logs stop after "_init_worker"
 #   First boot does real network work (model checks, one chat call, threshold calibration).
 #   The healthcheck allows for it; if it still trips, the proxy is unreachable -- run STEP 1.
+
+# --- 2026-08-18: admin-gated library growth ---
+# TSG_PROMOTION_AUTO_APPROVE_ENABLED (UAT secrets set it to 'false') is now the MASTER
+# auto-mode switch, not just the name-triage band: false (default) = NOTHING new enters the
+# shared threat library at accept — novel threat types, names, AND actors all queue in the
+# admin candidates API (kind='threat' | 'actor') and actor->type links happen only on approval.
+# true = full auto at accept (types + clearly-novel names + actors + links, ai_auto_promoted).
+# DB prerequisite: re-run TSG_Core.sql (adds Threat_Candidate_Review.CandidateKind/CreatedBy,
+# relaxes ProposedCategory/ProposedType to NULL, and creates UX_Scenario_ActiveAccepted).

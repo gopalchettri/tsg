@@ -366,17 +366,37 @@ CREATE TABLE Threat_Candidate_Review (
     TenantID          nvarchar(200) NOT NULL,
     EntityID          nvarchar(200) NULL,
     SessionID         uniqueidentifier NOT NULL,
-    ProposedCategory  nvarchar(200) NOT NULL,
-    ProposedType      nvarchar(300) NOT NULL,
-    ProposedName      nvarchar(500) NOT NULL,
+    ProposedCategory  nvarchar(200) NULL,     -- NULL on actor candidates (kind='actor')
+    ProposedType      nvarchar(300) NULL,     -- actor candidates: the threat type the actor was
+                                              -- proposed FOR (approval's link target); NULL only on legacy rows
+    ProposedName      nvarchar(500) NOT NULL, -- threat name, or the actor name for kind='actor'
     ProposedGenericName nvarchar(500) NULL,  -- library-shaped name the curator generalizes toward
     Status            nvarchar(20)  NOT NULL,
     ThreatTypeID      int NULL,
     ThreatCatalogueID int NULL,
     ReviewedBy        nvarchar(200) NULL,
     ReviewedAt        datetime2 NULL,
-    CreatedAt         datetime2 NOT NULL
+    CreatedAt         datetime2 NOT NULL,
+    CandidateKind     nvarchar(20) NULL,      -- 'threat' | 'actor'; NULL = legacy 'threat'
+    CreatedBy         nvarchar(200) NULL      -- ORIGINAL proposer (accepting user), never the admin
 );
+
+-- Admin-gated library growth (2026-08-18): the queue now also holds ACTOR candidates
+-- (CandidateKind 'actor'; NULL = legacy 'threat' rows). On those, ProposedName is the actor and
+-- ProposedType names the threat type it was proposed for (approval's link target) — category is
+-- NULL, and both columns must become nullable (type is NULL on legacy actor rows queued before
+-- the type text was stamped). CreatedBy = the ORIGINAL proposer (the user whose accept raised
+-- the candidate); NULL reads honestly as "predates the column".
+IF COL_LENGTH('dbo.Threat_Candidate_Review', 'CandidateKind') IS NULL
+    ALTER TABLE dbo.Threat_Candidate_Review ADD CandidateKind nvarchar(20) NULL;
+IF COL_LENGTH('dbo.Threat_Candidate_Review', 'CreatedBy') IS NULL
+    ALTER TABLE dbo.Threat_Candidate_Review ADD CreatedBy nvarchar(200) NULL;
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Threat_Candidate_Review')
+           AND name = 'ProposedCategory' AND is_nullable = 0)
+    ALTER TABLE dbo.Threat_Candidate_Review ALTER COLUMN ProposedCategory nvarchar(200) NULL;
+IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Threat_Candidate_Review')
+           AND name = 'ProposedType' AND is_nullable = 0)
+    ALTER TABLE dbo.Threat_Candidate_Review ALTER COLUMN ProposedType nvarchar(300) NULL;
 
 -- Speeds up the curator queue's "list pending" read. Non-unique: names can legitimately recur.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_Session_Status' AND object_id = OBJECT_ID('dbo.Threat_Candidate_Review'))

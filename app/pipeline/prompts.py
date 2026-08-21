@@ -186,112 +186,6 @@ def build_base_context(asset_name: str, asset_context: dict[str, Any],
     }
 
 
-# def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: list[dict[str, Any]],
-#                     max_threats: int, categories: list[str] | None = None,
-#                     actor_examples: list[str] | None = None,
-#                     exclude: list[str] | None = None) -> list[dict]:
-#     """The Stage 1 prompt: propose candidate threats to the asset, grounded in the context."""
-#     cats = categories or _FALLBACK_STRIDE_CATEGORIES
-
-#     # Stage 1 CHOOSES the category; Stage 2 ACTS on it (_STRIDE_SCENARIO_SHAPES steers the
-#     # scenario's narrative shape). Defining it here from the SAME dict is what stops the two
-#     # stages drifting apart — a mislabel at Stage 1 now produces a confidently wrong Stage 2
-#     # narrative, so "exactly one of <six bare names>" is no longer enough guidance.
-#     # No prompt-cache constraint here: threats_prompt is called once per ROUND, not once per
-#     # threat, so there is no batch sharing a prefix. `cats` may legitimately vary per session.
-#     category_defs = [f"{c} → {_STRIDE_SCENARIO_SHAPES[c]}" for c in cats
-#                     if c in _STRIDE_SCENARIO_SHAPES]
-#     undefined = [c for c in cats if c not in _STRIDE_SCENARIO_SHAPES]
-#     if undefined:
-#         # A live Threat_Category renamed away from the canonical STRIDE names. Stage 1 can still
-#         # emit it, but Stage 2 will match no shape line and silently fall back to its RULE 4 for
-#         # every such threat — degradation with no other signal, so it is reported here.
-#         log.warning("prompt.stride_categories_undefined", categories=undefined,
-#                     defined=sorted(_STRIDE_SCENARIO_SHAPES))
-#     if actor_examples:
-#         actors_line = ("actors: labels chosen ONLY from this list: " + ", ".join(actor_examples)
-#                     + ". Empty list if none applies — never a label outside the list, never "
-#                     "invented group names or descriptive sentences.\n")
-#     else:
-#         actors_line = (f"actors: short generic role labels (for example: "
-#                     f"{_FALLBACK_ACTOR_VOCABULARY_HINT}) — never invented group names or "
-#                     "descriptive sentences. Empty list if the context evidences no specific actor.\n")
-#     coverage = ""
-#     if exclude:
-#         coverage = ("\n5) Repeat nothing from this ALREADY-COVERED list; propose only threats "
-#                     "materially different from every item in it: "
-#                     + "; ".join(redact(e) or "" for e in exclude)
-#                     + ". If nothing materially different remains, output an empty array [].")    
-#     return [
-#         {"role": "system", "content":
-#         "You are an enterprise threat-discovery analyst for critical infrastructure, "
-#         "identifying candidate BUSINESS-IMPACT threats to ONE protected asset. The asset is "
-#         "the only threat subject. Supporting systems in the context (databases, identity "
-#         "providers, gateways, cloud platforms) may be attacked, abused or fail — but they are "
-#         "attack paths, never threat subjects. Reason: supporting system → attack path → "
-#         "protected asset → business impact. Output only the resulting business impact on the "
-#         "asset.\n"
-#         "\nMETHOD — reason internally; output none of it\n"
-#         "1) Understand the asset first: why it exists, the business capability it supports, "
-#         "the information it holds or processes, who depends on it, why compromise would "
-#         "matter.\n"
-#         "2) For EVERY supporting system independently, determine how it supports the asset "
-#         "(stores, processes, transmits, authenticates, authorizes, administers, monitors, "
-#         "logs, protects, backs up, restores, integrates), then ask: if this system became "
-#         "malicious, unavailable, manipulated, spoofed, abused, misconfigured or fully "
-#         "compromised, what business impacts could ultimately reach the protected asset?\n"
-#         "3) Trace attack paths across trust relationships, authentication and authorization "
-#         "chains, administrative access, shared infrastructure, integrations, data flows, "
-#         "monitoring, logging, backup, disaster recovery and third-party dependencies — "
-#         "multi-hop, never one-hop only.\n"
-#         "4) Sweep the full impact space beyond obvious STRIDE hits: confidentiality, "
-#         "integrity, availability, authenticity, authorization, accountability, privacy, "
-#         "operational continuity, business-process integrity, financial operations, regulatory "
-#         "compliance, auditability, recoverability, safety, organizational trust, service "
-#         "delivery, decision integrity — including cascading failures and failures of "
-#         "recovery, monitoring, audit and backup.\n"
-#         "5) Uniqueness is judged ONLY by business impact: different attack paths, different "
-#         "supporting systems, or different wording producing the same business consequence are "
-#         "the SAME threat — propose one canonical threat per unique impact. Optimize for "
-#         "discovery of new, distinct impact families until every category is covered and the "
-#         "count in RULE 1 is reached — never by rewording the same impact to inflate the count.\n"
-#         "\nFIELDS\n"
-#         "name: '<impact> of <asset name>', using the asset's name exactly as the context gives "
-#         "it — e.g. 'Unauthorized disclosure of Citizen Personal Information', never 'SQL "
-#         "Injection against Oracle Database'. No attack techniques, tools or vectors — how a "
-#         "threat materializes is written at the scenario stage, not here.\n"
-#         "generic_name: the SAME impact as name with the asset, product and technology names "
-#         "removed — the library-shaped form, e.g. 'Unauthorized disclosure of sensitive "
-#         "information'. Same impact wording as name, generalized only — never placeholders "
-#         "like 'N/A' or 'None'; omit nothing, generalize.\n"
-#         "type: the generic impact in plain library terms, with no asset, product or technology "
-#         "names — " + "; ".join(
-#             f"{c} → {_STRIDE_TYPE_HINTS.get(c, 'impact on the asset')}" for c in cats) + ".\n"
-#         "category: exactly one of " + ", ".join(cats) + ". Choose by what the threat is actually "
-#         "ABOUT, not by how it might be carried out"
-#         + (" — " + "; ".join(category_defs) if category_defs else "") + ".\n"
-#         + actors_line +
-#         "\nRULES\n"
-#         f"1) Identify exactly {max_threats} distinct threats, most contextually relevant first, "
-#         "ensuring every category above is covered before a second threat is added to any one "
-#         "category.\n"
-#         "2) Ground every proposal in the supplied context and reasonable implications of "
-#         "evidenced relationships only — invent no technologies, products, users, "
-#         "integrations, regulations or business processes.\n"
-#         "3) Business consequences in defensive, enterprise risk language only: no "
-#         "vulnerabilities, exploits, malware, CVEs, payloads or procedural attack steps. "
-#         "Keep every field a short phrase — name and generic_name under 500 characters, "
-#         "type under 300, category under 200.\n"
-#         "4) These are candidates only, each independently checked against an approved threat "
-#         "library before use — you decide nothing." + coverage + "\n"
-#         "\nOutput ONLY a JSON array of {category, type, name, generic_name, actors:[]} objects "
-#         "— no markdown code fences, no text before or after it."},
-#         # Redaction and no-value scrubbing happen inside build_base_context; _context_message
-#         # adds the db-key scrub and the framing.
-#         {"role": "user",
-#         "content": _context_message(build_base_context(asset_name, asset_context, subsystems))},
-#     ]
-
 def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: list[dict[str, Any]],
                     max_threats: int, categories: list[str] | None = None,
                     actor_examples: list[str] | None = None,
@@ -317,12 +211,19 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         log.warning("prompt.stride_categories_undefined", categories=undefined,
                     defined=sorted(_STRIDE_SCENARIO_SHAPES))
     if actor_examples:
-        actors_line = ("actors: labels chosen ONLY from this list: " + ", ".join(actor_examples)
-                    + ". Empty list if none applies — never a label outside the list, never "
-                    "invented group names or descriptive sentences. The existence of users, "
-                    "vendors, administrators or outsourcing in the context does not by itself "
-                    "establish malicious activity — assign an actor only when it is relevant "
-                    "to this specific condition.\n")
+        # Same posture as `type`: the vocabulary steers spelling, it does not muzzle. A name
+        # outside the list survives grounding (canonicalize-and-keep) and reaches the
+        # admin-gated review queue at accept — the gate is the library door, not this prompt.
+        actors_line = ("actors: name the adversary behind this condition — a real, publicly "
+                    "documented group or a short generic role label. PREFER these existing "
+                    "labels, spelled EXACTLY as given, whenever one fits: "
+                    + ", ".join(actor_examples)
+                    + ". A name outside the list is allowed ONLY for a real, publicly "
+                    "documented group or a concise generic role — never a fabricated or "
+                    "speculative group name, never a descriptive sentence. Empty list if none "
+                    "applies. The existence of users, vendors, administrators or outsourcing "
+                    "in the context does not by itself establish malicious activity — assign "
+                    "an actor only when it is relevant to this specific condition.\n")
     else:
         actors_line = (f"actors: short generic role labels (for example: "
                     f"{_FALLBACK_ACTOR_VOCABULARY_HINT}) — never invented group names or "

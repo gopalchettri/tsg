@@ -70,6 +70,35 @@ Content-Type: application/json      # on requests with a body
 - **Timestamps:** all datetimes are UTC (ISO-8601).
 - **Pagination:** list endpoints take `limit`/`offset`. Only some responses carry a `total` (intel items, promotions, candidates) — the scenario lists, treatment register and audit feeds do **not**; page until a response comes back shorter than `limit`.
 
+### 2.4 Recommended fetch wrapper
+
+One wrapper keeps every call correct:
+
+```js
+const api = (path, { admin = false, ...init } = {}) =>
+  fetch(`${BASE_URL}${path}`, {
+    ...init,
+    headers: {
+      "X-API-Key": API_KEY,
+      "X-User-Id": ctx.userId,
+      "X-Entity-Id": ctx.entityId,
+      "X-Tenant-Id": ctx.tenantId,
+      ...(admin ? { "X-Admin-Key": ADMIN_KEY } : {}),
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...init.headers,
+    },
+  });
+```
+
+### 2.5 Handling auth failures
+
+- `401 unauthorized` — key or identity headers missing/invalid; the body is deliberately
+  generic, so check which header you dropped. A revoked key also lands here. Never retry
+  as-is.
+- `403 forbidden` — authenticated, but this user/entity may not touch this resource. Show
+  "no access"; do not retry. Everything is entity-scoped: a session created under entity 78
+  is a `404` under entity 79.
+
 ---
 
 ## 3. Common Error Responses
@@ -121,14 +150,47 @@ Long-running work returns **202 + an id**; you then poll a GET and/or subscribe 
 | Library import → `job_id` | `GET .../imports/{job_id}` | `GET .../imports/events/{job_id}` |
 | Intel refresh → `jobs{feed: job_id}` | `GET .../threat-intel/feeds` (no per-job GET) | `GET .../feeds/events/{job_id}` |
 
-**Typical end-to-end sequence (main user flow):**
+**The main user flow, step by step** (each endpoint's full detail + sample response is in §5):
 
-1. `POST /v1/sessions` → `202 session_id`.
-2. Open `GET /v1/sessions/{id}/events` (SSE) and poll `GET /v1/sessions/{id}` as backstop.
-3. When `progress.overall` = `awaiting_review` → `GET .../results` and render the review screen.
-4. Optional loops: `POST .../scenarios/next-set` ("generate more") and `POST .../regenerate/scenarios`, re-fetching `/results` after each result event/epoch match.
-5. `POST .../accept` → session `completed`; `GET .../accepted-scenarios` for the final record.
-6. (If the Treatment module is enabled:) `GET .../treatment-plans` board → `POST .../treatment-plan` per scenario (first time; later versions via `POST .../treatment-plan/regenerate`) → poll the GET on the same path → `POST .../treatment-plan/review` (optionally with `plan_id` to adopt an older version).
+1. **Preflight** — `GET /health` → `200 {"status":"ok"}` (no auth). Optional: `GET /ready`
+   for a per-dependency status badge.
+2. **Create the session** — `POST /v1/sessions` (§5.2) with the asset/supporting-system ids
+   from your host platform, plus an `Idempotency-Key` so a network retry is safe → `202
+   session_id`. Branch on `409 active_session_exists` (offer to open
+   `details.active_session_id`) and `503 capacity_exceeded` (honor `Retry-After`).
+3. **Watch progress** — open `GET /v1/sessions/{id}/events` (SSE) immediately AND poll
+   `GET /v1/sessions/{id}` as backstop. Render from the `reconcile` snapshot; drive the whole
+   UI state from `progress.overall`.
+4. **Render the review screen** — when `progress.overall` = `awaiting_review` →
+   `GET .../results`: threats + scenario cards (a failed card has `scenario: null` and
+   `validation_errors` — show it as a failure card, don't hide it). Excel: `.../results.xlsx`.
+5. **Optional loops** — "Generate more": `POST .../scenarios/next-set` (no body) → match the
+   returned `epoch` against `progress.last_next_set.epoch` (or the `next_set_result` event),
+   then re-fetch `/results`; on `outcome: "exhausted"` disable the button, on
+   `"partial_retryable"` offer a retry. "Regenerate selected": `POST
+   .../regenerate/scenarios` with `output_ids` (+ optional `user_note`) — same epoch-matching
+   pattern via `last_regen`. Both `409 regenerate_conflict` while another generation runs —
+   disable the buttons while one is in flight.
+6. **Accept (terminal — confirm with the user first)** — `POST .../accept` with
+   `{"mode":"all"}`, `{"mode":"none"}`, or `{"mode":"subset","output_ids":[…]}` → session
+   `completed`. Then render the permanent record: `GET .../accepted-scenarios`.
+   (`POST .../cancel` is the terminal abandon action.)
+7. **Treatment plans (optional module)** — per accepted scenario: `POST .../treatment-plan`
+   (first version) or `.../treatment-plan/regenerate` (later versions) → `202`; watch the
+   same session SSE stream for `treatment_plan_result` (advisory) and poll the GET on the
+   same path; `POST .../treatment-plan/review` records the decision (optionally with
+   `plan_id` to adopt an older version). Board: `GET .../treatment-plans`; entity register:
+   `GET /v1/entities/{id}/treatment-plans`.
+8. **Admin screens (optional)** — the curation queue (§5.8): list pending cards
+   (`?kind=threat|actor`), the rejected blacklist (`?status=rejected`), approve (mints with
+   the original proposer credited) or reject (identity stays suppressed); a concurrent
+   resolve returns `409` — refresh the queue. Promotions monitor + retry: §5.7.
+
+**Golden rules:** all four user headers on every non-admin call, key server-side in
+production (§2); SSE via `fetch()` streaming, never `EventSource`, always with the polling
+backstop; drive state from `progress.overall`, treat events as acceleration; match `epoch`
+to pair a click with its result and disable in-flight buttons; switch on `details.reason`
+for every 409; accept/cancel are terminal — confirm first.
 
 **SSE rules (UI-critical):**
 - Streams require the auth headers, so the browser `EventSource` API **cannot** be used. Use `fetch()` + `ReadableStream` parsing. A working reference client ships with the backend at `app/static/sse_test.html` (served at `/dev/sse-test` in dev environments only).
@@ -383,7 +445,13 @@ Match `epoch` against `progress.last_regen.epoch` on the board (or the `regen_re
 **Purpose:** Generates the next batch of scenarios (accumulating; nothing is replaced).
 **When to call:** "Generate more" button during review.
 **Request:** no body.
-**Response:** `202` — same shape as Regenerate with `"status": "generating"`; match `epoch` against `progress.last_next_set.epoch`. `last_next_set.outcome` tells you what happened: `complete` (full set), `partial_retryable` (click again to retry failures), `exhausted` (nothing further exists — disable the button).
+**Response:** `202` — same shape as Regenerate with `"status": "generating"`:
+
+```json
+{ "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "user_id": "jsmith", "status": "generating", "epoch": 2 }
+```
+
+Match `epoch` against `progress.last_next_set.epoch`. `last_next_set.outcome` tells you what happened: `complete` (full set), `partial_retryable` (click again to retry failures), `exhausted` (nothing further exists — disable the button).
 **Errors:** `409 regenerate_conflict` · `503`.
 
 ### Cancel Session
@@ -420,6 +488,19 @@ Match `epoch` against `progress.last_regen.epoch` on the board (or the `regen_re
 | `treatment_plan_result` | `output_id, plan_id, status, reason, ts` |
 | `error` | `scope ("stage"\|"session"\|null), subsystem_id, message, generation_epoch, ts` — **not necessarily terminal; do not tear the UI down on it** |
 | `heartbeat` | `session_id, ts` |
+
+Example frames:
+
+```text
+event: stage_completed
+data: {"type":"stage_completed","session_id":"5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e","subsystem_id":321,"stage":"SCENARIO_GENERATION","status":"COMPLETE","generation_epoch":1,"ts":"2026-08-15T02:04:11Z"}
+
+event: session_entered_review
+data: {"type":"session_entered_review","session_id":"5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e","status":"SCENARIOS_AWAITING_DECISION","generation_epoch":1,"ts":"2026-08-15T02:04:12Z"}
+
+event: heartbeat
+data: {"type":"heartbeat","session_id":"5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e","ts":"2026-08-15T02:04:27Z"}
+```
 
 The stream closes itself when the session leaves `active`.
 **Errors:** `503 sse_capacity_exceeded` (fall back to polling) · `404` · `403`.
@@ -475,7 +556,19 @@ Same headers as §5.2 (all four user headers).
 **Endpoint:** `/v1/entities/{entity_id}/scenarios`
 **Purpose:** Scenario history for one entity.
 **When to call:** Entity-level register screen.
-**Query & response:** identical to the user listing above.
+**Query & response:** identical to the user listing above:
+
+```json
+[
+  { "output_id": "9d4e8c2a-77b1-4b3a-9f6e-2c1d0a5b7e33", "supporting_system_id": 321, "threat_type_id": 5,
+    "threat_catalogue_id": 42, "threat_type": "Spoofing", "threat_name": "PLC identity spoofing",
+    "threat_actors": ["APT33"], "scenario": { "scenario_title": "…", "scenario_statement": "…", "risk_statement": "…" },
+    "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "entity_id": "78", "user_id": "jsmith",
+    "session_status": "completed", "scenario_number": 1, "accepted": true, "superseded": false,
+    "created_at": "2026-08-01T10:15:00" }
+]
+```
+
 **Errors:** `403` if the entity is not in the caller's authorized set.
 
 ### Get One Scenario
@@ -485,7 +578,17 @@ Same headers as §5.2 (all four user headers).
 **Purpose:** One scenario row regardless of its flags — use it to inspect superseded versions or failure cards (`scenario` is `null` on those).
 **When to call:** Scenario detail view / history drill-down.
 **Query:** `user_id` (string, **required**) — mismatch returns `404`.
-**Response:** `200` — one scenario list item (same shape as above).
+**Response:** `200` — one scenario list item (same shape as above):
+
+```json
+{ "output_id": "9d4e8c2a-77b1-4b3a-9f6e-2c1d0a5b7e33", "supporting_system_id": 321, "threat_type_id": 5,
+  "threat_catalogue_id": 42, "threat_type": "Spoofing", "threat_name": "PLC identity spoofing",
+  "threat_actors": ["APT33"], "scenario": { "scenario_title": "…", "scenario_statement": "…", "risk_statement": "…" },
+  "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "entity_id": "78", "user_id": "jsmith",
+  "session_status": "completed", "scenario_number": 1, "accepted": true, "superseded": false,
+  "created_at": "2026-08-01T10:15:00" }
+```
+
 **Errors:** `404`, `403`, `422` (missing `user_id`).
 
 ---
@@ -547,7 +650,11 @@ Same headers as §5.2 (all four user headers). Treatment plans apply to **accept
 
 - `user_note` (optional, ≤1000): steering for this regeneration; **replaces** the previous version's note entirely (omit for none). This is the only field.
 
-**Response:** `202` — same shape as Generate.
+**Response:** `202` — same shape as Generate:
+
+```json
+{ "plan_id": "…", "session_id": "…", "output_id": "…", "status": "RUNNING" }
+```
 
 **Errors:** `409 treatment_conflict` with `details.reason` ∈ `scenario_not_accepted | generation_in_progress` · `404` (no plan ever generated — use Generate first) · `500` (enqueue failure; plan parked in ERROR).
 
@@ -573,12 +680,15 @@ Same headers as §5.2 (all four user headers). Treatment plans apply to **accept
   "plan": {
     "title": "…", "treatment_plan": "…", "action_plan": "…",
     "applicable_to_all_subsystems": "No",
-    "controls_to_be_implemented": { "control_coverage": "gaps", "controls": ["…"] },
+    "controls_to_be_implemented": { "control_coverage": "gaps",
+      "controls": [
+        { "control_type": "preventive", "control_name": "Account Management",
+          "description": "…", "priority": "Critical",
+          "control_code": "AC-2", "control_library_id": 9 }
+      ] },
     "remediation_action_plan": "…", "mitigation_timeline": "…", "mitigation_owner": "…",
     "risk_owner": "…", "impacted_business_division": "…"
   },
-  "warnings": [],
-  "moderation_flagged": false,
   "error_message": null,
   "reason": null,
   "superseded": null
@@ -712,7 +822,20 @@ Same headers as §5.2 (all four user headers). Treatment plans apply to **accept
 **Purpose:** Entity-wide treatment audit events, newest first.
 **When to call:** Compliance/audit feed screen.
 **Query:** `from` / `to` (ISO datetime, optional) · `user_id` (optional) · `limit` (default 200, max 1000) · `offset` (default 0).
-**Response:** `200` — `{ "entity_id", "limit", "offset", "events": [ …same event shape as above, with session_id populated… ] }`
+**Response:** `200` — same event shape as above, with `session_id` populated:
+
+```json
+{
+  "entity_id": "78", "limit": 200, "offset": 0,
+  "events": [
+    { "at": "2026-08-15T09:00:00", "event": "reviewed", "actor": "jsmith", "actor_type": "user",
+      "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "detail": { } },
+    { "at": "2026-08-15T08:59:00", "event": "requested", "actor": "jsmith", "actor_type": "user",
+      "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "detail": { } }
+  ]
+}
+```
+
 **Errors:** `403`.
 
 ### Treatment Plan Evidence
@@ -764,7 +887,11 @@ All four action endpoints share the same body and return `202` with a `job_id`:
 **Endpoint:** `/v1/tsg/threat-library/embeddings/create`
 **Purpose:** Embed specific newly added items. **Both `group` and `names` are required here** (422 otherwise).
 **When to call:** After adding named library items outside the CRUD API.
-**Response:** `202` → `{ "job_id": "…" }`
+**Response:** `202`
+
+```json
+{ "job_id": "b7e2c9a4-1f35-4c8e-9d21-7a6f0b3c5d18" }
+```
 
 ### Update Embeddings
 
@@ -772,7 +899,11 @@ All four action endpoints share the same body and return `202` with a `job_id`:
 **Endpoint:** `/v1/tsg/threat-library/embeddings/update`
 **Purpose:** Whole-group sync — embeds whatever is missing. Body may be `{}`.
 **When to call:** Routine sync, or after a CRUD write returned a null `embeddings_job_id` warning.
-**Response:** `202` → `{ "job_id": "…" }`
+**Response:** `202`
+
+```json
+{ "job_id": "b7e2c9a4-1f35-4c8e-9d21-7a6f0b3c5d18" }
+```
 
 ### Recreate Embeddings
 
@@ -780,7 +911,11 @@ All four action endpoints share the same body and return `202` with a `job_id`:
 **Endpoint:** `/v1/tsg/threat-library/embeddings/recreate`
 **Purpose:** Wipe then re-embed. `names` without `group` → 422.
 **When to call:** After model/config changes that invalidate stored vectors.
-**Response:** `202` → `{ "job_id": "…" }`
+**Response:** `202`
+
+```json
+{ "job_id": "b7e2c9a4-1f35-4c8e-9d21-7a6f0b3c5d18" }
+```
 
 ### Delete Embeddings
 
@@ -788,7 +923,11 @@ All four action endpoints share the same body and return `202` with a `job_id`:
 **Endpoint:** `/v1/tsg/threat-library/embeddings/delete`
 **Purpose:** Wipe vectors without re-embedding. `group` and `names` cannot both be omitted (422).
 **When to call:** Cleanup only.
-**Response:** `202` → `{ "job_id": "…" }`
+**Response:** `202`
+
+```json
+{ "job_id": "b7e2c9a4-1f35-4c8e-9d21-7a6f0b3c5d18" }
+```
 
 ### Get Embedding Job Status
 
@@ -811,7 +950,17 @@ All four action endpoints share the same body and return `202` with a `job_id`:
 **Endpoint:** `/v1/tsg/threat-library/embeddings/events/{job_id}`
 **Purpose:** Live updates for one embedding job (event type `embedding_job_update`; snapshot on connect; closes when terminal).
 **When to call:** Instead of tight polling, per §4's SSE rules.
-**Response:** `200`, `text/event-stream`. **Errors:** `404` · `503 sse_capacity_exceeded`.
+**Response:** `200`, `text/event-stream`. Example frames:
+
+```text
+event: embedding_job_update
+data: {"type":"embedding_job_update","job_id":"b7e2c9a4-1f35-4c8e-9d21-7a6f0b3c5d18","state":"STARTED"}
+
+event: embedding_job_update
+data: {"type":"embedding_job_update","job_id":"b7e2c9a4-1f35-4c8e-9d21-7a6f0b3c5d18","state":"SUCCESS","rows_processed":{"threat_type":12},"vectors_deleted":null}
+```
+
+**Errors:** `404` · `503 sse_capacity_exceeded`.
 
 ---
 
@@ -869,7 +1018,12 @@ Errors here use FastAPI's plain shape: `{"detail": "..."}`.
 **Purpose:** Deactivates a client's key immediately.
 **When to call:** Key rotation or compromise.
 **Request:** no body (`X-User-Id` required).
-**Response:** `200` → `{ "client_id": "ui-bff", "status": "revoked" }`
+**Response:** `200`
+
+```json
+{ "client_id": "ui-bff", "status": "revoked" }
+```
+
 **Errors:** `400` · `404` (no active client with that id).
 
 ---
@@ -905,7 +1059,16 @@ Admin headers (§2.2). "Promotions" are post-completion library-promotion attemp
 **Endpoint:** `/v1/tsg/sessions/promotions/{session_id}`
 **Purpose:** One promotion's detail (same row shape as above).
 **When to call:** Drill-down from the list.
-**Response:** `200`. **Errors:** `404`.
+**Response:** `200`
+
+```json
+{ "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "entity_id": "78", "asset_id": "103",
+  "asset_name": "SCADA Server", "failed_at": "2026-08-15T02:00:00Z", "attempts": 2, "max_attempts": 5,
+  "exhausted": false, "error": "promotion transaction deadlocked", "user_id": "jsmith",
+  "completed_at": "2026-08-15T01:58:40Z" }
+```
+
+**Errors:** `404`.
 
 ### Retry Promotion
 
@@ -914,7 +1077,12 @@ Admin headers (§2.2). "Promotions" are post-completion library-promotion attemp
 **Purpose:** Retries the promotion **synchronously** (not a job).
 **When to call:** Admin clicks "Retry".
 **Request:** no body.
-**Response:** `200` → `{ "session_id": "…", "outcome": "succeeded" }` — `outcome`: `succeeded | failed | skipped`.
+**Response:** `200` — `outcome`: `succeeded | failed | skipped`.
+
+```json
+{ "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "outcome": "succeeded" }
+```
+
 **Errors:** `404`.
 
 ### Dismiss Promotion
@@ -923,33 +1091,58 @@ Admin headers (§2.2). "Promotions" are post-completion library-promotion attemp
 **Endpoint:** `/v1/tsg/sessions/promotions/{session_id}`
 **Purpose:** Removes the pending promotion without retrying.
 **When to call:** Admin clicks "Dismiss".
-**Response:** `200` — same `PromotionRetryResult` shape. **Errors:** `404`.
+**Response:** `200` — same `PromotionRetryResult` shape:
+
+```json
+{ "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "outcome": "succeeded" }
+```
+
+**Errors:** `404`.
 
 ---
 
 ## 5.8 Threat Library Candidates
 
-Admin headers (§2.2). Candidates are AI-proposed threat names awaiting curation into the library.
+Admin headers (§2.2). The queue holds EVERYTHING new the AI pipeline proposes — threats
+(`kind: "threat"` — a type+name pair) **and actors** (`kind: "actor"` — the actor name, with
+`proposed_type` showing which threat TYPE the actor was proposed for, so the reviewer sees the
+association approval will create; `proposed_category` is `null` on actor rows). With
+`promotion_auto_approve_enabled` off (the default), nothing enters the shared library without
+an approval here (previously novel types auto-minted and novel actors were silently dropped).
 
 ### List Candidates
 
 **Method:** `GET`
 **Endpoint:** `/v1/tsg/threat-library/candidates`
-**Purpose:** Pending AI-proposed threats.
-**When to call:** Curation screen.
-**Query:** `limit` (default 100).
+**Purpose:** Pending AI-proposed threats AND actors — or the standing rejected blacklist.
+**When to call:** Curation screen; blacklist view.
+**Query:** `limit` (default 100) · `kind` (`threat` | `actor`, optional — omit for both) ·
+`status` (`pending` default | `rejected` — rejected identities never re-queue and never
+auto-mint, so this view is the audit trail of every standing "no").
 **Response:** `200`
 
 ```json
 {
   "candidates": [
     { "candidate_id": "…", "session_id": "…", "entity_id": "78",
+      "kind": "threat", "created_by": "sara",
       "proposed_category": "Tampering", "proposed_type": "…", "proposed_name": "…",
-      "proposed_generic_name": null, "status": "pending", "created_at": "2026-08-15T02:00:00Z" }
+      "proposed_generic_name": null, "threat_type_id": null,
+      "status": "pending", "created_at": "2026-08-15T02:00:00Z" },
+    { "candidate_id": "…", "session_id": "…", "entity_id": "78",
+      "kind": "actor", "created_by": "sara",
+      "proposed_category": null, "proposed_type": "Firmware Tampering",
+      "proposed_name": "State-sponsored group APT-X",
+      "proposed_generic_name": null, "threat_type_id": 210,
+      "status": "pending", "created_at": "2026-08-15T02:01:00Z" }
   ],
-  "total": 1
+  "total": 2
 }
 ```
+
+`created_by` is the ORIGINAL proposer (the user whose accept raised the card); on approval the
+minted master row's `CreatedBy` credits that user — the approving admin lands on the card's
+reviewer fields and the audit trail.
 
 ### Get One Candidate
 
@@ -957,17 +1150,39 @@ Admin headers (§2.2). Candidates are AI-proposed threat names awaiting curation
 **Endpoint:** `/v1/tsg/threat-library/candidates/{candidate_id}`
 **Purpose:** One candidate's detail (same row shape).
 **When to call:** Drill-down.
-**Response:** `200`. **Errors:** `404`.
+**Response:** `200`
+
+```json
+{ "candidate_id": "c9a8b7c6-d5e4-4f3a-9b1c-0d9e8f7a6b5c", "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
+  "entity_id": "78", "kind": "threat", "created_by": "sara",
+  "proposed_category": "Tampering", "proposed_type": "Firmware Tampering",
+  "proposed_name": "Firmware supply-chain tampering", "proposed_generic_name": null,
+  "threat_type_id": null, "status": "pending", "created_at": "2026-08-15T02:00:00Z" }
+```
+
+**Errors:** `404`.
 
 ### Approve Candidate
 
 **Method:** `POST`
 **Endpoint:** `/v1/tsg/threat-library/candidates/{candidate_id}/approve`
-**Purpose:** Accepts the candidate into the library.
+**Purpose:** Accepts the candidate into the library — a threat card mints its type+catalogue
+entry (reusing the card's `threat_type_id` while that type is still active, else creating one);
+an actor card mints the `Threat_Actor` row and links it to the type the card names, resolved
+at approval time in two steps: the card's `threat_type_id` is used FIRST when that type is
+still active and not deleted; a null or dead id falls back to matching the `proposed_type`
+text (approve the sibling threat card first and the link lands on its freshly minted type; if
+no active type — or more than one — matches, the actor is created UNLINKED,
+`threat_type_id: null` in the response AND on the resolved card, and the skip is audited).
+Minted rows credit the ORIGINAL proposer.
 **When to call:** Curator approves.
 **Request:** no body.
-**Response:** `200` → `{ "candidate_id": "…", "status": "accepted", "threat_type_id": 5, "threat_catalogue_id": 42 }`
-**Errors:** `404` · `409 accept_conflict` (already reviewed).
+**Response:** `200` (actor cards: `threat_catalogue_id` is null; `threat_type_id` is the linked type or null)
+
+```json
+{ "candidate_id": "c9a8b7c6-d5e4-4f3a-9b1c-0d9e8f7a6b5c", "status": "accepted", "threat_type_id": 5, "threat_catalogue_id": 42 }
+```
+**Errors:** `404` · `409 accept_conflict` (already reviewed — a losing concurrent approve/reject is rolled back whole, leaving no library rows behind).
 
 ### Reject Candidate
 
@@ -976,7 +1191,13 @@ Admin headers (§2.2). Candidates are AI-proposed threat names awaiting curation
 **Purpose:** Rejects the candidate.
 **When to call:** Curator rejects.
 **Request:** no body.
-**Response:** `200` — same shape with `"status": "rejected"` (ids null). **Errors:** `404` · `409`.
+**Response:** `200` — same shape with `"status": "rejected"` (ids null):
+
+```json
+{ "candidate_id": "c9a8b7c6-d5e4-4f3a-9b1c-0d9e8f7a6b5c", "status": "rejected", "threat_type_id": null, "threat_catalogue_id": null }
+```
+
+**Errors:** `404` · `409`.
 
 ---
 
@@ -995,14 +1216,17 @@ Admin headers (§2.2). Bulk-imports external threat libraries (MITRE ATT&CK, MIS
 ```json
 {
   "sources": [
-    { "source": "attack", "source_tag": "…", "loaded": true,
-      "type_count": 14, "threat_count": 800, "actor_count": null,
-      "last_run": { "status": "SUCCESS", "dry_run": false } }
+    { "source": "attack_ics", "source_tag": "mitre_attack_ics", "loaded": true,
+      "type_count": 12, "threat_count": 95, "actor_count": null,
+      "last_run": { "status": "success", "dry_run": false,
+                    "started_at": "2026-07-27T09:14:00Z", "finished_at": "2026-07-27T09:16:12Z",
+                    "error": null, "types_imported": 12, "threats_imported": 95,
+                    "started_by": "jsmith" } }
   ]
 }
 ```
 
-(`last_run` keys beyond `status`/`dry_run`: `<TO_BE_CONFIRMED>`.)
+(`last_run` is null if the source was never attempted; keys: `status, dry_run, started_at, finished_at, error, types_imported, threats_imported, actors_upserted` (misp_actors only), `started_by` — null for CLI-driven runs. `actor_count` is populated for `misp_actors` only.)
 
 ### Start Import
 
@@ -1021,7 +1245,12 @@ Admin headers (§2.2). Bulk-imports external threat libraries (MITRE ATT&CK, MIS
 - `max_actors` (int, default 40, min 1) — `misp_actors` only.
 - `file_content` (string) — **the "uploaded" file as JSON text inside this JSON body** (no multipart upload anywhere in this API). Size-capped by the server (422 if over; 413 if the whole request exceeds the body limit).
 
-**Response:** `202` → `{ "job_id": "…" }`
+**Response:** `202`
+
+```json
+{ "job_id": "e4f1a2b3-6c7d-4e8f-9a0b-1c2d3e4f5a6b" }
+```
+
 **Errors:** `404` (unknown source) · `422 threat_library_import_error` (bad flag combination, oversized/unparseable content) · `413`.
 
 ### Get Import Job Status
@@ -1030,7 +1259,19 @@ Admin headers (§2.2). Bulk-imports external threat libraries (MITRE ATT&CK, MIS
 **Endpoint:** `/v1/tsg/threat-library/imports/{job_id}`
 **Purpose:** Poll an import job.
 **When to call:** After the 202, until `state` is terminal.
-**Response:** `200` → `{ "state": "SUCCESS", "result": { … }, "error": null }` — `state` as in §5.5; `result` holds run stats on SUCCESS (exact keys `<TO_BE_CONFIRMED>`; OT-source real runs include `ot_rules` and `embeddings_job_id`).
+**Response:** `200` — `state` as in §5.5; `result` holds run stats on SUCCESS. Every source reports `source, dry_run, skipped_count, skipped`; catalogue sources add `types, threats, new_category_links, before_count, after_count, ot_rules` (`ot_rules` non-empty for OT sources only); `misp_actors` adds `actors_upserted` instead; real (non-dry) runs also carry `embeddings_job_id`.
+
+```json
+{
+  "state": "SUCCESS",
+  "result": { "source": "attack", "dry_run": false, "skipped_count": 3, "skipped": [],
+              "types": 14, "threats": 800, "new_category_links": 2,
+              "before_count": 0, "after_count": 800, "ot_rules": [],
+              "embeddings_job_id": "b7e2c9a4-1f35-4c8e-9d21-7a6f0b3c5d18" },
+  "error": null
+}
+```
+
 **Errors:** `404`.
 
 ### Import Job Events (SSE)
@@ -1039,7 +1280,17 @@ Admin headers (§2.2). Bulk-imports external threat libraries (MITRE ATT&CK, MIS
 **Endpoint:** `/v1/tsg/threat-library/imports/events/{job_id}`
 **Purpose:** Live updates for one import job (event type `import_job_update`).
 **When to call:** Instead of tight polling (§4 SSE rules apply).
-**Response:** `200`, `text/event-stream`. **Errors:** `404` · `503`.
+**Response:** `200`, `text/event-stream`. Example frames:
+
+```text
+event: import_job_update
+data: {"type":"import_job_update","job_id":"e4f1a2b3-6c7d-4e8f-9a0b-1c2d3e4f5a6b","state":"STARTED","source":"attack"}
+
+event: import_job_update
+data: {"type":"import_job_update","job_id":"e4f1a2b3-6c7d-4e8f-9a0b-1c2d3e4f5a6b","state":"SUCCESS","source":"attack","dry_run":false,"skipped_count":3,"skipped":[],"types":14,"threats":800,"new_category_links":2,"before_count":0,"after_count":800,"ot_rules":[],"embeddings_job_id":"b7e2c9a4-1f35-4c8e-9d21-7a6f0b3c5d18"}
+```
+
+**Errors:** `404` · `503`.
 
 ---
 
@@ -1071,7 +1322,15 @@ Admin headers (§2.2). Five resources, one pattern:
 ```
 
 Required: `threat_category_id` (int ≥ 1), `threat_category_name` (1–200). Optional: `threat_category_code` (≤20), `security_objective` (≤200), `is_active` (default `true`). PATCH accepts the same fields minus the id.
-**Row response:** the fields above + audit block.
+**Row response:** the fields above + audit block:
+
+```json
+{ "threat_category_id": 7, "threat_category_name": "Elevation of Privilege",
+  "threat_category_code": "EOP", "security_objective": "Authorization",
+  "is_active": true, "is_deleted": false, "source": null,
+  "created_at": "2026-08-15T02:00:00Z", "created_by": "admin1",
+  "updated_at": null, "updated_by": null, "embeddings_job_id": null }
+```
 
 ### Threat Types — `/v1/tsg/threat-library/threat-types`
 
@@ -1088,7 +1347,15 @@ Required: `threat_category_id` (int ≥ 1), `threat_category_name` (1–200). Op
 ```
 
 Required: `threat_type_name` (1–300). Optional: `description`, `sector_id` (≥1), `threat_category_id` (≥1, must be a live category → else 404), `is_active`, `actor_names` (linked best-effort). On PATCH, `actor_names` links **additively** (never removes); an actors-only PATCH is legal. A rename queues re-embedding → non-null `embeddings_job_id`.
-**Row response:** `threat_type_id, threat_type_name, description, sector_id, threat_category_id` + audit block.
+**Row response:** `threat_type_id, threat_type_name, description, sector_id, threat_category_id` + audit block:
+
+```json
+{ "threat_type_id": 5, "threat_type_name": "Ransomware", "description": "Malware that encrypts data for extortion.",
+  "sector_id": 95, "threat_category_id": 7,
+  "is_active": true, "is_deleted": false, "source": null,
+  "created_at": "2026-08-15T02:00:00Z", "created_by": "admin1",
+  "updated_at": null, "updated_by": null, "embeddings_job_id": null }
+```
 
 ### Threat Catalogue — `/v1/tsg/threat-library/threat-catalogue`
 
@@ -1105,7 +1372,15 @@ Required: `threat_type_name` (1–300). Optional: `description`, `sector_id` (�
 ```
 
 Required: `threat_type_id` (≥1, live), `threat_name` (1–500). Optional: `description`, `sector_id`, `is_active`.
-**Row response:** `threat_catalogue_id, threat_type_id, threat_name, description, sector_id` + audit block.
+**Row response:** `threat_catalogue_id, threat_type_id, threat_name, description, sector_id` + audit block:
+
+```json
+{ "threat_catalogue_id": 42, "threat_type_id": 5, "threat_name": "Ransomware on historian server",
+  "description": "Encryption of the OT historian database for extortion.", "sector_id": 95,
+  "is_active": true, "is_deleted": false, "source": null,
+  "created_at": "2026-08-15T02:00:00Z", "created_by": "admin1",
+  "updated_at": null, "updated_by": null, "embeddings_job_id": null }
+```
 
 ### Threat Actors — `/v1/tsg/threat-library/threat-actors`
 
@@ -1115,7 +1390,14 @@ Required: `threat_type_id` (≥1, live), `threat_name` (1–500). Optional: `des
 | `PATCH` / `DELETE` | `/v1/tsg/threat-library/threat-actors/{threat_actor_id}` |
 
 **Create request:** `{ "threat_actor_name": "FIN7", "is_capable": 1, "is_active": true }` — required: `threat_actor_name` (1–200). Actors are not embedded → `embeddings_job_id` always null.
-**Row response:** `threat_actor_id, threat_actor_name, is_capable` + audit block.
+**Row response:** `threat_actor_id, threat_actor_name, is_capable` + audit block:
+
+```json
+{ "threat_actor_id": 61, "threat_actor_name": "FIN7", "is_capable": 1,
+  "is_active": true, "is_deleted": false, "source": null,
+  "created_at": "2026-08-15T02:00:00Z", "created_by": "admin1",
+  "updated_at": null, "updated_by": null, "embeddings_job_id": null }
+```
 
 ### Threat Rules — `/v1/tsg/threat-library/threat-rules`
 
@@ -1139,7 +1421,13 @@ Scoping rules that gate/weight threat families. **List** adds one extra query pa
 - `rule_value` (optional, ≤450) · `weight` (optional; **forbidden on `tech_gate`**) · `is_active` (default `true`).
 - **PATCH:** only `rule_value`, `weight`, `is_active` are mutable (`rule_type`/`rule_key`/`threat_type_id` are immutable — retire and recreate instead). An explicit `"weight": null` clears the override.
 
-**Row response:** `threat_rule_id, rule_type, threat_type_id, rule_key, rule_value, weight, is_active, is_deleted, created_at, created_by, updated_at, updated_by`.
+**Row response:** `threat_rule_id, rule_type, threat_type_id, rule_key, rule_value, weight, is_active, is_deleted, created_at, created_by, updated_at, updated_by`:
+
+```json
+{ "threat_rule_id": 3, "rule_type": "relevance_flag", "threat_type_id": 12, "rule_key": "asset_type",
+  "rule_value": "Operational Technology (OT)", "weight": 10.0, "is_active": true, "is_deleted": false,
+  "created_at": "2026-08-15T02:00:00Z", "created_by": "admin1", "updated_at": null, "updated_by": null }
+```
 **Errors:** `422 admin_validation_error` (bad `rule_type`/`rule_key`, weight on a tech_gate, empty PATCH).
 
 ---
@@ -1156,7 +1444,14 @@ Admin headers (§2.2). Same shared pattern as §5.10 (list params, soft delete, 
 | `PATCH` / `DELETE` | `/v1/tsg/control-library/standards/{standard_id}` |
 
 **Create request:** `{ "standard_name": "ISO 27001", "is_active": true }` — required: `standard_name` (1–200). Standards are not embedded.
-**Row response:** `standard_id, standard_name` + audit block.
+**Row response:** `standard_id, standard_name` + audit block:
+
+```json
+{ "standard_id": 1, "standard_name": "ISO 27001",
+  "is_active": true, "is_deleted": false, "source": null,
+  "created_at": "2026-08-15T02:00:00Z", "created_by": "admin1",
+  "updated_at": null, "updated_by": null, "embeddings_job_id": null }
+```
 
 ### Controls — `/v1/tsg/control-library/controls`
 
@@ -1176,6 +1471,15 @@ Admin headers (§2.2). Same shared pattern as §5.10 (list params, soft delete, 
 Required: `control_code` (1–20, the natural key), `itot` (`IT`/`OT`), `domain` (1–200), `control_name` (1–500), `control_description` (min 1). Optional: `sample_evidence`, `is_active`. Editing `control_name` **or** `control_description` queues re-embedding.
 **Row response:** `control_library_id, control_code, itot, domain, control_name, control_description, sample_evidence` + audit block. (URL segment is `{control_id}`; the response field is `control_library_id`.)
 
+```json
+{ "control_library_id": 9, "control_code": "AC-2", "itot": "IT", "domain": "Access Control",
+  "control_name": "Account Management", "control_description": "Manage system accounts, group memberships, and access authorizations.",
+  "sample_evidence": null,
+  "is_active": true, "is_deleted": false, "source": null,
+  "created_at": "2026-08-15T02:00:00Z", "created_by": "admin1",
+  "updated_at": null, "updated_by": null, "embeddings_job_id": null }
+```
+
 ### Link Control ↔ Standard
 
 **Method:** `POST`
@@ -1183,7 +1487,12 @@ Required: `control_code` (1–20, the natural key), `itot` (`IT`/`OT`), `domain`
 **Purpose:** Tags a control with a standard. Idempotent — re-linking an existing pair returns `201` unchanged, never 409.
 **When to call:** Admin assigns standards on the control editor.
 **Request:** no body.
-**Response:** `201` → `{ "control_library_id": 9, "standard_ids": [1, 2], "standards": ["ISO 27001", "NIST CSF"] }`
+**Response:** `201`
+
+```json
+{ "control_library_id": 9, "standard_ids": [1, 2], "standards": ["ISO 27001", "NIST CSF"] }
+```
+
 **Errors:** `404` (control or standard missing/deleted).
 
 ### Unlink Control ↔ Standard
@@ -1192,7 +1501,12 @@ Required: `control_code` (1–20, the natural key), `itot` (`IT`/`OT`), `domain`
 **Endpoint:** `/v1/tsg/control-library/controls/{control_id}/standards/{standard_id}`
 **Purpose:** Removes the tag — **hard delete** (the only one in this API).
 **When to call:** Admin removes a standard tag.
-**Response:** `200` — same shape as Link.
+**Response:** `200` — same shape as Link:
+
+```json
+{ "control_library_id": 9, "standard_ids": [1], "standards": ["ISO 27001"] }
+```
+
 **Errors:** `404` (pair was not linked).
 
 ---
@@ -1247,7 +1561,11 @@ Admin headers (§2.2). External threat-intelligence feeds that inform generation
 **Purpose:** Queues a refresh of every enabled feed — one job per feed.
 **When to call:** Admin clicks "Refresh all".
 **Request:** no body.
-**Response:** `202` → `{ "jobs": { "feed_name": "job_id", "…": "…" } }`
+**Response:** `202`
+
+```json
+{ "jobs": { "cisa_kev": "f0e1d2c3-b4a5-4968-8776-655443322110", "otx": "a1b2c3d4-e5f6-4708-9a0b-c1d2e3f4a5b6" } }
+```
 
 ### Refresh One Feed
 
@@ -1256,7 +1574,12 @@ Admin headers (§2.2). External threat-intelligence feeds that inform generation
 **Purpose:** Queues a refresh of one feed.
 **When to call:** Per-feed "Refresh" button.
 **Request:** no body.
-**Response:** `202` — same shape (one entry).
+**Response:** `202` — same shape (one entry):
+
+```json
+{ "jobs": { "otx": "a1b2c3d4-e5f6-4708-9a0b-c1d2e3f4a5b6" } }
+```
+
 **Errors:** `404` — unknown feed **or a known-but-disabled feed**.
 
 ### Intel Job Events (SSE)
@@ -1265,4 +1588,14 @@ Admin headers (§2.2). External threat-intelligence feeds that inform generation
 **Endpoint:** `/v1/tsg/threat-intel/feeds/events/{job_id}`
 **Purpose:** Live updates for one refresh job (event type `intel_job_update`; note `RETRY` is non-terminal here).
 **When to call:** After a refresh, per §4's SSE rules; confirm final state via `GET /feeds`.
-**Response:** `200`, `text/event-stream`. **Errors:** `404` · `503`.
+**Response:** `200`, `text/event-stream`. Example frames:
+
+```text
+event: intel_job_update
+data: {"type":"intel_job_update","job_id":"a1b2c3d4-e5f6-4708-9a0b-c1d2e3f4a5b6","state":"STARTED","feed":"otx"}
+
+event: intel_job_update
+data: {"type":"intel_job_update","job_id":"a1b2c3d4-e5f6-4708-9a0b-c1d2e3f4a5b6","state":"SUCCESS","feed":"otx","item_count":120}
+```
+
+**Errors:** `404` · `503`.

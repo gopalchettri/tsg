@@ -145,16 +145,20 @@ def test_membership_on_inactive_assignment_is_403(db, monkeypatch):
 
 # --- boot-path guards (the part the request-path e2e can't exercise) ---
 
-def test_retired_auth_dev_mode_fails_boot(monkeypatch):
-    """A stale AUTH_DEV_MODE must fail the boot, not silently do nothing."""
+def test_retired_auth_dev_mode_is_silently_ignored(monkeypatch):
+    """A stale AUTH_DEV_MODE has NO effect: no Settings field exists for it
+    (extra='ignore'), so boot succeeds and no bypass value appears anywhere in the
+    resolved config. (The former _RETIRED_SETTINGS boot-crash guard was removed by
+    an explicit decision 2026-08-19 — this pins that no bypass path came back.)"""
     from app.core.config import get_settings
     monkeypatch.setenv("AUTH_DEV_MODE", "true")
     get_settings.cache_clear()
     try:
-        with pytest.raises(RuntimeError):
-            get_settings()
+        s = get_settings()   # must NOT raise
+        assert "auth_dev_mode" not in s.model_dump()
+        assert "AUTH_DEV_MODE" not in s.model_dump_json()
     finally:
-        get_settings.cache_clear()   # drop the poisoned cache for later tests
+        get_settings.cache_clear()   # drop the env-influenced cache for later tests
 
 
 def _staging_settings():

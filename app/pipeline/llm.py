@@ -788,7 +788,12 @@ def _ensure_litellm_proxy_bypassed(s: Settings) -> None:
     Gated on anything that actually reaches the proxy, INCLUDING moderation (its only backend is
     the proxy, independent of the three provider switches). Merges into any existing NO_PROXY
     rather than overwriting an operator's other entries.
+
+    Set settings.litellm_bypass_proxy=False when the deployment's proxy is REQUIRED for litellm
+    traffic (not broken) — otherwise this bypass silently defeats it.
     """
+    if not s.litellm_bypass_proxy:
+        return
     if not (s.llm_provider == "litellm_proxy" or s.embedding_provider == "litellm_proxy"
             or s.reranker_provider == "litellm_proxy" or s.llm_moderation_enabled):
         return

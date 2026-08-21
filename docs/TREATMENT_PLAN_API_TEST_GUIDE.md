@@ -68,8 +68,8 @@ existed). All blocks are guarded, so it is safe to re-run.
 > mounted at import. Editing `.env` while the stack is running changes nothing. Edit first, or
 > restart **both** the API and the worker afterwards.
 
-> ⚠️ **The dev auth bypass is retired — do NOT set `TSG_AUTH_DEV_MODE`.** Setting it now
-> **fails boot** (`config.py::_RETIRED_SETTINGS`); no bypass exists in the code. Every request,
+> ⚠️ **The dev auth bypass is retired — `TSG_AUTH_DEV_MODE` no longer exists.** Setting it is
+> **silently ignored**; no bypass path exists in the code. Every request,
 > local boxes included, authenticates with real headers: `X-API-Key` (matched against an active
 > `API_Client` row) plus `X-User-Id` and `X-Entity-Id` (`X-Tenant-Id` optional). Seeding a local
 > key and the full contract: `docs/TSG_API_AUTHENTICATION_GUIDE.md`.

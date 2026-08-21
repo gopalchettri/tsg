@@ -6,6 +6,8 @@ streams the worker's live embedding_job_update hints over SSE.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, Query, Request
 
@@ -24,7 +26,7 @@ from app.api.schemas import (
     PromotionRetryResult,
 )
 from app.core.config import get_settings
-from app.core.enums import CandidateStatus, CeleryJobState, SSEEventType
+from app.core.enums import CandidateKind, CandidateStatus, CeleryJobState, SSEEventType
 from app.core.logging import get_logger
 from app.db import dal
 from app.db.dal import NotFoundError
@@ -250,8 +252,8 @@ def dismiss_promotion_route(session_id: str, principal: Principal = Depends(get_
 
 
 # ---------------------------------------------------------------------------
-# Threat-library candidate review — the curator workflow CandidateStatus's own docstring calls
-# "reserved... set by the curator workflow when it lands". Lists and resolves
+# Threat-library candidate review — the curator workflow whose approve/reject writes
+# CandidateStatus.accepted/rejected (via resolve_candidate). Lists and resolves
 # Threat_Candidate_Review rows accept.py queues (always for an ambiguous triage verdict; also for
 # a "genuinely novel" one when promotion_auto_approve_enabled is off).
 # ---------------------------------------------------------------------------
@@ -263,11 +265,16 @@ candidates_router = APIRouter(
 
 
 def _to_pending_candidate(row) -> PendingCandidate:
-    """Shared row -> response mapping for the list and detail candidate routes."""
+    """Shared row -> response mapping for the list and detail candidate routes. On actor
+    candidates category is None and proposed_type names the type the actor was proposed for
+    (None only on legacy rows); a NULL CandidateKind is a legacy 'threat' row."""
     return PendingCandidate(
         candidate_id=row["CandidateID"], session_id=row["SessionID"], entity_id=row["EntityID"],
+        kind=row.get("CandidateKind") or CandidateKind.threat,
+        created_by=row.get("CreatedBy"),
         proposed_category=row["ProposedCategory"], proposed_type=row["ProposedType"],
         proposed_name=row["ProposedName"], proposed_generic_name=row["ProposedGenericName"],
+        threat_type_id=row.get("ThreatTypeID"),
         status=row["Status"], created_at=row["CreatedAt"].isoformat(),
     )
 
@@ -275,13 +282,25 @@ def _to_pending_candidate(row) -> PendingCandidate:
 @candidates_router.get("", response_model=PendingCandidatesResponse)
 def list_candidates(
     limit: int = Query(default=100, ge=1, description="Max rows to return."),
+    kind: CandidateKind | None = Query(
+        default=None, description="Filter to one candidate kind ('threat' or 'actor'); "
+                                  "omit for both."),
+    status: Literal["pending", "rejected"] = Query(
+        default="pending", description="'pending' (default) lists cards awaiting review; "
+                                       "'rejected' lists the standing identity blacklist "
+                                       "(rejected cards permanently suppress re-queuing)."),
     _principal: Principal = Depends(get_admin_principal),
 ) -> PendingCandidatesResponse:
-    """Every threat awaiting curator review, oldest first."""
+    """Every proposal in one review state (threats AND actors), oldest first — by default the
+    cards awaiting curator review; `status=rejected` enumerates the otherwise-invisible
+    identity blacklist. Approve/reject stay pending-only — listing a rejected card does not
+    reopen it."""
     settings = get_settings()
     bounded_limit = min(limit, settings.promotion_list_max_limit)
     with db_session() as sess:
-        rows = dal.list_pending_candidates(sess, limit=bounded_limit)
+        # kind and status filter IN SQL, before the LIMIT — a Python filter here would let one
+        # matching card hide forever behind a page of older cards (and misreport `total`).
+        rows = dal.list_pending_candidates(sess, limit=bounded_limit, kind=kind, status=status)
     candidates = [_to_pending_candidate(row) for row in rows]
     return PendingCandidatesResponse(candidates=candidates, total=len(candidates))
 
@@ -304,12 +323,16 @@ def _resolve_and_respond(candidate_id: str, principal: Principal, *, approve: bo
         if candidate is None:
             raise NotFoundError(f"candidate {candidate_id!r} not found")
         resolution = resolve_candidate(sess, candidate, principal.user_id, approve=approve)
+        if not resolution.won:
+            # INSIDE the block on purpose: raising here makes db_session() roll back, so a
+            # losing approve leaves NO trace — its mints/links are ERASED, never committed
+            # alongside the other request's verdict. Checking after commit (the old shape)
+            # let a lost approve durably add master rows while the card read "rejected".
+            raise AcceptConflict(f"candidate {candidate_id!r} was already reviewed")
     # db_session()'s `with` block has now committed (or raised) — the mint above, if any, is
     # durable. Eager-embed AFTER that, in a FRESH session, never inside the same block: doing it
     # before commit risks writing to Mongo for a name whose SQL row could still be rolled back by
     # a later failure in the same block (same orphan-vector trap run_promotion_phase avoids).
-    if not resolution.won:
-        raise AcceptConflict(f"candidate {candidate_id!r} was already reviewed")
     if resolution.promoted_names:
         with db_session() as sess:
             eager_embed_promoted(sess, get_llm(), resolution.promoted_names)
@@ -324,9 +347,10 @@ def _resolve_and_respond(candidate_id: str, principal: Principal, *, approve: bo
 
 @candidates_router.post("/{candidate_id}/approve", response_model=CandidateResolutionResult)
 def approve_candidate(candidate_id: str, principal: Principal = Depends(get_admin_principal)) -> CandidateResolutionResult:
-    """Approve — mint (or reuse) this candidate's Threat_Type/Threat_Catalogue entry into the
-    shared library now. CAS-guarded: a candidate already reviewed by someone else returns 409,
-    never re-runs the mint."""
+    """Approve — mint this card's proposal into the shared library now (threat card: its
+    Threat_Type + Threat_Catalogue entry; actor card: the Threat_Actor plus its link to the
+    type the card names, when one live unambiguous match exists). CAS-guarded: a candidate
+    already reviewed by someone else returns 409 with every write rolled back."""
     return _resolve_and_respond(candidate_id, principal, approve=True)
 
 

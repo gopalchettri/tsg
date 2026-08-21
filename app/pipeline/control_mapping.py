@@ -106,7 +106,7 @@ def collect_control_queries(scenario_json: str | None, top_k: int) -> tuple[list
 
 def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 subsystems: list[dict] | None, llm: LLMClient, subsystem_id: int,
-                task_id: str, epoch: int) -> None:
+                task_id: str, epoch: int, *, durable: bool = False) -> None:
     """Map every not-yet-attempted active complete output of this session to library controls.
 
     Runs as a tail step of the SCENARIOS stage. Idempotency = `ControlsMappedAt IS NULL`:
@@ -115,6 +115,16 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
     re-scanned/re-reranked on later runs; regen/next-set mint fresh OutputIDs (stamp NULL)
     and are picked up naturally. The extra NOT-EXISTS guard covers pre-stamp-column rows that
     already have map rows: they must be neither reprocessed (PK collision) nor re-stamped.
+
+    `durable=True`: commit this function's writes for real once they're done, instead of just
+    riding the caller's transaction. Only pass this when the caller has NOTHING else uncommitted
+    on `sess` at call time (today: the plain, non-targeted write_scenarios path only — its
+    scenario rows are already committed one-by-one as generated). Otherwise a durable commit here
+    would prematurely finalize the caller's own still-unvalidated writes (targeted regen/next-set
+    buffers its scenario inserts uncommitted until after this call returns — see
+    _reconcile_targeted_regen). Without `durable`, a claim-loss rollback in the caller (stage
+    lease expired during the grounding call below, which can run many minutes) silently discards
+    an already-successful mapping: it was logged as "controls.mapped" but never reached disk.
     """
     # ponytail: mapping is enrichment; a scenario without controls beats a failed stage — any
     # failure below logs and returns, never raises into the stage.
@@ -227,6 +237,13 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         if not per_output:
             # No audit event: a controls_mapped row reporting 0 processed outputs reads as
             # work done. The stamp above still prevents any future re-scan of these outputs.
+            if durable:
+                # Real commit, not a savepoint release: the earlier sess.commit() (before the
+                # grounding call) already released `sp`, so this is a plain top-level commit of
+                # exactly the stamp just written — nothing else is pending on `sess` for this
+                # caller (see the `durable` docstring). Without it, a claim-loss rollback the
+                # caller does afterward would undo the stamp too, forcing a pointless re-scan.
+                sess.commit()
             log.warning("controls.nothing_groundable", session_id=sid, skipped=skipped)
             return
         dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
@@ -240,6 +257,12 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         log.info("controls.mapped", session_id=sid, outputs=len(per_output), mapped=inserted,
                 dropped=dropped, fallbacks=fallbacks, skipped=skipped, itot=itot,
                 min_score=min_score)
+        if durable:
+            # Same real commit as above, placed at the very end of the success path so the
+            # audit row commits together with the map rows + stamp it describes — otherwise a
+            # caller rollback right after return would leave durable mapping data with no
+            # matching audit trail entry, a smaller but real inconsistency.
+            sess.commit()
     except Exception:  # noqa: BLE001
         # Unwind to the savepoint FIRST: a DBAPI error mid-write (deadlock, constraint conflict)
         # marks the failed statement's transaction inactive, and without this the caller's very
@@ -247,7 +270,16 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         # into a whole-stage failure, the exact outcome this catch-all exists to prevent.
         # Unlike the whole-transaction rollback this replaces, it cannot touch the caller's own
         # uncommitted scenarios (see the savepoint note at the top of this function).
-        sp.rollback()
+        #
+        # `sp` is only ACTIVE up to the mid-function sess.commit() above (before the grounding
+        # call) — that commit releases the savepoint, same as the `durable` commit below it does
+        # again later. Any exception raised after either of those points (a systemic rerank
+        # failure, a constraint conflict on insert) hits a savepoint that's already closed:
+        # sp.rollback() on it raises sqlalchemy.exc.ResourceClosedError, which — uncaught here —
+        # would propagate out of this function and crash the whole stage, exactly what this
+        # try/except exists to prevent. Roll back whatever transaction is actually current
+        # instead once the savepoint is gone.
+        (sp.rollback() if sp.is_active else sess.rollback())
         log.warning("controls.mapping_failed", session_id=scenario_session.get("SessionID"), exc_info=True)
     finally:
         # `finally`, not `else`: the try body has several early `return`s (no candidates, no

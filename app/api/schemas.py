@@ -42,6 +42,7 @@ class ApiClientInfo(BaseModel):
 # Typing the wire with these is what puts them in /openapi.json — the UI generates its own
 # string-literal unions from the spec instead of hand-copying codes out of the API guide.
 from app.core.enums import (
+    CandidateKind,
     CandidateStatus,
     CeleryJobState,
     ClickOutcomeReason,
@@ -1573,21 +1574,25 @@ class PromotionRetryResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Threat-library candidate review (app/api/admin.py) — the curator workflow CandidateStatus's own
-# docstring calls "reserved... set by the curator workflow when it lands": list/approve/reject
+# Threat-library candidate review (app/api/admin.py) — the curator workflow whose approve/reject
+# writes CandidateStatus.accepted/rejected: list/approve/reject
 # for Threat_Candidate_Review rows queued by accept.py when promotion_auto_approve_enabled is off
 # (or the triage verdict was genuinely ambiguous, which always queues regardless of that setting).
 # ---------------------------------------------------------------------------
 class PendingCandidate(BaseModel):
-    """One threat awaiting curator review — a row of GET /v1/tsg/threat-library/candidates."""
+    """One proposal awaiting curator review — a row of GET /v1/tsg/threat-library/candidates.
+    Two kinds share the shape: a THREAT card (type+name pair) and an ACTOR card (actor name,
+    with proposed_type naming the threat type the actor was proposed for)."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "candidate_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
                 "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "entity_id": "ENT-001",
+                "kind": "threat", "created_by": "sara",
                 "proposed_category": "Spoofing", "proposed_type": "Vendor Update Tampering",
                 "proposed_name": "Payment Gateway vendor software update tampering",
                 "proposed_generic_name": "Vendor software update tampering",
+                "threat_type_id": None,
                 "status": "pending", "created_at": "2026-08-10T09:15:00Z",
             }
         }
@@ -1595,10 +1600,30 @@ class PendingCandidate(BaseModel):
     candidate_id: str = Field(description="Row's unique id — use it to approve or reject.")
     session_id: str = Field(description="Session whose accept first proposed this threat.")
     entity_id: str | None = Field(description="Entity the originating session belongs to.")
-    proposed_category: str = Field(description="AI-proposed STRIDE-style category.")
-    proposed_type: str = Field(description="AI-proposed threat type name.")
+    kind: CandidateKind = Field(
+        default=CandidateKind.threat,
+        description="'threat' (a proposed type+name pair) or 'actor' (a proposed actor name — "
+                    "proposed_type shows which threat type the actor was proposed for, and "
+                    "approval links the minted actor to that type; category is null).")
+    created_by: str | None = Field(
+        default=None,
+        description="The ORIGINAL proposer — the user whose accept raised this candidate. "
+                    "Null on rows queued before this column existed. On approval, the minted "
+                    "master row's CreatedBy credits this user, never the admin.")
+    proposed_category: str | None = Field(description="AI-proposed STRIDE-style category. Null on actor candidates.")
+    proposed_type: str | None = Field(description="AI-proposed threat type name. On actor candidates: the type "
+                                                "the actor was proposed FOR — approval resolves the actor→type "
+                                                "link from it. Null only on legacy actor rows.")
     proposed_name: str = Field(description="AI-proposed name, asset-specific as originally written.")
     proposed_generic_name: str | None = Field(description="Asset-agnostic form — what actually gets embedded/catalogued on approval.")
+    threat_type_id: int | None = Field(
+        default=None,
+        description="On a PENDING card: the queue-time grounding — the id approval uses FIRST "
+                    "(after a liveness check), else approval resolves by the proposed_type "
+                    "text. On a RESOLVED card (the detail route serves those too): the "
+                    "resolution outcome — the minted/linked type, null when an actor approval "
+                    "skipped the link; a rejected card keeps its queue-time value. Shown so "
+                    "the reviewer sees the actual target, not just its text.")
     status: CandidateStatus = Field(description="pending, accepted, or rejected.")
     created_at: str = Field(description="When this candidate was queued (ISO 8601).")
 
@@ -1610,14 +1635,19 @@ class PendingCandidatesResponse(BaseModel):
 
 
 class CandidateResolutionResult(BaseModel):
-    """Response of POST .../candidates/{id}/approve or .../reject."""
+    """Response of POST .../candidates/{id}/approve or .../reject — both card kinds."""
     model_config = ConfigDict(json_schema_extra={"example": {"candidate_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
                                                             "status": "accepted", "threat_type_id": 210,
                                                             "threat_catalogue_id": 4021}})
     candidate_id: str = Field(description="Candidate that was resolved.")
     status: CandidateStatus = Field(description="accepted or rejected — the status this candidate now has.")
-    threat_type_id: int | None = Field(description="Library Threat_Type id this candidate resolved to. Null on reject.")
-    threat_catalogue_id: int | None = Field(description="Library Threat_Catalogue id this candidate resolved to. Null on reject.")
+    threat_type_id: int | None = Field(
+        description="Library Threat_Type id this candidate resolved to. Null on reject; on an "
+                    "actor approval it is the type the actor was LINKED to — null when the link "
+                    "was skipped (no unambiguous active type matched the card).")
+    threat_catalogue_id: int | None = Field(
+        description="Library Threat_Catalogue id this candidate resolved to. Null on reject, "
+                    "and always null on actor approvals (actors have no catalogue entry).")
 
 
 # ---------------------------------------------------------------------------

@@ -419,7 +419,7 @@ The ten toolkit output keys (`api.treatment._VISIBLE_PLAN_KEYS`) and where each 
 
 | Concern | Control |
 |---|---|
-| Authentication | Header model via `get_principal` (existing): `X-API-Key` against an active `API_Client` hash + `X-User-Id`/`X-Entity-Id` identity — see docs/TSG_API_AUTHENTICATION_GUIDE.md; the former JWT/`AUTH_DEV_MODE` posture is retired (`_RETIRED_SETTINGS` fails boot on it) |
+| Authentication | Header model via `get_principal` (existing): `X-API-Key` against an active `API_Client` hash + `X-User-Id`/`X-Entity-Id` identity — see docs/TSG_API_AUTHENTICATION_GUIDE.md; the former JWT/`AUTH_DEV_MODE` settings no longer exist and are ignored if set — header auth is enforced by the code itself (no bypass path exists) |
 | Authorization | `get_authorized_session`: 404 for a missing session, **403** for a foreign one — THE boundary (D8); the body carries plain risk data, no foreign identifiers, so no second resource authz exists |
 | Route audit | Both routes in `_ENTITY_SCOPED_ROUTES`; boot asserts `get_principal` in the dependency tree of every mounted entity-scoped route |
 | Prompt injection | All untrusted text (body free text, scenario text) `redact()`ed and length-capped (`_clip` behind the Pydantic bounds), framed by `_CONTEXT_PREFIX`, carried only inside JSON strings |

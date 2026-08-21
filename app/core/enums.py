@@ -133,12 +133,14 @@ class ActorType(StrEnum):
 
 
 class CandidateStatus(StrEnum):
-    """`Threat_Candidate_Review.Status`. accept.py queues every AI-proposed threat NAME here
-    rather than auto-creating a Threat_Catalogue row: prompts.py requires that name to embed the
-    asset's own name, so it is never library-shaped."""
-    pending = "pending"    # what accept.py writes — awaiting a curator to generalize the name
-    accepted = "accepted"  # no writer: set by the curator workflow when it lands
-    rejected = "rejected"  # no writer yet (curator workflow)
+    """`Threat_Candidate_Review.Status`. accept.py queues BOTH kinds of admin-gated proposal
+    here — threat cards (a type+name pair; the asset-embedded name is never library-shaped, so
+    only its generic form is ever minted) and actor cards (CandidateKind='actor'). Under the
+    promotion_auto_approve_enabled master switch OFF (default) this queue is the ONLY way any
+    of it enters the shared library."""
+    pending = "pending"    # what accept.py writes — awaiting an admin's approve/reject
+    accepted = "accepted"  # written by dal.close_candidate_review via resolve_candidate (approve)
+    rejected = "rejected"  # written by the same CAS close on reject — nothing minted
 
 
 class RetryOutcome(StrEnum):
@@ -174,13 +176,16 @@ class AuditEventType(StrEnum):
     threat_regrounded = "threat_regrounded"            # reserved — only `scenario` regen is implemented
     subsystem_advanced = "subsystem_advanced"          # written at the START of a subsystem's work
     auto_fanout_review = "auto_fanout_review"          # reserved — no current producer
-    library_promoted = "library_promoted"              # on accept, per NEW Threat_Type master created from an
-                                                    # unverified threat (catalogue names go through triage)
+    library_promoted = "library_promoted"              # on accept, per threat whose library resolution CHANGED —
+                                                    # a minted type/name (auto mode) or a link/adoption of an
+                                                    # existing entry (the only form under switch OFF);
+                                                    # DetailJSON.triage_verdict tells which
     promotion_triage = "promotion_triage"              # on accept, ONE row listing every candidate's
                                                     # {generic_name, cosine, matched id, verdict} — the record
                                                     # the triage bands are tightened from
-    candidate_reconciled = "candidate_reconciled"      # reserved — means a Threat_Candidate_Review row was CLOSED
-                                                    # as accepted, which only the curator workflow can do
+    candidate_reconciled = "candidate_reconciled"      # a Threat_Candidate_Review row was CLOSED — written by
+                                                    # resolve_candidate on EVERY resolution, approve AND
+                                                    # reject; DetailJSON.decision carries which
     session_cancelled = "session_cancelled"            # explicit cancel, or _mark_session_failed's total-failure
                                                     # path — either way releases the M4 lock
     stage_error = "stage_error"                        # a stage failed after retries
@@ -197,6 +202,10 @@ class AuditEventType(StrEnum):
                                                            # retired_plan_id, output_id}; ActorType=user.
                                                            # plan_id key REQUIRED — the per-scenario trail
                                                            # filters on it (api/treatment.py)
+    scenario_unaccepted = "scenario_unaccepted"            # (forthcoming — no route writes this yet)
+                                                           # per-scenario accept UNDONE post-completion;
+                                                           # {output_id}; ActorType=user. The accept's own
+                                                           # rows stay — the ledger shows both decisions
 
 
 class AuditDecision(StrEnum):
@@ -366,6 +375,25 @@ class AcceptSubsetReason(StrEnum):
     failure_card = "failure_card"                                      # generation failed; no content to accept
     subsystem_not_awaiting_decision = "subsystem_not_awaiting_decision"  # its stage isn't at the review barrier
     duplicate_identity = "duplicate_identity"                          # subset names 2+ versions of ONE scenario
+
+
+class CandidateKind(StrEnum):
+    """`Threat_Candidate_Review.CandidateKind` — what kind of admin-gated proposal a queue row
+    is. A NULL column value reads as `threat` (legacy rows predate the column)."""
+    threat = "threat"    # a proposed threat (type+name pair) — the original queue shape
+    actor = "actor"      # a proposed actor: ProposedName is the actor, ProposedType names the
+                         # threat type it was proposed for (approval's link target; NULL only
+                         # on legacy rows), ProposedCategory is NULL
+
+
+class UnacceptGateReason(StrEnum):
+    """(Forthcoming) Why POST .../scenarios/{output_id}/unaccept would be refused — HTTP 409
+    `details.reason`. Reserved for the paused per-scenario unaccept feature; NO route raises
+    these yet."""
+    not_accepted = "not_accepted"                        # the scenario isn't accepted (or a racing
+                                                         # unaccept already flipped it)
+    treatment_plan_exists = "treatment_plan_exists"      # a plan was generated FROM this acceptance —
+                                                         # undoing beneath it would orphan the plan
 
 
 class TreatmentGateReason(StrEnum):

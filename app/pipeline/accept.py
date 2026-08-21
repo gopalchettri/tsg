@@ -13,7 +13,7 @@ import json
 from collections.abc import Sequence
 from typing import Any, NamedTuple, cast
 
-from sqlalchemy import RowMapping, Table, bindparam, insert, or_, select, update
+from sqlalchemy import RowMapping, Table, bindparam, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.core import tuning
@@ -23,6 +23,7 @@ from app.core.enums import (
     ActorType,
     AuditDecision,
     AuditEventType,
+    CandidateKind,
     CandidateStatus,
     SessionStatus,
     StageStatus,
@@ -35,6 +36,20 @@ from app.db import dal
 from app.db import models as m
 from app.db.dal import EntityForbidden, NotFoundError, guid, now
 from app.pipeline import embeddings, grounding
+
+# The whole actor-candidacy subsystem lives in its own module (accept_actors) — accept.py
+# stays the orchestration layer. Underscored names are shared package-internals, not API.
+from app.pipeline.accept_actors import (
+    _ActorPromoCtx,
+    _clean_actor_name,
+    _extract_actor_names_per_threat,
+    _link_actors_to_threat_type,
+    _preload_actor_memo,
+    _queue_or_mint_row_actors,
+    log_withheld_links,
+    pending_card_identities,
+    resolve_actor_id_by_identity,
+)
 from app.pipeline.llm import get_llm
 from app.sse import bus
 
@@ -337,22 +352,26 @@ class CandidateResolution(NamedTuple):
     """Outcome of one resolve_candidate() call — a small named result instead of a growing
     positional tuple, so a call site reads `resolution.type_id` instead of counting positions."""
     won: bool                          # False = lost the CAS race; caller should report 409
-    type_id: int | None                # library id this candidate resolved to; None on reject/loss
-    catalogue_id: int | None           # library id this candidate resolved to; None on reject/loss
+    type_id: int | None                # library id this candidate resolved to; None on reject/
+                                       # loss AND on a won actor approval whose link was skipped
+    catalogue_id: int | None           # library id this candidate resolved to; None on reject/
+                                       # loss AND on every actor approval (actors have no entry)
     promoted_names: list[tuple[str, str]]  # for the caller to eager-embed after its own commit
 
 
 def resolve_candidate(sess: Session, candidate: RowMapping, reviewer_user_id: str | None,
                     *, approve: bool) -> CandidateResolution:
-    """Curator resolution of one Threat_Candidate_Review row — the workflow `CandidateStatus`'s
-    own docstring calls "reserved... set by the curator workflow when it lands". Reject just
-    closes the row; approve additionally mints/reuses its Threat_Type and Threat_Catalogue entry,
-    reusing the SAME race-safe upsert primitives auto-promotion uses.
+    """Curator resolution of one Threat_Candidate_Review row — THE writer `CandidateStatus`'s
+    accepted/rejected comments name (via dal.close_candidate_review). Reject just closes the
+    row; approve additionally mints/reuses its Threat_Type and Threat_Catalogue entry, reusing
+    the SAME race-safe upsert primitives auto-promotion uses.
 
-    No Identified_Threat row is touched and no actor names are linked: Threat_Candidate_Review
-    carries no ThreatID (a proposal can be deduplicated across many threats, even across
-    sessions, so there is no single "originating" row) and never stored actor names either — both
-    by this table's actual schema, not an oversight here.
+    No Identified_Threat row is touched: Threat_Candidate_Review carries no ThreatID (a proposal
+    can be deduplicated across many threats, even across sessions, so there is no single
+    "originating" row). Actor cards DO link on approval — to the type the card itself names
+    (the grounded ThreatTypeID when queue time recorded one that is still live, else a
+    find-only lookup of the stored ProposedType text) — the admin saw that association on the
+    card and approved it.
 
     `won` is False when a concurrent request already resolved this candidate first (CAS loss —
     caller should report 409, never re-run this). Returns the resolved type/catalogue ids
@@ -360,6 +379,16 @@ def resolve_candidate(sess: Session, candidate: RowMapping, reviewer_user_id: st
     call already computed. `promoted_names` is the SAME (embedding_group, name) contract
     `_add_unverified_threats_to_library` returns, for the caller to eager-embed after its own
     commit; empty on reject or on a lost CAS."""
+    # KIND BRANCH FIRST — mandatory, not defensive: an actor row (NULL ProposedCategory;
+    # ProposedType holds the proposing threat's TYPE TEXT, not a threat proposal — NULL only
+    # on legacy actor rows) must never reach the threat path below, which would mint a bogus
+    # type/catalogue pair from it. NULL CandidateKind = legacy 'threat' row.
+    kind = candidate.get("CandidateKind")
+    # CreatedBy = the ORIGINAL proposer (the accepting user who raised the card) — master-row
+    # credit goes to the discoverer, never the admin; the admin lands on ReviewedBy + audit.
+    # Legacy rows (CreatedBy NULL, predates the column) fall back to the reviewer.
+    original_proposer = candidate.get("CreatedBy") or reviewer_user_id
+
     if not approve:
         won = dal.close_candidate_review(sess, candidate["CandidateID"],
                                         status=CandidateStatus.rejected, reviewer_user_id=reviewer_user_id)
@@ -368,32 +397,102 @@ def resolve_candidate(sess: Session, candidate: RowMapping, reviewer_user_id: st
                             TenantID=candidate["TenantID"], EntityID=candidate["EntityID"],
                             EventType=AuditEventType.candidate_reconciled, ActorUserID=reviewer_user_id,
                             DetailJSON=json.dumps({"candidate_id": candidate["CandidateID"],
+                                                    "kind": str(kind or CandidateKind.threat),
                                                     "decision": str(CandidateStatus.rejected)}))
         return CandidateResolution(won, None, None, [])
+
+    # APPROVE paths only from here (reject above never consumes the grounded id, so it never
+    # pays this SELECT). Queue-time grounding can go stale: a curator may have soft-deleted
+    # (or deactivated) the type between queue time and this approval, and nothing revalidates
+    # the card meanwhile. ONE liveness check at this shared point covers BOTH branches: a dead
+    # id is treated as ungrounded — the actor branch re-resolves by name (else links nothing),
+    # the threat branch mints/find-or-creates fresh under the resolved category (the soft
+    # delete freed the natural key, so this is name resurrection, not a duplicate).
+    grounded_type_id = candidate["ThreatTypeID"]
+    if grounded_type_id is not None and not dal.threat_type_active(sess, grounded_type_id):
+        grounded_type_id = None
+
+    if kind == CandidateKind.actor:
+        # Approve a proposed ACTOR: link it to the type the CARD NAMES — the admin saw
+        # ProposedType and approved the association, not just a bare name. The target resolves
+        # LIVE: the (liveness-checked) grounded id when queue time recorded one, else a
+        # find-only lookup of the stored type text — so approving the sibling threat card first
+        # makes the link land, and an unapproved type just means no link yet, never a guessed
+        # one. ORDER MATTERS: reads first, then the CAS, and only a WINNER writes — a losing
+        # request must not mint, link, or log anything (its transaction is rolled back by the
+        # caller, but a log line would survive the rollback and mislead an operator).
+        # No embedding — actors have no embedding group.
+        link_type_id = grounded_type_id
+        if link_type_id is None:
+            link_type_id = dal.find_active_type_id_by_name(sess, candidate["ProposedType"])
+        won = dal.close_candidate_review(sess, candidate["CandidateID"],
+                                        status=CandidateStatus.accepted,
+                                        reviewer_user_id=reviewer_user_id,
+                                        type_id=link_type_id,
+                                        # link skipped -> the card must read NULL, not keep the
+                                        # stale (possibly dead) queue-time grounding
+                                        clear_type_id=True)
+        if not won:
+            return CandidateResolution(False, None, None, [])  # lost the CAS — nothing written
+        # Strip wrapping junk before the mint — a card queued as '"APT-Nova"' must not become
+        # the literal stored spelling (the same rule the auto-mint path applies). Pure junk
+        # falls back to the raw text: the admin SAW it and explicitly approved it — the gate's
+        # job is review, not overruling the reviewer. IDENTITY-GUARDED: 'APT Nova' approved
+        # against an existing 'APT-Nova' reuses that row — exact-name upserts alone would mint
+        # a normalized twin the read layer then resolves ambiguously.
+        display = _clean_actor_name(candidate["ProposedName"]) or candidate["ProposedName"]
+        actor_master_id = resolve_actor_id_by_identity(sess, display)
+        if actor_master_id is None:
+            actor_master_id = dal.upsert_threat_actor(sess, display,
+                                                    created_by=original_proposer)
+        if link_type_id is not None:
+            dal.link_type_actor(sess, link_type_id, actor_master_id)
+        else:
+            # No live type matches the card (type never approved / soft-deleted since queue
+            # time / legacy card with no stored text), or SEVERAL match (ambiguous name) —
+            # save the actor, skip the link; never guess master data. The log + audit answer
+            # "why isn't APT-X linked?".
+            log.warning("accept.actor_link_skipped", candidate_id=candidate["CandidateID"],
+                        actor=candidate["ProposedName"], proposed_type=candidate["ProposedType"],
+                        note="no unambiguous active Threat_Type for the card's type text — "
+                            "actor created unlinked; link via PATCH /threat-types/{id} if real")
+        dal.append_audit(sess, AuditID=guid(), SessionID=candidate["SessionID"],
+                        TenantID=candidate["TenantID"], EntityID=candidate["EntityID"],
+                        EventType=AuditEventType.candidate_reconciled, ActorUserID=reviewer_user_id,
+                        ThreatTypeRefID=link_type_id,
+                        DetailJSON=json.dumps({"candidate_id": candidate["CandidateID"],
+                                                "kind": str(CandidateKind.actor),
+                                                "actor_id": actor_master_id,
+                                                "linked_type_id": link_type_id,
+                                                "decision": str(CandidateStatus.accepted)}))
+        return CandidateResolution(True, link_type_id, None, [])
 
     # Sector-agnostic (sector_id=None): a candidate carries no sector scoping of its own, unlike
     # a live accept's scenario_session (which _pick_sector_for_promotion draws from).
     category_id = grounding.find_category(sess, candidate["ProposedCategory"])
-    type_id = candidate["ThreatTypeID"]
+    type_id = grounded_type_id  # liveness-checked above — a dead grounded id re-mints fresh
     if type_id is None:
         type_id, _created = dal.upsert_threat_type(sess, candidate["ProposedType"], category_id,
-                                                    sector_id=None, created_by=reviewer_user_id)
+                                                    sector_id=None, created_by=original_proposer)
     generic = candidate["ProposedGenericName"] or candidate["ProposedName"]
     catalogue_id = dal.upsert_threat_catalogue(sess, generic, type_id, sector_id=None,
-                                                created_by=reviewer_user_id)
+                                                created_by=original_proposer)
     dal.link_catalogue_category(sess, catalogue_id, category_id)
     won = dal.close_candidate_review(sess, candidate["CandidateID"], status=CandidateStatus.accepted,
                                     reviewer_user_id=reviewer_user_id, type_id=type_id,
                                     catalogue_id=catalogue_id)
     if not won:
-        # Lost the CAS: another request resolved this candidate first. The mint above is harmless
-        # (upsert_threat_type/upsert_threat_catalogue are race-safe by construction — see the
-        # design's gap #14/#15), just redundant this call — report the conflict, don't audit twice.
+        # Lost the CAS: another request resolved this candidate first. The caller checks `won`
+        # INSIDE its transaction and rolls back (admin.py::_resolve_and_respond), so the mint
+        # above is erased, not committed alongside a "rejected" verdict — report the conflict,
+        # don't audit twice. (The upserts are also race-safe against a concurrent WINNING
+        # approve of another card with the same name — see the design's gap #14/#15.)
         return CandidateResolution(False, None, None, [])
     dal.append_audit(sess, AuditID=guid(), SessionID=candidate["SessionID"], TenantID=candidate["TenantID"],
                     EntityID=candidate["EntityID"], EventType=AuditEventType.candidate_reconciled,
                     ActorUserID=reviewer_user_id, ThreatTypeRefID=type_id,
                     DetailJSON=json.dumps({"candidate_id": candidate["CandidateID"],
+                                            "kind": str(kind or CandidateKind.threat),
                                             "decision": str(CandidateStatus.accepted),
                                             "catalogue_id": catalogue_id}))
     return CandidateResolution(True, type_id, catalogue_id,
@@ -491,76 +590,27 @@ def _pick_sector_for_promotion(scenario_session: RowMapping) -> int | None:
     return None           # no sector context at all → global
 
 
-def _link_actors_to_threat_type(sess: Session, type_id: int, actors: list[str], resolved: dict,
-                                created_by: str | None = None,
-                                resolve_only: bool = False) -> list[str]:
-    """Link actor names to this threat type; returns only the names that got a BRAND-NEW link, for
-    audit.
-
-    `resolve_only=True` — the AI-promotion posture — links EXISTING active actors but NEVER creates
-    one. The closed actor vocabulary lives only in the Stage-1 prompt, and the unverified branch
-    passes actors RAW, so an upsert here would turn any hallucinated string into a permanent global
-    Threat_Actor row — which immediately enters every future session's closed list: a
-    self-reinforcing vocabulary loop with no review step. Unresolved names are skipped and logged;
-    POST /threat-actors stays the one deliberate creation path."""
-    newly_linked: list[str] = []
-    # `resolved` is a shared memo (actor name -> id, and (type,actor) -> "already linked")
-    # so repeated actor names across many threats in this accept don't hit the DB twice.
-    for actor_name in actors:
-        actor_key = ("actor", actor_name)
-        # exact first, then case-insensitive — MSSQL's collation resolves 'nation state' to
-        # 'Nation State', so the memo must too or a case-variant would mint a duplicate row.
-        actor_id = resolved.get(actor_key)
-        if actor_id is None:
-            actor_id = resolved.get(("actor_cf", actor_name.casefold()))
-        if actor_id is None:
-            if resolve_only:
-                log.warning("accept.actor_not_in_vocabulary", actor=actor_name, type_id=type_id,
-                            note="AI-proposed actor has no active Threat_Actor row — skipped, "
-                                "never auto-created; add it via POST /threat-actors if real")
-                continue
-            actor_id = dal.upsert_threat_actor(sess, actor_name, created_by=created_by)
-        resolved[actor_key] = actor_id
-        resolved[("actor_cf", actor_name.casefold())] = actor_id
-        link_key = ("link", type_id, actor_id)
-        if link_key not in resolved:
-            if dal.link_type_actor(sess, type_id, actor_id):  # True only when a NEW link row was inserted
-                newly_linked.append(actor_name)
-            resolved[link_key] = True
-    return newly_linked
-
-
-def _extract_actor_names_per_threat(rows: Sequence[RowMapping]) -> tuple[dict[int, list[str]], set[str]]:
-    """Per-threat actor lists plus the union of all names seen (for the bulk id lookup).
-
-    Reads the RAW list deliberately: promotion candidates are exactly the UNVERIFIED threats, whose
-    stored blob is always validated=false, so a validated_actors gate returns [] for every one and
-    makes actor linking a silent no-op. Trust is enforced downstream by
-    _link_actors_to_threat_type(resolve_only=True)."""
-    parsed_actors: dict[int, list[str]] = {}
-    all_actor_names: set[str] = set()
-    for row in rows:
-        # The one shared reader for the ThreatActorsJSON shape — a corrupt blob degrades to
-        # no-actors instead of raising.
-        actors = grounding.stored_actors(row["ThreatActorsJSON"])
-        parsed_actors[row["ThreatID"]] = actors
-        all_actor_names.update(actors)
-    return parsed_actors, all_actor_names
 
 
 def _find_or_create_type_and_catalogue(
     sess: Session, row: RowMapping, sector_id: int | None, resolved: dict,
-    created_by: str | None = None,
-) -> tuple[int, int | None]:
+    created_by: str | None = None, allow_mint: bool = True,
+) -> tuple[int | None, int | None]:
     """Resolve the Threat_Type id this unverified threat points at — reusing Stage 2's verified type
     match when present, else creating one under the resolved category — and pass the stored
     catalogue id straight through.
 
-    ONLY the TYPE is auto-promoted. prompts.py REQUIRES `name` to embed the asset's own name and
-    FORBIDS asset names in `type`, so `ThreatType` is library-shaped by construction and
-    `ThreatName` never is: auto-minting a catalogue row from it could only park an asset-named
-    sibling beside the generic entry it belongs under. The proposal goes to Threat_Candidate_Review
-    as `pending` instead.
+    TYPE minting is governed by `allow_mint` (the promotion_auto_approve_enabled master switch):
+    True (switch ON) find-or-creates under the resolved category; False (switch OFF) returns
+    `(None, catalogue_id)` for a novel type — nothing is minted, the candidate card keeps
+    ThreatTypeID NULL, and resolve_candidate mints only when the admin approves. Matched types
+    (a verified Stage-2 id, or the in-accept memo) flow under either posture.
+
+    The NAME is never auto-minted HERE under any posture: prompts.py REQUIRES `name` to embed
+    the asset's own name and FORBIDS asset names in `type`, so `ThreatType` is library-shaped by
+    construction and `ThreatName` never is — minting a catalogue row from it could only park an
+    asset-named sibling beside the generic entry it belongs under. The proposal goes to
+    Threat_Candidate_Review as `pending` instead.
 
     So `catalogue_id` is always exactly `row["ThreatCatalogueID"]` — the caller cannot use it to
     detect that something happened; see the `promoted` split in
@@ -577,6 +627,11 @@ def _find_or_create_type_and_catalogue(
         # under the resolved category.
         key = ("type", row["ThreatCategory"], row["ThreatType"])
         type_id = resolved.get(key)
+        if type_id is None and not allow_mint:
+            # Admin-gated mode (master switch OFF): a novel type is NEVER minted at accept —
+            # the candidate row keeps ThreatTypeID NULL and resolve_candidate mints it only
+            # when the admin approves. Matched types (the branch above) still flow.
+            return None, row["ThreatCatalogueID"]
         if type_id is None:
             type_id, created = dal.upsert_threat_type(sess, row["ThreatType"], _category_id(),
                                                     sector_id, created_by=created_by)
@@ -667,17 +722,16 @@ def _triage_generic_name(qv: Sequence[float], cand_cat_id: int | None, sector_id
 
 
 def _promotion_candidates(sess: Session, sid: str, good_subs: list[int]) -> list[RowMapping]:
-    """Every below-threshold threat, in an accepted subsystem, with at least one ACCEPTED
-    scenario — the candidate set for library promotion.
+    """Every threat in an accepted subsystem with at least one ACCEPTED scenario — with its
+    GroundingScore, so the CALLER splits candidacy: THREAT promotion keeps the
+    library_promotion_threshold filter (in Python now, not SQL), while ACTOR candidacy runs
+    over every row — how novel an actor name is has nothing to do with how well its threat
+    matched, so filtering here silently excluded every actor riding a well-matched threat.
 
-    Selects on SCORE, not on GroundingStatus, and that distinction is the point. "Do we trust
-    this match enough to use the library's wording?" and "should this go INTO the library?" are
-    different questions; piggybacking curation on the grounding band meant every retune of the
-    matching cutoff silently moved promotion volume too.
-
-    NULL-safe by design: `GroundingScore < th` alone is UNKNOWN for a NULL score, which would
-    silently EXCLUDE such a row. A row with no recorded score is by definition not a confident
-    match, so it belongs in the candidate set — the column is nullable and legacy rows carry NULL.
+    Threat candidacy still selects on SCORE, not on GroundingStatus, and that distinction is
+    the point. "Do we trust this match enough to use the library's wording?" and "should this
+    go INTO the library?" are different questions; piggybacking curation on the grounding band
+    meant every retune of the matching cutoff silently moved promotion volume too.
     """
     st, out = m.Scoped_Threat, m.Threat_Scenario_Output
     # An unverified threat only gets promoted if at least one of its scenario outputs was
@@ -697,42 +751,16 @@ def _promotion_candidates(sess: Session, sid: str, good_subs: list[int]) -> list
     return sess.execute(
         select(m.Identified_Threat.ThreatID, m.Identified_Threat.ThreatCategory,
             m.Identified_Threat.ThreatType, m.Identified_Threat.ThreatName,
-            m.Identified_Threat.GenericName,
+            m.Identified_Threat.GenericName, m.Identified_Threat.GroundingScore,
             m.Identified_Threat.ThreatActorsJSON, m.Identified_Threat.ThreatTypeID,
             m.Identified_Threat.ThreatCatalogueID)
         .where(m.Identified_Threat.SessionID == sid,
             dal.active(m.Identified_Threat.Superseded),
             m.Identified_Threat.SubsystemID.in_(good_subs),
-            or_(m.Identified_Threat.GroundingScore.is_(None),
-                m.Identified_Threat.GroundingScore < get_settings().library_promotion_threshold),
             scenario_accepted)
     ).mappings().all()
 
 
-def _preload_actor_memo(sess: Session, rows: Sequence[RowMapping], all_actor_names: set[str],
-                        resolved: dict) -> None:
-    """Bulk-load existing actor ids and type-actor links into the in-accept memo, so the
-    promotion loop issues no per-actor query. Two queries, both skipped when there is nothing
-    to look up."""
-    if all_actor_names:
-        for actor_id, name in sess.execute(
-            select(m.Threat_Actor.ThreatActorID, m.Threat_Actor.ThreatActorName).where(
-                m.Threat_Actor.ThreatActorName.in_(all_actor_names),
-                m.Threat_Actor.IsActive == True, m.Threat_Actor.IsDeleted == False)  # noqa: E712
-        ):
-            resolved[("actor", name)] = actor_id
-            # casefold alias so a case-variant proposal resolves to the canonical row instead
-            # of reading as unknown (MSSQL's IN() above matches case-insensitively already)
-            resolved[("actor_cf", name.casefold())] = actor_id
-    known_type_ids = {r["ThreatTypeID"] for r in rows if r["ThreatTypeID"] is not None}
-    actor_ids = {v for k, v in resolved.items() if k[0] == "actor"}
-    if known_type_ids and actor_ids:
-        for type_id, actor_id in sess.execute(
-            select(m.ThreatType_ThreatActor_Map.ThreatTypeID, m.ThreatType_ThreatActor_Map.ThreatActorID)
-            .where(m.ThreatType_ThreatActor_Map.ThreatTypeID.in_(known_type_ids),
-                m.ThreatType_ThreatActor_Map.ThreatActorID.in_(actor_ids))
-        ):
-            resolved[("link", type_id, actor_id)] = True  # pre-existing link, not newly created
 
 
 class _TriageInputs(NamedTuple):
@@ -787,7 +815,8 @@ def _prepare_triage(sess: Session, llm, scenario_session: RowMapping,
 class _CandidateFate(NamedTuple):
     """One candidate's resolved library outcome."""
     verdict: str                   # auto_reject | auto_approve | review
-    type_id: int                   # the Threat_Type the threat ends up pointing at
+    type_id: int | None            # the Threat_Type the threat ends up pointing at; None =
+                                   # novel type under admin-gated mode (queued, not minted)
     catalogue_id: int | None       # its Threat_Catalogue id after triage (None = none matched)
     matched_id: int | None         # the entry the cosine was measured against (audit/calibration)
     cosine: float | None
@@ -803,7 +832,8 @@ class _CandidateFate(NamedTuple):
 
 def _decide_candidate_fate(sess: Session, row: RowMapping, generic: str | None, sector_id: int | None,
                         resolved: dict, triage: _TriageInputs, tn: tuning.ResolvedTuning,
-                        *, created_by: str | None) -> _CandidateFate:
+                        *, created_by: str | None, auto_mode: bool,
+                        pending_cards: set) -> _CandidateFate:
     """Banded triage of the LIBRARY-SHAPED name (never the asset-embedded one), then the type
     and catalogue ids that follow from it. Runs triage BEFORE type resolution so an auto-reject
     adopts the matched entry's owning type instead of minting a fresh Threat_Type it is about
@@ -841,15 +871,23 @@ def _decide_candidate_fate(sess: Session, row: RowMapping, generic: str | None, 
         # embeds far from everything, so it lands EXACTLY in the auto-approve band — the one
         # band no curator sees. Nothing enters the shared library without passing the gate.
         verdict = TriageVerdict.review
-    if verdict is TriageVerdict.auto_approve and not get_settings().promotion_auto_approve_enabled:
-        # Master-table writes are manual-by-default: a genuinely novel candidate still gets its
-        # type/catalogue resolved below like any other, but downgrading the verdict here routes
-        # it into the SAME curator queue as the ambiguous "review" band below, instead of minting
-        # an entry no human has seen. get_settings() (not `tn`, the per-session frozen tuning
-        # snapshot) deliberately: an admin flipping this is an operational policy that should
-        # apply to every promotion attempt from that moment on, including a retry of a session
-        # created before the flip — not something frozen at session-creation time.
+    if verdict is TriageVerdict.auto_approve and not auto_mode:
+        # Master-table writes are manual-by-default: a genuinely novel candidate is routed
+        # into the SAME curator queue as the ambiguous "review" band below, instead of minting
+        # an entry no human has seen. `auto_mode` is the caller's one LIVE get_settings() read
+        # (never `tn`, the per-session frozen tuning snapshot) deliberately: an admin flipping
+        # the master switch is operational policy that applies to every promotion attempt from
+        # that moment on, including a retry of a session created before the flip.
         verdict = TriageVerdict.review
+    if verdict is TriageVerdict.auto_approve:
+        # An admin's earlier verdict on this identity OWNS it: a card already queued (pending)
+        # or already REJECTED must never be auto-minted past — the switch being ON does not
+        # outrank a recorded human decision. Demoted to review; the card block below then
+        # dedupes against the same set, so a rejected identity mints nothing and re-queues
+        # nothing. Same fold as the card block's `ident` — the two must never diverge.
+        ident = ((generic or row["ThreatName"]) or "").strip().casefold()
+        if ident and (CandidateKind.threat, ident) in pending_cards:
+            verdict = TriageVerdict.review
     matched_entry = (next((e for e in triage.entries if e["id"] == matched_id), None)
                     if verdict is TriageVerdict.auto_reject else None)
     if verdict is TriageVerdict.auto_reject and matched_entry is None:
@@ -868,15 +906,27 @@ def _decide_candidate_fate(sess: Session, row: RowMapping, generic: str | None, 
         # stored (ThreatTypeID, ThreatCatalogueID) pair keeps (grounding's model)
         type_id = matched_entry["type_id"]
         minted: list[tuple[str, str]] = []
-        if type_id is None:  # ownerless legacy entry — resolve/mint as usual
+        if type_id is None:  # ownerless legacy entry — resolve/mint as usual (gated by the
+            # switch). Under OFF a novel type text deliberately gets NO card here either: the
+            # matched entry already covers this threat ("already present, do nothing") — its
+            # type vocabulary is the curator's call via the library CRUD, not a queue item.
             type_id, _ = _find_or_create_type_and_catalogue(sess, row, sector_id, resolved,
-                                                            created_by=created_by)
+                                                            created_by=created_by,
+                                                            allow_mint=auto_mode)
+            if type_id is None:
+                # Switch OFF + ownerless entry: adopting the entry WITHOUT its owner would
+                # store the one (ThreatTypeID NULL, ThreatCatalogueID real) pair every other
+                # writer's invariant forbids. Fail toward the human instead: review card,
+                # row left exactly as it was.
+                return _CandidateFate(TriageVerdict.review, None, row["ThreatCatalogueID"],
+                                    matched_id, cosine, [])
             if resolved.get(("minted_type", type_id)):
                 minted.append(("threat_type", row["ThreatType"]))
         return _CandidateFate(verdict, type_id, matched_id, matched_id, cosine, minted)
 
     type_id, catalogue_id = _find_or_create_type_and_catalogue(sess, row, sector_id, resolved,
-                                                            created_by=created_by)
+                                                            created_by=created_by,
+                                                            allow_mint=auto_mode)
     minted = [("threat_type", row["ThreatType"])] if resolved.get(("minted_type", type_id)) else []
     if verdict is TriageVerdict.auto_approve:
         catalogue_id = dal.upsert_threat_catalogue(sess, generic, type_id, sector_id,
@@ -908,11 +958,21 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
     sector_id = _pick_sector_for_promotion(scenario_session)
     sid = scenario_session["SessionID"]
     tenant, entity = scenario_session["TenantID"], scenario_session["EntityID"]
-    rows = _promotion_candidates(sess, sid, good_subs)
+    all_rows = _promotion_candidates(sess, sid, good_subs)
+    # THREAT candidacy keeps the threshold ("should this go INTO the library?"); ACTOR
+    # candidacy deliberately does not — a novel actor name on a 92-scoring threat still
+    # reaches the curator queue (the scored_rows pass below). NULL-safe: a row with no
+    # recorded score is by definition not a confident match, so it stays a threat candidate.
+    threshold = get_settings().library_promotion_threshold
+    rows, scored_rows = [], []
+    for r in all_rows:
+        (rows if r["GroundingScore"] is None or r["GroundingScore"] < threshold
+        else scored_rows).append(r)
 
     resolved: dict[tuple, Any] = {}  # in-accept memo: ("category"|"type"|"cat"|"actor"|"link", ...) -> id/True
-    parsed_actors, all_actor_names = _extract_actor_names_per_threat(rows)
-    _preload_actor_memo(sess, rows, all_actor_names, resolved)
+    parsed_actors, all_actor_names = _extract_actor_names_per_threat(all_rows)
+    actor_table, actor_trigram_index, actor_token_index = _preload_actor_memo(
+        sess, all_rows, all_actor_names, resolved)
 
     # Main promotion loop: for each candidate threat, work out (or create) the Threat_Type,
     # Threat_Catalogue, and actor links it should end up pointing at, then ACCUMULATE the
@@ -929,12 +989,26 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
     actor_type = ActorType.user if user_id else ActorType.system
     llm = get_llm()
     tn = tuning.from_session(scenario_session)
+    # THE master switch, read LIVE once per promotion attempt (config.py docstring): OFF =
+    # admin-gated (no mints, no links, novel actors queue); ON = full auto at accept.
+    auto_mode = get_settings().promotion_auto_approve_enabled
     triage = _prepare_triage(sess, llm, scenario_session, rows)
+    # Cross-session dedup, preloaded in ONE query (same batched-IO rule as the actor memo):
+    # (kind, folded identity) of every PENDING or REJECTED curation card, checked at the
+    # queue/mint sites instead of a per-row probe. Loaded AFTER _prepare_triage on purpose:
+    # that call spans an external embedding round-trip, and reading the card set before it
+    # would stretch the (accepted, documented) preload-then-insert dedup window across a
+    # network call for no reason. Skipped when there is nothing to file.
+    pending_cards = pending_card_identities(sess) if all_rows else set()
     update_rows: list[dict] = []
     audit_rows: list[dict] = []
     candidate_rows: list[dict] = []
     triage_details: list[dict] = []
+    actor_triage: list[dict] = []
     promoted_names: list[tuple[str, str]] = []  # (embedding_group, name) — see return docstring
+    actx = _ActorPromoCtx(sess, resolved, pending_cards, actor_table, actor_trigram_index,
+                        actor_token_index, tn, auto_mode, candidate_rows, actor_triage, sid,
+                        tenant, entity, stamp, actor_id)
     for row in rows:
         # Banded triage of the LIBRARY-SHAPED name FIRST (never the asset-embedded one) —
         # before any type resolution, so an auto-reject adopts the matched entry's owning type
@@ -948,30 +1022,37 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
         # Auto-MERGE stays forbidden: automation never rewrites or retires an existing entry.
         generic = triage.generic_by_tid[row["ThreatID"]]
         fate = _decide_candidate_fate(sess, row, generic, sector_id, resolved, triage, tn,
-                                    created_by=actor_id)
+                                    created_by=actor_id, auto_mode=auto_mode,
+                                    pending_cards=pending_cards)
         verdict, type_id, catalogue_id_new, matched_id, cosine, minted = fate
 
         actors = parsed_actors[row["ThreatID"]]
-        # TWO gates, closing two different loops:
-        # * resolve_only — AI-proposed names may LINK existing actors, never CREATE one (the
-        #   vocabulary-growth loop, _link_actors_to_threat_type's docstring);
-        # * minted-only — links may SEED a type minted in this very accept, never extend a
-        #   pre-existing type's actor set. Without this, an unvalidated AI assertion ("Hacktivist
-        #   does type 210") written today becomes the very set get_allowed_actor_names validates
-        #   future sessions against tomorrow — attribution laundering one level up from the
-        #   vocabulary loop. A curated type's actor set changes only via
-        #   PATCH /threat-types/{id} (actor_names), the deliberate, audited path.
+        # Actor candidacy FIRST — the same order the type/catalogue path uses (triage before
+        # any write): duplicates resolve into the memo, novel names mint (switch ON, junk-
+        # gated) or queue as cards, the review band queues under either switch. Only names
+        # this call resolved or minted can then LINK below.
+        _queue_or_mint_row_actors(actx, row, type_id, actors)
+        # The remaining gate, closing the laundering loop: links may SEED a type minted in
+        # this very accept, never extend a pre-existing type's actor set. Without this, an
+        # unvalidated AI assertion ("Hacktivist does type 210") written today becomes the very
+        # set get_allowed_actor_names canonicalizes future sessions against tomorrow. A curated
+        # type's actor set changes only via PATCH /threat-types/{id} (actor_names) or an
+        # admin-approved actor card — the deliberate, audited paths.
         if resolved.get(("minted_type", type_id)):
-            linked_actors = _link_actors_to_threat_type(sess, type_id, actors, resolved,
-                                                        created_by=actor_id,
-                                                        resolve_only=True)  # names NEWLY linked this accept
+            linked_actors = _link_actors_to_threat_type(sess, type_id, actors, resolved)
         else:
             linked_actors = []
-            if actors:
-                log.info("accept.actor_links_withheld", type_id=type_id, actors=actors,
-                        threat_id=row["ThreatID"],
-                        note="type pre-exists this accept; curator owns its actor set — add via "
-                            "PATCH /v1/tsg/threat-library/threat-types/{id} if the attribution is real")
+            if actors and type_id is not None:
+                # PATCH hint, filtered inside the helper to the names it is actionable for
+                # (known-but-unlinked) — carded and unknown names have their own traces.
+                log_withheld_links(resolved, type_id, actors, row["ThreatID"])
+            elif actors:
+                # OFF + novel type: no id to PATCH yet — the type is itself pending as a card.
+                # The names above were still triaged/queued; links become possible only after
+                # the admin approves the type (and actor) cards. Distinct line because the
+                # withheld-log's "type pre-exists" wording would be wrong here.
+                log.info("accept.actor_links_deferred_novel_type", actors=actors,
+                        threat_id=row["ThreatID"])
         triage_details.append({"threat_id": row["ThreatID"], "generic_name": generic,
                             "verdict": verdict, "cosine": cosine,
                             "matched_catalogue_id": matched_id})
@@ -1004,10 +1085,19 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
 
         # ONLY the middle band reaches a human. `pending` is the honest status — nothing has
         # been reviewed, hence no ReviewedBy/ReviewedAt and no `candidate_reconciled` audit.
-        # Deduped per (type, name) within one accept — the table has no unique index, so two
-        # identical proposals would otherwise queue the same curation task twice.
-        ckey = ("candidate", row["ThreatType"], row["ThreatName"])
-        if verdict is TriageVerdict.review and row["ThreatName"] and ckey not in resolved:
+        # TWO dedup layers (the table has no unique index): the in-accept memo, then the
+        # preloaded cross-session set of already-PENDING rows — without that layer, every
+        # session that proposes the same threat queues the same curation card again (the
+        # pile-up the curator queue existed to avoid). BOTH layers key on the SAME folded
+        # identity (generic-or-name), so two paraphrases in one accept can't double-queue
+        # what one session would have deduped against another.
+        ident = ((generic or row["ThreatName"]) or "").strip().casefold()
+        ckey = ("candidate", ident)
+        # `ident` (not just ThreatName) must be non-empty: the preload drops empty folds, so a
+        # blank-identity card could never be remembered and would re-queue every accept.
+        if (verdict is TriageVerdict.review and row["ThreatName"] and ident
+                and ckey not in resolved
+                and (CandidateKind.threat, ident) not in pending_cards):
             resolved[ckey] = True
             candidate_rows.append({
                 "CandidateID": guid(), "TenantID": tenant, "EntityID": entity,
@@ -1017,12 +1107,36 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
                 "Status": CandidateStatus.pending, "ThreatTypeID": type_id,
                 "ThreatCatalogueID": catalogue_id_new,
                 "ReviewedBy": None, "ReviewedAt": None, "CreatedAt": stamp,
+                "CandidateKind": CandidateKind.threat, "CreatedBy": actor_id,
             })
+        elif (verdict is TriageVerdict.review and ident
+                and (CandidateKind.threat, ident) in pending_cards):
+            # Cross-session suppression must not be silent (the actor path already logs its
+            # twin): the identity is queued or was rejected — an operator can answer "why does
+            # this threat never reach the library?" from this line alone.
+            log.info("accept.threat_card_suppressed", threat_id=row["ThreatID"], ident=ident,
+                    note="identity already queued for review or previously rejected — no re-queue")
 
-    if triage_details:
+    # GAP B pass: rows whose THREAT matched well (score >= threshold) carry no threat
+    # candidacy — their type/catalogue ids are already the library's — but their ACTOR names
+    # still get the full gate: triage, cards, junk-gated mints under the switch. Links stay
+    # curator-owned (the anti-laundering rule above): a pre-existing type's actor set never
+    # grows at accept, so a known-but-unlinked name only logs the PATCH hint.
+    for row in scored_rows:
+        actors = parsed_actors[row["ThreatID"]]
+        if not actors:
+            continue
+        vtype_id = row["ThreatTypeID"]
+        _queue_or_mint_row_actors(actx, row, vtype_id, actors)
+        if vtype_id is not None:
+            log_withheld_links(resolved, vtype_id, actors, row["ThreatID"])
+
+    if triage_details or actor_triage:
         # ONE calibration record per accept (AuditEventType.promotion_triage): every candidate's
         # cosine, matched entry and band verdict, plus the bands in force — 6d tightens the
         # bands by comparing these against what curators actually chose in the middle band.
+        # "candidates" = threat/catalogue decisions (embedding cosine); "actors" = actor-name
+        # decisions (string ratio, same band knobs) — the kind discriminator IS the array.
         audit_rows.append(dal.audit_row(
             sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=entity,
             EventType=AuditEventType.promotion_triage, ActorUserID=actor_id, ActorType=actor_type,
@@ -1030,7 +1144,8 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
             DetailJSON=json.dumps({
                 "bands": {"auto_reject": tn.triage_auto_reject_cosine,
                         "auto_approve": tn.triage_auto_approve_cosine},
-                "candidates": triage_details})))
+                "candidates": triage_details,
+                "actors": actor_triage})))
     if update_rows:
         # Table (Core), not the mapped class: a plain executemany UPDATE, not an ORM bulk-update-
         # by-PK (which requires the dict key to be the PK attribute name, not a bindparam name,
@@ -1039,6 +1154,11 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
         sess.execute(update(it).where(it.c.ThreatID == bindparam("b_tid")), update_rows)
     if candidate_rows:
         sess.execute(insert(m.Threat_Candidate_Review), candidate_rows)
+        n_actor = sum(1 for c in candidate_rows if c["CandidateKind"] == CandidateKind.actor)
+        # The one operator-visible trace that the admin-gated path did its job this accept.
+        log.info("accept.candidates_queued", session_id=sid,
+                threat_cards=len(candidate_rows) - n_actor, actor_cards=n_actor,
+                auto_mode=auto_mode)
     if audit_rows:
         sess.execute(insert(m.Scenario_Audit), audit_rows)
     return promoted_names

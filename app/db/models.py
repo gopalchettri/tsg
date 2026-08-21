@@ -490,16 +490,18 @@ class Config_Tuning(Base):
 # accept. Now genuinely a pending-review queue — accept.py writes `pending` and does NOT create a
 # Threat_Catalogue row from the name, because prompts.py requires that name to embed the asset's
 # own name and so it is never library-shaped. A curator generalizes it and creates the real entry.
-# Threat_TYPE promotion stays automatic and still writes its own `library_promoted` audit row.
+# The queue holds BOTH kinds of admin-gated proposals: threats (name+type) and actors
+# (name only) — CandidateKind tells them apart (NULL = legacy 'threat' rows).
 class Threat_Candidate_Review(Base):
     __tablename__ = "Threat_Candidate_Review"
     CandidateID: Mapped[str] = mapped_column(GUID, primary_key=True)
     TenantID: Mapped[str] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
     SessionID: Mapped[str] = mapped_column(GUID)
-    ProposedCategory: Mapped[str] = mapped_column(Unicode(200))
-    ProposedType: Mapped[str] = mapped_column(Unicode(300))
-    ProposedName: Mapped[str] = mapped_column(Unicode(500))
+    ProposedCategory: Mapped[str | None] = mapped_column(Unicode(200))  # NULL on actor candidates
+    ProposedType: Mapped[str | None] = mapped_column(Unicode(300))      # on actor candidates: the
+    # threat type the actor was proposed FOR (approval's link target); NULL only on legacy rows
+    ProposedName: Mapped[str] = mapped_column(Unicode(500))  # threat name, or the actor name
     # The candidate's library-shaped name — what the curator actually generalizes toward.
     # NULL on rows queued before the column existed.
     ProposedGenericName: Mapped[str | None] = mapped_column(Unicode(500))
@@ -509,6 +511,8 @@ class Threat_Candidate_Review(Base):
     ReviewedBy: Mapped[str | None] = mapped_column(Unicode(200))
     ReviewedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedAt: Mapped[datetime] = mapped_column(DateTime)
+    CandidateKind: Mapped[str | None] = mapped_column(Unicode(20))  # CandidateKind enum; NULL = 'threat'
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))     # ORIGINAL proposer, never the admin
 
 # One row per LLM call (exact prompt + raw response, success or failure). Raw model output is
 # NEVER put in ErrorMessage/audit/SSE (all client-visible) — only here.
@@ -557,7 +561,8 @@ class Scenario_Audit(Base):
     EventType: Mapped[str] = mapped_column(Unicode(40))
     Decision: Mapped[str | None] = mapped_column(Unicode(30))  # accept only — AuditDecision; NULL elsewhere
     Granularity: Mapped[str | None] = mapped_column(Unicode(20))  # regeneration_completed only
-    ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)  # library_promoted only
+    ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)  # library_promoted +
+    # candidate_reconciled (approvals: the minted/linked type)
     # WHO IS ACCOUNTABLE, not who typed the command: human actions record the authenticated
     # principal, worker rows are back-filled from Scenario_Session.UserID by dal.append_audit.
     ActorUserID: Mapped[str | None] = mapped_column(Unicode(200))

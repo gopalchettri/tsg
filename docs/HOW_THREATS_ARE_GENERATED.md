@@ -45,7 +45,7 @@
 | **STRIDE category** | One of six standard threat families: Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, Elevation of Privilege. |
 | **Threat type** | The *generic* impact, in library wording, with no product names — e.g. "Sensitive data exposure". |
 | **Threat name** | The impact *as it applies to this asset* — e.g. "Unauthorized disclosure of Citizen Personal Information". Deliberately different in shape from the type; see [§14](#14-known-gaps-and-defects). |
-| **Threat actor** | Who would do it — "Nation-state/APT", "Malicious insider". Only labels already in the library are kept. |
+| **Threat actor** | Who would do it — "Nation-state/APT", "Malicious insider". At grounding time only labels already in the library are kept; at accept, unknown labels queue for admin review (or are auto-added when the master switch is on) — see Step 31. |
 | **Threat library** | The organisation's approved catalogue of categories, types, names and actors. The AI's output is checked against it, never trusted on its own. |
 | **Grounding** | Matching an AI-proposed threat to a real library entry, so the same real-world threat worded two ways always lands on the same catalogue row. |
 | **Verified / unverified** | The two possible grounding outcomes. **Verified** = matched an approved entry. **Unverified** = not in the library *yet* — still gets a scenario, and is what library growth feeds on. It does **not** mean "rejected". |
@@ -238,6 +238,9 @@ resumed.
 allowed-field lists are read **exactly once per run** (`app/pipeline/tasks.py:1259`). *Business rule:
 a curator editing configuration mid-run cannot change the rules between two threats of the same run.*
 (Regeneration deliberately does the opposite — see [§13](#13-what-one-session-actually-costs).)
+The actor vocabulary itself is capped and cached (`dal.active_actor_names`,
+`TSG_ACTOR_VOCABULARY_CAP`/`TSG_ACTOR_VOCABULARY_CACHE_SECONDS`) — see the note where the
+prompt text is shown below.
 
 ---
 
@@ -306,8 +309,12 @@ Then, and only if the *type* verified:
 
 6. **Name** — the same shortlist-and-rerank, but searched **only within that type's catalogue
    entries**, so an unrelated type's entry can't win on wording alone.
-7. **Actors** — the AI's proposed actors are filtered down to the library's approved actor list for
-   that type. Invented actors are dropped.
+7. **Actors** — canonicalize-and-keep: proposed actors the type's approved list knows are
+   rewritten to the library's exact spelling; names it does NOT know are **kept as proposed**,
+   never dropped. Whether a kept name is genuinely new is judged at accept against the FULL
+   actor table (banded triage: same name in a different spelling → reuse the existing actor;
+   merely similar → admin review card; clearly novel → review card, or a junk-gated auto-add
+   under the master switch), Step 31.
 
 If the **type** comes back unverified, matching stops immediately — there is no trusted type id to
 scope a name or actor search by, and the actors are returned raw and marked unvalidated. If the
@@ -586,21 +593,33 @@ threats were identified — marks the chosen scenarios accepted, and completes t
 id can't be accepted, nothing is accepted and the response names each offending id and why, in plain
 English.
 
-**Step 31 — What accepting does to the shared library.** (`app/pipeline/accept.py:419`)
+**Step 31 — What accepting does to the shared library.** (`app/pipeline/accept.py::_add_unverified_threats_to_library`)
 
 Threats whose grounding score was below `library_promotion_threshold` = **75**, *and* whose scenario
-was actually accepted, are candidates for promotion. For each:
+was actually accepted, are candidates for promotion. Since 2026-08-18 the behavior is governed by
+ONE master switch, `promotion_auto_approve_enabled` (default **OFF**):
 
-- its **threat type** is created (or reused) in the library, with its validated actors linked —
-  race-safely, so two concurrent accepts can't create duplicates;
-- its **threat name is deliberately NOT auto-added**. The prompt *requires* that name to embed the
-  asset's own name ("Unauthorized disclosure of Citizen Personal Information"), while every one of the
-  curated catalogue entries is generic idiom. Auto-minting it could only ever park an asset-named
-  near-duplicate beside the generic entry it belongs under. Instead the proposal is queued as a
-  `pending` `Threat_Candidate_Review` row for a curator to generalise.
+- **Switch OFF (default — admin-gated):** anything matching the master library is used as-is
+  (nothing saved); anything NEW writes **zero master rows** at accept. Novel threat **types**,
+  **names**, and **actors** each queue as `pending` `Threat_Candidate_Review` cards
+  (`CandidateKind` 'threat' | 'actor'), cross-session deduplicated, stamped `CreatedBy` = the
+  accepting user. The admin's approval mints the entry (the master row's `CreatedBy` credits the
+  ORIGINAL proposer, never the admin) and, for actors, links them to the type the card names —
+  the grounded id first when it is still active, else resolved from the stored type text (one
+  unambiguous active match; otherwise the actor is created unlinked). Before this change, novel
+  actors were silently dropped and novel types were auto-minted at accept.
+- **Switch ON (full auto):** the threat **type** is created (or reused) race-safely, clearly-novel
+  **actors** are auto-added (junk-gated; gray-zone spellings still queue for review, duplicates
+  reuse the existing row) and linked when the type was minted this accept, and a clearly-novel
+  generic **name** may auto-enter the catalogue; everything is stamped `Source='ai_auto_promoted'`.
+- In both modes the **asset-embedded name is deliberately NOT auto-added**. The prompt *requires*
+  that name to embed the asset's own name ("Unauthorized disclosure of Citizen Personal
+  Information"), while curated catalogue entries are generic idiom — the generic form is what
+  queues (or, ON, auto-enters).
 
-*Business rules: the library grows only through human-accepted content; catalogue wording is
-curated, never auto-generated; accept and regenerate are mutually exclusive.*
+*Business rules: the library grows only through human-accepted content — and, with the switch
+off, only through the admin's explicit approval; catalogue wording is curated; accept and
+regenerate are mutually exclusive.*
 
 **Step 32 — Or cancel.** `POST .../cancel` marks the session cancelled. In-flight work isn't
 interrupted — it notices on its next compare-and-swap and stops writing.
@@ -681,8 +700,23 @@ scenario stage, not here.
 type: the generic impact in plain library terms, with no asset, product or technology names —
 <one gloss per live category, e.g. Spoofing → impersonation to gain unauthorized access; ...>.
 category: exactly one of <the live category names>.
-actors: labels chosen ONLY from this list: <the live actor names>. Empty list if none applies —
-never a label outside the list, never invented group names or descriptive sentences.
+actors: name the adversary behind this condition — a real, publicly documented group or a short
+generic role label. PREFER these existing labels, spelled EXACTLY as given, whenever one fits:
+<the live actor names>. A name outside the list is allowed ONLY for a real, publicly documented
+group or a concise generic role — never a fabricated or speculative group name, never a
+descriptive sentence. Empty list if none applies.
+```
+
+> **The actor list is capped and cached, not the whole table.** `<the live actor names>` is
+> at most `TSG_ACTOR_VOCABULARY_CAP` (default 300) names, ordered by relevance — the actors
+> already linked to the most threat types first, ties broken by most-recently-created —
+> never alphabetical (which would permanently favor names starting early in the alphabet as
+> the table grows past the cap). The list is process-cached for
+> `TSG_ACTOR_VOCABULARY_CACHE_SECONDS` (default 30s) so it isn't re-queried on every single
+> identification call. Neither matters for correctness: this is only a spelling hint — a
+> real actor outside the cap is still fully handled by grounding and accept-time triage
+> (`app/pipeline/accept_actors.py`); capping/caching only bounds how large the prompt gets
+> as the actor library grows.
 
 RULES
 1) Propose at most <max_threats> unique threats, most contextually relevant first.
@@ -712,8 +746,8 @@ CONTEXT:
 > **An audit caveat nobody would guess.** Three parts of that system message are **built at runtime
 > from the database**: the per-category glosses on `type`, the list of category names, and the
 > `actors` sentence — which is a *completely different sentence* when `Threat_Actor` is unseeded
-> (it degrades to "short generic role labels, for example …" because you cannot demand "only from
-> this list" when the list is empty) (`app/pipeline/prompts.py:98`, `:130`). The Stage-2 controls cap
+> (it degrades to "short generic role labels, for example …" because there is no preferred-spelling
+> list to show when the table is empty) (`app/pipeline/prompts.py:98`, `:130`). The Stage-2 controls cap
 > is likewise interpolated from settings at call time.
 >
 > Meanwhile `PROMPT_VERSION` is pinned to the literal `"1.0"` (`app/pipeline/prompts.py:21`) and

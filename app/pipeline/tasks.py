@@ -1329,7 +1329,12 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
         return []
     partial_error = (f"{len(failures)} of {len(failures) + len(provs)} scenario(s) failed to "
                     f"generate: {'; '.join(failures)}") if failures else None
-    _finalize_scenario_batch(sess, scenario_session, asset_context, subsystems, llm, task_id, epoch)
+    # durable=not targeted: only the plain full-run path has nothing else uncommitted on `sess`
+    # at this point (see map_controls' durable docstring) — targeted regen/next-set still has
+    # buffered, uncommitted scenario rows here (_reconcile_targeted_regen), so it must keep
+    # riding this transaction instead of forcing an early commit of unvalidated writes.
+    _finalize_scenario_batch(sess, scenario_session, asset_context, subsystems, llm, task_id, epoch,
+                            durable=not targeted)
     if not dal.finish_stage(sess, sid, ss, SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION,
                             epoch, task_id, error=partial_error):
         sess.rollback()
@@ -1344,9 +1349,10 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
 
 
 def _finalize_scenario_batch(sess: Session, scenario_session: dict, asset_context: dict,
-                            subsystems: list[dict], llm: LLMClient, task_id: str, epoch: int) -> None:
+                            subsystems: list[dict], llm: LLMClient, task_id: str, epoch: int,
+                            *, durable: bool = False) -> None:
     control_mapping.map_controls(sess, scenario_session, asset_context, subsystems, llm,
-                                ASSET_UNIT_ID, task_id, epoch)
+                                ASSET_UNIT_ID, task_id, epoch, durable=durable)
 
 
 def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id: int,
@@ -1462,7 +1468,8 @@ def _failure_client_message(exc: Exception) -> str:
     return _classify_llm_failure(exc)[1]
 
 
-def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, exc: Exception, epoch: int = _EPOCH) -> None:
+def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, exc: Exception,
+                    epoch: int = _EPOCH, extra: dict | None = None) -> None:
     sess.rollback()
     sid = scenario_session["SessionID"]
     client_msg = _failure_client_message(exc)
@@ -1475,9 +1482,12 @@ def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, ex
             m.Subsystem_Stage_State.Status.in_([StageStatus.IDLE, StageStatus.RUNNING]))
         .values(Status=StageStatus.ERROR, ErrorMessage=client_msg, LeaseExpiresAt=None, UpdatedAt=now())
     )
+    detail = {"error": client_msg, "subsystem_id": subsystem_id}
+    if extra:
+        detail.update(extra)
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"], EntityID=scenario_session["EntityID"],
                     SubsystemID=subsystem_id, EventType=AuditEventType.stage_error,
-                    DetailJSON=json.dumps({"error": client_msg, "subsystem_id": subsystem_id}))
+                    DetailJSON=json.dumps(detail))
     sess.commit()
     # Item 27: explicit "scope" instead of leaving the client to infer it from whether
     # subsystem_id is present — see the typed ErrorEvent model (schemas.py) for the full contract.

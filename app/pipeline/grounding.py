@@ -6,9 +6,12 @@ each time.
 
 Every match bands into GroundingStatus.verified/unverified across ONE cutoff
 (a configurable Setting, see label_match_from_score) — unverified means "not in
-the library yet". On accept, its Threat_TYPE is promoted automatically; its NAME
-is queued for curator generalization instead (accept.py), because the prompt
-requires that name to embed the asset's own name.
+the library yet". What happens to an unverified threat on accept is governed by
+the promotion_auto_approve_enabled master switch (accept.py): OFF (the default)
+routes every novel type, name, and actor through the admin candidate queue; ON
+lets banded triage auto-promote. Either way the asset-embedded NAME itself never
+enters the library — the prompt requires it to embed the asset's own name, so
+only its curator-generalized generic form is promoted or queued.
 
 sector_ids is always [own_sector_id, parent_sector_id] (fewer/empty = no
 sector context) — see visible_to_this_sector / how_specific_is_this_sector.
@@ -17,6 +20,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -438,9 +443,12 @@ class GroundingResult:
                             even though a best-scoring candidate row existed. The shortlist
                             is fail-open and the rerank has no minimum, so "there was a
                             candidate" is not evidence of a match — see find_threat_in_library.
-    actors_validated      — False means the type was unverified, so `actors` is
-                            the AI's raw/unchecked proposal, not confirmed
-                            against the library's allowed set.
+    actors_validated      — False means the type was unverified, so `actors` is the AI's raw
+                            proposal untouched. True means the type verified and the list was
+                            CANONICALIZED against its allowed set (known names take the
+                            library spelling; unknown names are KEPT — see
+                            canonicalize_actors). Not a purity flag: either way, novelty is
+                            judged at accept, and no production reader gates on this.
     """
 
     status: GroundingStatus
@@ -464,6 +472,41 @@ def ensure_actor_list(raw: Any) -> list[str]:
     if isinstance(raw, list):
         return [x for x in raw if isinstance(x, str)]
     return []
+
+
+# Spelling-normalization for actor-name identity — THE one identity key for actor dedup
+# everywhere (accept_actors' memo/triage/card identity and its pending-card fold), so an
+# identity remembered by one layer can never be missed by another. Unicode-aware on purpose:
+# actor columns are NVARCHAR and a Cyrillic or CJK group name is a name, not junk — an
+# ASCII-only alphabet silently deleted every non-Latin proposal.
+_ACTOR_NORM_RE = re.compile(r"[\W_]+")
+# Letter↔digit boundaries count as separators, so "APT41", "APT-41" and "APT 41" are ONE
+# identity — otherwise the verdict on a numbered group depended on which spelling the
+# library happened to store.
+_ALNUM_BOUNDARY_RE = re.compile(r"(?<=[^\W\d_])(?=\d)|(?<=\d)(?=[^\W\d_])")
+
+
+def norm_actor_name(name: str) -> str:
+    """The one comparison key for actor-name identity (and similarity input): casefold →
+    NFKD-decompose + drop combining marks (so 'Fáncy Bear' == 'Fancy Bear' and full-width
+    text folds to ASCII) → split letter↔digit boundaries → collapse every non-word run to
+    one space. Letters of ALL scripts survive; only true letterless junk folds to ''."""
+    decomposed = unicodedata.normalize("NFKD", name.casefold())
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return _ACTOR_NORM_RE.sub(" ", _ALNUM_BOUNDARY_RE.sub(" ", stripped)).strip()
+
+
+def canonicalize_actors(actors_in: list[str], allowed: list[str]) -> list[str]:
+    """Canonicalize-and-KEEP (§8.4 step 5): names the type's vocabulary knows are rewritten to
+    the LIBRARY's spelling (case-insensitively — "MSSQL's collation resolves 'nation state' to
+    'Nation State', so this must too", keeping ThreatActorsJSON joinable to accept.py's
+    exact-first memo); names it does NOT know are kept as proposed. Whether a kept name is
+    genuinely new is judged at ACCEPT against the FULL actor table (banded triage +
+    admin-gated review cards), not against one type's short list — the old drop-out-of-set
+    rule silently vetoed every LLM-proposed actor on a verified type before any human could
+    see it, so the library could never learn a new actor from the threats it recognizes best."""
+    allowed_cf = {a.casefold(): a for a in allowed}
+    return [allowed_cf.get(a.casefold(), a) for a in actors_in]
 
 
 def _actors_meta(threat_actors_json: str | None) -> dict:
@@ -728,7 +771,8 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
     against the real library. Matches TYPE first; if that comes back unverified,
     stops immediately — there's no confident ThreatTypeID to scope a name/actor
     search by — and returns actors raw/unvalidated. Otherwise matches NAME
-    within that type only ([R6]), filters actors to the type's allowed set,
+    within that type only ([R6]), canonicalizes actors against the type's
+    allowed set (keeping unknown names for accept-time triage),
     and reports the weaker of the type/name confidence.
 
     `cache`: optional dict, shared by the caller across every proposal in one
@@ -797,15 +841,9 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
 
     akey = ("actors", type_id)
     allowed = _cached(cache, akey, lambda: get_allowed_actor_names(sess, type_id))
-    # Case-insensitive, and normalised to the LIBRARY's spelling — the same convention
-    # accept.py's actor memo documents ("MSSQL's collation resolves 'nation state' to
-    # 'Nation State', so the memo must too"). An exact `in` dropped any actor differing only in
-    # case, and it drops it ONLY on a verified type — an unverified one returns actors raw above
-    # — so exact matching made better grounding yield FEWER actors. Returning the canonical
-    # spelling also keeps ThreatActorsJSON joinable to accept.py's exact-first lookup.
-    allowed_cf = {a.casefold(): a for a in allowed}
-    actors = [allowed_cf[cf] for a in actors_in
-              if (cf := a.casefold()) in allowed_cf]  # drop out-of-set (§8.4 step 5)
+    # Canonicalize-and-KEEP — see canonicalize_actors: known names take the library spelling,
+    # unknown ones survive to accept's banded triage instead of being silently dropped here.
+    actors = canonicalize_actors(actors_in, allowed)
 
     # Symmetry with the TYPE branch above: an unverified type already yields type_id=None. An
     # unverified NAME must likewise yield no id and no library wording. `crow` is only ever the

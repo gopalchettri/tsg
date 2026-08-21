@@ -66,7 +66,7 @@ only ever park a near-duplicate beside the generic entry it belongs under.
 flowchart TD
     A["<b>Before anything runs</b><br/>Approved library exists:<br/>categories, types, generic names, actors"] --> B
 
-    B["<b>STEP 1 — GENERATE</b><br/>One AI request per run.<br/>The approved actor list is read live<br/>from the database and placed into<br/>the request as a closed list."] --> C
+    B["<b>STEP 1 — GENERATE</b><br/>One AI request per run.<br/>The approved actor list is read live<br/>from the database and placed into<br/>the request as PREFERRED spellings;<br/>real new groups may be named too."] --> C
 
     C["AI returns up to 10 proposals.<br/>Each carries 5 fields:<br/>category · type · threat name ·<br/>generic name · actors"] --> D
 
@@ -134,12 +134,13 @@ discovering new kinds of impact, never for volume.
 | **type** | The generic impact. No asset, product or technology names. |
 | **name** | `<impact> of <asset name>` — must name the asset. No attack techniques or tools. |
 | **generic name** | The same impact with asset, product and technology names removed. |
-| **actors** | Chosen **only** from the approved actor list, which is included in the request. Empty is a valid answer. |
+| **actors** | Real, publicly documented groups or short generic roles. The approved actor list is included as **preferred spellings**; a name outside it is allowed only for a real group, never an invented one. Empty is a valid answer. |
 
 **Where the actor list comes from.** It is read from the approved actor table at the moment the
-request is built, and inserted as a closed list — *"labels chosen ONLY from this list…"*. If that
-table has never been populated, the request degrades honestly to asking for short generic role
-labels, because you cannot demand a choice from an empty list.
+request is built, and inserted as the preferred vocabulary — *"PREFER these existing labels,
+spelled EXACTLY as given…"*. The AI may still name a real new group; that name then travels the
+same recognize-and-gate road a novel threat type does (checks 4 and section 7). If the table has
+never been populated, the request degrades honestly to asking for short generic role labels.
 
 **Two business guarantees at this step:**
 
@@ -204,8 +205,11 @@ candidate is not evidence of a match.
 
 ### Check 4 — The threat actors
 
-The AI's proposed actors are filtered down to the actors **approved for that specific matched type**.
-Anything outside that set is dropped. The prompt asked for a closed list; this is the enforcement.
+The AI's proposed actors are checked against the actors **approved for that specific matched
+type**: recognized names are corrected to the library's exact spelling, and names the list does
+NOT know are **kept as proposed** — never dropped. Whether a kept name is genuinely new is judged
+later, at accept, against the whole actor table (same three-band check the threat types get:
+duplicate spelling → reuse the existing actor; clearly new or unsure → an admin review card).
 
 ### The verdict
 
@@ -303,15 +307,18 @@ against what curators actually decided.
 
 ### The threat actors
 
-Approved actors that already exist are **linked** to the threat type. **A new actor is never created
-automatically.** An unrecognised actor name is skipped and logged.
+Approved actors that already exist are **linked** to the threat type (only when that type was
+itself created in this same acceptance — a curated type's actor set never grows here). An
+unrecognised actor name is triaged: a duplicate spelling of an existing actor is recognized and
+reused; a genuinely new or uncertain name becomes an **admin review card** — with the master
+switch OFF (the default), **a new actor is never created without an admin's approval**.
 
-This restraint is the single most important safeguard in the promotion path. New actors are created
-only by deliberate administrative action, through the dedicated endpoint. If automation could mint
-them, one invented label would immediately join the approved actor table — which is read into *every
-future request's closed list*. The AI would then see its own invention offered back as approved
-vocabulary, and propose it again with more confidence. That is a self-reinforcing loop with no human
-checkpoint anywhere in it.
+That human checkpoint is the single most important safeguard in the promotion path. If automation
+could mint actors unreviewed, one invented label would immediately join the approved actor table —
+which is read into *every future request's preferred vocabulary*. The AI would then see its own
+invention offered back as approved and propose it again with more confidence. The admin's approval
+(which credits the original proposing user as the discoverer) is what breaks that self-reinforcing
+loop — the library grows, but only through the gate.
 
 ---
 
@@ -399,7 +406,7 @@ for a human. It did not gain an asset-named near-duplicate, and it did not gain 
 | If this is missing or wrong | What you will see |
 |---|---|
 | The **threat library** is empty or unseeded | Every threat comes back unverified. Scenarios are still produced, but no official wording is ever used. |
-| The **actor table** is unseeded | The AI is asked for generic role labels instead of a closed list, and no actor can ever be validated. |
+| The **actor table** is unseeded | The AI is asked for generic role labels instead of being shown preferred spellings, and every proposed actor reads as new — all of them go to the admin review queue. |
 | A library entry has **no stored comparison data** | That entry exists but is invisible to comparison. It can never be matched. |
 | The asset's **context fields are mostly unrecorded** | Blank and placeholder values are dropped, so little reaches the AI and proposals come back generic and weak. The remedy is completing the asset record, not a configuration change. |
 | The match cutoff is **pinned by hand** | Automatic per-model calibration is switched off. After a model change, matches may be misjudged in either direction. |

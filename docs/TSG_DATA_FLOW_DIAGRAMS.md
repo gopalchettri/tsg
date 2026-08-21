@@ -40,7 +40,7 @@ flowchart TD
 
     SNAP --> PREP["Prepare what the AI may see.<br/>Only approved fields.<br/>Secrets and personal data stripped"]
     CFG[("Curator settings:<br/>allowed fields, categories,<br/>approved actor list")]
-    CFG -.->|"Actor list is sent as a<br/>closed list to choose from"| PREP
+    CFG -.->|"Actor list is sent as<br/>preferred spellings to use"| PREP
 
     PREP --> AI["ONE AI request for the whole asset"]
     AI --> OUT["Up to 10 candidate threats.<br/>Each one carries: category, threat type,<br/>threat name, generic name, actors"]

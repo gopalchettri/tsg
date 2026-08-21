@@ -1,0 +1,34 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-litellm-proxy
+  namespace: ai-threatgen
+spec:
+  # tsg-api and celery-worker (component: fastapi / celery) both carry this one label — no
+  # separate "tsg-worker" value needed, it never matched any real pod.
+  podSelector:
+    matchLabels:
+      app: tsg-api
+  policyTypes:
+    - Egress
+  egress:
+    # Rule 1 — DNS (redundant with tsg-api-network-policy, kept here for clarity)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+    # Rule 2 — HTTP to the corporate proxy (litellm traffic is proxied, not direct — confirmed
+    # with network team). This one rule also unblocks any other HTTP_PROXY/HTTPS_PROXY-routed
+    # traffic from these pods (e.g. the OTX threat-intel feed), since it's the same proxy.
+    - to:
+        - ipBlock:
+            cidr: 10.61.192.2/32
+      ports:
+        - port: 8080
+          protocol: TCP
