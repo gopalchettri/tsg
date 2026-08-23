@@ -39,6 +39,18 @@ THREE THINGS TO KNOW BEFORE YOU START
     from these scripts.
 
 NOT PART OF THE INSTALL — do not run:
+  * TSG_Core_Drop.sql -- *** DESTRUCTIVE, DEVELOPMENT ONLY. ***
+    DROPS the 13 tables TSG_Core.sql creates so it can recreate them clean — every
+    assessment, scenario, decision, audit record and API client, unrecoverable. Set
+    @I_UNDERSTAND = 'YES' inside it to arm it; it does nothing otherwise. Also empties
+    Threat_Scenario_Control_Map, which holds per-scenario data but is created by
+    Control_library.sql — dropping the scenario tables without it leaves orphan rows keyed
+    to OutputIDs that no longer exist. Recreates NOTHING: run TSG_Core.sql afterwards, then
+    re-insert an API_Client row or the app will not boot.
+  * TSG_Migration_ScenarioLifecycle.sql -- copy-paste extract of the scenario-lifecycle
+    changes, for applying that one release without running the full ~800-line TSG_Core.sql.
+    Every statement in it is verbatim from TSG_Core.sql, so running either, or both, in any
+    order is safe. TSG_Core.sql stays canonical.
   * backfill_null_platform_fields_for_testing.sql -- developer fixture. Writes FABRICATED
     values into PLATFORM tables. It now refuses to run unless the database name looks like
     dev/test, but do not run it regardless.
