@@ -1,7 +1,7 @@
 """Create control-library mappings for generated scenario outputs.
 
-The module converts scenario control suggestions into search queries, grounds them against
-the control library, and stores the highest-scoring matches.
+The module grounds each scenario's own text (title + statement) against the control
+library and stores the highest-scoring matches — the LLM never proposes controls.
 """
 from __future__ import annotations
 
@@ -64,30 +64,24 @@ def _min_score(sess: Session, llm: LLMClient, s) -> float:
     return grounding.resolve_thresholds(sess, llm, s)
 
 
-def collect_control_queries(scenario_json: str | None, top_k: int) -> tuple[list[tuple[str, str | None]], bool]:
-    """Convert one output's JSON into grounding queries.
+def collect_control_query(scenario_json: str | None) -> str | None:
+    """One grounding query per output: the scenario's own title + statement.
 
-    Returns ``(queries, used_fallback)``. Each query contains the control name and reason,
-    plus the name to store in ``SuggestedControl``. If no valid control name exists, use the
-    scenario title and statement as one query with no suggested-control value.
+    The LLM no longer proposes controls (library-first redesign) — the narrative text is
+    matched directly against Control_Library, so control selection never depends on the
+    model's control wording. The json.loads guard stays: ScenarioJSON is NULL on error
+    cards and must yield None, not a crash. Legacy rows still carrying a model-authored
+    "controls" key are deliberately ignored here — the map row is the source of truth.
     """
     try:
         scenario = json.loads(scenario_json or "{}")
     except ValueError:
         scenario = {}
-    queries: list[tuple[str, str | None]] = []
-    for c in scenario.get("controls") or []:
-        if not isinstance(c, dict):
-            continue
-        name = grounding.ensure_text(c.get("name")).strip()
-        why = grounding.ensure_text(c.get("why")).strip()
-        if name:
-            queries.append((f"{name}: {why}" if why else name, name[:500]))
-    if queries:
-        return queries[:top_k], False
+    if not isinstance(scenario, dict):
+        return None
     text = " ".join(t for t in (grounding.ensure_text(scenario.get("scenario_title")).strip(),
                                 grounding.ensure_text(scenario.get("scenario_statement")).strip()) if t)
-    return ([(text, None)] if text else []), bool(text)
+    return text or None
 
 
 def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
@@ -96,10 +90,12 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
     """Store top control matches for active, complete scenario outputs.
 
     Reads outputs with a null ``ControlsMappedAt`` value and no existing map rows, grounds
-    their control suggestions, filters matches by score, removes duplicate control IDs, and
-    inserts the top ``control_map_top_k`` rows. It timestamps every selected output, including
-    outputs with no valid query. A mapping error is logged without failing scenario generation.
-    With ``durable=True``, mapping writes are committed before this function returns.
+    each output's SCENARIO TEXT (title + statement — the LLM no longer proposes controls)
+    against Control_Library via the hybrid shortlist + reranker, filters matches by score,
+    removes duplicate control IDs, and inserts the top ``control_map_top_k`` rows. It
+    timestamps every selected output, including outputs with no valid query. A mapping error
+    is logged without failing scenario generation. With ``durable=True``, mapping writes are
+    committed before this function returns.
     """
     # A savepoint prevents mapping errors from rolling back scenario writes.
     sp = sess.begin_nested()
@@ -123,20 +119,19 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         ).all()
         if not outputs:
             return
-        # Build all output queries before calling the embedding service once per batch.
-        per_output: list[tuple[str, list[tuple[str, str | None]]]] = []
-        fallbacks = 0
+        # ONE query per output — the scenario's own text. Built before calling the
+        # embedding service once per batch.
+        per_output: list[tuple[str, str]] = []
         for output_id, scenario_json in outputs:
-            queries, used_fallback = collect_control_queries(scenario_json, s.control_map_top_k)
-            if not queries:
+            query = collect_control_query(scenario_json)
+            if not query:
                 continue
-            fallbacks += used_fallback
-            per_output.append((output_id, queries))
+            per_output.append((output_id, query))
         skipped = len(outputs) - len(per_output)
         min_score = _min_score(sess, llm, s)
         inserted = dropped = 0
         if per_output:
-            texts = list(dict.fromkeys(q for _, qs in per_output for q, _ in qs))
+            texts = list(dict.fromkeys(q for _, q in per_output))
             qv_map: dict[str, list[float]] = {}
             try:  # Cache query vectors; grounding still works if this warm-up fails.
                 batch = get_settings().embedding_batch_size
@@ -145,30 +140,30 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                     qv_map.update(zip(chunk, llm.embed(chunk, kind="query")))
             except Exception:
                 log.warning("controls.query_prime_failed", session_id=sid, exc_info=True)
-            
+
             if not (dal.renew_lease(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id)
                     or dal.stage_settled_at_epoch(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch)):
                 log.warning("controls.lease_lost", session_id=sid)
                 return
             sess.commit()  # End the lease transaction before the slow grounding call.
-            flat = [(q, qv_map.get(q)) for _, qs in per_output for q, _ in qs]
-            matches = grounding.ground_control_queries(llm, flat, candidates, s)
-            pos = 0
-            for output_id, queries in per_output:
+            flat = [(q, qv_map.get(q)) for _, q in per_output]
+            match_lists = grounding.ground_control_queries(llm, flat, candidates, s)
+            for (output_id, _query), matches in zip(per_output, match_lists):
+                # KEEP the best[cid] dedup: the PK (OutputID, ControlLibraryID) turns any
+                # duplicate into an IntegrityError the outer except would swallow into
+                # controls.mapping_failed — losing the whole output's mapping on one
+                # WARNING. One guard here is cheaper than trusting every upstream path.
                 best: dict[int, dict] = {}
-                for (_query, suggested), match in zip(queries, matches[pos:pos + len(queries)]):
-                    if match is None:
-                        dropped += 1
-                        continue
-                    row, score = match
+                for row, score in matches:
                     if score < min_score:
                         dropped += 1
                         continue
                     cid = row["ControlLibraryID"]
                     if cid not in best or score > best[cid]["Score"]:
+                        # SuggestedControl deliberately not written (column stays, legacy
+                        # rows keep theirs): the LLM no longer suggests controls.
                         best[cid] = {"OutputID": output_id, "ControlLibraryID": cid, "SessionID": sid,
-                                    "Score": score, "SuggestedControl": suggested, "CreatedAt": now()}
-                pos += len(queries)
+                                    "Score": score, "CreatedAt": now()}
                 keep = sorted(best.values(), key=lambda r: r["Score"], reverse=True)[: s.control_map_top_k]
                 for rank, rec in enumerate(keep, start=1):
                     rec["MapRank"] = rank
@@ -187,13 +182,15 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
                         EntityID=scenario_session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,
                         SubsystemID=ss, EventType=AuditEventType.controls_mapped,
+                        # fallback_queries dropped from the detail: every query is scenario-text
+                        # now, the metric was constant. Historical rows keep the old key.
                         DetailJSON=json.dumps({"outputs": len(per_output), "mapped": inserted,
-                                                "dropped": dropped, "fallback_queries": fallbacks,
+                                                "dropped": dropped,
                                                 "skipped": skipped, "itot": itot or "",
                                                 "itot_filter_applied": itot is not None,
                                                 "min_score": min_score}))
         log.info("controls.mapped", session_id=sid, outputs=len(per_output), mapped=inserted,
-                dropped=dropped, fallbacks=fallbacks, skipped=skipped, itot=itot,
+                dropped=dropped, skipped=skipped, itot=itot,
                 min_score=min_score)
         if durable:
             sess.commit()

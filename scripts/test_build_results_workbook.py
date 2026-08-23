@@ -26,10 +26,10 @@ from app.api.schemas import (
 CONTROL_A = MappedControl(
     control_library_id=49, control_code="CII-CID-049", domain="Business Continuity & Disaster Recovery",
     control_name="Telecommunications Services Availability", rank=1, score=99.9,
-    suggested_control="Out-of-band backup communications", standards=["DESC ISR v3"])
+    standards=["DESC ISR v3"])
 CONTROL_B = MappedControl(
     control_library_id=464, control_code="CII-CID-464", domain="Secure Engineering & Architecture",
-    control_name="Fail Safe", rank=3, score=None, suggested_control=None, standards=[])
+    control_name="Fail Safe", rank=3, score=None, standards=[])
 
 APPLICABILITY = [
     SupportingSystemApplicability(supporting_system="OT Telecom Network", applicable=True,

@@ -84,7 +84,10 @@ _RESOURCES: dict[str, dict[str, Any]] = {
     },
     "threat-actors": {
         "model": m.Threat_Actor, "pk": m.Threat_Actor.ThreatActorID,
-        "pk_field": "threat_actor_id", "group": None,
+        # group was None while actors had no embeddings; the nearest-match fallback
+        # (library-first actors) now searches threat_actor vectors, so a rename must
+        # re-embed exactly like types/catalogue rows do.
+        "pk_field": "threat_actor_id", "group": "threat_actor",
         "name_col": m.Threat_Actor.ThreatActorName,
     },
     "controls": {

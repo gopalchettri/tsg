@@ -473,8 +473,12 @@ class Control_Library_Standard_Map(Base):
 # scripts/Threat_library.sql (run manually — see test_schema_sync's _DEPLOYED_SEPARATELY).
 class Threat_Catalogue_Category_Map(Base):
     __tablename__ = "Threat_Catalogue_Category_Map"
-    ThreatCatalogueID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Declared CATEGORY-first to match the DDL's PK_Threat_Catalogue_Category_Map
+    # (ThreatCategoryID, ThreatCatalogueID) — the order is load-bearing for
+    # get_possible_types' category seek, and SQLAlchemy derives composite-PK order
+    # from declaration order (the SQLite test schema must agree with MSSQL's).
     ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ThreatCatalogueID: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 

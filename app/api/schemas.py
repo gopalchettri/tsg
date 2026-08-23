@@ -493,8 +493,6 @@ _MAPPED_CONTROL_EXAMPLE: JsonDict = {
     "control_name": "Multi-Factor Authentication",
     "rank": 1,
     "score": 93.0,
-    "suggested_control": "Multi-factor authentication for privileged accounts",
-    "suggested_why": "Mitigates the risk of credential theft being used to reach the asset.",
     "standards": ["NIST SP 800-53 Rev. 5", "ISO 27001:2022"],
 }
 
@@ -524,33 +522,20 @@ _SCENARIO_EXAMPLE: JsonDict = {
         {"supporting_system": "SCADA System", "applicable": False,
          "justification": "The RTU accepts firmware updates directly; SCADA plays no role."},
     ],
-    # Two suggestions, only the first of which grounded — the second has no counterpart in
-    # `controls` above, which is exactly the library-gap signal this field exists to show.
-    "suggested_controls": [
-        {"name": "Multi-factor authentication for privileged accounts",
-         "why": "Mitigates the risk of credential theft being used to reach the asset."},
-        {"name": "Vendor firmware attestation at the RTU boot loader",
-         "why": "Blocks unsigned images from ever loading on the device."},
-    ],
-    # unmatched_suggested_controls precomputes exactly this diff: the one suggestion above with no
-    # counterpart in `controls`.
-    "unmatched_suggested_controls": [
-        {"name": "Vendor firmware attestation at the RTU boot loader",
-         "why": "Blocks unsigned images from ever loading on the device."},
-    ],
 }
 
 
 class MappedControl(BaseModel):
     """One Control_Library row mapped to a scenario by Step-4 control mapping
-    (control_mapping.map_controls): the LLM suggested a mitigating control in free text and grounding
-    matched it to this real library control. Ordered by rank (1 = best).
+    (control_mapping.map_controls): the scenario's own text was grounded against the control
+    library and this real library control matched. Ordered by rank (1 = best). The LLM never
+    proposes controls (library-first redesign).
 
-    Delivered nested, as `scenario.controls` — it REPLACES the LLM's raw `{name, why}` suggestions
-    there (sessions.py::_scenario_with_controls), so a scenario carries one control list, not two.
-    Each entry keeps the suggestion it grounded from in `suggested_control`/`suggested_why`.
-    An empty `scenario.controls` means nothing in the library matched well enough — a library-gap
-    signal, not an error, but only once `controls_mapped` is true (see ScenarioResult)."""
+    Delivered nested, as `scenario.controls` — it replaces whatever a legacy scenario's raw JSON
+    carried under that key (sessions.py::_scenario_with_controls), so a scenario carries one
+    control list, not two. An empty `scenario.controls` means nothing in the library matched well
+    enough — a library-gap signal, not an error, but only once `controls_mapped` is true (see
+    ScenarioResult)."""
     model_config = ConfigDict(json_schema_extra={"example": _MAPPED_CONTROL_EXAMPLE})
 
     control_library_id: int = Field(description="Control_Library primary key.")
@@ -559,29 +544,7 @@ class MappedControl(BaseModel):
     control_name: str = Field(description="The library control's official name.")
     rank: int = Field(description="1 = best match for this scenario.")
     score: float | None = Field(description="Raw rerank confidence 0-100 at mapping time.")
-    suggested_control: str | None = Field(
-        description="The LLM's original free-text suggestion this control grounded from; null when the mapping fell back to the scenario text.")
-    # The map row stores only the suggestion's NAME (control_mapping.collect_control_queries keeps
-    # `name[:500]`), so the LLM's rationale is recovered at read time from the scenario's own raw
-    # suggestions — which is why it also works for sessions mapped before this field existed.
-    # Defaults to None so _query_controls can keep building MappedControl straight from DB rows.
-    suggested_why: str | None = Field(
-        default=None,
-        description="The LLM's one-line rationale for the suggestion this control grounded from; null when the mapping fell back to the scenario text.")
     standards: list[str] = Field(default_factory=list, description="Referred standard names for this control.")
-
-
-class SuggestedControl(BaseModel):
-    """One raw control suggestion exactly as the LLM wrote it (prompt v1.3), before grounding.
-
-    Reported ALONGSIDE the grounded `controls` rather than replaced by them, for two reasons. A
-    suggestion that matched no library control appears only here — that difference IS the
-    library-gap signal, and it was previously invisible. And between a scenario being written and
-    Step-4 running (a tail step of the same stage, so minutes later), this is the only control
-    content that exists at all; blanking it made a normal in-progress read look like the model
-    had proposed nothing."""
-    name: str = Field(description="The control the LLM named, in its own words.")
-    why: str | None = Field(default=None, description="The LLM's one-line rationale for it.")
 
 
 class SupportingSystemApplicability(BaseModel):
@@ -623,24 +586,6 @@ class ScenarioNarrative(BaseModel):
         description=(
             "Step-4 mitigating controls mapped from the control library, best first. Empty means "
             "nothing matched well enough — but only once `controls_mapped` is true; see there."
-        ),
-    )
-    suggested_controls: list[SuggestedControl] = Field(
-        default_factory=list,
-        description=(
-            "The LLM's own control suggestions, present from the moment the scenario is written "
-            "and independent of mapping state. Compare against `controls`: a suggestion here with "
-            "no entry there naming it in `suggested_control` found no good library counterpart — "
-            "a gap in the control library. Empty for pre-v1.3 scenarios, which produced none."
-        ),
-    )
-    unmatched_suggested_controls: list[SuggestedControl] | None = Field(
-        default=None,
-        description=(
-            "The subset of suggested_controls with no counterpart in controls — the library-gap "
-            "signal precomputed for you, instead of diffing the two lists yourself. Null (not an "
-            "empty list) when control mapping hasn't been attempted yet — see controls_mapped on "
-            "the enclosing result; suggested_controls itself is still populated either way."
         ),
     )
     supporting_system_applicability: list[SupportingSystemApplicability] = Field(
@@ -1296,9 +1241,9 @@ class EmbeddingActionBody(BaseModel):
         json_schema_extra={"example": {"group": "threat_type", "names": ["Spoofing", "Denial of Service"]}}
     )
 
-    group: Literal["threat_type", "threat_catalogue", "control_library"] | None = Field(
+    group: Literal["threat_type", "threat_catalogue", "control_library", "threat_actor"] | None = Field(
         default=None,
-        description="Which table to act on: threat_type, threat_catalogue or control_library. Omit for every group.",
+        description="Which table to act on: threat_type, threat_catalogue, control_library or threat_actor. Omit for every group.",
     )
     names: list[str] | None = Field(
         default=None,

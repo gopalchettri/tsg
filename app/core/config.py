@@ -297,8 +297,12 @@ class Settings(BaseSettings):
 
     # TSG_CONTROL_MAP_TOP_K — most controls kept per scenario ("up to K", never padded).
     control_map_top_k: int = Field(5, ge=1)
-    # TSG_CONTROL_MAP_MIN_SCORE — drop suggestions reranking below this. LEAVE UNSET: the
-    # cutoff then follows the model pair's match threshold; setting it pins a static cutoff.
+    # TSG_CONTROL_MAP_MIN_SCORE — drop matches reranking below this. SET IT EXPLICITLY once
+    # measured: the query is now the SCENARIO PARAGRAPH (library-first redesign), not a short
+    # control label, and the auto-derived fallback threshold was calibrated label-vs-label — a
+    # materially different score distribution. Left unset it follows the model pair's match
+    # threshold, which risks silently dropping every match (controls=[] reading as a healthy
+    # "library gap"). Measure on the real library before relying on the fallback.
     control_map_min_score: float = Field(60.0, ge=0.0, le=100.0)
     # TSG_RERANK_CONCURRENCY — concurrent REMOTE rerank calls (local reranker ignores this).
     rerank_concurrency: int = Field(8, ge=1)
@@ -577,6 +581,20 @@ class Settings(BaseSettings):
                 f"max_proposal_chars ({self.max_proposal_chars}) must not exceed max_embed_chars "
                 f"({self.max_embed_chars}) — embed() errors on an over-limit text instead of "
                 "truncating it, which would lose every threat in the batch.")
+        return self
+
+    # grounding_shortlist_k >= control_map_top_k — control mapping now sends ONE scenario-text
+    # query per output and takes its top_k matches from that single reranked shortlist, so a
+    # shortlist smaller than top_k silently caps every scenario below the configured count.
+    @model_validator(mode="after")
+    def _validate_shortlist_covers_control_top_k(self) -> Settings:
+        if self.grounding_shortlist_k < self.control_map_top_k:
+            raise ValueError(
+                f"grounding_shortlist_k ({self.grounding_shortlist_k}) must be >= "
+                f"control_map_top_k ({self.control_map_top_k}) — one scenario-text query per "
+                "output draws its top-K controls from a single shortlist, so a smaller "
+                "shortlist silently caps every scenario's mapped controls below the "
+                "configured count.")
         return self
 
     # Unset embedding/reranker providers follow llm_provider=litellm_proxy; explicit values win.

@@ -167,8 +167,8 @@ def regen_risk_input_from_snapshot(snapshot: dict[str, Any], user_note: str | No
     version).
 
     Reverse-maps exactly the register-sourced keys, named exhaustively because the
-    `existing_controls` block MIXES register data with TSG-derived data (scenario_suggested/
-    library_mapped/_count must be rebuilt fresh, never carried): `register_controls`,
+    `existing_controls` block MIXES register data with TSG-derived data (library_mapped/
+    _count must be rebuilt fresh, never carried): `register_controls`,
     `applied_to_all_subsystems`, `applied_to_all_subsystems_justification`, the whole
     `risk_assessment` block, and the echo-only `register` block. Carried values are already
     clipped/redacted; build_treatment_input re-applies both, which is idempotent, so the stored
@@ -237,8 +237,9 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
         warnings.append("threat join returned no rows — plan generated without threat identity")
 
     scenario_json = _loads(scenario_row.get("ScenarioJSON"), {})
-    suggested = [{"name": redact((c or {}).get("name")), "why": redact((c or {}).get("why"))}
-                 for c in scenario_json.get("controls") or [] if isinstance(c, dict)]
+    # scenario_suggested is GONE from the snapshot: the LLM no longer proposes controls
+    # (library-first redesign), so library_mapped is the whole TSG-derived control input.
+    # Legacy snapshots still carrying the key are inert — nothing reads it back.
 
     # Degrade-to-empty, same rationale as sessions._controls_by_output: a DB where
     # Control_library.sql hasn't run yet must not 500 the POST. The two warnings are
@@ -275,7 +276,6 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
                 if isinstance(a, dict)],
         },
         "existing_controls": {
-            "scenario_suggested": suggested,
             "library_mapped": library_mapped,
             "library_mapped_count": len(library_mapped),
             # The register's controls, verbatim from the request (the gap-analysis baseline).
@@ -362,7 +362,7 @@ def _validate_plan(parsed: dict[str, Any]) -> list[str]:
 def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any]) -> None:
     """Put `control_library_id` on each recommended control, and DROP any control that
     doesn't resolve to one — every control in the persisted plan must be a real
-    Control_Library row, never text the model invented or copied from scenario_suggested.
+    Control_Library row, never text the model invented.
 
     The model is never shown a primary key (prompts._EXCLUDE_DB_KEY_TO_PROMPT): it echoes the
     stable `control_code` instead. The id is resolved HERE, server-side, from the snapshot's own
@@ -396,8 +396,7 @@ def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any
         ctl["control_code"] = hit["control_code"]   # canonical spelling, not the echo
         kept.append(ctl)
     cti["controls"] = kept
-    # A dropped control means the model invented/mistyped a code, or drew from
-    # scenario_suggested despite the prompt's instruction not to — either way it isn't a
+    # A dropped control means the model invented/mistyped a code — either way it isn't a
     # library entry and must not reach the persisted plan. Logged rather than silent: an
     # occasional invented code is expected, but one that SHOULD have matched is a join-key loss.
     if dropped:

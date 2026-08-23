@@ -345,7 +345,10 @@ def resolve_candidate(sess: Session, candidate: RowMapping, reviewer_user_id: st
                                                 "actor_id": actor_master_id,
                                                 "linked_type_id": link_type_id,
                                                 "decision": str(CandidateStatus.accepted)}))
-        return CandidateResolution(True, link_type_id, None, [])
+        # Through promoted_names so the caller's existing eager_embed_promoted call vectors the
+        # new actor for the nearest-match fallback. Best-effort there (create_items skips cached
+        # names; an identity-matched EXISTING actor whose spelling differs just logs and no-ops).
+        return CandidateResolution(True, link_type_id, None, [("threat_actor", display)])
 
     category_id = grounding.find_category(sess, candidate["ProposedCategory"])
     type_id = grounded_type_id
@@ -729,8 +732,18 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
     rows: list[RowMapping] = []
     scored_rows: list[RowMapping] = []
     for r in all_rows:
-        (rows if r["GroundingScore"] is None or r["GroundingScore"] < threshold
-        else scored_rows).append(r)
+        # GAP-7 guard: a threat ALREADY linked to a catalogue row must never enter the
+        # promotion lane, whatever its score. Library-first retrieval writes continuous
+        # scores (not just the synthetic band the old split assumed), so a low-scoring
+        # library match could otherwise run _find_or_create_type_and_catalogue and mint a
+        # near-duplicate catalogue row for something already present — and near-duplicate
+        # entries permanently break _auto_calibrate for every future worker boot.
+        if r["ThreatCatalogueID"] is not None:
+            scored_rows.append(r)
+        elif r["GroundingScore"] is None or r["GroundingScore"] < threshold:
+            rows.append(r)
+        else:
+            scored_rows.append(r)
 
     resolved: dict[tuple, Any] = {}
     parsed_actors, all_actor_names = _extract_actor_names_per_threat(all_rows)

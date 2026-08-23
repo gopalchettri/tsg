@@ -676,12 +676,12 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     log.info("stage.complete", session_id=sid, subsystem=ss, stage="THREATS", count=len(threats))
     return threats, prov
 
-# Runs the moderation check on a scenario's text and controls together.
+# Runs the moderation check on a scenario's three prose fields. Controls are no longer part
+# of the moderated text: the LLM stops proposing them (library-first redesign), and library
+# control names are curated data that never needs moderating.
 # Returns {"checked": ok?, "flagged": found something?, "categories": [...], "error": str|None}.
-def _moderation_report(scenario: dict) -> dict:  
+def _moderation_report(scenario: dict) -> dict:
     text = " ".join(str(scenario.get(f) or "") for f in _SCENARIO_TEXT_FIELDS)
-    text = " ".join([text] + [f"{c.get('name') or ''} {c.get('why') or ''}".strip()
-                            for c in (scenario.get("controls") or []) if isinstance(c, dict)])
     r = moderate(text)
     return {"checked": r.checked, "flagged": r.flagged, "categories": r.categories, "error": r.error}
 

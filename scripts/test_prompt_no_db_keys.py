@@ -56,7 +56,6 @@ def snapshot(base):
                              {"supporting_system": "Billing Portal", "applicable": False,
                               "justification": "No control or data path to generation."}]},
             "existing_controls": {
-                "scenario_suggested": [{"name": "Network segmentation", "why": "Limits pivot."}],
                 "library_mapped": [                                    # depth 3: the second leak
                     {"control_library_id": 28, "control_code": "CII-CID-028", "domain": "BCDR",
                      "control_name": "Testing for Reliability", "standards": ["DESC ISR v3"]}],

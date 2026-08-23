@@ -38,13 +38,13 @@ THREAT_ROW = {
 
 CONTROLS = [MappedControl(control_library_id=28, control_code="CII-CID-028", domain="BCDR",
                           control_name="Testing for Reliability", rank=1, score=99.0,
-                          suggested_control="Network segmentation", standards=["DESC ISR v3"])]
+                          standards=["DESC ISR v3"])]
 
 
 def main() -> None:
     # 1 — threat_row merges threat_category/type/name/actors into the scenario dict, alongside
     #     the existing controls merge.
-    merged = sessions._scenario_with_controls(RAW_SCENARIO_JSON, CONTROLS, True, THREAT_ROW)
+    merged = sessions._scenario_with_controls(RAW_SCENARIO_JSON, CONTROLS, THREAT_ROW)
     assert merged["threat_category"] == "Denial of Service"
     assert merged["threat_type"] == "loss of availability"
     assert merged["threat_name"] == "Loss of control and generation availability of PGS"
@@ -64,7 +64,7 @@ def main() -> None:
 
     # 3 — threat_row=None (the accepted-scenarios/scenario-list call sites, unchanged by this
     #     work) must still validate: new fields default to None/[], not a validation error.
-    no_threat = sessions._scenario_with_controls(RAW_SCENARIO_JSON, CONTROLS, True, None)
+    no_threat = sessions._scenario_with_controls(RAW_SCENARIO_JSON, CONTROLS, None)
     assert no_threat.get("threat_category") is None
     narrative_no_threat = ScenarioNarrative(**no_threat)
     assert narrative_no_threat.threat_category is None
@@ -74,7 +74,7 @@ def main() -> None:
     # 4 — a pre-existing scenario written before this field existed (no supporting_system_
     #     applicability key at all) still validates, defaulting to an empty list.
     old_json = json.dumps({"scenario_title": "t", "scenario_statement": "s", "risk_statement": "r"})
-    old = sessions._scenario_with_controls(old_json, [], True, THREAT_ROW)
+    old = sessions._scenario_with_controls(old_json, [], THREAT_ROW)
     narrative_old = ScenarioNarrative(**old)
     assert narrative_old.supporting_system_applicability == []
     print("4 OK  pre-existing scenarios (no applicability key) default to an empty list")

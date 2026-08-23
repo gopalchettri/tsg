@@ -578,7 +578,7 @@ def _controls_by_output(sess: Session, output_ids: list[str]) -> dict[str, list[
 
 def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str, list[MappedControl]]:
     rows = sess.execute(
-        select(cmap.OutputID, cmap.MapRank, cmap.Score, cmap.SuggestedControl,
+        select(cmap.OutputID, cmap.MapRank, cmap.Score,
             lib.ControlLibraryID, lib.ControlCode, lib.Domain, lib.ControlName)
         .join(lib, lib.ControlLibraryID == cmap.ControlLibraryID)
         .where(cmap.OutputID.in_(output_ids),
@@ -601,37 +601,22 @@ def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str
         out.setdefault(r["OutputID"], []).append(MappedControl(
             control_library_id=r["ControlLibraryID"], control_code=r["ControlCode"],
             domain=r["Domain"], control_name=r["ControlName"], rank=r["MapRank"],
-            score=r["Score"], suggested_control=r["SuggestedControl"],
+            score=r["Score"],
             standards=std_names.get(r["ControlLibraryID"], [])))
     return out
 
 
-def _suggestion_key(name: object) -> str:
-    """The exact SuggestedControl string control_mapping.collect_control_queries stored for a
-    suggestion: non-str -> "" (grounding.ensure_text), then strip, THEN truncate to 500.
-
-    Every step matters, and the read side has to mirror all three. Keying on the raw name made a
-    whitespace-padded suggestion ("  Multi-factor authentication ") miss its own map row: it was
-    falsely reported as an unmatched library gap AND its mapped control came back with
-    suggested_why=null. Indexing a non-str name raised TypeError on a core read."""
-    return (name if isinstance(name, str) else "").strip()[:500]
-
-
 def _scenario_with_controls(scenario_json: str | None, controls: list[MappedControl],
-                        controls_mapped: bool = True, threat_row: dict | None = None) -> dict | None:
+                        threat_row: dict | None = None) -> dict | None:
     """Projects one ScenarioJSON row for the API: `controls` becomes the Step-4 grounded
-    Control_Library matches, and the LLM's raw `{name, why}` suggestions they replace move to
-    `suggested_controls`. Presentation-layer merge only — Threat_Scenario_Control_Map stays the
-    single source of truth and ScenarioJSON is never rewritten.
+    Control_Library matches. Presentation-layer merge only — Threat_Scenario_Control_Map stays
+    the single source of truth and ScenarioJSON is never rewritten.
 
-    Both lists are reported: a suggestion that no map row names grounded to nothing — a library
-    gap, visible nowhere else. Overwriting the raw list outright also blanked every scenario in
-    the window between write and Step-4, making an in-progress read look like the model had
-    proposed nothing. `why` is never persisted, so the rationale is a read-time join by name.
-
-    `controls_mapped` gates `unmatched_suggested_controls`: mid-stage, every suggestion would otherwise
-    look unmatched before mapping had run. Defaults True for the accepted-scenarios caller,
-    where mapping is necessarily complete.
+    The overwrite of `controls` MUST stay even though the LLM no longer proposes controls:
+    LEGACY rows still carry a model-authored `{name, why}` list under that key, and without the
+    overwrite they would publish it where ScenarioNarrative.controls declares list[MappedControl]
+    — a validation 500 on every pre-redesign session. Legacy suggestion text stops being
+    surfaced; the raw ScenarioJSON blob remains the archival copy.
 
     `threat_row` (a _scenario_select() row) carries the threat's own category/type/name/actors —
     NOT part of the LLM's scenario JSON — merged in here so a caller only has one dict to read.
@@ -644,24 +629,7 @@ def _scenario_with_controls(scenario_json: str | None, controls: list[MappedCont
         scenario["threat_type"] = threat_row.get("ThreatType")
         scenario["threat_name"] = threat_row.get("ThreatName")
         scenario["threat_actors"] = stored_actors(threat_row.get("ThreatActorsJSON"))
-    # Read the raw suggestions BEFORE overwriting the key they live under.
-    raw = [c for c in (scenario.get("controls") or [])
-        if isinstance(c, dict) and _suggestion_key(c.get("name"))]
-    # keyed exactly as the map row stored it, so a long or padded name still matches
-    whys = {_suggestion_key(c.get("name")): c.get("why") for c in raw}
-    scenario["suggested_controls"] = [{"name": c["name"], "why": c.get("why")} for c in raw]
-    scenario["controls"] = [
-        c.model_copy(update={"suggested_why": whys.get(c.suggested_control or "")}).model_dump()
-        for c in controls
-    ]
-    if controls_mapped:
-        matched = {c.suggested_control for c in controls if c.suggested_control}
-        scenario["unmatched_suggested_controls"] = [
-            {"name": c["name"], "why": c.get("why")} for c in raw
-            if _suggestion_key(c.get("name")) not in matched
-        ]
-    else:
-        scenario["unmatched_suggested_controls"] = None
+    scenario["controls"] = [c.model_dump() for c in controls]
     return scenario
 
 
@@ -671,8 +639,7 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
     checked, flagged, categories = _moderation_summary(row["ValidationJSON"])
     validation_status, validation_errors = _validation_summary(row["ValidationJSON"])
     return ScenarioResult(output_id=row["OutputID"], threat_id=row["ThreatID"],
-                        scenario=_scenario_with_controls(row["ScenarioJSON"], controls or [],
-                                                        controls_mapped, row),
+                        scenario=_scenario_with_controls(row["ScenarioJSON"], controls or [], row),
                         accepted=bool(row["Accepted"]),
                         moderation_checked=checked, moderation_flagged=flagged, moderation_categories=categories,
                         validation_status=validation_status, validation_errors=validation_errors,
@@ -1135,12 +1102,10 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
                 # prefer the curated catalogue name/type; fall back to the freeform one if not linked to the library
                 threat_type=r["LibraryThreatType"] or r["ThreatType"],
                 threat_name=r["LibraryThreatName"] or r["ThreatName"],
-                # controls_mapped=True: an accepted scenario has necessarily passed Stage 2's tail
-                # mapping step before the session could reach REVIEW/accept. threat_row reuses the
-                # SAME library-preferred type/name computed above, so scenario.threat_type and the
-                # sibling threat_type field can never disagree.
+                # threat_row reuses the SAME library-preferred type/name computed above, so
+                # scenario.threat_type and the sibling threat_type field can never disagree.
                 scenario=_scenario_with_controls(
-                    r["ScenarioJSON"], controls.get(r["OutputID"], []), True,
+                    r["ScenarioJSON"], controls.get(r["OutputID"], []),
                     {"ThreatCategory": r["ThreatCategory"],
                     "ThreatType": r["LibraryThreatType"] or r["ThreatType"],
                     "ThreatName": r["LibraryThreatName"] or r["ThreatName"],
@@ -1178,7 +1143,7 @@ def _scenario_list_item(row: dict, controls: list[MappedControl]) -> ScenarioLis
         threat_type_id=row["ThreatTypeID"], threat_catalogue_id=row["ThreatCatalogueID"],
         threat_type=threat_type, threat_name=threat_name,
         scenario=_scenario_with_controls(
-            row["ScenarioJSON"], controls, row["ControlsMappedAt"] is not None,
+            row["ScenarioJSON"], controls,
             {"ThreatCategory": row["ThreatCategory"], "ThreatType": threat_type,
             "ThreatName": threat_name, "ThreatActorsJSON": row["ThreatActorsJSON"]}),
         session_id=row["SessionID"], entity_id=row["EntityID"], user_id=row["UserID"],

@@ -31,7 +31,7 @@ from app.core.config import Settings, get_settings
 from app.core.enums import GroundingStatus
 from app.core.logging import get_logger
 from app.db import models as m
-from app.pipeline import embeddings
+from app.pipeline import embeddings, hybrid_search
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 
 log = get_logger(__name__)
@@ -219,16 +219,24 @@ def get_control_candidates(sess: Session, itot: str | None) -> list[dict[str, An
 
 
 def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] | None]],
-                        rows: list[dict[str, Any]], s: Settings) -> list[tuple[dict[str, Any], float] | None]:
+                        rows: list[dict[str, Any]], s: Settings) -> list[list[tuple[dict[str, Any], float]]]:
     """Batch Step-4 grounding: every query shortlists against the same candidate set, then
     all shortlists rerank in one llm.rerank_many call instead of one round trip per query.
 
-    `queries` = (text, optionally pre-embedded qv). Returns the best (row, score) per query,
-    or None if a query got no shortlist or its rerank failed — per-item fail-open (dropped +
+    `queries` = (text, optionally pre-embedded qv). Returns, PER QUERY, the full reranked
+    shortlist as (row, score) best-first — never collapsed to a single best: the caller now
+    sends ONE scenario-text query per output and needs control_map_top_k distinct matches
+    from it, so collapsing here would silently cap every output at one control. [] for a
+    query whose shortlist was empty or whose rerank failed — per-item fail-open (dropped +
     logged), raising only when rerank_many itself judges the whole batch failed.
+
+    HYBRID shortlist: the cosine leg (existing) is UNIONED with a BM25 keyword leg over the
+    same "ControlName: Description" corpus — rare exact tokens (product names, acronyms)
+    carry strong signal that embeddings dilute. The reranker stays the final arbiter of
+    order, so no score fusion is needed; the legs only decide what gets reranked.
     Falls back to per-query llm.rerank when the client has no rerank_many (test fakes)."""
     if not rows or not queries:
-        return [None] * len(queries)
+        return [[] for _ in queries]
     names = [r["text"] for r in rows]
     # Resolve the cached matrix once for the whole batch (cheap once, wasteful per query);
     # dict-path vectors only if the matrix is unavailable.
@@ -236,6 +244,11 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
                                         group="control_library", kind="passage")
     name_vecs = None if matrix_info is not None else embeddings.get_vectors(
         llm, names, model_id=s.embedding_model, group="control_library", kind="passage")
+    # BM25 keyword leg: corpus tokenized once per batch; per query, the top-shortlist_k
+    # keyword hits are UNIONED into the cosine shortlist before the rerank. Zero-score docs
+    # never enter (hybrid_search._ranked_indices excludes them), so an all-miss query adds
+    # nothing and behaves exactly as before.
+    docs_tokens = [hybrid_search.tokenize(r["text"]) for r in rows]
     shortlists: list[list[dict[str, Any]]] = []
     for query, qv in queries:
         if qv is None:
@@ -249,6 +262,10 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
                 name_vecs = embeddings.get_vectors(llm, names, model_id=s.embedding_model,
                                                 group="control_library", kind="passage")
             sl = _shortlist_candidates(qv, rows, name_vecs, "text", s)
+        kw_scores = hybrid_search.bm25_scores(hybrid_search.tokenize(query), docs_tokens)
+        kw_top = hybrid_search._ranked_indices(kw_scores)[:s.grounding_shortlist_k]
+        seen_ids = {id(r) for r in sl}
+        sl = sl + [rows[i] for i in kw_top if id(rows[i]) not in seen_ids]
         shortlists.append(sl)
     # Rerank only the queries that actually have a shortlist; map results back by position.
     todo = [i for i, sl in enumerate(shortlists) if sl]
@@ -268,14 +285,17 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
                 scored.append(None)
         if items and failures == len(items):
             raise RuntimeError(f"all {len(items)} control rerank calls failed")
-    results: list[tuple[dict[str, Any], float] | None] = [None] * len(queries)
+    results: list[list[tuple[dict[str, Any], float]]] = [[] for _ in queries]
     for i, rr in zip(todo, scored):
         if rr is None:
             continue
         docs = shortlists[i]
         if len(rr) != len(docs):  # same fail-loud guard as find_closest_match
             raise RuntimeError(f"rerank returned {len(rr)} scores for {len(docs)} docs")
-        results[i] = max(zip(docs, rr), key=lambda rs: rs[1])
+        # Full reranked list, best-first — the caller filters by min score, dedups by
+        # ControlLibraryID and caps at control_map_top_k. Collapsing to max() here would
+        # silently cap every scenario at ONE mapped control under the one-query design.
+        results[i] = sorted(zip(docs, rr), key=lambda rs: rs[1], reverse=True)
     return results
 
 

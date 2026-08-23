@@ -57,6 +57,10 @@ _GROUPS = {
     "threat_type": (m.Threat_Type, m.Threat_Type.ThreatTypeName),
     "threat_catalogue": (m.Threat_Catalogue, m.Threat_Catalogue.ThreatName),
     "control_library": (m.Control_Library, _CONTROL_TEXT),
+    # Actor names for the nearest-match fallback (library-first actors): bare labels — the
+    # table has no description column. Name-only vectors are weak alone, so the consumer
+    # pairs them with the BM25 keyword leg via hybrid_search.hybrid_match.
+    "threat_actor": (m.Threat_Actor, m.Threat_Actor.ThreatActorName),
 }
 
 
