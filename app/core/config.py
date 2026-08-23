@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     # TSG_DB_DSN — main application DB. The default is a placeholder so a missing value fails
     # loudly instead of silently connecting to the wrong database.
     db_dsn: str = (
-        r"mssql+pyodbc://@CONFIGURE_TSG_DB_DSN_IN_ENV\SQLEXPRESS/CONFIGURE_TSG_DB_DSN_IN_ENV?driver=ODBC+Driver+17+for+SQL+Server&Trusted_Connection=yes&TrustServerCertificate=yes"  # noqa: E501
+        r"mssql+pyodbc://@CONFIGURE_TSG_DB_DSN_IN_ENV\SQLEXPRESS/CONFIGURE_TSG_DB_DSN_IN_ENV?driver=ODBC+Driver+17+for+SQL+Server&Trusted_Connection=yes&TrustServerCertificate=yes"
     )
 
     # TSG_DB_POOL_SIZE — persistent connections per process.
@@ -310,6 +310,10 @@ class Settings(BaseSettings):
     max_threats_per_asset: int = Field(
         10, validation_alias=AliasChoices("TSG_MAX_THREATS_PER_ASSET", "TSG_MAX_THREATS_PER_SUBSYSTEM"))
 
+    # TSG_MAX_ACTORS_PER_THREAT — caps actor names from one threat to limit candidate rows and
+    # triage work. A higher value keeps more actors but increases processing and review work.
+    max_actors_per_threat: int = Field(10, ge=1)
+
     # TSG_ACTOR_VOCABULARY_CAP — how many actor names Stage 1's prompt shows as PREFERRED
     # spellings (dal.active_actor_names). A hint list, not a gate: capping it never stops the
     # AI proposing a real actor outside it (that name is still fully handled by grounding +
@@ -326,6 +330,9 @@ class Settings(BaseSettings):
     # (its AI-declared plausible entry points). A NON-TERMINATION GUARD, not a depth policy:
     # an identity stops at (plausible entry points + this slack) scenario rows.
     coverage_attempt_slack: int = Field(2, ge=0)
+
+    # TSG_EXCLUSIONS_CHAR_BUDGET — maximum characters used for prior threat labels in a prompt.
+    exclusions_char_budget: int = Field(24_000, ge=1)
 
     # TSG_VARIANT_SIBLING_PROMPT_K — a threat's existing scenarios quoted into the variant
     # prompt (prompt width only, not analysis depth).
@@ -489,6 +496,14 @@ class Settings(BaseSettings):
     # authenticates by X-API-Key only and trusts the identity headers.
     verify_membership: bool = Field(
         False, validation_alias=AliasChoices("VERIFY_MEMBERSHIP", "TSG_VERIFY_MEMBERSHIP"))
+
+    # TSG_ALLOW_REMOTE_IN_DEV — escape hatch for the dev/prod-infrastructure gate in
+    # assert_security_posture. APP_ENV=local/dev disables four production guards at once, so
+    # pointing such a build at a real (non-loopback) database or Redis is refused by default.
+    # Set this True to say "yes, I really am developing against shared infrastructure" — the
+    # point is that it has to be DELIBERATE, not that it is impossible.
+    allow_remote_in_dev: bool = Field(
+        False, validation_alias=AliasChoices("ALLOW_REMOTE_IN_DEV", "TSG_ALLOW_REMOTE_IN_DEV"))
 
     # FLOWER_BASIC_AUTH / TSG_FLOWER_BASIC_AUTH — "user:password" for Flower's --basic-auth.
     # Read by docker/compose.prod.yml and start.ps1, never by Python; kept here so config stays
@@ -721,10 +736,75 @@ def get_settings() -> Settings:
     return Settings()
 
 
-# Startup posture check: warn (never fail) when staging/prod runs with the defence-in-depth
-# (user, entity) DB verification off. The hard gate (>=1 API key) lives in db.invariants.
+#: Hosts that mean "this developer's own machine". Anything else is shared infrastructure.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "host.docker.internal", ""})
+
+
+def _dsn_host(url: str) -> str:
+    r"""Best-effort host out of a SQLAlchemy DSN or a redis:// URL.
+
+    Deliberately string-level, not urlparse: an ODBC DSN can carry a backslashed instance name
+    (``@HOST\SQLEXPRESS``) and a password full of URL-hostile characters, both of which make
+    urlparse either raise or return nonsense. Returns "" when nothing host-shaped is found, and
+    "" is treated as loopback so an unparseable DSN can never HARD-FAIL a boot on its own.
+    """
+    tail = url.split("://", 1)[-1]
+    authority = tail.split("/", 1)[0].split("?", 1)[0]
+    host = authority.rsplit("@", 1)[-1]          # strip user:password@
+    for sep in ("\\", ","):                      # instance name / MSSQL port separator
+        host = host.split(sep, 1)[0]
+    if host.startswith("["):                      # bracketed IPv6
+        return host.split("]", 1)[0] + "]"
+    return host.split(":", 1)[0].strip().lower()
+
+
+# Startup posture check. Two HARD gates plus the historical membership warning. Called first in
+# the FastAPI lifespan — before db.invariants.verify_startup — so it is the earliest gate there
+# is. The >=1-API-key hard gate lives in db.invariants.
 def assert_security_posture(settings: Settings | None = None) -> None:
     s = settings or get_settings()
+
+    # GATE 1 — a dev/local build must not run against shared infrastructure.
+    #
+    # APP_ENV is not a label, it is a switch: at local/dev it echoes raw exception text to
+    # clients (api/errors.py), mounts the /dev/sse-test harness (main.py), skips the
+    # "at least one active API_Client" boot check (db/invariants.py), and silences the
+    # membership warning below. A deployment that sets APP_ENV=dev against a real database
+    # therefore turns off four protections at once, silently and with no other signal.
+    # Nothing prevented that, which is exactly how it reached a shared environment.
+    if s.app_env in ("local", "dev") and not s.allow_remote_in_dev:
+        remote = {name: host for name, host in
+                (("TSG_DB_DSN", _dsn_host(s.db_dsn)), ("TSG_REDIS_URL", _dsn_host(s.redis_url)))
+                if host not in _LOOPBACK_HOSTS}
+        if remote:
+            targets = ", ".join(f"{k} -> {v}" for k, v in sorted(remote.items()))
+            raise RuntimeError(
+                f"APP_ENV={s.app_env} but this process points at NON-LOOPBACK infrastructure "
+                f"({targets}). At local/dev the app returns raw exception text to clients, mounts "
+                f"the /dev/sse-test page, and skips the active-API_Client boot check — none of "
+                f"which may run against shared data. Either set APP_ENV=staging|prod (the real "
+                f"posture), or set TSG_ALLOW_REMOTE_IN_DEV=true to state deliberately that you "
+                f"are developing against shared infrastructure.")
+
+    # GATE 2 — TLS posture on the database connection.
+    #
+    # TrustServerCertificate=yes negotiates TLS and then does not verify the certificate, so it
+    # stops MITM being detectable. Hard-fail in prod only: a staging SQL Server may legitimately
+    # still be on a self-signed cert, and failing that boot would be an outage rather than a fix.
+    if "trustservercertificate=yes" in s.db_dsn.lower():
+        if s.app_env == "prod":
+            raise RuntimeError(
+                "TSG_DB_DSN sets TrustServerCertificate=yes with APP_ENV=prod: the server "
+                "certificate is not validated, so the connection is not MITM-resistant. Install a "
+                "trusted certificate on the SQL Server and set TrustServerCertificate=no.")
+        if s.app_env == "staging":
+            from app.core.logging import get_logger
+            get_logger(__name__).warning(
+                "db.tls_certificate_unverified", app_env=s.app_env,
+                note="TSG_DB_DSN sets TrustServerCertificate=yes — the server certificate is not "
+                    "validated. Acceptable on a self-signed staging box; this is a HARD FAILURE "
+                    "at APP_ENV=prod, so fix it before promoting.")
+
     if s.app_env in ("staging", "prod") and not s.verify_membership:
         from app.core.logging import get_logger
         get_logger(__name__).warning(

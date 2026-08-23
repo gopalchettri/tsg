@@ -41,19 +41,8 @@ _FALLBACK_ACTOR_VOCABULARY_HINT = ("Cybercriminal, External attacker, Hacktivist
                                 "Malicious user, Nation-state/APT, Negligent insider, "
                                 "Ransomware affiliate, Third-party/Vendor")
 
-# Per-category gloss injected into the `type` field spec, so `type` comes back as a generic
-# impact, not a product name. Keyed by the live category names the `category` field enumerates; a
-# renamed/custom category falls back to a generic phrase rather than teaching the model a
-# category the `category` field then forbids.
-# _STRIDE_TYPE_HINTS = {
-#     "Spoofing": "impersonation to gain unauthorized access",
-#     "Tampering": "unauthorized modification",
-#     "Repudiation": "repudiation of actions or changes",
-#     "Information Disclosure": "unauthorized disclosure",
-#     "Denial of Service": "loss of availability",
-#     "Elevation of Privilege": "unauthorized elevation of access",
-# }
 
+#  STRIDE TYPE HINTS FOR BETTER PROMPTING
 _STRIDE_TYPE_HINTS = {
     "Spoofing": "Identity Impersonation; Credential Misuse; Authentication Bypass; Device/System Impersonation; Service Impersonation",
     "Tampering": "Data Modification; Configuration Modification; Command Modification; Transaction Modification; Control-State Modification; Security-Control Modification; Log/Audit Modification; Backup/Recovery Modification",
@@ -671,21 +660,22 @@ def treatment_prompt(snapshot: dict[str, Any]) -> list[dict]:
         "title: the domain of the recommended controls, e.g. 'Identity and Access Management "
         "Hardening'.\n"
         "controls_to_be_implemented: object {\"control_coverage\": exactly one of "
-        f"{coverage_values}. 'covered' ONLY when every control identified for this scenario "
-        "(the context's existing_controls.library_mapped and "
-        "existing_controls.scenario_suggested) is already addressed by "
-        "existing_controls.register_controls; \"controls\": THE GAP ANALYSIS — only the "
-        "scenario-identified controls (library_mapped + scenario_suggested) that are NOT "
-        "already covered by register_controls, matched by meaning, not wording (e.g. 'annual "
-        "patching' covers a patch-management control). Every entry must trace to an "
-        "identified control or close a gap it names; never add a control unrelated to the "
-        "identified set. MUST be an empty array when control_coverage is 'covered'. Array of "
+        f"{coverage_values}. 'covered' ONLY when every control in the context's "
+        "existing_controls.library_mapped is already addressed by "
+        "existing_controls.register_controls; \"controls\": THE GAP ANALYSIS — only controls "
+        "copied from existing_controls.library_mapped that are NOT already covered by "
+        "register_controls, matched by meaning, not wording (e.g. 'annual patching' covers a "
+        "patch-management control). Every entry MUST be one of the library_mapped controls, "
+        "identified by its control_code — never a control of your own invention, and never "
+        "one taken from existing_controls.scenario_suggested (that list is reference-only, "
+        "not a source for this table; a control with no library_mapped match has no gap to "
+        "report). MUST be an empty array when control_coverage is 'covered'. Array of "
         "{\"control_type\": exactly "
         f"one of {control_types}; \"control_name\": <concrete control>; \"description\": "
         "<what it does for THIS scenario, 1-2 sentences>; \"priority\": exactly one of "
-        f"{priorities}; \"control_code\": the control_code string verbatim (e.g. "
-        "'CII-CID-028') ONLY when echoing a control from the context's library_mapped list, "
-        "else null}}.\n"
+        f"{priorities}; \"control_code\": the library_mapped control_code string verbatim "
+        "(e.g. 'CII-CID-028') — REQUIRED, must exactly match one of the library_mapped "
+        "entries}}.\n"
         "remediation_action_plan: array of {\"action_id\": \"A1\",\"A2\",... in priority "
         "order; \"action\": <specific implementation step>; \"owner\": <responsible role or "
         f"team — a role, never a person's name>; \"priority\": exactly one of {priorities}; "

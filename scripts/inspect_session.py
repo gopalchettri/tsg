@@ -15,10 +15,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import select
 
-from app.db import models as m  # noqa: E402
-from app.db.engine import db_session  # noqa: E402
+from app.db import models as m
+from app.db.engine import db_session
 
 
 def main() -> int:

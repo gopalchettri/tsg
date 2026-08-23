@@ -192,7 +192,10 @@ async def _handle_unhandled_exception(request: Request, exc: Exception):
     `finally` has already cleared the contextvar by the time this runs. Echoed on the response
     header so a client-reported 500 can be grepped straight to its crash log."""
     request_id = getattr(request.state, "request_id", None)
-    log.error("unhandled_exception", path=str(request.url), request_id=request_id, exc_info=True)
+    # LOG014 wants exc_info only inside an `except` block. This IS an exception handler —
+    # Starlette calls it with the live exception — so the traceback is available and wanted.
+    log.error("unhandled_exception", path=str(request.url), request_id=request_id,
+            exc_info=True)  # noqa: LOG014
     s = get_settings()
     detail = str(exc) if s.app_env in ("local", "dev") else "an unexpected error occurred"
     headers = {"X-Request-Id": request_id} if request_id else None

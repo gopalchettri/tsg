@@ -27,18 +27,18 @@ from gevent import monkey
 
 monkey.patch_all()
 
-import os  # noqa: E402 -- everything below must import AFTER monkey.patch_all() above
-import sys  # noqa: E402
-import time  # noqa: E402
+import os
+import sys
+import time
 
-import gevent  # noqa: E402
+import gevent
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.logging import configure_logging  # noqa: E402
-from app.pipeline import local_models  # noqa: E402
-from app.pipeline.llm import LiteLLMClient  # noqa: E402
+from app.core.config import get_settings
+from app.core.logging import configure_logging
+from app.pipeline import local_models
+from app.pipeline.llm import LiteLLMClient
 
 N_CONCURRENT = 24
 HEARTBEAT_S = 0.01  # 10 ms cadence; stalls only if the greenlet hub is frozen

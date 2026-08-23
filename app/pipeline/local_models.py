@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from collections.abc import Callable, Sequence
 from functools import lru_cache
-from typing import Callable, Sequence
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger

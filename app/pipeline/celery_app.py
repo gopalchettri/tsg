@@ -309,7 +309,7 @@ def admin_embedding_action_task(self, action: str, group: str | None, names: lis
         # would tear down on a job that is merely waiting for an LLM slot.
         _publish_emb_job_event(job_id, CeleryJobState.RETRY, action=action)
         raise
-    except Exception as e:  # noqa: BLE001 — publish the terminal hint, then let Celery record FAILURE
+    except Exception as e:
         _publish_emb_job_event(job_id, CeleryJobState.FAILURE, action=action, error=str(e)[:500])
         raise
     _publish_emb_job_event(job_id, CeleryJobState.SUCCESS, action=action, **out)
@@ -397,7 +397,7 @@ def intel_refresh_feed_task(self, feed: str) -> int:
     _publish_intel_job_event(job_id, CeleryJobState.STARTED, feed=feed)
     try:
         count = refresh_one(feed)
-    except Exception as exc:  # noqa: BLE001 — publish a hint, then let autoretry_for decide
+    except Exception as exc:
         state = CeleryJobState.FAILURE if self.request.retries >= self.max_retries else CeleryJobState.RETRY
         _publish_intel_job_event(job_id, state, feed=feed, error=str(exc)[:500])
         raise
@@ -454,7 +454,7 @@ def import_threat_library_task(source: str, file_content: str | None, via_taxii:
             stats = threat_library_import.run_import(
                 sess, source, file_content=file_content, via_taxii=via_taxii,
                 max_actors=max_actors, dry_run=dry_run, started_by=started_by)
-    except Exception as exc:  # noqa: BLE001 — record the failure, then let Celery mark FAILURE
+    except Exception as exc:
         # Own transaction, outside the rolled-back import session: a failed import that left no
         # trace is the case an operator most needs to see.
         threat_library_import.record_import_finished(run_id, error=f"{type(exc).__name__}: {exc}")

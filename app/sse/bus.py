@@ -134,7 +134,7 @@ def publish(session_id: str, event: dict) -> None:
         # covered nothing about this session.
     try:
         _redis().publish(channel(session_id), json.dumps(event, default=str))
-    except Exception:  # noqa: BLE001 — best-effort, but never silent
+    except Exception:
         _breaker_until = time.monotonic() + settings.sse_breaker_cooldown_seconds
         logger.warning("sse.publish_failed", session_id=session_id, event_type=event.get("type"),
                     breaker_owner=_breaker_owner(),  # item 9: which process's breaker just opened

@@ -32,8 +32,8 @@ from app.db import dal
 from app.db.dal import NotFoundError
 from app.db.engine import db_session
 from app.pipeline.accept import AcceptConflict, eager_embed_promoted, resolve_candidate
-from app.pipeline.llm import get_llm
 from app.pipeline.celery_app import admin_embedding_action_task, celery_app
+from app.pipeline.llm import get_llm
 from app.pipeline.reaper import dismiss_promotion, retry_one_promotion
 
 router = APIRouter(

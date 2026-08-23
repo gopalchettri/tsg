@@ -6,7 +6,7 @@
   "python.testing.pytestArgs": [
     "tests"
   ],
-  "python-envs.defaultEnvManager": "ms-python.python:system",
+  "python-envs.defaultEnvManager": "ms-python.python:venv",
 
   // The Mypy Type Checker extension does NOT inherit python.defaultInterpreterPath above:
   // without an explicit cwd/interpreter it can invoke mypy from the wrong place and report

@@ -14,7 +14,7 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-import app.api.api_clients as api_clients
+from app.api import api_clients
 from app.api.schemas import CreateApiClientBody
 from app.db import dal
 from app.db import models as m

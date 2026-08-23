@@ -6,6 +6,8 @@ differs here.
 """
 from __future__ import annotations
 
+from typing import cast
+
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
@@ -114,7 +116,9 @@ def _iter_rows(results: SessionResults):
 def build_results_workbook(results: SessionResults) -> Workbook:
     """One 'Scenarios' sheet, one row per scenario (current, plus replaced when included)."""
     wb = Workbook()
-    ws: Worksheet = wb.active
+    # A freshly constructed Workbook always has exactly one active sheet; wb.active is
+    # Optional only for a workbook whose sheets were all removed.
+    ws: Worksheet = cast("Worksheet", wb.active)
     ws.title = "Scenarios"
 
     header_font = Font(bold=True)

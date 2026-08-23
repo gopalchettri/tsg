@@ -1,20 +1,17 @@
-"""Grounding — matches an AI-proposed threat to a real entry in the org's
-threat library (Threat_Category/Threat_Type/Threat_Catalogue/Threat_Actor),
-so the same real-world threat described in different words always resolves
-to the same ThreatTypeID/ThreatCatalogueID instead of being treated as new
-each time.
+"""Grounding — matches an AI-proposed threat to a real library entry
+(Threat_Category/Threat_Type/Threat_Catalogue/Threat_Actor), so the same
+threat described in different words always resolves to the same
+ThreatTypeID/ThreatCatalogueID instead of being treated as new each time.
 
-Every match bands into GroundingStatus.verified/unverified across ONE cutoff
-(a configurable Setting, see label_match_from_score) — unverified means "not in
-the library yet". What happens to an unverified threat on accept is governed by
-the promotion_auto_approve_enabled master switch (accept.py): OFF (the default)
-routes every novel type, name, and actor through the admin candidate queue; ON
-lets banded triage auto-promote. Either way the asset-embedded NAME itself never
-enters the library — the prompt requires it to embed the asset's own name, so
-only its curator-generalized generic form is promoted or queued.
+Every match bands into GroundingStatus.verified/unverified against one cutoff
+(see label_match_from_score). What happens to an unverified threat at accept
+depends on promotion_auto_approve_enabled (accept.py): OFF routes it through
+the admin queue, ON lets banded triage auto-promote. Either way, the
+asset-embedded name itself never enters the library — only its
+curator-generalized generic form is promoted or queued.
 
-sector_ids is always [own_sector_id, parent_sector_id] (fewer/empty = no
-sector context) — see visible_to_this_sector / how_specific_is_this_sector.
+sector_ids is always [own_sector_id, parent_sector_id] (empty = no sector
+context) — see visible_to_this_sector / how_specific_is_this_sector.
 """
 from __future__ import annotations
 
@@ -39,11 +36,10 @@ from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 
 log = get_logger(__name__)
 
-# numpy rides in with the optional sentence-transformers extra (requirements' `local` provider);
-# a litellm-proxy-only deployment may not have it. _shortlist_candidates uses it when present —
-# pure-Python cosine is fine for the ~85-row threat library but O(candidates x dims) per query,
-# which at Control_Library scale (1,288 rows x 1,024 dims) costs whole seconds of CPU per query
-# on a gevent worker. The pure-Python branch below stays as the no-numpy fallback.
+# numpy comes with the optional sentence-transformers extra (requirements' `local` provider) —
+# a litellm-proxy-only deployment may not have it. _shortlist_candidates uses it when present:
+# pure-Python cosine is fine for the small threat library, but too slow at Control_Library scale
+# (1000+ rows x 1024 dims) on a gevent worker. Pure-Python branch below is the no-numpy fallback.
 try:
     import numpy
     _np: ModuleType | None = numpy
@@ -55,34 +51,26 @@ _BAND_ORDER = {GroundingStatus.verified: 1, GroundingStatus.unverified: 0}
 
 
 # --- self-calibrating threshold ---------------------------------------------------------------
-# The match cutoff is MODEL-SPECIFIC: a different embedding+reranker pair scores the SAME
-# threat/library match differently, so a static number silently misclassifies after any model
-# change (a threat that verifies in dev can come back unverified in prod, with no error anywhere —
-# and unverified threats are what library promotion feeds on). The resolver below derives the
-# cutoff from the live models + live library, per model pair, so a stale threshold structurally
-# cannot recur.
+# The match cutoff is model-specific: a different embedding+reranker pair scores the same
+# match differently, so a static number silently misclassifies after any model change. The
+# resolver below derives the cutoff from the live models + live library, per model pair, so a
+# stale threshold can't recur.
 
 _RESOLVED_THRESHOLDS: dict[tuple[str, str], float] = {}
 
-# Sample size and paraphrases-per-name now live in Settings.calibration_sample_size /
-# Settings.calibration_paraphrases_per_name (defaults unchanged: 100 / 2).
-# The near-duplicate give-up score lives in config (Settings.near_duplicate_score): a "negative"
-# at/above it is a DUPLICATE catalogue entry, not an impostor — on the 0-100 rerank scale nothing
-# a paraphrase can score reliably clears it, so calibration is unwinnable until the library is
-# deduped. Measured: the real catalogue's worst pair scores 99.5. See _auto_calibrate.
+# Sample size / paraphrases-per-name: Settings.calibration_sample_size / calibration_paraphrases_per_name.
+# near_duplicate_score (Settings): a negative at/above it is a duplicate catalogue entry, not an
+# impostor — calibration is unwinnable until the library is deduped. See _auto_calibrate.
 
 
 def how_similar(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine similarity; 0.0 for a zero-magnitude vector instead of raising.
 
-    [Fix] raises ValueError on a LENGTH mismatch rather than letting zip(a, b) silently
-    truncate to the shorter vector. A length mismatch is never legitimate input — it always
-    means a real embedding-dimension problem (e.g. a cached vector left over from before an
-    EMBEDDING_PROVIDER/EMBEDDING_DIMENSIONS change; llm.py's verify_litellm_models catches a
-    boot-time MISCONFIGURATION, but not a vector already sitting in the cache from before
-    that). Silently truncating would produce a numerically plausible but meaningless score
-    with no error anywhere — the caller (_shortlist_candidates) is what decides how broadly
-    a single bad vector should be allowed to fail, not this function.
+    [Fix] Raises ValueError on a length mismatch instead of letting zip() silently truncate
+    to the shorter vector — a mismatch always means a real embedding-dimension problem (e.g.
+    a stale cached vector from before an EMBEDDING_PROVIDER/EMBEDDING_DIMENSIONS change).
+    Silent truncation would give a meaningless score with no error. The caller
+    (_shortlist_candidates) decides how broadly one bad vector should fail, not this function.
     """
     if len(a) != len(b):
         raise ValueError(f"how_similar received vectors of different lengths ({len(a)} vs {len(b)})")
@@ -93,16 +81,16 @@ def how_similar(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def label_match_from_score(score: float, s: Settings, *, match_th: float | None = None) -> GroundingStatus:
-    """The one place the score cutoff is applied. The optional override carries
-    resolve_thresholds' per-model-pair value (find_threat_in_library passes it); left None,
-    the static settings field applies — direct callers and tests are unchanged."""
+    """The one place the score cutoff is applied. `match_th` overrides the static
+    setting with resolve_thresholds' per-model-pair value (find_threat_in_library
+    passes it); left None, direct callers and tests use the static default."""
     th = s.grounding_match_threshold if match_th is None else match_th
     return GroundingStatus.verified if score >= th else GroundingStatus.unverified
 
 
 def pick_worse_of_two(a: GroundingStatus, b: GroundingStatus) -> GroundingStatus:
-    """Overall confidence is only as good as the weaker of two checks (type vs name) — with two
-    bands that means verified + unverified -> unverified."""
+    """Overall confidence is only as good as the weaker of two checks (type vs name):
+    verified + unverified -> unverified."""
     return a if _BAND_ORDER[a] <= _BAND_ORDER[b] else b
 
 
@@ -164,11 +152,11 @@ def get_possible_types(sess: Session, category_id: int | None, sector_ids: list[
         visible_to_this_sector(m.Threat_Type.SectorID, sector_ids),
     )
     if category_id is not None:  # else fall back to searching all categories ([R6])
-        # [A2] Threat_Type.ThreatCategoryID is only a rough single default — an individual
-        # Threat_Catalogue row under a type can carry a DIFFERENT/additional STRIDE category
-        # via Threat_Catalogue_Category_Map (74/75 real curated threats do). Narrowing on the
-        # Type's default alone would wrongly drop a type whose real match is via one of its
-        # OTHER mapped categories, so a type counts as a candidate if EITHER matches.
+        # [A2] Threat_Type.ThreatCategoryID is just a rough default — a Threat_Catalogue row
+        # under a type can carry a different/extra STRIDE category via
+        # Threat_Catalogue_Category_Map (true for most curated threats). Narrowing on the
+        # type's default alone would drop a type whose real match is via one of those other
+        # mapped categories, so a type counts as a candidate if either matches.
         mapped_type_ids = (
             select(m.Threat_Catalogue.ThreatTypeID)
             .join(m.Threat_Catalogue_Category_Map,
@@ -178,9 +166,8 @@ def get_possible_types(sess: Session, category_id: int | None, sector_ids: list[
         )
         q = q.where(or_(m.Threat_Type.ThreatCategoryID == category_id,
                         m.Threat_Type.ThreatTypeID.in_(mapped_type_ids)))
-    # ORDER BY makes the underlying row order deterministic (same reason find_category
-    # above orders by ThreatCategoryID) so the stable sort below breaks same-specificity
-    # ties the same way every time, instead of following SQL Server's arbitrary scan order.
+    # ORDER BY makes row order deterministic, so the stable sort below breaks
+    # same-specificity ties the same way every time instead of SQL Server's scan order.
     q = q.order_by(m.Threat_Type.ThreatTypeID)
     rows = [dict(r) for r in sess.execute(q).mappings()]
     rows.sort(key=lambda r: how_specific_is_this_sector(r["SectorID"], sector_ids), reverse=True)
@@ -188,10 +175,10 @@ def get_possible_types(sess: Session, category_id: int | None, sector_ids: list[
 
 
 def get_possible_names(sess: Session, type_id: int, sector_ids: list[int]) -> list[dict[str, Any]]:
-    """Candidate Threat_Catalogue rows under the already-matched type ONLY
-    keeps the name match consistent with the type match instead of
-    searching the whole library, where an unrelated type's entry could win on
-    text similarity alone.
+    """Candidate Threat_Catalogue rows under the already-matched type only —
+    keeps the name match consistent with the type match instead of searching
+    the whole library, where an unrelated type's entry could win on text
+    similarity alone.
     """
     q = select(
         m.Threat_Catalogue.ThreatCatalogueID,
@@ -209,14 +196,13 @@ def get_possible_names(sess: Session, type_id: int, sector_ids: list[int]) -> li
 
 
 def get_control_candidates(sess: Session, itot: str | None) -> list[dict[str, Any]]:
-    """Active Control_Library rows as candidates for Step-4 grounding (control_mapping.map_controls),
-    each carrying `text` = the SAME name+description expression the embedding cache was built
-    from (embeddings._CONTROL_TEXT — sharing it is load-bearing for cache-key equality).
+    """Active Control_Library rows for Step-4 grounding (control_mapping.map_controls).
+    `text` uses the same name+description expression the embedding cache was built from
+    (embeddings._CONTROL_TEXT) — must match, or cache keys won't line up.
 
-    `itot` pre-filter is tolerant: it narrows to IT-only or OT-only controls ONLY when the
-    asset's declared type is literally 'IT'/'OT' (case folded by the caller); any other value
-    searches the whole library rather than guessing a family. Fetch once per session and reuse
-    across every suggestion — not once per query."""
+    `itot` narrows to IT-only/OT-only controls only when the asset's declared type is
+    literally 'IT'/'OT' (caller case-folds it); any other value searches the whole library.
+    Fetch once per session and reuse across every suggestion, not once per query."""
     q = select(
         m.Control_Library.ControlLibraryID,
         m.Control_Library.ControlCode,
@@ -224,8 +210,8 @@ def get_control_candidates(sess: Session, itot: str | None) -> list[dict[str, An
         m.Control_Library.ControlName,
         embeddings._CONTROL_TEXT.label("text"),
     ).where(
-        m.Control_Library.IsActive == True,  # noqa: E712
-        m.Control_Library.IsDeleted == False,  # noqa: E712
+        m.Control_Library.IsActive == True,
+        m.Control_Library.IsDeleted == False,
     ).order_by(m.Control_Library.ControlLibraryID)  # deterministic tie-break, see get_possible_types
     if itot in ("IT", "OT"):
         q = q.where(m.Control_Library.ITOT == itot)
@@ -234,20 +220,18 @@ def get_control_candidates(sess: Session, itot: str | None) -> list[dict[str, An
 
 def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] | None]],
                         rows: list[dict[str, Any]], s: Settings) -> list[tuple[dict[str, Any], float] | None]:
-    """Batch Step-4 grounding: every query shortlists against the SAME candidate set, then all
-    shortlists rerank in one llm.rerank_many call (one local model dispatch, or
-    bounded-concurrent remote calls) instead of one rerank round trip per query.
+    """Batch Step-4 grounding: every query shortlists against the same candidate set, then
+    all shortlists rerank in one llm.rerank_many call instead of one round trip per query.
 
     `queries` = (text, optionally pre-embedded qv). Returns the best (row, score) per query,
-    in order, or None for a query that produced no shortlist or whose rerank failed —
-    PER-ITEM fail-open (a dropped suggestion, logged) matching Step 4's enrichment posture;
-    raises only when rerank_many itself decides the failure is systemic (every item failed).
+    or None if a query got no shortlist or its rerank failed — per-item fail-open (dropped +
+    logged), raising only when rerank_many itself judges the whole batch failed.
     Falls back to per-query llm.rerank when the client has no rerank_many (test fakes)."""
     if not rows or not queries:
         return [None] * len(queries)
     names = [r["text"] for r in rows]
-    # Resolve the cached matrix ONCE for the whole batch (the digest check costs ~ms — fine
-    # once, wasteful once per query); dict-path vectors only if the matrix is unavailable.
+    # Resolve the cached matrix once for the whole batch (cheap once, wasteful per query);
+    # dict-path vectors only if the matrix is unavailable.
     matrix_info = embeddings.get_matrix(llm, names, model_id=s.embedding_model,
                                         group="control_library", kind="passage")
     name_vecs = None if matrix_info is not None else embeddings.get_vectors(
@@ -278,7 +262,7 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
         for q, docs in items:
             try:
                 scored.append(llm.rerank(q, docs))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 failures += 1
                 log.warning("controls.rerank_item_failed", query=q[:80], exc_info=True)
                 scored.append(None)
@@ -311,21 +295,18 @@ def get_allowed_actor_names(sess: Session, type_id: int) -> set[str]:
 
 def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs: dict[str, list[float]],
                         name_key: str, s: Settings) -> list[dict[str, Any]]:
-    """Cosine-scores every candidate against the query embedding, best match
-    first. The semantic-match floor keeps only candidates above
-    `semantic_match_threshold`, but falls back to the top-K anyway if nothing
-    clears it, so a bad match still reaches label_match_from_score as
-    `flagged` instead of silently returning nothing.
-    [Fix] a single dimension-mismatched cached vector (see how_similar's ValueError) is
-    skipped with a warning, not allowed to blow up scoring for every OTHER candidate — the
-    blast radius of one corrupted cache entry should be "this one candidate isn't considered
-    this time," not "the whole grounding lookup fails." If every candidate ends up skipped,
-    the caller's own `if not shortlist: return None, 0.0` already handles that gracefully.
+    """Cosine-scores every candidate against the query embedding, best match first.
+    Keeps only candidates above `semantic_match_threshold`, falling back to the top-K
+    anyway if nothing clears it, so a bad match still reaches label_match_from_score
+    instead of returning nothing.
+
+    [Fix] A dimension-mismatched cached vector (see how_similar's ValueError) is skipped
+    with a warning instead of blowing up scoring for every other candidate — one bad cache
+    entry should only cost that one candidate, not the whole lookup.
     """
-    # Score every candidate against the query by cosine similarity, best match first.
-    # Vectorized when numpy is available (see the guarded import at module top): one matrix
-    # multiply replaces len(rows) pure-Python dot products — same scores, same
-    # dimension-mismatch skip, same 0.0-for-zero-magnitude convention as how_similar.
+    # Vectorized when numpy is available: one matrix multiply replaces len(rows) pure-Python
+    # dot products — same scores, same dimension-mismatch skip, same zero-magnitude
+    # convention as how_similar.
     scored = []
     if _np is not None:
         ok_rows, vecs = [], []
@@ -351,12 +332,10 @@ def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs
             except ValueError:
                 log.warning("grounding.dimension_mismatch_skipped", candidate=r.get(name_key))
     if rows and not scored:
-        # Candidates existed and EVERY one was skipped — systemic embedding-dimension drift, never
-        # a genuine no-match. Silent, this returns unverified/score=0.0 for every threat in every
-        # session: the audit row still reads as a healthy run, and at accept a 0.0 score sits below
-        # every promotion threshold, so raw AI text is mass-minted into the shared library. ERROR
-        # rather than raise — the session still yields usable unverified threats, so degrading is
-        # acceptable; degrading SILENTLY is not.
+        # Every candidate got skipped — systemic embedding-dimension drift, not a real no-match.
+        # Left silent, this reads as a healthy run while raw AI text gets mass-promoted into the
+        # library (score 0.0 clears no threshold). ERROR, not raise: the session still yields
+        # usable unverified threats, so degrading is fine — degrading silently is not.
         log.error("grounding.all_candidates_skipped", candidates=len(rows), name_key=name_key)
     return _apply_shortlist(scored, s)
 
@@ -392,16 +371,14 @@ def find_closest_match(llm: LLMClient, query: str, rows: list[dict[str, Any]], n
     shortlists, then reranks. Called twice by find_threat_in_library — once
     for the type match, once for the name match.
 
-    `qv`: an already-computed embedding for `query`. Pass this when the caller has
-    batched `query`'s embed together with a sibling query text (see
-    find_threat_in_library, which embeds the type+name text in one round trip
-    instead of two) — omit it (default None) for a one-off call, which embeds
-    `query` here exactly as before.
+    `qv`: pass an already-computed embedding when the caller batched it with a
+    sibling query (see find_threat_in_library, which embeds type+name together
+    in one round trip). Omit for a one-off call — embeds `query` here instead.
 
-    embeddings.get_vectors() caches candidate vectors per (model, group), so
-    the library is embedded once, not on every call. The final sort is stable,
-    so an exact rerank-score tie falls back to the sector-specificity order set
-    by get_possible_types/get_possible_names ([R6]).
+    embeddings.get_vectors() caches candidate vectors per (model, group), so the
+    library is embedded once, not per call. The final sort is stable, so an exact
+    rerank-score tie falls back to the sector-specificity order from
+    get_possible_types/get_possible_names ([R6]).
     """
     if not rows:
         return None, 0.0
@@ -411,9 +388,9 @@ def find_closest_match(llm: LLMClient, query: str, rows: list[dict[str, Any]], n
         if len(vecs) != 1:  # fail loud rather than a bare IndexError — same guard as the rerank check below
             raise RuntimeError(f"embed returned {len(vecs)} vectors for 1 query")
         qv = vecs[0]
-    # Fast path: the cached pre-normalized matrix (built once per library state) turns the
-    # per-candidate cosine loop into a single matvec. Falls back to the per-vector dict path
-    # when numpy is absent or the query dimension doesn't match the cached matrix.
+    # Fast path: the cached pre-normalized matrix turns the per-candidate cosine loop into
+    # one matvec. Falls back to the per-vector dict path when numpy is absent or the query
+    # dimension doesn't match the cached matrix.
     shortlist = None
     matrix_info = embeddings.get_matrix(llm, names, model_id=s.embedding_model, group=group, kind="passage")
     if matrix_info is not None:
@@ -427,7 +404,6 @@ def find_closest_match(llm: LLMClient, query: str, rows: list[dict[str, Any]], n
     rr = llm.rerank(query, docs)
     if len(rr) != len(docs):  # fail loud rather than silently mispair scores to candidates
         raise RuntimeError(f"rerank returned {len(rr)} scores for {len(docs)} docs")
-    # Pair each shortlisted row back up with its rerank score and pick the best.
     ranked = sorted(zip(shortlist, rr), key=lambda rs: rs[1], reverse=True)
     return ranked[0]  # (row, score)
 
@@ -437,18 +413,16 @@ class GroundingResult:
     """Verdict for one proposed threat, returned by find_threat_in_library().
 
     score/status         — the weaker of the type-match and name-match confidence.
-    type_id/catalogue_id — the real library IDs matched. Each is set ONLY when its own
-                            half verified: an unverified type yields type_id=None, and an
-                            unverified name yields catalogue_id=None (and library_name=None)
-                            even though a best-scoring candidate row existed. The shortlist
-                            is fail-open and the rerank has no minimum, so "there was a
-                            candidate" is not evidence of a match — see find_threat_in_library.
-    actors_validated      — False means the type was unverified, so `actors` is the AI's raw
-                            proposal untouched. True means the type verified and the list was
-                            CANONICALIZED against its allowed set (known names take the
-                            library spelling; unknown names are KEPT — see
-                            canonicalize_actors). Not a purity flag: either way, novelty is
-                            judged at accept, and no production reader gates on this.
+    type_id/catalogue_id — the real library IDs matched, set ONLY when that half verified:
+                            an unverified type yields type_id=None; an unverified name
+                            yields catalogue_id=None and library_name=None even if a
+                            best-scoring candidate existed (shortlist is fail-open, rerank
+                            has no minimum — a candidate existing isn't evidence of a match).
+    actors_validated      — False: type was unverified, `actors` is the AI's raw proposal.
+                            True: type verified and actors were CANONICALIZED against its
+                            allowed set (known names take library spelling, unknown ones
+                            KEPT — see canonicalize_actors). Not a purity flag; novelty is
+                            judged at accept regardless.
     """
 
     status: GroundingStatus
@@ -463,9 +437,8 @@ class GroundingResult:
 
 def ensure_actor_list(raw: Any) -> list[str]:
     """Defends against malformed AI JSON: a bare string would explode into
-    single characters via `list(raw)`, and a non-str list element isn't
-    hashable against the allowed-actor set — both are handled safely here
-    instead of crashing.
+    single characters via list(raw), and a non-str list element could break
+    downstream set lookups. Both handled safely here instead of crashing.
     """
     if isinstance(raw, str):
         return [raw]
@@ -474,47 +447,41 @@ def ensure_actor_list(raw: Any) -> list[str]:
     return []
 
 
-# Spelling-normalization for actor-name identity — THE one identity key for actor dedup
-# everywhere (accept_actors' memo/triage/card identity and its pending-card fold), so an
-# identity remembered by one layer can never be missed by another. Unicode-aware on purpose:
-# actor columns are NVARCHAR and a Cyrillic or CJK group name is a name, not junk — an
-# ASCII-only alphabet silently deleted every non-Latin proposal.
+# The one identity key for actor-name dedup everywhere (accept_actors' memo/triage/card
+# identity and pending-card fold) — an identity remembered by one layer is never missed by
+# another. Unicode-aware on purpose: actor names are NVARCHAR, and Cyrillic/CJK names are
+# real names, not junk to strip.
 _ACTOR_NORM_RE = re.compile(r"[\W_]+")
-# Letter↔digit boundaries count as separators, so "APT41", "APT-41" and "APT 41" are ONE
-# identity — otherwise the verdict on a numbered group depended on which spelling the
-# library happened to store.
+# Letter<->digit boundaries count as separators, so "APT41", "APT-41", "APT 41" are one
+# identity regardless of which spelling the library stores.
 _ALNUM_BOUNDARY_RE = re.compile(r"(?<=[^\W\d_])(?=\d)|(?<=\d)(?=[^\W\d_])")
 
 
 def norm_actor_name(name: str) -> str:
-    """The one comparison key for actor-name identity (and similarity input): casefold →
-    NFKD-decompose + drop combining marks (so 'Fáncy Bear' == 'Fancy Bear' and full-width
-    text folds to ASCII) → split letter↔digit boundaries → collapse every non-word run to
-    one space. Letters of ALL scripts survive; only true letterless junk folds to ''."""
+    """Comparison key for actor-name identity: casefold, NFKD-decompose and drop combining
+    marks (so 'Fáncy Bear' == 'Fancy Bear'), split letter<->digit boundaries, collapse
+    non-word runs to one space. Letters in any script survive; only junk folds to ''."""
     decomposed = unicodedata.normalize("NFKD", name.casefold())
     stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return _ACTOR_NORM_RE.sub(" ", _ALNUM_BOUNDARY_RE.sub(" ", stripped)).strip()
 
 
 def canonicalize_actors(actors_in: list[str], allowed: list[str]) -> list[str]:
-    """Canonicalize-and-KEEP (§8.4 step 5): names the type's vocabulary knows are rewritten to
-    the LIBRARY's spelling (case-insensitively — "MSSQL's collation resolves 'nation state' to
-    'Nation State', so this must too", keeping ThreatActorsJSON joinable to accept.py's
-    exact-first memo); names it does NOT know are kept as proposed. Whether a kept name is
-    genuinely new is judged at ACCEPT against the FULL actor table (banded triage +
-    admin-gated review cards), not against one type's short list — the old drop-out-of-set
-    rule silently vetoed every LLM-proposed actor on a verified type before any human could
-    see it, so the library could never learn a new actor from the threats it recognizes best."""
+    """Canonicalize-and-keep (§8.4 step 5): names the type's vocabulary knows are rewritten
+    to the library's spelling, case-insensitively (matches MSSQL's collation, keeps
+    ThreatActorsJSON joinable to accept.py's exact-first memo); unknown names are kept as
+    proposed. Whether a kept name is genuinely new is judged at ACCEPT against the full
+    actor table, not this type's short list — dropping unknowns here would silently veto
+    every new actor before a human could ever see it."""
     allowed_cf = {a.casefold(): a for a in allowed}
     return [allowed_cf.get(a.casefold(), a) for a in actors_in]
 
 
 def _actors_meta(threat_actors_json: str | None) -> dict:
-    """THE one parser for the `Identified_Threat.ThreatActorsJSON` SHAPE — a DICT,
-    `{"actors": [...], "validated": bool}` (written by tasks.py). A corrupt, absent, or
-    mis-shaped blob returns {} instead of crashing (accept.py used to raise on exactly that;
-    treatment.py used to silently read the dict as a list and get []). Both readers below go
-    through here so the shape can never drift per-reader again."""
+    """The one parser for `Identified_Threat.ThreatActorsJSON` — a dict shaped
+    {"actors": [...], "validated": bool} (written by tasks.py). A corrupt, absent, or
+    mis-shaped blob returns {} instead of crashing. Both readers below go through here
+    so the shape can't drift per-reader."""
     try:
         meta = json.loads(threat_actors_json or "{}")
     except (TypeError, ValueError):
@@ -523,20 +490,20 @@ def _actors_meta(threat_actors_json: str | None) -> dict:
 
 
 def stored_actors(threat_actors_json: str | None) -> list[str]:
-    """The RAW stored actor list, regardless of the validated flag — for paths that must see
-    what Stage 1 proposed: scenario prompts, API display, actor linking on promotion
-    (`accept.py`), and treatment plans, which reason about a scenario the model already wrote
-    from this same raw list. Gating any of those returns [] for every unverified threat."""
+    """The raw stored actor list, regardless of the validated flag — for paths that need
+    what Stage 1 proposed: scenario prompts, API display, promotion actor-linking
+    (accept.py), and treatment plans. Gating any of these would return [] for every
+    unverified threat."""
     return ensure_actor_list(_actors_meta(threat_actors_json).get("actors", []))
 
 
 def validated_actors(threat_actors_json: str | None) -> list[str]:
-    """`stored_actors` gated on the flag it is kept beside (`GroundingResult.actors_validated`):
-    actors are trusted only when `validated`.
+    """`stored_actors` gated on `validated` (GroundingResult.actors_validated): actors are
+    trusted only when the type verified.
 
-    Currently has no production caller — treatment plans moved to `stored_actors` so a plan
+    No production caller today — treatment plans use `stored_actors` instead, so a plan
     sees the adversaries its own scenario names. Kept as the one place expressing the trust
-    distinction, for any future path that may cite only grounded actors."""
+    distinction, for any future path that needs only grounded actors."""
     meta = _actors_meta(threat_actors_json)
     return ensure_actor_list(meta.get("actors", []) if meta.get("validated") else [])
 
@@ -551,11 +518,10 @@ def ensure_text(v: Any, default: str = "") -> str:
 def prime_query_embeddings(llm: LLMClient, proposals: list[dict[str, Any]], cache: dict[Any, Any]) -> None:
     """Embed every proposal's type/name text in ONE call, into the shared per-run `cache`.
 
-    find_threat_in_library otherwise embeds its own pair per proposal — one round trip per
-    proposed threat (up to max_threats_per_asset) for texts that are all known before the loop
-    even starts. Deduped, so a repeated STRIDE type is embedded once, not once per proposal.
-    Best-effort: a failure here leaves the cache unprimed and each proposal embeds its own pair
-    exactly as before, so this can only ever save work, never break the run."""
+    Otherwise find_threat_in_library embeds its own pair per proposal — one round trip per
+    threat when all the texts are known upfront. Deduped, so a repeated STRIDE type embeds
+    once, not once per proposal. Best-effort: on failure the cache stays unprimed and each
+    proposal embeds its own pair as before — this can only save work, never break the run."""
     texts: list[str] = []
     seen: set[str] = set()
     for p in proposals:
@@ -567,7 +533,7 @@ def prime_query_embeddings(llm: LLMClient, proposals: list[dict[str, Any]], cach
         return
     try:
         vecs = llm.embed(texts, kind="query")
-    except Exception:  # noqa: BLE001 — pure optimization; the per-proposal path still works
+    except Exception:
         log.warning("grounding.prime_embeddings_failed", count=len(texts), exc_info=True)
         return
     if len(vecs) != len(texts):  # same fail-loud guard find_closest_match applies to its own embed
@@ -577,34 +543,30 @@ def prime_query_embeddings(llm: LLMClient, proposals: list[dict[str, Any]], cach
 
 
 def boundary_between(below: list[float], above: list[float]) -> float | None:
-    """Midpoint cutoff strictly between two score classes, or None when they overlap/are empty.
-    Shared by _auto_calibrate and scripts/calibrate_grounding.py — a midpoint sits inside the
-    measured gap by construction, so it can never be derived onto or past a measured score the
-    way an independent min-margin/max+margin pair can."""
+    """Midpoint cutoff strictly between two score classes, or None when they overlap/are
+    empty. Shared by _auto_calibrate and scripts/calibrate_grounding.py — a midpoint sits
+    inside the measured gap by construction, so it can't land on or past a measured score."""
     if not below or not above:
         return None
     lo, hi = max(below), min(above)
     if lo >= hi:
         return None
-    # NOT round()-ed: scores are continuous floats, so an integer midpoint can land back ON or
-    # OUTSIDE the measured gap when it is under ~1 point (max(neg)=71.2, min(pos)=71.4 →
-    # round(71.3)=71 ≤ 71.2, and label_match_from_score's `score >= th` would then band a
-    # measured IMPOSTOR as verified — trusted against a master it does not match). Return the true
-    # midpoint; the value is only ever compared, never displayed as a whole number.
+    # NOT round()-ed: scores are continuous floats, and an integer midpoint can land back on
+    # or outside a gap under ~1 point (max(neg)=71.2, min(pos)=71.4 → round(71.3)=71 ≤ 71.2,
+    # banding a measured impostor as verified). Return the true midpoint; it's only compared.
     return (lo + hi) / 2
 
 
 def resolve_thresholds(sess: Session | None, llm: LLMClient | None,
                         s: Settings | None = None, *,
                         allow_calibration: bool = False) -> float:
-    """The match cutoff for the CURRENT embedding+reranker pair. Precedence:
-      1. operator explicitly set it in env (it appears in model_fields_set) → static wins;
-      2. stored calibration for this exact model pair (embeddings.load_thresholds, Mongo);
-      3. auto-calibrate now from the live library, store for every later worker;
-      4. anything unavailable (Mongo down, library too small, no sess/llm) → the static
-         default + a WARNING — degrade-safe, never blocks a run.
-    Memoized per process; celery_app._init_worker warms it at boot so the one-time calibration
-    cost lands at deploy time, never inside a leased pipeline stage."""
+    """The match cutoff for the current embedding+reranker pair. Precedence:
+      1. operator set it explicitly in env (in model_fields_set) → static wins;
+      2. stored calibration for this model pair (embeddings.load_thresholds, Mongo);
+      3. auto-calibrate now from the live library, store for later workers;
+      4. unavailable (Mongo down, library too small, no sess/llm) → static default + WARNING.
+    Memoized per process; celery_app._init_worker warms it at boot so calibration cost
+    lands at deploy time, never inside a leased pipeline stage."""
     s = s or get_settings()
     if "grounding_match_threshold" in s.model_fields_set:
         return s.grounding_match_threshold
@@ -614,12 +576,11 @@ def resolve_thresholds(sess: Session | None, llm: LLMClient | None,
         return hit
     resolved = embeddings.load_thresholds(key)
     if resolved is None and allow_calibration:
-        # ONLY the boot warm-up passes allow_calibration=True. Calibration is ~30 sequential
-        # chat calls plus ~180 embed/rerank calls; run lazily from find_threat_in_library it
-        # would execute INSIDE a leased THREATS stage whose lease covers roughly two chat calls,
-        # so the lease expires mid-pass, the reaper ERRORs the row and closes out the session,
-        # and the worker's eventual finish_stage loses its CAS — a healthy run cancelled and its
-        # spend discarded. Deploy-time work belongs at deploy time.
+        # ONLY the boot warm-up passes allow_calibration=True. Calibration costs ~30 chat
+        # calls + ~180 embed/rerank calls; run lazily inside a leased THREATS stage (lease
+        # covers ~2 chat calls) the lease would expire mid-pass, the reaper would ERROR and
+        # close the session, and the run's spend would be discarded for nothing. Deploy-time
+        # work belongs at deploy time.
         resolved = _auto_calibrate(sess, llm, s)
         if resolved is not None:
             embeddings.store_thresholds(key, resolved)
@@ -631,20 +592,19 @@ def resolve_thresholds(sess: Session | None, llm: LLMClient | None,
                     note="static default in use — it was tuned for a DIFFERENT model pair "
                         "and may misclassify; seed the threat library (>=5 entries) so worker "
                         "boot can calibrate, or set the threshold explicitly in env")
-        # Deliberately NOT memoized: memoizing the fallback pinned a worker to the static default
-        # for its whole life, even after a SIBLING worker stored a real calibration seconds
-        # later. Leaving it unmemoized costs one small indexed find_one per grounding call and
-        # lets the worker self-heal the moment a calibration exists.
+        # Deliberately NOT memoized: memoizing the fallback would pin a worker to the static
+        # default even after a sibling worker stores a real calibration seconds later. Costs
+        # one small indexed find_one per call, but lets the worker self-heal.
         return s.grounding_match_threshold
     _RESOLVED_THRESHOLDS[key] = resolved
     return resolved
 
 
 def _paraphrase(llm: LLMClient, name: str, s: Settings) -> list[str]:
-    """Up to s.calibration_paraphrases_per_name rewordings of a threat name — the auto-labelled
-    POSITIVES for calibration (a real-world query is a paraphrase, never the exact library
-    string, so exact-string self-matches would overstate what a genuine match scores).
-    Best-effort: an unparseable/failed reply contributes nothing rather than failing calibration."""
+    """Up to s.calibration_paraphrases_per_name rewordings of a threat name — the
+    auto-labelled POSITIVES for calibration (a real query is a paraphrase, never the exact
+    library string, so exact-match self-scores would overstate a genuine match).
+    Best-effort: an unparseable/failed reply contributes nothing, doesn't fail calibration."""
     n = s.calibration_paraphrases_per_name
     try:
         text, _prov = llm.chat([{
@@ -660,13 +620,11 @@ def _paraphrase(llm: LLMClient, name: str, s: Settings) -> list[str]:
             return []
         return [p for p in out if isinstance(p, str) and p.strip()][:n]
     except LLMSlotUnavailable:
-        # NEVER swallowed — the codebase-wide contract (llm.py's own docstring; the explicit
-        # re-raises in tasks/cascade/embeddings). Swallowed here it would turn a coordinated
-        # restart's transient slot squeeze into "every paraphrase failed" → empty positives →
-        # a permanent static-threshold fallback, misreported as a class-overlap. Propagating it
-        # lets the boot warm-up's retry loop do its job.
+        # NEVER swallowed — codebase-wide contract (see llm.py, tasks/cascade/embeddings).
+        # Swallowed here, a transient slot squeeze would look like "every paraphrase failed"
+        # -> empty positives -> permanent fallback misreported as a class overlap.
         raise
-    except Exception:  # noqa: BLE001 — a malformed/failed reply just contributes no positives
+    except Exception:
         log.warning("grounding.calibration_paraphrase_failed", name=name, exc_info=True)
         return []
 
@@ -675,15 +633,15 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
                     s: Settings) -> float | None:
     """Derive the match cutoff from the LIVE library + CURRENT models, no labelled data:
     POSITIVES = scores of LLM paraphrases of sampled catalogue names against the full library
-    (what a genuine match scores under THESE models); NEGATIVES = each sampled name scored with
+    (what a genuine match scores under these models); NEGATIVES = each sampled name scored with
     itself removed (the best an impostor achieves). The cutoff is the midpoint between the two
-    classes — with one band boundary that IS the whole answer, no derived second number.
-    # ponytail: heuristic band placement; a labelled-CSV run of scripts/calibrate_grounding.py
-    # beats it when curators can supply ground truth — its env override then wins."""
+    classes.
+    # ponytail: heuristic band placement — a labelled-CSV run of scripts/calibrate_grounding.py
+    # beats it when curators have ground truth; its env override then wins."""
     if sess is None or llm is None:
         return None
-    table, name_col = embeddings._GROUPS["threat_catalogue"]  # noqa: SLF001 — deliberate internal reuse
-    names = embeddings._active_names(sess, table, name_col)  # noqa: SLF001
+    table, name_col = embeddings._GROUPS["threat_catalogue"]
+    names = embeddings._active_names(sess, table, name_col)
     if len(names) < 5:
         return None  # too little library to say anything meaningful
     sample = names[:s.calibration_sample_size]
@@ -691,25 +649,21 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
     negatives: list[float] = []
     collisions: list[tuple[float, str, str]] = []  # (score, name, nearest other) — see the warnings below
 
-    # NEGATIVES FIRST, and separately from the positives, because the two cost wildly different
-    # things: a negative is a local embed+rerank (free, in-process), while every positive needs a
-    # BILLED paraphrase call. Interleaved — as this loop used to be — the pass paid for ~30 LLM
-    # requests before it could discover that separation was unreachable, and repeated that spend
-    # on EVERY worker boot, forever, in any environment that had not pinned the thresholds.
+    # NEGATIVES FIRST and separately from positives: a negative is a free local embed+rerank,
+    # a positive needs a BILLED paraphrase call. This lets a hopeless library (see the
+    # near-duplicate bail-out below) fail before spending anything, on every boot.
     for n in sample:
         others = [r for r in rows_all if r["ThreatName"] != n]
         row, neg = find_closest_match(llm, n, others, "ThreatName", s, group="threat_catalogue")
         negatives.append(neg)
         collisions.append((neg, n, (row or {}).get("ThreatName", "")))
 
-    # Bail BEFORE spending anything when the library itself makes success impossible. A negative
-    # at/above near_duplicate_score is not an impostor at all: it is a second catalogue entry for
-    # the same threat ('Shared, stale or orphaned account misuse' ~ 'Shared, default or stale OT
-    # account abuse' scored 99.5 on the real 85-entry library). boundary_between needs
-    # max(negatives) < min(positives), so ONE such pair would require every paraphrase to clear
-    # ~100 on a 0-100 scale — unattainable for any model. This is a property of the LIBRARY, so it
-    # recurs identically every boot until a curator dedupes; detecting it here is what stops the
-    # symptom from coming back rather than just reporting it after the fact.
+    # Bail BEFORE spending anything when the library itself makes success impossible. A
+    # negative at/above near_duplicate_score isn't an impostor — it's a second catalogue
+    # entry for the same threat (e.g. two near-duplicate names scored 99.5 on the real
+    # library). boundary_between needs max(negatives) < min(positives), so one such pair
+    # would need every paraphrase to clear ~100 on a 0-100 scale — unattainable. This is a
+    # property of the LIBRARY, so it recurs every boot until a curator dedupes it.
     worst = max(collisions) if collisions else None
     if worst is not None and worst[0] >= s.near_duplicate_score:
         log.warning("grounding.calibration_impossible_near_duplicate_library",
@@ -755,10 +709,9 @@ def _auto_calibrate(sess: Session | None, llm: LLMClient | None,
 
 
 def _cached(cache: dict[Any, Any], key: Any, compute: Callable[[], Any]) -> Any:
-    """Cache-on-first-use: `compute()` only runs if `key` hasn't been seen yet
-    this call, then every later hit reuses the stored result — see
-    find_threat_in_library's docstring for why (repeat category/type across
-    proposals in one find_threats() call reuses the earlier DB lookup).
+    """Cache-on-first-use: compute() runs only if key hasn't been seen this call;
+    later hits reuse the stored result. See find_threat_in_library for why (a
+    repeated category/type across proposals reuses the earlier DB lookup).
     """
     if key not in cache:
         cache[key] = compute()
@@ -768,22 +721,20 @@ def _cached(cache: dict[Any, Any], key: Any, compute: Callable[[], Any]) -> Any:
 def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, Any], sector_ids: list[int],
                             settings: Settings | None = None, cache: dict[Any, Any] | None = None) -> GroundingResult:
     """Matches one AI-proposed threat ({"category", "type", "name", "actors"})
-    against the real library. Matches TYPE first; if that comes back unverified,
-    stops immediately — there's no confident ThreatTypeID to scope a name/actor
-    search by — and returns actors raw/unvalidated. Otherwise matches NAME
-    within that type only ([R6]), canonicalizes actors against the type's
-    allowed set (keeping unknown names for accept-time triage),
-    and reports the weaker of the type/name confidence.
+    against the real library. Matches TYPE first; if unverified, stops immediately
+    (no confident ThreatTypeID to scope a name/actor search by) and returns actors
+    raw/unvalidated. Otherwise matches NAME within that type ([R6]), canonicalizes
+    actors against the type's allowed set (unknown names kept for accept-time
+    triage), and reports the weaker of the two confidences.
 
-    `cache`: optional dict, shared by the caller across every proposal in one
-    find_threats() call. sector_ids is fixed for that whole call, so a repeat
-    category/type across proposals (common — the AI only has ~6 STRIDE
-    categories to choose from) can reuse the earlier DB lookup instead of
-    re-querying. Pass None for a one-off call; each key is looked up fresh.
+    `cache`: optional dict shared across every proposal in one find_threats()
+    call. sector_ids is fixed for that call, so a repeated category/type
+    (common — only ~6 STRIDE categories) reuses the earlier DB lookup instead
+    of re-querying. Pass None for a one-off call.
     """
     s = settings or get_settings()
     cache = {} if cache is None else cache
-    # Per-model-pair cutoff (memoized; worker boot warms it) — the static settings number is
+    # Per-model-pair cutoff (memoized; worker boot warms it) — the static setting is
     # only the fallback. See resolve_thresholds.
     match_th = resolve_thresholds(sess, llm, s)
     actors_in = ensure_actor_list(proposed.get("actors", []))
@@ -795,28 +746,25 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
     tkey = ("types", category_id)
     types = _cached(cache, tkey, lambda: get_possible_types(sess, category_id, sector_ids))
 
-    # Both the type and name query text are known up front, regardless of the type-match
-    # outcome, so embed them together in ONE round trip instead of find_closest_match doing
-    # two separate single-item llm.embed() calls — one per proposal instead of up to two.
-    # Skipped when `types` is empty since find_closest_match would return (None, 0.0)
-    # without embedding anything anyway (see its `if not rows` guard).
+    # Type and name query text are both known up front, so embed them together in ONE round
+    # trip instead of find_closest_match's two separate single-item calls. Skipped when
+    # `types` is empty since find_closest_match returns (None, 0.0) without embedding anyway.
     type_text = ensure_text(proposed.get("type"))
     name_text = ensure_text(proposed.get("name"))
     type_qv: list[float] | None = None
     name_qv: list[float] | None = None
     if types:
-        # Prefer vectors primed in ONE batched call for every proposal (prime_query_embeddings,
-        # called by find_threats before its loop) — otherwise embed this proposal's pair here,
-        # exactly as before, so a direct one-off caller still works.
+        # Prefer vectors primed in one batched call (prime_query_embeddings, called by
+        # find_threats before its loop) — otherwise embed this proposal's pair here, so a
+        # direct one-off caller still works.
         type_qv, name_qv = cache.get(("qv", type_text)), cache.get(("qv", name_text))
         if type_qv is None or name_qv is None:
             type_qv, name_qv = llm.embed([type_text, name_text], kind="query")
 
-    # Memoized per (query text, candidate set): the AI only has ~6 STRIDE categories to choose
-    # from, so a repeated type across proposals re-ran an IDENTICAL rerank — the single most
-    # expensive model call in this path. `types` is itself derived from category_id (cached
-    # above) with sector_ids fixed for the whole find_threats() call, so the same key really
-    # does mean the same candidates.
+    # Memoized per (query text, candidate set): only ~6 STRIDE categories exist, so a repeated
+    # type across proposals would rerun an identical rerank — the most expensive call in this
+    # path. `types` derives from category_id (cached above) with sector_ids fixed for the
+    # whole call, so the same key really does mean the same candidates.
     trow, tscore = _cached(cache, ("match_type", type_text, category_id),
                         lambda: find_closest_match(llm, type_text, types, "ThreatTypeName", s,
                                                     group="threat_type", qv=type_qv))
@@ -845,14 +793,12 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
     # unknown ones survive to accept's banded triage instead of being silently dropped here.
     actors = canonicalize_actors(actors_in, allowed)
 
-    # Symmetry with the TYPE branch above: an unverified type already yields type_id=None. An
-    # unverified NAME must likewise yield no id and no library wording. `crow` is only ever the
-    # best candidate, never necessarily a real match — _apply_shortlist is fail-open
-    # (`above or scored`) and find_closest_match applies no rerank minimum, so a 22/100 row was
-    # stored indistinguishably from a 97/100 one. That id is authoritative downstream in three
-    # places at once: the name the API renders (sessions.py `LibraryThreatName or ThreatName`),
-    # the "official library name" the scenario prompt writes about, and the `cat:` rung of
-    # tasks._dedup_key. Withholding the CLAIM is the fix; `score` still reports what was measured.
+    # Symmetric with the TYPE branch: unverified type already yields type_id=None, so an
+    # unverified NAME must likewise yield no id/wording. `crow` is only the best candidate,
+    # never necessarily a real match — shortlisting is fail-open and rerank has no minimum,
+    # so a 22/100 row is stored indistinguishably from a 97/100 one. That id is authoritative
+    # downstream in three places (API display, scenario prompt, tasks._dedup_key's `cat:`
+    # rung), so withholding the claim (not the score) is what matters here.
     matched = crow if cstatus == GroundingStatus.verified else None
     return GroundingResult(
         status=pick_worse_of_two(tstatus, cstatus),

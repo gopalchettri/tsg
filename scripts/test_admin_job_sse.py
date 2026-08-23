@@ -24,11 +24,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
-import requests  # noqa: E402
+import requests
 
-from app.core.config import get_settings  # noqa: E402
-from app.intel.fetchers import enabled_feed_names  # noqa: E402
-from app.pipeline.threat_library_import import URLS  # noqa: E402
+from app.core.config import get_settings
+from app.intel.fetchers import enabled_feed_names
+from app.pipeline.threat_library_import import URLS
 
 
 def _read_sse(resp: requests.Response, expect_type: str, timeout_s: float) -> dict:

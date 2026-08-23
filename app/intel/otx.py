@@ -80,7 +80,7 @@ def fetch_page(s, page: int) -> tuple[list[dict], bool]:
             results = data.get("results", [])
             # a short page is the tail; OTX also serves an empty page one past the end
             return [pulse_doc(p) for p in results], len(results) < s.intel_otx_page_size
-        except Exception:  # noqa: BLE001 — retry transient 5xx/timeouts, then let it out
+        except Exception:
             if attempt == _PAGE_ATTEMPTS:
                 raise
             log.warning("intel.otx_page_retry", page=page, attempt=attempt, exc_info=True)
@@ -94,7 +94,7 @@ def _read_cursor(col) -> int:
     try:
         doc = col.database[_STATUS_COLLECTION].find_one({"feed": _FEED}) or {}
         return max(1, int(doc.get("sync_page") or 1))
-    except Exception:  # noqa: BLE001 — an unreadable cursor restarts the cycle, never fails the run
+    except Exception:
         log.warning("intel.otx_cursor_read_failed", exc_info=True)
         return 1
 
@@ -106,7 +106,7 @@ def _save_cursor(col, page: int) -> None:
         col.database[_STATUS_COLLECTION].update_one(
             {"feed": _FEED}, {"$set": {"sync_page": page}, "$setOnInsert": {"feed": _FEED}},
             upsert=True)
-    except Exception:  # noqa: BLE001 — losing the cursor costs a re-walk, never the run
+    except Exception:
         log.warning("intel.otx_cursor_save_failed", exc_info=True)
 
 
@@ -116,7 +116,7 @@ def _page_or_skip(s, page: int) -> tuple[list[dict], bool]:
     must not cost the entire cycle."""
     try:
         return fetch_page(s, page)
-    except Exception:  # noqa: BLE001 — logged and left for the next cycle
+    except Exception:
         log.warning("intel.otx_page_skipped", page=page, exc_info=True)
         return [], False
 

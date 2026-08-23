@@ -18,6 +18,6 @@ if "pytest" not in sys.modules:
     from gevent import monkey  # type: ignore[import]
     monkey.patch_all()
 
-from app.pipeline.celery_app import celery_app  # noqa: E402 -- must import after patching
+from app.pipeline.celery_app import celery_app
 
 __all__ = ["celery_app"]

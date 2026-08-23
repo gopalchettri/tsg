@@ -6,7 +6,7 @@ queries run through SQLAlchemy Core against `Subsystem_Stage_State`/`Scenario_Se
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -25,7 +25,7 @@ def _engine():
 
 
 def _stage_row(session_id: str, level: str, lease_expired: bool) -> dict:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return dict(
         StateID=str(uuid.uuid4()), SessionID=session_id, TenantID="t", EntityID="e",
         SubsystemID=0, Level=level, Status=StageStatus.RUNNING, GenerationEpoch=1,

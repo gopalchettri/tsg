@@ -33,7 +33,7 @@ def _check_database() -> bool:
         with get_engine().connect() as c:
             c.execute(text("SELECT 1"))
         return True
-    except Exception:  # noqa: BLE001 — report not-ready; log the detail SERVER-SIDE only
+    except Exception:
         logger.exception("readyz.database_unreachable")
         return False
 
@@ -52,7 +52,7 @@ def _check_redis() -> bool:
             socket_timeout=s.sse_subscribe_connect_timeout_seconds,
         ).ping()
         return True
-    except Exception:  # noqa: BLE001 — report not-ready; log the detail SERVER-SIDE only
+    except Exception:
         logger.exception("readyz.redis_unreachable")
         return False
 
@@ -82,7 +82,7 @@ def _check_mongo() -> bool | None:
         ) as client:
             client.admin.command("ping")
         return True
-    except Exception:  # noqa: BLE001 — report not-ready; log the detail SERVER-SIDE only
+    except Exception:
         logger.exception("readyz.mongo_unreachable")
         return False
 
@@ -100,7 +100,7 @@ def _check_workers() -> bool:
             return True
         logger.warning("readyz.workers_absent")
         return False
-    except Exception:  # noqa: BLE001 — report degraded; log the detail SERVER-SIDE only
+    except Exception:
         logger.exception("readyz.workers_check_failed")
         return False
 

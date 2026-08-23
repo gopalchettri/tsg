@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.pipeline import prompts, treatment  # noqa: E402
+from app.pipeline import prompts, treatment
 
 EXCL = prompts._EXCLUDE_DB_KEY_TO_PROMPT
 
@@ -119,11 +119,9 @@ def main() -> None:
         "treatment_prompt mutated the snapshot — _inject_reserved will resolve controls to None"
     parsed = {"controls_to_be_implemented": {"control_coverage": "gaps",
         "controls": [{"control_code": "CII-CID-028"}, {"control_code": "CII-CID-999"}, {}]}}
-    ids = [c.get("control_library_id")
-           for c in treatment._inject_reserved(parsed, snap)
-                    ["controls_to_be_implemented"]["controls"]]
-    assert ids == [28, None, None], ids
-    print("4 OK  snapshot unmutated; control_code -> control_library_id resolves", ids)
+    kept = treatment._inject_reserved(parsed, snap)["controls_to_be_implemented"]["controls"]
+    assert [c.get("control_library_id") for c in kept] == [28], kept
+    print("4 OK  snapshot unmutated; control_code -> control_library_id resolves, unmatched dropped", kept)
 
     # 5 — ordering guard: a subsystem holding only id/criticality must be ABSENT, not {}
     assert base["supporting_systems"] == [

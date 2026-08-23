@@ -14,9 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.api.schemas import TreatmentPlanStatus  # noqa: E402
-from app.api.treatment import _VISIBLE_PLAN_KEYS, _normalize_plan_shape  # noqa: E402
-from app.api.treatment_plan_excel import (  # noqa: E402
+from app.api.schemas import TreatmentPlanStatus
+from app.api.treatment import _VISIBLE_PLAN_KEYS, _normalize_plan_shape
+from app.api.treatment_plan_excel import (
     _COLUMNS,
     _sanitize,
     build_treatment_plans_workbook,

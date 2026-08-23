@@ -31,8 +31,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.core.config import get_settings  # noqa: E402
-from app.pipeline.llm import get_llm  # noqa: E402
+from app.core.config import get_settings
+from app.pipeline.llm import get_llm
 
 # Each entry: (label_a, label_b, is_paraphrase). Labels are asset-stripped, mirroring
 # _semantic_duplicates' comparison input. The e5-large@1024 reference numbers are in comments —

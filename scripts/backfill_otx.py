@@ -25,10 +25,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.logging import configure_logging  # noqa: E402
-from app.intel import fetchers  # noqa: E402
-from app.intel.otx import _read_cursor  # noqa: E402
+from app.core.config import get_settings
+from app.core.logging import configure_logging
+from app.intel import fetchers
+from app.intel.otx import _read_cursor
 
 
 def _stamp_legacy_published_at(col) -> int:

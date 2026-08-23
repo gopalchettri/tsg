@@ -320,6 +320,13 @@ def _stix_ext_id(obj, source_names) -> str | None:
     return None
 
 
+# NOTE on the EN DASH (U+2013) in the `type_name` values in this section — the three
+# RUF001 suppressions below are deliberate, NOT laziness. These strings become
+# `Threat_Type.ThreatTypeName`, which carries the UX_ThreatType_NaturalKey unique index.
+# Rows already imported use the en dash, so "fixing" it to a plain hyphen would not correct
+# them — it would create a SECOND, visually identical type for every family and silently
+# split the library. The lookalike hazard RUF001 warns about is real (a curator typing '-'
+# gets no match); the fix is a normalizing migration of the existing rows, not an edit here.
 def _adapt_attack(data, kill_chain_name: str, type_prefix: str):
     records, skipped = [], []
     for obj in _stix_patterns(data):
@@ -333,7 +340,7 @@ def _adapt_attack(data, kill_chain_name: str, type_prefix: str):
             skipped.append({"reason": f"unmapped tactic(s): {tactics}", "item": f"{ext_id} {obj.get('name')}"})
             continue
         # one Threat_Type per tactic family; techniques spanning tactics file under the first
-        type_name = f"{type_prefix} – {_tidy(tactics[0])}"
+        type_name = f"{type_prefix} – {_tidy(tactics[0])}"  # noqa: RUF001
         records.append({
             "type_name": type_name,
             "threat_name": f"{ext_id} {obj.get('name')}".strip(),
@@ -366,7 +373,7 @@ def adapt_capec(data) -> tuple[list[dict], list[dict]]:
             continue
         domain = (obj.get("x_capec_domains") or ["General"])[0]
         records.append({
-            "type_name": f"CAPEC – {domain}",
+            "type_name": f"CAPEC – {domain}",  # noqa: RUF001
             "threat_name": f"{ext_id} {obj.get('name')}".strip(),
             "description": (obj.get("description") or "")[:1000] or None,
             "categories": cats,
@@ -384,7 +391,7 @@ def adapt_emb3d(data) -> tuple[list[dict], list[dict]]:
             skipped.append({"reason": f"unknown EMB3D category: {category}", "item": f"{t.get('id')} {t.get('text')}"})
             continue
         records.append({
-            "type_name": f"Embedded Device – {category.title()}",
+            "type_name": f"Embedded Device – {category.title()}",  # noqa: RUF001
             "threat_name": f"{t.get('id')} {t.get('text')}".strip(),
             "description": None,  # EMB3D threats.json carries name + category only
             "categories": cats,
@@ -426,7 +433,7 @@ def adapt_atlas(data) -> tuple[list[dict], list[dict]]:
 
     sub_by_parent: dict[str, list[str]] = collections.defaultdict(list)
     is_subtechnique: set[str] = set()
-    for tech_id, rels in relationships.items():
+    for _tech_id, rels in relationships.items():
         for rel in rels.get("specializes", []):
             sub_by_parent[rel["target"]].append(rel["source"])
             is_subtechnique.add(rel["source"])
@@ -534,14 +541,14 @@ def load(source: str, file_content: str | None, via_taxii: bool):
     else:
         url = URLS[source]
         log.info("threat_library_import.downloading", source=source, url=url)
-        with urllib.request.urlopen(url, timeout=180) as resp:  # noqa: S310 — pinned https URLs above
+        with urllib.request.urlopen(url, timeout=180) as resp:
             data = yaml.safe_load(resp.read()) if is_yaml else json.load(resp)
         if source == "atlas":
             # URLS["atlas"] is dist/manifest.yaml, not the dataset itself — resolve the real
             # current v6 file and fetch that before check_source_shape runs on it below.
             dataset_url = _resolve_atlas_dataset_url(data)
             log.info("threat_library_import.downloading", source=source, url=dataset_url)
-            with urllib.request.urlopen(dataset_url, timeout=180) as resp:  # noqa: S310 — path checked in _resolve_atlas_dataset_url
+            with urllib.request.urlopen(dataset_url, timeout=180) as resp:
                 data = yaml.safe_load(resp.read())
     check_source_shape(source, data)
     return data
@@ -550,7 +557,7 @@ def load(source: str, file_content: str | None, via_taxii: bool):
 def category_ids(sess) -> dict[str, int]:
     rows = sess.execute(
         select(m.Threat_Category.ThreatCategoryName, m.Threat_Category.ThreatCategoryID)
-        .where(m.Threat_Category.IsActive == True, m.Threat_Category.IsDeleted == False)  # noqa: E712
+        .where(m.Threat_Category.IsActive == True, m.Threat_Category.IsDeleted == False)
     ).all()
     return {name: cid for name, cid in rows}
 
@@ -578,7 +585,7 @@ def record_import_started(source: str, *, dry_run: bool, job_id: str | None,
                 RunID=run_id, Source=source, SourceTag=SOURCE_TAGS.get(source),
                 DryRun=dry_run, Status="running", JobID=job_id, StartedBy=started_by,
                 StartedAt=now()))
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.warning("import.history_start_failed", source=source, exc_info=True)
     return run_id
 
@@ -604,7 +611,7 @@ def record_import_finished(run_id: str, *, stats: dict | None = None, error: str
             sess.execute(update(m.Threat_Library_Import_Run)
                         .where(m.Threat_Library_Import_Run.RunID == run_id)
                         .values(**values))
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.warning("import.history_finish_failed", run_id=run_id, exc_info=True)
 
 
@@ -735,7 +742,7 @@ def run_import(sess, source: str, *, file_content: str | None = None, via_taxii:
     if source == "misp_actors":
         try:
             actors, skipped = adapt_misp_actors(data, max_actors)
-        except Exception as exc:  # noqa: BLE001 — same containment net as ADAPTERS below
+        except Exception as exc:
             # This branch sat OUTSIDE the try/except that wraps every other source, so an
             # item-level malformation (a values[] entry with CII keywords but no "value" key)
             # escaped as a raw KeyError — a 500-class traceback string on the job status

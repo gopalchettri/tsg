@@ -17,9 +17,10 @@ intel-refresh beat task, the reaper) has no snapshot and takes its values from c
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Mapping
+from typing import Any
 
 from pydantic import ValidationError
 

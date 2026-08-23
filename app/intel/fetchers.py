@@ -108,7 +108,7 @@ def _store_if_healthy():
         return None
     try:
         col = _intel_store()
-    except Exception:  # noqa: BLE001 — Mongo down → open breaker, caller degrades
+    except Exception:
         _breaker_open_until = now + _BREAKER_COOLDOWN_S
         log.warning("intel.mongo_breaker_open", cooldown_seconds=_BREAKER_COOLDOWN_S, exc_info=True)
         return None
@@ -129,7 +129,7 @@ def _get(url: str, headers: dict[str, str] | None = None, timeout: int = 120) ->
     `refresh_one` records against that one feed, rather than an OOM that takes the worker with it.
     The total-duration half of the bound is the task's `soft_time_limit` (see celery_app.py)."""
     req = urllib.request.Request(url, headers={"User-Agent": "TSG-intel/1.0", **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — config-pinned https URLs
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = resp.read(_MAX_FETCH_BYTES + 1)
     if len(body) > _MAX_FETCH_BYTES:
         raise ValueError(f"feed response exceeded {_MAX_FETCH_BYTES} bytes: {url}")
@@ -198,7 +198,7 @@ def fetch_ics_advisories(s) -> list[dict]:
             "cisa_ics", "ics_advisory", code, f"{code} {meta.get('title', '')}".strip(),
             description=" ".join(cves)[:2000],
             url=f"https://www.cisa.gov/news-events/ics-advisories/{code.lower()}",
-            tags=["ot", "ics"] + cves[:10], raw=None))
+            tags=["ot", "ics", *cves[:10]], raw=None))
     return docs
 
 
@@ -292,7 +292,7 @@ def _record_feed_status(col, feed: str, *, items: int | None = None, error: str 
     try:
         col.database["intel_feed_status"].update_one(
             {"feed": feed}, {"$set": update, "$setOnInsert": {"feed": feed}}, upsert=True)
-    except Exception:  # noqa: BLE001 — status bookkeeping is never worth failing a refresh over
+    except Exception:
         log.warning("intel.status_record_failed", feed=feed, exc_info=True)
 
 
@@ -349,7 +349,7 @@ def refresh_one(feed: str) -> int:
         if batch:
             _upsert_batch(col, batch, now)
             stored += len(batch)
-    except Exception as exc:  # noqa: BLE001 — record, then re-raise for the retry policy
+    except Exception as exc:
         _record_feed_status(col, feed, items=stored, error=f"{type(exc).__name__}: {exc}"[:500])
         log.warning("intel.feed_failed", feed=feed, items_stored=stored, exc_info=True)
         raise
@@ -400,7 +400,7 @@ def feed_status() -> list[dict[str, Any]]:
                 if r["last"] and (cur["last_fetched_at"] is None or r["last"] > cur["last_fetched_at"]):
                     cur["last_fetched_at"] = r["last"]
             status_docs = {d["feed"]: d for d in col.database["intel_feed_status"].find({}, {"_id": 0})}
-        except Exception:  # noqa: BLE001 — reporting degrades, never raises
+        except Exception:
             log.warning("intel.status_read_failed", exc_info=True)
     out = []
     for feed in ALL_FEEDS:
@@ -472,7 +472,7 @@ def query_intel(terms: list[str], prefer_kinds: tuple[str, ...] = ("cve",),
             out.extend(col.find({**match, "kind": kind}, {"_id": 0, "raw": 0})
                     .sort("published_at", -1).limit(limit - len(out)))
         return out
-    except Exception:  # noqa: BLE001 — enrichment is optional, never breaks generation
+    except Exception:
         log.warning("intel.query_failed", exc_info=True)
         return []
 
@@ -493,7 +493,7 @@ def list_intel(source: str | None = None, limit: int = 50, offset: int = 0) -> t
         items = list(col.find(q, {"_id": 0, "raw": 0})
                     .sort([("published_at", -1), ("external_id", 1)]).skip(offset).limit(limit))
         return items, col.count_documents(q)
-    except Exception:  # noqa: BLE001 — a mid-query blip is the same "store unavailable"
+    except Exception:
         # as a breaker-open connection: the route's one 503 path must cover both, never
         # a raw 500 with a stack trace.
         log.warning("intel.list_failed", exc_info=True)

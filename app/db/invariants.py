@@ -319,7 +319,7 @@ def _warn_dead_context_field_config(engine: Engine) -> None:
             rows = c.execute(text(
                 "SELECT ContextGroup, FieldName FROM Context_Field_Config "
                 "WHERE IsActive = 0 AND IsDeleted = 0")).all()
-    except Exception:  # noqa: BLE001 — an advisory check must never break startup
+    except Exception:
         log.debug("startup.dead_context_field_config_check_skipped", exc_info=True)
         return
     if not rows:

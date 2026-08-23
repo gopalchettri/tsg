@@ -52,7 +52,7 @@ def mark_admin_job(job_id: str, family: str) -> None:
     the job itself; the job merely becomes unpollable via its status route."""
     try:
         _slot_redis().setex(_key(job_id, family), get_settings().result_expires_seconds, "1")
-    except Exception:  # noqa: BLE001 — best-effort provenance marker, never blocks the queue
+    except Exception:
         log.warning("admin.job_marker_write_failed", job_id=job_id, family=family, exc_info=True)
 
 

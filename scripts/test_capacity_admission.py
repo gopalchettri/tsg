@@ -17,7 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
-import app.db.dal as dal  # noqa: E402
+from app.db import dal
 
 
 class _FakeSettings:

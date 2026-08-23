@@ -13,8 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.api.results_excel import _COLUMNS, _sanitize, build_results_workbook  # noqa: E402
-from app.api.schemas import (  # noqa: E402
+from app.api.results_excel import _COLUMNS, _sanitize, build_results_workbook
+from app.api.schemas import (
     MappedControl,
     ScenarioNarrative,
     ScenarioResult,

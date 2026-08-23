@@ -19,7 +19,9 @@ dependencies = [
   "pymongo>=4.17.0",
   "structlog>=26.1.0",
   "flower>=2.0.1",
-  "prometheus-client>=0.26.0",
+  # prometheus-client removed: it was declared but never imported, and no /metrics route exists
+  # (`grep -rn "prometheus\|Counter(\|Histogram(" app/` finds nothing). Add it back together with
+  # the endpoint and the instrumentation, not ahead of them.
   "numpy>=2.5.1",
   "httpx>=0.28.1",
   "ruff>=0.16.1",
@@ -31,8 +33,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# httpx/ruff/mypy are already top-level dependencies above; pytest is the only test-only addition.
-dev = ["pytest>=8.2"]
+# httpx/ruff/mypy are already top-level dependencies above. The type stubs are dev-only: without
+# them mypy reports `import-untyped` for openpyxl/yaml, which CI enforces as an error.
+dev = ["pytest>=8.2", "types-openpyxl>=3.1", "types-PyYAML>=6.0"]
 # >=5.0, not >=3.0: local_models.py calls get_embedding_dimension(), which replaced
 # get_sentence_embedding_dimension() in 5.x (the old name still works but FutureWarns).
 local = ["sentence-transformers>=5.0"]   # local embedding + reranker (EMBEDDING/RERANKER_PROVIDER=local)
@@ -68,10 +71,53 @@ module = ["gevent.*", "celery.*", "taxii2client.*"]
 ignore_missing_imports = true
 
 # Pins the linter that was already running here unconfigured (the stale .ruff_cache and the
-# `# noqa: BLE001` markers are its fingerprints). Default rule set (E4/E7/E9 + F) — E501 is
-# NOT in it, so the long dict-literal lines below are fine as written.
+# `# noqa: BLE001` markers are its fingerprints).
 [tool.ruff]
 line-length = 120
+
+# EXPLICIT rule selection — do not delete this table and go back to ruff's defaults.
+#
+# This file previously set only `line-length` and relied on "the default rule set (E4/E7/E9 + F)".
+# That was true when it was written and silently stopped being true: ruff 0.16 widened its
+# defaults, which enforced ~20 new rule families overnight and left 157 `# noqa` directives dead
+# (RUF100). Nobody noticed, because nothing ran ruff. Selecting explicitly means a ruff upgrade
+# can never change what this repo enforces without a visible diff to THIS list.
+#
+# The list is "rules this codebase demonstrably already cares about" — every family below is
+# either the historical default or is evidenced by existing `# noqa` markers in the tree:
+#   E4/E7/E9, F  historical default (E501 deliberately absent: long dict literals are fine)
+#   I            import order — deterministic and autofixable
+#   UP           pyupgrade; the codebase is 3.11+ and already clean
+#   B            bugbear real-bug patterns (see the flake8-bugbear table below — its presence
+#                is the proof this family was intended)
+#   BLE          blind excepts; the tree carries 5 deliberate `# noqa: BLE001` markers
+#   LOG, G       logging correctness — cheap, and log calls are the production debugging surface
+#   RUF          ruff-specific, and RUF100 (dead noqa) is what surfaced the drift above
+#
+# Deliberately NOT selected: SIM, RET, TRY, C4, PL*, DTZ, FURB, ANN, D. They are style opinions,
+# were never enforced here, and their findings were all cosmetic churn in tests/ and scripts/.
+# Add one only with a reason, never because it exists.
+#
+# S (bandit) is NOT selected either, despite the `# noqa: S310` markers in the tree. Those markers
+# were themselves dead (ruff reported them as "non-enabled: S310"), so S has never actually run
+# here — they were speculative. Enabling it fires S101 on all 568 `assert`s in tests/ and in
+# treatment.py's self-check block, which is bandit being used for the wrong job. Turning on
+# security scanning is a deliberate project, not a side effect of this config cleanup.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "BLE", "LOG", "G", "RUF"]
+
+ignore = [
+    # SQLAlchemy Core turns `col == True` into a SQL expression. Ruff's suggested `if col:`
+    # would instead evaluate the Column's Python truthiness and silently emit the WRONG QUERY.
+    # Global, not per-file: this is a codebase-wide convention spanning 9 modules today, and a
+    # per-file list would be stale the moment a tenth is written.
+    "E712",
+    # KNOWN RETROFIT, not an endorsement: `zip()` without `strict=` silently truncates to the
+    # shorter input. There are 16 call sites and the right argument (True vs False) differs per
+    # site, so a blanket autofix would be a behaviour change disguised as a lint fix. Left
+    # visible here rather than fixed wrong. Remove this line and work through them site by site.
+    "B905",
+]
 
 # FastAPI's dependency-injection markers are meant to be called in argument defaults
 # (that's the documented way to use them) — B008 doesn't know that and flags every
@@ -80,10 +126,22 @@ line-length = 120
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Header"]
 
 [tool.ruff.lint.per-file-ignores]
-# SQLAlchemy Core turns `col == True` into a SQL expression. Ruff's suggested `if col:` would
-# instead evaluate the Column's Python truthiness and silently emit the wrong query.
-"app/db/dal.py" = ["E712"]
-"app/pipeline/accept.py" = ["E712"]
-"app/pipeline/grounding.py" = ["E712"]
+# (The former E712 entries for dal.py/accept.py/grounding.py moved to the global `ignore` above —
+# the same pattern had spread to nine modules, so a per-file list was the wrong shape.)
+
 # Deliberate `get_settings.cache_clear(); get_engine.cache_clear(); ...` triples.
 "tests/conftest.py" = ["E702"]
+
+# Pydantic forward refs and the response-model rebuild must run after the classes they name,
+# so a handful of imports genuinely cannot sit at the top of the module.
+"app/api/schemas.py" = ["E402"]
+
+# scripts/ self-checks are standalone: they `sys.path.insert(0, ...)` to find `app` BEFORE
+# importing it, which is exactly what E402 describes and exactly what they must do.
+"scripts/calibrate_grounding.py" = ["E402"]
+"scripts/smoke_local_models.py" = ["E402"]
+
+# Test and self-check helpers: RUF012 (mutable class attr) and RUF015 (prefer next() over [0])
+# are readability opinions that cost clarity in throwaway fixtures. Not applied to app/.
+"tests/**" = ["RUF012", "RUF015"]
+"scripts/test_*.py" = ["RUF012", "RUF015"]

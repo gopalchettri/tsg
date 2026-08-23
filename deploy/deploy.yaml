@@ -39,7 +39,7 @@ spec:
       containers:
         - name: fastapi
           image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always  # mutable ':latest' tag — IfNotPresent never repulls
           command:
             - gunicorn
             - app.main:app
@@ -65,15 +65,30 @@ spec:
                 name: tsg-api-config
             - secretRef:
                 name: tsg-api-secrets
-          # /health = process up, unconditional 200 (app/api/health.py).
+          # READINESS = "can this pod serve traffic?" -> /ready, which checks the database,
+          # Redis and (when in use) Mongo. NOT /health: that returns 200 unconditionally by
+          # design (app/api/health.py), so probing it here kept pods with a dead DB in the
+          # Service endpoints. Enforced by tests/test_deploy_manifest.py.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 8000
             initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
+          # LIVENESS = "is the process wedged?" -> /health, the unconditional 200. Deliberately
+          # NOT /ready: a transient DB outage must not make Kubernetes restart every API pod,
+          # which turns a dependency blip into a crash-loop. failureThreshold is generous for
+          # the same reason.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             requests:
               cpu: "250m"
@@ -122,7 +137,7 @@ spec:
       containers:
         - name: celery-worker
           image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always  # mutable ':latest' tag — IfNotPresent never repulls
           command:
             - celery
             - -A
@@ -196,7 +211,7 @@ spec:
           # Confirm the live repo spelling ('tsg-apii') against the cluster registry before
           # applying.
           image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always  # mutable ':latest' tag — IfNotPresent never repulls
           # compose.prod.yml:100 verbatim — celery_app, NOT celery_worker: beat runs on plain
           # asyncio and must never be monkey-patched (celery_app.py module docstring).
           command:
@@ -206,9 +221,14 @@ spec:
             - beat
             - -l
             - info
+          # SAME env sources as tsg-api and celery-worker. This previously read a separate
+          # `tsg-uat-env` Secret, so beat could run with different settings than the workers
+          # executing what it schedules. Enforced by tests/test_deploy_manifest.py.
           envFrom:
+            - configMapRef:
+                name: tsg-api-config
             - secretRef:
-                name: tsg-uat-env
+                name: tsg-api-secrets
           # compose.prod.yml:115 — beat has no ping; check the schedule file's mtime instead.
           # Real sync cadence is ~180-240s (PersistentScheduler.sync_every), so 360s is the
           # tightest honest threshold. Schedule file lands in /app (group-writable, ephemeral —

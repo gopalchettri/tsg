@@ -179,7 +179,7 @@ def check_dead_threat_rules(sess: Session) -> str | None:
 
     ct = m.Config_Threat_Rule
     active_keys = sess.execute(
-        select(ct.RuleKey).where(ct.IsActive == True, ct.IsDeleted == False).distinct()  # noqa: E712
+        select(ct.RuleKey).where(ct.IsActive == True, ct.IsDeleted == False).distinct()
     ).scalars().all()
     dead = sorted(set(active_keys) - _RULE_KEY_FIELDS.keys())
     if dead:
@@ -211,7 +211,7 @@ def check_ctm_scan_category_names(sess: Session) -> str | None:
     # subsystems with a blank asset_type" — not a category name to look up here at all.
     expected = [v.strip() for v in sess.execute(
         select(ct.RuleValue).where(
-            ct.RuleKey == "asset_type", ct.IsActive == True, ct.IsDeleted == False,  # noqa: E712
+            ct.RuleKey == "asset_type", ct.IsActive == True, ct.IsDeleted == False,
             ct.RuleValue.is_not(None),
         ).distinct()
     ).scalars().all() if v is not None and v.strip()]
@@ -235,15 +235,14 @@ def check_ungated_threat_types(sess: Session) -> None:
     tt, ct = m.Threat_Type, m.Config_Threat_Rule
     has_gate = select(ct.ThreatRuleID).where(
         ct.ThreatTypeID == tt.ThreatTypeID, ct.RuleType == "tech_gate",
-        ct.IsActive == True, ct.IsDeleted == False)  # noqa: E712
+        ct.IsActive == True, ct.IsDeleted == False)
     ungated = sess.execute(
         select(tt.ThreatTypeName).where(
-            tt.IsActive == True, tt.IsDeleted == False,  # noqa: E712
+            tt.IsActive == True, tt.IsDeleted == False,
             ~has_gate.exists()).order_by(tt.ThreatTypeName)
     ).scalars().all()
     if ungated:
         log.info("selfcheck.ungated_threat_types", count=len(ungated), names=ungated[:40])
-    return None
 
 
 def check_orphaned_scenario_outputs(sess: Session) -> str | None:
@@ -308,7 +307,7 @@ def run_self_checks(sess: Session) -> list[str]:
     for name, check in checks:
         try:
             result = check()  # type: ignore[operator]
-        except Exception:  # noqa: BLE001 — one broken check must never stop the rest
+        except Exception:
             log.warning("selfcheck.check_failed", check=name, exc_info=True)
             continue
         if result:

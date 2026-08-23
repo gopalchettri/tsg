@@ -5,7 +5,8 @@ the rest of the app never needs it installed.
 """
 from __future__ import annotations
 
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 # MITRE's public ATT&CK TAXII 2.1 server (no auth). Collection ids are stable and
 # published by MITRE; if one ever rotates, the TAXII 404 error names the bad id.
@@ -37,10 +38,10 @@ def _collection(server_url: str, collection_id: str):
     from taxii2client.v21 import ApiRoot  # lazy: optional dependency
 
     api_root = ApiRoot(server_url)
-    api_root._conn.session.request = _timeout_bound(api_root._conn.session.request)  # noqa: SLF001
+    api_root._conn.session.request = _timeout_bound(api_root._conn.session.request)
     for col in api_root.collections:
         if col.id == collection_id or collection_id in str(col.id):
-            col._conn.session.request = _timeout_bound(col._conn.session.request)  # noqa: SLF001
+            col._conn.session.request = _timeout_bound(col._conn.session.request)
             return col
     raise LookupError(f"collection {collection_id!r} not found at {server_url}")
 

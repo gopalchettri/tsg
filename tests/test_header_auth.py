@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import hashlib
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-import app.api.deps as deps
+from app.api import deps
 from app.core.security import AuthError
 from app.db import models as m
 from app.db.dal import EntityForbidden
@@ -39,7 +39,7 @@ def db(monkeypatch):
     Session = sessionmaker(bind=engine, future=True)
     with Session() as s:
         s.add(m.API_Client(ClientID="shield", KeyHash=KEY_HASH, Name="Shield",
-                           Active=True, CreatedAt=datetime.now(timezone.utc)))
+                           Active=True, CreatedAt=datetime.now(UTC)))
         # user 1138 -> entity 86 (scope_type 4 = Entity), active
         s.add(m.user_scope_assignment(id=1, user_id=1138, scope_type=4, ref_id=86, is_active=True))
         # user 1152 -> ref 1720 but scope_type 2 = Sub-Sector (must NOT count as entity access)
@@ -162,7 +162,20 @@ def test_retired_auth_dev_mode_is_silently_ignored(monkeypatch):
 
 
 def _staging_settings():
-    return type("S", (), {"app_env": "staging", "verify_membership": False})()
+    """Minimal duck-typed Settings for the two boot checks below.
+
+    Carries db_dsn/redis_url/allow_remote_in_dev as well as app_env/verify_membership because
+    assert_security_posture now inspects the infrastructure posture too (loopback-vs-remote at
+    local/dev, and TrustServerCertificate at prod). Loopback + a verified certificate keeps this
+    stub on the "nothing to complain about" path, so the test still asserts exactly one thing:
+    membership-off warns and does not raise."""
+    return type("S", (), {
+        "app_env": "staging",
+        "verify_membership": False,
+        "db_dsn": "mssql+pyodbc://@localhost/DB?driver=x&TrustServerCertificate=no",
+        "redis_url": "redis://127.0.0.1:6379/0",
+        "allow_remote_in_dev": False,
+    })()
 
 
 def test_staging_without_active_api_client_fails_boot(monkeypatch):
@@ -175,13 +188,14 @@ def test_staging_without_active_api_client_fails_boot(monkeypatch):
 
 
 def test_staging_with_active_api_client_passes(monkeypatch):
-    import app.db.invariants as inv
     from sqlalchemy.orm import sessionmaker
+
+    import app.db.invariants as inv
     eng = create_engine("sqlite://")
     m.API_Client.__table__.create(eng)
     with sessionmaker(bind=eng)() as s:
         s.add(m.API_Client(ClientID="x", KeyHash="h", Name="n",
-                           Active=True, CreatedAt=datetime.now(timezone.utc)))
+                           Active=True, CreatedAt=datetime.now(UTC)))
         s.commit()
     monkeypatch.setattr(inv, "get_settings", _staging_settings)
     inv._assert_api_client_configured(eng)              # must not raise
@@ -212,6 +226,7 @@ def test_sse_shutdown_assertion_fails_when_no_uvicorn_server_is_wired():
     non-uvicorn ASGI server, or a worker class that never installs it, leaves in place) must fail
     loudly, not pass by accident."""
     import signal as _signal
+
     from app.core.config import assert_sse_graceful_shutdown_wired
 
     with pytest.raises(RuntimeError):
@@ -238,7 +253,7 @@ def test_key_is_scoped_to_its_module(db):
         assert dal.api_client_id_for_key_hash(s, KEY_HASH, "chatbot") is None
         # a chatbot-scoped key: valid for 'chatbot', rejected for 'tsg'
         s.add(m.API_Client(ClientID="cb", KeyHash=cb_hash, Name="Chatbot",
-                           Module="chatbot", Active=True, CreatedAt=datetime.now(timezone.utc)))
+                           Module="chatbot", Active=True, CreatedAt=datetime.now(UTC)))
         s.commit()
         assert dal.api_client_id_for_key_hash(s, cb_hash, "chatbot") == "cb"
         assert dal.api_client_id_for_key_hash(s, cb_hash, "tsg") is None
@@ -298,8 +313,16 @@ def test_entity_header_requirement_is_admin_only():
     the entity-scoped routers must still pull it in — a swap that leaked into sessions/treatment
     would silently remove an IDOR guard. Reuses route_audit's own dependency walker so this sees
     router-level dependencies too, not just per-handler ones."""
-    from app.api import (admin, api_clients, control_library_crud, sessions, threat_intel,
-                         threat_library_crud, threat_library_import, treatment)
+    from app.api import (
+        admin,
+        api_clients,
+        control_library_crud,
+        sessions,
+        threat_intel,
+        threat_library_crud,
+        threat_library_import,
+        treatment,
+    )
     from app.api.route_audit import _all_dependency_calls
 
     admin_routers = [admin.router, admin.promotions_router, admin.candidates_router,

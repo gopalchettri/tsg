@@ -40,11 +40,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.logging import configure_logging  # noqa: E402
-from app.db.engine import db_session  # noqa: E402
-from app.pipeline import grounding  # noqa: E402
-from app.pipeline.llm import get_llm  # noqa: E402
+from app.core.config import get_settings
+from app.core.logging import configure_logging
+from app.db.engine import db_session
+from app.pipeline import grounding
+from app.pipeline.llm import get_llm
 
 _VALID = {"verified", "unverified"}
 _BAD_INPUT = 2  # distinct from 1 ("ran fine, thresholds misclassify") so a deploy gate can tell
@@ -83,7 +83,7 @@ def _load(path: str) -> list[dict[str, str]]:
 # be derived onto or past a measured score the way an independent per-class margin can.
 # NOTE on precedence: the app auto-calibrates whenever the threshold is UNSET in env; the number
 # this script suggests only takes effect if you SET it, which disables auto-calibration.
-from app.pipeline.grounding import boundary_between as _boundary  # noqa: E402
+from app.pipeline.grounding import boundary_between as _boundary
 
 
 def _score_all(rows: list[dict[str, str]], sector_ids: list[int]) -> list[tuple[str, float, str]]:

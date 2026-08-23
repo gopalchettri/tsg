@@ -120,8 +120,8 @@ def _standards_of(sess, control_id: int) -> ControlStandardsResponse:
         .join(m.Control_Standard,
             m.Control_Standard.StandardID == m.Control_Library_Standard_Map.StandardID)
         .where(m.Control_Library_Standard_Map.ControlLibraryID == control_id,
-            m.Control_Standard.IsActive == True,  # noqa: E712
-            m.Control_Standard.IsDeleted == False)  # noqa: E712
+            m.Control_Standard.IsActive == True,
+            m.Control_Standard.IsDeleted == False)
         .order_by(m.Control_Standard.StandardName)
     ).all()
     return ControlStandardsResponse(control_library_id=control_id,

@@ -68,7 +68,7 @@ class _FakePubSub:
     async def get_message(self, ignore_subscribe_messages=True, timeout=None):
         self.calls += 1
         if self.calls == 1:
-            return None  # first call: immediate tick, so the test can get past __anext__() #1
+            return  # first call: immediate tick, so the test can get past __anext__() #1
         await asyncio.sleep(1000)  # second call: never resolves on its own -- must be cancelled
 
     async def aclose(self):

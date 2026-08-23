@@ -18,12 +18,12 @@ import json
 import os
 import sys
 import urllib.error
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
-from app.core.config import get_settings  # noqa: E402
-from app.intel import fetchers, otx  # noqa: E402
+from app.core.config import get_settings
+from app.intel import fetchers, otx
 
 DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "otx_response.json")
 
@@ -68,7 +68,7 @@ def main() -> int:
               "for /pulses/subscribed to return results.")
 
     out = {
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(UTC).isoformat(),
         "url": s.intel_otx_url,
         "pulse_count": len(docs),
         "raw_response": raw,          # everything OTX sent (indicators, references, adversary, ...)

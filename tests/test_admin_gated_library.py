@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -47,7 +47,7 @@ def _engine():
 
 
 def _now():
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _session_mapping(sid: str = SID) -> dict:
@@ -443,7 +443,7 @@ def test_list_kind_filter_is_sql_side_not_post_limit():
                 CandidateID=str(uuid.uuid4()), TenantID="t", EntityID="86", SessionID=SID,
                 ProposedCategory="Spoofing", ProposedType="T", ProposedName=f"Threat {i}",
                 Status=CandidateStatus.pending,
-                CreatedAt=datetime(2026, 8, 1, i, tzinfo=timezone.utc),
+                CreatedAt=datetime(2026, 8, 1, i, tzinfo=UTC),
                 CandidateKind=None if i == 0 else str(CandidateKind.threat), CreatedBy="sara"))
         s.execute(m.Threat_Candidate_Review.__table__.insert().values(
             CandidateID=str(uuid.uuid4()), TenantID="t", EntityID="86", SessionID=SID,
@@ -471,7 +471,7 @@ def test_list_status_filter_is_sql_side_not_post_limit():
                 CandidateID=str(uuid.uuid4()), TenantID="t", EntityID="86", SessionID=SID,
                 ProposedCategory="Spoofing", ProposedType="T", ProposedName=f"Threat {i}",
                 Status=CandidateStatus.pending,
-                CreatedAt=datetime(2026, 8, 1, i, tzinfo=timezone.utc),
+                CreatedAt=datetime(2026, 8, 1, i, tzinfo=UTC),
                 CandidateKind=str(CandidateKind.threat), CreatedBy="sara"))
         for status, name in ((CandidateStatus.accepted, "APT-Accepted"),
                              (CandidateStatus.rejected, "APT-Rejected")):
@@ -1139,8 +1139,6 @@ def test_active_actor_names_cache_hit_issues_no_query(monkeypatch):
 def test_active_actor_names_serves_stale_on_refresh_failure(monkeypatch):
     """A refresh that raises AFTER a successful cache fill serves the STALE list rather than
     propagate — a hint-list refresh hiccup must never fail an entire find_threats() call."""
-    engine = _engine()
-    Session = sessionmaker(bind=engine, future=True)
     dal._actor_vocab_cache = (["APT-X"], 0.0)  # 0.0 forces the TTL to read as expired
     monkeypatch.setattr(get_settings(), "actor_vocabulary_cache_seconds", 30.0)
     monkeypatch.setattr(dal, "_query_active_actor_names",

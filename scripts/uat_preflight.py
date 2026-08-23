@@ -157,7 +157,7 @@ def main() -> int:
     @check("MongoDB reachable (vector + threshold store)")
     def _mongo():
         from app.pipeline import embeddings
-        col = embeddings._store_if_healthy()  # noqa: SLF001
+        col = embeddings._store_if_healthy()
         if col is None:
             raise RuntimeError("vector store unavailable — embedding cache and calibrated "
                             "thresholds will not persist")
@@ -178,10 +178,10 @@ def main() -> int:
         from app.pipeline.llm import _ensure_litellm_proxy_bypassed, _litellm_http_headers
         # trust_env=False + the NO_PROXY bypass: a jump server with HTTP_PROXY/HTTPS_PROXY set
         # routes this through a corporate proxy whose CONNECT tunnel never completes.
-        _ensure_litellm_proxy_bypassed(s)  # noqa: SLF001 — same call the app makes at boot
+        _ensure_litellm_proxy_bypassed(s)
         with httpx.Client(timeout=s.llm_timeout_seconds, trust_env=False) as c:
             resp = c.get(f"{s.litellm_base_url.rstrip('/')}/v1/models",
-                        headers=_litellm_http_headers(s))  # noqa: SLF001
+                        headers=_litellm_http_headers(s))
             resp.raise_for_status()
         available = {mdl["id"] for mdl in resp.json()["data"]}
         missing = wanted - available

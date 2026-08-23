@@ -15,8 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.api import sessions  # noqa: E402
-from app.api.schemas import MappedControl, ScenarioNarrative  # noqa: E402
+from app.api import sessions
+from app.api.schemas import MappedControl, ScenarioNarrative
 
 RAW_SCENARIO_JSON = json.dumps({
     "scenario_title": "PGS outage",

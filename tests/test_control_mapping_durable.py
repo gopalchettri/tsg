@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -36,7 +36,7 @@ def _engine():
 
 
 def _seed(s, session_id: str, task_id: str, epoch: int = 1) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     s.execute(m.Scenario_Session.__table__.insert().values(
         SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
         AssetName="a", AssetID="1", SessionStatus="active", CurrentStage="SCENARIOS",

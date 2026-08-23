@@ -36,16 +36,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import getpass
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
-from app.core.logging import configure_logging  # noqa: E402
-from app.db.engine import db_session  # noqa: E402
-from app.pipeline.threat_library_import import (  # noqa: E402
+from app.core.logging import configure_logging
+from app.db.engine import db_session
+from app.pipeline.threat_library_import import (
     URLS,
     ThreatLibraryImportError,
     run_import,

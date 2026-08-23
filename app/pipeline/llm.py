@@ -125,7 +125,7 @@ def _heartbeat_loop(r, token: str, interval: float, stop_event: threading.Event)
     while not stop_event.wait(interval):
         try:
             r.zadd(_SLOTS_KEY, {token: time.time()})
-        except Exception:  # noqa: BLE001 — a missed beat self-heals next tick; never worth crashing the call over
+        except Exception:
             log.warning("llm.slot_heartbeat_failed", exc_info=True)
 
 
@@ -147,7 +147,7 @@ def _llm_slot(s: Settings):
     token = str(uuid.uuid4())
     try:
         r = _slot_redis()
-    except Exception:  # noqa: BLE001 — can't even build the client → fail open
+    except Exception:
         log.warning("llm.slot_redis_unavailable_fail_open", exc_info=True)
         yield
         return
@@ -156,7 +156,7 @@ def _llm_slot(s: Settings):
     while True:
         try:
             admitted = _try_admit(r, limit, s.llm_slot_stale_after_seconds, token)
-        except Exception:  # noqa: BLE001 — Redis error (at first attempt OR mid-poll) → fail open, never "confirmed over capacity"
+        except Exception:
             log.warning("llm.slot_redis_error_fail_open", exc_info=True)
             yield
             return
@@ -323,7 +323,7 @@ class LiteLLMClient:
         """Accepts an explicit `Settings` for tests; production goes through `get_llm()`."""
         self.s = settings or get_settings()
 
-    def _chat_kwargs(self, model: str | None = None, temperature: float | None = None,  # noqa: PLR0912
+    def _chat_kwargs(self, model: str | None = None, temperature: float | None = None,
                     expected_type: type | None = None) -> dict[str, Any]:
         """Provider dispatch for chat(): azure_openai / openai / (default) litellm proxy, plus
         the timeout+retry budget every call in this file shares."""
@@ -529,7 +529,7 @@ class LiteLLMClient:
         for fut, i in futures.items():  # pool exited -> all futures done; order restored via i
             try:
                 results[i] = fut.result()
-            except Exception:  # noqa: BLE001 — per-item fail-open, see docstring
+            except Exception:
                 failures += 1
                 log.warning("rerank_many.item_failed", index=i, exc_info=True)
         if failures == len(items):
@@ -594,7 +594,7 @@ def moderate(text: str, *, settings: Settings | None = None) -> ModerationResult
         # is what keeps a moderation slot shortage from discarding finished work upstream.
         log.warning("llm.moderation_slots_exhausted")
         return ModerationResult(checked=False, error="moderation_slots_exhausted")
-    except Exception:  # noqa: BLE001 — a moderation-service failure must never block generation
+    except Exception:
         log.warning("llm.moderation_call_failed", exc_info=True)
         return ModerationResult(checked=False, error="moderation_unavailable")
 
@@ -681,7 +681,7 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
         for model in wanted.values():
             rpm = by_name.get(model, {}).get("litellm_params", {}).get("rpm")
             log.info("llm.model_config", model=model, rpm=rpm)
-    except Exception:  # noqa: BLE001 — informational only, must never block worker boot
+    except Exception:
         log.warning("llm.model_config_check_failed", exc_info=True)
 
 
@@ -774,7 +774,7 @@ def log_litellm_key_info(settings: Settings | None = None) -> None:
         else:  # never log the raw body: an unconfirmed future shape could carry something more
             # sensitive than these four fields, with no redact() applied.
             log.warning("llm.key_info_unexpected_shape")
-    except Exception:  # noqa: BLE001 — informational only, must never block worker boot
+    except Exception:
         log.warning("llm.key_info_check_failed", exc_info=True)
 
 

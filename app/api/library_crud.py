@@ -192,8 +192,8 @@ def _conflict(sess, resource: str, name: str | None, pk_value=None) -> LibraryCo
     if name is not None:
         hits = sess.execute(
             select(res["pk"]).where(res["name_col"] == name,
-                                    res["model"].IsActive == True,  # noqa: E712
-                                    res["model"].IsDeleted == False)  # noqa: E712
+                                    res["model"].IsActive == True,
+                                    res["model"].IsDeleted == False)
             .limit(2)                       # 2 is enough to tell "unique" from "ambiguous"
         ).scalars().all()
         if hits:
@@ -226,7 +226,7 @@ def _refresh_embeddings(resource: str, action: str, names: list[str | None]) -> 
         job = admin_embedding_action_task.delay(action, group, clean, False)
         mark_admin_job(job.id, FAMILY_EMBEDDINGS)  # without the marker the id 404s on /status
         return job.id
-    except Exception:  # noqa: BLE001 — the committed write is the request's real outcome
+    except Exception:
         log.warning("library_crud.embeddings_dispatch_failed", resource=resource,
                     action=action, names=clean, exc_info=True)
         return None
@@ -247,8 +247,8 @@ def _require_parent(sess, model, pk_col, value: int | None, label: str) -> None:
     if value is None:
         return
     found = sess.execute(
-        select(pk_col).where(pk_col == value, model.IsActive == True,  # noqa: E712
-                            model.IsDeleted == False)  # noqa: E712
+        select(pk_col).where(pk_col == value, model.IsActive == True,
+                            model.IsDeleted == False)
     ).scalar()
     if found is None:
         raise dal.NotFoundError(f"{label} {value} not found")
@@ -269,7 +269,7 @@ def _list(resource: str, limit: int, offset: int, include_deleted: bool) -> list
     with db_session() as sess:
         stmt = select(res["model"])
         if not include_deleted:
-            stmt = stmt.where(res["model"].IsDeleted == False)  # noqa: E712
+            stmt = stmt.where(res["model"].IsDeleted == False)
         rows = sess.execute(stmt.order_by(res["pk"]).limit(limit).offset(offset)).scalars().all()
         return [_row_out(resource, r) for r in rows]
 

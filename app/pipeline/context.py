@@ -1,13 +1,8 @@
-""" before the AI pipeline can start, this file figures out
-which asset and which supporting systems the user is asking about, using the
-organization's own existing data.
+"""Stage-0 context resolution.
 
-Stage-0 context resolution.
-
-The caller supplies entity/sector/user/asset ids; everything else is resolved by
-JOIN to the platform's own tables (the module owns no asset→context mapping).
-The same resolved context pre-fills the UI and builds the AI prompt, so they stay
-consistent.
+Given entity/sector/user/asset ids, loads the asset, its sector, and its
+supporting systems from the platform's own tables (no local mapping data).
+The same resolved context feeds both the UI and the AI prompt.
 """
 from __future__ import annotations
 
@@ -24,14 +19,8 @@ from app.db.dal import EntityForbidden, NotFoundError
 
 log = get_logger(__name__)
 
-# onboarding_supporting_systems columns that store a single option_value code as a plain
-# int (not a JSON array) — same option/option_value resolution as the multiselect columns
-# above, just one code per row instead of a decoded array.
-#
-# The stored code is option_value.ID, not option_value.value. The CII Onboarding DDD says
-# these columns hold `value`; measured against UAT that is wrong for every populated column,
-# single- and multi-select alike (all 111 supporting-system rows match on id, none on value).
-# Keying on `value` silently resolved nothing and leaked raw ids into the prompt.
+# Columns storing one option_value.id as a plain int (not a JSON array).
+# Note: match on option_value.ID, not .value — the two differ in this table.
 _SINGLESELECT_OPTION_CODES = {
     "accessability_channel": "acc-channel",
     "hosting_location": "hosting-location",
@@ -40,10 +29,7 @@ _SINGLESELECT_OPTION_CODES = {
     "managed_by": "managed-by",  # In-house vs Outsourced: third-party exposure, not an owner name
 }
 
-# onboarding_supporting_systems columns that store their value as a JSON array of
-# option_value codes (e.g. technology_used = "[6]") rather than a plain scalar —
-# same option/option_value resolution as asset_type, just multi-valued and keyed by
-# a fixed option.code per column instead of a single hardcoded option_id.
+# Columns storing a JSON array of option_value ids, e.g. technology_used = "[6]".
 _MULTISELECT_OPTION_CODES = {
     "technology_used": "technology-used",
     "database_platforms": "database-platforms",
@@ -54,9 +40,7 @@ _MULTISELECT_OPTION_CODES = {
 
 
 def _validate_supporting_system_ids(asset_id: int, supporting_system_ids: list[int]) -> None:
-    """Reject bad input before touching the database: no duplicate ids, and at
-    least one supporting system must be requested.
-    """
+    """No duplicate ids, and at least one id required."""
     duplicates = sorted({i for i in supporting_system_ids if supporting_system_ids.count(i) > 1})
     if duplicates:
         raise ValueError(f"duplicate supporting_system_id(s): {duplicates}")
@@ -65,17 +49,11 @@ def _validate_supporting_system_ids(asset_id: int, supporting_system_ids: list[i
 
 
 def _load_asset(sess: Session, asset_id: int) -> tuple[dict[str, Any], list[str] | None]:
-    """Fetch the asset row itself, plus the name of every service it's linked to via
-    `ctm_scan_entity_bu` (batched lookup, same style as _load_category_lookup) — an asset can
-    legitimately link to more than one (confirmed live: asset 1 has 2 rows), so this returns a
-    list, not a single value. Replaces the old join through `ctm_scan_entity.
-    tier1_critical_service_id`: that field is confirmed unpopulated on every current asset (see
-    dal.py::asset_owning_entities, fixed the same way in an earlier session).
+    """Load the asset row plus the names of every service it's linked to via
+    ctm_scan_entity_bu (an asset can link to more than one service).
 
-    Deliberately excludes ctm_scan_entity.owner_custodian: it's an internal
-    person/team name, not threat-relevant, and every other free-text owner-identity
-    field in this schema (onboarding_supporting_systems.managed_by) is
-    excluded the same way — never surfaced to the model.
+    owner_custodian is skipped on purpose: it's a person/team name, not
+    threat-relevant, same as onboarding_supporting_systems.managed_by.
     """
     asset_row = sess.execute(
         select(m.ctm_scan_entity.id, m.ctm_scan_entity.name, m.ctm_scan_entity.criticality,
@@ -104,9 +82,7 @@ def _load_asset(sess: Session, asset_id: int) -> tuple[dict[str, Any], list[str]
 
 
 def _load_sector(sess: Session, sector_id: int | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Sectors are self-referencing (a sector can have a parent sector), so this
-    self-joins the table to itself via an alias to pull both rows in one query.
-    """
+    """Sectors can have a parent sector, so self-join the table to pull both rows in one query."""
     if sector_id is None:
         return None, None
     parent = m.onboarding_sectors.__table__.alias("parent_sector")
@@ -129,30 +105,11 @@ def _load_sector(sess: Session, sector_id: int | None) -> tuple[dict[str, Any] |
 def _load_supporting_systems(
     sess: Session, asset_id: int, supporting_system_ids: list[int],
 ) -> dict[int, Mapping[str, Any]]:
-    """Fetch only the requested supporting systems, and only if each one is
-    actually linked to this asset (the join enforces that). Pulls every column
-    on the real table that carries threat-relevant information — usage scale,
-    accessibility/hosting/network exposure, DR/backup posture, data-residency,
-    and RTO/RPO targets — not just the original narrow subset.
+    """Fetch the requested supporting systems, but only the ones actually linked
+    to this asset — the join enforces that.
 
-    Cross-checked against the org's own SupportingSystemDetails reporting query
-    (asset_id -> ctm_scan_entity_supporting_system -> onboarding_supporting_systems,
-    with ctm_scan_category/option/option_value resolving asset_type and the
-    single/multi-value coded columns — see _load_category_lookup/
-    _load_singleselect_lookup/_load_multiselect_lookup): every column that query
-    resolves is covered here or by one of those three lookups, except
-    onboarding_supporting_systems.url, still deliberately excluded, and the
-    creation_date/created_by/date_updated/updated_by audit columns, never
-    modeled for any table in this codebase.
-
-    managed_by WAS excluded here as an "owner name, not threat-relevant". That was
-    wrong: it is a single-select code resolving through option group `managed-by` to
-    In-house or Outsourced — a third-party-exposure signal that changes the actor
-    profile and who owns each control. Now resolved via _SINGLESELECT_OPTION_CODES.
-
-    min_no_of_transactions/max_no_of_transactions are the one addition beyond that
-    reference query — real, non-audit, threat-relevant columns worth keeping even
-    though that particular report doesn't select them.
+    url and the audit columns (created/updated by/date) are deliberately
+    excluded; everything else threat-relevant is included.
     """
     ss_rows: dict[int, Mapping[str, Any]] = {
         r["id"]: dict(r) for r in sess.execute(
@@ -196,12 +153,11 @@ def _load_supporting_systems(
             .where(
                 m.ctm_scan_entity_supporting_system.ctm_scan_entity_id == asset_id,
                 m.onboarding_supporting_systems.id.in_(supporting_system_ids),
-                m.onboarding_supporting_systems.is_deleted == False,  # noqa: E712 — SQLAlchemy binary expr, not a Python bool
+                m.onboarding_supporting_systems.is_deleted == False,
             )
         ).mappings()
     }
-    # any requested id that didn't come back from the query above either
-    # doesn't exist or isn't linked to this asset — reject the whole request
+    # requested id missing from the result = doesn't exist or isn't linked to this asset
     missing = [i for i in supporting_system_ids if i not in ss_rows]
     if missing:
         raise EntityForbidden(f"supporting system(s) {missing} not linked to asset {asset_id}")
@@ -209,10 +165,7 @@ def _load_supporting_systems(
 
 
 def _load_category_lookup(sess: Session, ss_rows: dict[int, Mapping[str, Any]]) -> dict[int, str]:
-    """Small, fixed-size batched lookup shared across every supporting system —
-    O(1) in query count regardless of how many were requested, and skipped
-    entirely when nothing requested actually needs it.
-    """
+    """One batched lookup for all requested supporting systems — single query, skipped if none need it."""
     category_ids = {row["asset_type"] for row in ss_rows.values() if row.get("asset_type") is not None}
     if not category_ids:
         return {}
@@ -225,11 +178,9 @@ def _load_category_lookup(sess: Session, ss_rows: dict[int, Mapping[str, Any]]) 
 
 
 def _decode_codes(raw: str | None) -> list[int]:
-    """Parse one JSON-array-of-codes column value (e.g. "[6]"). The real column is
-    user/vendor-populated free-form JSON, not app-controlled — malformed or legacy
-    data must degrade to "unresolved", never crash the whole session-creation
-    request over one bad row on one subsystem. Shared by every caller that decodes
-    this shape, so a fix here covers all of them at once."""
+    """Parse a JSON array of codes, e.g. "[6]" -> [6]. Data is user-entered, so
+    bad JSON returns [] instead of raising.
+    """
     if not raw:
         return []
     try:
@@ -240,26 +191,22 @@ def _decode_codes(raw: str | None) -> list[int]:
 
 
 def _fold_code(code: str) -> str:
-    """Casefold an option-group code so a Python dict lookup agrees with the case-insensitive
-    SQL match that produced the row. Used on BOTH sides of every option_ids lookup below."""
+    """Lowercase a code so Python dict lookups match SQL's case-insensitive comparison."""
     return str(code).strip().lower()
 
 
 def _load_multiselect_lookup(
     sess: Session, ss_rows: dict[int, Mapping[str, Any]],
 ) -> dict[str, dict[int, str]]:
-    """Batched resolution for the 5 JSON-array-of-codes columns above. Returns
-    {column_name: {code: resolved_name}}, skipping any column nothing requested
-    actually has a value for, and any option group not found in `option`.
+    """Resolve the 5 JSON-array-of-codes columns to names.
+
+    Returns {column_name: {code: name}}, skipping columns with no values and
+    option groups missing from `option`.
     """
     needed_cols = [c for c in _MULTISELECT_OPTION_CODES if any(row.get(c) for row in ss_rows.values())]
     if not needed_cols:
         return {}
-    # Key on the CASEFOLDED code: the SQL `in_` above matches under MSSQL's case-insensitive
-    # collation, but this dict lookup is case-sensitive — so an `option.code` seeded in a
-    # different casing than the _MULTISELECT_OPTION_CODES constant returned a row that then
-    # failed the `not in option_ids` check below, silently dropping all five columns from the
-    # LLM prompt with no error anywhere. Both sides are folded so the two agree.
+    # Casefold both sides: SQL matches case-insensitively, Python dict lookup doesn't.
     option_ids = {
         str(r["code"]).strip().lower(): r["id"] for r in sess.execute(
             select(m.option.code, m.option.id)
@@ -286,11 +233,9 @@ def _load_multiselect_lookup(
 
 
 def _resolve_multiselect(raw: str | None, lookup: dict[int, str]) -> list[str] | None:
-    """Decode one JSON-array-of-codes column value into human-readable names.
-
-    Unresolvable codes are DROPPED, never stringified: a bare `1105` in the prompt is
-    noise the model may treat as a fact, and _scrub_db_keys exists to keep raw ids out.
-    All-unresolvable therefore yields None -- "we don't know" -- not ['1105'].
+    """Decode codes to names. Unresolvable codes are dropped, not stringified —
+    a raw id like 1105 in the prompt would read to the model as a fact.
+    All-unresolvable therefore yields None, not ['1105'].
     """
     names = [lookup[code] for code in _decode_codes(raw) if code in lookup]
     return names or None
@@ -299,14 +244,11 @@ def _resolve_multiselect(raw: str | None, lookup: dict[int, str]) -> list[str] |
 def _load_singleselect_lookup(
     sess: Session, ss_rows: dict[int, Mapping[str, Any]],
 ) -> dict[str, dict[int, str]]:
-    """Batched resolution for the 4 single-value option_value-code columns above. Same
-    {column_name: {code: resolved_name}} shape as _load_multiselect_lookup, minus the
-    JSON-array decode step — these columns already hold one option_value code as a plain int.
-    """
+    """Same as _load_multiselect_lookup but for the 4 single-value columns (no JSON-array decode)."""
     needed_cols = [c for c in _SINGLESELECT_OPTION_CODES if any(row.get(c) is not None for row in ss_rows.values())]
     if not needed_cols:
         return {}
-    option_ids = {  # casefolded keys — same SQL-CI vs Python-CS mismatch as the multiselect twin
+    option_ids = {  # casefolded — see _load_multiselect_lookup
         _fold_code(r["code"]): r["id"] for r in sess.execute(
             select(m.option.code, m.option.id)
             .where(m.option.code.in_([_SINGLESELECT_OPTION_CODES[c] for c in needed_cols]))
@@ -326,11 +268,7 @@ def _load_singleselect_lookup(
 
 
 def _resolve_singleselect(raw: int | None, lookup: dict[int, str]) -> str | None:
-    """Decode one single-value option_value-code column into its human-readable name.
-
-    Returns None for an unresolvable code -- see _resolve_multiselect for why raw codes
-    must never reach the prompt.
-    """
+    """Resolve one code to its name, or None if unresolvable."""
     return lookup.get(raw) if raw is not None else None
 
 
@@ -339,25 +277,21 @@ def _build_subsystems(
     category_lookup: dict[int, str], multiselect_lookup: dict[str, dict[int, str]],
     singleselect_lookup: dict[str, dict[int, str]], criticality: Any,
 ) -> list[dict[str, Any]]:
-    """Build the output list in the caller's requested order (not DB order),
-    resolving each subsystem's asset_type id, the JSON-array-of-codes columns, and
-    the single-value option_value-code columns to their human-readable names.
+    """Build the output list in the caller's requested order, resolving each
+    subsystem's option codes to names.
 
     last_dr_test_date/rto_target_mins/rpo_target_mins are converted to
-    str/float here (not left as datetime/Decimal) — both go straight into
-    json.dumps() below via subsystems_json, which can't serialize either type.
+    str/float here so json.dumps() below (subsystems_json) can serialize them.
 
-    last_dr_test_date is additionally sentinel-checked: every one of the 111 UAT rows holds
-    1753-01-01, SQL Server's datetime minimum, which means "never tested" but reads to the model
-    as a real DR test in the 18th century. Emitted as None instead — an absent field is honest,
-    a fabricated date is not.
+    last_dr_test_date also treats SQL Server's datetime minimum (1753-01-01,
+    or 1900-01-01 for smalldatetime) as "never tested" and emits None instead
+    of that sentinel date.
     """
     subsystems = []
     for ssid in supporting_system_ids:
         ss_row = ss_rows[ssid]
         last_dr_test_date = ss_row.get("last_dr_test_date")
-        # .year works on both date and datetime, so no type branch. 1753-01-01 is datetime's
-        # minimum and 1900-01-01 smalldatetime's; no real DR test predates either.
+        # .year works for both date and datetime; no real DR test predates 1900
         if last_dr_test_date is not None and last_dr_test_date.year <= 1900:
             last_dr_test_date = None
         rto_target_mins = ss_row.get("rto_target_mins")
@@ -403,9 +337,7 @@ def _build_subsystems(
 def _resolve_sector_names(
     sector: dict[str, Any] | None, parent_sector: dict[str, Any] | None,
 ) -> tuple[str | None, str | None]:
-    """Sector edge case: sector_id IS the sub-sector/leaf. If it has no parent, it
-    represents a top-level sector with no leaf — sub_sector stays None.
-    """
+    """sector_id is the leaf sector. No parent means it's top-level, so sub_sector stays None."""
     if sector is None:
         return None, None
     if parent_sector is not None:
@@ -417,15 +349,12 @@ def gather_asset_details(
     sess: Session, *, asset_id: int, entity_id: str, sector_id: int | None, user_id: str | None,
     supporting_system_ids: list[int], subsector_id: int | None = None,
 ) -> dict[str, Any]:
-    """Look up one asset plus its sector/parent-sector and the requested supporting
-    systems, then package everything into a single dict — some fields shaped for the
-    UI, plus JSON-encoded copies of the same data for the AI prompt.
+    """Look up the asset, its sector, and the requested supporting systems, and
+    package it all into one dict — UI-shaped fields plus JSON copies for the AI prompt.
 
-    `_load_sector` wants the SUB-SECTOR (the child row) and derives the parent sector itself, so
-    pass `subsector_id` — NOT `sector_id`, which is the parent and yields sub_sector=None plus a
-    one-element sector_ids. `sector_id` is accepted only as a fallback for callers predating
-    `subsector_id`. An id that resolves to nothing is a caller error: _load_sector raises
-    NotFoundError, which is the right answer — TSG does not second-guess the ids it is given.
+    Pass subsector_id, not sector_id: _load_sector expects the leaf/child
+    sector row and derives the parent itself. sector_id is accepted only as a
+    fallback for callers that predate subsector_id.
     """
     _validate_supporting_system_ids(asset_id, supporting_system_ids)
 
@@ -438,8 +367,7 @@ def gather_asset_details(
     subsystems = _build_subsystems(supporting_system_ids, ss_rows, category_lookup, multiselect_lookup, singleselect_lookup, asset["criticality"])
     resolved_sector, resolved_sub_sector = _resolve_sector_names(sector, parent_sector)
 
-    # this is the trimmed-down view of the asset that goes into the AI prompt —
-    # only the fields the model actually needs, not the full asset row
+    # trimmed view of the asset for the AI prompt — only fields the model needs
     asset_context = {
         "cii_asset_description": asset.get("description"),
         "critical_service": critical_service,
@@ -459,11 +387,7 @@ def gather_asset_details(
         "sector": sector,
         "parent_sector": parent_sector,
         "sector_ids": [s["id"] for s in (sector, parent_sector) if s],
-        # this is only used to remember who asked for this, for the permanent history
-        # log — it does NOT control what the user is allowed to do; that permission
-        # check happens separately.
-        #
-        # provenance only (→ session UserID / audit ActorUserID); NOT an authz principal — auth uses deps.principal
+        # audit/history only — not an authz principal; auth uses deps.principal
         "user_id": user_id,
         "subsystems": subsystems,
         "subsystems_json": json.dumps(subsystems),

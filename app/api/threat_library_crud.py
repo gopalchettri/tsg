@@ -9,19 +9,19 @@ refuses to boot otherwise.
 """
 from __future__ import annotations
 
-import json as _json  # noqa: E402 — scoped alias; the module has no other json use
+import json as _json
 
 from fastapi import APIRouter, Depends, Path, Request
-from fastapi import Query as _Query  # noqa: E402
-from sqlalchemy import insert as _sa_insert  # noqa: E402
+from fastapi import Query as _Query
+from sqlalchemy import insert as _sa_insert
 from sqlalchemy import select as _sa_select
 from sqlalchemy import update as _sa_update
-from sqlalchemy.exc import IntegrityError as _IntegrityError  # noqa: E402
+from sqlalchemy.exc import IntegrityError as _IntegrityError
 
-from app.api.admin import AdminValidationError  # noqa: E402
+from app.api.admin import AdminValidationError
 from app.api.deps import Principal, get_admin_principal, require_admin
-from app.api.library_crud import (  # noqa: E402
-    _DELETED,  # noqa: E402
+from app.api.library_crud import (
+    _DELETED,
     _LIMIT,
     _OFFSET,
     _RESOURCES,
@@ -35,7 +35,7 @@ from app.api.library_crud import (  # noqa: E402
     _update,
 )
 from app.api.library_crud import _DELETED as _RULE_DELETED
-from app.api.schemas import (  # noqa: E402
+from app.api.schemas import (
     ThreatActorCreate,
     ThreatActorRow,
     ThreatActorUpdate,
@@ -52,11 +52,11 @@ from app.api.schemas import (  # noqa: E402
     ThreatTypeRow,
     ThreatTypeUpdate,
 )
-from app.core.enums import ThreatRuleType  # noqa: E402
+from app.core.enums import ThreatRuleType
 from app.core.logging import get_logger
 from app.db import dal
-from app.db import models as m  # noqa: E402
-from app.db.dal import NotFoundError, now  # noqa: E402
+from app.db import models as m
+from app.db.dal import NotFoundError, execute_dml, inserted_pk, now
 from app.db.engine import db_session
 from app.pipeline.scoping import _RULE_KEY_FIELDS
 
@@ -306,7 +306,7 @@ def list_threat_rules(limit: int = _LIMIT, offset: int = _OFFSET,
     with db_session() as sess:
         stmt = _sa_select(m.Config_Threat_Rule)
         if not include_deleted:
-            stmt = stmt.where(m.Config_Threat_Rule.IsDeleted == False)  # noqa: E712
+            stmt = stmt.where(m.Config_Threat_Rule.IsDeleted == False)
         if threat_type_id is not None:
             stmt = stmt.where(m.Config_Threat_Rule.ThreatTypeID == threat_type_id)
         rows = sess.execute(stmt.order_by(m.Config_Threat_Rule.ThreatRuleID)
@@ -324,7 +324,7 @@ def create_threat_rule(body: ThreatRuleCreate, request: Request,
         _require_parent(sess, m.Threat_Type, m.Threat_Type.ThreatTypeID,
                         body.threat_type_id, "Threat_Type")
         try:
-            res = sess.execute(_sa_insert(m.Config_Threat_Rule).values(
+            res = execute_dml(sess, _sa_insert(m.Config_Threat_Rule).values(
                 RuleType=body.rule_type, ThreatTypeID=body.threat_type_id,
                 RuleKey=body.rule_key, RuleValue=body.rule_value,
                 Metadata=_json.dumps({"weight": body.weight}) if body.weight is not None else None,
@@ -336,7 +336,7 @@ def create_threat_rule(body: ThreatRuleCreate, request: Request,
             raise LibraryConflict(
                 "a live Config_Threat_Rule row already matches this "
                 "(threat_type_id, rule_type, rule_key, rule_value) natural key") from None
-        new_id = res.inserted_primary_key[0]
+        new_id = inserted_pk(res)
         out = _rule_row_out(_get_rule(sess, new_id))
     _audit(request, "threat-rules", "create", new_id, principal)
     return out

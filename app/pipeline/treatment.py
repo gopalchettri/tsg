@@ -113,7 +113,7 @@ def _library_map_stmt(output_id: str):
         select(cmap.MapRank, lib.ControlLibraryID, lib.ControlCode, lib.Domain, lib.ControlName)
         .join(lib, lib.ControlLibraryID == cmap.ControlLibraryID)
         .where(cmap.OutputID == output_id,
-            lib.IsActive == True, lib.IsDeleted == False)  # noqa: E712
+            lib.IsActive == True, lib.IsDeleted == False)
         .order_by(cmap.MapRank)
     )
 
@@ -124,7 +124,7 @@ def _standards_stmt(control_library_ids: list[int]):
         select(smap.ControlLibraryID, std.StandardName)
         .join(std, std.StandardID == smap.StandardID)
         .where(smap.ControlLibraryID.in_(control_library_ids),
-            std.IsActive == True, std.IsDeleted == False)  # noqa: E712
+            std.IsActive == True, std.IsDeleted == False)
         .order_by(std.StandardName)
     )
 
@@ -225,13 +225,14 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
     # that same raw list (dal.active_threats feeds scenario_prompt stored_actors), so a
     # validated_actors gate would hand the treatment [] for every unverified threat and plan
     # against adversaries the scenario it is treating names out loud.
-    threat: dict[str, Any] | None = {
+    threat_fields: dict[str, Any] = {
         "category": redact(scenario_row.get("ThreatCategory")),
         "type": redact(scenario_row.get("LibraryThreatType") or scenario_row.get("ThreatType")),
         "name": redact(scenario_row.get("LibraryThreatName") or scenario_row.get("ThreatName")),
         "actors": [redact(a) for a in grounding.stored_actors(scenario_row.get("ThreatActorsJSON")) if a],
     }
-    if not threat["type"] and not threat["name"]:
+    threat: dict[str, Any] | None = threat_fields
+    if not threat_fields["type"] and not threat_fields["name"]:
         threat = None
         warnings.append("threat join returned no rows — plan generated without threat identity")
 
@@ -245,7 +246,7 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
     lookup_failed = False
     try:
         library_mapped = _library_controls(sess, scenario_row["OutputID"])
-    except Exception:  # noqa: BLE001 — controls are enrichment here; degrade loudly
+    except Exception:
         sess.rollback()  # no uncommitted writes exist at this point in the POST
         log.warning("treatment.library_controls_read_failed", exc_info=True)
         library_mapped, lookup_failed = [], True
@@ -359,42 +360,48 @@ def _validate_plan(parsed: dict[str, Any]) -> list[str]:
 
 
 def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any]) -> None:
-    """Put `control_library_id` back on each recommended control, in place.
+    """Put `control_library_id` on each recommended control, and DROP any control that
+    doesn't resolve to one — every control in the persisted plan must be a real
+    Control_Library row, never text the model invented or copied from scenario_suggested.
 
-    The model is never shown a primary key (prompts._EXCLUDE_DB_KEY_TO_PROMPT):
-    it echoes the stable `control_code` instead. The id is resolved HERE, server-side, from the
-    snapshot's own library_mapped rows — so the persisted plan and the API response still carry
-    it, and a code the model invented or mistyped resolves to None rather than to some other
-    library row. Both keys are kept: the code is what a human reads, the id is what joins.
+    The model is never shown a primary key (prompts._EXCLUDE_DB_KEY_TO_PROMPT): it echoes the
+    stable `control_code` instead. The id is resolved HERE, server-side, from the snapshot's own
+    library_mapped rows. Both keys are kept on a surviving control: the code is what a human
+    reads, the id is what joins.
 
-    The join key now travels through model-reproduced free text, so it is FOLDED (strip +
-    casefold) on both sides before lookup — the same posture as every other model-echoed
-    identifier in the pipeline (accept.py's name folding, _ground_entry_points' casefold entry
-    points, embeddings' normalisation). A bare exact match would send ' CII-CID-028' or
-    'cii-cid-028' to None, indistinguishable from an invented code, and one model version that
-    lowercases its output would silently null every link in every plan. ControlCode is unique
-    among live rows, so folding cannot produce a wrong-row match — only a recovered one. The
-    canonical code is written back too, so the human-visible half is repaired as well.
+    The join key travels through model-reproduced free text, so it is FOLDED (strip + casefold)
+    on both sides before lookup — the same posture as every other model-echoed identifier in the
+    pipeline (accept.py's name folding, _ground_entry_points' casefold entry points, embeddings'
+    normalisation). A bare exact match would send ' CII-CID-028' or 'cii-cid-028' to no match,
+    indistinguishable from an invented code, and one model version that lowercases its output
+    would silently drop every control in every plan. ControlCode is unique among live rows, so
+    folding cannot produce a wrong-row match — only a recovered one. The canonical code is
+    written back too, so the human-visible half is repaired as well.
     """
     by_code = {str(c["control_code"]).strip().casefold(): c
                for c in ((snapshot.get("existing_controls") or {}).get("library_mapped") or [])
                if isinstance(c, dict) and c.get("control_code") and c.get("control_library_id")}
-    unresolved: list[str] = []
-    controls = (parsed.get("controls_to_be_implemented") or {}).get("controls") or []
-    for ctl in controls:
+    cti = parsed.get("controls_to_be_implemented") or {}
+    kept: list[dict] = []
+    dropped: list[str] = []
+    for ctl in cti.get("controls") or []:
         if not isinstance(ctl, dict):
             continue
         raw = str(ctl.get("control_code") or "").strip()
         hit = by_code.get(raw.casefold())
-        ctl["control_library_id"] = hit["control_library_id"] if hit else None
-        if hit:
-            ctl["control_code"] = hit["control_code"]   # canonical spelling, not the echo
-        elif raw:
-            unresolved.append(raw)
-    # A code the model invented is expected and fine (it becomes a null link); a code that
-    # SHOULD have matched is a silent join-key loss, so leave a trace rather than nothing.
-    if unresolved:
-        log.info("treatment.control_code_unresolved", codes=unresolved,
+        if hit is None:
+            dropped.append(raw or "<no control_code>")
+            continue
+        ctl["control_library_id"] = hit["control_library_id"]
+        ctl["control_code"] = hit["control_code"]   # canonical spelling, not the echo
+        kept.append(ctl)
+    cti["controls"] = kept
+    # A dropped control means the model invented/mistyped a code, or drew from
+    # scenario_suggested despite the prompt's instruction not to — either way it isn't a
+    # library entry and must not reach the persisted plan. Logged rather than silent: an
+    # occasional invented code is expected, but one that SHOULD have matched is a join-key loss.
+    if dropped:
+        log.info("treatment.control_code_unresolved_dropped", codes=dropped,
                  known=sorted(c["control_code"] for c in by_code.values()))
 
 
@@ -403,8 +410,9 @@ def _inject_reserved(parsed: dict[str, Any], snapshot: dict[str, Any]) -> dict[s
     same-named key the model emitted — AI output can never impersonate register data:
     - treatment_plan: the server-side strategy stamp;
     - the three register echoes, from the snapshot's prompt-hidden `register` block.
-    The controls_to_be_implemented table is otherwise the AI's own gap-analysis output; only
-    its control_library_id is server-owned, resolved from the model's echoed control_code."""
+    controls_to_be_implemented.controls is filtered here too (see
+    _resolve_control_library_ids): only entries that resolve to a real library_mapped
+    control survive, so a control never reaches the plan without a Control_Library row."""
     register = snapshot.get("register") or {}
     parsed["treatment_plan"] = str(TreatmentStrategy.mitigate)
     parsed["risk_identification_date"] = register.get("risk_identification_date")
@@ -670,17 +678,24 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     assert "SOC" not in narrative
 
     # _inject_reserved: server keys overwrite AI-emitted impostors; register echoes come from
-    # the prompt-hidden block; the AI's controls table is NOT rewritten. The drift-pin assert
-    # makes adding a key to _RESERVED_PLAN_KEYS without teaching the injector fail here.
-    ai_controls = [{"control_name": "MFA"}, {"control_name": "Backups"}]
+    # the prompt-hidden block; controls_to_be_implemented.controls is filtered to ONLY entries
+    # that resolve to a real library_mapped control_code — "Made-up control" has no match and
+    # is dropped, "MFA" resolves and gets its control_library_id stamped on. The drift-pin
+    # assert makes adding a key to _RESERVED_PLAN_KEYS without teaching the injector fail here.
+    ai_controls = [{"control_name": "MFA", "control_code": "CII-CID-028"},
+                   {"control_name": "Made-up control", "control_code": "NOT-REAL"}]
     injected = _inject_reserved(
         {"treatment_plan": "Avoid", "risk_owner": "Dr. Evil",
          "controls_to_be_implemented": {"control_coverage": "gaps", "controls": ai_controls}},
         {"register": {"risk_identification_date": "2026-06-14T08:31:00",
                       "risk_owner": "Head of OT Operations",
-                      "impacted_business_division": "Water Treatment Operations"}})
+                      "impacted_business_division": "Water Treatment Operations"},
+         "existing_controls": {"library_mapped": [
+             {"control_library_id": 28, "control_code": "CII-CID-028"}]}})
     assert injected["treatment_plan"] == "Mitigate"
-    assert injected["controls_to_be_implemented"]["controls"] is ai_controls  # AI-owned hand-off
+    kept = injected["controls_to_be_implemented"]["controls"]
+    assert [c["control_name"] for c in kept] == ["MFA"]  # unresolved control dropped
+    assert kept[0]["control_library_id"] == 28
     assert injected["risk_owner"] == "Head of OT Operations"
     assert injected["impacted_business_division"] == "Water Treatment Operations"
     assert set(_RESERVED_PLAN_KEYS) <= set(injected.keys())  # drift pin

@@ -1,13 +1,7 @@
-"""Step 4 (spec): map each generated scenario to the Control_Library.
+"""Create control-library mappings for generated scenario outputs.
 
-Propose→ground, the same idiom find_threats uses for threats: the LLM's free-text `controls`
-suggestions (scenario_prompt v1.3) become retrieval queries; each grounds to its best library
-row via cached-matrix cosine shortlist + batched rerank (grounding.ground_control_queries);
-matches under the min-score cutoff are dropped, the rest dedupe by ControlLibraryID and the
-top control_map_top_k get ranked Threat_Scenario_Control_Map rows.
-
-Lives in its own module (not tasks.py) because it is a self-contained enrichment stage with
-its own vocabulary/threshold concerns — tasks.py stays the pipeline driver.
+The module converts scenario control suggestions into search queries, grounds them against
+the control library, and stores the highest-scoring matches.
 """
 from __future__ import annotations
 
@@ -22,21 +16,18 @@ from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
 from app.db.dal import guid, now
-from app.pipeline import embeddings, grounding
+from app.pipeline import grounding
 from app.pipeline.llm import LLMClient
 
 log = get_logger(__name__)
 
 
 def itot_family(value: object) -> str | None:
-    """Fold a platform asset/subsystem type onto the control library's IT/OT axis, or None.
+    """Return ``IT`` or ``OT`` for a recognized technology label, otherwise ``None``.
 
-    The platform's controlled vocabulary for the subsystem-level `asset_type` is
-    'Information Technology (IT)' / 'Operational Technology (OT)' (the exact strings the
-    seeded Config_Threat_Rule tech_gates match on — scripts/Seed_to_Threat_library.sql);
-    the asset-level `type` is free text that MAY also carry these markers. Recognizing the
-    real vocabulary (plus bare IT/OT) is what makes the pre-filter actually engage on
-    production data instead of silently never matching."""
+    Accepts the bare labels and the platform labels ``Information Technology (IT)`` and
+    ``Operational Technology (OT)``.
+    """
     v = grounding.ensure_text(value).strip().upper()
     if not v:
         return None
@@ -50,11 +41,11 @@ def itot_family(value: object) -> str | None:
 
 
 def _resolve_itot(asset_context: dict, subsystems: list[dict] | None) -> str | None:
-    """One IT/OT family for the asset, from every signal that carries one: the asset's own
-    type plus each supporting system's resolved asset_type category. Filter only when the
-    signals AGREE on a single family — a mixed IT+OT asset searches the whole library rather
-    than guessing (dropping the right OT control because one subsystem said IT would be a
-    correctness bug, not an optimization)."""
+    """Return one shared IT/OT family from the asset and its supporting subsystems.
+
+    Returns ``IT`` or ``OT`` only when all recognized values agree. Returns ``None`` when
+    no value is recognized or when both families are present, so mixed assets are not filtered.
+    """
     families = {itot_family(asset_context.get("asset_type"))}
     for sub in subsystems or []:
         families.add(itot_family(sub.get("asset_type")))
@@ -63,28 +54,23 @@ def _resolve_itot(asset_context: dict, subsystems: list[dict] | None) -> str | N
 
 
 def _min_score(sess: Session, llm: LLMClient, s) -> float:
-    """The rerank cutoff below which a suggestion is dropped. Rerank scores are MODEL-specific
-    (a different reranker scores on a different distribution), so a fixed default cannot fit
-    every environment. Precedence: an operator-pinned TSG_CONTROL_MAP_MIN_SCORE wins; otherwise
-    reuse the per-(embedding, reranker)-pair MATCH threshold grounding already resolves and
-    stores per model pair (grounding.resolve_thresholds — memoized, degrade-safe), so the
-    cutoff follows the models in every environment instead of needing manual recalibration.
+    """Return the score required before a grounded control is stored.
 
-    Note this cutoff rose when the bands collapsed: it used to track the lower (confirm) of two
-    numbers and now tracks the only one. Controls are dropped slightly more readily as a result —
-    pin TSG_CONTROL_MAP_MIN_SCORE if an environment wants the old, looser behaviour back."""
+    Use ``control_map_min_score`` when explicitly configured. Otherwise use the threshold
+    resolved for the current embedding and reranker models.
+    """
     if "control_map_min_score" in s.model_fields_set:
         return s.control_map_min_score
     return grounding.resolve_thresholds(sess, llm, s)
 
 
 def collect_control_queries(scenario_json: str | None, top_k: int) -> tuple[list[tuple[str, str | None]], bool]:
-    """Parse one output's ScenarioJSON into control-grounding queries.
+    """Convert one output's JSON into grounding queries.
 
-    Returns (queries, used_fallback): each query is (text to ground, SuggestedControl to store).
-    Suggestions ground as `name: why`; an output with no usable suggestions (pre-1.3 prompt,
-    parse variance) falls back to the scenario text itself as a single query with no stored
-    suggestion. An empty list means the output has nothing groundable at all — skip it."""
+    Returns ``(queries, used_fallback)``. Each query contains the control name and reason,
+    plus the name to store in ``SuggestedControl``. If no valid control name exists, use the
+    scenario title and statement as one query with no suggested-control value.
+    """
     try:
         scenario = json.loads(scenario_json or "{}")
     except ValueError:
@@ -107,37 +93,15 @@ def collect_control_queries(scenario_json: str | None, top_k: int) -> tuple[list
 def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 subsystems: list[dict] | None, llm: LLMClient, subsystem_id: int,
                 task_id: str, epoch: int, *, durable: bool = False) -> None:
-    """Map every not-yet-attempted active complete output of this session to library controls.
+    """Store top control matches for active, complete scenario outputs.
 
-    Runs as a tail step of the SCENARIOS stage. Idempotency = `ControlsMappedAt IS NULL`:
-    every output this run processes gets stamped — INCLUDING ones that produced zero map rows
-    (nothing groundable, or every suggestion below the cutoff) — so no output is ever
-    re-scanned/re-reranked on later runs; regen/next-set mint fresh OutputIDs (stamp NULL)
-    and are picked up naturally. The extra NOT-EXISTS guard covers pre-stamp-column rows that
-    already have map rows: they must be neither reprocessed (PK collision) nor re-stamped.
-
-    `durable=True`: commit this function's writes for real once they're done, instead of just
-    riding the caller's transaction. Only pass this when the caller has NOTHING else uncommitted
-    on `sess` at call time (today: the plain, non-targeted write_scenarios path only — its
-    scenario rows are already committed one-by-one as generated). Otherwise a durable commit here
-    would prematurely finalize the caller's own still-unvalidated writes (targeted regen/next-set
-    buffers its scenario inserts uncommitted until after this call returns — see
-    _reconcile_targeted_regen). Without `durable`, a claim-loss rollback in the caller (stage
-    lease expired during the grounding call below, which can run many minutes) silently discards
-    an already-successful mapping: it was logged as "controls.mapped" but never reached disk.
+    Reads outputs with a null ``ControlsMappedAt`` value and no existing map rows, grounds
+    their control suggestions, filters matches by score, removes duplicate control IDs, and
+    inserts the top ``control_map_top_k`` rows. It timestamps every selected output, including
+    outputs with no valid query. A mapping error is logged without failing scenario generation.
+    With ``durable=True``, mapping writes are committed before this function returns.
     """
-    # ponytail: mapping is enrichment; a scenario without controls beats a failed stage — any
-    # failure below logs and returns, never raises into the stage.
-    #
-    # SAVEPOINT, not a bare transaction rollback (see the except/finally below). This runs BEFORE
-    # the caller's finish_stage+commit, and on the TARGETED paths (regenerate / next-set) the
-    # caller's scenarios are still UNCOMMITTED here: _reconcile_targeted_regen buffers them and
-    # writes the supersede+insert in one go, unlike the full run which commits per scenario. A
-    # whole-transaction rollback therefore discarded the caller's entire regenerated batch, after
-    # which finish_stage still SUCCEEDED (its RUNNING claim was committed earlier) and the audit
-    # row + stage_completed SSE reported a completed regeneration that had produced nothing.
-    # Scoping the failure to a savepoint unwinds ONLY this function's writes while leaving the
-    # outer transaction usable — which is all the old rollback was ever reaching for.
+    # A savepoint prevents mapping errors from rolling back scenario writes.
     sp = sess.begin_nested()
     try:
         s = get_settings()
@@ -159,8 +123,7 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         ).all()
         if not outputs:
             return
-        # Parse every output's suggestions FIRST so all query texts embed in one batched call
-        # (same round-trip-saving idea as grounding.prime_query_embeddings).
+        # Build all output queries before calling the embedding service once per batch.
         per_output: list[tuple[str, list[tuple[str, str | None]]]] = []
         fallbacks = 0
         for output_id, scenario_json in outputs:
@@ -175,41 +138,25 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         if per_output:
             texts = list(dict.fromkeys(q for _, qs in per_output for q, _ in qs))
             qv_map: dict[str, list[float]] = {}
-            try:  # best-effort batch prime, chunked so a big session can't exceed a remote
-                # provider's per-request batch limit — a failure just means per-query embeds below
+            try:  # Cache query vectors; grounding still works if this warm-up fails.
                 batch = get_settings().embedding_batch_size
                 for i in range(0, len(texts), batch):
                     chunk = texts[i:i + batch]
                     qv_map.update(zip(chunk, llm.embed(chunk, kind="query")))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.warning("controls.query_prime_failed", session_id=sid, exc_info=True)
-            # One lease renewal covers the whole batched grounding call (the only long operation
-            # left — shortlisting is a cached-matrix matvec and the rerank is one batched local
-            # dispatch / bounded-concurrent remote calls; the inserts below are milliseconds).
-            # Two legitimate callers, two different stage states. write_scenarios calls us while
-            # the stage is still RUNNING under its claim, so renewing the lease is both possible
-            # and necessary. write_variant_scenarios calls us AFTER the stage went terminal —
-            # variants are a plain side write under the caller's subsystem lock, by design (see
-            # its docstring) — so renew_lease, which fences on Status == RUNNING, can only ever
-            # return False there. Treating that as "lease lost" made Step-4 mapping a guaranteed
-            # no-op for every variant: they shipped with controls: [] and, because the
-            # ControlsMappedAt stamp below was skipped too, stayed unmapped until some later
-            # RUNNING-stage run happened to sweep them up. Accepting a stage already settled at
-            # OUR epoch covers that caller while keeping the reaped/stolen-stage protection
-            # intact for the RUNNING one.
+            
             if not (dal.renew_lease(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id)
                     or dal.stage_settled_at_epoch(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch)):
                 log.warning("controls.lease_lost", session_id=sid)
                 return
-            sess.commit()  # close the renew_lease txn before the slow grounding call below —
-            # otherwise the snapshot transaction stays open for however long grounding takes
-            # (rerank / remote calls), which is what selfcheck.tempdb_long_running_txn catches
+            sess.commit()  # End the lease transaction before the slow grounding call.
             flat = [(q, qv_map.get(q)) for _, qs in per_output for q, _ in qs]
             matches = grounding.ground_control_queries(llm, flat, candidates, s)
             pos = 0
             for output_id, queries in per_output:
                 best: dict[int, dict] = {}
-                for (query, suggested), match in zip(queries, matches[pos:pos + len(queries)]):
+                for (_query, suggested), match in zip(queries, matches[pos:pos + len(queries)]):
                     if match is None:
                         dropped += 1
                         continue
@@ -228,21 +175,12 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 if keep:
                     sess.execute(insert(m.Threat_Scenario_Control_Map), keep)
                     inserted += len(keep)
-        # Stamp EVERY fetched output as attempted — including nothing-groundable and
-        # zero-survivor ones — so none of them is ever re-scanned on a later run. Rides the
-        # caller's transaction: a crash before commit rolls back stamps and map rows together.
+        # Timestamp every selected output so it is not processed again.
         sess.execute(update(m.Threat_Scenario_Output)
                     .where(m.Threat_Scenario_Output.OutputID.in_([oid for oid, _ in outputs]))
                     .values(ControlsMappedAt=now()))
         if not per_output:
-            # No audit event: a controls_mapped row reporting 0 processed outputs reads as
-            # work done. The stamp above still prevents any future re-scan of these outputs.
             if durable:
-                # Real commit, not a savepoint release: the earlier sess.commit() (before the
-                # grounding call) already released `sp`, so this is a plain top-level commit of
-                # exactly the stamp just written — nothing else is pending on `sess` for this
-                # caller (see the `durable` docstring). Without it, a claim-loss rollback the
-                # caller does afterward would undo the stamp too, forcing a pointless re-scan.
                 sess.commit()
             log.warning("controls.nothing_groundable", session_id=sid, skipped=skipped)
             return
@@ -258,33 +196,12 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 dropped=dropped, fallbacks=fallbacks, skipped=skipped, itot=itot,
                 min_score=min_score)
         if durable:
-            # Same real commit as above, placed at the very end of the success path so the
-            # audit row commits together with the map rows + stamp it describes — otherwise a
-            # caller rollback right after return would leave durable mapping data with no
-            # matching audit trail entry, a smaller but real inconsistency.
             sess.commit()
-    except Exception:  # noqa: BLE001
-        # Unwind to the savepoint FIRST: a DBAPI error mid-write (deadlock, constraint conflict)
-        # marks the failed statement's transaction inactive, and without this the caller's very
-        # next finish_stage would die on PendingRollbackError — turning an enrichment failure
-        # into a whole-stage failure, the exact outcome this catch-all exists to prevent.
-        # Unlike the whole-transaction rollback this replaces, it cannot touch the caller's own
-        # uncommitted scenarios (see the savepoint note at the top of this function).
-        #
-        # `sp` is only ACTIVE up to the mid-function sess.commit() above (before the grounding
-        # call) — that commit releases the savepoint, same as the `durable` commit below it does
-        # again later. Any exception raised after either of those points (a systemic rerank
-        # failure, a constraint conflict on insert) hits a savepoint that's already closed:
-        # sp.rollback() on it raises sqlalchemy.exc.ResourceClosedError, which — uncaught here —
-        # would propagate out of this function and crash the whole stage, exactly what this
-        # try/except exists to prevent. Roll back whatever transaction is actually current
-        # instead once the savepoint is gone.
+    except Exception:
+        # Roll back mapping changes and allow scenario generation to finish.
         (sp.rollback() if sp.is_active else sess.rollback())
         log.warning("controls.mapping_failed", session_id=scenario_session.get("SessionID"), exc_info=True)
     finally:
-        # `finally`, not `else`: the try body has several early `return`s (no candidates, no
-        # unmapped outputs, lease lost, nothing groundable), and an `else` clause is skipped by
-        # a return — which would leave the savepoint open. Releasing it keeps whatever this
-        # function wrote in the caller's transaction, to be committed with the batch.
+        # Close the savepoint after normal returns and early returns.
         if sp.is_active:
             sp.commit()
