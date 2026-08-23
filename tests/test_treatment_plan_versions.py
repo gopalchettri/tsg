@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import create_engine, select, text, update
@@ -48,7 +48,7 @@ def _engine():
 
 
 def _now():
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _seed(Session) -> None:
@@ -95,7 +95,7 @@ def _principal() -> Principal:
 def _body(**over) -> TreatmentPlanBody:
     base = dict(existing_controls=["annual patching"], likelihood_rating=4, impact_rating=5,
                 final_risk_rating=20, risk_level="Critical",
-                risk_identification_date=datetime(2026, 6, 14, 8, 31, tzinfo=timezone.utc),
+                risk_identification_date=datetime(2026, 6, 14, 8, 31, tzinfo=UTC),
                 risk_owner="Head of OT Operations", impacted_business_division="Water Ops",
                 existing_controls_all_subsystems="No",
                 existing_controls_all_subsystems_justification="IT systems only",

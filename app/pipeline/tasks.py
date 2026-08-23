@@ -5,9 +5,9 @@ import json
 import math
 import re
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, overload
 
-from sqlalchemy import insert, update
+from sqlalchemy import func, insert, update
 from sqlalchemy.orm import Session
 
 from app.core import tuning
@@ -165,8 +165,11 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
     def _key(t: dict) -> str:
         return asset_agnostic_name(threat_label(t), asset_name) or ""
 
-    entries = [(t.get("threat_id"), _key(t), _cat(t)) for t in threats]
-    entries = [(tid, lbl, c) for tid, lbl, c in entries if tid and lbl]
+    raw_entries = [(t.get("threat_id"), _key(t), _cat(t)) for t in threats]
+    # Separate name for the filtered list so the `if tid and lbl` guard is reflected in the
+    # annotation: rebinding the same name keeps the pre-filter `str | None`, and every downstream
+    # use (dupes[tid], tid_of[lbl]) then reads as a possible None key.
+    entries: list[tuple[str, str, Any]] = [(tid, lbl, c) for tid, lbl, c in raw_entries if tid and lbl]
     prior_entries = [(t.get("threat_id"), _key(t), _cat(t)) for t in (priors or [])]
     prior_entries = [(tid, lbl, c) for tid, lbl, c in prior_entries if lbl]
     if not entries or not (prior_entries or len(entries) > 1):
@@ -244,7 +247,7 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
 def _statement_of(scenario_json: str | None) -> str:
 
     try:
-        return str((json.loads(scenario_json) or {}).get("scenario_statement") or "")
+        return str((json.loads(scenario_json or "{}") or {}).get("scenario_statement") or "")
     except (TypeError, ValueError):
         return ""
 
@@ -295,7 +298,9 @@ def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_ses
             expected_type: type, temperature: float | None = None) -> tuple[Any, Provenance | None]:
     
     sid = scenario_session["SessionID"]
-    if level is not None:
+    if level is not None and epoch is not None and task_id is not None:
+        # All three travel together: renew_lease needs every one of them, so guarding on
+        # `level` alone would hand it None for epoch/task_id on any caller that omitted them.
         if not dal.renew_lease(sess, sid, subsystem_id, level, epoch, task_id):
             log.warning("stage.lease_renewal_failed", session_id=sid,
                         subsystem=subsystem_id, level=str(level))
@@ -359,7 +364,14 @@ def set_up_progress_tracking(sess: Session, session_id: str, tenant_id: str, ent
     sess.execute(insert(m.Subsystem_Stage_State), rows)
 
 
+@overload
+def _safe_text(v: Any, default: str) -> str: ...
+@overload
+def _safe_text(v: Any, default: None) -> str | None: ...
 def _safe_text(v: Any, default: str | None) -> str | None:
+    """Overloaded so a non-None `default` is typed as returning `str`: callers slice the
+    result immediately (`[:300]`), which a `str | None` return would make a type error at
+    every call site rather than here, where the guarantee actually lives."""
     if default is None:
         return v if isinstance(v, str) else None
     return grounding.ensure_text(v, default)
@@ -778,7 +790,11 @@ def _ground_entry_points(scenario: dict, vocab: dict[str, int],
 def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict, sc,
                     enriched: dict, llm: LLMClient, task_id: str, epoch: int,
                     sibling_texts: list[tuple[int, str]] | None = None,
-                    coverage: _Coverage | None = None) -> tuple[dict, dict, Provenance | None]:    
+                    coverage: _Coverage | None = None,
+                    # Per-item id stamped onto BOTH Prompt_Log rows this call can write (the
+                    # generation attempt and its repair turn), so a receipt joins back to the
+                    # scenario it produced. Callers pass the ScopedThreatID.
+                    *, correlation_id: str | None = None) -> tuple[dict, dict, Provenance | None]:    
     info = enriched.get(sc.threat_id, {})
     threat_type = info.get("library_threat_type") or info.get("threat_type")
     threat_name = info.get("library_threat_name") or info.get("threat_name")
@@ -810,6 +826,7 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     scenario, prov = _ask_ai(sess, llm, messages,
                             scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID, stage="scenario",
                             level=SubsystemLevel.SCENARIOS, epoch=epoch, task_id=task_id, expected_type=dict,
+                            correlation_id=correlation_id,
                             temperature=get_settings().scenario_generation_temperature)
     # Use critical_service from base_ctx (what the model actually saw), not the raw
     # asset_context — placeholder values like "Unknown"/"TBD" are scrubbed out there, and
@@ -827,7 +844,7 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     # so those all see the final version.
     missing = [e for e in report["errors"] if e.startswith("missing ")]
     if missing:
-        repair_messages = messages + [
+        repair_messages = [*messages,
             # Scrub DB ids like any other payload. Currently a no-op since this runs before
             # _ground_entry_points adds any ids — but it's safe even if that order changes later.
             {"role": "assistant", "content": json.dumps(prompts._scrub_db_keys(scenario))},
@@ -840,6 +857,10 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
                                     scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID,
                                     stage="scenario", level=SubsystemLevel.SCENARIOS, epoch=epoch,
                                     task_id=task_id, expected_type=dict,
+                                    # Deliberately the SAME id as the attempt above: CorrelationID
+                                    # has no unique constraint and the evidence read returns every
+                                    # matching row ordered by CreatedAt, so the two attempts group.
+                                    correlation_id=correlation_id,
                                     temperature=get_settings().scenario_generation_temperature)
         except Exception:
             # Must roll back here. _ask_ai runs DB commits before and after the LLM call, over
@@ -920,8 +941,8 @@ def _scrub_model_output(scenario: dict, sid: str, threat_id: str | None) -> dict
         if cleaned != scenario:
             log.info("scenario.output_redacted", session_id=sid, threat_id=threat_id)
         return cleaned
-    except Exception:  # noqa: BLE001 — see docstring
-        log.error("scenario.output_scrub_failed", session_id=sid, threat_id=threat_id, exc_info=True)
+    except Exception:
+        log.exception("scenario.output_scrub_failed", session_id=sid, threat_id=threat_id)
         return scenario
 
 
@@ -1280,10 +1301,11 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
             scenario, report, prov = _generate_one_scenario(sess, scenario_session, base_ctx, sc,
                                                             enriched, llm, task_id, epoch,
                                                             sibling_texts=sibling_texts,
-                                                            coverage=coverage)
+                                                            coverage=coverage,
+                                                            correlation_id=scoped_id)
         except LLMSlotUnavailable:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — [R8] capture, don't swallow: kept as first_failure
             sess.rollback()
             first_failure = first_failure or exc
             failed_ids.add(sc.threat_id)
@@ -1401,26 +1423,32 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
                             # older primaries (before this column existed) have NULL here — kept as None, never guessed
                             selection=SelectionReason(sel) if sel else None,
                             factors=factors)
+        # Minted BEFORE the call, not after it, so the generation's Prompt_Log rows can carry it.
+        # Left unused on the break/continue paths below — guid() is pure, so a discarded id is free.
+        # This hoist and the correlation_id argument below are one change: passing the id while it
+        # is still minted after the call would stamp receipts with the PREVIOUS card's id, which is
+        # worse than NULL because a wrong id reads as an answer.
+        scoped_id = guid()
         try:
-            scenario, report, prov = _generate_one_scenario(
+            scenario, report, _prov = _generate_one_scenario(
                 sess, scenario_session, base_ctx, sc, enriched, llm, task_id, epoch,
                 sibling_texts=siblings_by_hash.get(item["identity_hash"]) or None,
                 coverage=_Coverage(
                     vocab=entry_vocab,
                     frozen=fold.frozen_by_hash.get(item["identity_hash"]),
                     others=[s for h, s in cross_pairs if h != item["identity_hash"]] or None,
-                    intel_terms=intel_terms, intel_ot=intel_ot))
+                    intel_terms=intel_terms, intel_ot=intel_ot),
+                correlation_id=scoped_id)
         except LLMSlotUnavailable:
             sess.rollback()
             log.warning("variant.slots_exhausted", session_id=sid, subsystem=ss,
                         created=created, remaining=len(eligible) - created)
             break
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — [R8] one variant's failure must not kill the batch
             sess.rollback()
             log.warning("variant.generation_failed", session_id=sid, subsystem=ss,
                         threat_id=item["threat_id"], error=repr(exc))
             continue
-        scoped_id = guid()
         try:
             sess.execute(insert(m.Scoped_Threat),
                         [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
@@ -1440,7 +1468,7 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
         try:
             _finalize_scenario_batch(sess, scenario_session, asset_context, subsystems, llm, task_id, epoch)
             sess.commit()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — [R8] finalize is best-effort; scenarios already committed
             sess.rollback()
             log.warning("variant.finalize_failed", session_id=sid, subsystem=ss,
                         created=created, error=repr(exc))
@@ -1522,6 +1550,20 @@ def decide_session_outcome(sess: Session, scenario_session: dict) -> str | None:
 # progress.last_regen.epoch (see GET /v1/sessions/{id}), not this event's generation_epoch. See
 # docs/SSE_SESSION_PROGRESS_CONTRACT_GUIDE.md §4.7.
 def _send_to_review(sess: Session, scenario_session: dict, epoch: int = _EPOCH) -> bool:
+    """Generation is finished: park at the review barrier AND end the session.
+
+    The session's own lifecycle is "a generation request", not "a review workstream" — it ends
+    when generation ends, which is what releases the asset (UX_Session_ActiveAsset is filtered on
+    SessionStatus='active'). Each scenario then carries its own pending -> accepted/rejected
+    lifecycle for as long as the reviewer needs, with no session left holding the asset open.
+
+    CurrentStage/StageStatus stay REVIEW/AWAITING_DECISION: they describe the EXECUTION, and
+    "awaiting a human decision" is still true. review_gate_reason tests that pair BEFORE it tests
+    SessionStatus, so accept and regenerate keep passing the gate on a completed session — that
+    ordering is load-bearing, not incidental.
+
+    CompletedAt uses COALESCE so a next-set run (which re-reserves the session and comes back
+    through here) never rewrites when generation first finished."""
     sid = scenario_session["SessionID"]
     res = execute_dml(
         sess,
@@ -1529,7 +1571,9 @@ def _send_to_review(sess: Session, scenario_session: dict, epoch: int = _EPOCH) 
         .where(m.Scenario_Session.SessionID == sid,
             m.Scenario_Session.SessionStatus == SessionStatus.active,
             m.Scenario_Session.CurrentStage != WorkflowStage.REVIEW)
-        .values(CurrentStage=WorkflowStage.REVIEW, StageStatus=StageStatus.AWAITING_DECISION, UpdatedAt=now())
+        .values(CurrentStage=WorkflowStage.REVIEW, StageStatus=StageStatus.AWAITING_DECISION,
+                SessionStatus=SessionStatus.completed,
+                CompletedAt=func.coalesce(m.Scenario_Session.CompletedAt, now()), UpdatedAt=now())
     )
     if res.rowcount != 1:
         return False

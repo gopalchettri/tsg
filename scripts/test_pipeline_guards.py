@@ -12,18 +12,24 @@ has regressed — the docstring on each says what breaks in production when it d
 """
 from __future__ import annotations
 
+import ast
+import inspect
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.core.config import get_settings  # noqa: E402
-from app.core.enums import DuplicateReason  # noqa: E402
-from app.pipeline import scoping  # noqa: E402
-from app.pipeline.cascade import (NextSetOutcome, _build_regen_audit_detail,  # noqa: E402
-                                _next_set_outcome)
-from app.pipeline.tasks import (_scrub_model_output, _semantic_duplicates,  # noqa: E402
-                                _usable_proposal, asset_agnostic_name, clean_library_name)
+from app.core.config import get_settings
+from app.core.enums import DuplicateReason
+from app.pipeline import accept, scoping, tasks
+from app.pipeline.cascade import NextSetOutcome, _build_regen_audit_detail, _next_set_outcome
+from app.pipeline.tasks import (
+    _scrub_model_output,
+    _semantic_duplicates,
+    _usable_proposal,
+    asset_agnostic_name,
+    clean_library_name,
+)
 
 ASSET = "Widget Control System"
 
@@ -38,7 +44,7 @@ class _StubLLM:
     _AXES = {"alpha": [1.0, 0.0, 0.0], "beta": [0.0, 1.0, 0.0], "gamma": [0.0, 0.0, 1.0],
              "trapx": [0.969, 0.246779, 0.0]}
 
-    def embed(self, texts, kind=None):  # noqa: ARG002 — signature parity with LLMClient
+    def embed(self, texts, kind=None):
         out = []
         for t in texts:
             head = t.split()[0].casefold() if t.split() else ""
@@ -225,7 +231,7 @@ def check_semantic_scan_failure_is_not_fatal() -> None:
     """A failed scan must degrade to 'no duplicates', never lose the round's threats."""
 
     class _Boom:
-        def embed(self, texts, kind=None):  # noqa: ARG002
+        def embed(self, texts, kind=None):
             raise RuntimeError("embedding backend down")
 
     dupes = _semantic_duplicates(_Boom(), "sess", 0,
@@ -342,7 +348,196 @@ def check_present_status_cutoff_is_caller_controlled() -> None:
     print("ok  _present_status: staleness decided by the caller's cutoff, not an internal clock")
 
 
+def check_scenario_receipts_carry_their_scenario_id() -> None:
+    """Every scenario-path LLM call stamps Prompt_Log.CorrelationID with the ScopedThreatID.
+
+    Without it the receipt (exact prompt + raw reply, written by _ask_ai even when parsing fails)
+    cannot be joined to the scenario it produced, so "why does this card cite CVE-X?" is
+    unanswerable. Three ways this regresses, all SILENT — nothing raises, the rows just go NULL
+    or, worse, carry someone else's id:
+
+      1. an _ask_ai call inside _generate_one_scenario dropping correlation_id — half the receipts
+         go NULL while the fix still looks applied;
+      2. a _generate_one_scenario call site not passing one — same, per path;
+      3. write_variant_scenarios minting scoped_id AFTER the call again (it did, before 2026-08).
+         Receipts then carry the PREVIOUS card's id, which is worse than NULL because a wrong id
+         reads as an answer.
+
+    Source-introspected rather than executed: this is a wiring invariant, and running it for real
+    needs an LLM and a database. Same approach as scripts/test_promotion_retry_flow.py.
+    """
+    src = inspect.getsource(tasks)
+    tree = ast.parse(src)
+    fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+
+    def calls_to(node, name):
+        return [c for c in ast.walk(node) if isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Name) and c.func.id == name]
+
+    gen = fns["_generate_one_scenario"]
+    kwonly = [a.arg for a in gen.args.kwonlyargs]
+    assert "correlation_id" in kwonly, (
+        "_generate_one_scenario lost its keyword-only correlation_id parameter")
+
+    asks = calls_to(gen, "_ask_ai")
+    assert len(asks) == 2, f"expected 2 _ask_ai calls (attempt + repair), found {len(asks)}"
+    for call in asks:
+        assert any(k.arg == "correlation_id" for k in call.keywords), (
+            f"_ask_ai at tasks.py line ~{call.lineno} is not stamping correlation_id — its "
+            "Prompt_Log rows will be orphaned")
+
+    sites = calls_to(tree, "_generate_one_scenario")
+    assert len(sites) == 2, f"expected 2 call sites (main + variant), found {len(sites)}"
+    for call in sites:
+        assert any(k.arg == "correlation_id" for k in call.keywords), (
+            f"_generate_one_scenario call at tasks.py line ~{call.lineno} passes no "
+            "correlation_id — that whole path's receipts go NULL")
+
+    variant = fns["write_variant_scenarios"]
+    mint = min(n.lineno for n in ast.walk(variant) if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "scoped_id" for t in n.targets))
+    call = min(c.lineno for c in calls_to(variant, "_generate_one_scenario"))
+    assert mint < call, (
+        f"write_variant_scenarios mints scoped_id at line ~{mint}, AFTER the generation call at "
+        f"~{call}: receipts would be stamped with the previous card's id")
+
+    print("scenario receipts: correlation_id wired on both paths; variant id minted pre-call")
+
+
+def check_catalogued_threats_do_not_requeue_curation_cards() -> None:
+    """A threat already linked to a library entry must never queue a pending curation card.
+
+    The cause is a SPLIT decision. `_decide_candidate_fate` skips triage when the threat already
+    carries a ThreatCatalogueID, so `verdict` keeps its default `review` — and the card-insert
+    block then reads that verdict without re-checking why it holds. Any re-run of promotion (the
+    reaper's retry sweep today; per-accept promotion once scenarios decide independently) therefore
+    re-queued threats already in the library, giving curators duplicate work that approving cannot
+    resolve.
+
+    Pinned by source because reproducing it behaviourally needs a live catalogue, embeddings and a
+    full promotion run — same approach as scripts/test_promotion_retry_flow.py.
+
+    NOTE: weaker than a behavioural test. It proves the conjunct is still present, not that it
+    still has the intended effect. Replace it if seeding a real promotion run ever gets cheap."""
+    tree = ast.parse(inspect.getsource(accept._add_unverified_threats_to_library))
+
+    # Locate every `if` whose body inserts a candidate card, then assert its condition consults
+    # ThreatCatalogueID — i.e. a catalogued threat cannot reach the insert at all.
+    card_guards = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+        if "CandidateKind" in body and "ProposedName" in body:
+            card_guards.append(ast.dump(node.test))
+    assert card_guards, "no candidate-card insert found in _add_unverified_threats_to_library"
+    for cond in card_guards:
+        assert "ThreatCatalogueID" in cond, (
+            "the candidate-card insert no longer checks ThreatCatalogueID — a threat already in "
+            "the library will be re-queued for curation on every promotion re-run")
+    print("promotion: catalogued threats cannot re-queue a curation card")
+
+
+#: The only function allowed to write a scenario's decision columns.
+_DECISION_WRITER = "decide_scenarios"
+_DECISION_COLUMNS = ("Accepted", "RejectedAt", "RejectedBy")
+
+
+def check_only_one_function_writes_a_scenario_decision() -> None:
+    """Accepted / RejectedAt / RejectedBy may be assigned ONLY inside dal.decide_scenarios.
+
+    This is what makes the single-writer design a fact rather than a convention. decide_scenarios
+    does three things together — applies the opposite decision's exclusion predicate, writes the
+    row, and writes one Scenario_Audit ledger entry per scenario. A second writer anywhere gets
+    none of them, and the failure is silent: the decision lands, the audit trail quietly does not,
+    and accept/reject stop being mutually exclusive until CK_ScenarioOutput_DecisionExclusive
+    surfaces as a 500 somewhere unrelated.
+
+    Both are regressions this repo has already had in other forms, which is why the rule is
+    enforced by parsing rather than by a comment asking nicely.
+    """
+    import ast
+    from pathlib import Path
+
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    offenders: list[str] = []
+    for path in sorted(app_dir.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        # Map every node to the function enclosing it, so a hit can name its writer.
+        enclosing: dict[ast.AST, str] = {}
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]:
+            for child in ast.walk(fn):
+                enclosing.setdefault(child, fn.name)
+        for node in ast.walk(tree):
+            # `.values(Accepted=1, ...)` — the SQLAlchemy UPDATE spelling
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "values"):
+                continue
+            named = {kw.arg for kw in node.keywords if kw.arg in _DECISION_COLUMNS}
+            if named and enclosing.get(node) != _DECISION_WRITER:
+                offenders.append(
+                    f"{path.relative_to(app_dir.parent)}: {sorted(named)} written in "
+                    f"{enclosing.get(node) or '<module level>'}()")
+    assert not offenders, (
+        "a scenario decision is written outside dal.decide_scenarios:\n  "
+        + "\n  ".join(offenders)
+        + f"\nRoute the write through {_DECISION_WRITER} instead — it is what pairs the decision "
+        "with its per-scenario audit row and with the opposite decision's exclusion predicate.")
+
+    # The guard is worthless if the writer it whitelists has been renamed or gutted.
+    import inspect
+
+    from app.db import dal
+    writer = getattr(dal, _DECISION_WRITER, None)
+    assert writer is not None, f"dal.{_DECISION_WRITER} is gone — this guard now protects nothing"
+    body = inspect.getsource(writer)
+    assert all(c in body for c in _DECISION_COLUMNS), (
+        f"dal.{_DECISION_WRITER} no longer writes {_DECISION_COLUMNS} — either it was split "
+        "(update this guard's whitelist) or the decision write moved somewhere unguarded")
+    print("decisions: only dal.decide_scenarios writes Accepted/RejectedAt/RejectedBy")
+
+
+#: Every function that decides scenarios must pass the review gate first.
+_GATE_CHECK = "_ensure_session_ready_to_accept"
+
+
+def check_every_decision_route_passes_the_review_gate() -> None:
+    """Any function calling dal.decide_scenarios must also call _ensure_session_ready_to_accept.
+
+    The gate refuses a decision on a session that is cancelled, still generating, or otherwise not
+    at a review barrier. A route that skips it writes a decision onto a session that was never
+    offered for review, and nothing looks broken afterwards.
+
+    NOT an ownership check: any authenticated colleague in the entity may decide, by deliberate
+    decision (see sessions.py::get_authorized_session). Who did it is recorded per scenario.
+    """
+    import ast
+    from pathlib import Path
+
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    offenders: list[str] = []
+    for path in sorted(app_dir.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in [n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]:
+            called = {c.func.attr for c in ast.walk(fn)
+                    if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)}
+            called |= {c.func.id for c in ast.walk(fn)
+                    if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            if _DECISION_WRITER in called and _GATE_CHECK not in called:
+                offenders.append(f"{path.relative_to(app_dir.parent)}: {fn.name}()")
+    assert not offenders, (
+        f"a function decides scenarios without calling {_GATE_CHECK} first:\n  "
+        + "\n  ".join(offenders)
+        + "\nA decision must not land on a session that was never offered for review.")
+    print("decisions: every decision route passes the review gate first")
+
+
 def demo() -> None:
+    check_only_one_function_writes_a_scenario_decision()
+    check_every_decision_route_passes_the_review_gate()
+    check_scenario_receipts_carry_their_scenario_id()
+    check_catalogued_threats_do_not_requeue_curation_cards()
     check_usable_proposal()
     check_semantic_duplicates_same_category()
     check_semantic_duplicates_identical_labels()

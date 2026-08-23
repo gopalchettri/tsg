@@ -272,7 +272,13 @@ CREATE TABLE Threat_Scenario_Output (
     GenerationEpoch      int           NOT NULL,
     ErrorMessage         nvarchar(max) NULL,
     CreatedAt            datetime2     NULL,
-    ControlsMappedAt     datetime2     NULL   -- Step-4 attempt stamp; NULL = not yet tried
+    ControlsMappedAt     datetime2     NULL,  -- Step-4 attempt stamp; NULL = not yet tried
+    -- Per-scenario review decision. NULL/NULL = pending (nobody has decided yet), which is why
+    -- these are nullable columns rather than a status value: Status is the GENERATION outcome
+    -- (complete|error) and is load-bearing in the accept and promotion predicates, so a review
+    -- verdict must not ride on it. Mutually exclusive with Accepted=1.
+    RejectedAt           datetime2     NULL,
+    RejectedBy           nvarchar(200) NULL
 );
 
 -- Adds ControlsMappedAt for pre-Step-4 databases.
@@ -289,6 +295,49 @@ IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
 IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ReplacesOutputID') IS NULL
     ALTER TABLE Threat_Scenario_Output ADD ReplacesOutputID uniqueidentifier NULL;
+
+-- Adds the per-scenario review decision for pre-2026-08-23 databases. Legacy rows read as
+-- pending, which is correct: nobody recorded a rejection for them.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'RejectedAt') IS NULL
+    ALTER TABLE Threat_Scenario_Output ADD RejectedAt datetime2 NULL;
+
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'RejectedBy') IS NULL
+    ALTER TABLE Threat_Scenario_Output ADD RejectedBy nvarchar(200) NULL;
+
+-- A scenario cannot be both accepted and rejected. Enforced in the DATABASE, not only in the
+-- service layer: accept and reject will be independent routes reachable at any time after the
+-- session completes, so the one place both orderings must meet is the row itself. Guarded so a
+-- re-run is a no-op, and NOT trusted to WITH CHECK on legacy data — existing rows all read
+-- pending (RejectedAt NULL), so the constraint holds for them by construction.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'RejectedAt') IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM sys.check_constraints
+                    WHERE name = 'CK_ScenarioOutput_DecisionExclusive')
+    ALTER TABLE Threat_Scenario_Output ADD CONSTRAINT CK_ScenarioOutput_DecisionExclusive
+        CHECK (RejectedAt IS NULL OR Accepted = 0);
+
+-- Per-scenario decision trail for pre-2026-08-23 databases. Legacy rows read as NULL, which is
+-- correct: they were session-scoped events and belong to no single scenario.
+IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'OutputID') IS NULL
+    ALTER TABLE Scenario_Audit ADD OutputID uniqueidentifier NULL;
+
+-- MANDATORY one-time backfill for the scenario-lifecycle change.
+-- Generation now COMPLETES the session when it reaches its review barrier, which is what releases
+-- the asset (UX_Session_ActiveAsset is filtered on SessionStatus='active'). Sessions created
+-- before that change are parked at REVIEW while still 'active', and nothing will ever complete
+-- them: the only writer that used to do it was accept, which no longer completes anything. Left
+-- alone they hold their asset open forever and block every new session for it.
+-- Idempotent: the WHERE clause matches nothing on a second run.
+IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
+    UPDATE Scenario_Session
+        SET SessionStatus = 'completed',
+            CompletedAt   = COALESCE(CompletedAt, SYSUTCDATETIME()),
+            UpdatedAt     = SYSUTCDATETIME()
+    WHERE SessionStatus = 'active'
+        AND CurrentStage = 'REVIEW';
 
 IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NULL
 CREATE TABLE Threat_Library_Import_Run (
@@ -320,6 +369,11 @@ CREATE TABLE Scenario_Audit (
     Stage            nvarchar(32)  NULL,
     SubsystemID      int           NULL,
     EventType        nvarchar(40)  NOT NULL,
+    -- The scenario this event is ABOUT. NULL on every session- or subsystem-scoped event; set on
+    -- the per-scenario decision rows (scenario_accepted / scenario_rejected). A column, not a
+    -- DetailJSON key, because "the decision history of this scenario" is the question a GRC
+    -- reviewer actually asks, and JSON cannot be indexed for it.
+    OutputID         uniqueidentifier NULL,
     Decision         nvarchar(30)  NULL,
     Granularity      nvarchar(20)  NULL,
     ThreatTypeRefID  int           NULL,
@@ -648,6 +702,12 @@ CREATE INDEX IX_ScenarioOutput_SessionSubActive ON Threat_Scenario_Output(Sessio
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_SessionSubEvent' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
 CREATE INDEX IX_ScenarioAudit_SessionSubEvent ON Scenario_Audit(SessionID, SubsystemID, EventType, CreatedAt DESC);
+
+-- "Show me every decision on this scenario, newest first." Filtered so it costs nothing for the
+-- session/subsystem rows that carry no OutputID, which is the overwhelming majority of the ledger.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Output' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+    AND COL_LENGTH('dbo.Scenario_Audit', 'OutputID') IS NOT NULL
+    EXEC('CREATE INDEX IX_ScenarioAudit_Output ON Scenario_Audit(OutputID, CreatedAt DESC) WHERE OutputID IS NOT NULL');
 -- Speeds up dal.latest_next_set_outcome, polled on every status check. Not in
 -- invariants.REQUIRED_INDEXES: that list is for correctness, not performance.
 

@@ -37,6 +37,7 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     ("POST", "/v1/sessions/{session_id}/accept"),
     ("POST", "/v1/sessions/{session_id}/regenerate/scenarios"),
     ("POST", "/v1/sessions/{session_id}/scenarios/next-set"),
+    ("POST", "/v1/sessions/{session_id}/scenarios/reject"),
     ("POST", "/v1/sessions/{session_id}/cancel"),
     ("GET", "/v1/sessions/{session_id}/events"),
     ("GET", "/v1/sessions/{session_id}/accepted-scenarios"),

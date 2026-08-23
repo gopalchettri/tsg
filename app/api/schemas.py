@@ -5,7 +5,7 @@ can be found in one place without wading through route logic.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -532,9 +532,9 @@ _SCENARIO_EXAMPLE: JsonDict = {
         {"name": "Vendor firmware attestation at the RTU boot loader",
          "why": "Blocks unsigned images from ever loading on the device."},
     ],
-    # unmatched_suggestions precomputes exactly this diff: the one suggestion above with no
+    # unmatched_suggested_controls precomputes exactly this diff: the one suggestion above with no
     # counterpart in `controls`.
-    "unmatched_suggestions": [
+    "unmatched_suggested_controls": [
         {"name": "Vendor firmware attestation at the RTU boot loader",
          "why": "Blocks unsigned images from ever loading on the device."},
     ],
@@ -634,7 +634,7 @@ class ScenarioNarrative(BaseModel):
             "a gap in the control library. Empty for pre-v1.3 scenarios, which produced none."
         ),
     )
-    unmatched_suggestions: list[SuggestedControl] | None = Field(
+    unmatched_suggested_controls: list[SuggestedControl] | None = Field(
         default=None,
         description=(
             "The subset of suggested_controls with no counterpart in controls — the library-gap "
@@ -838,6 +838,51 @@ class AcceptResponse(BaseModel):
     user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     status: str = Field(description="Result of the accept request. Always 'completed' on success.")
     accepted_count: int = Field(description="Number of scenarios actually marked accepted by this request (0 for mode='none').")
+
+
+class RejectBody(BaseModel):
+    """Body for the "reject scenarios" endpoint — an explicit, recorded decline.
+
+    Always an explicit list. There is deliberately no `mode` and no reject-all: accept has three
+    modes because "accept everything" is the common case, while declining every scenario is not a
+    click a reviewer should be one mis-tap away from. Leaving scenarios pending is already a valid
+    resting state, so the destructive-looking shortcut buys nothing."""
+    model_config = ConfigDict(
+        json_schema_extra={"examples": [{"output_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]}]}
+    )
+
+    output_ids: list[str] = Field(
+        description=(
+            f"Output ids to reject (non-empty, max {_MAX_BATCH}). Rejecting records WHO declined "
+            "the scenario and WHEN; it does not delete it, and the scenario stays visible in "
+            "GET /results. An id already accepted comes back 404 with reason 'already_accepted' "
+            "— the two decisions are mutually exclusive. Rejecting the same id twice is a no-op "
+            "that preserves the original decision, not a rewrite of it."
+        ),
+    )
+
+    _canonicalize_output_ids = field_validator("output_ids")(_canonical_output_ids)
+
+    @model_validator(mode="after")
+    def _output_ids_within_bounds(self) -> RejectBody:
+        # Same reasoning as AcceptBody: bounds live here, not as Field constraints, so the
+        # message is written for the caller rather than by Pydantic's generic length check.
+        if not self.output_ids:
+            raise ValueError("output_ids is required (non-empty)")
+        if len(self.output_ids) > _MAX_BATCH:
+            raise ValueError(f"output_ids must have at most {_MAX_BATCH} items")
+        return self
+
+
+class RejectResponse(BaseModel):
+    """Response confirming a reject request was processed."""
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "rejected_count": 2}}
+    )
+
+    session_id: str = Field(description="Session's unique id (GUID).")
+    user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
+    rejected_count: int = Field(description="Number of scenarios actually marked rejected by this request.")
 
 
 class RegenerateResponse(BaseModel):
@@ -2053,7 +2098,7 @@ class TreatmentPlanBody(BaseModel):
         # this schema) — normalize here so a "+05:30" timestamp can't store the wrong wall time.
         if v is None or v.tzinfo is None:
             return v
-        return v.astimezone(timezone.utc).replace(tzinfo=None)
+        return v.astimezone(UTC).replace(tzinfo=None)
 
 
 class TreatmentPlanRegenerateBody(BaseModel):
@@ -2190,7 +2235,7 @@ class TreatmentPlanStatus(BaseModel):
                     "regenerate), enqueue_failed (broker was down; retry now), content_blocked "
                     "(a safety guardrail refused it — do NOT auto-retry unchanged), invalid_plan / "
                     "generation_failed (retryable). Null on RUNNING and COMPLETE.")
-    superseded: list["TreatmentPlanStatus"] | None = Field(
+    superseded: list[TreatmentPlanStatus] | None = Field(
         default=None,
         description="Regeneration history — every replaced version, newest first, each with its "
                     "own plan_id, status, review verdict and plan content. Populated only on "

@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import (
@@ -31,11 +31,12 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.enums import (
     RESERVABLE_REJECTIONS,
-    AcceptSubsetReason,
     ActorType,
+    AuditDecision,
     AuditEventType,
     CandidateKind,
     CandidateStatus,
+    ScenarioDecisionReason,
     ScenarioStatus,
     SessionStatus,
     StageStatus,
@@ -197,7 +198,7 @@ def inserted_pk(res: CursorResult[Any]) -> int:
 
 def now() -> datetime:
     """Current UTC timestamp — one clock convention for every CreatedAt/UpdatedAt/LeaseExpiresAt."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 def guid() -> str:
     """Sequential (COMB) uuid, never uuid4: uniqueidentifier PKs are clustered, so a random key
@@ -242,7 +243,7 @@ def active_tuning_overrides(sess: Session) -> dict[str, tuple[float | int, str |
     out: dict[str, tuple[float | int, str | None]] = {}
     for r in sess.execute(
         select(ct.TuningKey, ct.TuningValue, ct.ValueType, ct.EmbeddingModel)
-        .where(ct.IsActive == True, ct.IsDeleted == False)  # noqa: E712 — SQL boolean columns
+        .where(ct.IsActive == True, ct.IsDeleted == False)
     ):
         try:
             val: float | int = int(r.TuningValue) if r.ValueType == "int" else float(r.TuningValue)
@@ -339,7 +340,7 @@ def session_active() -> Any:
     so the bound form falls back to reading an UNFILTERED index over ALL sessions
     (IX_Session_EntityUser INCLUDE (SessionStatus)) — wrong asymptotics, not wrong answers, so it
     shows up as growth-proportional latency, never as a test failure. NOT needed where SessionID
-    (the PK) already locates the row and SessionStatus is a residual predicate: complete_session /
+    (the PK) already locates the row and SessionStatus is a residual predicate: reserve_session /
     cancel_session, acquire_lock's EXISTS, tasks/sessions.py's REVIEW CAS updates. Also not
     scenario_rows' dynamic status filter — a variable status can never match a filtered index."""
     return m.Scenario_Session.SessionStatus == bindparam("st", SessionStatus.active.value,
@@ -380,32 +381,65 @@ def get_session(sess: Session, session_id: str, entity_id: str) -> RowMapping | 
     ).mappings().first()
 
 
-def complete_session(sess: Session, session_id: str) -> bool:
-    """Accept path: flip the session to completed/APPROVED/COMPLETE, releasing the M4 lock.
+def reserve_session(sess: Session, session_id: str) -> bool:
+    """Next-set only: briefly take the asset back, CAS `completed` -> `active`.
 
-    StageStatus moves too, or the board shows a completed session as still AWAITING_DECISION.
-    CAS-fenced on `SessionStatus == active` — False means a concurrent writer already ended it and
-    the caller must surface the lost race."""
+    Generation completes the session at its review barrier, which releases the asset
+    (UX_Session_ActiveAsset is filtered on SessionStatus='active'). Next-set generates NEW
+    scenarios, so for the duration of that run the asset must be reserved again or a second
+    session could start against the same asset mid-generation. tasks._send_to_review flips it
+    back to `completed` when the run reaches the barrier again.
+
+    Regeneration deliberately does NOT call this: it rewrites scenarios that already exist and
+    must never re-reserve the asset. False means someone else holds the asset -> 409 asset_busy."""
     res = execute_dml(
         sess,
         update(m.Scenario_Session)
         .where(m.Scenario_Session.SessionID == session_id,
-            m.Scenario_Session.SessionStatus == SessionStatus.active)
-        .values(
-            SessionStatus=SessionStatus.completed,
-            CurrentStage=WorkflowStage.APPROVED,
-            StageStatus=StageStatus.COMPLETE,
-            CompletedAt=now(),
-            UpdatedAt=now(),
-        )
+            m.Scenario_Session.SessionStatus == SessionStatus.completed)
+        .values(SessionStatus=SessionStatus.active, CurrentStage=WorkflowStage.SCENARIO_GENERATION,
+                StageStatus=StageStatus.RUNNING, UpdatedAt=now())
     )
     return res.rowcount == 1
+
+
+def active_accept_candidates(sess: Session, session_id: str,
+                             subsystem_ids: list[int]) -> dict[str, tuple[str | None, int]]:
+    """{OutputID: (IdentityHash, ScenarioNumber)} for exactly the rows an ACCEPT-ALL would flip.
+
+    Mirrors mark_scenarios_accepted's subset=None predicates (active + complete + these
+    subsystems) so the pre-flight and the write can never disagree about the candidate set."""
+    out = m.Threat_Scenario_Output
+    return {str(r["OutputID"]): (r["IdentityHash"], r["ScenarioNumber"]) for r in sess.execute(
+        select(out.OutputID, out.IdentityHash, out.ScenarioNumber)
+        .where(out.SessionID == session_id,
+            out.SubsystemID.in_(subsystem_ids),
+            out.Status == ScenarioStatus.complete,
+            active(out.Superseded))
+    ).mappings()}
+
+
+def accepted_identity_pairs(sess: Session, session_id: str) -> dict[tuple[str, int], str]:
+    """{(IdentityHash, ScenarioNumber): OutputID} for scenarios this session has ALREADY accepted.
+
+    Seeds accept.py's duplicate-identity guard. Before per-scenario decisions this was dead code —
+    accept completed the session, so a session could never hold an accepted row at accept time.
+    Now that accept is repeatable on a completed session, an accept N days later CAN collide with
+    an earlier one, and UX_Scenario_ActiveAccepted would raise IntegrityError instead of a 409
+    naming the version already accepted."""
+    out = m.Threat_Scenario_Output
+    return {(r["IdentityHash"], r["ScenarioNumber"]): str(r["OutputID"]) for r in sess.execute(
+        select(out.OutputID, out.IdentityHash, out.ScenarioNumber)
+        .where(out.SessionID == session_id,
+            accepted(out.Accepted),
+            out.IdentityHash.is_not(None))
+    ).mappings()}
 
 
 def cancel_session(sess: Session, session_id: str) -> bool:
     """Cancel/reaper path → cancelled/CANCELLED, releasing the M4 lock. CurrentStage/StageStatus
     move too, or the board shows the stale pre-cancel stage forever. Same CAS fence as
-    `complete_session`: False means already terminal — a conflict."""
+    `reserve_session`: False means already terminal — a conflict."""
     res = execute_dml(
         sess,
         update(m.Scenario_Session)
@@ -451,16 +485,16 @@ def list_pending_promotions(sess: Session, *, limit: int, include_exhausted: boo
     full scan. `include_exhausted=False` hides sessions the sweep has already given up on
     (PromotionAttempts >= max_attempts), showing only what the sweep is still actively retrying."""
     ss = m.Scenario_Session
-    where = [ss.PromotionFailedAt.isnot(None)]
+    where: list[Any] = [ss.PromotionFailedAt.isnot(None)]
     if not include_exhausted:
         where.append(ss.PromotionAttempts < max_attempts)
-    return sess.execute(
+    return list(sess.execute(
         select(ss.SessionID, ss.EntityID, ss.AssetID, ss.AssetName, ss.PromotionFailedAt,
             ss.PromotionAttempts, ss.PromotionError, ss.PromotionUserID, ss.CompletedAt)
         .where(*where)
         .order_by(ss.PromotionFailedAt.asc())
         .limit(limit)
-    ).mappings().all()
+    ).mappings().all())
 
 
 def get_pending_promotion(sess: Session, session_id: str) -> RowMapping | None:
@@ -636,18 +670,19 @@ def acquire_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str
     return res.rowcount == 1
 
 
-def acquire_promotion_retry_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
-    """Like acquire_lock, but WITHOUT its `SessionStatus == active` requirement — for
-    reaper.retry_one_promotion/dismiss_promotion, which only ever run on a session that has
-    ALREADY completed (a promotion failure can only exist after accept's own Phase 1 has already
-    completed the session). acquire_lock's active-only guard exists to stop a stale/redelivered
-    LIVE PIPELINE task (regenerate, next-set, threat identification) from resuming work on a
-    session that's no longer live — that scenario cannot happen here, since this caller's entire
-    premise is "the session is done; only its post-completion promotion side-effect needs
-    revisiting." Reusing acquire_lock unmodified here would make it CAS-fail on every single
-    call, since a completed session is never 'active' — that was a real, 100%-reproducible bug,
-    not a race, caught by live-testing the retry/dismiss admin endpoints against a real
-    completed session."""
+def acquire_execution_lock(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
+    """Like acquire_lock, but fenced on "not cancelled" instead of "is active" — the lock for every
+    EXECUTION that legitimately runs against a session whose generation is already finished.
+
+    Since generation now completes the session at its review barrier (tasks._send_to_review), a
+    session sitting at REVIEW awaiting per-scenario decisions is `completed`, not `active`. Accept,
+    regenerate and promotion-retry all run in exactly that state, so acquire_lock's
+    `SessionStatus == active` fence would CAS-fail on every call for all three — the same
+    100%-reproducible bug that originally forced a separate promotion-retry lock, now generalised.
+
+    `cancelled` is still refused: that is the one status where a stale or redelivered task must not
+    resume work. Next-set is the exception that still needs acquire_lock semantics indirectly — it
+    reserves the session (dal.reserve_session) before its worker runs, so it holds `active` legitimately."""
     res = execute_dml(
         sess,
         update(m.Subsystem_Stage_State)
@@ -656,6 +691,10 @@ def acquire_promotion_retry_lock(sess: Session, session_id: str, subsystem_id: i
             m.Subsystem_Stage_State.SubsystemID == subsystem_id,
             m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK,
             m.Subsystem_Stage_State.Status == StageStatus.IDLE,
+            ~(select(1)
+              .where(m.Scenario_Session.SessionID == session_id,
+                     m.Scenario_Session.SessionStatus == SessionStatus.cancelled)
+              .exists()),
         )
         .values(
             Status=StageStatus.RUNNING, ActiveTaskID=task_id,
@@ -1080,9 +1119,9 @@ def active_threat_rules(sess: Session, threat_type_ids: list[int]) -> list[dict]
     return [dict(r) for r in sess.execute(
         select(ct.RuleType, ct.ThreatTypeID, ct.RuleKey, ct.RuleValue, ct.Metadata)
         .where(ct.ThreatTypeID.in_(threat_type_ids),
-            ct.IsActive == True, ct.IsDeleted == False,  # noqa: E712 — SQLAlchemy binary expr
+            ct.IsActive == True, ct.IsDeleted == False,
             exists().where(tt.ThreatTypeID == ct.ThreatTypeID,
-                        tt.IsActive == True, tt.IsDeleted == False))  # noqa: E712
+                        tt.IsActive == True, tt.IsDeleted == False))
         .order_by(ct.ThreatRuleID)
     ).mappings()]
 
@@ -1094,7 +1133,7 @@ def active_category_names(sess: Session) -> list[str]:
     tc = m.Threat_Category
     return [r[0] for r in sess.execute(
         select(tc.ThreatCategoryName)
-        .where(tc.IsActive == True, tc.IsDeleted == False)  # noqa: E712
+        .where(tc.IsActive == True, tc.IsDeleted == False)
         .order_by(tc.ThreatCategoryID)
     )]
 
@@ -1128,7 +1167,7 @@ def _query_active_actor_names(sess: Session, cap: int) -> list[str]:
         select(ta.ThreatActorName)
         .select_from(ta)
         .outerjoin(tm, tm.ThreatActorID == ta.ThreatActorID)
-        .where(ta.IsActive == True, ta.IsDeleted == False)  # noqa: E712
+        .where(ta.IsActive == True, ta.IsDeleted == False)
         .group_by(ta.ThreatActorID, ta.ThreatActorName, ta.CreatedAt)
         .order_by(link_count.desc(), ta.CreatedAt.desc(), ta.ThreatActorID)
         .limit(cap)
@@ -1180,7 +1219,7 @@ def active_actors(sess: Session) -> list[tuple[int, str]]:
     ta = m.Threat_Actor
     return [(r[0], r[1]) for r in sess.execute(
         select(ta.ThreatActorID, ta.ThreatActorName)
-        .where(ta.IsActive == True, ta.IsDeleted == False)  # noqa: E712
+        .where(ta.IsActive == True, ta.IsDeleted == False)
         .order_by(ta.ThreatActorID)
     )]
 
@@ -1241,6 +1280,11 @@ def scenario_rows(sess: Session, *, entity_ids: set[str], user_id: str | None = 
     nullable copy on the output row. Same for `user_id`: the session's UserID is the accountable
     owner, the output copy is provenance.
 
+    `user_id` is an OPTIONAL filter: None means every user in the entity, which is what the
+    entity-wide list route wants. Entity scope is the authorization boundary — see
+    sessions.py::get_authorized_session for why per-user access control was considered and
+    deliberately not adopted.
+
     `status`: 'accepted' filters the scenario flag, the others filter the parent session. Failure
     cards never appear — they have no narrative. Newest first, OutputID tiebreak."""
     out, ss = m.Threat_Scenario_Output, m.Scenario_Session
@@ -1278,46 +1322,126 @@ def scenario_row(sess: Session, session_id: str, output_id: str) -> RowMapping |
     ).mappings().first()
 
 
-def mark_scenarios_accepted(
-    sess: Session, session_id: str, subsystem_ids: list[int], subset: list[str] | None = None,
-) -> int:
-    """Accepted=1 on the chosen scenarios for these subsystems (§5.7), optionally narrowed
-    to `subset` OutputIDs — `subset=[]` means "accept none", `subset=None` means "accept all".
+#: decision -> the audit event that records it. A dict, not an if/else chain:
+#: `AuditDecision.partial` has no entry, so passing a CALL-level decision where a per-scenario one
+#: belongs raises KeyError here instead of writing something half-meaningful. A third decision
+#: means adding a row here and nothing else.
+_DECISION_EVENT = {
+    AuditDecision.accept: AuditEventType.scenario_accepted,
+    AuditDecision.reject: AuditEventType.scenario_rejected,
+}
 
-    Accepted is DECOUPLED from Superseded: an explicit subset may name ANY version of a
-    scenario, current or superseded — the human's pick, not generation recency, is what
-    Accepted records (UX_Scenario_ActiveAccepted enforces one accepted version per identity;
-    accept.py's pre-flight duplicate-identity guard rejects a subset naming two versions of
-    one scenario before this runs). Accept-all still means "the current version of everything"
-    and keeps the Superseded=0 predicate. This function never writes Superseded.
 
-    Stamps `AcceptedSubsetJSON` only for a partial accept, so non-NULL means precisely "part of an
-    explicit partial pick" and a reviewer needs no Scenario_Audit join.
+def _decidable_where(session_id: str, subsystem_ids: list[int], decision: AuditDecision,
+                     subset: list[str] | None) -> list:
+    """The rows a decision may touch — THE single definition, shared by the write
+    (`decide_scenarios`) and the refusal explainer (`undecidable_subset_reasons`).
 
-    Returns rows actually flipped, so the caller can tell "N requested, M<N matched" from a clean
-    accept — otherwise a subset id naming a wrong row vanishes silently."""
-    where = [m.Threat_Scenario_Output.SessionID == session_id,
-            m.Threat_Scenario_Output.SubsystemID.in_(subsystem_ids),
-            # complete only: a FAILURE CARD (null scenario) must never be marked Accepted — it
-            # would reach downstream consumers as an accepted scenario with no content. A subset
-            # naming one simply doesn't match, and the caller reports it as not-acceptable (404).
-            m.Threat_Scenario_Output.Status == ScenarioStatus.complete]
+    Both used to spell these predicates out separately, kept in step by a comment reading "mirrors
+    mark_scenarios_accepted". That is the drift this removes: a predicate added here changes what
+    gets written AND what the 404 says, together, or not at all.
+
+    The opposite decision's exclusion is part of it. Accept and reject are mutually exclusive
+    (CK_ScenarioOutput_DecisionExclusive), and while they were two independent UPDATEs each owned
+    half of that invariant with no way to see the other half — so accepting a rejected scenario
+    reached the database and surfaced as an IntegrityError the accept path mislabelled
+    `duplicate_identity`. The constraint is now a backstop, not the arbiter."""
+    out = m.Threat_Scenario_Output
+    where = [out.SessionID == session_id,
+            out.SubsystemID.in_(subsystem_ids),
+            # complete only: a FAILURE CARD (null scenario) must never carry a decision — it would
+            # reach downstream consumers as an accepted scenario with no content. A subset naming
+            # one simply does not match, and the caller reports it as undecidable (404).
+            out.Status == ScenarioStatus.complete,
+            out.RejectedAt.is_(None) if decision is AuditDecision.accept else out.Accepted == 0]
     if subset is not None:
-        where.append(m.Threat_Scenario_Output.OutputID.in_(subset))
+        where.append(out.OutputID.in_(subset))
     else:
-        where.append(active(m.Threat_Scenario_Output.Superseded))
-    accepted_subset_json = json.dumps(subset) if subset is not None else None
-    res = execute_dml(sess, update(m.Threat_Scenario_Output).where(*where)
-                    .values(Accepted=1, AcceptedSubsetJSON=accepted_subset_json))
+        # Decide-all means "the current version of everything".
+        where.append(active(out.Superseded))
+    return where
+
+
+def decide_scenarios(
+    sess: Session, session_id: str, subsystem_ids: list[int], *, decision: AuditDecision,
+    subset: list[str] | None = None, tenant_id: str | None = None, entity_id: str | None = None,
+    user_id: str | None = None,
+) -> int:
+    """Record ONE reviewer decision per scenario — the row write and its ledger entry, together.
+
+    `subset=[]` decides none; `subset=None` decides the current version of everything.
+
+    The two writes are fused deliberately. They used to be a bare UPDATE here plus an
+    `append_audit` call back in the route, paired only by convention — so the trail was
+    CALL-scoped (one row saying "a review happened", with the ids buried in DetailJSON) and no
+    query could answer "who accepted scenario 3, and when". A decision can no longer be written
+    without its ledger entry, because there is no second step left to forget. A guard in
+    scripts/test_pipeline_guards.py fails the build if anything else writes Accepted/RejectedAt.
+
+    Accepted is DECOUPLED from Superseded: an explicit subset may name ANY version of a scenario,
+    current or superseded — the human's pick, not generation recency, is what the decision records
+    (UX_Scenario_ActiveAccepted enforces one accepted version per identity; accept.py's pre-flight
+    duplicate-identity guard rejects a subset naming two versions before this runs). This function
+    never writes Superseded.
+
+    Reject COALESCEs both of its columns, so deciding twice is a true no-op rather than a rewrite
+    of who declined and when — an append-only ledger must not be able to falsify its first entry.
+
+    `AcceptedSubsetJSON` is stamped only for a partial accept, so non-NULL means precisely "part of
+    an explicit partial pick" and a reviewer needs no Scenario_Audit join.
+
+    Returns rows actually decided, so the caller can tell "N requested, M<N matched" from a clean
+    run — otherwise a subset id naming a wrong row vanishes silently."""
+    event_type = _DECISION_EVENT[decision]
+    out = m.Threat_Scenario_Output
+    where = _decidable_where(session_id, subsystem_ids, decision, subset)
+
+    # Read first, so each scenario gets its own ledger row. Exact rather than racy: every caller
+    # holds this session's `_LOCK` (acquire_execution_lock) for the whole decision, so nothing else
+    # can add or remove a matching row between this SELECT and the UPDATE below.
+    rows = sess.execute(
+        select(out.OutputID, out.Accepted, out.RejectedAt).where(*where)).mappings().all()
+    if not rows:
+        return 0
+    # The ledger records TRANSITIONS, not matches. A row already carrying this decision still
+    # matches (deciding twice is idempotent, not a 404), but writing a second audit row for it
+    # would put two decisions in the trail where the reviewer made one — a double-click, or a
+    # retried request, silently corrupting the very evidence this per-scenario trail exists to be.
+    changed = [str(r["OutputID"]) for r in rows
+            if not (r["Accepted"] if decision is AuditDecision.accept else r["RejectedAt"])]
+
+    if decision is AuditDecision.accept:
+        values: dict = {"Accepted": 1,
+                        "AcceptedSubsetJSON": json.dumps(subset) if subset is not None else None}
+    else:
+        _now = now()
+        values = {"RejectedAt": func.coalesce(out.RejectedAt, _now),
+                "RejectedBy": func.coalesce(out.RejectedBy, user_id)}
+    res = execute_dml(sess, update(out).where(*where).values(**values))
+
+    if changed:
+        # Resolve the actor ONCE; audit_row's own back-fill would do a PK lookup per row.
+        actor = user_id if user_id is not None else sess.execute(
+            select(m.Scenario_Session.UserID)
+            .where(m.Scenario_Session.SessionID == session_id)).scalar()
+        sess.execute(insert(m.Scenario_Audit), [
+            audit_row(sess, AuditID=guid(), SessionID=session_id, TenantID=tenant_id,
+                    EntityID=entity_id, OutputID=oid, EventType=event_type, Decision=decision,
+                    ActorUserID=actor)
+            for oid in changed])
     return res.rowcount
 
 
-def unacceptable_subset_reasons(
+def undecidable_subset_reasons(
     sess: Session, session_id: str, subset: list[str], subsystem_ids: list[int],
-) -> dict[str, AcceptSubsetReason]:
-    """Why each requested OutputID could not be accepted — one AcceptSubsetReason per id
-    mark_scenarios_accepted would reject, mirroring its predicates. Accepted ids are absent.
-    No `superseded` reason: an explicitly named older version is a legitimate accept now.
+    *, decision: AuditDecision,
+) -> dict[str, ScenarioDecisionReason]:
+    """Why each requested OutputID could not be decided — one ScenarioDecisionReason per id
+    `decide_scenarios` would skip. Decidable ids are absent.
+
+    Asks `_decidable_where` which ids the write will actually touch rather than re-deriving the
+    rule, so a new predicate there cannot leave this explaining the wrong thing. No `superseded`
+    reason: an explicitly named older version is a legitimate accept.
 
     FAILURE-PATH ONLY: run it once the counts already disagree, since that request is about to 404
     and roll back anyway.
@@ -1327,31 +1451,52 @@ def unacceptable_subset_reasons(
     unauthenticated guess."""
     out = m.Threat_Scenario_Output
     rows = {str(r["OutputID"]): r for r in sess.execute(
-        select(out.OutputID, out.SubsystemID, out.Status)
+        select(out.OutputID, out.SubsystemID, out.Status, out.Accepted, out.RejectedAt)
         .where(out.SessionID == session_id, out.OutputID.in_(subset))
     ).mappings()}
-    reasons: dict[str, AcceptSubsetReason] = {}
+    decidable = {str(r[0]) for r in sess.execute(
+        select(out.OutputID).where(*_decidable_where(session_id, subsystem_ids, decision, subset)))}
+    reasons: dict[str, ScenarioDecisionReason] = {}
     for oid in subset:
+        if oid in decidable:
+            continue
         row = rows.get(oid)
         if row is None:
-            reasons[oid] = AcceptSubsetReason.unknown     # absent here, or another session's
+            reasons[oid] = ScenarioDecisionReason.unknown     # absent here, or another session's
         elif row["Status"] != ScenarioStatus.complete:
-            reasons[oid] = AcceptSubsetReason.failure_card  # no content, must never be accepted
+            reasons[oid] = ScenarioDecisionReason.failure_card  # no content, never decidable
+        elif decision is AuditDecision.accept and row["RejectedAt"] is not None:
+            reasons[oid] = ScenarioDecisionReason.already_rejected
+        elif decision is AuditDecision.reject and row["Accepted"]:
+            reasons[oid] = ScenarioDecisionReason.already_accepted
         elif row["SubsystemID"] not in subsystem_ids:
-            reasons[oid] = AcceptSubsetReason.subsystem_not_awaiting_decision
+            reasons[oid] = ScenarioDecisionReason.subsystem_not_awaiting_decision
     return reasons
 
 
-def scenario_identity_pairs(sess: Session, session_id: str, output_ids: list[str]) -> dict[str, tuple[str | None, int]]:
+def scenario_identity_pairs(sess: Session, session_id: str, output_ids: list[str],
+                            subsystem_ids: list[int]) -> dict[str, tuple[str | None, int]]:
     """OutputID -> (IdentityHash, ScenarioNumber) for accept.py's pre-flight duplicate-identity
     guard: a subset naming two versions of ONE scenario must be rejected BEFORE any write —
     after mark_scenarios_accepted, the only thing left to catch it would be the
     UX_Scenario_ActiveAccepted unique index surfacing as a raw IntegrityError.
-    Session-scoped for the same tenant-boundary reason as unacceptable_subset_reasons."""
+    Session-scoped for the same tenant-boundary reason as unacceptable_subset_reasons.
+
+    Asks `_decidable_where` for the accept predicate rather than restating it, so the guard sees
+    exactly the rows that WOULD be flipped. Restating it is how this drifted before: an id the
+    write will not touch — a failure card, a row in a subsystem not awaiting decision, or now an
+    already-rejected one — could still collide on identity here and 409 an accept that was never
+    going to violate the index.
+
+    Empty `output_ids` returns early: `subset=[]` is the decide-none path, and SQLAlchemy renders
+    an empty IN as a real round trip (`... IN (NULL) AND (1 != 1)`). Guarded HERE rather than at
+    the call site so every present and future caller inherits it."""
+    if not output_ids:
+        return {}
     out = m.Threat_Scenario_Output
     return {str(r["OutputID"]): (r["IdentityHash"], r["ScenarioNumber"]) for r in sess.execute(
         select(out.OutputID, out.IdentityHash, out.ScenarioNumber)
-        .where(out.SessionID == session_id, out.OutputID.in_(output_ids))
+        .where(*_decidable_where(session_id, subsystem_ids, AuditDecision.accept, output_ids))
     ).mappings()}
 
 
@@ -1529,7 +1674,7 @@ def _entry_ids(scenario_json: str | None, key: str) -> list[int]:
     Tolerates every pre-coverage row: a scenario written before entry-point grounding existed
     simply has no such key and yields [], which the caller reads as "no coverage signal"."""
     try:
-        data = json.loads(scenario_json) or {}
+        data = json.loads(scenario_json or "{}") or {}
     except (TypeError, ValueError):
         return []
     raw = data.get(key)
@@ -1819,10 +1964,10 @@ def candidate_identity_rows(sess: Session) -> list:
     unique index over free text). Cost: one duplicate admin card; close_candidate_review's
     CAS makes resolving both safe."""
     cr = m.Threat_Candidate_Review
-    return sess.execute(
+    return list(sess.execute(
         select(cr.CandidateKind, cr.ProposedGenericName, cr.ProposedName)
         .where(cr.Status.in_((CandidateStatus.pending, CandidateStatus.rejected)))
-    ).all()
+    ).all())
 
 
 def threat_type_active(sess: Session, type_id: int) -> bool:
@@ -1845,7 +1990,8 @@ def find_active_type_id_by_name(sess: Session, name: str | None) -> int | None:
     natural key is (name, category, sector), so one name can legally belong to several types —
     master-data links are never guessed, so >1 match (or a NULL/blank name, e.g. a legacy card
     predating the ProposedType stamp) returns None and the caller skips the link. Never mints."""
-    if not (name or "").strip():
+    name = (name or "").strip()
+    if not name:
         return None
     ids = sess.execute(
         select(m.Threat_Type.ThreatTypeID).where(
@@ -1879,9 +2025,9 @@ def list_pending_candidates(sess: Session, *, limit: int, kind: str | None = Non
             stmt = stmt.where(cr.CandidateKind == CandidateKind.actor)
         else:
             stmt = stmt.where(or_(cr.CandidateKind == CandidateKind.threat, cr.CandidateKind.is_(None)))
-    return sess.execute(
+    return list(sess.execute(
         stmt.order_by(cr.CreatedAt.asc()).limit(limit)
-    ).mappings().all()
+    ).mappings().all())
 
 
 def get_candidate(sess: Session, candidate_id: str) -> RowMapping | None:
@@ -1947,7 +2093,7 @@ def get_library_row(sess: Session, model, pk_col, pk_value: int, *, include_dele
     a deleted row must 404 like a missing one, or DELETE becomes silently repeatable."""
     stmt = select(model).where(pk_col == pk_value)
     if not include_deleted:
-        stmt = stmt.where(model.IsDeleted == False)  # noqa: E712
+        stmt = stmt.where(model.IsDeleted == False)
     row = sess.execute(stmt).scalar_one_or_none()
     if row is None:
         raise NotFoundError(f"{model.__tablename__} {pk_value} not found")
@@ -1960,7 +2106,7 @@ def update_library_row(sess: Session, model, pk_col, pk_value: int, values: dict
     NotFoundError; IntegrityError escapes for the caller to translate. The 404 comes from the
     UPDATE's own rowcount, not a preceding SELECT — one statement, no window for a concurrent
     soft-delete. Missing and already-deleted are deliberately the same."""
-    res = execute_dml(sess, update(model).where(pk_col == pk_value, model.IsDeleted == False)  # noqa: E712
+    res = execute_dml(sess, update(model).where(pk_col == pk_value, model.IsDeleted == False)
                     .values(**values, UpdatedAt=now(), UpdatedBy=user_id))
     if not res.rowcount:
         raise NotFoundError(f"{model.__tablename__} {pk_value} not found")
@@ -1971,7 +2117,7 @@ def soft_delete_library_row(sess: Session, model, pk_col, pk_value: int, user_id
     Never a hard DELETE: completed sessions reference these ids. The natural-key indexes are
     filtered on IsDeleted=0, so the freed name/code is reusable. Same rowcount-not-SELECT reasoning
     as update_library_row, so two concurrent deletes can't both report success."""
-    res = execute_dml(sess, update(model).where(pk_col == pk_value, model.IsDeleted == False)  # noqa: E712
+    res = execute_dml(sess, update(model).where(pk_col == pk_value, model.IsDeleted == False)
                     .values(IsDeleted=True, UpdatedAt=now(), UpdatedBy=user_id))
     if not res.rowcount:
         raise NotFoundError(f"{model.__tablename__} {pk_value} not found")
@@ -2196,7 +2342,7 @@ def active_plan_rows(sess: Session, session_id: str) -> list[RowMapping]:
         return []
     p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
     st, it = m.Scoped_Threat, m.Identified_Threat
-    return sess.execute(
+    return list(sess.execute(
         select(p.PlanID, p.SessionID, p.OutputID, p.Status,
             p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
             p.ErrorMessage, p.RiskLevel, p.ReviewStatus,
@@ -2207,7 +2353,7 @@ def active_plan_rows(sess: Session, session_id: str) -> list[RowMapping]:
                     .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
         .where(p.SessionID == session_id, active(p.Superseded))
-    ).mappings().all()
+    ).mappings().all())
 
 
 def review_plan(sess: Session, plan_id: str, *, status: str, comment: str | None,
@@ -2239,14 +2385,14 @@ def session_plan_board(sess: Session, session_id: str, *,
             p.CompletedAt.label("PlanCompletedAt")]
     if include_plan:
         cols.append(p.PlanJSON)
-    return sess.execute(
+    return list(sess.execute(
         select(*cols)
         .select_from(out.__table__.outerjoin(
             p, and_(p.OutputID == out.OutputID, active(p.Superseded))))
         # Accepted alone — the accepted version may be superseded (decoupled flags).
         .where(out.SessionID == session_id, accepted(out.Accepted))
         .order_by(out.CreatedAt, out.OutputID)
-    ).mappings().all()
+    ).mappings().all())
 
 
 def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
@@ -2299,9 +2445,9 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
         stmt = stmt.where(p.ReviewStatus == review_status)
     if risk_level is not None:
         stmt = stmt.where(p.RiskLevel == risk_level)
-    return sess.execute(
+    return list(sess.execute(
         stmt.order_by(p.CreatedAt.desc(), p.PlanID).limit(limit).offset(offset)
-    ).mappings().all()
+    ).mappings().all())
 
 
 def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[RowMapping]:
@@ -2310,12 +2456,12 @@ def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[Ro
     if not _valid_guid(output_id):
         return []
     p = m.Risk_Treatment_Plan
-    return sess.execute(
+    return list(sess.execute(
         select(p.PlanID, p.Status, p.Superseded, p.ErrorMessage, p.RiskLevel, p.ReviewStatus,
             p.ReviewedBy, p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
         .where(p.SessionID == session_id, p.OutputID == output_id)
         .order_by(p.CreatedAt)
-    ).mappings().all()
+    ).mappings().all())
 
 
 def superseded_plan_rows(sess: Session, session_id: str,
@@ -2359,7 +2505,7 @@ def superseded_plan_rows(sess: Session, session_id: str,
         # Accepted alone — board visibility follows acceptance, not generation recency.
         stmt = (stmt.join(out, out.OutputID == p.OutputID)
                     .where(accepted(out.Accepted)))
-    return sess.execute(stmt).mappings().all()
+    return list(sess.execute(stmt).mappings().all())
 
 
 def plan_row_by_id(sess: Session, session_id: str, output_id: str, plan_id: str) -> RowMapping | None:
@@ -2386,11 +2532,11 @@ def treatment_audit_rows(sess: Session, session_id: str) -> list[RowMapping]:
     """All treatment-plan audit events of one session, oldest first; the trail endpoint narrows
     them to one scenario in Python, since DetailJSON is opaque to SQL here."""
     a = m.Scenario_Audit
-    return sess.execute(
+    return list(sess.execute(
         select(a.EventType, a.ActorUserID, a.ActorType, a.DetailJSON, a.CreatedAt)
         .where(a.SessionID == session_id, a.EventType.in_(_TREATMENT_EVENTS))
         .order_by(a.CreatedAt, a.AuditID)
-    ).mappings().all()
+    ).mappings().all())
 
 
 def entity_treatment_audit_rows(sess: Session, entity_id: str, *, since=None, until=None,
@@ -2408,9 +2554,9 @@ def entity_treatment_audit_rows(sess: Session, entity_id: str, *, since=None, un
         stmt = stmt.where(a.CreatedAt <= until)
     if actor is not None:
         stmt = stmt.where(a.ActorUserID == actor)
-    return sess.execute(
+    return list(sess.execute(
         stmt.order_by(a.CreatedAt.desc(), a.AuditID.desc()).limit(limit).offset(offset)
-    ).mappings().all()
+    ).mappings().all())
 
 
 def prompt_logs_for_plan(sess: Session, plan_id: str) -> list[RowMapping]:
@@ -2420,9 +2566,9 @@ def prompt_logs_for_plan(sess: Session, plan_id: str) -> list[RowMapping]:
     if not _valid_guid(plan_id):
         return []
     pl = m.Prompt_Log
-    return sess.execute(
+    return list(sess.execute(
         select(pl.Prompt, pl.ResponseText, pl.Model, pl.ModelVersion, pl.PromptVersion,
             pl.ParseSucceeded, pl.CreatedAt)
         .where(pl.CorrelationID == plan_id)
         .order_by(pl.CreatedAt)
-    ).mappings().all()
+    ).mappings().all())

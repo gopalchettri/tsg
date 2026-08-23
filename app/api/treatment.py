@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import io
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Response
@@ -178,7 +178,10 @@ def _launch_generation(session_id: str, output_id: str, principal: Principal, *,
     the active-row read a complete existence check); `fence_plan_id` is regenerate's TOCTOU
     fence: the retire targets exactly the row whose snapshot was read, or fails the CAS."""
     with db_session() as sess:
-        scenario_session = get_authorized_session(sess, session_id, principal)
+        # Called for its SIDE EFFECT — this raises on an unauthorized caller and IS the
+        # authorization boundary. The return value is unused: the board load behind it omits
+        # the JSON blobs, so the full row is re-read via dal.load_session just below.
+        get_authorized_session(sess, session_id, principal)
 
         # Full session row — the board load behind get_authorized_session deliberately omits
         # the AssetContextJSON/SubsystemsJSON blobs the snapshot needs.
@@ -404,7 +407,7 @@ def _naive_utc(dt: datetime) -> datetime:
     aware value must be CONVERTED to UTC before the offset is stripped — a bare
     replace(tzinfo=None) on a +05:30 timestamp would shift every comparison by 5.5 hours.
     Naive input is trusted as UTC already (that is what the DB hands back)."""
-    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+    return dt.astimezone(UTC).replace(tzinfo=None) if dt.tzinfo else dt
 
 
 def _present_status(status: str, error_message: str | None, updated_at: datetime | None,

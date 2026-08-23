@@ -28,7 +28,11 @@ class WorkflowStage(StrEnum):
     THREAT_IDENTIFICATION = "THREAT_IDENTIFICATION"  # Stage 1: AI proposes STRIDE threats, grounded against the library
     SCENARIO_GENERATION = "SCENARIO_GENERATION"      # Stage 2: scenario per selected threat
     REVIEW = "REVIEW"                                # every subsystem hit its review barrier; waiting on the human
-    APPROVED = "APPROVED"                            # accepted — terminal, pairs with SessionStatus.completed
+    APPROVED = "APPROVED"                            # HISTORICAL: written by the pre-lifecycle accept path,
+                                                     # which completed the session on the first accept. Nothing
+                                                     # produces it now — generation completes the session AT
+                                                     # REVIEW so scenarios stay individually decidable — but
+                                                     # rows created before that change still carry it
     CANCELLED = "CANCELLED"
 
 
@@ -172,6 +176,13 @@ class AuditEventType(StrEnum):
     review_decision = "review_decision"                # the human's verdict at the review gate
     scenarios_accepted = "scenarios_accepted"          # Stage-2 outputs flipped Accepted=1 — NOT written on a
                                                     # mode="none" reject (nothing flipped)
+    scenario_accepted = "scenario_accepted"            # ONE row per scenario accepted, carrying OutputID. The
+                                                    # session-scoped rows above say a review action happened;
+                                                    # these say WHICH scenario, by WHOM, WHEN — the question a
+                                                    # GRC reviewer asks, now that decisions land days apart
+    scenario_rejected = "scenario_rejected"            # ONE row per scenario explicitly declined, carrying
+                                                    # OutputID. Written by the same dal.decide_scenarios call
+                                                    # that sets RejectedAt, so the two cannot diverge
     regeneration_completed = "regeneration_completed"  # one regenerate request finished its stage re-runs
     threat_regrounded = "threat_regrounded"            # reserved — only `scenario` regen is implemented
     subsystem_advanced = "subsystem_advanced"          # written at the START of a subsystem's work
@@ -355,26 +366,39 @@ class ReviewGateReason(StrEnum):
     Means "your request never ran", not "it ran and found nothing" (ClickOutcomeReason).
     Deliberately absent from cascade.py::_REASON_INFO — gate 409s carry `reason` plus the
     exception's own message, and adding entries would reshape every gate 409 body."""
-    session_completed = "session_completed"              # terminal: the review decision is already final
+    session_completed = "session_completed"              # terminal: the session is not at a review barrier
     session_cancelled = "session_cancelled"              # terminal: start a new session for the asset
     generation_in_progress = "generation_in_progress"    # transient: not at the REVIEW barrier yet
+    asset_busy = "asset_busy"                            # transient: next-set could not re-reserve the
+                                                         # asset — another execution holds it right now.
+                                                         # The one member NOT produced by
+                                                         # review_gate_reason (sessions.py::_do_next_set
+                                                         # raises it from dal.reserve_session's CAS)
 
 
-class AcceptSubsetReason(StrEnum):
-    """Why one OutputID in a partial-accept subset could not be accepted. The first three are
-    per-id codes inside the accept 404's `details.unacceptable` (produced by
-    dal.unacceptable_subset_reasons); `duplicate_identity` instead rides the accept 409's
-    `details.reason`, raised pre-flight by accept.py::_assert_one_version_per_scenario —
-    ClickOutcomeReason-style, one vocabulary across two channels. All are worded for humans
-    by accept.py::_REASON_TEXT (a test pins the two in step). Formerly bare string literals,
-    contrary to this module's one-source-of-truth rule.
+class ScenarioDecisionReason(StrEnum):
+    """Why one OutputID could not be DECIDED — accepted or rejected. Per-id codes inside the
+    404's `details.unacceptable` (produced by dal.undecidable_subset_reasons);
+    `duplicate_identity` instead rides the accept 409's `details.reason`, raised pre-flight by
+    accept.py::_assert_one_version_per_scenario — ClickOutcomeReason-style, one vocabulary across
+    two channels. All are worded for humans by accept.py::_REASON_TEXT (a test pins the two in
+    step). Formerly bare string literals, contrary to this module's one-source-of-truth rule.
+
+    Covers BOTH decisions on purpose. It was `ScenarioDecisionReason` while accept was the only
+    decision a reviewer could make; keeping that name once reject shipped is precisely how a
+    second, near-identical enum gets started. Wire values are unchanged by the rename — this
+    enum is not an OpenAPI Literal, only its strings travel.
 
     No `superseded` member: since Accepted was decoupled from Superseded, naming an older
     version is a legitimate accept, not a rejection cause."""
     unknown = "unknown"                                                # not a scenario in this session
-    failure_card = "failure_card"                                      # generation failed; no content to accept
+    failure_card = "failure_card"                                      # generation failed; no content to decide
     subsystem_not_awaiting_decision = "subsystem_not_awaiting_decision"  # its stage isn't at the review barrier
     duplicate_identity = "duplicate_identity"                          # subset names 2+ versions of ONE scenario
+    already_accepted = "already_accepted"                              # reject refused: accepting is the standing
+                                                                    # decision on this scenario
+    already_rejected = "already_rejected"                              # accept refused: rejecting is the standing
+                                                                    # decision on this scenario
 
 
 class CandidateKind(StrEnum):

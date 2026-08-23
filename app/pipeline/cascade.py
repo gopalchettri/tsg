@@ -1,13 +1,9 @@
-"""Regeneration cascade — redo a subsystem's scenario(s) without re-running the whole
-pipeline. Row-scoped, so redoing one bad item doesn't discard its siblings.
+"""Create or replace scenarios for one session and subsystem.
 
-Reuses tasks.py's CAS/lock/epoch machinery: `dal.acquire_lock` for the `_LOCK` mutex,
-`dal.claim_stage`'s `epoch`, and `decide_session_outcome` to re-enter REVIEW.
-
-The epoch is reserved by the CALLER (the endpoint's session-level CAS, once per logical
-request) and passed in — never minted here. A Celery redelivery (acks_late) re-executes at
-the SAME epoch, so claim_stage's CAS no-ops a level that already landed; a freshly-minted
-epoch would destructively re-run the whole hop.
+The public functions take a SQLAlchemy session, session data, subsystem and epoch identifiers,
+target IDs when regenerating, and an LLM client. They write scenario, stage, audit, and SSE
+records, then return the session outcome. Reused epochs make redelivery idempotent. Invalid or
+stale target IDs raise a conflict; LLM capacity errors are re-raised for task retry handling.
 """
 from __future__ import annotations
 
@@ -40,19 +36,15 @@ from app.sse import bus
 
 log = get_logger(__name__)
 
-# sessions.py::post_regenerate resets exactly these levels to IDLE before dispatching;
-# run_regeneration MUST regenerate the same set, or the endpoint resets a stage nothing
-# regenerates (stuck IDLE → reaper).
+# Regeneration resets this level before dispatch.
 LEVELS_BY_GRANULARITY = {
     RegenGranularity.scenario: (SubsystemLevel.SCENARIOS,),
 }
 
-# The endpoint resets ONLY SCENARIOS for a next-set click; an additive find_threats, when
-# needed, resets THREATS itself (see run_next_set).
+# Next-set requests reset scenarios; additive threat generation also resets threats.
 NEXT_SET_LEVELS = (SubsystemLevel.SCENARIOS,)
 
-# reason code -> (log-facing detail, end-user-facing message). ONE copy so the SSE payload, the
-# audit DetailJSON and every consumer say the same thing.
+# Maps a reason code to audit detail and the client message.
 _REASON_INFO: dict[str, dict[str, str]] = {
     "no_new_threats_found": {
         "detail": "Every threat identified for this asset already has an active scenario "
@@ -95,12 +87,15 @@ _REASON_INFO: dict[str, dict[str, str]] = {
 
 @contextmanager
 def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, kind: str) -> Generator[bool]:
-    """Acquire the per-subsystem `_LOCK` and commit it durable BEFORE any work: a body exception
-    routes through tasks._record_failure's unconditional rollback, which would otherwise undo an
-    uncommitted acquire and make the release spuriously fail. Always releases + commits on exit,
-    logging (never raising) a release failure so it can't mask the body's own error. A
-    not-acquired body must bail without doing work — the caller checks the yielded flag."""
-    acquired = dal.acquire_lock(sess, sid, subsystem_id, task_id)
+    """Yield whether the per-subsystem lock was acquired.
+
+    Commit acquisition before work so a later rollback cannot release it. Release failures are
+    logged and do not replace an exception from the wrapped work.
+    """
+    # acquire_execution_lock, not acquire_lock: every caller here is a regenerate/next-set
+    # execution, which runs on a session already completed at its review barrier.
+    # acquire_lock's SessionStatus == active fence would CAS-fail on all of them.
+    acquired = dal.acquire_execution_lock(sess, sid, subsystem_id, task_id)
     if acquired:
         sess.commit()
     try:
@@ -109,47 +104,40 @@ def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, ki
         if acquired:
             try:
                 if not dal.release_lock(sess, sid, subsystem_id, task_id):
-                    log.warning(f"{kind}.lock_lost", session_id=sid, subsystem=subsystem_id, task_id=task_id)
+                    log.warning(f"{kind}.lock_lost", session_id=sid, subsystem=subsystem_id, task_id=task_id)  # noqa: G004
                 sess.commit()
-            except Exception:  # noqa: BLE001 — logged, not re-raised, so it can't mask the body's own error
-                log.warning(f"{kind}.lock_release_failed", session_id=sid, subsystem=subsystem_id)
+            except Exception:  # noqa: BLE001
+                log.warning(f"{kind}.lock_release_failed", session_id=sid, subsystem=subsystem_id)  # noqa: G004
 
 
 def _settle_or_raise(sess: Session, sid: str, subsystem_id: int, epoch: int,
                     level: SubsystemLevel, kind: str) -> None:
-    """Shared 'write_scenarios returned [] without raising' check: a batch already landed at this
-    epoch (stage AWAITING_DECISION/COMPLETE) is a benign idempotent redelivery — log and fall
-    through; anything else is a genuine lost claim (reaped or superseded) — raise."""
+    """Verify that this epoch completed, or raise if its stage claim was lost.
+
+    An empty write is valid when the same epoch already completed. A reaped or superseded claim
+    raises `RuntimeError`.
+    """
     if not dal.stage_settled_at_epoch(sess, sid, subsystem_id, level, epoch):
         raise RuntimeError(f"{kind} claim lost mid-flight (stage reaped or superseded)")
-    log.info(f"{kind}.redelivery_already_landed", session_id=sid, subsystem=subsystem_id, epoch=epoch)
+    log.info(f"{kind}.redelivery_already_landed", session_id=sid, subsystem=subsystem_id, epoch=epoch)  # noqa: G004
 
 
 def _reason_info(reason: str | None) -> dict[str, str | None]:
-    """detail + message for an advisory SSE/audit reason code. An unrecognized or absent code
-    returns both as None rather than raising, so a caller can always spread this in."""
-    info = _REASON_INFO.get(reason or "", {})  # None → "" (not a key): same {} result, typed str
+    """Return the audit detail and client message for `reason`.
+
+    Unknown or missing reason codes return `None` for both values.
+    """
+    info = _REASON_INFO.get(reason or "", {})
     return {"detail": info.get("detail"), "message": info.get("message")}
 
 
 def _next_set_outcome(requested: int, made: int, variants: int, pool_size: int, *,
                     top_up_failed: bool = False) -> NextSetOutcome:
-    """Classify what a click ACHIEVED. `made` is fresh-threat scenarios committed, `variants` the
-    alternate takes topped up, `pool_size` how many unserved threats the click actually targeted.
+    """Classify a next-set result from its requested, created, and failed counts.
 
-    `made < pool_size` is the retryable signal: the pool handed over N threats and fewer came
-    back, so generation(s) failed. Those targets keep Selected=1 and stay re-servable, making the
-    next click a genuine retry. Anything else short means nothing further EXISTS — a correct
-    terminal answer, not a deficiency, which is exactly the distinction a bare shortfall count
-    cannot express.
-
-    `top_up_failed` closes the one hole in that reasoning. `_top_up_with_variants` MUST NEVER
-    RAISE, so it reports every failure — a dropped connection, a malformed ScenarioJSON, a bug —
-    as `created=0`, which is byte-identical to "nothing was eligible". On the conflict path
-    (made=0, pool_size=0) that lands on `exhausted`, which schemas.py publishes to the client as
-    "nothing further exists for this asset; clicking again changes nothing" and greys the button.
-    A transient error must never present as a terminal state, so a FAILED top-up is
-    partial_retryable — the one outcome that tells the user to click again."""
+    `made + variants >= requested` is complete. A shortfall in the selected threat pool or a
+    failed top-up is retryable; otherwise the eligible work is exhausted.
+    """
     if made + variants >= requested:
         return NextSetOutcome.complete
     if made < pool_size or top_up_failed:  # actionable case wins when both apply
@@ -160,20 +148,11 @@ def _settle_next_set_click(sess: Session, scenario_session: dict, subsystem_id: 
                         requested: int, made: int, variants: int, pool_size: int,
                         reason: str | None = None,
                         top_up_failed: bool = False) -> NextSetOutcome:
-    """The ONE place a "generate next set" click reports itself. Records the durable audit row
-    FIRST, then mirrors it to the advisory SSE, and returns the outcome.
+    """Commit an audit row and publish a next-set result.
 
-    Order is load-bearing. `bus.publish` is best-effort behind a circuit breaker with NO replay
-    log (see app/sse/bus.py) — a client that never connected, or whose connection dropped, learns
-    nothing from it. The audit row is what the status board serves as `last_next_set`, so it must
-    be committed before the hint goes out; then a dropped event costs nothing, because the next
-    board poll (or the reconcile snapshot on SSE reconnect) still carries the outcome. Writing
-    both here means an outcome can never be published without also being recorded.
-
-    `reason` is the ClickOutcomeReason that made the click fall back or come up empty. It rides
-    the payload as provenance whatever happened, but its detail/message pair is spread ONLY when
-    the click was fruitless — those sentences are phrased "nothing was added" and would flatly
-    contradict a payload reporting five new scenarios."""
+    The audit row is committed before the best-effort SSE event. Return the classified outcome;
+    include reason details only when `made + variants == 0`.
+    """
     sid = scenario_session["SessionID"]
     delivered = made + variants
     outcome = _next_set_outcome(requested, made, variants, pool_size, top_up_failed=top_up_failed)
@@ -202,17 +181,11 @@ def _publish_regen_result(sid: str, subsystem_id: int, requested_ids: list[str] 
                         replacements: list[dict] | None = None,
                         failed_threat_ids: set[str] | None = None,
                         rescored_threat_ids: set[str] | None = None) -> None:
-    """Advisory SSE naming exactly which outputs a regeneration replaced. `replacements` carries
-    the old→new PAIRS — the two flat lists beside it cannot express a mapping (three targets give
-    three old and three new ids with no way to pair them) and stay only for back-compat.
-    new_output_ids=[] means the click was fruitless. Purely informational, same contract as
-    _publish_next_set_result; the authoritative record is generation_epoch on the /results rows.
+    """Publish an advisory regeneration result for committed output IDs.
 
-    `failed_threat_ids`/`rescored_threat_ids` cover a PARTIAL multi-target regen: some targets
-    landed (new_output_ids non-empty) while others didn't, for two DIFFERENT reasons — transient
-    generation failure (worth retrying) vs. no longer meeting the scoping cutoff (won't change on
-    retry). Without these a partial batch reports only what succeeded, with total silence on why
-    the rest didn't — the client can diff the two id lists but can't tell retry-worthy from not."""
+    `replacements` maps old output IDs to new ones. Failed and rescored threat IDs describe
+    partial results. The event is advisory; database rows remain the source of record.
+    """
     bus.publish(sid, {"type": str(SSEEventType.regen_result), "session_id": sid,
                     "subsystem_id": subsystem_id, "reason": reason, **_reason_info(reason),
                     "requested_output_ids": [str(i) for i in (requested_ids or [])],
@@ -223,13 +196,11 @@ def _publish_regen_result(sid: str, subsystem_id: int, requested_ids: list[str] 
                     "ts": now().isoformat()})
 
 def _regen_replacements(sess: Session, sid: str, subsystem_id: int, epoch: int) -> list[dict]:
-    """`[{"old", "new"}]` for the rows this epoch committed. The epoch is unique per hop
-    (dal.next_epoch), so the active rows at it are exactly this call's replacements. ONE query
-    shared by the SSE tail and the audit row so they cannot disagree. Indexed seek — never a
-    `Superseded = 1` scan (no index serves it).
+    """Return active output replacements committed at `epoch`.
 
-    Rows with `old` None are RETAINED so the caller can still derive the full new_output_ids list
-    from this one query; callers wanting only true replacements filter on `old`."""
+    Each item has `old` and `new` IDs. A retained row has `old=None`, which lets callers derive
+    all new output IDs from the same result.
+    """
     out = m.Threat_Scenario_Output
     return [{"old": str(old) if old else None, "new": str(new)} for new, old in sess.execute(
         select(out.OutputID, out.ReplacesOutputID).where(
@@ -241,44 +212,40 @@ def _publish_regen_result_after_commit(sess: Session, sid: str, subsystem_id: in
                                     target_ids: list[str] | list[int] | None, epoch: int,
                                     failed_threat_ids: set[str] | None = None,
                                     rescored_threat_ids: set[str] | None = None) -> None:
-    """Advisory tail of a SUCCESSFUL regen: publish regen_result for the rows this epoch committed.
+    """Publish a committed regeneration result without raising.
 
-    MUST NEVER RAISE. It runs after the success commit, so an escape into run_regeneration's
-    generic handler would route a committed success through tasks._record_failure — whose
-    stage_error audit row and error SSE are unconditional — telling the client a success failed.
-    Losing the hint costs nothing (the client recovers via generation_epoch on /results).
-
-    `failed_threat_ids`/`rescored_threat_ids` are the caller's PARTIAL-batch bookkeeping — see
-    _publish_regen_result for why they matter."""
+    The threat-ID sets describe partial-batch failures and rescoring exclusions. If querying or
+    publishing fails, roll back the SQLAlchemy session when possible and log the failure.
+    """
     try:
         pairs = _regen_replacements(sess, sid, subsystem_id, epoch)
         _publish_regen_result(sid, subsystem_id, target_ids, [p["new"] for p in pairs],
                             replacements=[p for p in pairs if p["old"]],
                             failed_threat_ids=failed_threat_ids,
                             rescored_threat_ids=rescored_threat_ids)
-    except Exception:  # noqa: BLE001 — advisory-only tail; must never poison a committed success
-        # The rollback needs its own guard: on a broken connection whose SQLSTATE isn't in the
-        # dialect's is_disconnect set, ROLLBACK itself re-raises — recreating the exact
-        # spurious-failure bug above.
+    except Exception:
+        # A disconnected session can reject rollback, so log that failure separately.
         try:
             sess.rollback()
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.warning("regen.result_rollback_failed", session_id=sid, subsystem=subsystem_id, exc_info=True)
         log.warning("regen.result_publish_failed", session_id=sid, subsystem=subsystem_id, exc_info=True)
 
 
 def _split_target_ids(target_ids) -> tuple[list[str], list[str]]:
-    """Split the caller's requested ids into (all, well-formed-only), canonicalizing and deduping
-    in one pass. Returns the full list for the caller-facing "missing" report and the subset safe
-    to put in a WHERE clause."""
+    """Canonicalize and deduplicate requested IDs for reporting and SQL lookup.
+
+    Return `(seen, lookup)`: `seen` keeps every unique spelling for conflict reporting, while
+    `lookup` contains only valid canonical IDs. For example, a malformed ID is reported in
+    `seen` but excluded from the database query.
+    """
     seen: list[str] = []
     lookup: list[str] = []
     for raw in dict.fromkeys(target_ids or []):
         try:
             canonical = dal.canonical_guid(raw)
         except (ValueError, AttributeError, TypeError):
-            # malformed: never sent to SQL (GUID.bind_processor would raise → 500); still
-            # reported, by its original spelling, through the normal not-found path
+            # Exclude malformed IDs from SQL but retain their spelling for the conflict.
             if raw not in seen:
                 seen.append(raw)
             continue
@@ -291,18 +258,11 @@ def _split_target_ids(target_ids) -> tuple[list[str], list[str]]:
 def get_threat_id_to_redo(sess: Session, session_id: str, subsystem_id: int,
                 granularity: RegenGranularity,
                 target_ids: list[str] | list[int] | None) -> dict[str, tasks.RegenTarget]:
-    """Turn the caller's requested target ids into {OutputID: RegenTarget} — the exact ROWS to
-    redo, never a bare set of ThreatIDs. With multiple coexisting scenarios per threat
-    (ScenarioNumber), a ThreatID collapses regen of #1 and #2 into one indistinguishable target.
+    """Resolve active output IDs to regeneration targets.
 
-    Raises RegenerateConflict if none were given, or if any id doesn't resolve to an active
-    (non-superseded) output for this session/subsystem.
+    Return `{OutputID: RegenTarget}` for this session and subsystem. Raise `RegenerateConflict`
+    when no IDs are supplied or any requested ID is missing, malformed, or superseded.
     """
-    # Canonicalize BEFORE the `missing` comparison: `found` is keyed by OutputIDs that
-    # GUID.result_processor already canonicalized, so comparing raw client spellings (uppercase,
-    # dashless, braced) reports matched rows as missing — a false regenerate_conflict on a valid
-    # request. A malformed id is left as-is so the not-found path names it, instead of
-    # GUID.bind_processor raising and surfacing as a 500.
     ids, lookup_ids = _split_target_ids(target_ids)
     if not ids:
         raise RegenerateConflict(f"{granularity} regeneration requires at least one target id",
@@ -325,15 +285,18 @@ def get_threat_id_to_redo(sess: Session, session_id: str, subsystem_id: int,
             for r in rows}
     missing = set(ids) - found.keys()
     if missing:
-        # key=str: ids are str|int depending on caller, no single orderable type across the union
+        # String sorting keeps conflict reporting valid when ID types are mixed.
         raise RegenerateConflict(f"scenario output(s) not found or not active: {sorted(missing, key=str)}",
                                 reason="output_not_found_or_superseded")
     return found
 
 
 def _resolve_regen_context(scenario_session: dict) -> tuple[list[dict], dict]:
-    """Parse the session's supporting-systems list and asset-context JSON for the asset-level
-    cascade — the asset is the unit, so there is no single subsystem to look up."""
+    """Parse `SubsystemsJSON` and `AssetContextJSON` from a session record.
+
+    Return the subsystem list and asset-context mapping. Invalid JSON raises the decoder error;
+    a missing or empty asset context becomes `{}`.
+    """
     subsystems = json.loads(scenario_session["SubsystemsJSON"])
     asset_context = json.loads(scenario_session.get("AssetContextJSON") or "{}")
     return subsystems, asset_context
@@ -344,15 +307,13 @@ def _build_regen_audit_detail(threat_ids: set[str] | None, target_ids: list[str]
                             replacements: list[dict] | None = None,
                             failed_threat_ids: set[str] | None = None,
                             rescored_threat_ids: set[str] | None = None) -> str:
-    """DetailJSON for the regeneration-completed audit record. user_note is raw client free text
-    going to a persistent audit trail — redact() before it lands, same as every other free-text
-    value in this codebase.
+    """Build audit JSON for a completed regeneration.
 
-    `failed_threat_ids`/`rescored_threat_ids` carry a PARTIAL batch's excluded targets and why —
-    see _publish_regen_result for the transient-vs-terminal distinction they preserve."""
+    Include target and requested IDs, replacements, failed and rescored threat IDs, the epoch,
+    and a redacted user note. Return the JSON string.
+    """
     return json.dumps({
         "target_ids": sorted(threat_ids) if threat_ids else None,
-        # what the caller ASKED to replace, vs. `replacements` = what actually happened, old→new
         "requested_ids": list(target_ids) if target_ids else None,
         "replacements": replacements or [],
         "failed_threat_ids": sorted(failed_threat_ids) if failed_threat_ids else [],
@@ -362,35 +323,29 @@ def _build_regen_audit_detail(threat_ids: set[str] | None, target_ids: list[str]
 def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, granularity: RegenGranularity,
                     target_ids: list[str] | list[int] | None, epoch: int, llm: LLMClient, task_id: str,
                     user_note: str | None = None) -> str | None:
-    """Redo scenario generation for one subsystem's targeted threat(s) instead of the whole
-    pipeline. Any failure is recorded rather than raised, and the function always falls through
-    to decide_session_outcome."""
+    """Regenerate selected scenarios for one subsystem.
+
+    Validate target outputs, write replacements, record failures, publish advisory events, and
+    return the session outcome. A capacity error is re-raised for task retry; stale targets are
+    reported as conflicts without failing the stage.
+    """
     sid = scenario_session["SessionID"]
     subsystems, asset_context = _resolve_regen_context(scenario_session)
 
     try:
-        # fail fast, before taking the lock, if the requested target ids don't resolve to real rows
         targets = get_threat_id_to_redo(sess, sid, subsystem_id, granularity, target_ids)
     except RegenerateConflict as exc:
         log.info("regen.target_conflict", session_id=sid, subsystem=subsystem_id, reason=str(exc))
-        # SCENARIOS is still IDLE here (reset by the endpoint, never claimed — this check runs
-        # before the lock) — decide_session_outcome returns None for any IDLE row, so leaving it
-        # untouched wedges the session with zero client-visible signal. Claim-then-finish moves it
-        # to the SAME benign AWAITING_DECISION terminal the in-lock RegenerateConflict handler
-        # below leaves write_scenarios in, so this is a benign race, not a failure — no ERROR state.
+        # Finish the reset stage so a rejected request does not leave the session in IDLE.
         if dal.claim_stage(sess, sid, subsystem_id, SubsystemLevel.SCENARIOS, epoch, task_id):
             dal.finish_stage(sess, sid, subsystem_id, SubsystemLevel.SCENARIOS,
                             StageStatus.AWAITING_DECISION, epoch, task_id)
             sess.commit()
         _publish_regen_result(sid, subsystem_id, target_ids, [], reason=exc.reason)
         return tasks.decide_session_outcome(sess, scenario_session)
-    except Exception as exc:  # noqa: BLE001 — a transient DB/driver error here must not escape
+    except Exception as exc:  # noqa: BLE001
         log.error("regen.pre_lock_error", session_id=sid, subsystem=subsystem_id, error=repr(exc))
-        # Unlike RegenerateConflict, this IS a real failure. _record_failure matches the row
-        # directly (IDLE or RUNNING, no prior claim needed), flips it to ERROR with a client-safe
-        # message, publishes the error SSE, and writes the audit row — the same discipline every
-        # other generic-exception handler in this file already has (see the in-lock handler below,
-        # and run_next_set's outer handler).
+        # Record this failure directly because no stage claim exists yet.
         tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch,
                             extra={"user_note": redact(user_note)} if user_note else None)
         sess.commit()
@@ -401,28 +356,16 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
             log.warning("regen.locked", session_id=sid, subsystem=subsystem_id)
             return tasks.decide_session_outcome(sess, scenario_session)
         try:
-            # re-check under the lock, in case state changed since the pre-check above
             targets = get_threat_id_to_redo(sess, sid, subsystem_id, granularity, target_ids)
             threats = dal.active_threats(sess, sid, subsystem_id)
-            # Populated by _reconcile_targeted_regen (inside write_scenarios) BEFORE either
-            # consumer below runs: the audit hook fires after it, and the success path only
-            # reads it once write_scenarios has already returned. See _publish_regen_result for
-            # why a PARTIAL batch needs this — without it, targets that failed or no longer
-            # qualify vanish with no signal beyond the flat count of what succeeded.
             unresolved: dict = {}
 
-            # The audit row is staged INSIDE write_scenarios' transaction, so the regeneration and
-            # its record land together or not at all; written afterwards, a failure there would
-            # report a committed success as failed via the generic handler below.
+            # Commit the audit row with the scenario transaction.
             def _stage_regen_audit(_provs) -> None:
                 dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
                                 EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
-                                # Stage must be set: a NULL here drops regenerations from every
-                                # audit query filtered by Stage.
                                 Stage=WorkflowStage.SCENARIO_GENERATION,
                                 EventType=AuditEventType.regeneration_completed, Granularity=str(granularity),
-                                # Reads the pairs itself — this hook runs inside write_scenarios'
-                                # transaction, after the rows are inserted.
                                 DetailJSON=_build_regen_audit_detail(
                                     {t.threat_id for t in targets.values()}, target_ids, epoch, user_note,
                                     replacements=[p for p in _regen_replacements(sess, sid, subsystem_id, epoch)
@@ -435,59 +378,43 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
                                             on_before_commit=_stage_regen_audit,
                                             unresolved_targets=unresolved)
             if not scen_provs:
-                # Idempotent redelivery (batch already landed at this epoch) vs. genuine lost claim.
-                # The hook never ran on this path — no commit happened — so there is no audit row.
                 _settle_or_raise(sess, sid, subsystem_id, epoch, SubsystemLevel.SCENARIOS, "regen")
             else:
                 _publish_regen_result_after_commit(sess, sid, subsystem_id, target_ids, epoch,
                                                 failed_threat_ids=unresolved.get("failed_ids"),
                                                 rescored_threat_ids=unresolved.get("rescored_ids"))
         except RegenerateConflict as exc:
-            # Benign race (a concurrent regen/accept superseded the target in the gap), not a
-            # pipeline failure: no ERROR state, no audit row, no error SSE. exc.reason is None for
-            # the stale-target race; only the all-targets-rescored-out path sets a real code.
+            # A concurrent update can stale a target; report it without failing the stage.
             log.info("regen.target_conflict", session_id=sid, subsystem=subsystem_id, reason=str(exc))
             _publish_regen_result(sid, subsystem_id, target_ids, [], reason=exc.reason)
         except LLMSlotUnavailable:
-            # Transient capacity squeeze, not a bug — re-raise past _record_failure so Celery's
-            # autoretry_for retries instead of recording a permanent ERROR.
+            # Let task retry handling process this transient capacity error.
             raise
-        except Exception as exc:  # noqa: BLE001 — capture, don't swallow ([R8], same discipline as _process_all_supporting_systems)
+        except Exception as exc:  # noqa: BLE001
             tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch,
                                 extra={"user_note": redact(user_note)} if user_note else None)
             sess.commit()
 
     return tasks.decide_session_outcome(sess, scenario_session)
 
-# ponytail: fixed ceiling, not a Setting — any realistic session fits whole (300 threats is
-# roughly 12k chars); this only trims a RUNAWAY session's oldest labels. Truncation is safe by
-# the chain that already guards every proposal: the identity-fold dedup and the semantic
-# prior-scan drop a re-proposed threat before it becomes a row, and _buffered_ask's 2x headroom
-# absorbs the wasted slot — worst case is one spent proposal, never a duplicate or short click.
-_EXCLUSIONS_CHAR_BUDGET = 24_000
 
 
 def _coverage_exclusions(threats: list[dict]) -> list[str]:
-    """Distinct labels of the threats already proposed for this subsystem, fed to the
-    coverage-aware prompt so an additive round asks for genuinely NEW ones. Prefer the grounded
-    library label, fall back to the raw proposal; drop blanks.
+    """Return distinct, non-empty prior threat labels within the prompt budget.
 
-    NEWEST-FIRST under a character budget: dal.active_threats returns newest first and this
-    fold preserves that order, so a session past _EXCLUSIONS_CHAR_BUDGET drops only its OLDEST
-    labels — the ones least likely to be re-proposed — while every session under it sends its
-    full history (the completeness the uncapped version bought, now with an anti-runaway
-    ceiling instead of unbounded prompt growth)."""
-    # tasks.threat_label is THE definition — the semantic near-duplicate scan measures against
-    # the same string this list steers away from, so the two can never drift apart.
+    Preserve `active_threats` order, so newer labels appear first. Stop before adding a label
+    that would exceed the configured character budget.
+    """
     out: list[str] = []
     seen: set[str] = set()
     used = 0
+    budget = get_settings().exclusions_char_budget
     for t in threats:
         lbl = tasks.threat_label(t)
         if not lbl or lbl in seen:
             continue
-        used += len(lbl) + 2  # '; ' the prompt join spends per label
-        if used > _EXCLUSIONS_CHAR_BUDGET:
+        used += len(lbl) + 2
+        if used > budget:
             break
         seen.add(lbl)
         out.append(lbl)
@@ -495,43 +422,28 @@ def _coverage_exclusions(threats: list[dict]) -> list[str]:
 
 
 def _buffered_ask(shortfall: int, cap: int) -> int:
-    """How many threats the additive next-set call asks for: 2x the shortfall, so normal dedup
-    loss still leaves enough survivors to fill the click. Capped at max_threats_per_asset (the
-    per-round proposal ceiling), floored at the shortfall so no tuning combination can ever ask
-    for LESS than the exact ask did.
-    # ponytail: fixed 2x, not a tuning knob — add one only if real sessions still come up short."""
+    """Return a bounded request count for a shortfall.
+
+    The result is twice `shortfall`, capped at `cap`, and never below `shortfall`.
+    """
     return max(shortfall, min(shortfall * 2, cap))
 
 def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
                         subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
                         shortfall: int, *, exclude: set[str] | None = None) -> tuple[int, bool]:
-    """Fill the slots a next-set click could NOT fill from the unserved pool, with one alternate
-    scenario per already-covered threat. Returns (how many landed, whether it FAILED).
+    """Create alternate scenarios for unserved next-set slots.
 
-    The bool is the whole point of the tuple: because this never raises, a caller reading only
-    the count cannot tell "nothing was eligible" (a true terminal answer) from "the attempt blew
-    up" (retry me). `_next_set_outcome` needs that distinction or a transient error reports as
-    `exhausted` and permanently greys the client's button.
-
-    `shortfall` is what the POOL came up short by, never `next_set_size - committed`: a generation
-    that FAILED already reports itself via the stage row's partial_error, and filling its slot
-    would hide that.
-
-    MUST NEVER RAISE. Both callers run after the stage is terminal and (for the partial caller)
-    after the scenarios are committed, so an escape into run_next_set's generic handler would
-    route a committed success through _record_failure — whose stage_error audit row and error SSE
-    are unconditional. LLMSlotUnavailable is swallowed too: the redelivery's claim_stage no-ops
-    against an AWAITING_DECISION stage, so re-raising loses the SSE and buys no retry."""
+    Return `(created, failed)` and never raise. `failed=True` marks an exception, while
+    `(0, False)` means the fallback completed with no rows. `shortfall` is the number of slots.
+    """
     if shortfall <= 0:
-        return 0, False  # nothing was asked for — not a failure
+        return 0, False
     sid = scenario_session["SessionID"]
     try:
         created = tasks.write_variant_scenarios(sess, scenario_session, subsystem_id, subsystems,
                                                 asset_context, llm, task_id, epoch,
                                                 max_variants=shortfall, exclude_threat_ids=exclude)
         if created:
-            # Same row shape the productive path stages, so a click that both served and topped
-            # up leaves two rows that SUM to the click total.
             dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
                             EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
                             Stage=WorkflowStage.SCENARIO_GENERATION,
@@ -540,18 +452,13 @@ def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: i
                                                 "new_scenarios": created, "variants_generated": created}))
             sess.commit()
         return created, False
-    except Exception as exc:  # noqa: BLE001 — see docstring; a committed batch must never report failure
-        # ROLLBACK needs its own guard: on a broken connection whose SQLSTATE isn't in the
-        # dialect's is_disconnect set it re-raises, and an escape from HERE recreates the exact
-        # spurious-failure bug this guard exists to prevent.
+    except Exception as exc:  # noqa: BLE001
+        # A rollback failure must not escape from this fallback.
         try:
             sess.rollback()
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.warning("next_set.variant_top_up_rollback_failed", session_id=sid,
                         subsystem=subsystem_id, exc_info=True)
-        # Level tracks the exception, not the call site: capacity pressure is routine and would
-        # drown a real signal at ERROR, while anything else here is systematic and silent —
-        # swallowed at WARNING it would hide a top-up that fails on EVERY click.
         transient = isinstance(exc, LLMSlotUnavailable)
         (log.warning if transient else log.error)(
             "next_set.variant_top_up_failed", session_id=sid, subsystem=subsystem_id,
@@ -562,28 +469,16 @@ def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_i
                             exc: RegenerateConflict, subsystems: list[dict], asset_context: dict,
                             llm: LLMClient, task_id: str, next_set_size: int,
                             additive_failed: bool = False) -> str:
-    """`run_next_set`'s `except RegenerateConflict` body. write_scenarios already returned the
-    stage to AWAITING_DECISION and mutated nothing before raising — this only decides what to do
-    about it and reports the outcome; it never re-raises.
+    """Finish a next-set request when additive threat generation returns no usable result.
 
-    The variant fallback runs for EVERY reason code. Whether it can help depends only on whether
-    some already-covered threat still has an uncovered plausible entry point —
-    dal.variant_eligible_primaries answers that on its own and yields 0 when it can't. The old
-    `if exc.reason == "no_new_threats_found"` allowlist answered a DIFFERENT question ("why was
-    the batch empty") and so suppressed a working fallback whenever a candidate was found and
-    rescored out, leaving the click with 0 scenarios while eligible primaries sat unused — and
-    any reason code added later would have inherited the same hole by default.
-
-    Nothing was committed on this path, so the whole batch is the shortfall and there is no
-    just-served threat to exclude. The stage is already terminal and the subsystem lock is still
-    held, so this is a plain side write — no claim/epoch dance."""
+    Try variant scenarios, record the result, and return a client signal. No fresh scenarios
+    were committed on this path; the threats stage is already terminal.
+    """
     sid = scenario_session["SessionID"]
     created, top_up_failed = _top_up_with_variants(sess, scenario_session, subsystem_id, epoch,
                                                 subsystems, asset_context, llm, task_id,
                                                 next_set_size)
     if not created:
-        # Deliberately NOT routed through _record_failure — that avoidance is what keeps a
-        # transient additive failure from wedging or cancelling the session.
         dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
                         EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
                         Stage=WorkflowStage.SCENARIO_GENERATION,
@@ -592,21 +487,7 @@ def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_i
                                             "new_scenarios": 0, "no_new": True,
                                             "reason": exc.reason, **_reason_info(exc.reason)}))
         sess.commit()
-    # Both branches report through the same call, so the durable row and the SSE can never
-    # disagree about what this click did. `made=0` (nothing fresh was committed on this path) and
-    # `pool_size=0` (the pool is what came up empty), so `made < pool_size` can never fire here —
-    # which is exactly why `top_up_failed` has to be threaded: without it this path reports a
-    # blown-up top-up as `exhausted` ("nothing further exists"), the single most misleading
-    # answer available. `exc.reason` rides along even when variants SUCCEEDED — that provenance
-    # ("a candidate was found and rejected") used to reach the client via the fruitless path and
-    # would otherwise be lost now that the fallback usually rescues the click.
-    # generation_failed is transient BY DEFINITION (the targets stay Selected=1) — with
-    # made=0/pool_size=0 it would otherwise classify as `exhausted` when the variant fallback
-    # also comes up empty, permanently greying the client's button over a provider blip.
-    # `additive_failed` closes the same hole for the call that PRODUCES this empty pool: a
-    # non-slot exception from the additive find_threats itself is swallowed by run_next_set (to
-    # avoid wedging the session) and reaches here only as an empty `fresh` set, indistinguishable
-    # from a genuine "nothing new exists" unless threaded through explicitly.
+    # Keep the request retryable when either generation step failed without rows.
     retryable = exc.reason == "generation_failed" or additive_failed
     _settle_next_set_click(sess, scenario_session, subsystem_id, epoch,
                         requested=next_set_size, made=0, variants=created,
@@ -614,99 +495,53 @@ def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_i
                         top_up_failed=top_up_failed or retryable)
     return "generated" if created else "no_new_threats_this_round"
 
-# logic to get next set of threats and scenarios
-# Think of it like this:
-# Threat = a one-line idea of something bad that could happen (e.g. "power outage").
-# Scenario = the full write-up of how that could actually happen (a paragraph explaining the story, plus which controls would help).
-# When you first create a session, the system finds a batch of threats and writes one scenario for each. In your earlier example: 9 threats found, 9 scenarios written.
-# "Generate next set" = a button that says "give me 5 more scenarios." (5 is the default — configurable, but nobody's changed it here.)
-# To make 5 (configurable) new scenarios, it needs 5 threats to write them about. It gets those threats in one of two ways:
-# Reuse leftovers first — if any of the threats it already found don't have a scenario yet, it uses those. Free, no extra AI call needed.
-# Ask for more if it runs short — if there aren't 5 leftover threats sitting around, 
-# it asks the AI to come up with new threats (different from the ones already found) to make up the difference, then writes scenarios for those too.
 def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
                 threats_epoch: int, llm: LLMClient, task_id: str) -> str | None:
-    """"Generate next set": add up to `next_set_size` MORE unique scenarios that ACCUMULATE onto
-    the existing ones — nothing prior is superseded or dropped. Serves already-scored-but-unserved
-    threats first (no AI call); only when that pool can't fill the batch does it run ONE additive,
-    coverage-aware find_threats. Never hard-stops: a round that turns up nothing new returns
-    "no_new_threats_this_round" and leaves the session reviewable.
+    """Add up to the configured number of new scenarios for one subsystem.
 
-    `epoch` is the SCENARIOS epoch, `threats_epoch` the THREATS epoch — BOTH reserved once by the
-    endpoint and threaded through so a Celery redelivery re-executes at the SAME epochs: the
-    additive find_threats is skipped when THREATS is already COMPLETE at threats_epoch, instead of
-    firing a second AI call and a duplicate Identified_Threat batch. Accumulation rides on
-    write_scenarios' target mode only superseding outputs whose IdentityHash matches — a new
-    identity has no active match."""
+    Use unserved threats first, then make one additive threat-generation call if needed. New
+    scenarios accumulate without replacing unrelated outputs. Return the session outcome or a
+    no-new-threats signal. Reused epochs prevent duplicate threat generation.
+    """
     sid = scenario_session["SessionID"]
     subsystems, asset_context = _resolve_regen_context(scenario_session)
 
     signal: str | None = None
     with _subsystem_lock(sess, sid, subsystem_id, task_id, "next_set") as acquired:
         if not acquired:
-            # the per-(session,subsystem) mutex serialises concurrent clicks so two can't double-generate
+            # Serialize concurrent clicks for this session and subsystem.
             log.warning("next_set.locked", session_id=sid, subsystem=subsystem_id)
             return tasks.decide_session_outcome(sess, scenario_session)
-        # Bound BEFORE the try: the generic handler below settles the click with
-        # requested=next_set_size, and the failure it handles can fire before the session's
-        # tuning snapshot resolves. The config default is only the fallback for that window.
-        
-        # get the Number of Threats required count from the config.py or env 
         next_set_size = get_settings().next_set_size
-        
-        # True iff the additive find_threats call below raised rather than legitimately finding
-        # nothing. Threaded into both outcomes it can reach (the generated branch's top-up, and
-        # _settle_next_set_conflict's retryable check) so that failure can never collapse into a
-        # confident `exhausted` — see the except block below for where this is set.
         additive_failed = False
         try:
-            tn = tuning.from_session(scenario_session)  # the session's frozen rulebook
+            tn = tuning.from_session(scenario_session)  # Use the session's frozen rulebook.
             next_set_size = tn.next_set_size
 
-            # Reuse leftovers first — if any of the threats it already found don't have a scenario yet, it uses those. Free, no extra AI call needed.
             fresh = dal.next_unserved_unique_threats(sess, sid, subsystem_id, next_set_size)
 
-            # If the pool of unserved threats is too small, and the THREATS stage is not already COMPLETE at this epoch, 
-            # then it will ask the AI to come up with new threats (different from the ones already found) to make up the difference, then writes scenarios for those too.
             if len(fresh) < next_set_size and not dal.stage_completed_at_epoch_or_newer(
                     sess, sid, subsystem_id, SubsystemLevel.THREATS, threats_epoch):
                 
-                # Get active threats for this session/subsystem from database 
                 prior_threats = dal.active_threats(sess, sid, subsystem_id)
-
-                # get list of threats to exclude from the AI call
                 exclude = _coverage_exclusions(prior_threats)
 
                 dal.reset_stage_for_regen(sess, sid, subsystem_id, (SubsystemLevel.THREATS,), threats_epoch)
                 new_threats: list[dict] = []
                 try:
-                    # get the new threats from the AI call, passing in the list of threats to exclude.
-                    # max_threats=_buffered_ask(shortfall), NOT the bare shortfall: dedup drops any
-                    # proposal colliding with an existing threat BEFORE it counts, so an exact ask
-                    # has zero headroom — one duplicate already leaves the click short, and at
-                    # temperature 0 a re-click re-asks the same question and gets the same answer.
-                    # Survivors beyond this click's need are not waste: they stay banked as
-                    # unserved threats and a FUTURE click serves them with no AI call at all.
                     new_threats, _prov = tasks.find_threats(sess, scenario_session, subsystems, asset_context, llm, task_id,
                                                         epoch=threats_epoch, supersede=False, exclude=exclude,
                                                         prior_threats=prior_threats,
                                                         max_threats=_buffered_ask(next_set_size - len(fresh),
                                                                                 tn.max_threats_per_asset))
                 except LLMSlotUnavailable:
-                    raise  # retryable capacity squeeze — leave THREATS reclaimable so the retry re-runs it
-                except Exception as exc:  # noqa: BLE001 — a transient additive-threats failure must not wedge/cancel
-                    # find_threats commits THREATS=RUNNING@threats_epoch before its LLM call. Do NOT
-                    # route a non-slot error through _record_failure: it fences on the SCENARIOS
-                    # epoch, can't match the THREATS row, so THREATS stays RUNNING →
-                    # decide_session_outcome returns None → the session wedges → the reaper cancels
-                    # it and destroys the accumulated scenarios. Drive THREATS terminal below
-                    # instead and fall through to serve whatever pool we already had.
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Finish the stage below so this failure does not block the session.
                     log.error("next_set.additive_find_threats_failed", session_id=sid, subsystem=subsystem_id, error=repr(exc))
                     sess.rollback()
                     additive_failed = True
-                # Never leave THREATS RUNNING at this epoch (a RUNNING row makes
-                # decide_session_outcome return None → wedge). A no-op if find_threats already
-                # finished COMPLETE — finish_stage only matches a still-RUNNING row.
+                # A running threats stage would block the session outcome.
                 dal.finish_stage(sess, sid, subsystem_id, SubsystemLevel.THREATS, StageStatus.COMPLETE,
                                 threats_epoch, task_id)
                 sess.commit()
@@ -715,20 +550,15 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
 
             threats = dal.active_threats(sess, sid, subsystem_id)
 
-            # Same atomicity as the regen path above: staged inside write_scenarios' transaction,
-            # so a failure writing it rolls the batch back instead of leaving committed scenarios
-            # the handler below reports as failed.
+            # Commit the audit row with the scenario transaction.
             def _stage_next_set_audit(provs) -> None:
                 dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
                                 EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
-                                # one event type must not mean two row shapes — tasks.py's first-run
-                                # generation_complete also carries SCENARIO_GENERATION
                                 Stage=WorkflowStage.SCENARIO_GENERATION,
                                 EventType=AuditEventType.generation_complete,
                                 DetailJSON=json.dumps({"next_set": True, "subsystem_id": subsystem_id,
                                                     "new_scenarios": len(provs)}))
                 
-            # write scenario for the threats in the pool, and if the pool is too small, write scenario for the new threats generated by the AI call
             scen_provs = tasks.write_scenarios(sess, scenario_session, subsystems, asset_context, threats, llm, task_id,
                                             epoch=epoch, target_threat_ids=set(fresh), require_lock=True,
                                             on_before_commit=_stage_next_set_audit)
@@ -737,49 +567,32 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
             else:
                 signal = "generated"
                 made = len(scen_provs)
-                # Top up when the POOL came up short — see _top_up_with_variants for why the
-                # shortfall is `fresh`-derived, not `next_set_size - committed`.
                 variants, top_up_failed = _top_up_with_variants(
                     sess, scenario_session, subsystem_id, epoch, subsystems, asset_context, llm,
                     task_id, next_set_size - len(fresh), exclude=set(fresh))
-                # `pool_size=len(fresh)` is what makes a FAILED generation distinguishable from an
-                # exhausted library: fewer scenarios back than threats handed over means the
-                # targets are still Selected=1 and re-servable, so the next click retries them.
-                # `top_up_failed` covers the other half — a pool that delivered in full while the
-                # variant top-up blew up would otherwise round to `exhausted`. `additive_failed`
-                # covers a third: the pool was short because find_threats never got to try, so a
-                # fully-served pool must not be read as "nothing more exists".
                 _settle_next_set_click(sess, scenario_session, subsystem_id, epoch,
                                     requested=next_set_size, made=made, variants=variants,
                                     pool_size=len(fresh), top_up_failed=top_up_failed or additive_failed)
         except RegenerateConflict as exc:
-            # No new unique threats this round. write_scenarios already returned the stage to
-            # AWAITING_DECISION and mutated nothing — benign: no ERROR, no error SSE, click again.
+            # An empty additive result ends this round without failing the stage.
             log.info("next_set.no_new_threats", session_id=sid, subsystem=subsystem_id, reason=str(exc))
             signal = _settle_next_set_conflict(sess, scenario_session, subsystem_id, epoch, exc,
                                             subsystems, asset_context, llm, task_id, next_set_size,
                                             additive_failed=additive_failed)
         except LLMSlotUnavailable:
-            raise  # retryable capacity squeeze — let Celery autoretry, same as run_regeneration
-        except Exception as exc:  # noqa: BLE001 — capture, don't swallow ([R8], same as run_regeneration)
+            raise
+        except Exception as exc:  # noqa: BLE001
             tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch)
             sess.commit()
-            # EVERY accepted click must leave a durable next_set_outcome row — this path used to
-            # leave none, so `last_next_set` stayed null and the client could not tell "my click
-            # failed, retry" from "my click never ran" (observed live 2026-08-08: a transient
-            # Azure failure produced exactly that silence). partial_retryable is forced via
-            # top_up_failed because made=0/pool_size=0 would otherwise classify as `exhausted` —
-            # the one answer a transient failure must never give. Guarded: a settle failure must
-            # not mask the recorded stage error.
+            # Record a durable retryable outcome even when the main operation fails.
             try:
                 _settle_next_set_click(sess, scenario_session, subsystem_id, epoch,
                                     requested=next_set_size, made=0, variants=0, pool_size=0,
                                     reason="generation_failed", top_up_failed=True)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.warning("next_set.failure_outcome_record_failed", session_id=sid,
                             subsystem=subsystem_id, exc_info=True)
 
-    # decide_session_outcome runs either way so the session re-enters REVIEW; the signal only
-    # changes what the caller is told.
+    # Recompute session state after every path.
     outcome = tasks.decide_session_outcome(sess, scenario_session)
     return "no_new_threats_this_round" if signal == "no_new_threats_this_round" else outcome

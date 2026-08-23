@@ -11,7 +11,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, MetaData, TypeDecorator, Unicode, UnicodeText
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    Integer,
+    MetaData,
+    TypeDecorator,
+    Unicode,
+    UnicodeText,
+)
 from sqlalchemy.dialects import mssql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -187,6 +198,17 @@ class Scoped_Threat(Base):
 
 class Threat_Scenario_Output(Base):
     __tablename__ = "Threat_Scenario_Output"
+    # Declared here as well as in TSG_Core.sql, and NOT redundantly: the app never runs
+    # create_all (db/engine.py forbids it), so this materialises only where tables are built
+    # FROM the models — the SQLite test engines. Without it a test can assert that accept and
+    # reject are mutually exclusive against a shim that would happily store both, which is
+    # passing for the wrong reason. Same reasoning as the filtered unique indexes those engines
+    # create by hand, but declared once here so every present and future test file inherits it
+    # instead of each one remembering.
+    __table_args__ = (
+        CheckConstraint("RejectedAt IS NULL OR Accepted = 0",
+                        name="CK_ScenarioOutput_DecisionExclusive"),
+    )
     OutputID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
@@ -217,6 +239,18 @@ class Threat_Scenario_Output(Base):
     # this output; set on every attempt EVEN when zero controls matched, so an output is never
     # re-scanned/re-reranked on later runs. Regen mints a new OutputID (stamp NULL) naturally.
     ControlsMappedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    # Per-scenario review decision, independent of the session that produced the row: a reviewer
+    # decides each scenario on their own schedule, so the verdict lives here, not on the session.
+    # Both NULL = pending (nobody has looked) — which is what makes "seen and not chosen"
+    # distinguishable from "not yet seen", a pair Accepted alone can never express.
+    # Deliberately NOT folded into Status: that is the GENERATION outcome (complete|error) and is
+    # load-bearing in the accept and promotion predicates (dal.mark_scenarios_accepted,
+    # accept._promotion_candidates), so overloading it would couple a human decision to them.
+    # Mutually exclusive with Accepted=1, enforced in the DATABASE by
+    # CK_ScenarioOutput_DecisionExclusive — accept and reject are independent routes reachable in
+    # either order, so the row itself is the one place both orderings must meet.
+    RejectedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    RejectedBy: Mapped[str | None] = mapped_column(Unicode(200))
 
 
 class Threat_Library_Import_Run(Base):
@@ -559,6 +593,11 @@ class Scenario_Audit(Base):
     #   >= 1 = a specific supporting system. Historical rows only.
     SubsystemID: Mapped[int | None] = mapped_column(Integer)
     EventType: Mapped[str] = mapped_column(Unicode(40))
+    # The scenario this event is ABOUT — set only on the per-scenario decision rows
+    # (scenario_accepted / scenario_rejected), NULL on every session- or subsystem-scoped event.
+    # A real column rather than a DetailJSON key: IX_ScenarioAudit_Output makes "the decision
+    # history of this scenario" a seek, which is the query a GRC reviewer actually runs.
+    OutputID: Mapped[str | None] = mapped_column(GUID)
     Decision: Mapped[str | None] = mapped_column(Unicode(30))  # accept only — AuditDecision; NULL elsewhere
     Granularity: Mapped[str | None] = mapped_column(Unicode(20))  # regeneration_completed only
     ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)  # library_promoted +

@@ -13,8 +13,8 @@ from typing import Literal, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import exists, or_, select, update
-from sqlalchemy.engine import CursorResult
+from sqlalchemy import exists, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import Principal, get_principal
@@ -35,6 +35,8 @@ from app.api.schemas import (
     RegenerateResponse,
     RegenerateScenariosBody,
     RegenResultEvent,
+    RejectBody,
+    RejectResponse,
     ScenarioListItem,
     ScenarioResult,
     SessionBoard,
@@ -51,6 +53,7 @@ from app.core.config import get_settings
 from app.core.enums import (
     AuditEventType,
     RegenGranularity,
+    ReviewGateReason,
     SessionMode,
     SessionStatus,
     SSEEventType,
@@ -65,7 +68,7 @@ from app.db import models as m
 from app.db.dal import EntityForbidden, IdempotencyKeyConflict, RegenerateConflict, now
 from app.db.engine import db_session
 from app.pipeline import cascade, tasks
-from app.pipeline.accept import accept_session, review_gate_reason
+from app.pipeline.accept import accept_session, reject_scenarios, review_gate_reason
 from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
 from app.pipeline.context import gather_asset_details
 from app.pipeline.grounding import stored_actors
@@ -100,12 +103,16 @@ def get_overall_status(threats: str, scenarios: str, session_status: str) -> Sub
     vals = (threats, scenarios)
     if StageStatus.ERROR in vals:
         return SubsystemProgress.error
-    if session_status == SessionStatus.completed:
-        return SubsystemProgress.complete
     if session_status == SessionStatus.cancelled:
         return SubsystemProgress.cancelled
+    # AWAITING_DECISION is tested BEFORE `completed`, and the order is load-bearing: generation now
+    # completes the session at its review barrier (tasks._send_to_review) to release the asset, so
+    # a session with scenarios still waiting on a human is `completed` too. Testing `completed`
+    # first would report every such session as `complete` and the review queue would look empty.
     if scenarios == StageStatus.AWAITING_DECISION:
         return SubsystemProgress.awaiting_review
+    if session_status == SessionStatus.completed:
+        return SubsystemProgress.complete
     if all(v == StageStatus.IDLE for v in vals):
         return SubsystemProgress.pending
     return SubsystemProgress.in_progress
@@ -174,6 +181,16 @@ def get_authorized_session(sess: Session, session_id: str, principal: Principal)
         raise dal.NotFoundError(f"session {session_id} not found")
     if str(row["EntityID"]) not in principal.entities:  # object-level authz / IDOR guard
         raise EntityForbidden(f"session {session_id} not in caller's entity scope")
+    # DELIBERATE: entity scope is the whole authorization boundary. Any authenticated colleague
+    # in the entity may open, stream, export, regenerate and decide this assessment. An ownership
+    # check was built here and removed on purpose — covering for a teammate on leave is normal,
+    # and a second person approving a remediation plan is a requirement.
+    #
+    # Accountability is NOT weakened by that: dal.decide_scenarios writes one Scenario_Audit row
+    # per decided scenario naming the acting user, so "who accepted this, and when" is answerable
+    # whoever clicks. A DETECTIVE control, not a preventive one — a wrong decision is attributable
+    # after the fact rather than blocked. Do not "fix" this back to an owner check without that
+    # call being made again; tests/test_open_access.py pins the decision.
     return dict(row)
 
 
@@ -589,6 +606,17 @@ def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str
     return out
 
 
+def _suggestion_key(name: object) -> str:
+    """The exact SuggestedControl string control_mapping.collect_control_queries stored for a
+    suggestion: non-str -> "" (grounding.ensure_text), then strip, THEN truncate to 500.
+
+    Every step matters, and the read side has to mirror all three. Keying on the raw name made a
+    whitespace-padded suggestion ("  Multi-factor authentication ") miss its own map row: it was
+    falsely reported as an unmatched library gap AND its mapped control came back with
+    suggested_why=null. Indexing a non-str name raised TypeError on a core read."""
+    return (name if isinstance(name, str) else "").strip()[:500]
+
+
 def _scenario_with_controls(scenario_json: str | None, controls: list[MappedControl],
                         controls_mapped: bool = True, threat_row: dict | None = None) -> dict | None:
     """Projects one ScenarioJSON row for the API: `controls` becomes the Step-4 grounded
@@ -601,7 +629,7 @@ def _scenario_with_controls(scenario_json: str | None, controls: list[MappedCont
     the window between write and Step-4, making an in-progress read look like the model had
     proposed nothing. `why` is never persisted, so the rationale is a read-time join by name.
 
-    `controls_mapped` gates `unmatched_suggestions`: mid-stage, every suggestion would otherwise
+    `controls_mapped` gates `unmatched_suggested_controls`: mid-stage, every suggestion would otherwise
     look unmatched before mapping had run. Defaults True for the accepted-scenarios caller,
     where mapping is necessarily complete.
 
@@ -618,21 +646,22 @@ def _scenario_with_controls(scenario_json: str | None, controls: list[MappedCont
         scenario["threat_actors"] = stored_actors(threat_row.get("ThreatActorsJSON"))
     # Read the raw suggestions BEFORE overwriting the key they live under.
     raw = [c for c in (scenario.get("controls") or [])
-        if isinstance(c, dict) and str(c.get("name") or "").strip()]
-    # keyed on the same 500-char truncation the map row stored, so a long name still matches
-    whys = {c["name"][:500]: c.get("why") for c in raw}
+        if isinstance(c, dict) and _suggestion_key(c.get("name"))]
+    # keyed exactly as the map row stored it, so a long or padded name still matches
+    whys = {_suggestion_key(c.get("name")): c.get("why") for c in raw}
     scenario["suggested_controls"] = [{"name": c["name"], "why": c.get("why")} for c in raw]
     scenario["controls"] = [
-        c.model_copy(update={"suggested_why": whys.get(c.suggested_control)}).model_dump()
+        c.model_copy(update={"suggested_why": whys.get(c.suggested_control or "")}).model_dump()
         for c in controls
     ]
     if controls_mapped:
         matched = {c.suggested_control for c in controls if c.suggested_control}
-        scenario["unmatched_suggestions"] = [
-            {"name": c["name"], "why": c.get("why")} for c in raw if c["name"][:500] not in matched
+        scenario["unmatched_suggested_controls"] = [
+            {"name": c["name"], "why": c.get("why")} for c in raw
+            if _suggestion_key(c.get("name")) not in matched
         ]
     else:
-        scenario["unmatched_suggestions"] = None
+        scenario["unmatched_suggested_controls"] = None
     return scenario
 
 
@@ -672,14 +701,35 @@ _CONFLICT_RESPONSES: dict[int | str, dict] = {409: {"model": ErrorResponse, "des
 
 @router.post("/sessions/{session_id}/accept", response_model=AcceptResponse, responses=_CONFLICT_RESPONSES)
 def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depends(get_principal)) -> AcceptResponse:
-    """Accepts all or a subset of scenarios and finalizes the session; validation and the state
-    transition live in `accept_session`, this is the authz + HTTP wrapper."""
+    """Records an accept decision on all or a subset of this session's scenarios. Repeatable:
+    the session was already completed when generation finished, so scenarios left undecided stay
+    pending and can be accepted on a later visit. Validation and the writes live in
+    `accept_session`; this is the authz + HTTP wrapper."""
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
         matched = accept_session(sess, session_id, scenario_session["EntityID"], principal.user_id,
                                 subset=_subset_from_accept_body(body))
     return AcceptResponse(session_id=session_id, user_id=scenario_session["UserID"],
                         status=str(SessionStatus.completed), accepted_count=matched)
+
+
+@router.post("/sessions/{session_id}/scenarios/reject", response_model=RejectResponse,
+            responses=_CONFLICT_RESPONSES)
+def post_reject_scenarios(session_id: str, body: RejectBody,
+                        principal: Principal = Depends(get_principal)) -> RejectResponse:
+    """Explicitly decline scenarios, recording who declined them and when.
+
+    The counterpart to accept, and the reason a scenario has three states rather than two: a
+    pending scenario is one nobody has looked at, a rejected one is a decision somebody made and
+    signed. Rejecting does not delete anything — the scenario keeps its content and stays in
+    GET /results. Repeatable and order-independent with accept across visits, but the two are
+    mutually exclusive per scenario: an already-accepted id comes back 404 'already_accepted'."""
+    with db_session() as sess:
+        scenario_session = get_authorized_session(sess, session_id, principal)
+        matched = reject_scenarios(sess, session_id, scenario_session["EntityID"],
+                                principal.user_id, body.output_ids)
+    return RejectResponse(session_id=session_id, user_id=scenario_session["UserID"],
+                        rejected_count=matched)
 
 
 def enqueue_regeneration(session_id: str, subsystem_id: int, granularity: RegenGranularity,
@@ -743,19 +793,13 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
         ).scalar()
         if lock_status == StageStatus.RUNNING:
             raise RegenerateConflict(f"subsystem {subsystem_id} is locked (regeneration/accept in progress)")
-        # conditional UPDATE (compare-and-swap): only succeeds if the session is still
-        # active and at REVIEW: rowcount != 1 means a concurrent request already moved it
-        res: CursorResult = dal.execute_dml(
-            sess,
-            update(m.Scenario_Session)
-            .where(m.Scenario_Session.SessionID == session_id,
-                m.Scenario_Session.SessionStatus == SessionStatus.active,
-                m.Scenario_Session.CurrentStage == WorkflowStage.REVIEW)
-            .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING, UpdatedAt=now())
-        )
-        if res.rowcount != 1:
-            raise RegenerateConflict("another regeneration/accept won the race")
-
+        # No session-row write at all. Regeneration rewrites scenarios that ALREADY exist, so it
+        # must not re-reserve the asset (the session is completed, and re-reserving would block a
+        # fresh session on the same asset for the duration) and it must not move CurrentStage —
+        # the session stays parked at REVIEW/AWAITING_DECISION throughout, because that is still
+        # true: a human is still deciding. Regen progress is read from the stage rows, not the
+        # session row. The `_LOCK` check above screens the common race; the true arbiter is the
+        # worker's dal.acquire_execution_lock, with next_epoch fencing anything stale.
         levels = cascade.LEVELS_BY_GRANULARITY[granularity]
         epoch = dal.next_epoch(sess, session_id, subsystem_id, levels)
         dal.reset_stage_for_regen(sess, session_id, subsystem_id, levels, epoch)
@@ -804,18 +848,28 @@ def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> Re
         ).scalar()
         if lock_status == StageStatus.RUNNING:
             raise RegenerateConflict(f"subsystem {subsystem_id} is locked (regeneration/accept in progress)")
-        # conditional UPDATE (compare-and-swap): only succeeds while the session is still active
-        # and at REVIEW — rowcount != 1 means a concurrent request already moved it.
-        res: CursorResult = dal.execute_dml(
-            sess,
-            update(m.Scenario_Session)
-            .where(m.Scenario_Session.SessionID == session_id,
-                m.Scenario_Session.SessionStatus == SessionStatus.active,
-                m.Scenario_Session.CurrentStage == WorkflowStage.REVIEW)
-            .values(CurrentStage=WorkflowStage.SCENARIO_GENERATION, StageStatus=StageStatus.RUNNING, UpdatedAt=now())
-        )
-        if res.rowcount != 1:
-            raise RegenerateConflict("another regeneration/accept won the race")
+        # Next-set generates NEW scenarios, so unlike regenerate it DOES take the asset back for
+        # the duration: CAS completed -> active. Losing that CAS means another execution already
+        # holds the asset (or a fresh session claimed it while this reviewer was deciding), which
+        # is a transient conflict the client can retry — not the terminal "session is over".
+        # tasks._send_to_review flips it back to completed when generation reaches the barrier.
+        # Two ways to lose the asset, and BOTH land here. The CAS loses when another execution
+        # already re-reserved THIS session. IntegrityError fires when a different session claimed
+        # the same asset while this reviewer was deciding — releasing the asset at the review
+        # barrier is the whole point of the change, so that is now an ordinary outcome, and
+        # UX_Session_ActiveAsset is the arbiter. Without this catch it is a 500.
+        try:
+            reserved = dal.reserve_session(sess, session_id)
+        except IntegrityError as exc:
+            raise RegenerateConflict(
+                f"asset {scenario_session['AssetID']} is busy — another session holds it right "
+                f"now; retry in a moment",
+                reason=ReviewGateReason.asset_busy) from exc
+        if not reserved:
+            raise RegenerateConflict(
+                f"asset {scenario_session['AssetID']} is busy — another generation holds it right "
+                f"now; retry in a moment",
+                reason=ReviewGateReason.asset_busy)
 
         # Reserve the THREATS epoch here too — once — and thread it through so a redelivery of the
         # task re-uses it and run_next_set's idempotency guard can skip a second additive
@@ -887,17 +941,30 @@ def _stream_still_open(session_id: str, principal: Principal, verify_membership:
     `_load_events_board`). Called once per `bus.SUBSCRIBE_TICK`, never per real event — this is
     the guarantee that closes the stream whether or not any `bus.publish` call ever arrives.
 
-    False means the caller must close the generator: either the session left `active` (item 1 —
-    `load_session_board` returning None also counts, a hard-deleted row being the only way a
-    valid session id stops resolving) or, when `verify_membership` is on, the (user, entity) pair
+    False means the caller must close the generator: either the session is finished with this
+    client (`load_session_board` returning None also counts, a hard-deleted row being the only way
+    a valid session id stops resolving) or, when `verify_membership` is on, the (user, entity) pair
     no longer resolves (item 30). One function, one DB round trip per check — not two independent
-    handlers racing their own queries."""
+    handlers racing their own queries.
+
+    "Finished" is NOT `SessionStatus != active` any more. Generation completes the session at its
+    review barrier to release the asset, so a session awaiting per-scenario decisions is
+    `completed` while still very much live for this reviewer — closing on status alone would drop
+    the stream at the exact moment the review UI opens. `review_gate_reason(row) is None` is the
+    same predicate accept and regenerate gate on, reused here so the three cannot drift."""
     with db_session() as sess:
         row = dal.load_session_board(sess, session_id)
-        if row is None or str(row["SessionStatus"]) != str(SessionStatus.active):
+        if row is None:
             return False
-        if verify_membership and not dal.user_has_entity(sess, principal.user_id, row["EntityID"]):
+        if str(row["SessionStatus"]) != str(SessionStatus.active) and review_gate_reason(row) is not None:
             return False
+        if verify_membership:
+            # Fail CLOSED on a missing user id: membership cannot be verified without one, and
+            # dal.user_has_entity would raise TypeError on int(None) rather than deny.
+            if principal.user_id is None:
+                return False
+            if not dal.user_has_entity(sess, principal.user_id, row["EntityID"]):
+                return False
         return True
 
 
@@ -971,8 +1038,8 @@ _EVENT_STREAM_RESPONSES: dict[int | str, dict] = {
                     "approve that switches the active plan version DOES publish one after its "
                     "commit — recover with "
                     "GET /v1/sessions/{session_id}/treatment-plans and keep a slow poll. "
-                    "Full field-by-field shapes and recovery paths: "
-                    "docs/SSE_SESSION_PROGRESS_CONTRACT_GUIDE.md.",
+                    "Full field-by-field shapes: see the SessionProgress schema and the "
+                    "per-event schemas published alongside it in this document.",
         "content": {"text/event-stream": {}},
     }
 }
@@ -1126,7 +1193,11 @@ def _scenario_list_item(row: dict, controls: list[MappedControl]) -> ScenarioLis
 
 def _list_scenarios(entity_ids: set[str], user_id: str | None, status: str | None,
                     include_superseded: bool, limit: int, offset: int) -> list[ScenarioListItem]:
-    """Shared body of the two list routes: entity_ids must already be authorized."""
+    """Shared body of the two list routes: entity_ids must already be authorized.
+
+    `user_id` is a FILTER, not an identity claim — naming a colleague is allowed and returns their
+    rows, because entity scope is the authorization boundary here (see get_authorized_session for
+    why that is deliberate)."""
     with db_session() as sess:
         rows = dal.scenario_rows(sess, entity_ids=entity_ids, user_id=user_id, status=status,
                                 include_superseded=include_superseded, limit=limit, offset=offset)

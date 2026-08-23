@@ -10,14 +10,15 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.enums import (
-    AcceptSubsetReason,
+    AuditDecision,
+    ScenarioDecisionReason,
     ScenarioStatus,
     SessionStatus,
     StageStatus,
@@ -47,8 +48,8 @@ def _engine():
                 for key in path.lstrip("$.").split("."):
                     doc = doc[key]
                 return doc
-            except Exception:
-                return None
+            except Exception:  # noqa: BLE001 — SQLite UDF shim: ANY failure must return NULL,
+                return None      # which is what MSSQL's JSON_VALUE does for a bad path/blob
         dbapi_conn.create_function("json_value", 2, json_value)
 
     for table in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario_Output,
@@ -56,21 +57,46 @@ def _engine():
                 m.Threat_Catalogue, m.Risk_Treatment_Plan, m.Threat_Scenario_Control_Map,
                 m.Control_Library):
         table.__table__.create(engine)
+
+    # The two filtered unique indexes that arbitrate scenario identity in production
+    # (TSG_Core.sql:628, :637). SQLite supports partial indexes with the same semantics, so
+    # mirroring them here is what lets a test in this file DETECT a double-accept at all.
+    #
+    # Without them the shim silently accepts rows the real database would reject, so a test can
+    # assert a guard "prevents" a collision that the shim was never going to raise — passing for
+    # the wrong reason. That is not hypothetical: it is how a test asserting an unreachable
+    # duplicate-accept 500 came to look plausible. Creating them here removes the cause for every
+    # present and future test in this file, rather than fixing the one test that got it wrong.
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output"
+            "(SessionID, IdentityHash, ScenarioNumber) WHERE Superseded = 0")
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX UX_Scenario_ActiveAccepted ON Threat_Scenario_Output"
+            "(SessionID, IdentityHash, ScenarioNumber) WHERE Accepted = 1 AND IdentityHash IS NOT NULL")
     return engine
 
 
 def _now():
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _seed_session(Session, *, at_review: bool = True) -> str:
-    """One active session at the REVIEW barrier, with its _LOCK (IDLE) and SCENARIOS
-    (AWAITING_DECISION) stage rows for the asset unit (SubsystemID 0)."""
+    """One session at the REVIEW barrier, with its _LOCK (IDLE) and SCENARIOS
+    (AWAITING_DECISION) stage rows for the asset unit (SubsystemID 0).
+
+    At the barrier the session is COMPLETED, not active: generation completes it there so the
+    asset is released while the reviewer decides scenario by scenario (tasks._send_to_review).
+    Seeding `active` here would be seeding a state production can no longer reach, and every
+    accept assertion built on it would pass for the wrong reason. `at_review=False` still seeds
+    an active mid-generation session, which is exactly when accept must be refused."""
     sid = str(uuid.uuid4())
     with Session() as s:
         s.execute(m.Scenario_Session.__table__.insert().values(
             SessionID=sid, TenantID="t", EntityID="86", UserID="u1", AssetID=7,
-            AssetName="Citizen Portal", SessionStatus=SessionStatus.active,
+            AssetName="Citizen Portal",
+            SessionStatus=SessionStatus.completed if at_review else SessionStatus.active,
+            CompletedAt=_now() if at_review else None,
             CurrentStage=WorkflowStage.REVIEW if at_review else WorkflowStage.SCENARIO_GENERATION,
             StageStatus=StageStatus.AWAITING_DECISION if at_review else StageStatus.RUNNING,
             Mode="AUTO", CurrentSubsystemIndex=0, SubsystemsJSON="[]",
@@ -147,7 +173,8 @@ def test_accept_older_version_end_to_end(monkeypatch):
     with Session() as s:
         rows = dal.accepted_scenarios(s, sid)
         assert [json.loads(r["ScenarioJSON"])["scenario_title"] for r in rows] == ["v-B"]
-        # the session completed — the accept was real, not a partial no-op
+        # The session was ALREADY completed by generation and stays that way — accept decides
+        # scenarios, not sessions. C and D are still undecided and remain acceptable later.
         assert dict(dal.load_session(s, sid))["SessionStatus"] == str(SessionStatus.completed)
 
 
@@ -162,11 +189,15 @@ def test_duplicate_identity_rejected_before_any_write(monkeypatch):
     with pytest.raises(AcceptConflict) as exc_info:
         _accept(Session, sid, [b, d], monkeypatch)
 
-    assert exc_info.value.reason == AcceptSubsetReason.duplicate_identity
+    assert exc_info.value.reason == ScenarioDecisionReason.duplicate_identity
     for oid in (b, d):
         assert _flags(Session, oid)[0] == 0
-    with Session() as s:  # session must still be active and re-acceptable
-        assert dict(dal.load_session(s, sid))["SessionStatus"] == str(SessionStatus.active)
+    with Session() as s:  # the refusal ended nothing — the session sits where generation left it
+        assert dict(dal.load_session(s, sid))["SessionStatus"] == str(SessionStatus.completed)
+    # ...and "re-acceptable" is asserted by DOING it, not by reading a status string: retry with
+    # one version instead of two and it goes through.
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+    assert _flags(Session, b)[0] == 1
 
 
 def test_two_distinct_scenarios_both_acceptable(monkeypatch):
@@ -182,14 +213,48 @@ def test_two_distinct_scenarios_both_acceptable(monkeypatch):
     assert _flags(Session, other)[0] == 1
 
 
+def test_identity_guard_ignores_ids_the_write_would_not_touch(monkeypatch):
+    """scenario_identity_pairs mirrors mark_scenarios_accepted's predicates, so an id the write
+    will not flip cannot manufacture a false conflict in the guard.
+
+    A failed generation leaves a FAILURE CARD carrying its threat's IdentityHash; regenerating that
+    threat supersedes the card and writes a real scenario under the SAME identity. Both rows then
+    exist — the card superseded, the scenario active — which UX_Scenario_ActiveIdentity permits
+    because only one is active.
+
+    `mark_scenarios_accepted` skips the card (Status='error'), so it can never reach the index.
+    Before the guard's lookup mirrored those predicates it still saw the card's pair, and naming
+    both ids in one subset raised duplicate_identity for a collision that could not happen."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid = _seed_session(Session)
+    card = _scenario(Session, sid, identity=HASH_03, superseded=1,
+                    status=str(ScenarioStatus.error), title="v-card")
+    good = _scenario(Session, sid, identity=HASH_03, superseded=0, replaces=card, title="v-good")
+
+    # The guard must stay silent; the card is then reported by the normal not-acceptable path as a
+    # 404-with-reasons (failure_card), NOT as a duplicate_identity 409 from the pre-flight.
+    with pytest.raises(dal.NotFoundError) as exc_info:
+        _accept(Session, sid, [good, card], monkeypatch)
+    assert _REASON_TEXT[ScenarioDecisionReason.failure_card] in str(exc_info.value)
+    assert _flags(Session, good)[0] == 0, "nothing is written when a subset id is unacceptable"
+
+
+def test_reject_all_issues_no_identity_query(monkeypatch):
+    """subset=[] is the reject-all close. SQLAlchemy renders an empty IN as a real round trip
+    (`... IN (NULL) AND (1 != 1)`), so the early return in scenario_identity_pairs is what keeps
+    the close from paying for a query whose result cannot influence anything."""
+    assert dal.scenario_identity_pairs(None, "sess", [], [0]) == {}
+
+
 def test_reason_text_covers_every_enum_member_and_wire_values():
-    """No AcceptSubsetReason can surface without human wording; surviving members keep the
+    """No ScenarioDecisionReason can surface without human wording; surviving members keep the
     exact strings the old bare literals put on the wire."""
-    for member in AcceptSubsetReason:
+    for member in ScenarioDecisionReason:
         assert member in _REASON_TEXT, f"_REASON_TEXT missing wording for {member!r}"
-    assert AcceptSubsetReason.unknown == "unknown"
-    assert AcceptSubsetReason.failure_card == "failure_card"
-    assert AcceptSubsetReason.subsystem_not_awaiting_decision == "subsystem_not_awaiting_decision"
+    assert ScenarioDecisionReason.unknown == "unknown"
+    assert ScenarioDecisionReason.failure_card == "failure_card"
+    assert ScenarioDecisionReason.subsystem_not_awaiting_decision == "subsystem_not_awaiting_decision"
 
 
 def test_unacceptable_reasons_no_longer_flag_superseded():
@@ -202,10 +267,11 @@ def test_unacceptable_reasons_no_longer_flag_superseded():
                     status=str(ScenarioStatus.error))  # failure card, still unacceptable
     foreign = str(uuid.uuid4())  # a well-formed id that matches nothing in this session
     with Session() as s:
-        reasons = dal.unacceptable_subset_reasons(s, sid, [b, bad, foreign], [0])
+        reasons = dal.undecidable_subset_reasons(s, sid, [b, bad, foreign], [0],
+                                                 decision=AuditDecision.accept)
     assert b not in reasons
-    assert reasons[bad] == AcceptSubsetReason.failure_card
-    assert reasons[foreign] == AcceptSubsetReason.unknown
+    assert reasons[bad] == ScenarioDecisionReason.failure_card
+    assert reasons[foreign] == ScenarioDecisionReason.unknown
 
 
 def test_new_index_registered_in_boot_invariants():
@@ -273,9 +339,10 @@ def test_promotion_candidates_not_starved_by_superseded_accepted(monkeypatch):
 def test_results_default_view_shows_accepted_superseded_row(monkeypatch):
     """The GET /results default query must include the accepted-but-superseded version and
     still exclude non-accepted superseded ones. Exercised through the real route function."""
+    from contextlib import contextmanager
+
     import app.api.sessions as sessions_mod
     from app.api.deps import Principal
-    from contextlib import contextmanager
 
     engine = _engine()
     Session = sessionmaker(bind=engine, future=True)
@@ -314,11 +381,12 @@ def test_results_default_view_shows_accepted_superseded_row(monkeypatch):
 def test_treatment_gate_accepts_superseded_accepted_scenario(monkeypatch):
     """post_treatment_plan: an accepted-but-superseded scenario passes the gates (proven via a
     sentinel raised by the NEXT step); a non-accepted one still 409s scenario_not_accepted."""
+    from contextlib import contextmanager
+
     import app.api.treatment as treatment_api
     from app.api.deps import Principal
     from app.core.enums import TreatmentGateReason
     from app.pipeline import treatment as treatment_mod
-    from contextlib import contextmanager
 
     class Sentinel(Exception):
         """Raised in place of build_treatment_input — reaching it proves the gates passed."""
@@ -353,3 +421,66 @@ def test_treatment_gate_accepts_superseded_accepted_scenario(monkeypatch):
 
 if __name__ == "__main__":
     print("run via pytest")
+
+
+# --- the scenario lifecycle: decisions are per-scenario and outlive the session -------------
+def test_accept_one_today_and_the_rest_days_later(monkeypatch):
+    """THE requirement this lifecycle change exists for: accept one scenario now, come back
+    later and accept another. Before it, the first accept completed the session and every
+    remaining scenario was stranded with no reachable path back."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid = _seed_session(Session)
+    first = _scenario(Session, sid, identity="ident-1", number=1, superseded=0, title="v-1")
+    second = _scenario(Session, sid, identity="ident-2", number=1, superseded=0, title="v-2")
+
+    assert _accept(Session, sid, [first], monkeypatch) == 1
+    assert _flags(Session, first) == (1, 0)
+    assert _flags(Session, second) == (0, 0)   # untouched — still pending, not rejected
+
+    # ...days pass. The session is completed and the asset was released the whole time.
+    with Session() as s:
+        assert dict(dal.load_session(s, sid))["SessionStatus"] == str(SessionStatus.completed)
+
+    assert _accept(Session, sid, [second], monkeypatch) == 1
+    with Session() as s:
+        titles = sorted(json.loads(r["ScenarioJSON"])["scenario_title"]
+                        for r in dal.accepted_scenarios(s, sid))
+        assert titles == ["v-1", "v-2"]
+
+
+def test_second_accept_cannot_accept_another_version_of_an_accepted_scenario(monkeypatch):
+    """The collision the seeded guard exists for, and it is only reachable now that accept
+    repeats: accept version B, then come back and name version D of the SAME scenario.
+    UX_Scenario_ActiveAccepted would reject that at statement time; the pre-flight turns it
+    into a typed 409 that says the scenario is already accepted."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+
+    with pytest.raises(AcceptConflict) as exc_info:
+        _accept(Session, sid, [d], monkeypatch)
+    assert exc_info.value.reason == ScenarioDecisionReason.duplicate_identity
+    assert "already accepted" in str(exc_info.value)
+    assert _flags(Session, d)[0] == 0   # refused before any write
+    assert _flags(Session, b)[0] == 1   # the earlier decision stands
+
+
+def test_accept_all_is_guarded_against_an_earlier_accepted_version(monkeypatch):
+    """Accept-all is checked too. Accepting superseded version B and then clicking accept-all
+    would flip active version D — two accepted versions of one identity. Proof that dropping
+    the accept-all branch of the guard is not safe once accept repeats."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+
+    with pytest.raises(AcceptConflict) as exc_info:
+        _accept(Session, sid, None, monkeypatch)
+    assert exc_info.value.reason == ScenarioDecisionReason.duplicate_identity
+    assert _flags(Session, d)[0] == 0
