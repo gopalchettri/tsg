@@ -76,17 +76,17 @@ CREATE TABLE Scenario_Session (
     IdempotencyKey        nvarchar(200)  NULL,
     SectorIDsJSON         nvarchar(max)  NULL,
     AssetContextJSON      nvarchar(max)  NULL,
-    TuningSnapshotJSON    nvarchar(max)  NULL,               -- frozen tuning rulebook (core.tuning); NULL = pre-feature session
+    ScoringRulesSnapshotJSON    nvarchar(max)  NULL,               -- frozen tuning rulebook (core.tuning); NULL = pre-feature session
     CreatedAt             datetime2      NULL,
     UpdatedAt             datetime2      NULL,
     CompletedAt           datetime2      NULL,
     CONSTRAINT CK_Session_Status CHECK (SessionStatus IN ('active', 'completed', 'cancelled'))
 );
 
--- TuningSnapshotJSON: frozen Config_Tuning snapshot at session creation. NULL = pre-feature session.
+-- ScoringRulesSnapshotJSON: frozen Config_Tuning snapshot at session creation. NULL = pre-feature session.
 IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Scenario_Session', 'TuningSnapshotJSON') IS NULL
-    ALTER TABLE Scenario_Session ADD TuningSnapshotJSON nvarchar(max) NULL;
+    AND COL_LENGTH('dbo.Scenario_Session', 'ScoringRulesSnapshotJSON') IS NULL
+    ALTER TABLE Scenario_Session ADD ScoringRulesSnapshotJSON nvarchar(max) NULL;
 
 -- Library-promotion retry tracking (accept.py's isolated Phase 2). NULL PromotionFailedAt =
 -- never failed, or already resolved by a successful attempt/retry.
@@ -449,7 +449,7 @@ IF OBJECT_ID('dbo.Config_Tuning', 'U') IS NOT NULL
     ALTER TABLE Config_Tuning ALTER COLUMN ValueType nvarchar(100) NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- Rename Scenario_Session.TuningJSON -> TuningSnapshotJSON
+-- Rename Scenario_Session.TuningJSON -> ScoringRulesSnapshotJSON
 -- ---------------------------------------------------------------------------
 -- The value is a SNAPSHOT, frozen at session creation, and that is the whole point: every later
 -- stage reads it so a mid-run Config_Tuning edit cannot change how a session already in flight
@@ -459,8 +459,15 @@ IF OBJECT_ID('dbo.Config_Tuning', 'U') IS NOT NULL
 -- and is a no-op afterwards.
 IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Session', 'TuningJSON') IS NOT NULL
-    AND COL_LENGTH('dbo.Scenario_Session', 'TuningSnapshotJSON') IS NULL
-    EXEC sp_rename 'dbo.Scenario_Session.TuningJSON', 'TuningSnapshotJSON', 'COLUMN';
+    AND COL_LENGTH('dbo.Scenario_Session', 'ScoringRulesSnapshotJSON') IS NULL
+    EXEC sp_rename 'dbo.Scenario_Session.TuningJSON', 'ScoringRulesSnapshotJSON', 'COLUMN';
+
+-- Second hop, for anyone who ran this script during the brief window it used the intermediate
+-- name TuningSnapshotJSON. Guarded the same way, so it is a no-op on every other database.
+IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Session', 'TuningSnapshotJSON') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Session', 'ScoringRulesSnapshotJSON') IS NULL
+    EXEC sp_rename 'dbo.Scenario_Session.TuningSnapshotJSON', 'ScoringRulesSnapshotJSON', 'COLUMN';
 
 
 IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NULL

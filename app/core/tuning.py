@@ -3,7 +3,7 @@
 `get_settings()` is `@lru_cache`d, so a `.env` edit reaches nothing until every process
 restarts — and the pipeline runs in Celery WORKERS, whose beat schedule even freezes settings
 at import. `Config_Tuning` rows override config; the API resolves them ONCE at session
-creation and freezes the result onto `Scenario_Session.TuningSnapshotJSON`. Every later stage reads
+creation and freezes the result onto `Scenario_Session.ScoringRulesSnapshotJSON`. Every later stage reads
 the snapshot (`from_session`), so an edit applies to the NEXT session while a running
 assessment keeps its rulebook — one assessment is never scored under two rulebooks, and "what
 configuration produced this report?" is a stored column, not an inference.
@@ -65,7 +65,7 @@ def _coerce(key: str, value: Any) -> Any:
     floats (40.5 threats is nonsense, and int(40.5) would silently invent a policy); float
     keys accept ints; scoping_score_threshold accepts None ("no cutoff"). Without this, a
     Config_Tuning row declared ValueType='float' for an int key froze e.g. 40.0 into
-    TuningSnapshotJSON — and a float reaching pymongo's cursor.limit() or a slice made intel silently
+    ScoringRulesSnapshotJSON — and a float reaching pymongo's cursor.limit() or a slice made intel silently
     vanish from every scenario or errored the next-set stage."""
     if value is None and key == "scoping_score_threshold":
         return None
@@ -80,7 +80,7 @@ def _coerce(key: str, value: Any) -> Any:
 @dataclass(frozen=True)
 class ResolvedTuning:
     """The one immutable rulebook a session is assessed under. Built once per worker entry
-    point from the session's TuningSnapshotJSON snapshot (config fallback) and threaded as plain
+    point from the session's ScoringRulesSnapshotJSON snapshot (config fallback) and threaded as plain
     parameters into the helpers that consume each value — helpers never read get_settings()
     for these, or a Config_Tuning row would apply to some values and silently not others (a
     half-applied rulebook: the unreproducible-assessment failure the freeze exists to
@@ -105,7 +105,7 @@ def _from_config(s: Settings) -> dict[str, Any]:
 
 def resolve_snapshot(overrides: Mapping[str, tuple[Any, str | None]]) -> dict[str, Any]:
     """Config defaults + active Config_Tuning overrides → the dict frozen onto
-    `Scenario_Session.TuningSnapshotJSON` at session creation. `overrides` maps
+    `Scenario_Session.ScoringRulesSnapshotJSON` at session creation. `overrides` maps
     key → (typed value, embedding_model) — see dal.active_tuning_overrides. Unknown keys,
     wrong-typed values, and embedding-coupled rows tuned on a different model are skipped with
     a warning (config default applies).
@@ -149,7 +149,7 @@ def resolve_snapshot(overrides: Mapping[str, tuple[Any, str | None]]) -> dict[st
 
 @lru_cache(maxsize=64)
 def _parse_snapshot(raw: str) -> tuple[tuple[str, Any], ...] | None:
-    """Parse + type-heal one TuningSnapshotJSON blob, memoized on the raw string — from_session runs
+    """Parse + type-heal one ScoringRulesSnapshotJSON blob, memoized on the raw string — from_session runs
     per scenario, and re-parsing an identical frozen snapshot N times per batch is waste. Also
     the healing point for snapshots frozen BEFORE _coerce existed (a float in an int key):
     a bad value is dropped here (config default applies) rather than crashing a worker stage.
@@ -173,12 +173,12 @@ def _parse_snapshot(raw: str) -> tuple[tuple[str, Any], ...] | None:
 
 
 def from_session(scenario_session: Mapping[str, Any] | None) -> ResolvedTuning:
-    """The worker-side read: the session's frozen TuningSnapshotJSON, config fallback per key.
-    NULL/absent TuningSnapshotJSON (a pre-feature session) → pure config values; a corrupt blob or a
+    """The worker-side read: the session's frozen ScoringRulesSnapshotJSON, config fallback per key.
+    NULL/absent ScoringRulesSnapshotJSON (a pre-feature session) → pure config values; a corrupt blob or a
     wrong-typed value is logged and degrades to config — a session must fall back to the
     config rulebook, never crash mid-pipeline over calibration."""
     base = _from_config(get_settings())
-    raw = (scenario_session or {}).get("TuningSnapshotJSON")
+    raw = (scenario_session or {}).get("ScoringRulesSnapshotJSON")
     if raw:
         parsed = _parse_snapshot(raw)
         if parsed is None:

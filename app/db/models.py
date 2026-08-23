@@ -86,7 +86,7 @@ class Scenario_Session(Base):
     # is the load-bearing part - every later stage reads it so a mid-run Config_Tuning edit
     # cannot change how a session already in flight scores. The old name read as "the tuning
     # config", which is what it deliberately is NOT.
-    TuningSnapshotJSON: Mapped[str | None] = mapped_column(UnicodeText)
+    ScoringRulesSnapshotJSON: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CompletedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -502,7 +502,7 @@ class Config_Threat_Rule(Base):
 class Config_Tuning(Base):
     """Business-calibration overrides, editable at runtime (admin/DBA insert; no restart).
     An active row overrides the matching Settings field for every session created AFTER the
-    edit — never a running one, which keeps its Scenario_Session.TuningSnapshotJSON snapshot. Only
+    edit — never a running one, which keeps its Scenario_Session.ScoringRulesSnapshotJSON snapshot. Only
     keys in core.tuning.TUNABLE_KEYS have effect; unknown keys are skipped with a warning.
     EmbeddingModel names the model an embedding-coupled value was tuned on — on mismatch with
     the running model the row is skipped (config default applies)."""
