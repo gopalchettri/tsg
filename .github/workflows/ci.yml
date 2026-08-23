@@ -1,0 +1,67 @@
+# CI — the gate this repo never had.
+#
+# WHY: every check below already existed and already worked. Nothing ran them, so they rotted
+# silently and in ways nobody saw until a production-readiness audit went looking:
+#   * an uncommitted refactor left an IndentationError in scripts/test_next_set_overfetch.py,
+#     so a self-check guarding the next-set duplicate fix had not executed in some time;
+#   * a ruff upgrade widened its default rule set, which left 157 `# noqa` directives dead and
+#     ~660 findings unreported;
+#   * 49 mypy errors accumulated, two of them genuine None-crashes on live code paths.
+#
+# All four steps run WITHOUT infrastructure: the suite uses SQLite, a fake Redis and stub models
+# (tests/conftest.py), so there are no service containers and no secrets here. Keep it that way —
+# a CI job that needs credentials is a CI job that gets disabled.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run on the same ref.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the development venv. pyproject requires >=3.11.
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ODBC headers
+        # pyodbc ships manylinux wheels, but this keeps a source build possible rather than a
+        # confusing compiler error if a future pin has no wheel for this interpreter.
+        run: sudo apt-get update && sudo apt-get install -y unixodbc-dev
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      # --- the four gates, each run independently so one failure cannot mask the others -------
+      - name: Lint (ruff)
+        if: always()
+        run: ruff check app scripts tests
+
+      - name: Types (mypy)
+        if: always()
+        run: mypy app
+
+      - name: Env templates in sync with Settings
+        if: always()
+        # Only the committed templates exist in a fresh checkout (.env / .env.uat are gitignored),
+        # which is exactly the surface this guards: a Settings field with no documented env entry.
+        run: python -m app.core.env_selfcheck
+
+      - name: Tests
+        if: always()
+        # Includes the scripts/ self-checks, which run as subprocesses via
+        # tests/test_script_selfchecks.py — that is what caught the IndentationError above.
+        run: pytest -q
