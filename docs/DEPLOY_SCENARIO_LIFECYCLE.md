@@ -36,9 +36,15 @@ Guarded and idempotent; safe to re-run. It applies:
 (install) and `TSG_Core_UAT.sql` (upgrade). Both are byte-identical to the canonical script and a
 test enforces that; do not hand-edit them.
 
-## 2. The backfill — MANDATORY
+## 2. The backfill — mandatory wherever the existing data matters
 
-It runs inside the same script. Every session sitting at `active` + `REVIEW` flips to `completed`:
+**Development / a freshly created database: ignore this section.** The backfill matches zero rows
+when there is nothing parked at REVIEW, and the script is safe to run either way. It stays in the
+script rather than being a separate step precisely so nobody has to remember it later, when the
+environment does hold data somebody cares about.
+
+**UAT / production: this is not optional.** It runs inside the same script. Every session sitting
+at `active` + `REVIEW` flips to `completed`:
 
 ```sql
 UPDATE Scenario_Session
