@@ -318,6 +318,16 @@ class Settings(BaseSettings):
     # triage work. A higher value keeps more actors but increases processing and review work.
     max_actors_per_threat: int = Field(10, ge=1)
 
+    # TSG_THREAT_RETRIEVAL_TOP_K — cap on library candidates the retrieval funnel forwards to
+    # the LLM validator. LEAVE UNSET at today's library size (~75 rows): every gate-passing
+    # candidate is validated, which is what makes the coverage claim EXHAUSTIVE rather than
+    # sampled. Set only once the library outgrows validate-everything (post-MITRE import);
+    # gate-ungated ("always-eligible") types bypass the cap so universal threats survive it.
+    threat_retrieval_top_k: int | None = Field(None, ge=1)
+    # TSG_VALIDATOR_BATCH_SIZE — library candidates judged per LLM validation call. One batched
+    # call for the whole set is the norm at today's size; batches only split above this.
+    validator_batch_size: int = Field(20, ge=1)
+
     # TSG_ACTOR_VOCABULARY_CAP — how many actor names Stage 1's prompt shows as PREFERRED
     # spellings (dal.active_actor_names). A hint list, not a gate: capping it never stops the
     # AI proposing a real actor outside it (that name is still fully handled by grounding +

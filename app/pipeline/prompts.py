@@ -339,6 +339,60 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         "content": _context_message(build_base_context(asset_name, asset_context, subsystems))},
     ]
 
+def threat_validation_prompt(asset_name: str, asset_context: dict[str, Any],
+                             subsystems: list[dict[str, Any]],
+                             candidates: list[dict[str, Any]]) -> list[dict]:
+    """Stage-1a validator: judge LIBRARY candidates' applicability to THIS asset — the LLM as
+    a VALIDATOR, never a search engine. Candidates arrive index-keyed (1..N), never by DB id:
+    _EXCLUDE_DB_KEY_TO_PROMPT stays intact and the server maps indexes back to catalogue rows.
+
+    The candidates carry evidence the retrieval ranking never saw the model's side of —
+    descriptions, categories, fired applicability rules — and the verdict must cite the
+    asset's own context, which is what makes this a validation rather than a re-rank.
+    NOT_RELEVANT is a HARD DROP server-side (GAP-B), so the contract stresses that a drop
+    needs grounds in the context, not vibes."""
+    payload = build_base_context(asset_name, asset_context, subsystems)
+    payload["candidate_threats"] = [{
+        "index": i,
+        "category": [redact(c) for c in (cand.get("categories") or [])],
+        "type": redact(cand.get("type_name")),
+        "name": redact(cand.get("threat_name")),
+        "description": redact((cand.get("description") or "")[:600]),
+        # fired applicability rules, humanized — evidence the ranking already accepted
+        "applicability_evidence": [
+            f"rule {f.get('key')} ({f.get('family')})"
+            + (f" gate {f.get('gate')}" if f.get("gate") else f" weight {f.get('delta')}")
+            for f in (cand.get("rule_factors") or [])],
+    } for i, cand in enumerate(candidates, start=1)]
+    system_content = (
+        "You are a critical-infrastructure threat analyst VALIDATING pre-selected library "
+        "threats against one asset. For EVERY entry in the context's candidate_threats, judge "
+        "whether that threat genuinely applies to the asset described by the rest of the "
+        "context.\n"
+        "\nVERDICTS\n"
+        "RELEVANT: the asset's own technologies, systems, sector or context make this threat "
+        "credible here.\n"
+        "POTENTIALLY_RELEVANT: plausible, but the context lacks the evidence to confirm it.\n"
+        "NOT_RELEVANT: the context POSITIVELY shows the threat cannot apply (the technology "
+        "or exposure it needs is absent). Absence of mention alone is POTENTIALLY_RELEVANT, "
+        "not NOT_RELEVANT — a NOT_RELEVANT verdict removes the threat from the assessment, "
+        "so it must be groundable in the context.\n"
+        "\nRULES\n"
+        "1) Judge every candidate independently; return exactly one verdict per index, no "
+        "index skipped, none added.\n"
+        "2) justification: ONE sentence citing the specific context fact (a technology, a "
+        "supporting system, the sector, a rule) the verdict rests on — never a restatement "
+        "of the threat.\n"
+        "3) Use ONLY the supplied context — do not invent technologies or exposures.\n"
+        "\nOutput ONLY a JSON array of {\"index\": <int>, \"verdict\": \"RELEVANT\"|"
+        "\"POTENTIALLY_RELEVANT\"|\"NOT_RELEVANT\", \"justification\": \"<one sentence>\"} "
+        "— no markdown code fences, no text before or after it.")
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": _context_message(payload)},
+    ]
+
+
 def _defang(value: str) -> str:
     """Strip fence delimiters from untrusted feed text so it cannot forge a block boundary.
 

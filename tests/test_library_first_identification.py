@@ -1,0 +1,234 @@
+"""P2 gate for library-first threat identification (tasks.find_threats, Stage 1a/1b).
+
+Asserts the whole redesigned flow on real SQLite tables with a deterministic fake LLM:
+
+  - retrieval fills from the library FIRST: validated candidates land as Identified_Threat
+    rows carrying MASTER ids (ThreatTypeID/ThreatCatalogueID), verified, GroundingScore 100,
+    the type's LINKED actors (validated=True)
+  - a tech_gate rule hard-excludes a non-applicable type (metadata filter)
+  - the LLM validator's NOT_RELEVANT is a HARD DROP with a recorded justification
+  - generation runs only for the SHORTFALL, and a generated proposal that matches a
+    retrieved library row is dropped as an identity duplicate attributed to that row
+  - a genuinely novel proposal survives as unverified (the promotion path input)
+  - the grounding_summary audit row carries retrieved/generated counts, the validator
+    outcome, and the coverage report
+
+House pattern: real SQLite, bus.publish stubbed, no Mongo/Redis/real models.
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import UTC, datetime
+
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+
+from app.core.enums import GroundingStatus, StageStatus, SubsystemLevel
+from app.db import models as m
+from app.pipeline import embeddings, tasks
+from app.pipeline.tasks import find_threats, set_up_progress_tracking
+
+
+@pytest.fixture(autouse=True)
+def _isolated_embeddings(monkeypatch):
+    """Force the in-memory embedding store and clear the process caches: a REAL local Mongo
+    (docker compose dev) would otherwise serve real 1024-dim vectors for library names that
+    exist in the real seed, colliding with the fake 256-dim test vectors — and the test would
+    WRITE fake vectors into the real store."""
+    monkeypatch.setenv("TSG_EMBEDDING_STORE", "memory")
+    embeddings._L1.clear()
+    embeddings._MATRIX.clear()
+    yield
+    embeddings._L1.clear()
+    embeddings._MATRIX.clear()
+
+SID = str(uuid.uuid4())
+TASK_ID = str(uuid.uuid4())
+NOW = datetime.now(UTC)
+
+SUBSYSTEMS = [{"id": 41, "name": "SCADA HMI Server", "asset_type": "OT",
+               "technology_used": ["Siemens SCADA"], "vendor_name": "Siemens",
+               "criticality": "High"}]
+ASSET_CONTEXT = {"name": "Water Pumping Station", "asset_type": "Pumping Station",
+                 "sector": "Energy & Water", "sub_sector": "Water Supply",
+                 "critical_service": ["Potable water supply"]}
+
+
+class FakeLLM:
+    """Deterministic: one-hot embeddings per unique text (no accidental cosine collisions),
+    exact-match reranking, and canned chat answers per stage recognized by system text."""
+
+    def __init__(self):
+        self._slots: dict[str, int] = {}
+        self.chat_calls: list[tuple[str, str]] = []
+
+    def embed(self, texts, kind=None):
+        out = []
+        for t in texts:
+            idx = self._slots.setdefault(t, len(self._slots))
+            v = [0.0] * 256
+            v[idx % 256] = 1.0
+            out.append(v)
+        return out
+
+    def rerank(self, query, docs):
+        return [95.0 if d.strip().lower() == query.strip().lower() else 5.0 for d in docs]
+
+    def chat(self, messages, temperature=None, expected_type=None):
+        system, user = messages[0]["content"], messages[-1]["content"]
+        self.chat_calls.append((system, user))
+        if "VALIDATING pre-selected library threats" in system:
+            payload = json.loads(user[user.index("{"):])
+            verdicts = []
+            for cand in payload["candidate_threats"]:
+                bad = "web application" in (cand.get("name") or "").lower()
+                verdicts.append({
+                    "index": cand["index"],
+                    "verdict": "NOT_RELEVANT" if bad else "RELEVANT",
+                    "justification": ("no web application exists on this asset" if bad
+                                      else "SCADA controls pump setpoints directly")})
+            return json.dumps(verdicts), None
+        # Stage-1b gap generation: one duplicate of a library row + one genuinely novel.
+        return json.dumps([
+            {"category": "Tampering", "type": "Logic/Configuration Manipulation",
+             "name": "Unauthorised setpoint modification",
+             "generic_name": "Unauthorised setpoint modification", "actors": []},
+            {"category": "Repudiation", "type": "Audit Evidence Loss",
+             "name": "Loss of operator attribution from shared logins",
+             "generic_name": "Loss of operator attribution", "actors": []},
+        ]), None
+
+
+def _engine():
+    engine = create_engine("sqlite://")
+    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Identified_Threat,
+                m.Identified_Duplicate_Threat, m.Scenario_Audit, m.Prompt_Log,
+                m.Threat_Category, m.Threat_Type, m.Threat_Catalogue,
+                m.Threat_Catalogue_Category_Map, m.Threat_Actor,
+                m.ThreatType_ThreatActor_Map, m.Config_Threat_Rule):
+        tbl.__table__.create(engine)
+    return engine
+
+
+def _seed_library(s) -> None:
+    for cid, name in ((4, "Repudiation"), (5, "Spoofing"), (6, "Tampering")):
+        s.execute(m.Threat_Category.__table__.insert().values(
+            ThreatCategoryID=cid, ThreatCategoryName=name, IsActive=True, IsDeleted=False))
+    for tid, name, cat in ((7, "Logic/Configuration Manipulation", 6),
+                           (9, "Credential Abuse", 5),
+                           (11, "Retail POS Skimming", 5)):
+        s.execute(m.Threat_Type.__table__.insert().values(
+            ThreatTypeID=tid, ThreatTypeName=name, ThreatCategoryID=cat,
+            IsActive=True, IsDeleted=False))
+    for cid, name, tid, desc in (
+            (418, "Unauthorised setpoint modification", 7,
+             "An actor alters pump setpoints so control logic integrity is lost."),
+            (522, "Web application parameter tampering", 7,
+             "Tampering with parameters of a public web application."),
+            (205, "Credential phishing and MFA session theft", 9,
+             "Phishing steals operator credentials and session tokens."),
+            (900, "Payment card skimming at POS terminals", 11,
+             "Skimming devices harvest card data at retail POS.")):
+        s.execute(m.Threat_Catalogue.__table__.insert().values(
+            ThreatCatalogueID=cid, ThreatName=name, ThreatTypeID=tid, Description=desc,
+            IsActive=True, IsDeleted=False))
+    # multi-category membership: phishing is Spoofing AND Repudiation (map is authoritative)
+    for cat_id, cid in ((6, 418), (6, 522), (5, 205), (4, 205), (5, 900)):
+        s.execute(m.Threat_Catalogue_Category_Map.__table__.insert().values(
+            ThreatCategoryID=cat_id, ThreatCatalogueID=cid))
+    s.execute(m.Threat_Actor.__table__.insert().values(
+        ThreatActorID=1, ThreatActorName="APT33", IsCapable=1, IsActive=True, IsDeleted=False))
+    s.execute(m.ThreatType_ThreatActor_Map.__table__.insert().values(
+        ThreatTypeID=7, ThreatActorID=1))
+    # tech_gate: POS skimming applies only to RETAIL subsystems — none here, so type 11 is OUT
+    s.execute(m.Config_Threat_Rule.__table__.insert().values(
+        ThreatRuleID=1, RuleType="tech_gate", ThreatTypeID=11, RuleKey="asset_type",
+        RuleValue="RETAIL", IsActive=True, IsDeleted=False))
+
+
+def _seed_session(s) -> dict:
+    row = {"SessionID": SID, "TenantID": "t", "EntityID": "e", "UserID": "u",
+           "AssetName": "Water Pumping Station", "AssetID": "1", "SessionStatus": "active",
+           "CurrentStage": "THREAT_IDENTIFICATION", "StageStatus": "IDLE", "Mode": "AUTO",
+           "SubsystemsJSON": json.dumps(SUBSYSTEMS), "SectorIDsJSON": json.dumps([]),
+           "CreatedAt": NOW, "UpdatedAt": NOW}
+    s.execute(m.Scenario_Session.__table__.insert().values(**row))
+    set_up_progress_tracking(s, SID, "t", "e")
+    s.commit()
+    return row
+
+
+def test_library_first_identification_end_to_end(monkeypatch):
+    monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    llm = FakeLLM()
+    with Session() as s:
+        _seed_library(s)
+        scenario_session = _seed_session(s)
+        threats, _prov = find_threats(s, scenario_session, SUBSYSTEMS, ASSET_CONTEXT, llm,
+                                      TASK_ID, max_threats=4)
+
+    # --- library rows first, master identity intact -----------------------------------
+    with Session() as s:
+        rows = {r.ThreatCatalogueID: r for r in s.execute(
+            select(m.Identified_Threat)).scalars()}
+        retrieved = {cid: r for cid, r in rows.items() if cid is not None}
+        # 418 + 205 retrieved; 522 validator-dropped; 900 gate-excluded
+        assert set(retrieved) == {418, 205}
+        for r in retrieved.values():
+            assert str(r.GroundingStatus) == str(GroundingStatus.verified)
+            assert r.GroundingScore == 100.0
+            assert r.ThreatTypeID in (7, 9)
+            assert r.LibraryThreatName == r.ThreatName  # master name on every column
+        actors_418 = json.loads(retrieved[418].ThreatActorsJSON)
+        assert actors_418 == {"actors": ["APT33"], "validated": True}
+
+        # --- shortfall generation: duplicate dropped, novel survives -------------------
+        novel = [r for cid, r in rows.items() if cid is None]
+        assert len(novel) == 1
+        assert "operator attribution" in novel[0].ThreatName
+        assert str(novel[0].GroundingStatus) == str(GroundingStatus.unverified)
+        dups = list(s.execute(select(m.Identified_Duplicate_Threat)).scalars())
+        assert len(dups) == 1
+        assert dups[0].DuplicateReason == "identity"
+        assert dups[0].DuplicateOfThreatID == retrieved[418].ThreatID
+
+        # --- stage completed + audit carries the full provenance -----------------------
+        stage = s.execute(select(m.Subsystem_Stage_State).where(
+            m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS)).scalar_one()
+        assert str(stage.Status) == str(StageStatus.COMPLETE)
+        audit = [json.loads(a.DetailJSON) for a in s.execute(
+            select(m.Scenario_Audit)).scalars() if a.DetailJSON]
+        summary = next(d for d in audit if "retrieved" in d)
+        assert summary["retrieved"] == 2 and summary["generated"] == 1
+        assert summary["validator"]["kept"] == 2
+        assert summary["validator"]["dropped"][0]["catalogue_id"] == 522
+        assert "no web application" in summary["validator"]["dropped"][0]["justification"]
+        cov = summary["coverage"]
+        # 205 is Spoofing AND Repudiation (multi-category), 418 Tampering — all 3 covered
+        assert cov["cells"] == 3 and cov["unexplained"] == 0
+
+    # --- return value feeds write_scenarios: retrieved first, then novel ---------------
+    assert [t.get("selection_source") for t in threats[:2]] == ["library_retrieval"] * 2
+    assert threats[0]["validator_verdict"] == "RELEVANT"
+    assert len(threats) == 3
+
+
+def test_empty_library_degrades_to_generation_only(monkeypatch):
+    """No library rows → the funnel returns [] loudly and the pre-redesign generation-only
+    path runs unchanged. The degraded-library ladder's 'genuinely empty' rung."""
+    monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    llm = FakeLLM()
+    with Session() as s:
+        scenario_session = _seed_session(s)  # library tables exist but are EMPTY
+        threats, _prov = find_threats(s, scenario_session, SUBSYSTEMS, ASSET_CONTEXT, llm,
+                                      TASK_ID, max_threats=4)
+    assert len(threats) == 2                      # both fake proposals, generation-only
+    assert all(t.get("selection_source") is None for t in threats)
+    # only the threats-stage chat ran — no validator call without candidates
+    assert all("VALIDATING pre-selected" not in sys for sys, _ in llm.chat_calls)

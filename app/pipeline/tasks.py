@@ -15,6 +15,7 @@ from app.core.config import get_settings
 from app.core.enums import (
     AuditEventType,
     DuplicateReason,
+    GroundingStatus,
     ScenarioStatus,
     ScopingRejection,
     SelectionReason,
@@ -29,7 +30,15 @@ from app.core.security import _redact_value, is_placeholder
 from app.db import dal
 from app.db import models as m
 from app.db.dal import execute_dml, guid, now
-from app.pipeline import control_mapping, grounding, prompts, scoping, validation
+from app.pipeline import (
+    control_mapping,
+    coverage,
+    grounding,
+    prompts,
+    scoping,
+    threat_retrieval,
+    validation,
+)
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable, Provenance, moderate
 from app.sse import bus
 
@@ -545,6 +554,93 @@ def _usable_proposal(p: object) -> bool:
     return bool(ptype) and bool(pname) and len(ptype) + len(pname) <= get_settings().max_proposal_chars
 
 
+
+def _validate_candidates(sess: Session, llm: LLMClient, scenario_session: dict,
+                        subsystems: list[dict], asset_context: dict, candidates: list[dict],
+                        subsystem_id: int, epoch: int, task_id: str) -> tuple[list[dict], dict]:
+    """Batched LLM validation of library candidates — the validator half of Stage 1a.
+
+    Per candidate: RELEVANT | POTENTIALLY_RELEVANT | NOT_RELEVANT + a one-line justification.
+    NOT_RELEVANT is a HARD DROP (GAP-B): it removes the candidate before any scoring, never a
+    0.0 score term a retrieval score could outvote. Everything else FAILS OPEN — a missing or
+    unrecognized verdict, or a whole failed batch, degrades to POTENTIALLY_RELEVANT (kept):
+    a validator outage must weaken ranking, never silently shrink coverage. Verdicts are
+    fully reproducible from Prompt_Log (written by _ask_ai) plus the grounding_summary audit.
+    LLMSlotUnavailable propagates — the Celery retry resumes via the stage CAS as usual."""
+    s = get_settings()
+    verdicts: dict[int, dict] = {}
+    degraded = 0
+    for start in range(0, len(candidates), s.validator_batch_size):
+        batch = candidates[start:start + s.validator_batch_size]
+        messages = prompts.threat_validation_prompt(
+            scenario_session["AssetName"], asset_context, subsystems, batch)
+        try:
+            parsed, _prov = _ask_ai(sess, llm, messages, scenario_session=scenario_session,
+                                    subsystem_id=subsystem_id, stage="threat_validation",
+                                    level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id,
+                                    expected_type=list,
+                                    temperature=s.threat_identification_temperature)
+        except LLMSlotUnavailable:
+            raise
+        except Exception:
+            sess.rollback()
+            degraded += 1
+            log.warning("threat_validation.batch_failed_fail_open",
+                        session_id=scenario_session["SessionID"],
+                        batch_start=start, batch_size=len(batch), exc_info=True)
+            continue
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            if isinstance(idx, int) and 1 <= idx <= len(batch):
+                verdicts[start + idx - 1] = {
+                    "verdict": str(item.get("verdict") or "").strip().upper(),
+                    "justification": str(item.get("justification") or "")[:500]}
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for i, cand in enumerate(candidates):
+        v = verdicts.get(i) or {"verdict": "POTENTIALLY_RELEVANT", "justification": ""}
+        if v["verdict"] == "NOT_RELEVANT":
+            dropped.append({"catalogue_id": cand["catalogue_id"],
+                            "threat_name": cand["threat_name"],
+                            "justification": v["justification"]})
+            continue
+        if v["verdict"] not in ("RELEVANT", "POTENTIALLY_RELEVANT"):
+            v = {"verdict": "POTENTIALLY_RELEVANT", "justification": v["justification"]}
+        kept.append({**cand, "validator_verdict": v["verdict"],
+                     "validator_justification": v["justification"]})
+    return kept, {"candidates": len(candidates), "kept": len(kept),
+                  "dropped": dropped, "degraded_batches": degraded}
+
+
+def _build_retrieved_records(cand: dict, sid: str, tenant: str, ss: int,
+                            scenario_session: dict) -> tuple[dict, dict]:
+    """Identified_Threat row + pipeline summary for one VALIDATED library candidate.
+
+    The candidate IS the library row, so grounding is identity, not similarity:
+    verified, GroundingScore 100.0 (a real match confidence would imply a rerank that
+    never ran), master ids and names on every column, and the type's LINKED actors with
+    validated=True. Reuses _build_threat_records so the row shape cannot drift."""
+    gr = grounding.GroundingResult(
+        status=GroundingStatus.verified, type_id=cand["type_id"],
+        catalogue_id=cand["catalogue_id"], library_type=cand["type_name"],
+        library_name=cand["threat_name"], score=100.0,
+        actors=cand["actors"], actors_validated=True)
+    pcat = (cand["categories"][0] if cand.get("categories") else "")[:200]
+    row, summary = _build_threat_records(
+        guid(), sid, tenant, ss, cand["type_name"][:300], pcat, cand["threat_name"][:500],
+        gr, scenario_session["EntityID"], scenario_session.get("UserID"),
+        generic_name=cand["threat_name"])
+    # Additive keys, ignored by _dedup_key/scoring: full multi-category membership for the
+    # coverage grid, plus retrieval/validator provenance for the audit trail.
+    summary["categories"] = cand.get("categories") or []
+    summary["selection_source"] = "library_retrieval"
+    summary["retrieval_score"] = cand.get("retrieval_score")
+    summary["validator_verdict"] = cand.get("validator_verdict")
+    return row, summary
+
+
 def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
                 epoch: int = _EPOCH, categories: list[str] | None = None,
                 actor_examples: list[str] | None = None,
@@ -565,23 +661,26 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # and gets the original tn.max_threats_per_asset ceiling, unchanged.
     if max_threats is None:
         max_threats = tn.max_threats_per_asset
-    proposals, prov = _ask_ai(sess, llm, prompts.threats_prompt(
-                                scenario_session["AssetName"], asset_context, subsystems,
-                                max_threats=max_threats,
-                                categories=categories if categories is not None else dal.active_category_names(sess),
-                                actor_examples=actor_examples if actor_examples is not None else dal.active_actor_names(sess),
-                                exclude=exclude),
-                                scenario_session=scenario_session, subsystem_id=ss, stage="threats",
-                                level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
-                                temperature=get_settings().threat_identification_temperature)
-    # Filter untrusted LLM output once here (see _usable_proposal) rather than in every place
-    # that reads it below — that's both the smallest fix and the only one that covers every
-    # reader, including grounding.prime_query_embeddings.
-    usable = [p for p in proposals if _usable_proposal(p)]
-    if len(usable) != len(proposals):
-        log.warning("threats.proposals_dropped", session_id=sid,
-                    dropped=len(proposals) - len(usable), received=len(proposals))
-    proposals = usable
+    cats = categories if categories is not None else dal.active_category_names(sess)
+    sector_ids = json.loads(scenario_session["SectorIDsJSON"]) if scenario_session.get("SectorIDsJSON") else []
+
+    # --- Stage 1a: LIBRARY-FIRST — deterministic retrieval, then LLM validation ---------
+    # The funnel selects candidate Threat_Catalogue rows (metadata/rules gates + hybrid
+    # ranking) and the validator judges each one; generation below only fills the SHORTFALL.
+    # Any retrieval failure degrades to generation-only — exactly the pre-redesign path.
+    try:
+        candidates = threat_retrieval.retrieve_library_threats(
+            sess, llm, subsystems, asset_context, sector_ids)
+    except Exception:
+        sess.rollback()
+        log.warning("threat_retrieval.failed_generation_only", session_id=sid, exc_info=True)
+        candidates = []
+    validator_audit: dict = {}
+    if candidates:
+        candidates, validator_audit = _validate_candidates(
+            sess, llm, scenario_session, subsystems, asset_context, candidates,
+            ss, epoch, task_id)
+
     if supersede:
         dal.supersede(sess, m.Identified_Threat, sid, ss)
     existing_identities = dal.active_identified_threat_identities(sess, sid, ss) if not supersede else {}
@@ -589,7 +688,48 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     rows: list[dict] = []
     duplicates = 0
     dup_rows: list[dict] = []  # Identified_Duplicate_Threat rows — audit-only, see _duplicate_row
-    sector_ids = json.loads(scenario_session["SectorIDsJSON"]) if scenario_session.get("SectorIDsJSON") else []
+    retrieved_summaries: list[dict] = []
+    for cand in candidates:
+        if len(rows) >= max_threats:
+            log.info("threat_retrieval.cap_reached", session_id=sid, cap=max_threats)
+            break
+        row, summary = _build_retrieved_records(cand, sid, tenant, ss, scenario_session)
+        identity = dal.identity_hash(sid, ss, summary)
+        if identity in existing_identities:
+            # Already active on this session (an additive next-set round re-retrieving the
+            # library) — a no-op, not an audit-worthy duplicate.
+            continue
+        existing_identities[identity] = row["ThreatID"]
+        rows.append(row)
+        threats.append(summary)
+        retrieved_summaries.append(summary)
+
+    # --- Stage 1b: GAP GENERATION — the LLM proposes only what the library did not fill.
+    shortfall = max_threats - len(rows)
+    proposals: list = []
+    prov: Provenance | None = None
+    if shortfall > 0:
+        exclude_all = list(exclude or []) + [t["threat_name"] for t in retrieved_summaries
+                                            if t.get("threat_name")]
+        proposals, prov = _ask_ai(sess, llm, prompts.threats_prompt(
+                                    scenario_session["AssetName"], asset_context, subsystems,
+                                    max_threats=shortfall,
+                                    categories=cats,
+                                    actor_examples=actor_examples if actor_examples is not None else dal.active_actor_names(sess),
+                                    exclude=exclude_all or None),
+                                    scenario_session=scenario_session, subsystem_id=ss, stage="threats",
+                                    level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
+                                    temperature=get_settings().threat_identification_temperature)
+        # Filter untrusted LLM output once here (see _usable_proposal) rather than in every place
+        # that reads it below — that's both the smallest fix and the only one that covers every
+        # reader, including grounding.prime_query_embeddings.
+        usable = [p for p in proposals if _usable_proposal(p)]
+        if len(usable) != len(proposals):
+            log.warning("threats.proposals_dropped", session_id=sid,
+                        dropped=len(proposals) - len(usable), received=len(proposals))
+        proposals = usable
+    else:
+        log.info("threats.generation_skipped_library_filled", session_id=sid, cap=max_threats)
     grounding_cache: dict = {}
     # Grounding and the identity fingerprint both run on the library-ready name: the AI's
     # own generic_name if valid, otherwise a stripped-down fallback name (_generic_name_of).
@@ -632,7 +772,14 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # exact-match check above only catches identical wording, so two threats phrased
     # differently would both slip through and get generated (and billed) separately. Can be
     # switched off without a deploy by setting semantic_near_duplicate_threshold to 1.0.
-    dupe_info = _semantic_duplicates(llm, sid, ss, threats, prior_threats,
+    # GENERATED summaries only: retrieved threats are curated library rows whose distinctness
+    # the curator already vouched for — two similar catalogue entries must both survive. The
+    # retrieved set rides as PRIORS instead, so a generated paraphrase of a library threat is
+    # dropped (and attributed to the library row it duplicates).
+    retrieved_ids = {t["threat_id"] for t in retrieved_summaries}
+    generated_summaries = [t for t in threats if t["threat_id"] not in retrieved_ids]
+    dupe_info = _semantic_duplicates(llm, sid, ss, generated_summaries,
+                                    (prior_threats or []) + retrieved_summaries,
                                     scenario_session["AssetName"],
                                     threshold=tn.semantic_near_duplicate_threshold)
     near_dupes = len(dupe_info)
@@ -653,12 +800,27 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         sess.rollback()
         log.warning("stage.claim_lost", session_id=sid, subsystem=ss, stage="THREATS", epoch=epoch)
         return [], None
+    # Coverage close-out (safety gate): which (subsystem x STRIDE) cells does this round
+    # leave unanswered? Multi-category memberships count for every category they carry.
+    # Logged AND recorded in the audit row — a gap must be visible, never silent.
+    cov = coverage.coverage_report(
+        [ss], cats,
+        [{"subsystem_id": ss,
+          "categories": t.get("categories") or ([t["category"]] if t.get("category") else [])}
+         for t in threats])
+    if cov["unexplained"]:
+        log.warning("threats.coverage_gaps", session_id=sid, subsystem=ss,
+                    unexplained=cov["unexplained"], gaps=cov["gaps"][:12])
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.THREAT_IDENTIFICATION, SubsystemID=ss,
                     EventType=AuditEventType.grounding_summary,
                     DetailJSON=json.dumps({"count": len(threats),
+                                        "retrieved": len(retrieved_summaries),
+                                        "generated": len(threats) - len(retrieved_summaries),
+                                        "validator": validator_audit,
                                         "identity_duplicates": duplicates,
-                                        "semantic_near_duplicates": near_dupes}))
+                                        "semantic_near_duplicates": near_dupes,
+                                        "coverage": {**cov, "gaps": cov["gaps"][:50]}}))
     sess.commit()
     if dup_rows:
         # Deliberately OUTSIDE the transaction above, in its own try/except: this is an
