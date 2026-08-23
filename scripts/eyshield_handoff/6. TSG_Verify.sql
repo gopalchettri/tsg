@@ -165,6 +165,78 @@ SELECT 'Columns', 'PASS', N'Late-ALTER columns present (Threat_Type.Source, Thre
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Columns');
 
 -- ---------------------------------------------------------------------------
+-- 3b. THE SCENARIO-LIFECYCLE RELEASE
+-- ---------------------------------------------------------------------------
+-- Everything below is added by TSG_Core.sql for the release that made scenarios
+-- individually decidable (accept one today, the rest next week) and gave each
+-- decision its own audit row.
+--
+-- Its own category because the application ASSERTS these at startup
+-- (app/db/invariants.py) and refuses to boot without them. Before this block
+-- existed, the 0-6 sequence could run against a database that never received
+-- them, report a clean PASS, and get signed off — and only then would the app
+-- fail to start. A verification that green-lights an install the application
+-- will reject is worse than no verification: it turns a loud failure into an
+-- approved one.
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Scenario lifecycle', 'FAIL', N'Column missing: Threat_Scenario_Output.' + x.C,
+       N'Records who declined a scenario and when. Added by TSG_Core.sql; its absence means that '
+     + N'script did not run to completion. Re-run it — it is guarded and idempotent.'
+FROM (VALUES (N'RejectedAt'), (N'RejectedBy')) AS x(C)
+WHERE OBJECT_ID(N'dbo.Threat_Scenario_Output') IS NOT NULL
+  AND COL_LENGTH(N'dbo.Threat_Scenario_Output', x.C) IS NULL;
+
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Scenario lifecycle', 'FAIL', N'Column missing: Scenario_Audit.OutputID',
+       N'Names WHICH scenario a decision event is about. Without it the audit trail cannot answer '
+     + N'"who accepted this scenario, and when" — the question the per-scenario trail exists for.'
+WHERE OBJECT_ID(N'dbo.Scenario_Audit') IS NOT NULL
+  AND COL_LENGTH(N'dbo.Scenario_Audit', N'OutputID') IS NULL;
+
+-- Accept and reject are mutually exclusive. Enforced in the DATABASE because they are independent
+-- routes reachable at any time, so the row itself is the only place both orderings meet.
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Scenario lifecycle', 'FAIL', N'Constraint missing: CK_ScenarioOutput_DecisionExclusive',
+       N'Without it a scenario can be recorded as BOTH accepted and rejected. The service layer '
+     + N'also checks, but this constraint is the arbiter when two decisions race.'
+WHERE OBJECT_ID(N'dbo.Threat_Scenario_Output') IS NOT NULL
+  AND COL_LENGTH(N'dbo.Threat_Scenario_Output', N'RejectedAt') IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM sys.check_constraints
+                  WHERE name = 'CK_ScenarioOutput_DecisionExclusive');
+
+-- Checked HERE and not via @req_indexes: that block FAILs any index with is_unique = 0, and this
+-- one is deliberately non-unique AND filtered. Registering it there would fail every correctly
+-- installed database. app/db/invariants.py leaves it out for exactly the same reason.
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Scenario lifecycle', 'FAIL', N'Index missing: IX_ScenarioAudit_Output',
+       N'Filtered index on Scenario_Audit(OutputID, CreatedAt DESC). The application asserts it at '
+     + N'startup and will NOT BOOT without it. Re-run TSG_Core.sql.'
+WHERE OBJECT_ID(N'dbo.Scenario_Audit') IS NOT NULL
+  AND COL_LENGTH(N'dbo.Scenario_Audit', N'OutputID') IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM sys.indexes i
+                  JOIN sys.tables t ON t.object_id = i.object_id
+                  WHERE i.name = 'IX_ScenarioAudit_Output' AND t.name = 'Scenario_Audit');
+
+-- The backfill. Schema presence does not prove the migration finished: generation now completes a
+-- session at its review barrier, and the accept path that used to close pre-release sessions no
+-- longer completes anything. Any session left at active+REVIEW is stranded PERMANENTLY and holds
+-- its asset open, blocking every new assessment for it. Silent, until someone tries that asset.
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Scenario lifecycle', 'FAIL',
+       N'Stranded sessions: ' + CAST(COUNT(*) AS nvarchar(20)) + N' left at active+REVIEW',
+       N'TSG_Core.sql''s backfill did not run, or ran before these were created. Re-run it — the '
+     + N'UPDATE is idempotent. Left alone these never complete and never release their asset.'
+FROM dbo.Scenario_Session
+WHERE SessionStatus = 'active' AND CurrentStage = 'REVIEW'
+HAVING COUNT(*) > 0;
+
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Scenario lifecycle', 'PASS', N'Scenario-lifecycle schema complete and backfill applied',
+       N'RejectedAt/RejectedBy, CK_ScenarioOutput_DecisionExclusive, Scenario_Audit.OutputID and '
+     + N'IX_ScenarioAudit_Output all present; no session stranded at active+REVIEW.'
+WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Scenario lifecycle');
+
+-- ---------------------------------------------------------------------------
 -- 4. ENUM COLUMNS ARE WIDE ENOUGH FOR THE VALUES THE APPLICATION WRITES
 -- ---------------------------------------------------------------------------
 -- The third silent failure mode. A column narrower than the longest value its
