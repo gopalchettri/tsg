@@ -52,7 +52,7 @@ def _now():
 
 def _session_mapping(sid: str = SID) -> dict:
     return {"SessionID": sid, "TenantID": "t", "EntityID": "86", "UserID": "sara",
-            "SectorIDsJSON": "[]", "TuningJSON": None}
+            "SectorIDsJSON": "[]", "TuningSnapshotJSON": None}
 
 
 def _seed_threat(Session, sid: str, *, type_id=None, actors=("APT-X",),

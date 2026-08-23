@@ -76,17 +76,17 @@ CREATE TABLE Scenario_Session (
     IdempotencyKey        nvarchar(200)  NULL,
     SectorIDsJSON         nvarchar(max)  NULL,
     AssetContextJSON      nvarchar(max)  NULL,
-    TuningJSON            nvarchar(max)  NULL,               -- frozen tuning rulebook (core.tuning); NULL = pre-feature session
+    TuningSnapshotJSON    nvarchar(max)  NULL,               -- frozen tuning rulebook (core.tuning); NULL = pre-feature session
     CreatedAt             datetime2      NULL,
     UpdatedAt             datetime2      NULL,
     CompletedAt           datetime2      NULL,
     CONSTRAINT CK_Session_Status CHECK (SessionStatus IN ('active', 'completed', 'cancelled'))
 );
 
--- TuningJSON: frozen Config_Tuning snapshot at session creation. NULL = pre-feature session.
+-- TuningSnapshotJSON: frozen Config_Tuning snapshot at session creation. NULL = pre-feature session.
 IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Scenario_Session', 'TuningJSON') IS NULL
-    ALTER TABLE Scenario_Session ADD TuningJSON nvarchar(max) NULL;
+    AND COL_LENGTH('dbo.Scenario_Session', 'TuningSnapshotJSON') IS NULL
+    ALTER TABLE Scenario_Session ADD TuningSnapshotJSON nvarchar(max) NULL;
 
 -- Library-promotion retry tracking (accept.py's isolated Phase 2). NULL PromotionFailedAt =
 -- never failed, or already resolved by a successful attempt/retry.
@@ -189,7 +189,7 @@ CREATE TABLE Identified_Threat (
     LibraryThreatName  nvarchar(500) NULL,
     ThreatTypeID       int           NULL,
     ThreatCatalogueID  int           NULL,
-    GroundingStatus    nvarchar(20)  NOT NULL,
+    GroundingStatus    nvarchar(100)  NOT NULL,
     GroundingScore     float         NULL,
     Superseded         int           NOT NULL,
     CreatedAt          datetime2     NULL
@@ -215,7 +215,7 @@ CREATE TABLE Identified_Duplicate_Threat (
     GenericName        nvarchar(500) NULL,
     ThreatActorsJSON   nvarchar(max) NULL,
     DuplicateOfThreatID uniqueidentifier NULL,   -- Identified_Threat.ThreatID it matched, when known
-    DuplicateReason    nvarchar(30)  NOT NULL,   -- DuplicateReason enum (app/core/enums.py)
+    DuplicateReason    nvarchar(100)  NOT NULL,   -- DuplicateReason enum (app/core/enums.py)
     SimilarityScore    float         NULL,       -- cosine score for semantic matches; NULL for identity
     CreatedAt          datetime2     NULL
 );
@@ -239,8 +239,8 @@ CREATE TABLE Scoped_Threat (
     ScopeRank       int           NOT NULL,
     Selected        int           NOT NULL,
     Reason          nvarchar(500) NULL,
-    RejectionKind   nvarchar(30)  NULL,
-    SelectionKind   nvarchar(30)  NULL,
+    RejectionKind   nvarchar(100)  NULL,
+    SelectionKind   nvarchar(100)  NULL,
     FactorsJSON     nvarchar(max) NULL,
     Superseded      int           NOT NULL,
     CreatedAt       datetime2     NULL
@@ -276,7 +276,7 @@ CREATE TABLE Threat_Scenario_Output (
     UserID               nvarchar(200) NULL,
     SubsystemID          int           NOT NULL,
     ScopedThreatID       uniqueidentifier NOT NULL,
-    Status               nvarchar(20)  NOT NULL,
+    Status               nvarchar(100)  NOT NULL,
     ScenarioJSON         nvarchar(max) NULL,
     ValidationJSON       nvarchar(max) NULL,
     AcceptedSubsetJSON   nvarchar(max) NULL,
@@ -355,13 +355,121 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
     WHERE SessionStatus = 'active'
         AND CurrentStage = 'REVIEW';
 
+-- ---------------------------------------------------------------------------
+-- Widen the short enum/status columns to nvarchar(100)
+-- ---------------------------------------------------------------------------
+-- These hold values from closed vocabularies (app/core/enums.py) and were sized to the longest
+-- member at the time. Adding a longer member later is a one-line enum change that silently
+-- outgrows its column: every SHORTER value still inserts, so the application looks healthy right
+-- up until the first write of the new value fails, and the workflow stalls with no obvious cause.
+-- TSG_Verify.sql has a whole 'Column width' section devoted to catching exactly that.
+--
+-- nvarchar(100) is far past any current member, so that failure mode stops being reachable. The
+-- cost is nothing: nvarchar is variable-length, so a 12-character value occupies 12 characters
+-- whatever the declared maximum.
+--
+-- Guarded on the CURRENT width, so re-running is a no-op and a site already at 100 is skipped.
+
+-- IX_ScenarioAudit_SessionSubEvent has EventType in its key, and SQL Server refuses ALTER COLUMN
+-- while an index depends on it. Dropped here and recreated by the guarded CREATE INDEX further
+-- down this same script - no duplicate definition to keep in step.
+IF COL_LENGTH('dbo.Scenario_Audit', 'EventType') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Audit'), 'EventType', 'CharMaxLen') < 100
+    AND EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_SessionSubEvent'
+                AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+    DROP INDEX IX_ScenarioAudit_SessionSubEvent ON Scenario_Audit;
+
+IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'GroundingStatus') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Identified_Threat'), 'GroundingStatus', 'CharMaxLen') < 100
+    ALTER TABLE Identified_Threat ALTER COLUMN GroundingStatus nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Identified_Duplicate_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Duplicate_Threat', 'DuplicateReason') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Identified_Duplicate_Threat'), 'DuplicateReason', 'CharMaxLen') < 100
+    ALTER TABLE Identified_Duplicate_Threat ALTER COLUMN DuplicateReason nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Scoped_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scoped_Threat', 'RejectionKind') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Scoped_Threat'), 'RejectionKind', 'CharMaxLen') < 100
+    ALTER TABLE Scoped_Threat ALTER COLUMN RejectionKind nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Scoped_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scoped_Threat', 'SelectionKind') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Scoped_Threat'), 'SelectionKind', 'CharMaxLen') < 100
+    ALTER TABLE Scoped_Threat ALTER COLUMN SelectionKind nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'Status') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Scenario_Output'), 'Status', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Scenario_Output ALTER COLUMN Status nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Library_Import_Run', 'Source') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Library_Import_Run'), 'Source', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Library_Import_Run ALTER COLUMN Source nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Library_Import_Run', 'SourceTag') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Library_Import_Run'), 'SourceTag', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Library_Import_Run ALTER COLUMN SourceTag nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Library_Import_Run', 'Status') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Library_Import_Run'), 'Status', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Library_Import_Run ALTER COLUMN Status nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'Stage') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Audit'), 'Stage', 'CharMaxLen') < 100
+    ALTER TABLE Scenario_Audit ALTER COLUMN Stage nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'EventType') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Audit'), 'EventType', 'CharMaxLen') < 100
+    ALTER TABLE Scenario_Audit ALTER COLUMN EventType nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'Decision') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Audit'), 'Decision', 'CharMaxLen') < 100
+    ALTER TABLE Scenario_Audit ALTER COLUMN Decision nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'Granularity') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Audit'), 'Granularity', 'CharMaxLen') < 100
+    ALTER TABLE Scenario_Audit ALTER COLUMN Granularity nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'ActorType') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Audit'), 'ActorType', 'CharMaxLen') < 100
+    ALTER TABLE Scenario_Audit ALTER COLUMN ActorType nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Prompt_Log', 'Stage') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Prompt_Log'), 'Stage', 'CharMaxLen') < 100
+    ALTER TABLE Prompt_Log ALTER COLUMN Stage nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Prompt_Log', 'PromptVersion') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Prompt_Log'), 'PromptVersion', 'CharMaxLen') < 100
+    ALTER TABLE Prompt_Log ALTER COLUMN PromptVersion nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Threat_Candidate_Review', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Candidate_Review', 'CandidateKind') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Candidate_Review'), 'CandidateKind', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Candidate_Review ALTER COLUMN CandidateKind nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Config_Tuning', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Config_Tuning', 'ValueType') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Config_Tuning'), 'ValueType', 'CharMaxLen') < 100
+    ALTER TABLE Config_Tuning ALTER COLUMN ValueType nvarchar(100) NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- Rename Scenario_Session.TuningJSON -> TuningSnapshotJSON
+-- ---------------------------------------------------------------------------
+-- The value is a SNAPSHOT, frozen at session creation, and that is the whole point: every later
+-- stage reads it so a mid-run Config_Tuning edit cannot change how a session already in flight
+-- scores. "TuningJSON" read as "the tuning config", which is exactly what it is not.
+--
+-- sp_rename, not add-and-copy: it preserves the data in place. Guarded both ways, so it runs once
+-- and is a no-op afterwards.
+IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Session', 'TuningJSON') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Session', 'TuningSnapshotJSON') IS NULL
+    EXEC sp_rename 'dbo.Scenario_Session.TuningJSON', 'TuningSnapshotJSON', 'COLUMN';
+
+
 IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NULL
 CREATE TABLE Threat_Library_Import_Run (
     RunID            uniqueidentifier NOT NULL CONSTRAINT PK_Threat_Library_Import_Run PRIMARY KEY,
-    Source           nvarchar(50)  NOT NULL,   -- attack | attack_ics | capec | emb3d | pytm | threat_composer | misp_actors
-    SourceTag        nvarchar(50)  NULL,       -- provenance tag stamped on imported rows (Threat_Type.Source)
+    Source           nvarchar(100)  NOT NULL,   -- attack | attack_ics | capec | emb3d | pytm | threat_composer | misp_actors
+    SourceTag        nvarchar(100)  NULL,       -- provenance tag stamped on imported rows (Threat_Type.Source)
     DryRun           bit           NOT NULL,
-    Status           nvarchar(20)  NOT NULL,   -- running | success | failed
+    Status           nvarchar(100)  NOT NULL,   -- running | success | failed
     JobID            nvarchar(100) NULL,       -- Celery task id
     StartedBy        nvarchar(200) NULL,
     StartedAt        datetime2     NULL,
@@ -382,19 +490,19 @@ CREATE TABLE Scenario_Audit (
     SessionID        uniqueidentifier NOT NULL,
     TenantID         nvarchar(200) NULL,
     EntityID         nvarchar(200) NULL,
-    Stage            nvarchar(32)  NULL,
+    Stage            nvarchar(100)  NULL,
     SubsystemID      int           NULL,
-    EventType        nvarchar(40)  NOT NULL,
+    EventType        nvarchar(100)  NOT NULL,
     -- The scenario this event is ABOUT. NULL on every session- or subsystem-scoped event; set on
     -- the per-scenario decision rows (scenario_accepted / scenario_rejected). A column, not a
     -- DetailJSON key, because "the decision history of this scenario" is the question a GRC
     -- reviewer actually asks, and JSON cannot be indexed for it.
     OutputID         uniqueidentifier NULL,
-    Decision         nvarchar(30)  NULL,
-    Granularity      nvarchar(20)  NULL,
+    Decision         nvarchar(100)  NULL,
+    Granularity      nvarchar(100)  NULL,
     ThreatTypeRefID  int           NULL,
     ActorUserID      nvarchar(200) NULL,   -- who is ACCOUNTABLE (back-filled to the session owner)
-    ActorType        nvarchar(20)  NULL,   -- who PERFORMED it: 'user' | 'system'
+    ActorType        nvarchar(100)  NULL,   -- who PERFORMED it: 'user' | 'system'
     DetailJSON       nvarchar(max) NULL,
     CreatedAt        datetime2     NOT NULL
 );
@@ -407,8 +515,8 @@ CREATE TABLE Prompt_Log (
     EntityID        nvarchar(200) NULL,
     UserID          nvarchar(200) NULL,
     SubsystemID     int           NOT NULL,
-    Stage           nvarchar(20)  NOT NULL,
-    PromptVersion   nvarchar(20)  NOT NULL,
+    Stage           nvarchar(100)  NOT NULL,
+    PromptVersion   nvarchar(100)  NOT NULL,
     Messages        nvarchar(max) NOT NULL,
     Prompt          nvarchar(max) NULL,
     ResponseText    nvarchar(max) NULL,
@@ -447,7 +555,7 @@ CREATE TABLE Threat_Candidate_Review (
     ReviewedBy        nvarchar(200) NULL,
     ReviewedAt        datetime2 NULL,
     CreatedAt         datetime2 NOT NULL,
-    CandidateKind     nvarchar(20) NULL,      -- 'threat' | 'actor'; NULL = legacy 'threat'
+    CandidateKind     nvarchar(100) NULL,      -- 'threat' | 'actor'; NULL = legacy 'threat'
     CreatedBy         nvarchar(200) NULL      -- ORIGINAL proposer (accepting user), never the admin
 );
 
@@ -773,7 +881,7 @@ CREATE TABLE Config_Tuning (
     TuningID        int            NOT NULL IDENTITY(1,1) CONSTRAINT PK_Config_Tuning PRIMARY KEY,
     TuningKey       nvarchar(100)  NOT NULL CONSTRAINT UQ_Config_Tuning_Key UNIQUE,
     TuningValue     nvarchar(100)  NOT NULL,
-    ValueType       nvarchar(10)   NOT NULL CONSTRAINT CK_Config_Tuning_ValueType CHECK (ValueType IN ('float', 'int')),
+    ValueType       nvarchar(100)   NOT NULL CONSTRAINT CK_Config_Tuning_ValueType CHECK (ValueType IN ('float', 'int')),
     EmbeddingModel  nvarchar(200)  NULL,
     CreateDate      datetime2      NULL,
     CreatedBy       nvarchar(200)  NULL,

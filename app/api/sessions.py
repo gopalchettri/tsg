@@ -213,7 +213,7 @@ def _build_session_row(sid: str, tenant: str, body: CreateSessionBody, ctx: dict
         "StageStatus": StageStatus.IDLE, "Mode": SessionMode.AUTO, "CurrentSubsystemIndex": 0,
         "SubsystemsJSON": ctx["subsystems_json"], "SectorIDsJSON": json.dumps(ctx["sector_ids"]),
         "AssetContextJSON": ctx["asset_context_json"],
-        "TuningJSON": json.dumps(tuning_snapshot),
+        "TuningSnapshotJSON": json.dumps(tuning_snapshot),
         "CreatedAt": now(), "UpdatedAt": now(),
         "IdempotencyKey": idempotency_key,
     }

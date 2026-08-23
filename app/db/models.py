@@ -82,7 +82,11 @@ class Scenario_Session(Base):
     AssetContextJSON: Mapped[str | None] = mapped_column(UnicodeText)
     # The session's frozen tuning rulebook (core.tuning.resolve_snapshot), written once at
     # creation. NULL = pre-feature session: workers resolve from config instead.
-    TuningJSON: Mapped[str | None] = mapped_column(UnicodeText)
+    # Renamed from TuningJSON: the value is a SNAPSHOT, frozen at session creation, and that
+    # is the load-bearing part - every later stage reads it so a mid-run Config_Tuning edit
+    # cannot change how a session already in flight scores. The old name read as "the tuning
+    # config", which is what it deliberately is NOT.
+    TuningSnapshotJSON: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CompletedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -143,7 +147,7 @@ class Identified_Threat(Base):
     LibraryThreatName: Mapped[str | None] = mapped_column(Unicode(500))
     ThreatTypeID: Mapped[int | None] = mapped_column(Integer)
     ThreatCatalogueID: Mapped[int | None] = mapped_column(Integer)
-    GroundingStatus: Mapped[str] = mapped_column(Unicode(20))
+    GroundingStatus: Mapped[str] = mapped_column(Unicode(100))
     GroundingScore: Mapped[float | None] = mapped_column(Float)
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -167,7 +171,7 @@ class Identified_Duplicate_Threat(Base):
     ThreatActorsJSON: Mapped[str | None] = mapped_column(UnicodeText)
     # Identified_Threat.ThreatID it matched, when known — best-effort, see the SQL comment.
     DuplicateOfThreatID: Mapped[str | None] = mapped_column(GUID)
-    DuplicateReason: Mapped[str] = mapped_column(Unicode(30))  # DuplicateReason enum (app/core/enums.py)
+    DuplicateReason: Mapped[str] = mapped_column(Unicode(100))  # DuplicateReason enum (app/core/enums.py)
     SimilarityScore: Mapped[float | None] = mapped_column(Float)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -187,10 +191,10 @@ class Scoped_Threat(Base):
     Reason: Mapped[str | None] = mapped_column(Unicode(500))
     # ScopingRejection, or NULL when Selected=1. The machine-readable twin of Reason: next-set
     # re-servability branches on THIS, so rewording Reason can never change behaviour.
-    RejectionKind: Mapped[str | None] = mapped_column(Unicode(30))
+    RejectionKind: Mapped[str | None] = mapped_column(Unicode(100))
     # SelectionReason, or NULL when Selected=0 (and on rows written before the column existed —
     # readers must treat NULL as "unknown", never re-derive it from Reason prose).
-    SelectionKind: Mapped[str | None] = mapped_column(Unicode(30))
+    SelectionKind: Mapped[str | None] = mapped_column(Unicode(100))
     FactorsJSON: Mapped[str | None] = mapped_column(UnicodeText)
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -216,7 +220,7 @@ class Threat_Scenario_Output(Base):
     UserID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
     ScopedThreatID: Mapped[str] = mapped_column(GUID)
-    Status: Mapped[str] = mapped_column(Unicode(20))
+    Status: Mapped[str] = mapped_column(Unicode(100))
     ScenarioJSON: Mapped[str | None] = mapped_column(UnicodeText)
     ValidationJSON: Mapped[str | None] = mapped_column(UnicodeText)
     AcceptedSubsetJSON: Mapped[str | None] = mapped_column(UnicodeText)
@@ -259,10 +263,10 @@ class Threat_Library_Import_Run(Base):
     terminal row is committed in its own transaction so a FAILED import still leaves a record."""
     __tablename__ = "Threat_Library_Import_Run"
     RunID: Mapped[str] = mapped_column(GUID, primary_key=True)
-    Source: Mapped[str] = mapped_column(Unicode(50))              # API source name
-    SourceTag: Mapped[str | None] = mapped_column(Unicode(50))    # provenance tag on the imported rows
+    Source: Mapped[str] = mapped_column(Unicode(100))              # API source name
+    SourceTag: Mapped[str | None] = mapped_column(Unicode(100))    # provenance tag on the imported rows
     DryRun: Mapped[bool] = mapped_column(Boolean, default=False)
-    Status: Mapped[str] = mapped_column(Unicode(20))              # running | success | failed
+    Status: Mapped[str] = mapped_column(Unicode(100))              # running | success | failed
     JobID: Mapped[str | None] = mapped_column(Unicode(100))
     StartedBy: Mapped[str | None] = mapped_column(Unicode(200))
     StartedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -498,7 +502,7 @@ class Config_Threat_Rule(Base):
 class Config_Tuning(Base):
     """Business-calibration overrides, editable at runtime (admin/DBA insert; no restart).
     An active row overrides the matching Settings field for every session created AFTER the
-    edit — never a running one, which keeps its Scenario_Session.TuningJSON snapshot. Only
+    edit — never a running one, which keeps its Scenario_Session.TuningSnapshotJSON snapshot. Only
     keys in core.tuning.TUNABLE_KEYS have effect; unknown keys are skipped with a warning.
     EmbeddingModel names the model an embedding-coupled value was tuned on — on mismatch with
     the running model the row is skipped (config default applies)."""
@@ -506,7 +510,7 @@ class Config_Tuning(Base):
     TuningID: Mapped[int] = mapped_column(Integer, primary_key=True)
     TuningKey: Mapped[str] = mapped_column(Unicode(100), unique=True)
     TuningValue: Mapped[str] = mapped_column(Unicode(100))
-    ValueType: Mapped[str] = mapped_column(Unicode(10))  # 'float' | 'int'
+    ValueType: Mapped[str] = mapped_column(Unicode(100))  # 'float' | 'int'
     EmbeddingModel: Mapped[str | None] = mapped_column(Unicode(200))
     CreateDate: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
@@ -545,7 +549,7 @@ class Threat_Candidate_Review(Base):
     ReviewedBy: Mapped[str | None] = mapped_column(Unicode(200))
     ReviewedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedAt: Mapped[datetime] = mapped_column(DateTime)
-    CandidateKind: Mapped[str | None] = mapped_column(Unicode(20))  # CandidateKind enum; NULL = 'threat'
+    CandidateKind: Mapped[str | None] = mapped_column(Unicode(100))  # CandidateKind enum; NULL = 'threat'
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))     # ORIGINAL proposer, never the admin
 
 # One row per LLM call (exact prompt + raw response, success or failure). Raw model output is
@@ -558,8 +562,8 @@ class Prompt_Log(Base):
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
     UserID: Mapped[str | None] = mapped_column(Unicode(200))  # provenance — see pipeline outputs above
     SubsystemID: Mapped[int] = mapped_column(Integer)
-    Stage: Mapped[str] = mapped_column(Unicode(20))           # 'threats' | 'scenario'
-    PromptVersion: Mapped[str] = mapped_column(Unicode(20))
+    Stage: Mapped[str] = mapped_column(Unicode(100))           # 'threats' | 'scenario'
+    PromptVersion: Mapped[str] = mapped_column(Unicode(100))
     Messages: Mapped[str] = mapped_column(UnicodeText)        # exact prompt sent, as the wire JSON structure
     # The same prompt flattened to one readable string. Nullable: rows written before this column
     # existed have no value, and TSG_Core.sql never backfills row data.
@@ -584,7 +588,7 @@ class Scenario_Audit(Base):
     # WorkflowStage this event belongs to. NULL on events that are not a stage transition
     # (session_started, subsystem_advanced) and on stage_error, which cannot know which of the
     # in-flight work levels failed.
-    Stage: Mapped[str | None] = mapped_column(Unicode(32))
+    Stage: Mapped[str | None] = mapped_column(Unicode(100))
     # NOT a plain foreign key — three distinct meanings, none of them a broken reference:
     #   0    = THE ASSET ITSELF (tasks.ASSET_UNIT_ID). The pipeline is asset-centric, so almost
     #          every worker-written row carries 0; real supporting-system ids are >= 1.
@@ -592,14 +596,14 @@ class Scenario_Audit(Base):
     #          session_cancelled, the accept family).
     #   >= 1 = a specific supporting system. Historical rows only.
     SubsystemID: Mapped[int | None] = mapped_column(Integer)
-    EventType: Mapped[str] = mapped_column(Unicode(40))
+    EventType: Mapped[str] = mapped_column(Unicode(100))
     # The scenario this event is ABOUT — set only on the per-scenario decision rows
     # (scenario_accepted / scenario_rejected), NULL on every session- or subsystem-scoped event.
     # A real column rather than a DetailJSON key: IX_ScenarioAudit_Output makes "the decision
     # history of this scenario" a seek, which is the query a GRC reviewer actually runs.
     OutputID: Mapped[str | None] = mapped_column(GUID)
-    Decision: Mapped[str | None] = mapped_column(Unicode(30))  # accept only — AuditDecision; NULL elsewhere
-    Granularity: Mapped[str | None] = mapped_column(Unicode(20))  # regeneration_completed only
+    Decision: Mapped[str | None] = mapped_column(Unicode(100))  # accept only — AuditDecision; NULL elsewhere
+    Granularity: Mapped[str | None] = mapped_column(Unicode(100))  # regeneration_completed only
     ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)  # library_promoted +
     # candidate_reconciled (approvals: the minted/linked type)
     # WHO IS ACCOUNTABLE, not who typed the command: human actions record the authenticated
@@ -608,7 +612,7 @@ class Scenario_Audit(Base):
     # WHO PERFORMED it, which ActorUserID above deliberately cannot answer once worker rows are
     # back-filled with the session owner. NULL on rows predating the column — never back-filled,
     # since rewriting an append-only ledger would falsify records that were true when written.
-    ActorType: Mapped[str | None] = mapped_column(Unicode(20))
+    ActorType: Mapped[str | None] = mapped_column(Unicode(100))
     DetailJSON: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime] = mapped_column(DateTime)
 
