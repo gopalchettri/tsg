@@ -27,7 +27,7 @@ IF OBJECT_ID('dbo.Threat_Category', 'U') IS NULL
 CREATE TABLE Threat_Category (
     ThreatCategoryID    int            NOT NULL CONSTRAINT PK_Threat_Category PRIMARY KEY,
     ThreatCategoryName  nvarchar(200)  NOT NULL,
-    ThreatCategoryCode  nvarchar(20)   NULL,
+    ThreatCategoryCode  nvarchar(100)   NULL,
     SecurityObjective   nvarchar(200)  NULL,
     IsActive            bit            NOT NULL,
     IsDeleted           bit            NOT NULL,
@@ -76,7 +76,7 @@ CREATE TABLE Threat_Actor (
     IsCapable        int            NOT NULL,
     IsActive         bit            NOT NULL,
     IsDeleted        bit            NOT NULL,
-    Source           nvarchar(50)   NULL,
+    Source           nvarchar(100)   NULL,
     CreatedAt        datetime2      NULL,
     CreatedBy        nvarchar(200)  NULL,
     UpdatedAt        datetime2      NULL,
@@ -85,7 +85,7 @@ CREATE TABLE Threat_Actor (
 
 -- No-op once these columns exist — all four are always added together.
 IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Actor', 'Source') IS NULL
-    ALTER TABLE Threat_Actor ADD Source nvarchar(50) NULL;
+    ALTER TABLE Threat_Actor ADD Source nvarchar(100) NULL;
 
 IF OBJECT_ID('dbo.Threat_Category', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Category', 'CreatedAt') IS NULL
     ALTER TABLE Threat_Category ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
@@ -175,7 +175,7 @@ END
 IF OBJECT_ID('dbo.Config_Threat_Rule', 'U') IS NULL
 CREATE TABLE Config_Threat_Rule (
     ThreatRuleID  int            IDENTITY(22,1) NOT NULL CONSTRAINT PK_Config_Threat_Rule PRIMARY KEY,
-    RuleType      nvarchar(50)   NOT NULL,               -- tech_gate | relevance_flag | relevance_context_value
+    RuleType      nvarchar(100)   NOT NULL,               -- tech_gate | relevance_flag | relevance_context_value
     ThreatTypeID  int            NOT NULL,               -- app-enforced FK -> Threat_Type
     RuleKey       nvarchar(200)  NOT NULL,               -- e.g. 'asset_type' (scoping.py allowlist)
     RuleValue     nvarchar(450)  NULL,
@@ -219,3 +219,31 @@ UNION ALL
 SELECT 'Threat_Catalogue.Source', COL_LENGTH('dbo.Threat_Catalogue', 'Source')
 UNION ALL
 SELECT 'Config_Threat_Rule', OBJECT_ID('dbo.Config_Threat_Rule', 'U');
+
+
+-- ---------------------------------------------------------------------------
+-- Widen every remaining short nvarchar column to nvarchar(100)
+-- ---------------------------------------------------------------------------
+-- A blanket floor, not a per-column judgement. Narrow columns sized to today's longest value are
+-- a standing trap: the value that outgrows one is usually a one-line enum or vocabulary change,
+-- and the failure is invisible because every SHORTER value still inserts - the application looks
+-- healthy until the first write of the new value fails, mid-workflow, with no obvious cause.
+--
+-- nvarchar is variable-length, so this costs nothing: a 12-character value occupies 12 characters
+-- whatever the declared maximum. Index keys are unaffected in practice - the widest key here
+-- reaches 220 bytes against a 1700-byte limit.
+--
+-- Each is guarded on the CURRENT width, so re-running is a no-op and a site already at 100 skips.
+
+IF OBJECT_ID('dbo.Threat_Category', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Category', 'ThreatCategoryCode') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Category'), 'ThreatCategoryCode', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Category ALTER COLUMN ThreatCategoryCode nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Actor', 'Source') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Actor'), 'Source', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Actor ALTER COLUMN Source nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Config_Threat_Rule', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Config_Threat_Rule', 'RuleType') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Config_Threat_Rule'), 'RuleType', 'CharMaxLen') < 100
+    ALTER TABLE Config_Threat_Rule ALTER COLUMN RuleType nvarchar(100) NOT NULL;

@@ -74,7 +74,7 @@ class Scenario_Session(Base):
     SessionStatus: Mapped[str] = mapped_column(Unicode(100))
     CurrentStage: Mapped[str] = mapped_column(Unicode(100))
     StageStatus: Mapped[str] = mapped_column(Unicode(100))
-    Mode: Mapped[str] = mapped_column(Unicode(20))
+    Mode: Mapped[str] = mapped_column(Unicode(100))
     CurrentSubsystemIndex: Mapped[int | None] = mapped_column(Integer)
     SubsystemsJSON: Mapped[str] = mapped_column(UnicodeText)
     IdempotencyKey: Mapped[str | None] = mapped_column(Unicode(200))
@@ -226,7 +226,7 @@ class Threat_Scenario_Output(Base):
     AcceptedSubsetJSON: Mapped[str | None] = mapped_column(UnicodeText)
     Accepted: Mapped[int] = mapped_column(Integer, default=0)
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
-    IdentityHash: Mapped[str | None] = mapped_column(Unicode(64))     #sha256(SessionID|SubsystemID|dedup_key) — dedup_key = cat:/type:/txt: (tasks._dedup_key); UX_Scenario_ActiveIdentity blocks a 2nd active row per (key, ScenarioNumber)
+    IdentityHash: Mapped[str | None] = mapped_column(Unicode(100))     #sha256(SessionID|SubsystemID|dedup_key) — dedup_key = cat:/type:/txt: (tasks._dedup_key); UX_Scenario_ActiveIdentity blocks a 2nd active row per (key, ScenarioNumber)
     # Which of the threat's coexisting scenarios this is: 1 = the original, 2+ = alternates
     # ("generate next set" variant fallback). How many a threat accumulates is NOT capped by a
     # setting: dal.variant_eligible_primaries derives it from that threat's own plausible entry
@@ -350,7 +350,7 @@ class Threat_Category(Base):
     # Server rejects (Msg 8106) -> 500 on every create. SQLite has no such logic, so CI can't see it.
     ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     ThreatCategoryName: Mapped[str] = mapped_column(Unicode(200))
-    ThreatCategoryCode: Mapped[str | None] = mapped_column(Unicode(20))
+    ThreatCategoryCode: Mapped[str | None] = mapped_column(Unicode(100))
     SecurityObjective: Mapped[str | None] = mapped_column(Unicode(200))
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -391,7 +391,7 @@ class Threat_Catalogue(Base):
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
     # See Threat_Type.Source above — same provenance tracking, same script adds it.
-    Source: Mapped[str | None] = mapped_column(Unicode(50))
+    Source: Mapped[str | None] = mapped_column(Unicode(100))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -408,7 +408,7 @@ class Threat_Actor(Base):
     # Same provenance vocabulary as Threat_Type.Source, but declared directly in this table's own
     # CREATE block in scripts/Threat_library.sql (moved from scripts/TSG_Core.sql 2026-08-04) —
     # so unlike the other two it needs no _COLUMN_DEPLOYED_SEPARATELY entry.
-    Source: Mapped[str | None] = mapped_column(Unicode(50))
+    Source: Mapped[str | None] = mapped_column(Unicode(100))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -432,7 +432,7 @@ class Control_Standard(Base):
     __tablename__ = "Control_Standard"
     StandardID: Mapped[int] = mapped_column(Integer, primary_key=True)
     StandardName: Mapped[str] = mapped_column(Unicode(200))
-    Source: Mapped[str | None] = mapped_column(Unicode(50))
+    Source: Mapped[str | None] = mapped_column(Unicode(100))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -444,13 +444,13 @@ class Control_Standard(Base):
 class Control_Library(Base):
     __tablename__ = "Control_Library"
     ControlLibraryID: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ControlCode: Mapped[str] = mapped_column(Unicode(20))     # 'CII-CID-001'..'CII-CID-1288', unique
-    ITOT: Mapped[str] = mapped_column(Unicode(10))            # 'IT' | 'OT' — grounding's tolerant asset_type pre-filter
+    ControlCode: Mapped[str] = mapped_column(Unicode(100))     # 'CII-CID-001'..'CII-CID-1288', unique
+    ITOT: Mapped[str] = mapped_column(Unicode(100))            # 'IT' | 'OT' — grounding's tolerant asset_type pre-filter
     Domain: Mapped[str] = mapped_column(Unicode(200))         # un-normalized vocabulary (96 distinct values) — report as-is, never join on it
     ControlName: Mapped[str] = mapped_column(Unicode(500))
     ControlDescription: Mapped[str] = mapped_column(UnicodeText)
     SampleEvidence: Mapped[str | None] = mapped_column(UnicodeText)
-    Source: Mapped[str | None] = mapped_column(Unicode(50))
+    Source: Mapped[str | None] = mapped_column(Unicode(100))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -482,7 +482,7 @@ class Threat_Catalogue_Category_Map(Base):
 class Config_Threat_Rule(Base):
     __tablename__ = "Config_Threat_Rule"
     ThreatRuleID: Mapped[int] = mapped_column(Integer, primary_key=True)
-    RuleType: Mapped[str] = mapped_column(Unicode(50))       # enums.ThreatRuleType
+    RuleType: Mapped[str] = mapped_column(Unicode(100))       # enums.ThreatRuleType
     ThreatTypeID: Mapped[int] = mapped_column(Integer)        # app-enforced FK → Threat_Type
     # One of scoping._RULE_KEY_FIELDS — currently exactly: criticality, subsystem_name,
     # asset_type, past_incidents. This example used to read "internet_facing", a key REMOVED on
@@ -543,7 +543,7 @@ class Threat_Candidate_Review(Base):
     # The candidate's library-shaped name — what the curator actually generalizes toward.
     # NULL on rows queued before the column existed.
     ProposedGenericName: Mapped[str | None] = mapped_column(Unicode(500))
-    Status: Mapped[str] = mapped_column(Unicode(20))
+    Status: Mapped[str] = mapped_column(Unicode(100))
     ThreatTypeID: Mapped[int | None] = mapped_column(Integer)
     ThreatCatalogueID: Mapped[int | None] = mapped_column(Integer)
     ReviewedBy: Mapped[str | None] = mapped_column(Unicode(200))
@@ -642,11 +642,11 @@ class user_scope_assignment(Base):
 class API_Client(Base):
     __tablename__ = "API_Client"
     ClientID: Mapped[str] = mapped_column(Unicode(100), primary_key=True)
-    KeyHash: Mapped[str] = mapped_column(Unicode(64))          # SHA-256 hex of the 32-byte secret
+    KeyHash: Mapped[str] = mapped_column(Unicode(100))          # SHA-256 hex of the 32-byte secret
     Name: Mapped[str] = mapped_column(Unicode(200))
     # Which module this key may authenticate ('tsg', 'chatbot', ...). A key is valid ONLY for its
     # own Module, so one leaked key is contained to a single module. See dal.api_client_id_for_key_hash.
-    Module: Mapped[str] = mapped_column(Unicode(50), default="tsg")
+    Module: Mapped[str] = mapped_column(Unicode(100), default="tsg")
     Active: Mapped[bool] = mapped_column(Boolean, default=True)
     # Audit trail — who provisioned / revoked this key. NOT read by the auth path
     # (verify_api_key uses only KeyHash/Module/Active); these exist for provenance in the register.

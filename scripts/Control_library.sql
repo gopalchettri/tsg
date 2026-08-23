@@ -21,7 +21,7 @@ IF OBJECT_ID('dbo.Control_Standard', 'U') IS NULL
 CREATE TABLE Control_Standard (
     StandardID     int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Control_Standard PRIMARY KEY,
     StandardName   nvarchar(200)  NOT NULL,
-    Source         nvarchar(50)   NULL,
+    Source         nvarchar(100)   NULL,
     CreatedAt      datetime       NOT NULL CONSTRAINT DF_Control_Standard_CreatedAt DEFAULT SYSUTCDATETIME(),
     CreatedBy      nvarchar(200)   NULL,
     UpdatedAt      datetime       NULL,
@@ -33,13 +33,13 @@ CREATE TABLE Control_Standard (
 IF OBJECT_ID('dbo.Control_Library', 'U') IS NULL
 CREATE TABLE Control_Library (
     ControlLibraryID    int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Control_Library PRIMARY KEY,
-    ControlCode          nvarchar(20)   NOT NULL,
-    ITOT                  nvarchar(10)   NOT NULL,
+    ControlCode          nvarchar(100)   NOT NULL,
+    ITOT                  nvarchar(100)   NOT NULL,
     Domain                nvarchar(200)  NOT NULL,
     ControlName            nvarchar(500)  NOT NULL,
     ControlDescription     nvarchar(max)  NOT NULL,
     SampleEvidence          nvarchar(max)  NULL,
-    Source                  nvarchar(50)   NULL,
+    Source                  nvarchar(100)   NULL,
     CreatedAt               datetime       NOT NULL CONSTRAINT DF_Control_Library_CreatedAt DEFAULT SYSUTCDATETIME(),
     CreatedBy                nvarchar(200)   NULL,
     UpdatedAt                 datetime       NULL,
@@ -169,3 +169,35 @@ BEGIN
     ALTER TABLE Control_Library ADD CONSTRAINT DF_Control_Library_CreatedAt
         DEFAULT SYSUTCDATETIME() FOR CreatedAt;
 END
+
+
+-- ---------------------------------------------------------------------------
+-- Widen every remaining short nvarchar column to nvarchar(100)
+-- ---------------------------------------------------------------------------
+-- A blanket floor, not a per-column judgement. Narrow columns sized to today's longest value are
+-- a standing trap: the value that outgrows one is usually a one-line enum or vocabulary change,
+-- and the failure is invisible because every SHORTER value still inserts - the application looks
+-- healthy until the first write of the new value fails, mid-workflow, with no obvious cause.
+--
+-- nvarchar is variable-length, so this costs nothing: a 12-character value occupies 12 characters
+-- whatever the declared maximum. Index keys are unaffected in practice - the widest key here
+-- reaches 220 bytes against a 1700-byte limit.
+--
+-- Each is guarded on the CURRENT width, so re-running is a no-op and a site already at 100 skips.
+
+IF OBJECT_ID('dbo.Control_Standard', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Control_Standard', 'Source') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Control_Standard'), 'Source', 'CharMaxLen') < 100
+    ALTER TABLE Control_Standard ALTER COLUMN Source nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Control_Library', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Control_Library', 'ControlCode') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Control_Library'), 'ControlCode', 'CharMaxLen') < 100
+    ALTER TABLE Control_Library ALTER COLUMN ControlCode nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Control_Library', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Control_Library', 'ITOT') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Control_Library'), 'ITOT', 'CharMaxLen') < 100
+    ALTER TABLE Control_Library ALTER COLUMN ITOT nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Control_Library', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Control_Library', 'Source') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Control_Library'), 'Source', 'CharMaxLen') < 100
+    ALTER TABLE Control_Library ALTER COLUMN Source nvarchar(100) NULL;

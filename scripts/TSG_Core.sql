@@ -54,7 +54,7 @@ CREATE TABLE Scenario_Session (
     SessionStatus         nvarchar(100)   NOT NULL,
     CurrentStage          nvarchar(100)   NOT NULL,
     StageStatus           nvarchar(100)   NOT NULL,
-    Mode                  nvarchar(20)   NOT NULL,
+    Mode                  nvarchar(100)   NOT NULL,
     CurrentSubsystemIndex int            NULL,
     SubsystemsJSON        nvarchar(max)  NOT NULL,
     IdempotencyKey        nvarchar(200)  NULL,
@@ -266,7 +266,7 @@ CREATE TABLE Threat_Scenario_Output (
     AcceptedSubsetJSON   nvarchar(max) NULL,
     Accepted             int           NOT NULL,
     Superseded           int           NOT NULL,
-    IdentityHash         nvarchar(64)  NULL,
+    IdentityHash         nvarchar(100)  NULL,
     ScenarioNumber       int           NOT NULL CONSTRAINT DF_ScenarioOutput_ScenarioNumber DEFAULT 1,  -- 1 = original, 2+ = "generate next set" alternates
     ReplacesOutputID     uniqueidentifier NULL,   -- OutputID this row replaced; NULL for first-run/variant rows
     GenerationEpoch      int           NOT NULL,
@@ -540,7 +540,7 @@ CREATE TABLE Threat_Candidate_Review (
                                               -- proposed FOR (approval's link target); NULL only on legacy rows
     ProposedName      nvarchar(500) NOT NULL, -- threat name, or the actor name for kind='actor'
     ProposedGenericName nvarchar(500) NULL,  -- library-shaped name the curator generalizes toward
-    Status            nvarchar(20)  NOT NULL,
+    Status            nvarchar(100)  NOT NULL,
     ThreatTypeID      int NULL,
     ThreatCatalogueID int NULL,
     ReviewedBy        nvarchar(200) NULL,
@@ -902,9 +902,9 @@ GO
 IF OBJECT_ID('dbo.API_Client', 'U') IS NULL
 CREATE TABLE API_Client (
     ClientID    nvarchar(100) NOT NULL CONSTRAINT PK_API_Client PRIMARY KEY,
-    KeyHash     nvarchar(64)  NOT NULL,
+    KeyHash     nvarchar(100)  NOT NULL,
     Name        nvarchar(200) NOT NULL,
-    Module      nvarchar(50)  NOT NULL CONSTRAINT DF_API_Client_Module   DEFAULT 'tsg',
+    Module      nvarchar(100)  NOT NULL CONSTRAINT DF_API_Client_Module   DEFAULT 'tsg',
     Active      bit           NOT NULL CONSTRAINT DF_API_Client_Active    DEFAULT 1,
     -- Audit trail (provenance only; the auth path reads none of these):
     CreatedAt   datetime2(3)  NOT NULL CONSTRAINT DF_API_Client_CreatedAt DEFAULT SYSUTCDATETIME(),
@@ -926,3 +926,39 @@ WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME IN (
     'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Identified_Duplicate_Threat',
     'Scoped_Threat','Threat_Scenario_Output','Threat_Library_Import_Run','Scenario_Audit',
     'Prompt_Log','Threat_Candidate_Review','Risk_Treatment_Plan','Config_Tuning','API_Client');
+
+
+-- ---------------------------------------------------------------------------
+-- Widen every remaining short nvarchar column to nvarchar(100)
+-- ---------------------------------------------------------------------------
+-- A blanket floor, not a per-column judgement. Narrow columns sized to today's longest value are
+-- a standing trap: the value that outgrows one is usually a one-line enum or vocabulary change,
+-- and the failure is invisible because every SHORTER value still inserts - the application looks
+-- healthy until the first write of the new value fails, mid-workflow, with no obvious cause.
+--
+-- nvarchar is variable-length, so this costs nothing: a 12-character value occupies 12 characters
+-- whatever the declared maximum. Index keys are unaffected in practice - the widest key here
+-- reaches 220 bytes against a 1700-byte limit.
+--
+-- Each is guarded on the CURRENT width, so re-running is a no-op and a site already at 100 skips.
+
+IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Session', 'Mode') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Session'), 'Mode', 'CharMaxLen') < 100
+    ALTER TABLE Scenario_Session ALTER COLUMN Mode nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'IdentityHash') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Scenario_Output'), 'IdentityHash', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Scenario_Output ALTER COLUMN IdentityHash nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Threat_Candidate_Review', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Candidate_Review', 'Status') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Candidate_Review'), 'Status', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Candidate_Review ALTER COLUMN Status nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.API_Client', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.API_Client', 'KeyHash') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.API_Client'), 'KeyHash', 'CharMaxLen') < 100
+    ALTER TABLE API_Client ALTER COLUMN KeyHash nvarchar(100) NOT NULL;
+IF OBJECT_ID('dbo.API_Client', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.API_Client', 'Module') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.API_Client'), 'Module', 'CharMaxLen') < 100
+    ALTER TABLE API_Client ALTER COLUMN Module nvarchar(100) NOT NULL;
