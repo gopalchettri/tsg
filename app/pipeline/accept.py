@@ -29,13 +29,7 @@ from app.db import models as m
 from app.db.dal import EntityForbidden, NotFoundError, guid, now
 from app.pipeline import embeddings, grounding
 from app.pipeline.accept_actors import (
-    _ActorPromoCtx,
     _clean_actor_name,
-    _extract_actor_names_per_threat,
-    _link_actors_to_threat_type,
-    _preload_actor_memo,
-    _queue_or_mint_row_actors,
-    log_withheld_links,
     pending_card_identities,
     resolve_actor_id_by_identity,
 )
@@ -746,9 +740,6 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
             scored_rows.append(r)
 
     resolved: dict[tuple, Any] = {}
-    parsed_actors, all_actor_names = _extract_actor_names_per_threat(all_rows)
-    actor_table, actor_trigram_index, actor_token_index = _preload_actor_memo(
-        sess, all_rows, all_actor_names, resolved)
 
     stamp = now()
     actor_id = user_id or scenario_session["UserID"]
@@ -762,11 +753,7 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
     audit_rows: list[dict] = []
     candidate_rows: list[dict] = []
     triage_details: list[dict] = []
-    actor_triage: list[dict] = []
     promoted_names: list[tuple[str, str]] = []
-    actx = _ActorPromoCtx(sess, resolved, pending_cards, actor_table, actor_trigram_index,
-                        actor_token_index, tn, auto_mode, candidate_rows, actor_triage, sid,
-                        tenant, entity, stamp, actor_id)
     for row in rows:
         generic = triage.generic_by_tid[row["ThreatID"]]
         fate = _decide_candidate_fate(sess, row, generic, sector_id, resolved, triage, tn,
@@ -774,22 +761,15 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
                                     pending_cards=pending_cards)
         verdict, type_id, catalogue_id_new, matched_id, cosine, minted = fate
 
-        actors = parsed_actors[row["ThreatID"]]
-        _queue_or_mint_row_actors(actx, row, type_id, actors)
-        if type_id is not None and resolved.get(("minted_type", type_id)):
-            linked_actors = _link_actors_to_threat_type(sess, type_id, actors, resolved)
-        else:
-            linked_actors = []
-            if actors and type_id is not None:
-                log_withheld_links(resolved, type_id, actors, row["ThreatID"])
-            elif actors:
-                log.info("accept.actor_links_deferred_novel_type", actors=actors,
-                        threat_id=row["ThreatID"])
+        # NO actor minting or linking. Actors are library-only (grounding): a threat carries
+        # either its type's curator-maintained links or a nearest-match fallback. Writing a
+        # fallback back as a curated link would corrupt the library one accept at a time —
+        # the next session would read that guess as a curator's decision.
         triage_details.append({"threat_id": row["ThreatID"], "generic_name": generic,
                             "verdict": verdict, "cosine": cosine,
                             "matched_catalogue_id": matched_id})
 
-        promoted = (type_id != row["ThreatTypeID"] or bool(linked_actors)
+        promoted = (type_id != row["ThreatTypeID"]
                     or catalogue_id_new != row["ThreatCatalogueID"])
         if promoted:
             update_rows.append({"b_tid": row["ThreatID"], "ThreatTypeID": type_id,
@@ -799,7 +779,7 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
                 EventType=AuditEventType.library_promoted, ActorUserID=actor_id, ActorType=actor_type,
                 ThreatTypeRefID=type_id, CreatedAt=stamp,
                 DetailJSON=json.dumps({"threat_id": row["ThreatID"], "catalogue_id": catalogue_id_new,
-                                        "sector_id": sector_id, "actors": linked_actors,
+                                        "sector_id": sector_id,
                                         "triage_verdict": verdict})))
             log.info("threat.promoted", session_id=sid, threat_id=row["ThreatID"],
                     type_id=type_id, catalogue_id=catalogue_id_new, sector_id=sector_id)
@@ -833,16 +813,11 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
             log.info("accept.threat_card_suppressed", threat_id=row["ThreatID"], ident=ident,
                     note="identity already queued for review or previously rejected — no re-queue")
 
-    for row in scored_rows:
-        actors = parsed_actors[row["ThreatID"]]
-        if not actors:
-            continue
-        vtype_id = row["ThreatTypeID"]
-        _queue_or_mint_row_actors(actx, row, vtype_id, actors)
-        if vtype_id is not None:
-            log_withheld_links(resolved, vtype_id, actors, row["ThreatID"])
+    # The scored_rows loop that lived here existed ONLY to mint actors from well-matched
+    # threats. Actors are library-only now, so it is gone; scored_rows still names the rows
+    # deliberately EXCLUDED from threat promotion by the split above.
 
-    if triage_details or actor_triage:
+    if triage_details:
         audit_rows.append(dal.audit_row(
             sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=entity,
             EventType=AuditEventType.promotion_triage, ActorUserID=actor_id, ActorType=actor_type,
@@ -850,8 +825,7 @@ def _add_unverified_threats_to_library(sess: Session, scenario_session: RowMappi
             DetailJSON=json.dumps({
                 "bands": {"auto_reject": tn.triage_auto_reject_cosine,
                         "auto_approve": tn.triage_auto_approve_cosine},
-                "candidates": triage_details,
-                "actors": actor_triage})))
+                "candidates": triage_details})))
     if update_rows:
         it = cast(Table, m.Identified_Threat.__table__)
         sess.execute(update(it).where(it.c.ThreatID == bindparam("b_tid")), update_rows)

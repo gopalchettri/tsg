@@ -328,18 +328,6 @@ class Settings(BaseSettings):
     # call for the whole set is the norm at today's size; batches only split above this.
     validator_batch_size: int = Field(20, ge=1)
 
-    # TSG_ACTOR_VOCABULARY_CAP — how many actor names Stage 1's prompt shows as PREFERRED
-    # spellings (dal.active_actor_names). A hint list, not a gate: capping it never stops the
-    # AI proposing a real actor outside it (that name is still fully handled by grounding +
-    # accept-time triage) — it only bounds prompt size as the actor library grows past this.
-    actor_vocabulary_cap: int = Field(300, ge=1)
-    # TSG_ACTOR_VOCABULARY_CACHE_SECONDS — how long the capped, ordered actor-name list is
-    # cached process-locally before dal.active_actor_names re-queries. 0 disables caching.
-    # A few seconds of staleness after an admin approval/rename is a non-issue (still just a
-    # spelling hint); the DB is small and changes rarely, so a short TTL removes a redundant
-    # query from every Stage-1 call without ever showing meaningfully stale data.
-    actor_vocabulary_cache_seconds: float = Field(30.0, ge=0.0)
-
     # TSG_COVERAGE_ATTEMPT_SLACK — extra generation attempts beyond a threat's coverage target
     # (its AI-declared plausible entry points). A NON-TERMINATION GUARD, not a depth policy:
     # an identity stops at (plausible entry points + this slack) scenario rows.

@@ -715,7 +715,6 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                                     scenario_session["AssetName"], asset_context, subsystems,
                                     max_threats=shortfall,
                                     categories=cats,
-                                    actor_examples=actor_examples if actor_examples is not None else dal.active_actor_names(sess),
                                     exclude=exclude_all or None),
                                     scenario_session=scenario_session, subsystem_id=ss, stage="threats",
                                     level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
@@ -1807,10 +1806,9 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
         sess.commit()
         try:
             categories = dal.active_category_names(sess)
-            actor_examples = dal.active_actor_names(sess)
             _announce_generation_started(sess, scenario_session, ASSET_UNIT_ID)
             threats, prov_i = find_threats(sess, scenario_session, subsystems, asset_context, llm, task_id,
-                                        categories=categories, actor_examples=actor_examples)
+                                        categories=categories)
             sess.commit()
             threats_stage_done = True
             if not threats:

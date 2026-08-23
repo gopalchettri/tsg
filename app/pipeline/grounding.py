@@ -299,9 +299,13 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
     return results
 
 
-def get_allowed_actor_names(sess: Session, type_id: int) -> set[str]:
-    """Real, pre-approved actor names for this Threat_Type — used to drop any
-    actor the AI invented that doesn't belong to it.
+def get_allowed_actor_names(sess: Session, type_id: int) -> list[str]:
+    """The actors LINKED to this Threat_Type — the PRIMARY source of a threat's actors.
+
+    Library-first: the LLM never proposes an adversary, so this list (or
+    nearest_library_actors' fallback when it is empty) is the whole answer. Ordered by
+    ThreatActorID, not a set: Stage 1 runs at temperature 0 so two identical runs must
+    store byte-identical ThreatActorsJSON, and set iteration order would break that.
     """
     rows = sess.execute(
         select(m.Threat_Actor.ThreatActorName)
@@ -309,8 +313,45 @@ def get_allowed_actor_names(sess: Session, type_id: int) -> set[str]:
             m.ThreatType_ThreatActor_Map.ThreatActorID == m.Threat_Actor.ThreatActorID)
         .where(m.ThreatType_ThreatActor_Map.ThreatTypeID == type_id,
             m.Threat_Actor.IsActive == True, m.Threat_Actor.IsDeleted == False)
+        .order_by(m.Threat_Actor.ThreatActorID)
     )
-    return {r[0] for r in rows}
+    return [r[0] for r in rows]
+
+
+def nearest_library_actors(sess: Session, llm: LLMClient, query: str,
+                        top_n: int = 3) -> list[str]:
+    """Nearest active Threat_Actor rows to `query` — the fallback when a threat's type has
+    no linked actors (or is unverified). NEVER invents: every returned name is a real
+    library row, and an empty actor table yields [].
+
+    Hybrid (BM25 + embedding cosine) because actor names are bare 2-3 word labels with no
+    description column: the keyword leg carries most of the signal ("APT33" vs "APT 33"),
+    the vector leg catches wording drift. Best-effort on the vector half — an embedding
+    failure degrades to keyword-only rather than dropping the actor entirely.
+
+    # ponytail: top-3 fixed. Make it a setting only if reviewers ask for a different width.
+    """
+    rows = [r[0] for r in sess.execute(
+        select(m.Threat_Actor.ThreatActorName)
+        .where(m.Threat_Actor.IsActive == True, m.Threat_Actor.IsDeleted == False)
+        .order_by(m.Threat_Actor.ThreatActorID))]
+    if not rows or not (query or "").strip():
+        return []
+    s = get_settings()
+    candidates: list[dict[str, Any]] = [{"text": n, "name": n, "vector": None} for n in rows]
+    query_vec = None
+    try:
+        vecs = embeddings.get_vectors(llm, rows, model_id=s.embedding_model,
+                                    group="threat_actor", kind="passage")
+        for c in candidates:
+            c["vector"] = vecs.get(c["text"])
+        qv = llm.embed([query], kind="query")
+        if len(qv) == 1:
+            query_vec = qv[0]
+    except Exception:
+        log.warning("actors.nearest_embed_failed_keyword_only", exc_info=True)
+    ranked = hybrid_search.hybrid_match(query, candidates, query_vec=query_vec, top_n=top_n)
+    return [rows[i] for i, _score in ranked]
 
 
 def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs: dict[str, list[float]],
@@ -438,11 +479,12 @@ class GroundingResult:
                             yields catalogue_id=None and library_name=None even if a
                             best-scoring candidate existed (shortlist is fail-open, rerank
                             has no minimum — a candidate existing isn't evidence of a match).
-    actors_validated      — False: type was unverified, `actors` is the AI's raw proposal.
-                            True: type verified and actors were CANONICALIZED against its
-                            allowed set (known names take library spelling, unknown ones
-                            KEPT — see canonicalize_actors). Not a purity flag; novelty is
-                            judged at accept regardless.
+    actors_validated      — provenance of `actors`, which are ALWAYS real library rows
+                            (library-first: the model never proposes an adversary).
+                            True: taken from the matched type's curator-maintained links.
+                            False: nearest-match fallback (no linked actors, or the type
+                            itself was unverified) — a similarity guess among real rows,
+                            so it must never be written back as a curated link.
     """
 
     status: GroundingStatus
@@ -484,17 +526,6 @@ def norm_actor_name(name: str) -> str:
     decomposed = unicodedata.normalize("NFKD", name.casefold())
     stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return _ACTOR_NORM_RE.sub(" ", _ALNUM_BOUNDARY_RE.sub(" ", stripped)).strip()
-
-
-def canonicalize_actors(actors_in: list[str], allowed: list[str]) -> list[str]:
-    """Canonicalize-and-keep (§8.4 step 5): names the type's vocabulary knows are rewritten
-    to the library's spelling, case-insensitively (matches MSSQL's collation, keeps
-    ThreatActorsJSON joinable to accept.py's exact-first memo); unknown names are kept as
-    proposed. Whether a kept name is genuinely new is judged at ACCEPT against the full
-    actor table, not this type's short list — dropping unknowns here would silently veto
-    every new actor before a human could ever see it."""
-    allowed_cf = {a.casefold(): a for a in allowed}
-    return [allowed_cf.get(a.casefold(), a) for a in actors_in]
 
 
 def _actors_meta(threat_actors_json: str | None) -> dict:
@@ -740,12 +771,13 @@ def _cached(cache: dict[Any, Any], key: Any, compute: Callable[[], Any]) -> Any:
 
 def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, Any], sector_ids: list[int],
                             settings: Settings | None = None, cache: dict[Any, Any] | None = None) -> GroundingResult:
-    """Matches one AI-proposed threat ({"category", "type", "name", "actors"})
+    """Matches one AI-proposed threat ({"category", "type", "name"})
     against the real library. Matches TYPE first; if unverified, stops immediately
-    (no confident ThreatTypeID to scope a name/actor search by) and returns actors
-    raw/unvalidated. Otherwise matches NAME within that type ([R6]), canonicalizes
-    actors against the type's allowed set (unknown names kept for accept-time
-    triage), and reports the weaker of the two confidences.
+    (no confident ThreatTypeID to scope a name search by) and falls back to the nearest
+    LIBRARY actors. Otherwise matches NAME within that type ([R6]), takes the actors
+    LINKED to that type (nearest-match fallback when none are linked), and reports the
+    weaker of the two confidences. Actors are library rows in every branch — the model
+    is not asked for them.
 
     `cache`: optional dict shared across every proposal in one find_threats()
     call. sector_ids is fixed for that call, so a repeated category/type
@@ -757,7 +789,6 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
     # Per-model-pair cutoff (memoized; worker boot warms it) — the static setting is
     # only the fallback. See resolve_thresholds.
     match_th = resolve_thresholds(sess, llm, s)
-    actors_in = ensure_actor_list(proposed.get("actors", []))
     category_text = ensure_text(proposed.get("category"))
 
     ckey = ("category", category_text)
@@ -791,10 +822,14 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
     tstatus = label_match_from_score(tscore, s, match_th=match_th)
 
     if trow is None or tstatus == GroundingStatus.unverified:
-        # Unverified type: no trusted ThreatTypeID → actors cannot be map-filtered ([R6]).
+        # Unverified type: no trusted ThreatTypeID, so no linked actor set exists. Fall back
+        # to the nearest LIBRARY actors for the proposal's own wording — never the model's
+        # (it is no longer asked for actors at all). actors_validated=False records that this
+        # came from similarity, not from a curator's link.
         return GroundingResult(
             status=GroundingStatus.unverified, score=tscore,
-            actors=list(actors_in), actors_validated=False,
+            actors=nearest_library_actors(sess, llm, (type_text + " " + name_text).strip()),
+            actors_validated=False,
         )
 
     type_id = trow["ThreatTypeID"]
@@ -808,10 +843,13 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
             if crow is not None else GroundingStatus.unverified)
 
     akey = ("actors", type_id)
-    allowed = _cached(cache, akey, lambda: get_allowed_actor_names(sess, type_id))
-    # Canonicalize-and-KEEP — see canonicalize_actors: known names take the library spelling,
-    # unknown ones survive to accept's banded triage instead of being silently dropped here.
-    actors = canonicalize_actors(actors_in, allowed)
+    # LIBRARY-ONLY actors: the curator's links for this type are the answer. When the type
+    # has none linked yet, fall back to the nearest library actors so a threat is never
+    # actor-less — validated=False marks that provenance (see GroundingResult).
+    linked = _cached(cache, akey, lambda: get_allowed_actor_names(sess, type_id))
+    actors = linked or nearest_library_actors(
+        sess, llm, (trow["ThreatTypeName"] + " " + name_text).strip())
+    actors_validated = bool(linked)
 
     # Symmetric with the TYPE branch: unverified type already yields type_id=None, so an
     # unverified NAME must likewise yield no id/wording. `crow` is only the best candidate,
@@ -828,5 +866,5 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
         library_name=matched["ThreatName"] if matched else None,
         score=min(tscore, cscore),
         actors=actors,
-        actors_validated=True,
+        actors_validated=actors_validated,
     )

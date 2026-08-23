@@ -1138,120 +1138,6 @@ def active_category_names(sess: Session) -> list[str]:
     )]
 
 
-# Process-local cache for active_actor_names — (names, fetched_at) or None before the first
-# successful fill. ONE module-level name reassigned as a single atomic replace (`global` +
-# one `=`), not a dict with two keys written by two separate statements: this codebase's
-# gevent+pyodbc pairing (app/pipeline/celery_worker.py) means a blocking DB call already
-# can't be preempted mid-function today, but a two-write cache would silently stop being
-# safe the moment that ever changes (e.g. a future move to a threadpool-offloaded DB call,
-# as that module's own docstring flags as the eventual escape hatch). One atomic write has
-# no such hidden dependency. Same freshness-check IDEA as embeddings._MATRIX's
-# `{key: (digest, mat, row_indexes)}` — one key, one value, one write — applied here to a
-# TTL instead of a content digest because this wraps a periodically-refetched DB query, not
-# a content-addressed model computation.
-_actor_vocab_cache: tuple[list[str], float] | None = None
-
-
-def _query_active_actor_names(sess: Session, cap: int) -> list[str]:
-    """The live query: active actors ordered by RELEVANCE — most-linked-to-a-threat-type
-    first (an actor with zero links, e.g. one just approved, ties at 0 and falls back to
-    CreatedAt), never alphabetical. Alphabetical was rejected: it would permanently exclude
-    every actor whose name starts late in the alphabet AND every brand-new actor, once the
-    table exceeds `cap` — an arbitrary bias, not a defensible default. `ThreatActorID` is a
-    REQUIRED trailing tiebreak: Stage 1 runs at creativity=0 specifically so repeated calls
-    are reproducible, so two actors tied on both count and timestamp must still resolve to
-    the same top-`cap` set every time, not one that depends on undefined tie order."""
-    ta, tm = m.Threat_Actor, m.ThreatType_ThreatActor_Map
-    link_count = func.count(tm.ThreatTypeID)
-    return [r[0] for r in sess.execute(
-        select(ta.ThreatActorName)
-        .select_from(ta)
-        .outerjoin(tm, tm.ThreatActorID == ta.ThreatActorID)
-        .where(ta.IsActive == True, ta.IsDeleted == False)
-        .group_by(ta.ThreatActorID, ta.ThreatActorName, ta.CreatedAt)
-        .order_by(link_count.desc(), ta.CreatedAt.desc(), ta.ThreatActorID)
-        .limit(cap)
-    )]
-
-
-def active_actor_names(sess: Session) -> list[str]:
-    """The capped, relevance-ordered PROMPT HINT list (up to TSG_ACTOR_VOCABULARY_CAP names,
-    cached TSG_ACTOR_VOCABULARY_CACHE_SECONDS) — read so prompts.threats_prompt shows
-    preferred spellings without drifting from the table. This is a hint, never a gate: a real
-    actor outside this list is still fully handled by grounding + accept-time triage
-    (accept_actors.py), so capping/caching risks nothing but the freshness of a wording hint.
-    Empty result means the table isn't seeded yet (or a cold-start refresh failure below);
-    either way the caller falls back to a hardcoded generic-role-label default.
-
-    Caching is a plain TTL, not a change-digest: the data changes rarely (admin approval),
-    the consumer tolerates staleness by design, and self-healing every TTL window is simpler
-    than tracking a version signal for no measurable benefit at this call frequency.
-    RESILIENCE: a refresh that raises (transient DB hiccup) serves the last successfully
-    cached list instead of propagating — a hint-list refresh blip must never fail an entire
-    threat-identification call. Only on a cold start (nothing ever cached yet) is there
-    nothing to fall back to; degrading to [] there is exactly the existing "unseeded table"
-    input the caller already handles, not a new failure mode."""
-    global _actor_vocab_cache
-    s = get_settings()
-    ttl = s.actor_vocabulary_cache_seconds
-    now = time.monotonic()
-    cached = _actor_vocab_cache
-    if ttl > 0 and cached is not None and (now - cached[1]) < ttl:
-        return cached[0]
-    try:
-        names = _query_active_actor_names(sess, s.actor_vocabulary_cap)
-    except Exception:
-        if cached is not None:
-            log.warning("dal.actor_vocabulary_refresh_failed_stale", exc_info=True,
-                        age_seconds=round(now - cached[1], 1), ttl=ttl)
-            return cached[0]
-        log.warning("dal.actor_vocabulary_refresh_failed_cold", exc_info=True, ttl=ttl)
-        return []
-    if ttl > 0:
-        _actor_vocab_cache = (names, now)  # ONE atomic replace — see the cache's own comment
-    return names
-
-
-def active_actors(sess: Session) -> list[tuple[int, str]]:
-    """(id, name) of every active Threat_Actor — the full-table comparison set for accept's
-    banded actor-name triage AND the seed for its in-accept memo (active_actor_names above
-    covers the prompt, which needs names only). One bounded read of a small table."""
-    ta = m.Threat_Actor
-    return [(r[0], r[1]) for r in sess.execute(
-        select(ta.ThreatActorID, ta.ThreatActorName)
-        .where(ta.IsActive == True, ta.IsDeleted == False)
-        .order_by(ta.ThreatActorID)
-    )]
-
-
-def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
-    """Accepted scenarios for one session, joined to their grounded threat so every row carries
-    the [R13] join ids. Accepted==1 alone — no Superseded filter: the accepted version may be an
-    older, superseded one (Accepted is the human's pick, decoupled from generation recency).
-    One ordered query; a completed session's rows are immutable, so the joined tables need no
-    Superseded filter either.
-
-    OUTER, not INNER: with no enforced foreign keys the ScopedThreatID/ThreatID linkage isn't
-    guaranteed, and accept flipped Accepted=1 regardless. INNER would silently drop an
-    already-accepted row while accept's own count still included it. Worst case is null threat_*
-    columns, never a vanished row."""
-    out, st, it = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
-    return [dict(r) for r in sess.execute(
-        select(out.OutputID, out.SubsystemID, out.ScopedThreatID, out.ScenarioJSON,
-            it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
-            it.LibraryThreatType, it.LibraryThreatName, it.ThreatCategory, it.ThreatActorsJSON)
-        .select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
-                    .outerjoin(it, st.ThreatID == it.ThreatID))
-        .where(out.SessionID == session_id, accepted(out.Accepted))
-        .order_by(out.SubsystemID, out.OutputID)
-    ).mappings()]
-
-
-#: Shared select for the cross-session scenario reads below — output row + its owning
-#: session (entity/user/status truth) + grounded threat. OUTER joins for the same reason
-#: as accepted_scenarios above: no enforced FKs, a broken linkage must null the threat
-#: columns, never drop the row. INNER to the session: an output without a session row has
-#: no entity, and entity scope is the authz boundary.
 def _scenario_read_select():
     out, ss, st, it = m.Threat_Scenario_Output, m.Scenario_Session, m.Scoped_Threat, m.Identified_Threat
     return (
@@ -2572,3 +2458,37 @@ def prompt_logs_for_plan(sess: Session, plan_id: str) -> list[RowMapping]:
         .where(pl.CorrelationID == plan_id)
         .order_by(pl.CreatedAt)
     ).mappings().all())
+
+
+def active_actors(sess: Session) -> list[tuple[int, str]]:
+    """(id, name) of every active Threat_Actor — the full-table comparison set for accept's
+    banded actor-name triage AND the seed for its in-accept memo (active_actor_names above
+    covers the prompt, which needs names only). One bounded read of a small table."""
+    ta = m.Threat_Actor
+    return [(r[0], r[1]) for r in sess.execute(
+        select(ta.ThreatActorID, ta.ThreatActorName)
+        .where(ta.IsActive == True, ta.IsDeleted == False)
+        .order_by(ta.ThreatActorID)
+    )]
+
+def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
+    """Accepted scenarios for one session, joined to their grounded threat so every row carries
+    the [R13] join ids. Accepted==1 alone — no Superseded filter: the accepted version may be an
+    older, superseded one (Accepted is the human's pick, decoupled from generation recency).
+    One ordered query; a completed session's rows are immutable, so the joined tables need no
+    Superseded filter either.
+
+    OUTER, not INNER: with no enforced foreign keys the ScopedThreatID/ThreatID linkage isn't
+    guaranteed, and accept flipped Accepted=1 regardless. INNER would silently drop an
+    already-accepted row while accept's own count still included it. Worst case is null threat_*
+    columns, never a vanished row."""
+    out, st, it = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
+    return [dict(r) for r in sess.execute(
+        select(out.OutputID, out.SubsystemID, out.ScopedThreatID, out.ScenarioJSON,
+            it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
+            it.LibraryThreatType, it.LibraryThreatName, it.ThreatCategory, it.ThreatActorsJSON)
+        .select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
+                    .outerjoin(it, st.ThreatID == it.ThreatID))
+        .where(out.SessionID == session_id, accepted(out.Accepted))
+        .order_by(out.SubsystemID, out.OutputID)
+    ).mappings()]

@@ -36,12 +36,6 @@ DIRECT_ENTRY_ID = 0
 _FALLBACK_STRIDE_CATEGORIES = ("Spoofing", "Tampering", "Repudiation", "Information Disclosure",
                             "Denial of Service", "Elevation of Privilege")
 
-# Used only when the caller passes no live Threat_Actor rows (unseeded DB, or a test).
-_FALLBACK_ACTOR_VOCABULARY_HINT = ("Cybercriminal, External attacker, Hacktivist, Malicious insider, "
-                                "Malicious user, Nation-state/APT, Negligent insider, "
-                                "Ransomware affiliate, Third-party/Vendor")
-
-
 #  STRIDE TYPE HINTS FOR BETTER PROMPTING
 _STRIDE_TYPE_HINTS = {
     "Spoofing": "Identity Impersonation; Credential Misuse; Authentication Bypass; Device/System Impersonation; Service Impersonation",
@@ -199,26 +193,11 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         # every such threat — degradation with no other signal, so it is reported here.
         log.warning("prompt.stride_categories_undefined", categories=undefined,
                     defined=sorted(_STRIDE_SCENARIO_SHAPES))
-    if actor_examples:
-        # Same posture as `type`: the vocabulary steers spelling, it does not muzzle. A name
-        # outside the list survives grounding (canonicalize-and-keep) and reaches the
-        # admin-gated review queue at accept — the gate is the library door, not this prompt.
-        actors_line = ("actors: name the adversary behind this condition — a real, publicly "
-                    "documented group or a short generic role label. PREFER these existing "
-                    "labels, spelled EXACTLY as given, whenever one fits: "
-                    + ", ".join(actor_examples)
-                    + ". A name outside the list is allowed ONLY for a real, publicly "
-                    "documented group or a concise generic role — never a fabricated or "
-                    "speculative group name, never a descriptive sentence. Empty list if none "
-                    "applies. The existence of users, vendors, administrators or outsourcing "
-                    "in the context does not by itself establish malicious activity — assign "
-                    "an actor only when it is relevant to this specific condition.\n")
-    else:
-        actors_line = (f"actors: short generic role labels (for example: "
-                    f"{_FALLBACK_ACTOR_VOCABULARY_HINT}) — never invented group names or "
-                    "descriptive sentences. Empty list if the context evidences no specific "
-                    "actor. The existence of users, vendors, administrators or outsourcing in "
-                    "the context does not by itself establish malicious activity.\n")
+    # actors: DELIBERATELY NOT REQUESTED. Library-first — a threat's adversaries are the ones
+    # a curator LINKED to its Threat_Type (grounding.get_allowed_actor_names), or the nearest
+    # library rows when none are linked (grounding.nearest_library_actors). The model is never
+    # asked to name an adversary, so no invented group name can enter the pipeline. Do not
+    # re-add an actors field here: grounding ignores proposed["actors"] entirely.
 
     # canonical_types is OPTIONAL. When absent, behave exactly as before: loose, non-canonical
     # type guidance only. When present, hold the model to the supplied vocabulary per category.
@@ -298,7 +277,6 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         "category: exactly one of " + ", ".join(cats) + ". Choose by what the threat is "
         "actually ABOUT, not by how it might be carried out"
         + (" — " + "; ".join(category_defs) if category_defs else "") + ".\n"
-        + actors_line +
         "\nRULES\n"
         f"1) Identify exactly {max_threats} distinct threats, most contextually relevant "
         "first. Before treating a category as exhausted, walk every supporting system, "
@@ -331,7 +309,7 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         "selected, resolve the mismatch before output rather than submitting it inconsistent.\n"
         "5) These are candidates only, each independently checked against an approved threat "
         "library before use — you decide nothing." + coverage + "\n"
-        "\nOutput ONLY a JSON array of {category, type, name, generic_name, actors:[]} objects "
+        "\nOutput ONLY a JSON array of {category, type, name, generic_name} objects "
         "— no markdown code fences, no text before or after it."},
         # Redaction and no-value scrubbing happen inside build_base_context; _context_message
         # adds the db-key scrub and the framing.
