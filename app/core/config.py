@@ -302,7 +302,13 @@ class Settings(BaseSettings):
     # control label, and the auto-derived fallback threshold was calibrated label-vs-label — a
     # materially different score distribution. Left unset it follows the model pair's match
     # threshold, which risks silently dropping every match (controls=[] reading as a healthy
-    # "library gap"). Measure on the real library before relying on the fallback.
+    # "library gap").
+    #
+    # DO NOT GUESS THIS NUMBER — measure it against the deployed library:
+    #     python scripts/measure_control_map_scores.py
+    # It runs the real production path (same candidates, same hybrid shortlist, same reranker,
+    # same query builder) over real scenarios and prints, per candidate threshold, how many
+    # scenarios would publish NO controls. Read-only; safe against production.
     control_map_min_score: float = Field(60.0, ge=0.0, le=100.0)
     # TSG_RERANK_CONCURRENCY — concurrent REMOTE rerank calls (local reranker ignores this).
     rerank_concurrency: int = Field(8, ge=1)
