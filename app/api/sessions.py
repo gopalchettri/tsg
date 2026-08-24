@@ -444,7 +444,8 @@ def get_results(
 
         st, out, it = m.Scoped_Threat, m.Threat_Scenario_Output, m.Identified_Threat
         threats = get_current_rows(it,
-                        [it.ThreatID, it.ThreatType, it.ThreatName,
+                        [it.ThreatID, it.ThreatCategory, it.ThreatType, it.ThreatName,
+                        it.ThreatTypeID, it.LibraryThreatType, it.LibraryThreatName,
                         it.GroundingStatus, it.ThreatCatalogueID, it.ThreatActorsJSON,
                         # read at source — deliberately NOT denormalised onto Scoped_Threat,
                         # so the value can never drift from the row that owns it
@@ -497,8 +498,10 @@ def get_results(
         missing_tids = {s["ThreatID"] for s in scenarios if s["ThreatID"]} - set(threats_by_id)
         if missing_tids:
             threats += [dict(r) for r in sess.execute(
-                select(it.ThreatID, it.ThreatType, it.ThreatName, it.GroundingStatus,
-                       it.ThreatCatalogueID, it.ThreatActorsJSON, it.GroundingScore)
+                select(it.ThreatID, it.ThreatCategory, it.ThreatType, it.ThreatName,
+                       it.ThreatTypeID, it.LibraryThreatType, it.LibraryThreatName,
+                       it.GroundingStatus, it.ThreatCatalogueID, it.ThreatActorsJSON,
+                       it.GroundingScore)
                 .where(it.SessionID == sid, it.ThreatID.in_(missing_tids))
             ).mappings()]
         controls = _controls_by_output(sess, [s["OutputID"] for s in scenarios]
