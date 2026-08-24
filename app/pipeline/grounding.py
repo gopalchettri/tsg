@@ -355,10 +355,20 @@ def nearest_library_actors(sess: Session, llm: LLMClient, query: str,
     no linked actors (or is unverified). NEVER invents: every returned name is a real
     library row, and an empty actor table yields [].
 
+    HONEST LIMITATION, corrected 2026-08-24. The line below used to claim this "degrades to
+    keyword-only rather than dropping the actor entirely" on an embed failure. It does not.
+    Threat_Actor rows are bare 2-3 word labels with no description column, so BM25 between a
+    threat sentence and "APT33" scores zero, and hybrid_search excludes zero-score docs by
+    design (a leg that knows nothing must not vote). An embed failure therefore returns [] —
+    a populated actor table reads as an empty one. The WARNING below is the only signal;
+    lower stakes than the threat and control paths (actors annotate a threat rather than
+    deciding whether it exists), so it is recorded rather than restructured.
+
     Hybrid (BM25 + embedding cosine) because actor names are bare 2-3 word labels with no
     description column: the keyword leg carries most of the signal ("APT33" vs "APT 33"),
-    the vector leg catches wording drift. Best-effort on the vector half — an embedding
-    failure degrades to keyword-only rather than dropping the actor entirely.
+    the vector leg catches wording drift. Best-effort on the vector half — but see the
+    limitation above: with no description column the keyword leg usually scores zero against
+    threat prose, so an embed failure returns [] rather than a weaker list.
 
     # ponytail: top-3 fixed. Make it a setting only if reviewers ask for a different width.
     """

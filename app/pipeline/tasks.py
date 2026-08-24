@@ -682,7 +682,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # Any retrieval failure degrades to generation-only — exactly the pre-redesign path.
     try:
         candidates = threat_retrieval.retrieve_library_threats(
-            sess, llm, subsystems, asset_context, sector_ids)
+            sess, llm, subsystems, asset_context, sector_ids, session_id=sid)
     except Exception:
         sess.rollback()
         log.warning("threat_retrieval.failed_generation_only", session_id=sid, exc_info=True)
@@ -848,6 +848,10 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # Provenance roll-up: how many threats each leg of the funnel contributed, and which
     # ones an ACTOR put on the list. "APT33 operates in this sector and uses this technique"
     # is a defensible answer at a shutdown review; a similarity score is not.
+    # A keyword-only round selected a materially different candidate set. Recorded here, not
+    # just logged, because after the fact a degraded run is otherwise indistinguishable from a
+    # clean one — the same reason _validate_candidates persists `degraded`.
+    ranking_degraded = any(c.get("ranking_degraded") for c in candidates)
     selection_sources: dict[str, int] = {}
     for t in retrieved_summaries:
         key = t.get("selection_source") or "hybrid"
@@ -867,6 +871,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                     EventType=AuditEventType.grounding_summary,
                     DetailJSON=json.dumps({"count": len(threats),
                                         "selection_sources": selection_sources,
+                                        "ranking_degraded": ranking_degraded,
                                         "actor_derived": actor_derived,
                                         "subsystem_records": len(fanout_rows),
                                         "units": [ss, *grid_subsystem_ids],

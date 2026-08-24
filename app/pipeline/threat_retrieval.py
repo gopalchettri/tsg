@@ -238,7 +238,8 @@ def subsystem_attribution(sess: Session, subsystems: list[dict] | None,
 
 
 def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dict] | None,
-                             asset_context: dict, sector_ids: list[int]) -> list[dict]:
+                             asset_context: dict, sector_ids: list[int],
+                             session_id: str | None = None) -> list[dict]:
     """The funnel. Returns candidate dicts best-first (score desc, then catalogue id):
 
         {"catalogue_id", "type_id", "type_name", "threat_name", "description",
@@ -276,6 +277,7 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
     # vectors in one batch. Any failure degrades to keyword-only — ranking gets weaker,
     # eligibility is untouched.
     query_vecs: list[list[float] | None] = [None] * len(queries)
+    ranking_degraded = False
     try:
         texts = [c["text"] for c in corpus]
         vecs = embeddings.get_vectors(llm, texts, model_id=s.embedding_model,
@@ -287,7 +289,14 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
             if len(qvs) == len(queries):
                 query_vecs = list(qvs)
     except Exception:
-        log.warning("threat_retrieval.embed_failed_keyword_only", exc_info=True)
+        # Keyword-only is a WEAKER ANSWER, not a failure — eligibility is untouched and the
+        # session still completes. That is exactly why it has to be recorded: a run ranked by
+        # BM25 alone selects a materially different candidate set, and without this flag it is
+        # indistinguishable from a healthy one afterwards. session_id so it joins to something;
+        # this log line used to carry none, unlike its siblings above.
+        ranking_degraded = True
+        log.warning("threat_retrieval.embed_failed_keyword_only",
+                    session_id=session_id, candidates=len(rows), exc_info=True)
 
     best: dict[int, float] = {}  # row index -> best fused score across queries
     for q, qv in zip(queries, query_vecs):
@@ -332,6 +341,10 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
             "always_eligible": tid in ungated,
             "subsystem_ids": attribution.get(tid, []),
             "selection_source": source,
+            # Rides on every candidate rather than being returned separately, so the caller
+            # cannot receive the threats and drop the caveat. find_threats folds it into the
+            # grounding_summary audit row.
+            "ranking_degraded": ranking_degraded,
             # The actors whose technique set reaches this type. Turns the audit answer from
             # "cosine 0.78" into "APT33 operates in this sector and uses this technique".
             "actor_evidence": actor_types.get(tid, []),
