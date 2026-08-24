@@ -30,6 +30,7 @@ from app.core.security import _redact_value, is_placeholder
 from app.db import dal
 from app.db import models as m
 from app.db.dal import execute_dml, guid, now
+from app.db.engine import db_session
 from app.pipeline import (
     control_mapping,
     coverage,
@@ -1465,13 +1466,66 @@ def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, en
     sess.commit()
 
 
+def _generate_scenario_batch(sess: Session, scenario_session: dict, base_ctx: dict, work: list,
+                            enriched: dict, llm: LLMClient, task_id: str, epoch: int,
+                            per_item: dict, session_factory) -> list[tuple]:
+    """Generate every scenario in `work`, returning (scoped_id, result_or_None, exc_or_None)
+    in the SAME order - the caller persists sequentially, so ordering, ScenarioNumber and
+    determinism are untouched by how the calls were dispatched.
+
+    These calls are independent, so running them one at a time made a session's ~10 scenarios
+    take ~10x one call for no reason. Same tokens either way; only wall-clock changes.
+
+    EACH CONCURRENT ITEM GETS ITS OWN DB SESSION. _ask_ai commits Prompt_Log rows and renews
+    the stage lease mid-call, and a SQLAlchemy Session is not safe to share across greenlets -
+    sharing one here would interleave those commits into each other's transactions. The
+    caller's `sess` stays untouched until the sequential persist pass.
+
+    Falls back to the caller's session, strictly sequentially, when there is nothing to gain
+    (one item, concurrency 1) or nothing to open sessions with (session_factory=None - the
+    shape every existing test uses, so their in-memory SQLite session is never bypassed).
+
+    # ponytail: ThreadPoolExecutor, not a new abstraction - llm.rerank_many already runs this
+    # exact pattern under the same gevent worker, where threads are greenlets.
+    """
+    concurrency = min(get_settings().scenario_generation_concurrency, len(work))
+    if session_factory is None or concurrency <= 1:
+        out = []
+        for sc, scoped_id, _target in work:
+            try:
+                out.append((scoped_id, _generate_one_scenario(
+                    sess, scenario_session, base_ctx, sc, enriched, llm, task_id, epoch,
+                    **per_item[scoped_id], correlation_id=scoped_id), None))
+            except Exception as exc:  # noqa: BLE001 - [R8] captured per item, re-raised by the caller
+                out.append((scoped_id, None, exc))
+        return out
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(item):
+        sc, scoped_id, _target = item
+        try:
+            # Own session, own transaction, closed before the result is handed back - nothing
+            # from this greenlet is still open when the caller starts persisting.
+            with session_factory() as worker_sess:
+                return (scoped_id, _generate_one_scenario(
+                    worker_sess, scenario_session, base_ctx, sc, enriched, llm, task_id, epoch,
+                    **per_item[scoped_id], correlation_id=scoped_id), None)
+        except Exception as exc:  # noqa: BLE001 - [R8] same contract as the sequential branch
+            return (scoped_id, None, exc)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        return list(pool.map(_one, work))   # map preserves input order
+
+
 def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, threats: list[dict],
                 llm: LLMClient, task_id: str,
                 epoch: int = _EPOCH, target_threat_ids: set[str] | None = None,
                 *, require_lock: bool = False,
                 regen_targets: dict[str, RegenTarget] | None = None,
                 on_before_commit: Callable[[list[Provenance | None]], None] | None = None,
-                unresolved_targets: dict | None = None) -> list[Provenance | None]:
+                unresolved_targets: dict | None = None,
+                session_factory: Callable[[], Any] | None = None) -> list[Provenance | None]:
 
     sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
     entity_id, user_id = scenario_session["EntityID"], scenario_session.get("UserID")
@@ -1499,28 +1553,61 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     failures: list[str] = []
     failed_ids: set[str] = set()  # threat ids whose GENERATION failed — never "rescored out"
     first_failure: Exception | None = None
-    for sc, scoped_id, target in pairs:
-        if not sc.selected or sc.threat_id in already_done:
-            continue
+    work = [(sc, scoped_id, target) for sc, scoped_id, target in pairs
+            if sc.selected and sc.threat_id not in already_done]
+    identities = {scoped_id: dal.identity_hash(sid, ss, enriched.get(sc.threat_id, {}))
+                for sc, scoped_id, _t in work}
+    per_item: dict[str, dict] = {}
+    for _sc, scoped_id, target in work:
         sibling_texts = None
         if target is not None and target.identity_hash:
             sibling_texts = [(number, statement)
                             for output_id, number, statement in siblings_by_hash.get(target.identity_hash, [])
                             if output_id != target.output_id] or None
-        own_identity = dal.identity_hash(sid, ss, enriched.get(sc.threat_id, {}))
-        coverage = _Coverage(vocab=entry_vocab,
-                            frozen=batch.fold.frozen_by_hash.get(own_identity),
-                            others=[s for h, s in cross_pairs if h != own_identity] or None,
-                            intel_terms=batch.intel_terms, intel_ot=batch.intel_ot)
-        try:
-            scenario, report, prov = _generate_one_scenario(sess, scenario_session, base_ctx, sc,
-                                                            enriched, llm, task_id, epoch,
-                                                            sibling_texts=sibling_texts,
-                                                            coverage=coverage,
-                                                            correlation_id=scoped_id)
-        except LLMSlotUnavailable:
-            raise
-        except Exception as exc:  # noqa: BLE001 — [R8] capture, don't swallow: kept as first_failure
+        per_item[scoped_id] = {
+            "sibling_texts": sibling_texts,
+            # others=PRE-EXISTING scenarios only. The same-batch comparison used to happen
+            # here by appending to cross_pairs as the loop went, which meant scenario 1 was
+            # never compared against scenario 10 - the first one generated was checked
+            # against nothing. It now runs as one pass over the WHOLE batch below, which is
+            # both order-independent and strictly more thorough.
+            "coverage": _Coverage(vocab=entry_vocab,
+                                frozen=batch.fold.frozen_by_hash.get(identities[scoped_id]),
+                                others=[s for h, s in cross_pairs
+                                        if h != identities[scoped_id]] or None,
+                                intel_terms=batch.intel_terms, intel_ot=batch.intel_ot),
+        }
+        # correlation_id is passed as a LITERAL keyword at each call site, never through this
+        # dict: scripts/test_pipeline_guards.py verifies the stamp by reading the AST, and a
+        # value hidden inside **kwargs would silently retire that check.
+    generated = _generate_scenario_batch(sess, scenario_session, base_ctx, work, enriched, llm,
+                                        task_id, epoch, per_item, session_factory)
+    by_scoped = {sc_id: (res, exc) for sc_id, res, exc in generated}
+
+    # Same-batch cross-threat similarity, over the finished set. Deterministic string work,
+    # no model call, so it costs nothing to compare everything against everything.
+    ratio = tuning.from_session(scenario_session).sibling_similarity_ratio
+    fresh = [(identities[sc_id], str((res[0] or {}).get("scenario_statement") or ""))
+            for sc_id, res, _exc in generated if res is not None]
+    for sc_id, res, _exc in generated:
+        if res is None:
+            continue
+        others = [text for h, text in fresh if h != identities[sc_id]]
+        if others:
+            _flag_cross_threat_similarity(res[1], res[0], others, ratio)
+
+    # Persist SEQUENTIALLY, in the original order, on the caller's session.
+    slot_unavailable: Exception | None = None
+    for sc, scoped_id, _target in work:
+        result, exc = by_scoped[scoped_id]
+        if exc is not None:
+            if isinstance(exc, LLMSlotUnavailable):
+                # Not a scenario failure: no capacity right now. Remembered and raised AFTER
+                # the successes are committed, so a starved call cannot throw away work that
+                # was already generated and already billed. Celery retries the stage and
+                # _begin_full_run_attempt's already_done skips whatever landed.
+                slot_unavailable = slot_unavailable or exc
+                continue
             sess.rollback()
             first_failure = first_failure or exc
             failed_ids.add(sc.threat_id)
@@ -1532,6 +1619,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
                 _persist_full_run_failure(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
                                         enriched.get(sc.threat_id, {}), client_msg, epoch)
             continue
+        scenario, report, prov = result
         provs.append(prov)
         if not targeted:
             if not dal.renew_lease(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id):
@@ -1543,10 +1631,16 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
                                     enriched.get(sc.threat_id, {}), scenario, report, epoch)
         else:
             scenarios[scoped_id] = (scenario, report)
-        cross_pairs.append((own_identity, str(scenario.get("scenario_statement") or "")))
+        cross_pairs.append((identities[scoped_id], str(scenario.get("scenario_statement") or "")))
 
     if failures and not provs and not already_done and first_failure is not None:
         raise first_failure
+    if slot_unavailable is not None:
+        # Every success is committed by now (_persist_full_run_scenario commits per item), so
+        # the retry Celery is about to run resumes instead of regenerating and re-billing.
+        log.warning("scenarios.slot_exhausted_midbatch", session_id=sid, subsystem=ss,
+                    committed=len(provs))
+        raise slot_unavailable
 
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.SCENARIO_GENERATION, SubsystemID=ss,
@@ -1871,7 +1965,14 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
                     sess, session_id, ASSET_UNIT_ID, SubsystemLevel.THREATS, _EPOCH)
             if threats_stage_done:
                 scen_provs = write_scenarios(sess, scenario_session, subsystems, asset_context, threats, llm, task_id,
-                                            require_lock=True)
+                                            require_lock=True,
+                                            # Only the worker entry point hands over a real
+                                            # factory, so ONLY the worker generates in
+                                            # parallel. Every other caller (tests, the
+                                            # targeted regen/next-set paths that arrive with
+                                            # uncommitted rows on `sess`) stays sequential on
+                                            # the session it already owns.
+                                            session_factory=db_session)
                 dal.append_audit(sess, AuditID=guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
                                 EntityID=scenario_session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,
                                 SubsystemID=ASSET_UNIT_ID, EventType=AuditEventType.generation_complete,

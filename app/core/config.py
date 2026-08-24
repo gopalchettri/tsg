@@ -306,6 +306,15 @@ class Settings(BaseSettings):
     control_map_min_score: float = Field(60.0, ge=0.0, le=100.0)
     # TSG_RERANK_CONCURRENCY — concurrent REMOTE rerank calls (local reranker ignores this).
     rerank_concurrency: int = Field(8, ge=1)
+    # TSG_SCENARIO_GENERATION_CONCURRENCY — scenarios generated at once in one write_scenarios
+    # batch. They are independent calls, so a session's ~10 scenarios serialised into ~10x one
+    # call for no reason. 1 restores the strictly sequential behaviour.
+    #
+    # A LOCAL POLITENESS CAP ONLY: every call still takes its own Redis _llm_slot, so
+    # max_concurrent_llm_calls stays the global authority across replicas — same contract as
+    # rerank_concurrency. Raise it only alongside the provider's rpm headroom; a batch that
+    # exhausts the slot pool raises LLMSlotUnavailable and Celery retries the whole stage.
+    scenario_generation_concurrency: int = Field(5, ge=1, le=32)
 
     # --- 12. Threat volume & scenario coverage ------------------------------------------
 

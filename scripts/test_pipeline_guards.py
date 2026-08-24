@@ -386,8 +386,13 @@ def check_scenario_receipts_carry_their_scenario_id() -> None:
             f"_ask_ai at tasks.py line ~{call.lineno} is not stamping correlation_id — its "
             "Prompt_Log rows will be orphaned")
 
+    # 3 sites: the batch generator's sequential and concurrent branches, plus the variant
+    # path. Every one must stamp correlation_id as a LITERAL keyword — passing it inside a
+    # **kwargs dict would still work at runtime but would make this check unenforceable.
     sites = calls_to(tree, "_generate_one_scenario")
-    assert len(sites) == 2, f"expected 2 call sites (main + variant), found {len(sites)}"
+    assert len(sites) == 3, (
+        f"expected 3 call sites (batch sequential + batch concurrent + variant), "
+        f"found {len(sites)}")
     for call in sites:
         assert any(k.arg == "correlation_id" for k in call.keywords), (
             f"_generate_one_scenario call at tasks.py line ~{call.lineno} passes no "
