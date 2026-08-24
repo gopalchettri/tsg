@@ -820,11 +820,9 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         sess, subsystems,
         [t["threat_type_id"] for t in threats
         if t["threat_id"] not in retrieved_ids and t.get("threat_type_id") is not None])
-    grid_records: list[dict] = []
     fanout_rows: list[dict] = []
     for row in rows:
         t = summaries_by_id[row["ThreatID"]]
-        t_cats = t.get("categories") or ([t["category"]] if t.get("category") else [])
         if row["ThreatID"] in retrieved_ids:
             units = attribution.get(row["ThreatID"], [])
         else:
@@ -832,19 +830,22 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
             # one that grounded to nothing has no narrowing evidence at all, so it reaches
             # everything. Same fail-open rule, applied to a weaker piece of evidence.
             units = gen_attribution.get(t.get("threat_type_id"), grid_subsystem_ids)
-        grid_records.append({"subsystem_id": ss, "categories": t_cats})
         for unit in units:
             fanout_rows.append({**row, "ThreatID": guid(), "SubsystemID": unit})
-            grid_records.append({"subsystem_id": unit, "categories": t_cats})
     if rows:
         sess.execute(insert(m.Identified_Threat), rows + fanout_rows)
     if not dal.finish_stage(sess, sid, ss, SubsystemLevel.THREATS, StageStatus.COMPLETE, epoch, task_id):
         sess.rollback()
         log.warning("stage.claim_lost", session_id=sid, subsystem=ss, stage="THREATS", epoch=epoch)
         return [], None
-    # Coverage close-out (safety gate): which (subsystem x STRIDE) cells does this round
-    # leave unanswered? Multi-category memberships count for every category they carry.
-    # Logged AND recorded in the audit row — a gap must be visible, never silent.
+    # Coverage close-out (safety gate): which (subsystem x STRIDE) cells does the SESSION —
+    # not just this round — leave unanswered? Read live from the DB, after the insert above,
+    # rather than accumulated from `rows` alone: an additive round (next-set, regen) only
+    # inserts the few threats that are genuinely new, so a coverage computed from just that
+    # delta would describe the round, not the session, and could report a fully-covered
+    # session as almost entirely uncovered the moment a top-up added one threat.
+    # Multi-category memberships count for every category they carry. Logged AND recorded in
+    # the audit row — a gap must be visible, never silent.
     # Provenance roll-up: how many threats each leg of the funnel contributed, and which
     # ones an ACTOR put on the list. "APT33 operates in this sector and uses this technique"
     # is a defensible answer at a shutdown review; a similarity score is not.
@@ -861,6 +862,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     actor_derived = [{"threat_name": t.get("threat_name"), "actors": t["actor_evidence"]}
                     for t in retrieved_summaries if t.get("actor_evidence")][:20]
 
+    grid_records = dal.active_threat_grid_categories(sess, sid, [ss, *grid_subsystem_ids])
     cov = coverage.coverage_report([ss, *grid_subsystem_ids], cats, grid_records)
     if cov["unexplained"]:
         log.warning("threats.coverage_gaps", session_id=sid, subsystem=ss,

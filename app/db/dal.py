@@ -938,6 +938,53 @@ def active_threats(sess: Session, session_id: str, subsystem_id: int) -> list[di
     ]
 
 
+def active_threat_grid_categories(sess: Session, session_id: str,
+                                unit_ids: list[int]) -> list[dict]:
+    """The FULL current (subsystem x category) coverage state across every given unit, read
+    LIVE from the DB rather than accumulated in memory during one find_threats call.
+
+    Why this exists: an ADDITIVE round (next-set, regen) only inserts the handful of threats
+    that are genuinely new — everything already active is deliberately skipped as a duplicate
+    (see find_threats' existing_identities check). A coverage computation built only from what
+    ONE call inserted therefore describes that call's delta, not the session's actual state —
+    on a round that adds 1 threat to an already-fully-covered session, it reads as almost
+    entirely uncovered. Reading the durable rows back after insert makes that bug structurally
+    impossible: there is no "prior vs new" distinction left to forget, only "what is active
+    right now", which is what the coverage grid is supposed to describe.
+
+    Multi-category membership is resolved the same way threat_retrieval._load_candidates does:
+    Threat_Catalogue_Category_Map when the row has a ThreatCatalogueID (the map is
+    authoritative and can name several categories), falling back to the single ThreatCategory
+    column for a threat that never grounded to a catalogue row (a generated-and-ungrounded
+    threat has no map entry to look up)."""
+    if not unit_ids:
+        return []
+    it = m.Identified_Threat
+    rows = [dict(r) for r in sess.execute(
+        select(it.ThreatID, it.SubsystemID, it.ThreatCategory, it.ThreatCatalogueID)
+        .where(it.SessionID == session_id, it.SubsystemID.in_(unit_ids), active(it.Superseded))
+    ).mappings()]
+    if not rows:
+        return []
+    cat_ids = {r["ThreatCatalogueID"] for r in rows if r["ThreatCatalogueID"] is not None}
+    mapped: dict[int, list[str]] = {}
+    if cat_ids:
+        mp, tc = m.Threat_Catalogue_Category_Map, m.Threat_Category
+        for cid, cat_name in sess.execute(
+                select(mp.ThreatCatalogueID, tc.ThreatCategoryName)
+                .join(tc, tc.ThreatCategoryID == mp.ThreatCategoryID)
+                .where(mp.ThreatCatalogueID.in_(cat_ids),
+                    tc.IsActive == True, tc.IsDeleted == False)):
+            mapped.setdefault(cid, []).append(cat_name)
+    out: list[dict] = []
+    for r in rows:
+        cats = mapped.get(r["ThreatCatalogueID"]) if r["ThreatCatalogueID"] is not None else None
+        if not cats:
+            cats = [r["ThreatCategory"]] if r["ThreatCategory"] else []
+        out.append({"subsystem_id": r["SubsystemID"], "categories": cats})
+    return out
+
+
 def threat_scores(sess: Session, session_id: str) -> dict[str, dict]:
     """Best score/rank per threat for one session, in ONE grouped round trip. NEVER a join from the
     threat select: a threat has MANY active scoped rows (one per variant), so a join returns it once
