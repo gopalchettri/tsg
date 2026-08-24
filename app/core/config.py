@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -770,6 +771,29 @@ def get_settings() -> Settings:
 #: Hosts that mean "this developer's own machine". Anything else is shared infrastructure.
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "host.docker.internal", ""})
 
+#: This machine's own short name, lower-cased. socket.gethostname() is a local syscall - no DNS
+#: lookup, nothing that can hang at import (unlike socket.getfqdn()).
+_OWN_HOSTNAME = socket.gethostname().strip().lower().split(".", 1)[0]
+
+
+def _is_own_machine(host: str) -> bool:
+    r"""Does this host mean "the box this process is running on"?
+
+    _LOOPBACK_HOSTS alone did not cover the most ordinary case on Windows: a SQL Server Express
+    instance addressed as `MACHINENAME\SQLEXPRESS` rather than `localhost\SQLEXPRESS`. Same
+    instance, same data, same machine - but the gate below saw a non-loopback host and refused
+    to boot BOTH the API and the Celery worker.
+
+    This is NOT a weakening of the gate. That identical database is already reachable through
+    `localhost`, which has always been allowed, so admitting the machine's own name adds no
+    target a developer could not already point at. It only stops the gate firing on a
+    distinction that carries no meaning.
+
+    Compares the SHORT name, so `xwf8tnjr3.corp.example.com` matches `xwf8tnjr3` without
+    paying for a resolver call."""
+    host = host.strip().lower()
+    return host in _LOOPBACK_HOSTS or host.split(".", 1)[0] == _OWN_HOSTNAME
+
 
 def _dsn_host(url: str) -> str:
     r"""Best-effort host out of a SQLAlchemy DSN or a redis:// URL.
@@ -806,7 +830,7 @@ def assert_security_posture(settings: Settings | None = None) -> None:
     if s.app_env in ("local", "dev") and not s.allow_remote_in_dev:
         remote = {name: host for name, host in
                 (("TSG_DB_DSN", _dsn_host(s.db_dsn)), ("TSG_REDIS_URL", _dsn_host(s.redis_url)))
-                if host not in _LOOPBACK_HOSTS}
+                if not _is_own_machine(host)}
         if remote:
             targets = ", ".join(f"{k} -> {v}" for k, v in sorted(remote.items()))
             raise RuntimeError(

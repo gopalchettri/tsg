@@ -12,6 +12,8 @@ entrypoint for `celery worker`.
 """
 from __future__ import annotations
 
+import os
+import sys
 import time
 
 from celery import Celery, current_task  # type: ignore[import-untyped]
@@ -123,20 +125,43 @@ def _init_worker(sender=None, **_):
     # Fail-fast on prefork, the one pool that FORKS: celery_worker.py monkey-patches gevent at
     # import time, so forking after that hands every child an inherited hub — silent,
     # intermittent hangs rather than a clean error. -P solo never forks and stays allowed.
-    pool = getattr(getattr(sender, "pool_cls", None), "__module__", "")
-    if pool.endswith("prefork"):
-        raise RuntimeError(
-            "Celery worker started with the prefork pool, but app.pipeline.celery_worker has "
-            "already monkey-patched gevent — forking now yields a broken hub per child. "
-            "Launch with `-P gevent` (see start.ps1 / docker/compose.prod.yml)."
-        )
-    assert_security_posture()          # fail-closed: same auth guard as the API
-    verify_startup(get_engine())       # fail-fast: same DB invariant guard as the API
-    # local_models.py::_offload runs on gevent's native thread pool, sized independently of
-    # -c/--concurrency and otherwise capped at gevent's own default of 10. Set BEFORE
-    # validate_local_models warms the models, so the ceiling holds from the first call.
-    gevent.get_hub().threadpool.size = get_settings().local_model_threadpool_size
-    validate_local_models(warm=True)   # fail-fast + warm the local models so the 1st request is fast
+    # CELERY SWALLOWS EXCEPTIONS RAISED IN SIGNAL RECEIVERS. celery.utils.dispatch.signal.send
+    # catches whatever a receiver raises, logs "Signal handler ... raised", and carries on — so
+    # every guard below was ADVISORY despite saying "fail-closed", and a worker that failed one
+    # went on to report `ready` and pull tasks. Worse, the raise aborted the REST of this
+    # handler, so a single failed guard also silently skipped the DB invariants, the gevent
+    # threadpool sizing and the local-model warm-up.
+    #
+    # Anything meant to stop the worker therefore has to stop the PROCESS. sys.exit is no good
+    # either: SystemExit is a BaseException, and the receiver dispatch catches it just the same.
+    try:
+        pool = getattr(getattr(sender, "pool_cls", None), "__module__", "")
+        if pool.endswith("prefork"):
+            raise RuntimeError(
+                "Celery worker started with the prefork pool, but app.pipeline.celery_worker has "
+                "already monkey-patched gevent — forking now yields a broken hub per child. "
+                "Launch with `-P gevent` (see start.ps1 / docker/compose.prod.yml)."
+            )
+        assert_security_posture()      # fail-closed: same auth guard as the API
+        verify_startup(get_engine())   # fail-fast: same DB invariant guard as the API
+        # local_models.py::_offload runs on gevent's native thread pool, sized independently of
+        # -c/--concurrency and otherwise capped at gevent's own default of 10. Set BEFORE
+        # validate_local_models warms the models, so the ceiling holds from the first call.
+        gevent.get_hub().threadpool.size = get_settings().local_model_threadpool_size
+        validate_local_models(warm=True)   # fail-fast + warm so the 1st request is fast
+    except BaseException as exc:  # noqa: BLE001 — deliberate: the point is that NOTHING escapes
+        # this handler alive. Narrowing it would let some failure mode through to a worker that
+        # then reports ready, which is the exact defect being fixed.
+        from app.core.logging import get_logger
+        get_logger(__name__).critical("worker.boot_guard_failed", error=repr(exc), exc_info=True)
+        # Flush before _exit: os._exit skips atexit handlers and buffered stream teardown, and a
+        # boot failure nobody can read is worse than the boot failure.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001 — never mask the real failure with a flush error
+                pass
+        os._exit(1)
     verify_max_attempts = get_settings().llm_verify_max_attempts
     verify_backoff = get_settings().llm_verify_retry_backoff_seconds
     # verify_litellm_models goes through the same _llm_slot limiter as a real task, but this
