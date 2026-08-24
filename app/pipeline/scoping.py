@@ -104,6 +104,52 @@ def _matches(value: Any, expected: str | None) -> bool:
     return str(value).strip().lower() == expected.strip().lower()
 
 
+def _gate_hits_subsystem(rule: dict, subsystem: dict) -> bool:
+    """Does ONE tech_gate rule fire on ONE supporting system?
+
+    The same predicate _apply_rules uses, minus the collapse. Deliberately fail-CLOSED on an
+    unresolved field, the OPPOSITE of _apply_rules: there an absent field must not gate a
+    threat out of the asset entirely (it is a no-effect rule), but here the only question is
+    whether to ATTACH this system's label to a threat that already exists at the asset level.
+    "No evidence this system matches" must not become "claims it does"."""
+    mapping = _RULE_KEY_FIELDS.get(rule["RuleKey"])
+    if mapping is None:  # unknown key — logged by _apply_rules on the same pass, not twice here
+        return False
+    fld, default_expected = mapping
+    value = subsystem.get(fld)
+    if value is None:
+        return False
+    rule_value = rule.get("RuleValue")
+    return _matches(value, rule_value if rule_value is not None else default_expected)
+
+
+def gate_matching_subsystems(threat_type_id: Any, subsystems: list[dict] | None,
+                            rules_by_type: dict) -> list[int] | None:
+    """Which supporting systems this type's tech_gates individually reach, or None when the
+    type carries NO tech_gate at all.
+
+    None means "unconstrained", NOT "nothing" — the caller reads it as every system. That
+    distinction is the whole point: the 6 seeded types with no asset_type gate are the
+    UNIVERSAL threats (phishing, ransomware, supply chain), and an empty list would erase
+    them from every supporting system instead of placing them on all of them.
+
+    Gates AND across rules (one failing gate rejects) and OR across systems inside
+    _apply_rules; per-system that reduces to `all(gates)`, so the asset-level verdict and the
+    union of the per-system verdicts can never disagree."""
+    gates = [r for r in rules_by_type.get(threat_type_id, [])
+            if r["RuleType"] == ThreatRuleType.tech_gate]
+    if not gates:
+        return None
+    out: list[int] = []
+    for s in subsystems or []:
+        sid = s.get("id")
+        if sid is None:
+            continue
+        if all(_gate_hits_subsystem(rule, s) for rule in gates):
+            out.append(int(sid))
+    return out
+
+
 def _apply_rules(threat: dict, subsystems: list[dict] | None, rules_by_type: dict,
                 default_rule_weight: float) -> tuple[float, bool, list[str], list[dict]]:
     """Evaluate every rule for this threat's grounded type → (score delta, selected, failed gate

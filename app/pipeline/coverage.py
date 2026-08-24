@@ -8,9 +8,10 @@ one, so incompleteness must be made structurally visible rather than hoped away.
 
 Leaf module: stdlib only, so any pipeline stage can call it without an import cycle.
 Cells are keyed (subsystem_id, category_name); subsystem_id 0 is the asset itself
-(tasks.ASSET_UNIT_ID). While the pipeline still writes every threat at subsystem 0 the
-matrix is effectively 1 x categories — the 2D grid activates as Phase 2b un-collapses the
-subsystem dimension, with NO change needed here.
+(tasks.ASSET_UNIT_ID) and every other row is one supporting system. find_threats records a
+threat against the asset AND each system a tech_gate does not rule out
+(threat_retrieval.attribute_to_subsystems), so the grid is genuinely 2D: a 3-system asset
+answers 4 x 6 = 24 questions, not 6.
 """
 from __future__ import annotations
 

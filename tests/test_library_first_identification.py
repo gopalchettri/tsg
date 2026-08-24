@@ -12,6 +12,9 @@ Asserts the whole redesigned flow on real SQLite tables with a deterministic fak
   - a genuinely novel proposal survives as unverified (the promotion path input)
   - the grounding_summary audit row carries retrieved/generated counts, the validator
     outcome, and the coverage report
+  - Phase 2b: each threat is recorded against the asset AND every supporting system a
+    tech_gate does not rule out, so the coverage grid is 2D and an uncovered
+    (system x STRIDE) cell is reported instead of being invisible
 
 House pattern: real SQLite, bus.publish stubbed, no Mongo/Redis/real models.
 """
@@ -50,7 +53,10 @@ NOW = datetime.now(UTC)
 
 SUBSYSTEMS = [{"id": 41, "name": "SCADA HMI Server", "asset_type": "OT",
                "technology_used": ["Siemens SCADA"], "vendor_name": "Siemens",
-               "criticality": "High"}]
+               "criticality": "High"},
+              {"id": 42, "name": "Customer Billing Portal", "asset_type": "IT",
+               "technology_used": ["Django"], "vendor_name": "In-house",
+               "criticality": "Medium"}]
 ASSET_CONTEXT = {"name": "Water Pumping Station", "asset_type": "Pumping Station",
                  "sector": "Energy & Water", "sub_sector": "Water Supply",
                  "critical_service": ["Potable water supply"]}
@@ -146,6 +152,12 @@ def _seed_library(s) -> None:
     s.execute(m.Config_Threat_Rule.__table__.insert().values(
         ThreatRuleID=1, RuleType="tech_gate", ThreatTypeID=11, RuleKey="asset_type",
         RuleValue="RETAIL", IsActive=True, IsDeleted=False))
+    # tech_gate: setpoint manipulation is an OT concern. The ASSET still passes (system 41 is
+    # OT and the asset-level gate is an any()), but the per-system attribution must NOT put
+    # this threat on the IT billing portal — that narrowing is what Phase 2b buys.
+    s.execute(m.Config_Threat_Rule.__table__.insert().values(
+        ThreatRuleID=2, RuleType="tech_gate", ThreatTypeID=7, RuleKey="asset_type",
+        RuleValue="OT", IsActive=True, IsDeleted=False))
 
 
 def _seed_session(s) -> dict:
@@ -173,8 +185,11 @@ def test_library_first_identification_end_to_end(monkeypatch):
 
     # --- library rows first, master identity intact -----------------------------------
     with Session() as s:
-        rows = {r.ThreatCatalogueID: r for r in s.execute(
-            select(m.Identified_Threat)).scalars()}
+        all_rows = list(s.execute(select(m.Identified_Threat)).scalars())
+        # SubsystemID 0 only: Phase 2b also writes a copy of each threat on every supporting
+        # system it reaches, and those copies share the catalogue id (asserted separately
+        # below). Every consumer — scoping, scenarios, next-set, accept — reads unit 0.
+        rows = {r.ThreatCatalogueID: r for r in all_rows if r.SubsystemID == 0}
         retrieved = {cid: r for cid, r in rows.items() if cid is not None}
         # 418 + 205 retrieved; 522 validator-dropped; 900 gate-excluded
         assert set(retrieved) == {418, 205}
@@ -208,8 +223,25 @@ def test_library_first_identification_end_to_end(monkeypatch):
         assert summary["validator"]["dropped"][0]["catalogue_id"] == 522
         assert "no web application" in summary["validator"]["dropped"][0]["justification"]
         cov = summary["coverage"]
-        # 205 is Spoofing AND Repudiation (multi-category), 418 Tampering — all 3 covered
-        assert cov["cells"] == 3 and cov["unexplained"] == 0
+        # --- Phase 2b: the grid is 2D ---------------------------------------------------
+        # 3 units (asset + 2 supporting systems) x 3 STRIDE categories.
+        assert cov["cells"] == 9
+        assert summary["units"] == [0, 41, 42]
+
+        # The asset's working set is untouched by the fan-out: still exactly 3 threats.
+        assert len([r for r in all_rows if r.SubsystemID == 0]) == 3
+        by_unit = {u: {r.ThreatCatalogueID for r in all_rows if r.SubsystemID == u}
+                for u in (0, 41, 42)}
+        # 418 is OT-gated: recorded on the SCADA server, NOT on the billing portal.
+        assert 418 in by_unit[41] and 418 not in by_unit[42]
+        # 205 (Credential Abuse) carries no gate — universal, so it reaches both systems.
+        assert 205 in by_unit[41] and 205 in by_unit[42]
+
+        # ...and the grid now SEES what the flat version could not: no Tampering threat was
+        # identified for the IT subsystem. A reportable gap, not silence — this assertion is
+        # the whole point of the matrix.
+        assert cov["unexplained"] == 1
+        assert cov["gaps"] == [[42, "Tampering"]]
 
     # --- return value feeds write_scenarios: retrieved first, then novel ---------------
     assert [t.get("selection_source") for t in threats[:2]] == ["library_retrieval"] * 2

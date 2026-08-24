@@ -1,5 +1,9 @@
-"""Pins pipeline/coverage.py: the (subsystem x STRIDE) coverage matrix accounting."""
+"""Pins pipeline/coverage.py: the (subsystem x STRIDE) coverage matrix accounting, plus the
+rule that decides which subsystem rows a threat occupies (Phase 2b)."""
+from app.core.enums import ThreatRuleType
 from app.pipeline.coverage import coverage_gaps, coverage_report, covered_cells, required_cells
+from app.pipeline.scoping import _apply_rules, gate_matching_subsystems
+from app.pipeline.threat_retrieval import attribute_to_subsystems
 
 CATS = ["Spoofing", "Tampering", "Repudiation"]
 
@@ -36,3 +40,44 @@ def test_report_counts_and_zero_unexplained_definition():
     # a cell outside the required grid never inflates the counts
     r2 = coverage_report([0], CATS, [{"subsystem_id": 99, "category": "Spoofing"}])
     assert r2["covered"] == 0 and r2["unexplained"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b: WHICH rows the grid has — the per-subsystem attribution rule.
+# ---------------------------------------------------------------------------
+OT = {"id": 41, "name": "SCADA HMI", "asset_type": "OT"}
+IT = {"id": 42, "name": "Billing Portal", "asset_type": "IT"}
+BLANK = {"id": 43, "name": "Unclassified Link", "asset_type": None}
+_GATE = {"RuleType": ThreatRuleType.tech_gate, "RuleKey": "asset_type", "RuleValue": "OT"}
+
+
+def test_ungated_type_is_universal_not_unattributable():
+    # None means "no gate constrains this", NOT "reaches nothing". Collapsing the two would
+    # erase the seeded universal threats (phishing, ransomware) from every supporting system.
+    assert gate_matching_subsystems(7, [OT, IT], {}) is None
+    assert attribute_to_subsystems([OT, IT], [7], {}) == {7: [41, 42]}
+
+
+def test_gate_narrows_to_the_systems_it_actually_hits():
+    assert gate_matching_subsystems(7, [OT, IT], {7: [_GATE]}) == [41]
+    assert attribute_to_subsystems([OT, IT], [7], {7: [_GATE]}) == {7: [41]}
+
+
+def test_unresolved_field_fails_closed_here_and_open_in_apply_rules():
+    # _apply_rules skips a rule whose field is absent EVERYWHERE (a no-effect rule), so the
+    # asset keeps the threat. Attribution must not inherit that: "we don't know" is not
+    # "yes". The threat still exists at the asset level, so nothing is lost by not claiming.
+    assert gate_matching_subsystems(7, [BLANK], {7: [_GATE]}) == []
+    _delta, selected, _fails, _factors = _apply_rules(
+        {"threat_type_id": 7}, [BLANK], {7: [_GATE]}, 0.0)
+    assert selected is True
+
+
+def test_asset_verdict_and_per_system_union_cannot_disagree():
+    # Gates AND across rules and OR across systems. If the asset passed on a resolvable
+    # field, at least one system must be named — otherwise a threat would be recorded
+    # nowhere on the grid while still being live on the asset.
+    _delta, selected, _fails, _factors = _apply_rules(
+        {"threat_type_id": 7}, [OT, IT], {7: [_GATE]}, 0.0)
+    assert selected is True
+    assert gate_matching_subsystems(7, [OT, IT], {7: [_GATE]}) != []

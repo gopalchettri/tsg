@@ -45,7 +45,7 @@ from app.db import models as m
 from app.pipeline import embeddings, hybrid_search
 from app.pipeline.grounding import get_allowed_actor_names, visible_to_this_sector
 from app.pipeline.llm import LLMClient
-from app.pipeline.scoping import _apply_rules
+from app.pipeline.scoping import _apply_rules, gate_matching_subsystems
 
 log = get_logger(__name__)
 
@@ -116,10 +116,12 @@ def _load_candidates(sess: Session, sector_ids: list[int]) -> list[dict]:
 
 
 def _gate_types(sess: Session, rows: list[dict], subsystems: list[dict] | None,
-                default_rule_weight: float) -> tuple[dict[int, dict], set[int]]:
+                default_rule_weight: float) -> tuple[dict[int, dict], set[int], dict[int, list[dict]]]:
     """Evaluate each distinct type's Config_Threat_Rule rows once. Returns
     (type_id -> {"factors": [...], "delta": float}) for types that pass their gates,
-    plus the set of type_ids that carry NO tech_gate at all (the always-eligible tier)."""
+    the set of type_ids that carry NO tech_gate at all (the always-eligible tier), and the
+    loaded rules themselves so the caller can derive per-subsystem attribution without a
+    second query."""
     type_ids = sorted({r["ThreatTypeID"] for r in rows})
     rules_by_type: dict[int, list[dict]] = {}
     for rule in dal.active_threat_rules(sess, type_ids):
@@ -136,7 +138,51 @@ def _gate_types(sess: Session, rows: list[dict], subsystems: list[dict] | None,
         else:
             log.info("threat_retrieval.type_gated_out", threat_type_id=tid,
                      gates=gate_failures)
-    return passed, ungated
+    return passed, ungated, rules_by_type
+
+
+def all_subsystem_ids(subsystems: list[dict] | None) -> list[int]:
+    """Every supporting system's onboarding id, in context order. The asset itself
+    (tasks.ASSET_UNIT_ID = 0) is NOT in here — it is always recorded separately."""
+    return [int(s["id"]) for s in subsystems or [] if s.get("id") is not None]
+
+
+def attribute_to_subsystems(subsystems: list[dict] | None, type_ids: list[int],
+                            rules_by_type: dict[int, list[dict]]) -> dict[int, list[int]]:
+    """type_id -> the supporting systems this threat is RECORDED against.
+
+    ONE rule, stated once so it can be argued with:
+
+        a threat reaches the asset AND every supporting system, EXCEPT where a tech_gate
+        proves it does not reach that system.
+
+    Fail-OPEN by design, and that direction is chosen, not incidental. Over-attribution puts
+    a row in front of a reviewer who can dismiss it in a second; under-attribution removes a
+    real exposure from the grid with no trace, which is precisely the silent failure the
+    coverage matrix exists to make impossible. Gates are the ONLY narrowing evidence the
+    system has, and they only ever narrow.
+
+    Types with no tech_gate (the seeded universal threats — phishing, ransomware, supply
+    chain) therefore land on every system. That is correct, not a fallback: they are
+    universal because nothing gates them."""
+    every = all_subsystem_ids(subsystems)
+    out: dict[int, list[int]] = {}
+    for tid in type_ids:
+        matched = gate_matching_subsystems(tid, subsystems, rules_by_type)
+        out[tid] = every if matched is None else matched
+    return out
+
+
+def subsystem_attribution(sess: Session, subsystems: list[dict] | None,
+                          type_ids: list[int]) -> dict[int, list[int]]:
+    """attribute_to_subsystems for callers that do not already hold the rules — one query.
+    Used by the GENERATED half of find_threats, whose types are only known after grounding."""
+    if not type_ids:
+        return {}
+    rules_by_type: dict[int, list[dict]] = {}
+    for rule in dal.active_threat_rules(sess, sorted(set(type_ids))):
+        rules_by_type.setdefault(rule["ThreatTypeID"], []).append(rule)
+    return attribute_to_subsystems(subsystems, list(type_ids), rules_by_type)
 
 
 def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dict] | None,
@@ -145,7 +191,8 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
 
         {"catalogue_id", "type_id", "type_name", "threat_name", "description",
          "categories": [names], "retrieval_score": 0..1, "rule_factors": [...],
-         "always_eligible": bool, "actors": [names]}
+         "always_eligible": bool, "actors": [names],
+         "subsystem_ids": [supporting systems this threat is recorded against]}
 
     [] when the library holds nothing visible — the caller degrades to generation-only."""
     s = get_settings()
@@ -153,7 +200,7 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
     if not rows:
         log.warning("threat_retrieval.library_empty", sector_ids=sector_ids)
         return []
-    passed, ungated = _gate_types(sess, rows, subsystems, s.default_rule_weight)
+    passed, ungated, rules_by_type = _gate_types(sess, rows, subsystems, s.default_rule_weight)
     rows = [r for r in rows if r["ThreatTypeID"] in passed]
     if not rows:
         log.warning("threat_retrieval.all_types_gated_out")
@@ -194,6 +241,8 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
         keep |= {i for i in range(len(rows)) if rows[i]["ThreatTypeID"] in ungated}
         order = [i for i in order if i in keep]
 
+    attribution = attribute_to_subsystems(
+        subsystems, sorted({r["ThreatTypeID"] for r in rows}), rules_by_type)
     actor_memo: dict[int, list[str]] = {}
     out: list[dict] = []
     for i in order:
@@ -208,6 +257,7 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
             "retrieval_score": round(best.get(i, 0.0), 6),
             "rule_factors": passed[tid]["factors"],
             "always_eligible": tid in ungated,
+            "subsystem_ids": attribution.get(tid, []),
             "actors": actor_memo[tid][:s.max_actors_per_threat],
         })
     log.info("threat_retrieval.candidates", total=len(rows), forwarded=len(out),

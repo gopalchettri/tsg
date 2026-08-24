@@ -663,6 +663,12 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         max_threats = tn.max_threats_per_asset
     cats = categories if categories is not None else dal.active_category_names(sess)
     sector_ids = json.loads(scenario_session["SectorIDsJSON"]) if scenario_session.get("SectorIDsJSON") else []
+    # Phase 2b — the coverage grid's rows. A threat is recorded against the asset (ss) AND
+    # against every supporting system no tech_gate rules out; see
+    # threat_retrieval.attribute_to_subsystems for the rule and why it fails open. These extra
+    # rows are RECORDS: every dal reader of Identified_Threat is subsystem-scoped and scenario
+    # generation, scoring and accept all read the asset unit, so nothing downstream doubles up.
+    grid_subsystem_ids = threat_retrieval.all_subsystem_ids(subsystems)
 
     # --- Stage 1a: LIBRARY-FIRST — deterministic retrieval, then LLM validation ---------
     # The funnel selects candidate Threat_Catalogue rows (metadata/rules gates + hybrid
@@ -682,13 +688,18 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
             ss, epoch, task_id)
 
     if supersede:
-        dal.supersede(sess, m.Identified_Threat, sid, ss)
+        # Every unit the fan-out below writes to, not just the asset: a stale subsystem row
+        # left active from the previous round would double-count on the grid and make a real
+        # gap read as covered — the exact failure the coverage matrix exists to prevent.
+        for unit in (ss, *grid_subsystem_ids):
+            dal.supersede(sess, m.Identified_Threat, sid, unit)
     existing_identities = dal.active_identified_threat_identities(sess, sid, ss) if not supersede else {}
     threats: list[dict] = []
     rows: list[dict] = []
     duplicates = 0
     dup_rows: list[dict] = []  # Identified_Duplicate_Threat rows — audit-only, see _duplicate_row
     retrieved_summaries: list[dict] = []
+    attribution: dict[str, list[int]] = {}  # ThreatID -> supporting systems it reaches
     for cand in candidates:
         if len(rows) >= max_threats:
             log.info("threat_retrieval.cap_reached", session_id=sid, cap=max_threats)
@@ -700,6 +711,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
             # library) — a no-op, not an audit-worthy duplicate.
             continue
         existing_identities[identity] = row["ThreatID"]
+        attribution[row["ThreatID"]] = cand.get("subsystem_ids") or []
         rows.append(row)
         threats.append(summary)
         retrieved_summaries.append(summary)
@@ -793,8 +805,33 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         threats = [t for t in threats if t["threat_id"] not in dupe_info]
         log.info("threats.semantic_duplicates_dropped", session_id=sid, subsystem=ss,
                 dropped=near_dupes)
+    # Phase 2b fan-out. Built AFTER both dedup passes so a dropped threat is dropped on every
+    # unit at once — a subsystem copy of a superseded threat would be an orphan on the grid.
+    # The copies are records, not work: each gets its own ThreatID, and none is ever scored,
+    # scenario-generated or promoted, because every one of those paths reads the asset unit.
+    summaries_by_id = {t["threat_id"]: t for t in threats}
+    gen_attribution = threat_retrieval.subsystem_attribution(
+        sess, subsystems,
+        [t["threat_type_id"] for t in threats
+        if t["threat_id"] not in retrieved_ids and t.get("threat_type_id") is not None])
+    grid_records: list[dict] = []
+    fanout_rows: list[dict] = []
+    for row in rows:
+        t = summaries_by_id[row["ThreatID"]]
+        t_cats = t.get("categories") or ([t["category"]] if t.get("category") else [])
+        if row["ThreatID"] in retrieved_ids:
+            units = attribution.get(row["ThreatID"], [])
+        else:
+            # A generated threat that GROUNDED to a library type inherits that type's gates;
+            # one that grounded to nothing has no narrowing evidence at all, so it reaches
+            # everything. Same fail-open rule, applied to a weaker piece of evidence.
+            units = gen_attribution.get(t.get("threat_type_id"), grid_subsystem_ids)
+        grid_records.append({"subsystem_id": ss, "categories": t_cats})
+        for unit in units:
+            fanout_rows.append({**row, "ThreatID": guid(), "SubsystemID": unit})
+            grid_records.append({"subsystem_id": unit, "categories": t_cats})
     if rows:
-        sess.execute(insert(m.Identified_Threat), rows)
+        sess.execute(insert(m.Identified_Threat), rows + fanout_rows)
     if not dal.finish_stage(sess, sid, ss, SubsystemLevel.THREATS, StageStatus.COMPLETE, epoch, task_id):
         sess.rollback()
         log.warning("stage.claim_lost", session_id=sid, subsystem=ss, stage="THREATS", epoch=epoch)
@@ -802,18 +839,17 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # Coverage close-out (safety gate): which (subsystem x STRIDE) cells does this round
     # leave unanswered? Multi-category memberships count for every category they carry.
     # Logged AND recorded in the audit row — a gap must be visible, never silent.
-    cov = coverage.coverage_report(
-        [ss], cats,
-        [{"subsystem_id": ss,
-          "categories": t.get("categories") or ([t["category"]] if t.get("category") else [])}
-         for t in threats])
+    cov = coverage.coverage_report([ss, *grid_subsystem_ids], cats, grid_records)
     if cov["unexplained"]:
         log.warning("threats.coverage_gaps", session_id=sid, subsystem=ss,
+                    units=1 + len(grid_subsystem_ids),
                     unexplained=cov["unexplained"], gaps=cov["gaps"][:12])
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.THREAT_IDENTIFICATION, SubsystemID=ss,
                     EventType=AuditEventType.grounding_summary,
                     DetailJSON=json.dumps({"count": len(threats),
+                                        "subsystem_records": len(fanout_rows),
+                                        "units": [ss, *grid_subsystem_ids],
                                         "retrieved": len(retrieved_summaries),
                                         "generated": len(threats) - len(retrieved_summaries),
                                         "validator": validator_audit,

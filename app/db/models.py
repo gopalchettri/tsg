@@ -134,6 +134,12 @@ class Identified_Threat(Base):
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
     UserID: Mapped[str | None] = mapped_column(Unicode(200))
+    # 0 = the asset itself (tasks.ASSET_UNIT_ID); >= 1 = one supporting system.
+    # ONE threat produces SEVERAL rows: the asset row plus a copy, with its own ThreatID, on
+    # every supporting system a tech_gate does not rule out. The asset row is the WORKING row
+    # — scoping, scenario generation, next-set and accept all read subsystem 0 and are blind
+    # to the copies. The copies exist so the coverage grid has real (system x STRIDE) cells
+    # and a reviewer can see a threat's blast radius. Do not "deduplicate" them.
     SubsystemID: Mapped[int] = mapped_column(Integer)
     ThreatCategory: Mapped[str] = mapped_column(Unicode(200))
     ThreatType: Mapped[str] = mapped_column(Unicode(300))
