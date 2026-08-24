@@ -93,6 +93,10 @@ def substitute_names(scenario_json: str, source_names: list[str],
 
       * the two name lists are different lengths (the profile key should make this impossible,
         so reaching it means the key and the stored row disagree — trust neither);
+      * two SOURCE names collide (see the check right below) — positional substitution is
+        provably ambiguous the moment two subsystems share a name, and unfixable after the
+        fact: the stored text carries no marker saying which mention belonged to which
+        position, so no cleverer replacement logic could recover the right mapping either;
       * a source name survives the swap in any casing, which means the model wrote a variant
         ("the scada hmi", "SCADA HMI Server") that exact replacement could not reach.
 
@@ -101,6 +105,22 @@ def substitute_names(scenario_json: str, source_names: list[str],
     """
     if len(source_names) != len(target_names):
         return None
+    # Two subsystems with the identical name make the swap ambiguous, not just for THEIR pair
+    # but for every other pair that shares the string: re.sub has no notion of "this is
+    # occurrence #2, not #1", so the FIRST matching pair's replacement consumes every mention
+    # in the text — including the ones that belonged to the second position — and silently
+    # transplants one system's replacement text onto another's. The residue check further down
+    # cannot catch this: once the shared name is gone from the text, "does any source name
+    # survive" reads as a clean pass even though the wrong target landed in the wrong place.
+    # Refuse before touching the text, the same fail-closed discipline as the length check
+    # above — this applies even when the colliding positions happen to need no change, because
+    # the corruption risk lives in the WRITE side's ambiguity, not in this particular read.
+    seen_sources: set[str] = set()
+    for name in source_names:
+        if name:
+            if name in seen_sources:
+                return None
+            seen_sources.add(name)
     try:
         text = scenario_json if isinstance(scenario_json, str) else json.dumps(scenario_json)
         json.loads(text)                       # must already be valid before we touch it

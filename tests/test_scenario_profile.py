@@ -113,3 +113,43 @@ def test_unchanged_names_are_a_no_op_not_a_refusal():
     out = substitute_names(STORED, SOURCE, list(SOURCE))
     assert out is not None
     assert out["scenario_title"] == "SCADA HMI — unauthorised setpoint push"
+
+
+def test_duplicate_source_names_refuse_rather_than_transplant():
+    """THE regression the audit found. Two subsystems named identically at write time: a
+    stable sort keeps their positional order, so the FIRST pair's re.sub (no count=) consumes
+    every occurrence of the shared name in the text -- including the ones that belonged to the
+    SECOND position -- silently transplanting the first target's text onto the second
+    subsystem's mentions. The residue check cannot catch it: once "Server" is gone from the
+    text, "does any source name survive" reads as a clean pass even though the wrong target
+    landed in the wrong place. Unfixable after the fact (the text carries no marker saying
+    which "Server" was which), so refusing up front is the only sound answer."""
+    stored = json.dumps({
+        "scenario_statement": "Server talks to the primary Server over the internal link.",
+        "supporting_system_applicability": [
+            {"supporting_system": "Server", "applicable": True, "justification": "first"},
+            {"supporting_system": "Server", "applicable": True, "justification": "second"},
+        ],
+    })
+    # Two DIFFERENT subsystems, written with the identical name "Server".
+    duplicate_source = ["Asset A", "Server", "Server"]
+    assert substitute_names(stored, duplicate_source, ["Asset B", "Web-01", "DB-01"]) is None
+
+
+def test_duplicate_source_names_refuse_even_when_targets_are_unchanged():
+    """The ambiguity lives in the WRITE side, not this particular read: even serving back to
+    an asset whose own names happen to be unchanged must refuse, because the STORED text
+    itself cannot say which "Server" mention was which -- a later caller with genuinely
+    different targets for the two positions would silently corrupt the swap, and this
+    function has no way to know in advance which caller it's talking to."""
+    stored = json.dumps({"scenario_statement": "Server and Server are both online."})
+    assert substitute_names(stored, ["Asset A", "Server", "Server"],
+                            ["Asset A", "Server", "Server"]) is None
+
+
+def test_distinct_source_names_are_unaffected_by_the_collision_guard():
+    """Guard against over-tightening: ordinary distinct names must keep working exactly as
+    before."""
+    out = substitute_names(STORED, SOURCE, ["Jebel Ali Pumping Station", "Control Room HMI",
+                                            "Customer Web"])
+    assert out is not None
