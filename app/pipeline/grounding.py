@@ -263,7 +263,14 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
     order, so no score fusion is needed; the legs only decide what gets reranked.
     Falls back to per-query llm.rerank when the client has no rerank_many (test fakes)."""
     if not rows or not queries:
-        return [[] for _ in queries]
+        # ANSWERED, not failed: an empty library (or an empty query list) is a definitive
+        # "nothing to match against", the same class of fact the docstring above describes
+        # for a reranked-but-empty shortlist — never the "we never got a verdict" case. Every
+        # caller trusting the `list[ControlMatches]` return type (map_controls reads
+        # `.answered` on every item unconditionally) would otherwise crash with
+        # AttributeError the moment this path fired, instead of the type-safe contract this
+        # NamedTuple exists to guarantee.
+        return [ControlMatches([], True) for _ in queries]
     names = [r["text"] for r in rows]
     # Resolve the cached matrix once for the whole batch (cheap once, wasteful per query);
     # dict-path vectors only if the matrix is unavailable.

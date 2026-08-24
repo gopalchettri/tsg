@@ -111,3 +111,22 @@ def test_one_query_yields_top_k_distinct_ranked_controls(monkeypatch):
     assert [r.Score for r in rows] == [95.0, 90.0, 85.0, 80.0, 75.0]  # dedup kept the best
     assert all(r.SuggestedControl is None for r in rows)              # LLM suggestions are gone
     assert all(r.OutputID == output_id for r in rows)
+
+
+def test_empty_candidate_library_still_returns_control_matches_not_bare_lists():
+    """ground_control_queries is typed `-> list[ControlMatches]`. Its empty-`rows` fast path
+    used to return `[[] for _ in queries]` — a bare list, not the NamedTuple every caller
+    trusts. map_controls (above) reads `.answered` on every returned item unconditionally, so
+    an empty control library would have crashed with AttributeError instead of the intended
+    "answered, zero matches" outcome the type exists to express."""
+    class _UncalledLLM:
+        def embed(self, texts, kind):
+            raise AssertionError("the empty-rows fast path must return before touching the LLM")
+
+    from app.core.config import get_settings
+
+    out = grounding.ground_control_queries(
+        _UncalledLLM(), [("q1", None), ("q2", None)], [], get_settings())
+    assert out == [grounding.ControlMatches([], True), grounding.ControlMatches([], True)]
+    assert all(isinstance(r, grounding.ControlMatches) for r in out)
+    assert all(r.answered is True and r.matches == [] for r in out)
