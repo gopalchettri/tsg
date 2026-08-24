@@ -366,16 +366,16 @@ def test_results_default_view_shows_accepted_superseded_row(monkeypatch):
     principal = Principal(claims={"sub": "u1"}, entities={"86"}, client_id="c", tenant_id="t")
     results = sessions_mod.get_results(sid, include_replaced=False, principal=principal)
 
-    ids = {sc.output_id for sc in results.scenarios}
+    ids = {sc.OutputID for sc in results.scenarios}
     assert b in ids          # accepted, though superseded
     assert d in ids          # current version still visible (flagged not-accepted)
     assert a not in ids and c not in ids  # plain history stays hidden by default
     # Response invariant: every threat_id a returned card carries resolves in threats[] —
     # a card must never reference a threat the same response says does not exist.
-    threat_ids = {t.threat_id for t in results.threats}
+    threat_ids = {t.ThreatID for t in results.threats}
     for sc in results.scenarios:
-        if sc.threat_id is not None:
-            assert sc.threat_id in threat_ids
+        if sc.ThreatID is not None:
+            assert sc.ThreatID in threat_ids
 
 
 def test_treatment_gate_accepts_superseded_accepted_scenario(monkeypatch):

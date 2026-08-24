@@ -17,11 +17,11 @@ from app.api.schemas import MappedControl, ScenarioResult, SessionResults, Suppo
 
 _COLUMNS = (
     "session_id", "entity_id", "asset_id", "asset_name", "user_id",
-    "output_id", "threat_id", "threat_category", "threat_type", "threat_name", "threat_actors",
+    "OutputID", "ThreatID", "ThreatCategory", "ThreatType", "ThreatName", "ThreatActors",
     "scenario_title", "scenario_statement", "risk_statement",
     "controls", "supporting_system_applicability",
-    "accepted", "validation_status", "validation_errors", "controls_mapped",
-    "generation_epoch", "scenario_number", "is_replaced", "current_output_id",
+    "Accepted", "validation_status", "validation_errors", "ControlsMapped",
+    "GenerationEpoch", "ScenarioNumber", "is_replaced", "current_output_id",
 )
 
 #: Multi-line/long-prose columns get wrap_text; everything else stays single-line.
@@ -33,10 +33,10 @@ _WRAP_COLUMNS = frozenset({
 #: reviewer can resize in Excel same as any spreadsheet.
 _COLUMN_WIDTHS = {
     "session_id": 24, "entity_id": 10, "asset_id": 10, "asset_name": 28, "user_id": 12,
-    "output_id": 24, "threat_id": 24, "threat_category": 16, "threat_type": 22, "threat_name": 40,
-    "threat_actors": 30, "scenario_title": 40, "scenario_statement": 50, "risk_statement": 50,
-    "controls": 50, "supporting_system_applicability": 40, "accepted": 10, "validation_status": 14,
-    "validation_errors": 30, "controls_mapped": 14, "generation_epoch": 12, "scenario_number": 12,
+    "OutputID": 24, "ThreatID": 24, "ThreatCategory": 16, "ThreatType": 22, "ThreatName": 40,
+    "ThreatActors": 30, "scenario_title": 40, "scenario_statement": 50, "risk_statement": 50,
+    "controls": 50, "supporting_system_applicability": 40, "Accepted": 10, "validation_status": 14,
+    "validation_errors": 30, "ControlsMapped": 14, "GenerationEpoch": 12, "ScenarioNumber": 12,
     "is_replaced": 10, "current_output_id": 24,
 }
 
@@ -56,11 +56,14 @@ def _sanitize(value):
 
 
 def _controls_cell(controls: list[MappedControl]) -> str:
-    """One '{code} — {name} [{domain}] (rank R, score S)' line per mapped control."""
+    """One '{code} — {name} [{domain}] (MapRank R, Score S)' line per mapped control. The
+    labels are the API/DB field names on purpose: this cell is what a reviewer cross-references
+    against /results, and a third spelling would be a third thing to reconcile."""
     lines = []
     for c in controls:
-        score = f"{c.score:.1f}" if c.score is not None else "n/a"
-        lines.append(f"{c.control_code} — {c.control_name} [{c.domain}] (rank {c.rank}, score {score})")
+        score = f"{c.Score:.1f}" if c.Score is not None else "n/a"
+        lines.append(f"{c.ControlCode} — {c.ControlName} [{c.Domain}] "
+                    f"(MapRank {c.MapRank}, Score {score})")
     return "\n".join(lines)
 
 
@@ -81,23 +84,27 @@ def _row(results: SessionResults, scenario: ScenarioResult, *,
     return {
         "session_id": results.session_id, "entity_id": results.entity_id,
         "asset_id": results.asset_id, "asset_name": results.asset_name, "user_id": results.user_id,
-        "output_id": scenario.output_id, "threat_id": scenario.threat_id,
-        "threat_category": getattr(narrative, "threat_category", None),
-        "threat_type": getattr(narrative, "threat_type", None),
-        "threat_name": getattr(narrative, "threat_name", None),
-        "threat_actors": "; ".join(getattr(narrative, "threat_actors", None) or []),
+        "OutputID": scenario.OutputID, "ThreatID": scenario.ThreatID,
+        # These four ride in the scenario BODY (merged there by sessions._scenario_with_controls
+        # from the Identified_Threat row), which keeps the LLM's own snake_case keys — hence the
+        # spelling mismatch between the getattr and the column header. The header wins: it is
+        # what the reviewer reads.
+        "ThreatCategory": getattr(narrative, "threat_category", None),
+        "ThreatType": getattr(narrative, "threat_type", None),
+        "ThreatName": getattr(narrative, "threat_name", None),
+        "ThreatActors": "; ".join(getattr(narrative, "threat_actors", None) or []),
         "scenario_title": getattr(narrative, "scenario_title", None),
         "scenario_statement": getattr(narrative, "scenario_statement", None),
         "risk_statement": getattr(narrative, "risk_statement", None),
         "controls": _controls_cell(narrative.controls) if narrative else "",
         "supporting_system_applicability": (
             _applicability_cell(narrative.supporting_system_applicability) if narrative else ""),
-        "accepted": scenario.accepted,
+        "Accepted": scenario.Accepted,
         "validation_status": scenario.validation_status,
         "validation_errors": "; ".join(scenario.validation_errors or []),
-        "controls_mapped": scenario.controls_mapped,
-        "generation_epoch": scenario.generation_epoch,
-        "scenario_number": scenario.scenario_number,
+        "ControlsMapped": scenario.ControlsMapped,
+        "GenerationEpoch": scenario.GenerationEpoch,
+        "ScenarioNumber": scenario.ScenarioNumber,
         "is_replaced": is_replaced,
         "current_output_id": current_output_id,
     }
@@ -110,7 +117,7 @@ def _iter_rows(results: SessionResults):
     for scenario in results.scenarios:
         yield _row(results, scenario, is_replaced=False, current_output_id=None)
         for replaced in scenario.replaced_scenarios:
-            yield _row(results, replaced, is_replaced=True, current_output_id=scenario.output_id)
+            yield _row(results, replaced, is_replaced=True, current_output_id=scenario.OutputID)
 
 
 def build_results_workbook(results: SessionResults) -> Workbook:

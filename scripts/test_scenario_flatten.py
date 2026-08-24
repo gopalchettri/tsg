@@ -36,9 +36,9 @@ THREAT_ROW = {
     "ThreatActorsJSON": json.dumps({"actors": ["External attacker", "Nation-state/APT"], "validated": False}),
 }
 
-CONTROLS = [MappedControl(control_library_id=28, control_code="CII-CID-028", domain="BCDR",
-                          control_name="Testing for Reliability", rank=1, score=99.0,
-                          standards=["DESC ISR v3"])]
+CONTROLS = [MappedControl(ControlLibraryID=28, ControlCode="CII-CID-028", Domain="BCDR",
+                          ControlName="Testing for Reliability", MapRank=1, Score=99.0,
+                          StandardNames=["DESC ISR v3"])]
 
 
 def main() -> None:
@@ -49,7 +49,7 @@ def main() -> None:
     assert merged["threat_type"] == "loss of availability"
     assert merged["threat_name"] == "Loss of control and generation availability of PGS"
     assert merged["threat_actors"] == ["External attacker", "Nation-state/APT"]
-    assert merged["controls"][0]["control_code"] == "CII-CID-028"
+    assert merged["controls"][0]["ControlCode"] == "CII-CID-028"
     print("1 OK  threat fields merged in alongside the existing controls merge")
 
     # 2 — the merged dict validates as ScenarioNarrative, with supporting_system_applicability
@@ -79,9 +79,9 @@ def main() -> None:
     assert narrative_old.supporting_system_applicability == []
     print("4 OK  pre-existing scenarios (no applicability key) default to an empty list")
 
-    # 5 — accepted-scenarios / scenario-list wiring: _scenario_list_item must put the SAME
-    #     library-preferred threat_type/name on the nested scenario as on the sibling field —
-    #     never two different answers to "what is this scenario's threat_type" in one response.
+    # 5 — Phase 4 wiring: _scenario_list_item reports BOTH spellings side by side (proposed
+    #     vs matched, no coalesce), while the nested display prose keeps preferring the
+    #     curator's wording. The one coalesce left in the API lives in _scenario_with_controls.
     list_row = {
         "OutputID": "out-1", "SessionID": "sess-1", "SubsystemID": 7, "ScenarioJSON": RAW_SCENARIO_JSON,
         "Accepted": 1, "Superseded": 0, "ScenarioNumber": 1, "CreatedAt": None, "ControlsMappedAt": "x",
@@ -93,11 +93,18 @@ def main() -> None:
         "ThreatActorsJSON": json.dumps({"actors": ["External attacker"], "validated": True}),
     }
     item = sessions._scenario_list_item(list_row, CONTROLS)
-    assert item.threat_type == "Loss of Availability (curated)" == item.scenario.threat_type
-    assert item.threat_name == "Curated name" == item.scenario.threat_name
+    # what the model proposed, kept verbatim...
+    assert item.ThreatType == "loss of availability"
+    assert item.ThreatName == "raw stage-1 name"
+    # ...and what it matched, reported alongside rather than instead of it
+    assert item.LibraryThreatType == "Loss of Availability (curated)"
+    assert item.LibraryThreatName == "Curated name"
+    # display prose still prefers the curated wording
+    assert item.scenario.threat_type == "Loss of Availability (curated)"
+    assert item.scenario.threat_name == "Curated name"
     assert item.scenario.threat_category == "Denial of Service"
     assert item.scenario.threat_actors == ["External attacker"]
-    print("5 OK  _scenario_list_item's nested scenario matches its sibling threat_type/name exactly")
+    print("5 OK  both threat spellings reported; only the display prose coalesces")
 
     print("\nscenario flatten self-check OK")
 

@@ -439,47 +439,76 @@ class ThreatResult(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "threat_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
-                "threat_type": "Spoofing",
-                "threat_name": "Unauthorized RTU firmware update",
-                "grounding_status": "verified",
-                "threat_catalogue_id": 42,
+                "ThreatID": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
+                "ThreatCategory": "Tampering",
+                "ThreatType": "Spoofing",
+                "ThreatName": "Unauthorized RTU firmware update",
+                "ThreatTypeID": 3,
+                "ThreatCatalogueID": 42,
+                "LibraryThreatType": "Logic/Configuration Manipulation",
+                "LibraryThreatName": "Unauthorised firmware modification",
+                "GroundingStatus": "verified",
             }
         }
     )
 
-    threat_id: str = Field(description="Identified threat's unique id (GUID). Matches the threat_id on the scenario(s) generated from it.")
-    threat_type: str = Field(description="STRIDE threat category, e.g. Spoofing, Tampering, Denial of Service.")
-    threat_name: str | None = Field(description="Human-readable threat name.")
-    grounding_status: str = Field(
+    ThreatID: str = Field(description="Identified threat's unique id (GUID). Matches the ThreatID on the scenario(s) generated from it.")
+    ThreatCategory: str | None = Field(
+        default=None,
+        description="STRIDE category this threat was placed in (Spoofing, Tampering, Repudiation, "
+                    "Information Disclosure, Denial of Service, Elevation of Privilege) - the "
+                    "coverage grid's column."
+    )
+    ThreatType: str = Field(description="The threat's type AS PROPOSED. For a library-retrieved threat "
+                                        "this equals LibraryThreatType; for a generated one it is the "
+                                        "model's own wording, kept verbatim.")
+    ThreatName: str | None = Field(description="The threat's name AS PROPOSED - see ThreatType.")
+    ThreatTypeID: int | None = Field(
+        default=None,
+        description="Id of the matched Threat_Type master row. Null when the type came back unverified."
+    )
+    LibraryThreatType: str | None = Field(
+        default=None,
+        description="The MATCHED library type's own name, straight off Threat_Type. Null when nothing "
+                    "matched. Reported ALONGSIDE ThreatType rather than replacing it: the two differ "
+                    "exactly when the model's wording and the curator's differ, and that difference is "
+                    "the reviewer's signal about match quality."
+    )
+    LibraryThreatName: str | None = Field(
+        default=None,
+        description="The MATCHED library threat's own name, straight off Threat_Catalogue. Same "
+                    "alongside-not-instead-of rule as LibraryThreatType."
+    )
+    GroundingStatus: str = Field(
         description=(
             "Whether this threat matched an approved threat-library entry: `verified` (it did) "
             "or `unverified` (no confident match — a novel candidate, still scenario-generated "
             "and eligible for library promotion on accept)."
         )
     )
-    threat_catalogue_id: int | None = Field(
-        description="Id of the matched threat-catalogue master row, set only when the name match "
+    ThreatCatalogueID: int | None = Field(
+        description="Id of the matched Threat_Catalogue master row, set only when the name match "
                     "itself cleared the cutoff. Null whenever it did not — a close-but-unconfirmed "
                     "candidate is deliberately not reported as a match."
     )
-    threat_actors: list[str] = Field(
+    ThreatActors: list[str] = Field(
         default=[],
-        description="Adversary types proposed for this threat (raw Stage-1 list, drawn from the "
-                    "closed Threat_Actor vocabulary shown to the model). Empty when none were "
-                    "proposed."
+        description="Adversary names for this threat, taken from the LIBRARY only - the actors a "
+                    "curator linked to the matched Threat_Type, or the nearest active Threat_Actor "
+                    "rows when none are linked. The model never names an adversary, so a name here "
+                    "always corresponds to a real Threat_Actor row. Empty when the table holds none."
     )
-    grounding_score: float | None = Field(
+    GroundingScore: float | None = Field(
         default=None,
         description="Library-match confidence (reranker score, 0-100) against the threat "
                     "catalogue. Null for rows written before this field existed."
     )
-    score: float | None = Field(
+    Score: float | None = Field(
         default=None,
         description="Relevance score from scoping (base + confidence + rule boosts). Higher = "
                     "more relevant to this asset; rank best-first on this."
     )
-    scope_rank: int | None = Field(
+    ScopeRank: int | None = Field(
         default=None,
         description="1-based rank the scoping pass assigned within its round (1 = strongest)."
     )
@@ -487,13 +516,13 @@ class ThreatResult(BaseModel):
 
 #: One `scenario.controls` entry, for the OpenAPI examples below.
 _MAPPED_CONTROL_EXAMPLE: JsonDict = {
-    "control_library_id": 201,
-    "control_code": "CII-CID-201",
-    "domain": "Identification & Authentication",
-    "control_name": "Multi-Factor Authentication",
-    "rank": 1,
-    "score": 93.0,
-    "standards": ["NIST SP 800-53 Rev. 5", "ISO 27001:2022"],
+    "ControlLibraryID": 201,
+    "ControlCode": "CII-CID-201",
+    "Domain": "Identification & Authentication",
+    "ControlName": "Multi-Factor Authentication",
+    "MapRank": 1,
+    "Score": 93.0,
+    "StandardNames": ["NIST SP 800-53 Rev. 5", "ISO 27001:2022"],
 }
 
 #: The scenario narrative exactly as the pipeline produces it (prompts.py::scenario_prompt): these
@@ -534,17 +563,20 @@ class MappedControl(BaseModel):
     Delivered nested, as `scenario.controls` — it replaces whatever a legacy scenario's raw JSON
     carried under that key (sessions.py::_scenario_with_controls), so a scenario carries one
     control list, not two. An empty `scenario.controls` means nothing in the library matched well
-    enough — a library-gap signal, not an error, but only once `controls_mapped` is true (see
+    enough — a library-gap signal, not an error, but only once `ControlsMapped` is true (see
     ScenarioResult)."""
     model_config = ConfigDict(json_schema_extra={"example": _MAPPED_CONTROL_EXAMPLE})
 
-    control_library_id: int = Field(description="Control_Library primary key.")
-    control_code: str = Field(description="Stable control code, e.g. 'CII-CID-201'.")
-    domain: str = Field(description="The control's domain as recorded in the library (reported as-is).")
-    control_name: str = Field(description="The library control's official name.")
-    rank: int = Field(description="1 = best match for this scenario.")
-    score: float | None = Field(description="Raw rerank confidence 0-100 at mapping time.")
-    standards: list[str] = Field(default_factory=list, description="Referred standard names for this control.")
+    ControlLibraryID: int = Field(description="Control_Library primary key.")
+    ControlCode: str = Field(description="Stable control code, e.g. 'CII-CID-201'.")
+    Domain: str = Field(description="The control's domain as recorded in the library (reported as-is).")
+    ControlName: str = Field(description="The library control's official name.")
+    MapRank: int = Field(description="1 = best match for this scenario. Spelled as the "
+                                    "Threat_Scenario_Control_Map column it is read from.")
+    Score: float | None = Field(description="Raw match confidence 0-100 at mapping time.")
+    StandardNames: list[str] = Field(
+        default_factory=list,
+        description="Referred standard names for this control (Control_Standard.StandardName).")
 
 
 class SupportingSystemApplicability(BaseModel):
@@ -600,18 +632,18 @@ class ScenarioNarrative(BaseModel):
 
 #: Shared by ScenarioResult and by the SessionResults example that embeds one.
 _SCENARIO_RESULT_EXAMPLE: JsonDict = {
-    "output_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-    "threat_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
+    "OutputID": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "ThreatID": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
     "scenario": _SCENARIO_EXAMPLE,
-    "accepted": False,
+    "Accepted": False,
     "moderation_checked": False,
     "moderation_flagged": None,
     "moderation_categories": [],
     "validation_status": "ok",
     "validation_errors": [],
-    "generation_epoch": 1,
-    "scenario_number": 1,
-    "controls_mapped": True,
+    "GenerationEpoch": 1,
+    "ScenarioNumber": 1,
+    "ControlsMapped": True,
     "replaced_scenarios": [],
 }
 
@@ -620,9 +652,9 @@ class ScenarioResult(BaseModel):
     """One generated scenario for the session's asset, plus whether it has been accepted."""
     model_config = ConfigDict(json_schema_extra={"example": _SCENARIO_RESULT_EXAMPLE})
 
-    output_id: str = Field(description="Generated scenario's unique id (GUID). Used to accept/regenerate this scenario.")
-    threat_id: str | None = Field(
-        description="Id of the threat this scenario was generated from. Matches a threat_id in the "
+    OutputID: str = Field(description="Generated scenario's unique id (GUID). Used to accept/regenerate this scenario.")
+    ThreatID: str | None = Field(
+        description="Id of the threat this scenario was generated from. Matches a ThreatID in the "
                     "session's threats list. Null only if the underlying threat/scoping link is "
                     "missing (this schema has no enforced foreign keys) — the scenario itself is "
                     "still shown, never dropped, so it remains visible for review and accept."
@@ -633,7 +665,7 @@ class ScenarioResult(BaseModel):
             "plus the Step-4 `controls` mapped from the control library. Null if generation failed."
         )
     )
-    accepted: bool = Field(description="Whether a human reviewer has accepted this scenario.")
+    Accepted: bool = Field(description="Whether a human reviewer has accepted this scenario.")
     moderation_checked: bool = Field(
         description="Whether content moderation actually ran for this scenario. False means moderation_flagged is meaningless (never checked, not checked-and-clean) — off by default, or the moderation service was unavailable.",
     )
@@ -664,21 +696,21 @@ class ScenarioResult(BaseModel):
             "Empty unless validation_status is warning."
         ),
     )
-    generation_epoch: int = Field(
+    GenerationEpoch: int = Field(
         description=(
             "Generation round that produced this scenario: 1 = the initial run; each "
             "regenerate/next-set round increments it. The highest epoch is the newest batch — "
             "clients use this to spot fresh scenarios without diffing output ids."
         ),
     )
-    scenario_number: int = Field(
+    ScenarioNumber: int = Field(
         default=1,
         description=(
             "Which of its threat's coexisting scenarios this is: 1 = the original, 2+ = alternate "
             "takes added by 'generate next set' when no brand-new threat could be found. How many "
             "a threat accumulates is not a fixed setting — it is one per supporting system that "
             "could credibly carry that threat to the asset, so it varies by threat and by asset. "
-            "Group cards by threat_id and label them with this number; do NOT render a "
+            "Group cards by ThreatID and label them with this number; do NOT render a "
             "'Scenario 1 of N' total, because N is not known until that threat's coverage is "
             "complete. Without this number, two scenarios of one threat look like unrelated "
             "entries."
@@ -692,7 +724,7 @@ class ScenarioResult(BaseModel):
     # Mirrors Threat_Scenario_Output.ControlsMappedAt, so false ALSO covers the unseeded-library
     # case: control_mapping bails at `controls.no_candidates` without stamping, deliberately, so
     # those outputs are picked up by a later run once Seed_to_Control_library.sql has been applied.
-    controls_mapped: bool = Field(
+    ControlsMapped: bool = Field(
         description=(
             "Whether Step-4 control mapping has been attempted for this scenario. true with an "
             "empty `scenario.controls` = mapping ran and nothing in the library matched, a genuine "
@@ -704,8 +736,8 @@ class ScenarioResult(BaseModel):
         ),
     )
     # Declared LAST on purpose: Pydantic serializes in declaration order, and a nested array of
-    # whole scenarios ahead of the scalars would bury generation_epoch/scenario_number/
-    # controls_mapped under it. Self-referential — the only recursive model in this schema —
+    # whole scenarios ahead of the scalars would bury GenerationEpoch/ScenarioNumber/
+    # ControlsMapped under it. Self-referential — the only recursive model in this schema —
     # which resolves as a forward ref because of `from __future__ import annotations` above.
     replaced_scenarios: list[ScenarioResult] = Field(
         default=[],
@@ -1130,12 +1162,14 @@ class HeartbeatEvent(BaseModel):
 
 #: Shared by AcceptedScenario and by the AcceptedScenariosResponse example that embeds one.
 _ACCEPTED_SCENARIO_EXAMPLE: JsonDict = {
-    "output_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-    "supporting_system_id": 101,
-    "threat_type_id": 3,
-    "threat_catalogue_id": 42,
-    "threat_type": "Spoofing",
-    "threat_name": "Unauthorized RTU firmware update",
+    "OutputID": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "SubsystemID": 101,
+    "ThreatTypeID": 3,
+    "ThreatCatalogueID": 42,
+    "ThreatType": "Spoofing",
+    "ThreatName": "Unauthorized RTU firmware update",
+    "LibraryThreatType": "Logic/Configuration Manipulation",
+    "LibraryThreatName": "Unauthorised firmware modification",
     "scenario": _SCENARIO_EXAMPLE,
 }
 
@@ -1144,16 +1178,29 @@ class AcceptedScenario(BaseModel):
     """One accepted scenario row — joinable on ids."""
     model_config = ConfigDict(json_schema_extra={"example": _ACCEPTED_SCENARIO_EXAMPLE})
 
-    output_id: str = Field(description="Accepted scenario's unique id (GUID).")
-    supporting_system_id: int = Field(description="Supporting system this scenario applies to.")
-    threat_type_id: int | None = Field(
-        description="Id of the matched threat-type master row. Null when the type came back unverified."
+    OutputID: str = Field(description="Accepted scenario's unique id (GUID).")
+    SubsystemID: int = Field(
+        description="Unit of work this scenario belongs to: 0 = the asset itself, >= 1 = a specific "
+                    "supporting system. Scenarios are written at the asset unit; a threat's reach "
+                    "across supporting systems is reported per scenario in "
+                    "`scenario.supporting_system_applicability`."
     )
-    threat_catalogue_id: int | None = Field(
-        description="Id of the matched threat-catalogue master row. Null when no catalogue candidate matched."
+    ThreatTypeID: int | None = Field(
+        description="Id of the matched Threat_Type master row. Null when the type came back unverified."
     )
-    threat_type: str | None = Field(description="STRIDE threat category the scenario was generated from.")
-    threat_name: str | None = Field(description="Human-readable name of the threat the scenario was generated from.")
+    ThreatCatalogueID: int | None = Field(
+        description="Id of the matched Threat_Catalogue master row. Null when no catalogue candidate matched."
+    )
+    ThreatType: str | None = Field(description="The type AS PROPOSED for the threat this scenario came from.")
+    ThreatName: str | None = Field(description="The name AS PROPOSED for the threat this scenario came from.")
+    LibraryThreatType: str | None = Field(
+        default=None,
+        description="The MATCHED library type's own name. Reported alongside ThreatType, never "
+                    "instead of it - the API no longer coalesces the two, so a caller can see "
+                    "exactly what was proposed and exactly what it matched."
+    )
+    LibraryThreatName: str | None = Field(
+        default=None, description="The MATCHED library threat's own name. See LibraryThreatType.")
     scenario: ScenarioNarrative | None = Field(
         description=(
             "Accepted scenario narrative — scenario_title, scenario_statement, risk_statement, plus "
@@ -1161,10 +1208,10 @@ class AcceptedScenario(BaseModel):
             "ScenarioResult.scenario."
         )
     )
-    threat_actors: list[str] = Field(
+    ThreatActors: list[str] = Field(
         default=[],
-        description="Adversary types of the threat this scenario was generated from (raw Stage-1 "
-                    "list). Empty when none were proposed."
+        description="Library actors of the threat this scenario was generated from. Never "
+                    "model-invented - see ThreatResult.ThreatActors."
     )
 
 
@@ -1205,10 +1252,10 @@ _SCENARIO_LIST_ITEM_EXAMPLE: JsonDict = {
     "entity_id": "ENT-001",
     "user_id": "qa-user",
     "session_status": "completed",
-    "scenario_number": 1,
-    "accepted": True,
-    "superseded": False,
-    "created_at": "2026-07-20T14:32:11.123Z",
+    "ScenarioNumber": 1,
+    "Accepted": True,
+    "Superseded": False,
+    "CreatedAt": "2026-07-20T14:32:11.123Z",
 }
 
 
@@ -1218,19 +1265,23 @@ class ScenarioListItem(AcceptedScenario):
     GET /v1/sessions/{session_id}/scenarios/{output_id}) all return this shape."""
     model_config = ConfigDict(json_schema_extra={"example": _SCENARIO_LIST_ITEM_EXAMPLE})
 
+    # RENAME BOUNDARY (Phase 4): columns of the THREAT / SCENARIO / CONTROL tables carry their
+    # DB spelling above; the four session-envelope fields below deliberately keep their wire
+    # spelling, because AcceptedScenariosResponse returns the same four at its top level and
+    # splitting the two would leave one payload disagreeing with itself.
     session_id: str = Field(description="Owning session's unique id (GUID).")
     entity_id: str = Field(description="Tenant/business-unit code the owning session belongs to.")
     user_id: str | None = Field(
         description="The session's owning user (who created it). Null only if the principal had no identity to record."
     )
     session_status: str = Field(description="Owning session's status: active | completed | cancelled.")
-    scenario_number: int = Field(description="1 = original scenario, 2+ = coexisting 'next set' alternates.")
-    accepted: bool = Field(description="True once the user accepted this scenario.")
-    superseded: bool = Field(
+    ScenarioNumber: int = Field(description="1 = original scenario, 2+ = coexisting 'next set' alternates.")
+    Accepted: bool = Field(description="True once the user accepted this scenario.")
+    Superseded: bool = Field(
         description="True if a regeneration replaced this row. Only reachable in lists with "
                     "include_superseded=true, or on a direct fetch by output_id."
     )
-    created_at: datetime | None = Field(description="UTC timestamp the scenario row was created.")
+    CreatedAt: datetime | None = Field(description="UTC timestamp the scenario row was created.")
 
 
 class EmbeddingActionBody(BaseModel):

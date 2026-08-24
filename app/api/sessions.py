@@ -304,6 +304,11 @@ def _scenario_select():
         out.OutputID, out.ScenarioJSON, out.Accepted, out.ValidationJSON, out.GenerationEpoch,
         out.ScenarioNumber, out.ReplacesOutputID, out.ControlsMappedAt, it.ThreatID,
         it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON,
+        # Both library columns, so the scenario body's display wording is identical on
+        # /results and /accepted-scenarios. Before Phase 4 only the accepted read joined
+        # these, so the SAME scenario showed the model's wording on one endpoint and the
+        # curator's on the other.
+        it.LibraryThreatType, it.LibraryThreatName,
     ).select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                 .outerjoin(it, st.ThreatID == it.ThreatID))
 
@@ -471,14 +476,19 @@ def get_results(
             # list indistinguishable from a completed one. Reuses build_board rather than
             # re-deriving, so /results and the board can never disagree.
             progress=build_board(sess, scenario_session)["progress"],
-            threats=[ThreatResult(threat_id=t["ThreatID"],
-                                threat_type=t["ThreatType"], threat_name=t["ThreatName"],
-                                grounding_status=t["GroundingStatus"],
-                                threat_catalogue_id=t["ThreatCatalogueID"],
-                                threat_actors=stored_actors(t["ThreatActorsJSON"]),
-                                grounding_score=t["GroundingScore"],
-                                score=scores.get(t["ThreatID"], {}).get("score"),
-                                scope_rank=scores.get(t["ThreatID"], {}).get("scope_rank"))
+            threats=[ThreatResult(ThreatID=t["ThreatID"],
+                                ThreatCategory=t["ThreatCategory"],
+                                ThreatType=t["ThreatType"], ThreatName=t["ThreatName"],
+                                ThreatTypeID=t["ThreatTypeID"],
+                                ThreatCatalogueID=t["ThreatCatalogueID"],
+                                # Reported ALONGSIDE the proposed spelling, never instead of it.
+                                LibraryThreatType=t["LibraryThreatType"],
+                                LibraryThreatName=t["LibraryThreatName"],
+                                GroundingStatus=t["GroundingStatus"],
+                                ThreatActors=stored_actors(t["ThreatActorsJSON"]),
+                                GroundingScore=t["GroundingScore"],
+                                Score=scores.get(t["ThreatID"], {}).get("score"),
+                                ScopeRank=scores.get(t["ThreatID"], {}).get("scope_rank"))
                     for t in threats],
             scenarios=[_scenario_result(s, controls.get(s["OutputID"]),
                                         _nested(chains.get(s["OutputID"]) or []))
@@ -599,10 +609,10 @@ def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str
     out: dict[str, list[MappedControl]] = {}
     for r in rows:
         out.setdefault(r["OutputID"], []).append(MappedControl(
-            control_library_id=r["ControlLibraryID"], control_code=r["ControlCode"],
-            domain=r["Domain"], control_name=r["ControlName"], rank=r["MapRank"],
-            score=r["Score"],
-            standards=std_names.get(r["ControlLibraryID"], [])))
+            ControlLibraryID=r["ControlLibraryID"], ControlCode=r["ControlCode"],
+            Domain=r["Domain"], ControlName=r["ControlName"], MapRank=r["MapRank"],
+            Score=r["Score"],
+            StandardNames=std_names.get(r["ControlLibraryID"], [])))
     return out
 
 
@@ -626,8 +636,12 @@ def _scenario_with_controls(scenario_json: str | None, controls: list[MappedCont
         return None
     if threat_row is not None:
         scenario["threat_category"] = threat_row.get("ThreatCategory")
-        scenario["threat_type"] = threat_row.get("ThreatType")
-        scenario["threat_name"] = threat_row.get("ThreatName")
+        # DISPLAY PROSE prefers the curator's wording; this is the ONLY coalesce left in the
+        # API. The typed siblings report both spellings separately (ThreatType AND
+        # LibraryThreatType), so preferring one here hides nothing - and doing it in one place
+        # is what stops /results and /accepted-scenarios drifting apart again.
+        scenario["threat_type"] = threat_row.get("LibraryThreatType") or threat_row.get("ThreatType")
+        scenario["threat_name"] = threat_row.get("LibraryThreatName") or threat_row.get("ThreatName")
         scenario["threat_actors"] = stored_actors(threat_row.get("ThreatActorsJSON"))
     scenario["controls"] = [c.model_dump() for c in controls]
     return scenario
@@ -638,14 +652,14 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
     controls_mapped = row["ControlsMappedAt"] is not None
     checked, flagged, categories = _moderation_summary(row["ValidationJSON"])
     validation_status, validation_errors = _validation_summary(row["ValidationJSON"])
-    return ScenarioResult(output_id=row["OutputID"], threat_id=row["ThreatID"],
+    return ScenarioResult(OutputID=row["OutputID"], ThreatID=row["ThreatID"],
                         scenario=_scenario_with_controls(row["ScenarioJSON"], controls or [], row),
-                        accepted=bool(row["Accepted"]),
+                        Accepted=bool(row["Accepted"]),
                         moderation_checked=checked, moderation_flagged=flagged, moderation_categories=categories,
                         validation_status=validation_status, validation_errors=validation_errors,
-                        generation_epoch=row["GenerationEpoch"],
-                        scenario_number=row["ScenarioNumber"],
-                        controls_mapped=controls_mapped,
+                        GenerationEpoch=row["GenerationEpoch"],
+                        ScenarioNumber=row["ScenarioNumber"],
+                        ControlsMapped=controls_mapped,
                         replaced_scenarios=replaced or [])
 
 
@@ -1097,20 +1111,18 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
             session_id=scenario_session["SessionID"],
             completed_at=scenario_session["CompletedAt"],
             scenarios=[AcceptedScenario(
-                output_id=r["OutputID"], supporting_system_id=r["SubsystemID"],
-                threat_type_id=r["ThreatTypeID"], threat_catalogue_id=r["ThreatCatalogueID"],
-                # prefer the curated catalogue name/type; fall back to the freeform one if not linked to the library
-                threat_type=r["LibraryThreatType"] or r["ThreatType"],
-                threat_name=r["LibraryThreatName"] or r["ThreatName"],
-                # threat_row reuses the SAME library-preferred type/name computed above, so
-                # scenario.threat_type and the sibling threat_type field can never disagree.
+                OutputID=r["OutputID"], SubsystemID=r["SubsystemID"],
+                ThreatTypeID=r["ThreatTypeID"], ThreatCatalogueID=r["ThreatCatalogueID"],
+                # BOTH spellings, no coalesce: what the model proposed and what it matched
+                # are different facts, and a GRC reviewer defending this register needs to see
+                # the difference rather than a silently-preferred one of the two.
+                ThreatType=r["ThreatType"], ThreatName=r["ThreatName"],
+                LibraryThreatType=r["LibraryThreatType"],
+                LibraryThreatName=r["LibraryThreatName"],
+                # The row goes in whole; _scenario_with_controls owns the display preference.
                 scenario=_scenario_with_controls(
-                    r["ScenarioJSON"], controls.get(r["OutputID"], []),
-                    {"ThreatCategory": r["ThreatCategory"],
-                    "ThreatType": r["LibraryThreatType"] or r["ThreatType"],
-                    "ThreatName": r["LibraryThreatName"] or r["ThreatName"],
-                    "ThreatActorsJSON": r["ThreatActorsJSON"]}),
-                threat_actors=stored_actors(r["ThreatActorsJSON"]),
+                    r["ScenarioJSON"], controls.get(r["OutputID"], []), r),
+                ThreatActors=stored_actors(r["ThreatActorsJSON"]),
             ) for r in rows],
         )
 
@@ -1132,27 +1144,21 @@ _SCN_SUPERSEDED = Query(
 
 
 def _scenario_list_item(row: dict, controls: list[MappedControl]) -> ScenarioListItem:
-    """One dal.scenario_rows/scenario_row row → response item. Same catalogue-name fallback
-    and controls merge as get_accepted_scenarios above."""
-    # Same library-preferred type/name as the sibling fields below, reused for the nested
-    # threat_row so scenario.threat_type can never disagree with the top-level threat_type.
-    threat_type = row["LibraryThreatType"] or row["ThreatType"]
-    threat_name = row["LibraryThreatName"] or row["ThreatName"]
+    """One dal.scenario_rows/scenario_row row → response item. Same both-spellings rule and
+    controls merge as get_accepted_scenarios above."""
     return ScenarioListItem(
-        output_id=row["OutputID"], supporting_system_id=row["SubsystemID"],
-        threat_type_id=row["ThreatTypeID"], threat_catalogue_id=row["ThreatCatalogueID"],
-        threat_type=threat_type, threat_name=threat_name,
-        scenario=_scenario_with_controls(
-            row["ScenarioJSON"], controls,
-            {"ThreatCategory": row["ThreatCategory"], "ThreatType": threat_type,
-            "ThreatName": threat_name, "ThreatActorsJSON": row["ThreatActorsJSON"]}),
+        OutputID=row["OutputID"], SubsystemID=row["SubsystemID"],
+        ThreatTypeID=row["ThreatTypeID"], ThreatCatalogueID=row["ThreatCatalogueID"],
+        ThreatType=row["ThreatType"], ThreatName=row["ThreatName"],
+        LibraryThreatType=row["LibraryThreatType"], LibraryThreatName=row["LibraryThreatName"],
+        scenario=_scenario_with_controls(row["ScenarioJSON"], controls, row),
         session_id=row["SessionID"], entity_id=row["EntityID"], user_id=row["UserID"],
-        session_status=row["SessionStatus"], scenario_number=row["ScenarioNumber"],
-        accepted=bool(row["Accepted"]), superseded=bool(row["Superseded"]),
-        created_at=row["CreatedAt"],
+        session_status=row["SessionStatus"], ScenarioNumber=row["ScenarioNumber"],
+        Accepted=bool(row["Accepted"]), Superseded=bool(row["Superseded"]),
+        CreatedAt=row["CreatedAt"],
         # _scenario_read_select already carries ThreatActorsJSON — without this kwarg the list
         # routes would permanently return [] while /accepted-scenarios returns real actors.
-        threat_actors=stored_actors(row["ThreatActorsJSON"]),
+        ThreatActors=stored_actors(row["ThreatActorsJSON"]),
     )
 
 

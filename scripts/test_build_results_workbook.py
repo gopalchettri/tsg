@@ -24,12 +24,12 @@ from app.api.schemas import (
 )
 
 CONTROL_A = MappedControl(
-    control_library_id=49, control_code="CII-CID-049", domain="Business Continuity & Disaster Recovery",
-    control_name="Telecommunications Services Availability", rank=1, score=99.9,
-    standards=["DESC ISR v3"])
+    ControlLibraryID=49, ControlCode="CII-CID-049", Domain="Business Continuity & Disaster Recovery",
+    ControlName="Telecommunications Services Availability", MapRank=1, Score=99.9,
+    StandardNames=["DESC ISR v3"])
 CONTROL_B = MappedControl(
-    control_library_id=464, control_code="CII-CID-464", domain="Secure Engineering & Architecture",
-    control_name="Fail Safe", rank=3, score=None, standards=[])
+    ControlLibraryID=464, ControlCode="CII-CID-464", Domain="Secure Engineering & Architecture",
+    ControlName="Fail Safe", MapRank=3, Score=None, StandardNames=[])
 
 APPLICABILITY = [
     SupportingSystemApplicability(supporting_system="OT Telecom Network", applicable=True,
@@ -48,28 +48,28 @@ NARRATIVE = ScenarioNarrative(
 )
 
 CURRENT = ScenarioResult(
-    output_id="out-current", threat_id="threat-1", scenario=NARRATIVE, accepted=False,
+    OutputID="out-current", ThreatID="threat-1", scenario=NARRATIVE, Accepted=False,
     moderation_checked=False, validation_status="ok", validation_errors=[],
-    generation_epoch=1, scenario_number=1, controls_mapped=True,
+    GenerationEpoch=1, ScenarioNumber=1, ControlsMapped=True,
     replaced_scenarios=[
-        ScenarioResult(output_id="out-old", threat_id="threat-1", scenario=NARRATIVE,
-                    accepted=False, moderation_checked=False, validation_status="ok",
-                    validation_errors=[], generation_epoch=1, scenario_number=1,
-                    controls_mapped=True, replaced_scenarios=[]),
+        ScenarioResult(OutputID="out-old", ThreatID="threat-1", scenario=NARRATIVE,
+                    Accepted=False, moderation_checked=False, validation_status="ok",
+                    validation_errors=[], GenerationEpoch=1, ScenarioNumber=1,
+                    ControlsMapped=True, replaced_scenarios=[]),
     ],
 )
 
 FAILED = ScenarioResult(
-    output_id="out-failed", threat_id="threat-2", scenario=None, accepted=False,
+    OutputID="out-failed", ThreatID="threat-2", scenario=None, Accepted=False,
     moderation_checked=False, validation_status=None, validation_errors=["missing scenario_title"],
-    generation_epoch=1, scenario_number=1, controls_mapped=False, replaced_scenarios=[])
+    GenerationEpoch=1, ScenarioNumber=1, ControlsMapped=False, replaced_scenarios=[])
 
 RESULTS = SessionResults(
     session_id="sess-1", entity_id="78", asset_id=99, asset_name="Power Generation System (PGS)",
     user_id="gc", progress=None,
-    threats=[ThreatResult(threat_id="threat-1", threat_type="loss of availability",
-                        threat_name="Loss of availability", grounding_status="unverified",
-                        threat_catalogue_id=None)],
+    threats=[ThreatResult(ThreatID="threat-1", ThreatType="loss of availability",
+                        ThreatName="Loss of availability", GroundingStatus="unverified",
+                        ThreatCatalogueID=None)],
     scenarios=[CURRENT, FAILED],
 )
 
@@ -101,15 +101,16 @@ def main() -> None:
     assert row3[col["is_replaced"]] is True and row3[col["current_output_id"]] == "out-current"
     print("4 OK  replaced scenario flattened in with is_replaced=True, current_output_id set")
 
-    # 5 — threat_actors joined "; "
-    assert row2[col["threat_actors"]] == "External attacker; Nation-state/APT"
-    print("5 OK  threat_actors joined with '; '")
+    # 5 — ThreatActors joined "; "
+    assert row2[col["ThreatActors"]] == "External attacker; Nation-state/APT"
+    print("5 OK  ThreatActors joined with '; '")
 
     # 6 — controls cell: one line per control, domain present, "n/a" for a None score
     controls_cell = row2[col["controls"]]
     assert ("CII-CID-049 — Telecommunications Services Availability "
-            "[Business Continuity & Disaster Recovery] (rank 1, score 99.9)") in controls_cell
-    assert "CII-CID-464 — Fail Safe [Secure Engineering & Architecture] (rank 3, score n/a)" in controls_cell
+            "[Business Continuity & Disaster Recovery] (MapRank 1, Score 99.9)") in controls_cell
+    assert ("CII-CID-464 — Fail Safe [Secure Engineering & Architecture] "
+            "(MapRank 3, Score n/a)") in controls_cell
     assert controls_cell.count("\n") == 1  # two controls, one newline between them
     print("6 OK  controls cell: one line per control, domain included, None score -> 'n/a'")
 
@@ -132,7 +133,7 @@ def main() -> None:
 
     # 9 — a scenario with scenario=None (failed generation) still gets a row, with narrative
     #     fields blank rather than raising
-    assert row4[col["output_id"]] == "out-failed"
+    assert row4[col["OutputID"]] == "out-failed"
     assert row4[col["scenario_title"]] is None
     assert row4[col["controls"]] == ""
     assert row4[col["validation_errors"]] == "missing scenario_title"
