@@ -149,6 +149,25 @@ def _init_worker(sender=None, **_):
         # validate_local_models warms the models, so the ceiling holds from the first call.
         gevent.get_hub().threadpool.size = get_settings().local_model_threadpool_size
         validate_local_models(warm=True)   # fail-fast + warm so the 1st request is fast
+        # MUST stay inside this same try: verify_litellm_models' own comment below already
+        # claimed "fail-fast: same discipline" as the checks above it — it just wasn't actually
+        # wrapped by the guard that discipline depends on. A raise anywhere between the `try:`
+        # above and the `except` below now shares one enforcement point instead of two, so this
+        # bug class (a fail-fast claim outside the only mechanism that makes it true) cannot
+        # reopen by a future check being appended after the except block by mistake.
+        verify_max_attempts = get_settings().llm_verify_max_attempts
+        verify_backoff = get_settings().llm_verify_retry_backoff_seconds
+        # verify_litellm_models goes through the same _llm_slot limiter as a real task, but this
+        # signal handler is not a @celery_app.task, so autoretry_for never applies — several
+        # replicas booting at once would raise LLMSlotUnavailable straight out of worker startup.
+        for attempt in range(verify_max_attempts):
+            try:
+                verify_litellm_models()    # fail-fast, for whichever models route through the proxy
+                break
+            except LLMSlotUnavailable:
+                if attempt == verify_max_attempts - 1:
+                    raise
+                time.sleep(verify_backoff * (attempt + 1))
     except BaseException as exc:  # noqa: BLE001 — deliberate: the point is that NOTHING escapes
         # this handler alive. Narrowing it would let some failure mode through to a worker that
         # then reports ready, which is the exact defect being fixed.
@@ -162,19 +181,6 @@ def _init_worker(sender=None, **_):
             except Exception:  # noqa: BLE001 — never mask the real failure with a flush error
                 pass
         os._exit(1)
-    verify_max_attempts = get_settings().llm_verify_max_attempts
-    verify_backoff = get_settings().llm_verify_retry_backoff_seconds
-    # verify_litellm_models goes through the same _llm_slot limiter as a real task, but this
-    # signal handler is not a @celery_app.task, so autoretry_for never applies — several replicas
-    # booting at once would raise LLMSlotUnavailable straight out of worker startup.
-    for attempt in range(verify_max_attempts):
-        try:
-            verify_litellm_models()    # fail-fast: same discipline, for whichever models route through the proxy
-            break
-        except LLMSlotUnavailable:
-            if attempt == verify_max_attempts - 1:
-                raise
-            time.sleep(verify_backoff * (attempt + 1))
     log_litellm_key_info()             # observability only, never raises
     # Warm the per-model-pair grounding thresholds OUTSIDE any stage lease: the first resolution
     # for a new embedding+reranker pair auto-calibrates (a bounded paraphrase+scoring pass), which

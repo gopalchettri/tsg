@@ -63,14 +63,28 @@ def test_gate_narrows_to_the_systems_it_actually_hits():
     assert attribute_to_subsystems([OT, IT], [7], {7: [_GATE]}) == {7: [41]}
 
 
-def test_unresolved_field_fails_closed_here_and_open_in_apply_rules():
-    # _apply_rules skips a rule whose field is absent EVERYWHERE (a no-effect rule), so the
-    # asset keeps the threat. Attribution must not inherit that: "we don't know" is not
-    # "yes". The threat still exists at the asset level, so nothing is lost by not claiming.
-    assert gate_matching_subsystems(7, [BLANK], {7: [_GATE]}) == []
+def test_unresolved_field_everywhere_is_a_no_op_in_both_functions():
+    # Fixed 2026-08-24: this used to assert gate_matching_subsystems([BLANK]) == [] here, on
+    # the reasoning that "we don't know" must not become "yes". That reasoning is correct
+    # PER SUBSYSTEM when a rule is resolved elsewhere -- but when a rule is unresolved on
+    # EVERY subsystem, _apply_rules already treats it as a no-op at the asset level (the type
+    # is admitted, not rejected). Attribution disagreeing -- failing closed on every subsystem
+    # for the SAME rule the asset-level check ignored -- meant a threat could be recorded once
+    # at the asset level and attributed to ZERO supporting systems: a real exposure silently
+    # missing from every (subsystem, category) coverage cell it should have filled. Both
+    # functions must now agree: a wholly-unresolved rule contributes nothing to either verdict.
+    assert gate_matching_subsystems(7, [BLANK], {7: [_GATE]}) == [43]
     _delta, selected, _fails, _factors = _apply_rules(
         {"threat_type_id": 7}, [BLANK], {7: [_GATE]}, 0.0)
     assert selected is True
+
+
+def test_unresolved_on_this_system_but_resolved_elsewhere_still_fails_closed():
+    # The case the fix above must NOT change: a rule with real evidence on ANOTHER subsystem
+    # still must not claim a system it has no evidence for. Two systems, one OT (matches the
+    # gate), one with asset_type unset -- the unset one must stay excluded.
+    unresolved = {"id": 44, "name": "Unclassified Link 2", "asset_type": None}
+    assert gate_matching_subsystems(7, [OT, unresolved], {7: [_GATE]}) == [41]
 
 
 def test_asset_verdict_and_per_system_union_cannot_disagree():

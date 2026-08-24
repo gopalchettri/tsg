@@ -111,7 +111,11 @@ def _gate_hits_subsystem(rule: dict, subsystem: dict) -> bool:
     unresolved field, the OPPOSITE of _apply_rules: there an absent field must not gate a
     threat out of the asset entirely (it is a no-effect rule), but here the only question is
     whether to ATTACH this system's label to a threat that already exists at the asset level.
-    "No evidence this system matches" must not become "claims it does"."""
+    "No evidence this system matches" must not become "claims it does".
+
+    That fail-closed direction is correct PER SYSTEM, but only once _resolvable_anywhere below
+    has confirmed the rule has evidence to fail closed WITH — see gate_matching_subsystems for
+    the case where it does not."""
     mapping = _RULE_KEY_FIELDS.get(rule["RuleKey"])
     if mapping is None:  # unknown key — logged by _apply_rules on the same pass, not twice here
         return False
@@ -121,6 +125,23 @@ def _gate_hits_subsystem(rule: dict, subsystem: dict) -> bool:
         return False
     rule_value = rule.get("RuleValue")
     return _matches(value, rule_value if rule_value is not None else default_expected)
+
+
+def _resolvable_anywhere(rule: dict, subsystems: list[dict]) -> bool:
+    """Does at least one subsystem have this rule's field resolved at all?
+
+    The other half of _gate_hits_subsystem's fail-closed choice: failing closed per-subsystem
+    is only sound evidence when the field is resolved SOMEWHERE. If it is unresolved on EVERY
+    subsystem, that is not "the gate rejects every system" — it is "this rule has no evidence
+    to evaluate," which is exactly the case _apply_rules already treats as a no-op at the asset
+    level (`present = [...]; if not present: continue`, this file's _apply_rules). Reusing a
+    different verdict here — fail-closed instead of no-op — is precisely what broke the
+    invariant gate_matching_subsystems documents."""
+    mapping = _RULE_KEY_FIELDS.get(rule["RuleKey"])
+    if mapping is None:
+        return False
+    fld, _default = mapping
+    return any(s.get(fld) is not None for s in subsystems)
 
 
 def gate_matching_subsystems(threat_type_id: Any, subsystems: list[dict] | None,
@@ -135,17 +156,27 @@ def gate_matching_subsystems(threat_type_id: Any, subsystems: list[dict] | None,
 
     Gates AND across rules (one failing gate rejects) and OR across systems inside
     _apply_rules; per-system that reduces to `all(gates)`, so the asset-level verdict and the
-    union of the per-system verdicts can never disagree."""
+    union of the per-system verdicts can never disagree — PROVIDED every rule that could
+    exclude a system actually has evidence to do so. A rule unresolved on every subsystem is
+    excluded from that `all()` entirely (treated as vacuously satisfied), the same no-op verdict
+    _apply_rules already gives it at the asset level. Without this, a type admitted at the asset
+    level via a wholly-unresolved gate (e.g. a curator rule keyed on `criticality` while the
+    asset's criticality was never set) would fail closed on EVERY subsystem here — recorded
+    once at the asset level, attributed to zero supporting systems, and silently missing from
+    every (subsystem, category) coverage cell it should have filled. That is the exact silent
+    failure the coverage matrix exists to make impossible; see coverage.py's module docstring."""
+    subs = subsystems or []
     gates = [r for r in rules_by_type.get(threat_type_id, [])
             if r["RuleType"] == ThreatRuleType.tech_gate]
     if not gates:
         return None
+    active_gates = [r for r in gates if _resolvable_anywhere(r, subs)]
     out: list[int] = []
-    for s in subsystems or []:
+    for s in subs:
         sid = s.get("id")
         if sid is None:
             continue
-        if all(_gate_hits_subsystem(rule, s) for rule in gates):
+        if all(_gate_hits_subsystem(rule, s) for rule in active_gates):
             out.append(int(sid))
     return out
 

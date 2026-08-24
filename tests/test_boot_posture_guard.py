@@ -95,3 +95,31 @@ def test_worker_boot_guard_kills_the_process_rather_than_logging_and_continuing(
     with pytest.raises(_Exited) as caught:
         celery_app._init_worker(sender=None)
     assert caught.value.args[0] == 1, "a failed boot guard must exit non-zero"
+
+
+def test_unverified_llm_model_also_kills_the_process(monkeypatch):
+    """THE regression this test exists to pin. verify_litellm_models' own comment claimed
+    "fail-fast: same discipline" as the checks above it, but its retry loop was left OUTSIDE
+    the try/except BaseException block -- so a misconfigured/unreachable litellm proxy raised
+    straight into Celery's signal dispatch, which swallows it, and the worker reported ready
+    anyway with an unverified model. Now moved inside the same guard; this proves it stays
+    there by actually exercising the failure through _init_worker end to end, not just reading
+    the source."""
+    from app.pipeline import celery_app
+
+    class _Exited(Exception):
+        pass
+
+    def _fake_exit(code):
+        raise _Exited(code)
+
+    monkeypatch.setattr(celery_app.os, "_exit", _fake_exit)
+    monkeypatch.setattr(cfg, "assert_security_posture", lambda *a, **k: None)
+    monkeypatch.setattr("app.db.invariants.verify_startup", lambda *a, **k: None)
+    monkeypatch.setattr("app.pipeline.local_models.validate_local_models", lambda *a, **k: None)
+    monkeypatch.setattr("app.pipeline.llm.verify_litellm_models",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("proxy unreachable")))
+
+    with pytest.raises(_Exited) as caught:
+        celery_app._init_worker(sender=None)
+    assert caught.value.args[0] == 1, "an unverified model must exit non-zero, not report ready"
