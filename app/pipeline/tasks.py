@@ -692,6 +692,15 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         candidates, validator_audit = _validate_candidates(
             sess, llm, scenario_session, subsystems, asset_context, candidates,
             ss, epoch, task_id)
+    # NOT_RELEVANT is documented as a HARD DROP (GAP-B) — but the drop only ever removed the
+    # candidate from Stage 1a's own list. Stage 1b's generator has no knowledge of this
+    # round's verdicts, so it can propose an equivalent threat that regrounds (via
+    # grounding.find_threat_in_library, below) back to the SAME catalogue row the validator
+    # just rejected — silently reversing a verdict the reviewer never sees questioned twice.
+    # Seeded here, checked at the regrounding site, so the hard drop actually holds for the
+    # whole round, not just Stage 1a's slice of it.
+    rejected_catalogue_ids = {d["catalogue_id"] for d in validator_audit.get("dropped", [])
+                            if d.get("catalogue_id") is not None}
 
     if supersede:
         # Every unit the fan-out below writes to, not just the asset: a stale subsystem row
@@ -703,6 +712,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     threats: list[dict] = []
     rows: list[dict] = []
     duplicates = 0
+    validator_reversals = 0
     dup_rows: list[dict] = []  # Identified_Duplicate_Threat rows — audit-only, see _duplicate_row
     retrieved_summaries: list[dict] = []
     attribution: dict[str, list[int]] = {}  # ThreatID -> supporting systems it reaches
@@ -776,6 +786,14 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         row, summary = _build_threat_records(tid, sid, tenant, ss, ptype, pcat, pname, gr,
                                         scenario_session["EntityID"], scenario_session.get("UserID"),
                                         generic_name=gp.get("name") if isinstance(gp, dict) else None)
+        if gr.catalogue_id is not None and gr.catalogue_id in rejected_catalogue_ids:
+            # The hard drop, enforced a second time: this proposal regrounded to a catalogue
+            # row the validator already rejected for THIS asset this round. Recorded, not
+            # silently skipped — an operator reviewing why a threat is missing must be able
+            # to find it here rather than conclude the pipeline simply never considered it.
+            validator_reversals += 1
+            dup_rows.append(_duplicate_row(row, DuplicateReason.validator_rejected))
+            continue
         identity = dal.identity_hash(sid, ss, summary)
         if identity in existing_identities:
             duplicates += 1
@@ -881,6 +899,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                                         "generated": len(threats) - len(retrieved_summaries),
                                         "validator": validator_audit,
                                         "identity_duplicates": duplicates,
+                                        "validator_reversals_blocked": validator_reversals,
                                         "semantic_near_duplicates": near_dupes,
                                         "coverage": {**cov, "gaps": cov["gaps"][:50]}}))
     sess.commit()

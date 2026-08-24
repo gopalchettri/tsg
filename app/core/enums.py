@@ -76,6 +76,10 @@ class DuplicateReason(StrEnum):
     semantic_similarity = "semantic_same_threat"           # THE reason for every semantic drop now:
                                                         # cosine >= max(semantic_cross_category_threshold,
                                                         # session threshold), whatever the categories
+    # A Stage-1b GENERATED proposal regrounded to a library row this round's VALIDATOR already
+    # rejected as NOT_RELEVANT for this asset. The validator's drop is a hard drop (GAP-B) — a
+    # proposal reaching the same catalogue row by a different path must not silently reverse it.
+    validator_rejected = "validator_rejected"
                                                         # (tasks.py::_semantic_duplicates)
 
 
