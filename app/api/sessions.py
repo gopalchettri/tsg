@@ -118,11 +118,51 @@ def get_overall_status(threats: str, scenarios: str, session_status: str) -> Sub
     return SubsystemProgress.in_progress
 
 
+#: Gap cells returned on the board. The full list lives in the grounding_summary audit row;
+#: this caps what a status poll carries, and `unexplained` remains the true count.
+_MAX_BOARD_GAPS = 50
+
+
+def _coverage_verdict(sess: Session, session_id: str) -> dict | None:
+    """The board's per-supporting-system dimension: which (unit x STRIDE) cells this
+    assessment left unanswered.
+
+    Read from the newest grounding_summary audit row rather than recomputed — identification
+    already did the work, and re-deriving it on a status poll would let the poll and the audit
+    trail disagree about the same session. Same durable-mirror pattern as last_next_set.
+
+    Absent/short rows return None rather than a zero verdict: "nobody has measured this yet" and
+    "measured, nothing missing" must never look alike on a safety signal."""
+    detail = dal.latest_coverage_verdict(sess, session_id)
+    cov = (detail or {}).get("coverage")
+    if not isinstance(cov, dict) or "cells" not in cov:
+        return None
+    # Audit gaps are [subsystem_id, category] pairs (JSON has no tuples); named on the wire.
+    gaps = [{"subsystem_id": int(g[0]), "category": str(g[1])}
+            for g in (cov.get("gaps") or [])
+            if isinstance(g, (list, tuple)) and len(g) == 2][:_MAX_BOARD_GAPS]
+    unexplained = int(cov.get("unexplained") or 0)
+    return {
+        "cells": int(cov.get("cells") or 0),
+        "covered": int(cov.get("covered") or 0),
+        "justified_na": int(cov.get("justified_na") or 0),
+        "unexplained": unexplained,
+        "complete": unexplained == 0,
+        "units": [int(u) for u in (detail or {}).get("units") or []],
+        "gaps": gaps,
+    }
+
+
 def build_board(sess: Session, scenario_session: dict) -> dict:
     """The GET /sessions/{id} payload and the SSE reconnect-reconcile source.
 
-    One flat progress object, not a list: ASSET_UNIT_ID is the only subsystem id the
-    pipeline ever writes."""
+    STAGE progress stays one flat object, not a list, and that is a decision rather than a
+    leftover: ASSET_UNIT_ID is the only subsystem the pipeline schedules work for, because one
+    scenario covers a threat across every supporting system it reaches. Per-subsystem stage rows
+    would transition in lockstep and carry no information while breaking every client.
+
+    The per-supporting-system dimension that DOES carry information is coverage — which
+    (system x STRIDE) cells were answered — and that rides in `progress.coverage`."""
     stages: dict[str, str] = {}
     # BREAKING REST API CHANGE (plan item 7 — shipped last, deliberately separate from every
     # other change in this file): error_message used to be a single `str | None`, last-row-wins
@@ -166,6 +206,11 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
             # regeneration_completed audit row (app/pipeline/cascade.py::_stage_regen_audit).
             "last_regen": dal.latest_regen_outcome(sess, scenario_session["SessionID"],
                                                     ASSET_UNIT_ID),
+            # ADDITIVE: a new key, unlike the error_message reshape above — an old client that
+            # ignores it behaves exactly as before. It must not be ignored by a client that
+            # SIGNS OFF assessments, though: coverage.complete=false means threats were not
+            # identified for every (supporting system x STRIDE) pair.
+            "coverage": _coverage_verdict(sess, scenario_session["SessionID"]),
         },
     }
 

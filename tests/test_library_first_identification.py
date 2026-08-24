@@ -12,6 +12,7 @@ Asserts the whole redesigned flow on real SQLite tables with a deterministic fak
   - a genuinely novel proposal survives as unverified (the promotion path input)
   - the grounding_summary audit row carries retrieved/generated counts, the validator
     outcome, and the coverage report
+  - the coverage gap reaches the BOARD (progress.coverage), not just an audit row
   - Phase 2c: a threat type the SECTOR filter excludes still enters the pool when an actor
     operating in this sector uses it (ThreatType_ThreatActor_Map read backwards), and the
     audit records WHICH actor put it there
@@ -275,6 +276,16 @@ def test_library_first_identification_end_to_end(monkeypatch):
         # the whole point of the matrix.
         assert cov["unexplained"] == 1
         assert cov["gaps"] == [[42, "Tampering"]]
+
+        # ...and the gap REACHES THE CLIENT. Recording it in an audit blob nobody reads would
+        # leave the reviewer with a session that looks complete, which is the exact failure the
+        # matrix exists to prevent. This is the board's per-supporting-system dimension.
+        from app.api import sessions as sessions_mod
+        verdict = sessions_mod._coverage_verdict(s, SID)
+        assert verdict["complete"] is False
+        assert verdict["unexplained"] == 1
+        assert verdict["units"] == [0, 41, 42]
+        assert verdict["gaps"] == [{"subsystem_id": 42, "category": "Tampering"}]
 
     # --- return value feeds write_scenarios: retrieved first, then novel ---------------
     by_name = {t["threat_name"]: t for t in threats}

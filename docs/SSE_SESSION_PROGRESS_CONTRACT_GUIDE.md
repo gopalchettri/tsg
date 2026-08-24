@@ -71,12 +71,17 @@ spec instead of hand-copying the shapes below.
 here — stage state, locks and scenario generation are all asset-scoped units of work. Do not
 special-case the value `0`.
 
-> **Phase 2b note — this stream is unchanged.** Threat *records* are no longer asset-only:
+> **Phase 2b note — no event shape changed.** Threat *records* are no longer asset-only:
 > `Identified_Threat` now carries one row per (threat, supporting system it reaches), so the
 > coverage grid is 2-D. Those rows are records, not units of work: they are never scored,
-> scenario-generated or promoted, and they produce no stage rows, no locks and no events. The
-> progress object stays flat and this contract is byte-identical. A threat's reach across
-> supporting systems is reported per scenario in `scenario.supporting_system_applicability`.
+> scenario-generated or promoted, and they produce no stage rows, no locks and no events.
+>
+> STAGE PROGRESS STAYS FLAT, deliberately. One scenario covers a threat across every system it
+> reaches, so there is no per-subsystem scenario stage to report; per-subsystem stage rows
+> would transition in lockstep, carry no information, and break every client to say nothing.
+> The per-supporting-system dimension that DOES vary is COVERAGE, and it rides in
+> `progress.coverage` (see §9). A threat's reach across supporting systems is also reported
+> per scenario in `scenario.supporting_system_applicability`.
 
 ---
 
@@ -459,3 +464,53 @@ now, and the only place the preference still applies is the **display prose** in
 A side effect worth noting: `/results` and `/accepted-scenarios` previously disagreed about
 `scenario.threat_type` for the same scenario (only the accepted read joined the library
 columns). They now agree.
+
+---
+
+## 9. `progress.coverage` — ADDITIVE, and the one field a sign-off must not ignore
+
+New key inside `progress`, on both `GET /v1/sessions/{session_id}` and every `reconcile` event.
+Unlike the `error_message` reshape in §6 this breaks nothing: a client that ignores it behaves
+exactly as before. A client that lets a human SIGN OFF an assessment should not ignore it.
+
+```json
+"coverage": {
+  "cells": 18,
+  "covered": 17,
+  "justified_na": 0,
+  "unexplained": 1,
+  "complete": false,
+  "units": [0, 41, 42],
+  "gaps": [{"subsystem_id": 42, "category": "Tampering"}]
+}
+```
+
+`null` until threat identification has run — deliberately distinct from a zero verdict, because
+"nobody has measured this" and "measured, nothing missing" must never look alike on a safety
+signal.
+
+**What it means.** Threat modelling needs a set-level property that per-item relevance ranking
+is structurally blind to: an assessment that misses the one threat that matters looks IDENTICAL
+to a complete one — no error, no exception, the session reports success. So the threat space is
+treated as a MATRIX to fill rather than a list to search. `units` are the asset (`0`) plus every
+supporting system threats were recorded against; each unit is crossed with the active STRIDE
+categories; every resulting cell must hold a threat or a recorded justification. `gaps` names
+the cells that hold neither (capped for payload size — `unexplained` is the true count).
+
+**Gate sign-off on `complete`, NOT on `overall`.** They answer different questions and are
+deliberately not merged:
+
+| field | question | `false` / not-clean means |
+|---|---|---|
+| `overall` | did the PIPELINE finish? | something failed or is still running |
+| `coverage.complete` | is the ANSWER whole? | the run succeeded, but not every (system x STRIDE) pair got a threat |
+
+Folding a coverage gap into `overall` would make it read as a crash and send a reviewer hunting
+an infrastructure fault that does not exist. A session can legitimately be `overall: "complete"`
+AND `coverage.complete: false` — that is a usable assessment with a named, reviewable hole in it,
+and the reviewer is entitled to see it as exactly that.
+
+**Durable mirror:** this IS the durable mirror. It is projected from the newest
+`grounding_summary` audit row rather than recomputed, so the poll and the audit trail cannot
+disagree about the same session. No dedicated SSE event announces it; re-read the board (or
+reconnect, which sends `reconcile`) after `stage_completed` for THREATS.

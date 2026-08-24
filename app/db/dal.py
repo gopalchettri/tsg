@@ -1758,6 +1758,33 @@ def latest_next_set_outcome(sess: Session, session_id: str, subsystem_id: int) -
     return parsed if isinstance(parsed, dict) else None
 
 
+def latest_coverage_verdict(sess: Session, session_id: str) -> dict | None:
+    """The newest `grounding_summary` DetailJSON, backing SessionProgress.coverage.
+
+    Same durable-mirror pattern as latest_next_set_outcome above, with one difference: NOT
+    scoped to a subsystem. The coverage verdict is computed once per identification round over
+    the WHOLE grid (asset + every supporting system it recorded threats against), so scoping it
+    to subsystem 0 would be scoping the answer to one row of its own matrix.
+
+    Returns the raw DetailJSON dict; the caller projects the coverage half of it. None when
+    identification has not run yet, which is not an error — it is "no answer yet"."""
+    row = sess.execute(
+        select(m.Scenario_Audit.DetailJSON)
+        .where(m.Scenario_Audit.SessionID == session_id,
+            m.Scenario_Audit.EventType == AuditEventType.grounding_summary)
+        .order_by(m.Scenario_Audit.CreatedAt.desc(), m.Scenario_Audit.AuditID.desc())
+        .limit(1)
+    ).scalar()
+    if not row:
+        return None
+    try:
+        parsed = json.loads(row)
+    except (TypeError, ValueError):  # a truncated/hand-edited row must not 500 a status poll
+        log.warning("audit.grounding_summary_unparseable", session_id=session_id)
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def latest_regen_outcome(sess: Session, session_id: str, subsystem_id: int) -> dict | None:
     """DetailJSON of the newest `regeneration_completed` audit row, backing
     SessionProgress.last_regen — the durable mirror of the SSE `regen_result` event, same

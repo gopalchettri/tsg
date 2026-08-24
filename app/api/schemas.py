@@ -328,6 +328,47 @@ class RegenSummary(BaseModel):
         default=None, description="Free-text note the client supplied with the request, redacted.")
 
 
+class CoverageCell(BaseModel):
+    """One unanswered (supporting system x STRIDE category) question."""
+    subsystem_id: int = Field(description="0 = the asset itself, >= 1 = a specific supporting system.")
+    category: str = Field(description="STRIDE category with no threat recorded against that unit.")
+
+
+class CoverageVerdict(BaseModel):
+    """Did this assessment actually ANSWER every question it was supposed to ask?
+
+    Threat modelling needs a set-level property that per-item relevance ranking is structurally
+    blind to: an assessment that misses the one threat that matters looks IDENTICAL to a
+    complete one — no error, no exception, the session reports success. So the threat space is
+    treated as a matrix to fill, not a list to search: every (unit x STRIDE category) cell must
+    hold a threat or a recorded justification, and an empty cell is reported here rather than
+    passing silently.
+
+    Units are the asset (0) plus every supporting system a threat was recorded against
+    (pipeline/coverage.py). Null until threat identification has run.
+
+    DELIBERATELY SEPARATE FROM `overall`. That field answers "did the pipeline finish"; this one
+    answers "is the answer whole". Folding an uncovered cell into `overall` would make a
+    coverage gap read as a crash and send a reviewer hunting an infrastructure fault that does
+    not exist. Gate sign-off on `complete`, not on `overall`."""
+    cells: int = Field(description="Questions this assessment had to answer: units x active STRIDE categories.")
+    covered: int = Field(description="Cells holding at least one identified threat.")
+    justified_na: int = Field(description="Cells closed by a recorded, reviewable not-applicable justification.")
+    unexplained: int = Field(description="Cells holding NEITHER. Must be 0 before this assessment is complete.")
+    complete: bool = Field(
+        description="`unexplained == 0`. FALSE means threats were not identified for every "
+                    "(supporting system x STRIDE) pair and the gaps below say which — the "
+                    "assessment is usable but NOT whole, and should not be signed off as if it "
+                    "were. This is the one flag a reviewer must not ignore."
+    )
+    units: list[int] = Field(default_factory=list, description="The grid's rows: 0 (the asset) plus each supporting system id.")
+    gaps: list[CoverageCell] = Field(
+        default_factory=list,
+        description="The unexplained cells by name, capped for payload size — `unexplained` is "
+                    "the true count and may exceed this list's length."
+    )
+
+
 class SessionProgress(BaseModel):
     """The session's asset-level progress: per-stage statuses plus a derived overall status. One
     flat object, not a list — the pipeline tracks the asset as a single unit of work (see
@@ -342,6 +383,11 @@ class SessionProgress(BaseModel):
                     "variants": 0, "reason": None, "epoch": 4,
                 },
                 "last_regen": None,
+                "coverage": {
+                    "cells": 18, "covered": 17, "justified_na": 0, "unexplained": 1,
+                    "complete": False, "units": [0, 41, 42],
+                    "gaps": [{"subsystem_id": 42, "category": "Tampering"}],
+                },
             }
         }
     )
@@ -382,6 +428,16 @@ class SessionProgress(BaseModel):
             "Outcome of the most recent scenario-regenerate request, or null if none has run. "
             "Same epoch-comparison pattern as `last_next_set`: compare `last_regen.epoch` "
             "against the `epoch` RegenerateResponse returned for your request."
+        ),
+    )
+    coverage: CoverageVerdict | None = Field(
+        default=None,
+        description=(
+            "Whether every (supporting system x STRIDE category) question was answered. This is "
+            "the per-supporting-system dimension of the board: stage status stays asset-level "
+            "because generation IS asset-level (one scenario covers a threat across every "
+            "system it reaches), but COVERAGE genuinely varies per system and is what a "
+            "reviewer needs per system. Null until threat identification has run."
         ),
     )
 
