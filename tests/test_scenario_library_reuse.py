@@ -190,3 +190,66 @@ def test_prompt_version_change_invalidates_without_a_purge(monkeypatch, tmp_path
     with Session() as s:                       # the old row is kept, just not served
         rows = s.execute(select(m.Scenario_Library)).scalars().all()
     assert {r.PromptVersion for r in rows} == {original, original + "-next"}
+
+
+def test_reused_scenario_is_checked_against_a_prior_rounds_scenario_too(monkeypatch, tmp_path):
+    """THE GAP the redesign left open. A GENERATED scenario is compared against this
+    session's already-persisted, PRIOR-round scenarios via cov.others inside
+    _generate_one_scenario. A REUSED (library-served) scenario skips that function entirely
+    — it comes straight from _library_hits' own validate_scenario call, which never sees
+    cross_pairs at all — so a near-duplicate served from the library for a SECOND threat
+    used to slip past the exact check a freshly generated scenario would have failed."""
+    from app.pipeline import scenario_profile
+
+    Session = sessionmaker(bind=_engine(tmp_path), future=True)
+    sid = str(uuid.uuid4())
+    sector_ids = [4, 2]
+    with Session() as s:
+        scenario_session = _seed(s, sid, ASSET_A, SYSTEMS_A)
+
+        prior_text = ("An attacker with OT network access alters pump setpoints on the "
+                    "Qusais SCADA HMI, degrading control of Al Qusais Pumping Station.")
+        # A PRIOR round's already-persisted, COMPLETE scenario for a DIFFERENT threat.
+        s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+            OutputID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="e", UserID="u",
+            SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status="complete",
+            ScenarioJSON=json.dumps({"scenario_statement": prior_text}),
+            Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=1,
+            IdentityHash="prior-round-threat-hash", CreatedAt=NOW))
+
+        # A library row for THIS threat's catalogue id -- IDENTICAL text (ratio 1.0, safely
+        # above sibling_similarity_ratio), source names matching this asset's OWN names so
+        # the swap is a no-op and nothing else about the reuse path is in question here.
+        profile = scenario_profile.profile_key(sector_ids, ASSET_A, SYSTEMS_A)
+        s.execute(m.Scenario_Library.__table__.insert().values(
+            ScenarioLibraryID=str(uuid.uuid4()), ProfileKey=profile, ThreatCatalogueID=CATALOGUE_ID,
+            ScenarioNumber=1, ScenarioJSON=json.dumps({
+                "scenario_title": "Qusais SCADA HMI — unauthorised setpoint push",
+                "scenario_statement": prior_text,
+                "risk_statement": "Al Qusais Pumping Station provides Potable water supply.",
+                "supporting_system_applicability": [
+                    {"supporting_system": "Qusais SCADA HMI", "applicable": True,
+                    "justification": "Direct target."}]}),
+            SourceNamesJSON=json.dumps(["Al Qusais Pumping Station", "Qusais SCADA HMI"]),
+            PromptVersion=prompts.PROMPT_VERSION, ModelID=get_settings().inference_model))
+        s.commit()
+
+    monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
+    monkeypatch.setattr(tasks, "_fetch_intel", lambda *a, **k: None)
+    monkeypatch.setattr(tasks, "_finalize_scenario_batch", lambda *a, **k: None)
+    threat = {**THREAT, "threat_id": str(uuid.uuid4())}
+    llm = _CountingLLM("Al Qusais Pumping Station", "Qusais SCADA HMI")
+    with Session() as s:
+        tasks.write_scenarios(s, scenario_session, SYSTEMS_A, ASSET_A, [threat], llm,
+                            str(uuid.uuid4()))
+
+    assert llm.calls == 0                       # fully served from the library, as expected
+
+    with Session() as s:
+        row = s.execute(m.Threat_Scenario_Output.__table__.select().where(
+            m.Threat_Scenario_Output.SessionID == sid,
+            m.Threat_Scenario_Output.ScenarioSource == "library")).mappings().one()
+    report = json.loads(row["ValidationJSON"])
+    # THE assertion: the reused scenario was compared against the PRIOR round's text too.
+    assert any("similar to an active scenario of ANOTHER threat" in e for e in report["errors"])
+    assert report["validation_status"] == "warning"

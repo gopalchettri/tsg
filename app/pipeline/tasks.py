@@ -1754,9 +1754,22 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     for sc_id, (scenario, report) in reused.items():
         by_scoped[sc_id] = ((scenario, report, None), None)
 
+    ratio = tuning.from_session(scenario_session).sibling_similarity_ratio
+    # A GENERATED scenario is compared against cross_pairs (this session's already-persisted,
+    # PRIOR-round texts) inside _generate_one_scenario via cov.others. A REUSED scenario skips
+    # that function entirely — it comes straight from _library_hits' own validate_scenario
+    # call, which has no cross_pairs argument at all — so without this it would only ever be
+    # compared against THIS round's siblings (the same-batch sweep below), never against a
+    # prior round's scenario for a different threat. Checked once here, right where reused
+    # items enter the batch, so a stored scenario that now reads as a near-duplicate of an
+    # EXISTING scenario is flagged exactly like a freshly generated one would be.
+    for sc_id, (scenario, report) in reused.items():
+        others = [text for h, text in cross_pairs if h != identities[sc_id]]
+        if others:
+            _flag_cross_threat_similarity(report, scenario, others, ratio)
+
     # Same-batch cross-threat similarity, over the finished set. Deterministic string work,
     # no model call, so it costs nothing to compare everything against everything.
-    ratio = tuning.from_session(scenario_session).sibling_similarity_ratio
     fresh = [(identities[sc_id], str((res[0] or {}).get("scenario_statement") or ""))
             for sc_id, (res, _exc) in by_scoped.items() if res is not None]
     for sc_id, (res, _exc) in by_scoped.items():
