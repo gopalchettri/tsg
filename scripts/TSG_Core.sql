@@ -562,8 +562,13 @@ CREATE TABLE Threat_Candidate_Review (
 -- NULL, and both columns must become nullable (type is NULL on legacy actor rows queued before
 -- the type text was stamped). CreatedBy = the ORIGINAL proposer (the user whose accept raised
 -- the candidate); NULL reads honestly as "predates the column".
+-- nvarchar(100), NOT 20: this ADD sits BELOW the blanket widen block, so on a database that
+-- did not yet have the column the widen is a no-op (COL_LENGTH IS NULL) and this ADD is what
+-- the column ends up as - permanently. At 20 an upgraded site would sit two widths below a
+-- fresh install's CREATE TABLE, which is exactly the silent drift the widen block exists to
+-- stop. Matches the CREATE TABLE above.
 IF COL_LENGTH('dbo.Threat_Candidate_Review', 'CandidateKind') IS NULL
-    ALTER TABLE dbo.Threat_Candidate_Review ADD CandidateKind nvarchar(20) NULL;
+    ALTER TABLE dbo.Threat_Candidate_Review ADD CandidateKind nvarchar(100) NULL;
 IF COL_LENGTH('dbo.Threat_Candidate_Review', 'CreatedBy') IS NULL
     ALTER TABLE dbo.Threat_Candidate_Review ADD CreatedBy nvarchar(200) NULL;
 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Threat_Candidate_Review')

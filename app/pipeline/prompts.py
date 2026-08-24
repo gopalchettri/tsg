@@ -22,9 +22,15 @@ from app.core.security import redact, scrub_context
 log = get_logger(__name__)
 
 
-# Stays "1.0" for the whole development phase — prompts are still being reworked, so bumping per
-# edit would stamp meaningless versions onto Threat_Prompt_Audit. Bump at the first release.
-PROMPT_VERSION = "1.0"
+# NO LONGER JUST AN AUDIT STAMP. This is the scenario library's invalidation key
+# (dal.library_scenarios): a stored scenario is only served back to a session running the SAME
+# prompt version, so leaving this stale would serve text written by an older prompt as if the
+# current one had produced it. Bump it whenever a prompt's CONTRACT or content changes; the cost
+# of bumping unnecessarily is a regeneration, the cost of not bumping is a silently stale answer.
+#
+# 2.0 — the library-first redesign: threats_prompt stopped asking for actors, scenario_prompt
+# stopped asking for controls, and threat_validation_prompt (new) judges library candidates.
+PROMPT_VERSION = "2.0"
 
 # The stable key for "the threat reached the asset directly, through no supporting system".
 # Supporting-system ids are positive DB primary keys, so 0 is free. Deliberately NOT reusing
