@@ -322,6 +322,12 @@ IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario_Output', 'RejectedBy') IS NULL
     ALTER TABLE Threat_Scenario_Output ADD RejectedBy nvarchar(200) NULL;
 
+-- Adds ScenarioSource for pre-scenario-library databases. NULL reads as "generated for this
+-- asset", which is what every legacy row is.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ScenarioSource') IS NULL
+    ALTER TABLE Threat_Scenario_Output ADD ScenarioSource nvarchar(100) NULL;
+
 -- A scenario cannot be both accepted and rejected. Enforced in the DATABASE, not only in the
 -- service layer: accept and reject will be independent routes reachable at any time after the
 -- session completes, so the one place both orderings must meet is the row itself. Guarded so a
@@ -942,6 +948,48 @@ WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME IN (
     'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Identified_Duplicate_Threat',
     'Scoped_Threat','Threat_Scenario_Output','Threat_Library_Import_Run','Scenario_Audit',
     'Prompt_Log','Threat_Candidate_Review','Risk_Treatment_Plan','Config_Tuning','API_Client');
+
+
+-- ---------------------------------------------------------------------------
+-- Scenario_Library - generated scenario text, reused across every asset of one PROFILE
+-- ---------------------------------------------------------------------------
+-- Control_Library already proves the model: 1,288 pre-written rows, reused by everyone, zero
+-- AI. A threat scenario is content too, not a per-request computation, so generating the same
+-- text again for the 400th pumping station of the same design is pure waste - and output
+-- tokens, not call count, are the bill.
+--
+-- ProfileKey is a sha256 of CLASSIFICATION CODES ONLY (sector scope, asset type, sub-sector,
+-- and each supporting system's technology/criticality in order) - never a name, an entity id
+-- or free text. That is what makes a row here safe to serve across tenants while the asset
+-- data it was derived from stays isolated. See app/pipeline/scenario_profile.py.
+--
+-- SourceNamesJSON is the ordered [asset, system 1, system 2, ...] name list that was live when
+-- the text was written. Serving the row to a different asset swaps those names positionally,
+-- and the swap REFUSES rather than guesses if any source name survives it - so a mismatch
+-- costs a regeneration, never a register naming the wrong customer's system.
+--
+-- PromptVersion and ModelID are the invalidation key: a row is only served back to a session
+-- running the same prompt and model that produced it.
+IF OBJECT_ID('dbo.Scenario_Library', 'U') IS NULL
+CREATE TABLE Scenario_Library (
+    ScenarioLibraryID  uniqueidentifier NOT NULL CONSTRAINT PK_Scenario_Library PRIMARY KEY,
+    ProfileKey         nvarchar(100)  NOT NULL,   -- sha256 hex; classification codes only
+    ThreatCatalogueID  int            NOT NULL,   -- library threats only: a novel threat has no stable identity to key on
+    ScenarioNumber     int            NOT NULL CONSTRAINT DF_ScenarioLibrary_ScenarioNumber DEFAULT 1,
+    ScenarioJSON       nvarchar(max)  NOT NULL,
+    SourceNamesJSON    nvarchar(max)  NOT NULL,   -- ordered [asset, system 1, ...] at write time
+    PromptVersion      nvarchar(100)  NULL,
+    ModelID            nvarchar(200)  NULL,
+    CreatedAt          datetime2      NULL
+);
+
+-- The natural key. UNIQUE so a race between two sessions of the same profile cannot leave two
+-- competing texts for one (profile, threat, scenario number) - the loser's INSERT fails and is
+-- discarded, which is correct: either text was valid, and the session keeps its own copy
+-- regardless.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ScenarioLibrary_Natural' AND object_id = OBJECT_ID('dbo.Scenario_Library'))
+CREATE UNIQUE INDEX UX_ScenarioLibrary_Natural
+    ON Scenario_Library(ProfileKey, ThreatCatalogueID, ScenarioNumber);
 
 
 -- ---------------------------------------------------------------------------

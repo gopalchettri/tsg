@@ -182,6 +182,30 @@ class Identified_Duplicate_Threat(Base):
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
+class Scenario_Library(Base):
+    """Generated scenario text, reusable by every asset of one PROFILE — the zero-AI path.
+
+    Keyed by (ProfileKey, ThreatCatalogueID, ScenarioNumber). ProfileKey is a digest of
+    CLASSIFICATION CODES ONLY (scenario_profile.profile_key), so a row is safe to serve across
+    tenants; SourceNamesJSON carries the ordered names that were live when the text was written
+    so the serve path can swap them positionally — and REFUSE if the swap is not provably
+    complete. Library threats only: a novel, unpromoted threat has no stable identity to key on.
+
+    PromptVersion + ModelID are the invalidation key. A prompt or model change simply stops
+    matching, so stale text ages out instead of needing a purge.
+    """
+    __tablename__ = "Scenario_Library"
+    ScenarioLibraryID: Mapped[str] = mapped_column(GUID, primary_key=True)
+    ProfileKey: Mapped[str] = mapped_column(Unicode(100))
+    ThreatCatalogueID: Mapped[int] = mapped_column(Integer)
+    ScenarioNumber: Mapped[int] = mapped_column(Integer, default=1)
+    ScenarioJSON: Mapped[str] = mapped_column(UnicodeText)
+    SourceNamesJSON: Mapped[str] = mapped_column(UnicodeText)
+    PromptVersion: Mapped[str | None] = mapped_column(Unicode(100))
+    ModelID: Mapped[str | None] = mapped_column(Unicode(200))
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 class Scoped_Threat(Base):
     __tablename__ = "Scoped_Threat"
     ScopedThreatID: Mapped[str] = mapped_column(GUID, primary_key=True)
@@ -259,6 +283,11 @@ class Threat_Scenario_Output(Base):
     # Mutually exclusive with Accepted=1, enforced in the DATABASE by
     # CK_ScenarioOutput_DecisionExclusive — accept and reject are independent routes reachable in
     # either order, so the row itself is the one place both orderings must meet.
+    # WHERE THE TEXT CAME FROM: "library" = served from Scenario_Library (written for another
+    # asset of the SAME profile, with system names swapped in), anything else / NULL = written
+    # for this asset. A reviewer signing a risk register must be able to tell the difference,
+    # so this is a column, not an inference. See app/pipeline/scenario_profile.py.
+    ScenarioSource: Mapped[str | None] = mapped_column(Unicode(100))
     RejectedAt: Mapped[datetime | None] = mapped_column(DateTime)
     RejectedBy: Mapped[str | None] = mapped_column(Unicode(200))
 

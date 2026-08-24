@@ -1395,6 +1395,58 @@ def scenario_identity_pairs(sess: Session, session_id: str, output_ids: list[str
 # ponytail: if the table ever grows enough to matter, prune by session age, not on the write path.
 
 
+def library_scenarios(sess: Session, profile_key: str, catalogue_ids: list[int],
+                    prompt_version: str | None, model_id: str | None) -> dict[int, RowMapping]:
+    """ThreatCatalogueID -> the stored scenario for this PROFILE, or {} when nothing matches.
+
+    ScenarioNumber 1 only: alternates are per-session "next set" takes, and serving one as if
+    it were the primary would silently change what a reviewer sees first.
+
+    prompt_version/model_id are the invalidation key rather than a purge job — a prompt or model
+    change simply stops matching, so stale text ages out on its own and a rollback re-matches
+    the rows it produced. NULLs on either side never match, so a row written before the columns
+    existed is never served."""
+    if not catalogue_ids or not prompt_version or not model_id:
+        return {}
+    sl = m.Scenario_Library
+    return {r["ThreatCatalogueID"]: r for r in sess.execute(
+        select(sl.ThreatCatalogueID, sl.ScenarioJSON, sl.SourceNamesJSON)
+        .where(sl.ProfileKey == profile_key,
+            sl.ThreatCatalogueID.in_(sorted(set(catalogue_ids))),
+            sl.ScenarioNumber == 1,
+            sl.PromptVersion == prompt_version,
+            sl.ModelID == model_id)
+    ).mappings()}
+
+
+def remember_scenario(sess: Session, profile_key: str, catalogue_id: int, scenario_json: str,
+                    source_names_json: str, prompt_version: str | None,
+                    model_id: str | None) -> bool:
+    """Store one freshly generated scenario for reuse by the next asset of this profile.
+
+    BEST EFFORT BY CONSTRUCTION. Two sessions of the same profile can generate the same threat
+    at once; UX_ScenarioLibrary_Natural makes the loser's INSERT fail, and that is the correct
+    outcome — either text was valid, and the session keeps its own copy either way. Runs in a
+    SAVEPOINT so the collision cannot poison the caller's transaction, which is holding a
+    scenario that was already generated and already billed."""
+    if not profile_key or catalogue_id is None or not prompt_version or not model_id:
+        return False
+    try:
+        with sess.begin_nested():
+            sess.execute(insert(m.Scenario_Library).values(
+                ScenarioLibraryID=guid(), ProfileKey=profile_key, ThreatCatalogueID=catalogue_id,
+                ScenarioNumber=1, ScenarioJSON=scenario_json, SourceNamesJSON=source_names_json,
+                PromptVersion=prompt_version, ModelID=model_id, CreatedAt=now()))
+        return True
+    except IntegrityError:
+        log.info("scenario_library.race_lost", profile_key=profile_key, catalogue_id=catalogue_id)
+        return False
+    except Exception:
+        log.warning("scenario_library.write_failed", profile_key=profile_key,
+                    catalogue_id=catalogue_id, exc_info=True)
+        return False
+
+
 def supersede(sess: Session, table, session_id: str, subsystem_id: int) -> None:
     """Mark the active rows of a (session, subsystem) as superseded (§5.8)."""
     sess.execute(

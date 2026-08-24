@@ -36,6 +36,7 @@ from app.pipeline import (
     coverage,
     grounding,
     prompts,
+    scenario_profile,
     scoping,
     threat_retrieval,
     validation,
@@ -1164,7 +1165,8 @@ def _scrub_model_output(scenario: dict, sid: str, threat_id: str | None) -> dict
 
 def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, scenario: dict, report: dict,
                             epoch: int, entity_id: str | None, user_id: str | None, info: dict,
-                            scenario_number: int = 1, replaces_output_id: str | None = None) -> dict:
+                            scenario_number: int = 1, replaces_output_id: str | None = None,
+                            source: str = "generated") -> dict:
 
     scenario = _scrub_model_output(scenario, sid, info.get("threat_id"))
     identity = dal.identity_hash(sid, ss, info)
@@ -1178,6 +1180,10 @@ def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, s
         "IdentityHash": identity, "ScenarioNumber": scenario_number,
         "ReplacesOutputID": replaces_output_id,
         "GenerationEpoch": epoch, "ErrorMessage": None, "CreatedAt": now(),
+        # "library" = this text was written for another asset of the SAME profile and had its
+        # system names swapped in; anything else was written for this asset. A reviewer signing
+        # the register has to be able to tell, so it is persisted, never inferred.
+        "ScenarioSource": source,
     }
 
 
@@ -1451,7 +1457,8 @@ def _persist_full_run_failure(sess: Session, sid: str, ss: int, tenant: str, ent
 
 def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, entity_id: str | None,
                             user_id: str | None, sc, scoped_id: str, info: dict,
-                            scenario: dict, report: dict, epoch: int) -> None:
+                            scenario: dict, report: dict, epoch: int,
+                            source: str = "generated") -> None:
     retired_card = _retire_prior_card(sess, sid, ss, info)
     # Same as _persist_full_run_failure: retire any existing active Scoped_Threat row for this
     # threat before inserting a new one. This matters on a Celery retry — if attempt 1 failed
@@ -1462,8 +1469,86 @@ def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, en
                 [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
     sess.execute(insert(m.Threat_Scenario_Output),
                 [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
-                                            entity_id, user_id, info, replaces_output_id=retired_card)])
+                                            entity_id, user_id, info, replaces_output_id=retired_card,
+                                            source=source)])
     sess.commit()
+
+
+def _library_hits(sess: Session, work: list, enriched: dict, scenario_session: dict,
+                subsystems: list[dict], asset_context: dict,
+                entry_vocab: dict) -> tuple[dict[str, tuple[dict, dict]], str, list[str]]:
+    """Scenarios this session can take from Scenario_Library instead of paying to write again.
+
+    Returns ({scoped_id: (scenario, report)}, profile_key, this asset's ordered names).
+
+    THREE THINGS MUST ALL HOLD or the threat falls through to generation, and every one of them
+    fails CLOSED:
+
+      1. the threat carries a ThreatCatalogueID - a novel, unpromoted threat has no stable
+         identity to key on;
+      2. a row exists for this exact (profile, prompt version, model) - a prompt or model change
+         simply stops matching, which is the whole invalidation story;
+      3. the stored text's system names swap cleanly onto THIS asset's names
+         (scenario_profile.substitute_names refuses on any residue).
+
+    The reused text is re-VALIDATED and re-GROUNDED against this asset, never trusted as-is:
+    validate_scenario re-checks it against this asset's own critical service, and
+    _ground_entry_points re-resolves the entry-point labels - which the swap has just renamed -
+    against this asset's vocabulary. Both are local; neither calls a model.
+
+    Moderation is deliberately NOT re-run: the text was moderated when it was generated, and
+    re-moderating identical prose per asset would put a paid per-request call back into the
+    path whose entire purpose is not having one.
+    """
+    profile = scenario_profile.profile_key(
+        json.loads(scenario_session["SectorIDsJSON"]) if scenario_session.get("SectorIDsJSON") else [],
+        asset_context, subsystems)
+    target_names = scenario_profile.live_names(scenario_session["AssetName"], subsystems)
+    by_catalogue: dict[int, list] = {}
+    for sc, scoped_id, _t in work:
+        cid = enriched.get(sc.threat_id, {}).get("catalogue_id")
+        if cid is not None:
+            by_catalogue.setdefault(int(cid), []).append((sc, scoped_id))
+    if not by_catalogue:
+        return {}, profile, target_names
+    try:
+        rows = dal.library_scenarios(sess, profile, list(by_catalogue), prompts.PROMPT_VERSION,
+                                    get_settings().inference_model)
+    # [R8] Caught broadly on purpose: a cache miss is ALWAYS a safe answer, so no failure
+    # reading the library may be allowed to take down a stage that can simply generate.
+    except Exception:
+        sess.rollback()
+        log.warning("scenario_library.read_failed", session_id=scenario_session["SessionID"],
+                    exc_info=True)
+        return {}, profile, target_names
+
+    out: dict[str, tuple[dict, dict]] = {}
+    refused = 0
+    for cid, row in rows.items():
+        try:
+            source_names = json.loads(row["SourceNamesJSON"])
+        except ValueError:
+            refused += 1
+            continue
+        scenario = scenario_profile.substitute_names(row["ScenarioJSON"], source_names, target_names)
+        if scenario is None:
+            refused += 1
+            continue
+        for sc, scoped_id in by_catalogue[cid]:
+            info = enriched.get(sc.threat_id, {})
+            reused = json.loads(json.dumps(scenario))   # one private copy per output row
+            report = validation.validate_scenario(
+                reused,
+                info.get("library_threat_type") or info.get("threat_type"),
+                info.get("library_threat_name") or info.get("threat_name"),
+                asset_name=scenario_session["AssetName"],
+                critical_service=asset_context.get("critical_service"))
+            _ground_entry_points(reused, entry_vocab, None)
+            out[scoped_id] = (reused, report)
+    log.info("scenario_library.lookup", session_id=scenario_session["SessionID"],
+            profile=profile[:12], asked=len(by_catalogue), matched=len(rows),
+            served=len(out), refused=refused)
+    return out, profile, target_names
 
 
 def _generate_scenario_batch(sess: Session, scenario_session: dict, base_ctx: dict, work: list,
@@ -1580,16 +1665,32 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
         # correlation_id is passed as a LITERAL keyword at each call site, never through this
         # dict: scripts/test_pipeline_guards.py verifies the stamp by reading the AST, and a
         # value hidden inside **kwargs would silently retire that check.
-    generated = _generate_scenario_batch(sess, scenario_session, base_ctx, work, enriched, llm,
-                                        task_id, epoch, per_item, session_factory)
+    # Scenario library. Only on the plain full run: a TARGETED call is a reviewer asking for
+    # this asset's own take (regenerate) or for something they have not seen (next-set), and
+    # handing either of those a stored text would answer a different question than the one
+    # asked. That is also the bespoke escape hatch - regenerate always writes session-local
+    # text, which shadows the library row for this session.
+    reused: dict[str, tuple[dict, dict]] = {}
+    profile_key, source_names = "", []
+    if not targeted:
+        reused, profile_key, source_names = _library_hits(
+            sess, work, enriched, scenario_session, subsystems, asset_context, entry_vocab)
+    to_generate = [item for item in work if item[1] not in reused]
+    generated = _generate_scenario_batch(sess, scenario_session, base_ctx, to_generate, enriched,
+                                        llm, task_id, epoch, per_item, session_factory)
     by_scoped = {sc_id: (res, exc) for sc_id, res, exc in generated}
+    # Reused rows join the batch here, so the similarity sweep and the persist loop below treat
+    # them exactly like generated ones - a stored scenario that now reads as a near-duplicate of
+    # a freshly written sibling must be flagged the same way.
+    for sc_id, (scenario, report) in reused.items():
+        by_scoped[sc_id] = ((scenario, report, None), None)
 
     # Same-batch cross-threat similarity, over the finished set. Deterministic string work,
     # no model call, so it costs nothing to compare everything against everything.
     ratio = tuning.from_session(scenario_session).sibling_similarity_ratio
     fresh = [(identities[sc_id], str((res[0] or {}).get("scenario_statement") or ""))
-            for sc_id, res, _exc in generated if res is not None]
-    for sc_id, res, _exc in generated:
+            for sc_id, (res, _exc) in by_scoped.items() if res is not None]
+    for sc_id, (res, _exc) in by_scoped.items():
         if res is None:
             continue
         others = [text for h, text in fresh if h != identities[sc_id]]
@@ -1600,6 +1701,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     slot_unavailable: Exception | None = None
     for sc, scoped_id, _target in work:
         result, exc = by_scoped[scoped_id]
+        from_library = scoped_id in reused
         if exc is not None:
             if isinstance(exc, LLMSlotUnavailable):
                 # Not a scenario failure: no capacity right now. Remembered and raised AFTER
@@ -1622,13 +1724,26 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
         scenario, report, prov = result
         provs.append(prov)
         if not targeted:
+            if from_library:
+                log.info("scenario.served_from_library", session_id=sid,
+                        threat_id=sc.threat_id, profile=profile_key[:12])
+            else:
+                # Write-through: the next asset of this profile gets this text for free. Best
+                # effort in its own SAVEPOINT (dal.remember_scenario) - the scenario is already
+                # generated and already billed, so a cache write must never be able to lose it.
+                cid = enriched.get(sc.threat_id, {}).get("catalogue_id")
+                if cid is not None and profile_key:
+                    dal.remember_scenario(sess, profile_key, int(cid), json.dumps(scenario),
+                                        json.dumps(source_names), prompts.PROMPT_VERSION,
+                                        get_settings().inference_model)
             if not dal.renew_lease(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id):
                 sess.rollback()
                 log.warning("stage.claim_lost_midbatch", session_id=sid, subsystem=ss,
                             stage="SCENARIOS", epoch=epoch, committed=len(provs) - 1)
                 break
             _persist_full_run_scenario(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
-                                    enriched.get(sc.threat_id, {}), scenario, report, epoch)
+                                    enriched.get(sc.threat_id, {}), scenario, report, epoch,
+                                    source="library" if from_library else "generated")
         else:
             scenarios[scoped_id] = (scenario, report)
         cross_pairs.append((identities[scoped_id], str(scenario.get("scenario_statement") or "")))

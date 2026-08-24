@@ -302,7 +302,8 @@ def _scenario_select():
     out, st, it = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
     return select(
         out.OutputID, out.ScenarioJSON, out.Accepted, out.ValidationJSON, out.GenerationEpoch,
-        out.ScenarioNumber, out.ReplacesOutputID, out.ControlsMappedAt, it.ThreatID,
+        out.ScenarioNumber, out.ReplacesOutputID, out.ControlsMappedAt, out.ScenarioSource,
+        it.ThreatID,
         it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON,
         # Both library columns, so the scenario body's display wording is identical on
         # /results and /accepted-scenarios. Before Phase 4 only the accepted read joined
@@ -659,6 +660,10 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                         validation_status=validation_status, validation_errors=validation_errors,
                         GenerationEpoch=row["GenerationEpoch"],
                         ScenarioNumber=row["ScenarioNumber"],
+                        # NULL on every row written before the scenario library existed, and
+                        # those were all authored for their own asset — so the legacy reading
+                        # is "generated", not "unknown".
+                        ScenarioSource=row["ScenarioSource"] or "generated",
                         ControlsMapped=controls_mapped,
                         replaced_scenarios=replaced or [])
 

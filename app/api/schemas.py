@@ -644,6 +644,7 @@ _SCENARIO_RESULT_EXAMPLE: JsonDict = {
     "GenerationEpoch": 1,
     "ScenarioNumber": 1,
     "ControlsMapped": True,
+    "ScenarioSource": "generated",
     "replaced_scenarios": [],
 }
 
@@ -724,6 +725,20 @@ class ScenarioResult(BaseModel):
     # Mirrors Threat_Scenario_Output.ControlsMappedAt, so false ALSO covers the unseeded-library
     # case: control_mapping bails at `controls.no_candidates` without stamping, deliberately, so
     # those outputs are picked up by a later run once Seed_to_Control_library.sql has been applied.
+    ScenarioSource: str = Field(
+        default="generated",
+        description=(
+            "Where this scenario's TEXT came from. `generated` = written for this asset. "
+            "`library` = written for a DIFFERENT asset with an identical profile (same sector "
+            "scope, asset type, sub-sector, and the same technology on each supporting system, "
+            "in the same order) and reused here with the supporting-system names swapped to "
+            "this asset's. Reused text is re-validated and its entry points re-resolved against "
+            "this asset, and the swap is refused outright unless every name maps cleanly - but "
+            "a reviewer signing a risk register is entitled to know the prose was not authored "
+            "about the system in front of them. Ask for a bespoke version with "
+            "POST /regenerate/scenarios, which never serves from the library."
+        ),
+    )
     ControlsMapped: bool = Field(
         description=(
             "Whether Step-4 control mapping has been attempted for this scenario. true with an "
