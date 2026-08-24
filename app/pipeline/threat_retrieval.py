@@ -310,7 +310,14 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
         keep = set(order[:top_k])
         # GAP-A: gate-ungated types (universal threats) bypass the cap — they score ~0.3
         # against any specific asset text and would otherwise never reach the validator.
-        keep |= {i for i in range(len(rows)) if rows[i]["ThreatTypeID"] in ungated}
+        # Actor-leg-admitted types (Phase 2c, `tid not in sector_visible` below) must ALSO
+        # bypass: they were admitted BECAUSE the sector filter alone would have excluded
+        # them, so a low hybrid score against the asset's own text is the expected case for
+        # them, not evidence they don't belong. Without this, the cap silently undoes the
+        # actor leg's entire purpose — the exact GAP-A failure, for a second admission path.
+        keep |= {i for i in range(len(rows))
+                if rows[i]["ThreatTypeID"] in ungated
+                or rows[i]["ThreatTypeID"] not in sector_visible}
         order = [i for i in order if i in keep]
 
     attribution = attribute_to_subsystems(
