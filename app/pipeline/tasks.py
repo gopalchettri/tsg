@@ -635,7 +635,11 @@ def _build_retrieved_records(cand: dict, sid: str, tenant: str, ss: int,
     # Additive keys, ignored by _dedup_key/scoring: full multi-category membership for the
     # coverage grid, plus retrieval/validator provenance for the audit trail.
     summary["categories"] = cand.get("categories") or []
-    summary["selection_source"] = "library_retrieval"
+    # WHY this threat is here: "actor_intel" (an actor operating in this sector uses the
+    # technique - the sector filter alone would have dropped it), "rules" (the ungated
+    # universal tier), or "hybrid" (the ordinary metadata + ranking path).
+    summary["selection_source"] = cand.get("selection_source") or "hybrid"
+    summary["actor_evidence"] = cand.get("actor_evidence") or []
     summary["retrieval_score"] = cand.get("retrieval_score")
     summary["validator_verdict"] = cand.get("validator_verdict")
     return row, summary
@@ -839,6 +843,18 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # Coverage close-out (safety gate): which (subsystem x STRIDE) cells does this round
     # leave unanswered? Multi-category memberships count for every category they carry.
     # Logged AND recorded in the audit row — a gap must be visible, never silent.
+    # Provenance roll-up: how many threats each leg of the funnel contributed, and which
+    # ones an ACTOR put on the list. "APT33 operates in this sector and uses this technique"
+    # is a defensible answer at a shutdown review; a similarity score is not.
+    selection_sources: dict[str, int] = {}
+    for t in retrieved_summaries:
+        key = t.get("selection_source") or "hybrid"
+        selection_sources[key] = selection_sources.get(key, 0) + 1
+    if len(threats) > len(retrieved_summaries):
+        selection_sources["generated"] = len(threats) - len(retrieved_summaries)
+    actor_derived = [{"threat_name": t.get("threat_name"), "actors": t["actor_evidence"]}
+                    for t in retrieved_summaries if t.get("actor_evidence")][:20]
+
     cov = coverage.coverage_report([ss, *grid_subsystem_ids], cats, grid_records)
     if cov["unexplained"]:
         log.warning("threats.coverage_gaps", session_id=sid, subsystem=ss,
@@ -848,6 +864,8 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                     Stage=WorkflowStage.THREAT_IDENTIFICATION, SubsystemID=ss,
                     EventType=AuditEventType.grounding_summary,
                     DetailJSON=json.dumps({"count": len(threats),
+                                        "selection_sources": selection_sources,
+                                        "actor_derived": actor_derived,
                                         "subsystem_records": len(fanout_rows),
                                         "units": [ss, *grid_subsystem_ids],
                                         "retrieved": len(retrieved_summaries),

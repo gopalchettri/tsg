@@ -12,6 +12,9 @@ Asserts the whole redesigned flow on real SQLite tables with a deterministic fak
   - a genuinely novel proposal survives as unverified (the promotion path input)
   - the grounding_summary audit row carries retrieved/generated counts, the validator
     outcome, and the coverage report
+  - Phase 2c: a threat type the SECTOR filter excludes still enters the pool when an actor
+    operating in this sector uses it (ThreatType_ThreatActor_Map read backwards), and the
+    audit records WHICH actor put it there
   - Phase 2b: each threat is recorded against the asset AND every supporting system a
     tech_gate does not rule out, so the coverage grid is 2D and an uncovered
     (system x STRIDE) cell is reported instead of being invisible
@@ -128,6 +131,12 @@ def _seed_library(s) -> None:
         s.execute(m.Threat_Type.__table__.insert().values(
             ThreatTypeID=tid, ThreatTypeName=name, ThreatCategoryID=cat,
             IsActive=True, IsDeleted=False))
+    # Phase 2c: scoped to a sector this session CANNOT see, so the metadata filter alone
+    # drops it. It gets in only because APT33 - linked to type 7, which IS visible here -
+    # also uses it. This is the whole actor leg in one row.
+    s.execute(m.Threat_Type.__table__.insert().values(
+        ThreatTypeID=13, ThreatTypeName="Spear-phishing for Initial Access",
+        ThreatCategoryID=5, SectorID=999, IsActive=True, IsDeleted=False))
     for cid, name, tid, desc in (
             (418, "Unauthorised setpoint modification", 7,
              "An actor alters pump setpoints so control logic integrity is lost."),
@@ -136,18 +145,23 @@ def _seed_library(s) -> None:
             (205, "Credential phishing and MFA session theft", 9,
              "Phishing steals operator credentials and session tokens."),
             (900, "Payment card skimming at POS terminals", 11,
-             "Skimming devices harvest card data at retail POS.")):
+             "Skimming devices harvest card data at retail POS."),
+            (733, "Spear-phishing of control room engineers", 13,
+             "Tailored email lures an engineer into running attacker code.")):
         s.execute(m.Threat_Catalogue.__table__.insert().values(
             ThreatCatalogueID=cid, ThreatName=name, ThreatTypeID=tid, Description=desc,
             IsActive=True, IsDeleted=False))
     # multi-category membership: phishing is Spoofing AND Repudiation (map is authoritative)
-    for cat_id, cid in ((6, 418), (6, 522), (5, 205), (4, 205), (5, 900)):
+    for cat_id, cid in ((6, 418), (6, 522), (5, 205), (4, 205), (5, 900), (5, 733)):
         s.execute(m.Threat_Catalogue_Category_Map.__table__.insert().values(
             ThreatCategoryID=cat_id, ThreatCatalogueID=cid))
     s.execute(m.Threat_Actor.__table__.insert().values(
         ThreatActorID=1, ThreatActorName="APT33", IsCapable=1, IsActive=True, IsDeleted=False))
     s.execute(m.ThreatType_ThreatActor_Map.__table__.insert().values(
         ThreatTypeID=7, ThreatActorID=1))
+    # the second hop: the same actor also uses the out-of-sector type
+    s.execute(m.ThreatType_ThreatActor_Map.__table__.insert().values(
+        ThreatTypeID=13, ThreatActorID=1))
     # tech_gate: POS skimming applies only to RETAIL subsystems — none here, so type 11 is OUT
     s.execute(m.Config_Threat_Rule.__table__.insert().values(
         ThreatRuleID=1, RuleType="tech_gate", ThreatTypeID=11, RuleKey="asset_type",
@@ -191,12 +205,13 @@ def test_library_first_identification_end_to_end(monkeypatch):
         # below). Every consumer — scoping, scenarios, next-set, accept — reads unit 0.
         rows = {r.ThreatCatalogueID: r for r in all_rows if r.SubsystemID == 0}
         retrieved = {cid: r for cid, r in rows.items() if cid is not None}
-        # 418 + 205 retrieved; 522 validator-dropped; 900 gate-excluded
-        assert set(retrieved) == {418, 205}
+        # 418 + 205 sector-visible, 733 admitted by the ACTOR leg;
+        # 522 validator-dropped; 900 gate-excluded
+        assert set(retrieved) == {418, 205, 733}
         for r in retrieved.values():
             assert str(r.GroundingStatus) == str(GroundingStatus.verified)
             assert r.GroundingScore == 100.0
-            assert r.ThreatTypeID in (7, 9)
+            assert r.ThreatTypeID in (7, 9, 13)
             assert r.LibraryThreatName == r.ThreatName  # master name on every column
         actors_418 = json.loads(retrieved[418].ThreatActorsJSON)
         assert actors_418 == {"actors": ["APT33"], "validated": True}
@@ -218,24 +233,42 @@ def test_library_first_identification_end_to_end(monkeypatch):
         audit = [json.loads(a.DetailJSON) for a in s.execute(
             select(m.Scenario_Audit)).scalars() if a.DetailJSON]
         summary = next(d for d in audit if "retrieved" in d)
-        assert summary["retrieved"] == 2 and summary["generated"] == 1
-        assert summary["validator"]["kept"] == 2
+        assert summary["retrieved"] == 3 and summary["generated"] == 1
+        assert summary["validator"]["kept"] == 3
         assert summary["validator"]["dropped"][0]["catalogue_id"] == 522
         assert "no web application" in summary["validator"]["dropped"][0]["justification"]
         cov = summary["coverage"]
         # --- Phase 2b: the grid is 2D ---------------------------------------------------
         # 3 units (asset + 2 supporting systems) x 3 STRIDE categories.
+        # --- Phase 2c: the actor leg, and the audit trail it leaves ----------------------
+        # Sources are the DISTINGUISHING reason each threat is in the pool.
+        assert summary["selection_sources"] == {
+            "hybrid": 1,        # 418, sector-visible and gated
+            "rules": 1,         # 205, sector-visible and ungated (universal tier)
+            "actor_intel": 1,   # 733, reachable ONLY through APT33
+            "generated": 1,
+        }
+        # The audit answers "why is this here?" with a group, not a similarity number.
+        # BOTH APT33 types appear: the evidence is a fact about the type, recorded wherever
+        # it is true. selection_source above is the separate question of whether that fact is
+        # what got the threat INTO the pool - for 418 it was not, for 733 it was.
+        assert sorted(d["threat_name"] for d in summary["actor_derived"]) == [
+            "Spear-phishing of control room engineers", "Unauthorised setpoint modification"]
+        assert all(d["actors"] == ["APT33"] for d in summary["actor_derived"])
+
         assert cov["cells"] == 9
         assert summary["units"] == [0, 41, 42]
 
-        # The asset's working set is untouched by the fan-out: still exactly 3 threats.
-        assert len([r for r in all_rows if r.SubsystemID == 0]) == 3
+        # The asset's working set is untouched by the fan-out: 3 retrieved + 1 novel.
+        assert len([r for r in all_rows if r.SubsystemID == 0]) == 4
         by_unit = {u: {r.ThreatCatalogueID for r in all_rows if r.SubsystemID == u}
                 for u in (0, 41, 42)}
         # 418 is OT-gated: recorded on the SCADA server, NOT on the billing portal.
         assert 418 in by_unit[41] and 418 not in by_unit[42]
-        # 205 (Credential Abuse) carries no gate — universal, so it reaches both systems.
+        # 205 (Credential Abuse) and 733 (spear-phishing) carry no gate — universal, so
+        # they reach both systems.
         assert 205 in by_unit[41] and 205 in by_unit[42]
+        assert 733 in by_unit[41] and 733 in by_unit[42]
 
         # ...and the grid now SEES what the flat version could not: no Tampering threat was
         # identified for the IT subsystem. A reportable gap, not silence — this assertion is
@@ -244,9 +277,18 @@ def test_library_first_identification_end_to_end(monkeypatch):
         assert cov["gaps"] == [[42, "Tampering"]]
 
     # --- return value feeds write_scenarios: retrieved first, then novel ---------------
-    assert [t.get("selection_source") for t in threats[:2]] == ["library_retrieval"] * 2
+    by_name = {t["threat_name"]: t for t in threats}
+    spear = by_name["Spear-phishing of control room engineers"]
+    assert spear["selection_source"] == "actor_intel"
+    assert spear["actor_evidence"] == ["APT33"]
+    # 418's type is ALSO used by APT33, so it carries the same evidence - but it was already
+    # in the pool on its own merits, which is exactly what selection_source distinguishes.
+    assert by_name["Unauthorised setpoint modification"]["selection_source"] == "hybrid"
+    assert by_name["Unauthorised setpoint modification"]["actor_evidence"] == ["APT33"]
+    # ...and a threat whose type no actor is linked to claims nothing it cannot support
+    assert by_name["Credential phishing and MFA session theft"]["actor_evidence"] == []
     assert threats[0]["validator_verdict"] == "RELEVANT"
-    assert len(threats) == 3
+    assert len(threats) == 4
 
 
 def test_empty_library_degrades_to_generation_only(monkeypatch):

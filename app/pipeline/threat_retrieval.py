@@ -10,6 +10,11 @@ Selects candidate Threat_Catalogue rows for an asset BEFORE any generation happe
                          (hybrid_search.hybrid_match); a candidate keeps its best
                          score across queries — per-system queries stop one blended
                          asset vector diluting a 16-system asset (GAP-3)
+    2b. ACTOR LEG        ThreatType_ThreatActor_Map read BACKWARDS: the actors linked to
+                         sector-visible types, then EVERY type those actors use. Admits
+                         techniques the sector filter alone would have dropped, with a
+                         principled reason recorded on the candidate
+                         (selection_source / actor_evidence) - see actor_reachable_types
     3. CAP (optional)    threat_retrieval_top_k unset = ALL gate-passing candidates
                          go forward (exhaustive — provable coverage at today's
                          library size). When capped, gate-UNGATED types bypass the
@@ -34,7 +39,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -79,9 +84,55 @@ def build_queries(subsystems: list[dict] | None, asset_context: dict) -> list[st
     return [q for q in queries if q]
 
 
-def _load_candidates(sess: Session, sector_ids: list[int]) -> list[dict]:
-    """Active, sector-visible catalogue rows with their (active) parent type, the
-    multi-category STRIDE memberships, and the type's default category as fallback."""
+def actor_reachable_types(sess: Session, sector_ids: list[int]) -> dict[int, list[str]]:
+    """Threat types reachable by reading ThreatType_ThreatActor_Map BACKWARDS, mapped to the
+    actors that reach them. The threat-INTELLIGENCE direction (Phase 2c).
+
+    Asset-centric retrieval asks "what can go wrong with a SCADA system". This asks the other
+    question, which for critical infrastructure is often the more predictive one: "who
+    actually attacks assets in this sector, and what ELSE do they do". Two hops, both over
+    rows the seeds already populate:
+
+        sector-visible Threat_Types  ->  the actors linked to them        (hop 1)
+        those actors                 ->  EVERY type they are linked to    (hop 2)
+
+    Hop 2 is what earns this leg its place: it returns types the sector filter alone would
+    have excluded. Spear-phishing enters because APT33 uses it, not because someone hard-coded
+    it into a list, and the audit trail can say exactly that.
+
+    Nothing is admitted blindly: everything this adds goes through the SAME validator as every
+    other candidate, and NOT_RELEVANT is still a hard drop. The leg can only WIDEN the set the
+    model judges - it can never smuggle a threat past the judgement.
+
+    # ponytail: no actor->sector table is needed, because sector reaches actors THROUGH the
+    # type link that already exists. When the MISP/OTX import lands real actor->sector
+    # targeting, replace hop 1 with that join; hop 2 and every caller stay as they are.
+    """
+    mp, ta, tt = m.ThreatType_ThreatActor_Map, m.Threat_Actor, m.Threat_Type
+    seed_actors = (select(mp.ThreatActorID)
+                .join(tt, tt.ThreatTypeID == mp.ThreatTypeID)
+                .where(tt.IsActive == True, tt.IsDeleted == False,
+                        visible_to_this_sector(tt.SectorID, sector_ids)))
+    out: dict[int, list[str]] = {}
+    for type_id, actor_name in sess.execute(
+            select(mp.ThreatTypeID, ta.ThreatActorName)
+            .join(ta, ta.ThreatActorID == mp.ThreatActorID)
+            .where(mp.ThreatActorID.in_(seed_actors),
+                ta.IsActive == True, ta.IsDeleted == False)
+            .order_by(mp.ThreatTypeID, ta.ThreatActorID)):   # deterministic, like get_allowed_actor_names
+        out.setdefault(int(type_id), []).append(actor_name)
+    return out
+
+
+def _load_candidates(sess: Session, sector_ids: list[int],
+                    actor_type_ids: set[int] | None = None) -> list[dict]:
+    """Active catalogue rows with their (active) parent type, the multi-category STRIDE
+    memberships, and the type's default category as fallback.
+
+    A type is admitted when it is sector-visible OR an actor operating in this sector uses it
+    (actor_type_ids, from actor_reachable_types). The CATALOGUE row keeps its own sector rule
+    either way: the actor evidence is about the technique, not about which curated write-up of
+    it belongs to another sector."""
     tc, tt = m.Threat_Catalogue, m.Threat_Type
     rows = [dict(r) for r in sess.execute(
         select(tc.ThreatCatalogueID, tc.ThreatName, tc.Description,
@@ -90,7 +141,8 @@ def _load_candidates(sess: Session, sector_ids: list[int]) -> list[dict]:
         .where(tc.IsActive == True, tc.IsDeleted == False,
                tt.IsActive == True, tt.IsDeleted == False,
                visible_to_this_sector(tc.SectorID, sector_ids),
-               visible_to_this_sector(tt.SectorID, sector_ids))
+               or_(visible_to_this_sector(tt.SectorID, sector_ids),
+                   tt.ThreatTypeID.in_(actor_type_ids or set())))
         .order_by(tc.ThreatCatalogueID)  # deterministic base order
     ).mappings()]
     if not rows:
@@ -192,14 +244,25 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
         {"catalogue_id", "type_id", "type_name", "threat_name", "description",
          "categories": [names], "retrieval_score": 0..1, "rule_factors": [...],
          "always_eligible": bool, "actors": [names],
-         "subsystem_ids": [supporting systems this threat is recorded against]}
+         "subsystem_ids": [supporting systems this threat is recorded against],
+         "selection_source": "actor_intel" | "rules" | "hybrid",
+         "actor_evidence": [actors whose technique set reaches this type]}
 
     [] when the library holds nothing visible — the caller degrades to generation-only."""
     s = get_settings()
-    rows = _load_candidates(sess, sector_ids)
+    # Phase 2c: the actor leg runs FIRST, because it decides which types are eligible at all.
+    # Pure DB joins - no model, no embeddings, negligible cost.
+    actor_types = actor_reachable_types(sess, sector_ids)
+    rows = _load_candidates(sess, sector_ids, set(actor_types))
     if not rows:
         log.warning("threat_retrieval.library_empty", sector_ids=sector_ids)
         return []
+    # Which types the ordinary sector filter would have admitted on its own. Queried rather
+    # than recomputed in Python so the visibility rule lives in exactly one place
+    # (grounding.visible_to_this_sector) and the two can never drift apart.
+    sector_visible = {int(r[0]) for r in sess.execute(
+        select(m.Threat_Type.ThreatTypeID).where(
+            visible_to_this_sector(m.Threat_Type.SectorID, sector_ids)))}
     passed, ungated, rules_by_type = _gate_types(sess, rows, subsystems, s.default_rule_weight)
     rows = [r for r in rows if r["ThreatTypeID"] in passed]
     if not rows:
@@ -250,6 +313,16 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
         tid = r["ThreatTypeID"]
         if tid not in actor_memo:
             actor_memo[tid] = sorted(get_allowed_actor_names(sess, tid))
+        # WHY this candidate is in the pool - the distinguishing reason, not just a label.
+        # actor_intel is the strongest claim (the sector filter alone would have dropped it),
+        # so it wins; rules marks the ungated universal tier that bypasses the cap; hybrid is
+        # the ordinary metadata + ranking path.
+        if tid not in sector_visible:
+            source = "actor_intel"
+        elif tid in ungated:
+            source = "rules"
+        else:
+            source = "hybrid"
         out.append({
             "catalogue_id": r["ThreatCatalogueID"], "type_id": tid,
             "type_name": r["ThreatTypeName"], "threat_name": r["ThreatName"],
@@ -258,8 +331,16 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
             "rule_factors": passed[tid]["factors"],
             "always_eligible": tid in ungated,
             "subsystem_ids": attribution.get(tid, []),
+            "selection_source": source,
+            # The actors whose technique set reaches this type. Turns the audit answer from
+            # "cosine 0.78" into "APT33 operates in this sector and uses this technique".
+            "actor_evidence": actor_types.get(tid, []),
             "actors": actor_memo[tid][:s.max_actors_per_threat],
         })
+    by_source: dict[str, int] = {}
+    for c in out:
+        by_source[c["selection_source"]] = by_source.get(c["selection_source"], 0) + 1
     log.info("threat_retrieval.candidates", total=len(rows), forwarded=len(out),
-             capped=top_k is not None)
+             capped=top_k is not None, by_source=by_source,
+             actor_reachable_types=len(actor_types))
     return out

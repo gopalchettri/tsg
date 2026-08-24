@@ -325,8 +325,9 @@ def threat_validation_prompt(asset_name: str, asset_context: dict[str, Any],
     _EXCLUDE_DB_KEY_TO_PROMPT stays intact and the server maps indexes back to catalogue rows.
 
     The candidates carry evidence the retrieval ranking never saw the model's side of —
-    descriptions, categories, fired applicability rules — and the verdict must cite the
-    asset's own context, which is what makes this a validation rather than a re-rank.
+    descriptions, categories, fired applicability rules, and the actors whose technique set
+    reaches the type — and the verdict must cite the asset's own context, which is what makes
+    this a validation rather than a re-rank.
     NOT_RELEVANT is a HARD DROP server-side (GAP-B), so the contract stresses that a drop
     needs grounds in the context, not vibes."""
     payload = build_base_context(asset_name, asset_context, subsystems)
@@ -336,11 +337,18 @@ def threat_validation_prompt(asset_name: str, asset_context: dict[str, Any],
         "type": redact(cand.get("type_name")),
         "name": redact(cand.get("threat_name")),
         "description": redact((cand.get("description") or "")[:600]),
-        # fired applicability rules, humanized — evidence the ranking already accepted
+        # Fired applicability rules plus the actor evidence, humanized — inputs the
+        # RANKING never saw, which is what makes this a validation rather than a re-rank
+        # (GAP-4). The actor line is the intelligence direction stated in words the model
+        # can reason about: this technique is here because a group operating in this sector
+        # uses it, not because a vector happened to be close.
         "applicability_evidence": [
             f"rule {f.get('key')} ({f.get('family')})"
             + (f" gate {f.get('gate')}" if f.get("gate") else f" weight {f.get('delta')}")
-            for f in (cand.get("rule_factors") or [])],
+            for f in (cand.get("rule_factors") or [])]
+            + ([("threat actors known to operate against this sector and to use this "
+                "technique: " + ", ".join(redact(a) for a in cand["actor_evidence"]))]
+            if cand.get("actor_evidence") else []),
     } for i, cand in enumerate(candidates, start=1)]
     system_content = (
         "You are a critical-infrastructure threat analyst VALIDATING pre-selected library "
