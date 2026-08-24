@@ -53,14 +53,20 @@ def _resolve_itot(asset_context: dict, subsystems: list[dict] | None) -> str | N
     return families.pop() if len(families) == 1 else None
 
 
-def _min_score(sess: Session, llm: LLMClient, s) -> float:
-    """Return the score required before a grounded control is stored.
+def _min_score(sess: Session, llm: LLMClient, s) -> grounding.Threshold:
+    """The score a grounded control must clear, WITH where that number came from.
 
-    Use ``control_map_min_score`` when explicitly configured. Otherwise use the threshold
-    resolved for the current embedding and reranker models.
-    """
+    ``control_map_min_score`` when explicitly configured, else the threshold resolved for the
+    current embedding+reranker pair.
+
+    The origin matters more here than anywhere else. The fallback was calibrated
+    label-vs-label, but this stage now queries with a scenario PARAGRAPH (library-first
+    redesign) - a materially different score distribution. A cutoff too high drops every
+    match, and an empty control list is documented as a healthy library gap, so the failure is
+    invisible. Recording "this number was never measured for this question" alongside the
+    number is what makes that reviewable afterwards."""
     if "control_map_min_score" in s.model_fields_set:
-        return s.control_map_min_score
+        return grounding.Threshold(s.control_map_min_score, "env_pinned")
     return grounding.resolve_thresholds(sess, llm, s)
 
 
@@ -128,7 +134,8 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 continue
             per_output.append((output_id, query))
         skipped = len(outputs) - len(per_output)
-        min_score = _min_score(sess, llm, s)
+        threshold = _min_score(sess, llm, s)
+        min_score = threshold.value
         inserted = dropped = unanswered = 0
         answered: list[str] = []
         if per_output:
@@ -219,10 +226,16 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                                                 "unanswered": unanswered,
                                                 "skipped": skipped, "itot": itot or "",
                                                 "itot_filter_applied": itot is not None,
-                                                "min_score": min_score}))
+                                                "min_score": min_score,
+                                                # WHERE the cutoff came from. Without it a
+                                                # stored 75.0 cannot be told apart from a
+                                                # measured one, and "static_default" means it
+                                                # was tuned for a different model pair AND a
+                                                # different question (label vs paragraph).
+                                                "min_score_origin": threshold.origin}))
         log.info("controls.mapped", session_id=sid, outputs=len(per_output), mapped=inserted,
                 dropped=dropped, unanswered=unanswered, skipped=skipped, itot=itot,
-                min_score=min_score)
+                min_score=min_score, min_score_origin=threshold.origin)
         if durable:
             sess.commit()
     except Exception:

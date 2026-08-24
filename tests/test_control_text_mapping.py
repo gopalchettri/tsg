@@ -88,7 +88,8 @@ def test_one_query_yields_top_k_distinct_ranked_controls(monkeypatch):
     monkeypatch.setattr(grounding, "get_control_candidates",
                         lambda sess, itot: [{"ControlLibraryID": i, "text": f"c{i}"}
                                             for i in range(1, 7)])
-    monkeypatch.setattr(control_mapping, "_min_score", lambda sess, llm, s: 60.0)
+    monkeypatch.setattr(control_mapping, "_min_score",
+                        lambda sess, llm, s: grounding.Threshold(60.0, "test"))
     monkeypatch.setattr(grounding, "ground_control_queries",
                         lambda llm, flat, candidates, s: [
                             grounding.ControlMatches(list(matches), True) for _ in flat])

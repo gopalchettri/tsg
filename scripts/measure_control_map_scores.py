@@ -152,7 +152,15 @@ def main() -> int:
 
         auto = grounding.resolve_thresholds(sess, llm, s)
         explicit = "control_map_min_score" in s.model_fields_set
-        in_force = s.control_map_min_score if explicit else auto
+        in_force = s.control_map_min_score if explicit else auto.value
+        # Read the provenance rather than inferring it. The three origins collide numerically,
+        # so "75.0" alone cannot tell a measurement from a default meant for another model pair.
+        origin = "TSG_CONTROL_MAP_MIN_SCORE, operator-pinned" if explicit else {
+            "env_pinned": "TSG_GROUNDING_MATCH_THRESHOLD, operator-pinned",
+            "calibrated": "auto-calibrated for THIS embedding+reranker pair",
+            "static_default": ("the static Settings default - tuned for a DIFFERENT model pair, "
+                            "and never measured for paragraph-vs-label. NOT evidence"),
+        }.get(auto.origin, auto.origin)
 
         print(f"library         {len(candidates)} active controls"
             + (f" (ITOT={args.itot})" if args.itot else ""))
@@ -161,9 +169,7 @@ def main() -> int:
                 else "real scenarios from the DB"))
         print(f"models          embed={s.embedding_model}  rerank={s.reranker_model}")
         print(f"shortlist_k     {s.grounding_shortlist_k}   top_k={s.control_map_top_k}")
-        print(f"threshold NOW   {in_force:.1f} "
-            + ("(TSG_CONTROL_MAP_MIN_SCORE, explicit)" if explicit
-                else f"(UNSET — falling back to the auto-calibrated grounding threshold {auto:.1f})"))
+        print(f"threshold NOW   {in_force:.1f}   ({origin})")
         print()
 
         # The production call, unmodified: one query per scenario, full reranked shortlist back.
@@ -236,14 +242,13 @@ def main() -> int:
             "construction against the silent-empty failure.")
         print(f"  Stricter alternative: {p05_based:.0f} (5th percentile of best-match scores), "
             "which accepts ~5% of scenarios going empty in exchange for a cleaner tail.")
+    print()
+    print(f"  The value IN FORCE ({in_force:.1f}) comes from: {origin}.")
+    print(f"  At it, {in_force_empty} of {len(measured)} scenarios publish NO controls - "
+        "which the API reports as a healthy library gap, not as a mis-set cutoff.")
     if not explicit:
-        worst = next((empty for t, empty, _m in rows if abs(t - in_force) < 2.5), None)
-        print(f"\n  The value IN FORCE ({in_force:.1f}) is a FALLBACK, not a decision: it was "
-            "auto-calibrated on short label-vs-label pairs, not scenario paragraphs."
-            + (f" At that value {worst} of {len(results)} scenarios publish NO controls."
-                if worst is not None else ""))
-        print("  Set TSG_CONTROL_MAP_MIN_SCORE explicitly either way — an unset knob here is an "
-            "undocumented dependency on a number calibrated for a different question.")
+        print("  Set TSG_CONTROL_MAP_MIN_SCORE explicitly either way: an unset knob here is "
+            "an undocumented dependency on a number derived for a different question.")
     return 0
 
 

@@ -639,23 +639,48 @@ def boundary_between(below: list[float], above: list[float]) -> float | None:
     return (lo + hi) / 2
 
 
+class Threshold(NamedTuple):
+    """A match cutoff AND where it came from — never just the number.
+
+    `origin` is one of:
+        env_pinned      an operator set it explicitly; auto-calibration is disabled.
+        calibrated      measured for THIS embedding+reranker pair (stored, or just computed).
+        static_default  the Settings default, tuned for a DIFFERENT model pair. NOT a
+                        measurement. Treat any conclusion drawn from it as provisional.
+
+    Why the number alone is not enough: the three origins collide numerically. A calibrated
+    75.0, the static default 75.0 and library_promotion_threshold's unrelated 75.0 are the
+    same float, so a stored `min_score: 75.0` in an audit row cannot be interrogated after the
+    fact — and "the cutoff was tuned for a different model pair" is exactly the kind of thing
+    a reviewer needs to know when a threat comes back `unverified`. Same reasoning as
+    ControlMatches.answered: make the distinction a field, not something the caller infers."""
+    value: float
+    origin: str
+
+
 def resolve_thresholds(sess: Session | None, llm: LLMClient | None,
                         s: Settings | None = None, *,
-                        allow_calibration: bool = False) -> float:
-    """The match cutoff for the current embedding+reranker pair. Precedence:
+                        allow_calibration: bool = False) -> Threshold:
+    """The match cutoff for the current embedding+reranker pair, WITH its provenance.
+    Precedence:
       1. operator set it explicitly in env (in model_fields_set) → static wins;
       2. stored calibration for this model pair (embeddings.load_thresholds, Mongo);
       3. auto-calibrate now from the live library, store for later workers;
       4. unavailable (Mongo down, library too small, no sess/llm) → static default + WARNING.
     Memoized per process; celery_app._init_worker warms it at boot so calibration cost
-    lands at deploy time, never inside a leased pipeline stage."""
+    lands at deploy time, never inside a leased pipeline stage.
+
+    Returns a Threshold, not a float, so branches 1-2-3-4 stay distinguishable downstream —
+    they all collapse to the same handful of numbers otherwise."""
     s = s or get_settings()
     if "grounding_match_threshold" in s.model_fields_set:
-        return s.grounding_match_threshold
+        return Threshold(s.grounding_match_threshold, "env_pinned")
     key = (s.embedding_model, s.reranker_model)
     hit = _RESOLVED_THRESHOLDS.get(key)
     if hit is not None:
-        return hit
+        # Only calibrated values are memoized (the fallback deliberately is not, below), so a
+        # memo hit is always a real measurement for this pair.
+        return Threshold(hit, "calibrated")
     resolved = embeddings.load_thresholds(key)
     if resolved is None and allow_calibration:
         # ONLY the boot warm-up passes allow_calibration=True. Calibration costs ~30 chat
@@ -677,9 +702,9 @@ def resolve_thresholds(sess: Session | None, llm: LLMClient | None,
         # Deliberately NOT memoized: memoizing the fallback would pin a worker to the static
         # default even after a sibling worker stores a real calibration seconds later. Costs
         # one small indexed find_one per call, but lets the worker self-heal.
-        return s.grounding_match_threshold
+        return Threshold(s.grounding_match_threshold, "static_default")
     _RESOLVED_THRESHOLDS[key] = resolved
-    return resolved
+    return Threshold(resolved, "calibrated")
 
 
 def _paraphrase(llm: LLMClient, name: str, s: Settings) -> list[str]:
@@ -819,7 +844,7 @@ def find_threat_in_library(sess: Session, llm: LLMClient, proposed: dict[str, An
     cache = {} if cache is None else cache
     # Per-model-pair cutoff (memoized; worker boot warms it) — the static setting is
     # only the fallback. See resolve_thresholds.
-    match_th = resolve_thresholds(sess, llm, s)
+    match_th = resolve_thresholds(sess, llm, s).value
     category_text = ensure_text(proposed.get("category"))
 
     ckey = ("category", category_text)

@@ -62,7 +62,8 @@ def _stub_grounding(monkeypatch, *, raise_after_release: bool = False) -> None:
     monkeypatch.setattr(grounding, "get_control_candidates",
                         lambda sess, itot: [{"ControlLibraryID": 1, "ControlCode": "C1",
                                             "Domain": "d", "ControlName": "MFA", "text": "MFA"}])
-    monkeypatch.setattr(control_mapping, "_min_score", lambda sess, llm, s: 0.0)
+    monkeypatch.setattr(control_mapping, "_min_score",
+                        lambda sess, llm, s: grounding.Threshold(0.0, "test"))
     if raise_after_release:
         def _boom(*a, **k):
             raise RuntimeError("systemic rerank failure")

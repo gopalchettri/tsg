@@ -224,17 +224,24 @@ def main() -> int:
     @check("threshold resolved (calibrating now if not stored)")
     def _thresholds():
         from app.db.engine import db_session
-        from app.pipeline import embeddings, grounding
+        from app.pipeline import grounding
         from app.pipeline.llm import get_llm
-        pair = (s.embedding_model, s.reranker_model)
         if "grounding_match_threshold" in s.model_fields_set:
             raise SkipCheck(f"pinned in env: verified>={s.grounding_match_threshold} "
                             "(auto-calibration disabled)")
-        was_stored = embeddings.load_thresholds(pair) is not None
+        # Report what ACTUALLY happened. This used to guess from a pre-read
+        # (`"already stored" if was_stored else "CALIBRATED NOW and stored"`), so when
+        # calibration silently failed - library under 5 entries, class overlap, Mongo down -
+        # it printed "CALIBRATED NOW and stored" over a static fallback. The one check whose
+        # purpose is confirming provenance, asserting the opposite of the truth, in exactly
+        # the failure mode it exists to catch.
         with db_session() as sess:
-            match_th = grounding.resolve_thresholds(sess, get_llm(), allow_calibration=True)
-        origin = "already stored" if was_stored else "CALIBRATED NOW and stored"
-        return f"verified>={match_th:.1f}  ({origin})"
+            th = grounding.resolve_thresholds(sess, get_llm(), allow_calibration=True)
+        if th.origin == "static_default":
+            raise SkipCheck(f"NOT calibrated: verified>={th.value:.1f} is the static default, "
+                            "tuned for a DIFFERENT model pair. Seed the threat library "
+                            "(>=5 entries) so boot can calibrate, or pin it deliberately.")
+        return f"verified>={th.value:.1f}  ({th.origin})"
 
     print("\n" + "=" * 90)
     if _FAILED:

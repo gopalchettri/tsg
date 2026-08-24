@@ -73,7 +73,8 @@ def _stub(monkeypatch, results_for):
     monkeypatch.setattr(grounding, "get_control_candidates",
                         lambda sess, itot: [{"ControlLibraryID": 1, "ControlCode": "C1",
                                             "Domain": "d", "ControlName": "MFA", "text": "MFA"}])
-    monkeypatch.setattr(control_mapping, "_min_score", lambda sess, llm, s: 0.0)
+    monkeypatch.setattr(control_mapping, "_min_score",
+                        lambda sess, llm, s: grounding.Threshold(0.0, "test"))
     monkeypatch.setattr(grounding, "ground_control_queries",
                         lambda llm, flat, candidates, s: [results_for(i)
                                                         for i in range(len(flat))])
@@ -162,7 +163,8 @@ def test_total_rerank_failure_still_rolls_back_and_stamps_nothing(monkeypatch):
 
     monkeypatch.setattr(grounding, "get_control_candidates",
                         lambda sess, itot: [{"ControlLibraryID": 1, "text": "MFA"}])
-    monkeypatch.setattr(control_mapping, "_min_score", lambda sess, llm, s: 0.0)
+    monkeypatch.setattr(control_mapping, "_min_score",
+                        lambda sess, llm, s: grounding.Threshold(0.0, "test"))
 
     def _boom(*a, **k):
         raise RuntimeError("rerank_many: all 3 rerank calls failed")
