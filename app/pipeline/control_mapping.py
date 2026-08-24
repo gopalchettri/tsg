@@ -129,7 +129,8 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
             per_output.append((output_id, query))
         skipped = len(outputs) - len(per_output)
         min_score = _min_score(sess, llm, s)
-        inserted = dropped = 0
+        inserted = dropped = unanswered = 0
+        answered: list[str] = []
         if per_output:
             texts = list(dict.fromkeys(q for _, q in per_output))
             qv_map: dict[str, list[float]] = {}
@@ -148,7 +149,16 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
             sess.commit()  # End the lease transaction before the slow grounding call.
             flat = [(q, qv_map.get(q)) for _, q in per_output]
             match_lists = grounding.ground_control_queries(llm, flat, candidates, s)
-            for (output_id, _query), matches in zip(per_output, match_lists):
+            for (output_id, _query), result in zip(per_output, match_lists):
+                if not result.answered:
+                    # NO ANSWER for this output (its rerank item failed) — as opposed to an
+                    # answer of "nothing matched". Leave it completely alone: no map rows, and
+                    # crucially NOT in `answered`, so the stamp below skips it and the next
+                    # mapping run picks it straight back up.
+                    unanswered += 1
+                    continue
+                answered.append(output_id)
+                matches = result.matches
                 # KEEP the best[cid] dedup: the PK (OutputID, ControlLibraryID) turns any
                 # duplicate into an IntegrityError the outer except would swallow into
                 # controls.mapping_failed — losing the whole output's mapping on one
@@ -170,10 +180,26 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 if keep:
                     sess.execute(insert(m.Threat_Scenario_Control_Map), keep)
                     inserted += len(keep)
-        # Timestamp every selected output so it is not processed again.
-        sess.execute(update(m.Threat_Scenario_Output)
-                    .where(m.Threat_Scenario_Output.OutputID.in_([oid for oid, _ in outputs]))
-                    .values(ControlsMappedAt=now()))
+        # Timestamp the outputs we ACTUALLY ANSWERED, plus the ones that had no groundable
+        # query at all — those are answered by definition, there is nothing to retry for them.
+        #
+        # NOT the whole `outputs` list, which is what this used to be. The stamp is permanent
+        # (nothing anywhere clears it) and `ControlsMappedAt IS NULL` is the ONLY thing that
+        # keeps an output eligible for a later run — so stamping an output whose rerank had
+        # merely failed converted one transient 429 into a permanent, unrecoverable,
+        # authoritative-looking "the control library has nothing for this threat". Leaving it
+        # NULL is the entire fix: the row just stays in the queue and the next run retries it.
+        groundable = {oid for oid, _ in per_output}
+        to_stamp = answered + [oid for oid, _ in outputs if oid not in groundable]
+        if to_stamp:
+            sess.execute(update(m.Threat_Scenario_Output)
+                        .where(m.Threat_Scenario_Output.OutputID.in_(to_stamp))
+                        .values(ControlsMappedAt=now()))
+        if unanswered:
+            # Loud, attributable and joined to the session — unlike llm.rerank_many's
+            # `rerank_item_failed`, which logs an anonymous batch index that joins to nothing.
+            log.warning("controls.unanswered_left_for_retry", session_id=sid,
+                        unanswered=unanswered, of=len(per_output))
         if not per_output:
             if durable:
                 sess.commit()
@@ -186,11 +212,16 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                         # now, the metric was constant. Historical rows keep the old key.
                         DetailJSON=json.dumps({"outputs": len(per_output), "mapped": inserted,
                                                 "dropped": dropped,
+                                                # Same discipline as tasks._validate_candidates'
+                                                # `degraded`: a fail-open path must PERSIST how
+                                                # often it degraded, or afterwards a degraded run
+                                                # is indistinguishable from a clean one.
+                                                "unanswered": unanswered,
                                                 "skipped": skipped, "itot": itot or "",
                                                 "itot_filter_applied": itot is not None,
                                                 "min_score": min_score}))
         log.info("controls.mapped", session_id=sid, outputs=len(per_output), mapped=inserted,
-                dropped=dropped, skipped=skipped, itot=itot,
+                dropped=dropped, unanswered=unanswered, skipped=skipped, itot=itot,
                 min_score=min_score)
         if durable:
             sess.commit()

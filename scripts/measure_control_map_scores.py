@@ -171,20 +171,32 @@ def main() -> int:
                                                 candidates, s)
 
     # --- per-query score shape ------------------------------------------------------------
+    # ControlMatches.answered separates "we reranked and nothing scored" (a real data point)
+    # from "we never got an answer" (a failed rerank item — not a measurement). Folding the
+    # second into the first would inflate the "0 controls" column at EVERY threshold and, with
+    # one provider blip, suppress the recommendation entirely while blaming retrieval.
+    measured = [r.matches for r in results if r.answered]
+    unanswered = len(results) - len(measured)
     best: list[float] = []
     at_k: list[float] = []
     shortlist_sizes: list[int] = []
-    for matches in results:
+    for matches in measured:
         scores = [score for _row, score in matches]
         shortlist_sizes.append(len(scores))
         if scores:
             best.append(scores[0])
             at_k.append(scores[min(s.control_map_top_k, len(scores)) - 1])
 
+    if unanswered:
+        print(f"NOTE  {unanswered} of {len(results)} queries never got an answer (their rerank "
+            "item failed — look for rerank_many.item_failed). EXCLUDED from everything below "
+            "rather than counted as 'no controls'; re-run if this number is not 0.")
+        print()
     if not best:
-        print("FAIL  every query returned an EMPTY shortlist — that is a retrieval problem, not a "
-            "threshold one. Confirm the control_library embedding group is populated "
-            "(POST /v1/tsg/admin/embeddings) before reading anything below.")
+        print("FAIL  every measured query came back with an empty shortlist — that is a "
+            "retrieval problem, not a threshold one. Confirm the control_library embedding "
+            "group is populated (scripts/refresh_embeddings.py --group control_library) "
+            "before reading anything below.")
         return 2
 
     print("SCORE DISTRIBUTION  (reranker score, 0-100)")
@@ -199,13 +211,17 @@ def main() -> int:
     # --- what each threshold would actually DO ---------------------------------------------
     # The only number that matters for the silent-failure risk is `empty`: scenarios that would
     # publish controls: [] and be read as a healthy library gap.
-    print(f"WHAT EACH THRESHOLD WOULD DO  ({len(results)} scenarios, capped at "
+    print(f"WHAT EACH THRESHOLD WOULD DO  ({len(measured)} measured scenarios, capped at "
         f"top_k={s.control_map_top_k})")
     print("  threshold   scenarios with 0 controls   mean controls/scenario")
-    rows = sweep(results, s.control_map_top_k)
+    rows = sweep(measured, s.control_map_top_k)
     for t, empty, mean_kept in rows:
-        flag = "  <-- in force" if abs(t - in_force) < 2.5 else ""
-        print(f"  {t:>9}   {empty:>25}   {mean_kept:>21.2f}{flag}")
+        print(f"  {t:>9}   {empty:>25}   {mean_kept:>21.2f}")
+    # The in-force value gets its OWN line, evaluated at the real float. Flagging the nearest
+    # swept row instead left dead bands (nothing within 2.5 of, say, 35.0), and when the flag
+    # missed, the single most decision-relevant number silently vanished from the report.
+    in_force_empty = sum(1 for ms in measured if not any(sc >= in_force for _r, sc in ms))
+    print(f"  {in_force:>9.1f}   {in_force_empty:>25}   {'':>21}  <-- IN FORCE NOW")
     print()
 
     # --- the recommendation -----------------------------------------------------------------

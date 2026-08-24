@@ -68,11 +68,13 @@ def _stub_grounding(monkeypatch, *, raise_after_release: bool = False) -> None:
             raise RuntimeError("systemic rerank failure")
         monkeypatch.setattr(grounding, "ground_control_queries", _boom)
     else:
-        # New contract: a LIST of (row, score) per query, best-first (library-first
-        # redesign) — map_controls iterates each query's list and caps at top_k.
+        # Contract: one ControlMatches per query — the reranked list best-first, plus
+        # `answered`, which separates "we reranked and nothing matched" from "we never got
+        # an answer". map_controls iterates .matches and caps at top_k.
         monkeypatch.setattr(grounding, "ground_control_queries",
-                            lambda llm, flat, candidates, s: [[({"ControlLibraryID": 1}, 90.0)]
-                                                            for _ in flat])
+                            lambda llm, flat, candidates, s: [
+                                grounding.ControlMatches([({"ControlLibraryID": 1}, 90.0)], True)
+                                for _ in flat])
 
 
 class _FakeLLM:

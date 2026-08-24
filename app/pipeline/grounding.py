@@ -22,7 +22,7 @@ import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -218,17 +218,44 @@ def get_control_candidates(sess: Session, itot: str | None) -> list[dict[str, An
     return [dict(r) for r in sess.execute(q).mappings()]
 
 
+class ControlMatches(NamedTuple):
+    """One control query's OUTCOME — deliberately not a bare list.
+
+    `answered=False` means we never got a verdict for this query (its rerank item failed).
+    `answered=True` with `matches == []` means we DID rerank it and nothing scored: a real,
+    reportable library gap.
+
+    Why a type and not `None`: those two states used to share the value `[]`, and that single
+    conflation was the worst defect in this file (see ground_control_queries). Replacing one
+    overloaded sentinel with another — `None` vs `[]` — would leave the distinction resting on
+    convention, so the next reader can re-conflate it exactly as this one was. A named field
+    cannot be conflated by accident, and a caller who forgets it and iterates the result
+    directly fails loudly on the tuple unpack instead of silently treating "no answer" as
+    "no match"."""
+    matches: list[tuple[dict[str, Any], float]]
+    answered: bool
+
+
 def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] | None]],
-                        rows: list[dict[str, Any]], s: Settings) -> list[list[tuple[dict[str, Any], float]]]:
+                        rows: list[dict[str, Any]], s: Settings) -> list[ControlMatches]:
     """Batch Step-4 grounding: every query shortlists against the same candidate set, then
     all shortlists rerank in one llm.rerank_many call instead of one round trip per query.
 
-    `queries` = (text, optionally pre-embedded qv). Returns, PER QUERY, the full reranked
-    shortlist as (row, score) best-first — never collapsed to a single best: the caller now
-    sends ONE scenario-text query per output and needs control_map_top_k distinct matches
-    from it, so collapsing here would silently cap every output at one control. [] for a
-    query whose shortlist was empty or whose rerank failed — per-item fail-open (dropped +
-    logged), raising only when rerank_many itself judges the whole batch failed.
+    `queries` = (text, optionally pre-embedded qv). Returns, PER QUERY, a ControlMatches
+    carrying the full reranked shortlist best-first — never collapsed to a single best: the
+    caller sends ONE scenario-text query per output and needs control_map_top_k distinct
+    matches from it, so collapsing here would silently cap every output at one control.
+
+    ANSWERED vs MATCHED are different questions and this return type keeps them apart. Both
+    used to be `[]`, and map_controls could not tell them apart: it stamped ControlsMappedAt
+    for an output whose rerank had merely FAILED, `ControlsMappedAt IS NULL` then excluded that
+    output from every later run, and the API published `ControlsMapped=true` with an empty
+    control list — which schemas.py documents, three times over, as "a genuine library-gap
+    signal, not an error". One 429 became a permanent curated fact about the control library.
+
+    Per-item fail-open is retained deliberately (one bad query must not lose the batch);
+    rerank_many still raises when the WHOLE batch failed, which map_controls turns into a
+    rollback with nothing stamped — already correct, and pinned by a test.
 
     HYBRID shortlist: the cosine leg (existing) is UNIONED with a BM25 keyword leg over the
     same "ControlName: Description" corpus — rare exact tokens (product names, acronyms)
@@ -285,9 +312,12 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
                 scored.append(None)
         if items and failures == len(items):
             raise RuntimeError(f"all {len(items)} control rerank calls failed")
-    results: list[list[tuple[dict[str, Any], float]]] = [[] for _ in queries]
+    # Seeded answered=True: a query with NO shortlist genuinely matched nothing, which is a
+    # real answer. Only a FAILED rerank below flips one to answered=False.
+    results: list[ControlMatches] = [ControlMatches([], True) for _ in queries]
     for i, rr in zip(todo, scored):
         if rr is None:
+            results[i] = ControlMatches([], False)   # no answer — NOT "no match"
             continue
         docs = shortlists[i]
         if len(rr) != len(docs):  # same fail-loud guard as find_closest_match
@@ -295,7 +325,8 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
         # Full reranked list, best-first — the caller filters by min score, dedups by
         # ControlLibraryID and caps at control_map_top_k. Collapsing to max() here would
         # silently cap every scenario at ONE mapped control under the one-query design.
-        results[i] = sorted(zip(docs, rr), key=lambda rs: rs[1], reverse=True)
+        results[i] = ControlMatches(
+            sorted(zip(docs, rr), key=lambda rs: rs[1], reverse=True), True)
     return results
 
 

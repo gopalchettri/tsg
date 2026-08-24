@@ -324,8 +324,8 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
     ]
 
 def threat_validation_prompt(asset_name: str, asset_context: dict[str, Any],
-                             subsystems: list[dict[str, Any]],
-                             candidates: list[dict[str, Any]]) -> list[dict]:
+                            subsystems: list[dict[str, Any]],
+                            candidates: list[dict[str, Any]]) -> list[dict]:
     """Stage-1a validator: judge LIBRARY candidates' applicability to THIS asset — the LLM as
     a VALIDATOR, never a search engine. Candidates arrive index-keyed (1..N), never by DB id:
     _EXCLUDE_DB_KEY_TO_PROMPT stays intact and the server maps indexes back to catalogue rows.
@@ -612,7 +612,7 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
     payload = {**base_ctx, "threat_type": redact(threat_type),
             "threat_name": redact(threat_name), "threat_actors": safe_actors}
     if category:
-        # [A2] Stage 1's PROPOSED category, stored raw by tasks._build_threat_records — model
+        # Stage 1's PROPOSED category, stored raw by tasks._build_threat_records — model
         # output, so it crosses redacted like threat_type/threat_name. Omitted when absent, which
         # keeps the payload byte-identical to the pre-A2 one (same fail-open contract as intel).
         payload["threat_category"] = redact(category)
