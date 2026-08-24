@@ -141,7 +141,8 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
                         threats: list[dict],
                         priors: list[dict] | None = None,
                         asset_name: str = "",
-                        threshold: float | None = None) -> dict[str, dict]:
+                        threshold: float | None = None,
+                        compare_within: bool = True) -> dict[str, dict]:
     """Find threat IDs that mean the same thing as a higher-ranked threat already in this
     batch or already active on the session. The caller removes these before inserting.
 
@@ -157,7 +158,12 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
     First-wins: each threat is only compared against threats that survived so far, never
     against ones already dropped. Similarity isn't transitive (A~B and B~C doesn't mean
     A~C), so comparing against a dropped item could wrongly chain-drop something. This
-    only works because threats always arrive in a stable, deterministic order."""
+    only works because threats always arrive in a stable, deterministic order.
+
+    compare_within=False turns off that within-`threats` comparison entirely (only `priors`
+    can drop an entry) — for retrieved LIBRARY candidates, whose distinctness from each
+    other the curator already vouched for, so only a match against something OUTSIDE this
+    round's library set should count."""
     # Labels are compared with the asset name stripped out first (same as grounding does).
     # Every label ends in "... of <asset name>", so leaving it in mostly just confirms
     # "same asset" rather than "same threat" — stripping it raised the median similarity
@@ -232,7 +238,7 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
         if qv is None:
             kept.append(label)
             continue
-        for other in prior + kept:
+        for other in prior + (kept if compare_within else []):
             ov = vectors.get(other)
             # No check to skip comparing an entry to itself — it isn't needed. `kept` only
             # gets an entry added after it's confirmed unique, and `prior` was read before
@@ -713,6 +719,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     rows: list[dict] = []
     duplicates = 0
     validator_reversals = 0
+    retrieved_near_dupes = 0
     dup_rows: list[dict] = []  # Identified_Duplicate_Threat rows — audit-only, see _duplicate_row
     retrieved_summaries: list[dict] = []
     attribution: dict[str, list[int]] = {}  # ThreatID -> supporting systems it reaches
@@ -731,6 +738,33 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         rows.append(row)
         threats.append(summary)
         retrieved_summaries.append(summary)
+
+    # A retrieved LIBRARY candidate is checked against the exact identity hash of what's
+    # already active (existing_identities, above) but never against a PRIOR round's
+    # near-duplicate paraphrase: a prior round may have GENERATED a threat with different
+    # wording, or grounded to a related library row whose official name doesn't hash-match
+    # this round's, so identity_hash alone misses it. On the additive next-set path
+    # prior_threats carries exactly those rows, so scan retrieved candidates against them
+    # too. Retrieved-vs-retrieved stays exempt (compare_within=False): two distinct library
+    # rows surviving together is the curator's call, not this scan's.
+    if prior_threats and retrieved_summaries:
+        retrieved_dupes = _semantic_duplicates(llm, sid, ss, retrieved_summaries, prior_threats,
+                                                scenario_session["AssetName"],
+                                                threshold=tn.semantic_near_duplicate_threshold,
+                                                compare_within=False)
+        if retrieved_dupes:
+            retrieved_near_dupes = len(retrieved_dupes)
+            by_id = {r["ThreatID"]: r for r in rows}
+            dup_rows.extend(
+                _duplicate_row(by_id[tid], info["reason"],
+                            duplicate_of=info["duplicate_of_threat_id"], score=info["score"])
+                for tid, info in retrieved_dupes.items() if tid in by_id
+            )
+            rows = [r for r in rows if r["ThreatID"] not in retrieved_dupes]
+            threats = [t for t in threats if t["threat_id"] not in retrieved_dupes]
+            retrieved_summaries = [t for t in retrieved_summaries if t["threat_id"] not in retrieved_dupes]
+            log.info("threats.retrieved_semantic_duplicates_dropped", session_id=sid, subsystem=ss,
+                    dropped=retrieved_near_dupes)
 
     # --- Stage 1b: GAP GENERATION — the LLM proposes only what the library did not fill.
     shortfall = max_threats - len(rows)
@@ -901,6 +935,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                                         "identity_duplicates": duplicates,
                                         "validator_reversals_blocked": validator_reversals,
                                         "semantic_near_duplicates": near_dupes,
+                                        "retrieved_semantic_duplicates": retrieved_near_dupes,
                                         "coverage": {**cov, "gaps": cov["gaps"][:50]}}))
     sess.commit()
     if dup_rows:

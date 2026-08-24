@@ -227,6 +227,26 @@ def check_semantic_duplicates_against_priors() -> None:
     print("ok  _semantic_duplicates compares against prior rounds")
 
 
+def check_semantic_duplicates_compare_within_flag() -> None:
+    """compare_within=False is what lets a RETRIEVED library batch skip comparing its own
+    candidates against each other (the curator already vouched for two library rows
+    coexisting) while still catching a candidate that duplicates a PRIOR round's threat."""
+    llm = _StubLLM()
+    threats = [_threat("t1", "alpha one"), _threat("t2", "alpha two")]  # same axis: would
+    # collide with EACH OTHER under compare_within=True (see check_semantic_duplicates_
+    # same_category above), which is exactly what must NOT happen here.
+    no_priors = _semantic_duplicates(llm, "sess", 0, threats, None, ASSET,
+                                    threshold=0.92, compare_within=False)
+    assert no_priors == {}, no_priors  # neither drops the other absent a prior
+
+    priors = [_threat("p1", "alpha zero")]  # same axis as both t1 and t2
+    with_priors = _semantic_duplicates(llm, "sess", 0, threats, priors, ASSET,
+                                        threshold=0.92, compare_within=False)
+    assert set(with_priors) == {"t1", "t2"}, with_priors  # each judged independently vs prior
+    assert all(v["duplicate_of_threat_id"] == "p1" for v in with_priors.values())
+    print("ok  _semantic_duplicates compare_within=False exempts same-batch, keeps priors")
+
+
 def check_semantic_scan_failure_is_not_fatal() -> None:
     """A failed scan must degrade to 'no duplicates', never lose the round's threats."""
 
@@ -553,6 +573,7 @@ def demo() -> None:
     check_asset_name_stripping()
     check_semantic_duplicates_no_chain_drop()
     check_semantic_duplicates_against_priors()
+    check_semantic_duplicates_compare_within_flag()
     check_semantic_scan_failure_is_not_fatal()
     check_ranking_is_stable_and_meaningful()
     check_score_floor_still_reachable()
