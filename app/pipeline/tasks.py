@@ -1561,6 +1561,14 @@ def _library_hits(sess: Session, work: list, enriched: dict, scenario_session: d
     re-moderating identical prose per asset would put a paid per-request call back into the
     path whose entire purpose is not having one.
     """
+    # Canonicalize subsystem order before it becomes part of the cache key: SubsystemsJSON
+    # preserves the ORIGINAL request payload's array order, so the same real asset submitted
+    # twice with its supporting systems listed in a different order would otherwise hash to
+    # two DIFFERENT profile keys for what is actually one profile — splitting the
+    # cross-tenant scenario-library cache this table exists to share. Sorted once, by id, and
+    # used for BOTH profile_key and live_names so their positional correspondence (what makes
+    # substitute_names exact rather than approximate) stays intact.
+    subsystems = sorted(subsystems, key=lambda s: (s.get("id") is None, s.get("id")))
     profile = scenario_profile.profile_key(
         json.loads(scenario_session["SectorIDsJSON"]) if scenario_session.get("SectorIDsJSON") else [],
         asset_context, subsystems)

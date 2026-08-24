@@ -24,6 +24,7 @@ from app.core.enums import DuplicateReason
 from app.pipeline import accept, scoping, tasks
 from app.pipeline.cascade import NextSetOutcome, _build_regen_audit_detail, _next_set_outcome
 from app.pipeline.tasks import (
+    _library_hits,
     _scrub_model_output,
     _semantic_duplicates,
     _usable_proposal,
@@ -245,6 +246,30 @@ def check_semantic_duplicates_compare_within_flag() -> None:
     assert set(with_priors) == {"t1", "t2"}, with_priors  # each judged independently vs prior
     assert all(v["duplicate_of_threat_id"] == "p1" for v in with_priors.values())
     print("ok  _semantic_duplicates compare_within=False exempts same-batch, keeps priors")
+
+
+def check_library_hits_canonicalizes_subsystem_order() -> None:
+    """The same real asset, submitted twice with its supporting systems in different order
+    (SubsystemsJSON preserves the request's own array order), must hash to the SAME
+    profile_key -- otherwise the scenario-library cache silently splits per request-order
+    instead of per real profile. work=[] takes the early-return branch before any DB call,
+    so this needs no session and no candidates."""
+    scenario_session = {"AssetName": "Water Pumping Station", "SectorIDsJSON": "[]"}
+    asset_context = {"asset_type": "Pumping Station", "sector": "Energy & Water",
+                    "sub_sector": "Water Supply"}
+    sub_a = {"id": 41, "name": "SCADA HMI", "asset_type": "OT", "technology_used": ["Siemens"]}
+    sub_b = {"id": 42, "name": "Billing Portal", "asset_type": "IT", "technology_used": ["Django"]}
+
+    _, key_forward, names_forward = _library_hits(
+        None, [], {}, scenario_session, [sub_a, sub_b], asset_context, {})
+    _, key_reversed, names_reversed = _library_hits(
+        None, [], {}, scenario_session, [sub_b, sub_a], asset_context, {})
+
+    assert key_forward == key_reversed, (key_forward, key_reversed)
+    # Canonicalized identically for both calls, so the position-matched substitution target
+    # list is unaffected by which order the caller happened to submit -- always id-sorted.
+    assert names_forward == names_reversed == ["Water Pumping Station", "SCADA HMI", "Billing Portal"]
+    print("ok  _library_hits canonicalizes subsystem order into the cache key")
 
 
 def check_semantic_scan_failure_is_not_fatal() -> None:
@@ -574,6 +599,7 @@ def demo() -> None:
     check_semantic_duplicates_no_chain_drop()
     check_semantic_duplicates_against_priors()
     check_semantic_duplicates_compare_within_flag()
+    check_library_hits_canonicalizes_subsystem_order()
     check_semantic_scan_failure_is_not_fatal()
     check_ranking_is_stable_and_meaningful()
     check_score_floor_still_reachable()
