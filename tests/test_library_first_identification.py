@@ -317,3 +317,69 @@ def test_empty_library_degrades_to_generation_only(monkeypatch):
     assert all(t.get("selection_source") is None for t in threats)
     # only the threats-stage chat ran — no validator call without candidates
     assert all("VALIDATING pre-selected" not in sys for sys, _ in llm.chat_calls)
+
+
+def test_generation_asks_for_a_buffer_so_n_new_threats_actually_land(monkeypatch):
+    """find_threats(N) must return N whenever N obtainable threats exist.
+
+    THE BUG. Stage 1b asked the model for EXACTLY `shortfall`, then the consume loop dropped any
+    proposal duplicating what the session already holds — and nothing refilled them. So
+    find_threats(5) structurally returned fewer than 5 whenever the model repeated anything, and
+    next-set's "show more 5" delivered 4. cascade._buffered_ask tried to compensate from OUTSIDE
+    by over-asking, which is why it collided with max_threats_per_asset (a per-call identification
+    ceiling, unrelated to delivery) and forced operators to keep two settings in a 2x ratio.
+
+    The buffer now lives in Stage 1b, where the loss is measurable. This test pins that: the model
+    honours whatever count it is asked for and repeats itself half the time, so a bare-shortfall
+    ask cannot reach the target and a buffered one can.
+    """
+    monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
+
+    asked: list[int] = []
+    real_prompt = tasks.prompts.threats_prompt
+
+    def _capture(*a, **kw):
+        if kw.get("quota") is not None:          # the gap-generation call, not the threats prompt
+            asked.append(kw["max_threats"])
+        return real_prompt(*a, **kw)
+    monkeypatch.setattr(tasks.prompts, "threats_prompt", _capture)
+
+    class _RepeatingLLM(FakeLLM):
+        """Returns EXACTLY as many proposals as it was asked for, half of them the same threat.
+
+        Honouring the requested count is what makes this test load-bearing: a fake that always
+        returns a fixed surplus would pass on the old code too, because the consume loop already
+        takes survivors up to the target. The defect was never the loop — it was the ask.
+        """
+        def chat(self, messages, temperature=None, expected_type=None):
+            if "VALIDATING pre-selected library threats" in messages[0]["content"]:
+                return super().chat(messages, temperature, expected_type)
+            out = []
+            for i in range(asked[-1]):
+                if i % 2 == 0:      # a repeat — only the first copy survives identity dedup
+                    out.append({"category": "Tampering", "type": "Logic/Configuration Manipulation",
+                                "name": "Unauthorised setpoint modification",
+                                "generic_name": "Unauthorised setpoint modification", "actors": []})
+                else:
+                    out.append({"category": "Repudiation", "type": "Audit Evidence Loss",
+                                "name": f"Distinct novel threat {i}",
+                                "generic_name": f"Distinct novel threat {i}", "actors": []})
+            return json.dumps(out), None
+
+    want = 5
+    Session = sessionmaker(bind=_engine(), future=True)
+    with Session() as s:
+        _seed_library(s)
+        scenario_session = _seed_session(s)
+        threats, _prov = find_threats(s, scenario_session, SUBSYSTEMS, ASSET_CONTEXT,
+                                    _RepeatingLLM(), TASK_ID, max_threats=want)
+
+    assert asked, "gap generation never ran — the library filled everything, so this test is vacuous"
+    # THE assertion. Set TSG_GAP_GENERATION_BUFFER=1.0 (which makes _gap_ask return the bare
+    # shortfall, i.e. the old behaviour) and this fails: the model repeats itself, the repeats are
+    # dropped, and nothing refills them.
+    names = [t.get("threat_name") for t in threats]
+    assert len(threats) == want, (
+        f"asked for {want}, got {len(threats)} — generation under-delivered because its ask was "
+        f"not buffered against dedup loss (gap asks: {asked}, delivered: {names})")
+    assert len(set(names)) == len(names), f"delivered set is not unique: {names}"

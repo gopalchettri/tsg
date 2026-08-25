@@ -392,6 +392,15 @@ class Settings(BaseSettings):
     max_threats_per_asset: int = Field(
         10, validation_alias=AliasChoices("TSG_MAX_THREATS_PER_ASSET", "TSG_MAX_THREATS_PER_SUBSYSTEM"))
 
+    # TSG_GAP_GENERATION_BUFFER — how many threats to REQUEST per NEW one needed.
+    # Gap generation loses proposals to dedup: the model re-proposes threats the session already
+    # holds even though the exclusion list names every one of them. Asking for exactly the
+    # shortfall therefore guarantees under-delivery ("show more 5" returning 4), so the ask is
+    # multiplied by this and the surplus is discarded by the consume loop at no cost beyond the
+    # tokens. 2.0 absorbs a 50% repeat rate. Raise it if a deployment still sees short next-set
+    # clicks against its library; 1.0 disables the buffer.
+    gap_generation_buffer: float = Field(2.0, ge=1.0)
+
     # TSG_MAX_ACTORS_PER_THREAT — caps actor names from one threat to limit candidate rows and
     # triage work. A higher value keeps more actors but increases processing and review work.
     max_actors_per_threat: int = Field(10, ge=1)
@@ -755,13 +764,6 @@ class Settings(BaseSettings):
                 semantic_near_duplicate_threshold=self.semantic_near_duplicate_threshold,
                 note="below ~0.5 nearly every threat pair matches — the near-duplicate log stops "
                     "being a signal and cannot be used to calibrate a real cutoff")
-        if self.max_threats_per_asset < self.next_set_size * 1.25:
-            get_logger(__name__).warning(
-                "config.thin_next_set_headroom",
-                next_set_size=self.next_set_size,
-                max_threats_per_asset=self.max_threats_per_asset,
-                note="cascade._buffered_ask caps the additive ask at max_threats_per_asset, so a "
-                    "next-set click loses its 2x dedup cushion and will under-deliver more often")
         return self
 
     # Unset reaper grace follows stage_lease_seconds (must run AFTER _derive_stage_lease_seconds

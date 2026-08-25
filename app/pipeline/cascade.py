@@ -30,6 +30,7 @@ from app.core.security import redact
 from app.db import dal
 from app.db import models as m
 from app.db.dal import RegenerateConflict, guid, now
+from app.db.engine import db_session
 from app.pipeline import control_mapping, tasks
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 from app.sse import bus
@@ -376,7 +377,15 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
             scen_provs = tasks.write_scenarios(sess, scenario_session, subsystems, asset_context, threats, llm, task_id,
                                             epoch=epoch, regen_targets=targets, require_lock=True,
                                             on_before_commit=_stage_regen_audit,
-                                            unresolved_targets=unresolved)
+                                            unresolved_targets=unresolved,
+                                            # Generate concurrently, like the full run. write_scenarios
+                                            # commits right after claim_stage and nothing writes to
+                                            # `sess` before the batch dispatches, so the workers'
+                                            # own sessions cannot race the caller's. A single-target
+                                            # regen still takes the sequential branch by itself
+                                            # (_generate_scenario_batch short-circuits on one item),
+                                            # so this costs nothing on the common case.
+                                            session_factory=db_session)
             if not scen_provs:
                 _settle_or_raise(sess, sid, subsystem_id, epoch, SubsystemLevel.SCENARIOS, "regen")
             else:
@@ -420,13 +429,6 @@ def _coverage_exclusions(threats: list[dict]) -> list[str]:
         out.append(lbl)
     return out
 
-
-def _buffered_ask(shortfall: int, cap: int) -> int:
-    """Return a bounded request count for a shortfall.
-
-    The result is twice `shortfall`, capped at `cap`, and never below `shortfall`.
-    """
-    return max(shortfall, min(shortfall * 2, cap))
 
 def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
                         subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
@@ -532,8 +534,14 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
                     new_threats, _prov = tasks.find_threats(sess, scenario_session, subsystems, asset_context, llm, task_id,
                                                         epoch=threats_epoch, supersede=False, exclude=exclude,
                                                         prior_threats=prior_threats,
-                                                        max_threats=_buffered_ask(next_set_size - len(fresh),
-                                                                                tn.max_threats_per_asset))
+                                                        # Exactly the shortfall. find_threats now
+                                                        # keeps its own promise (tasks._gap_ask
+                                                        # buffers the generation ask internally),
+                                                        # so the caller no longer over-asks to
+                                                        # compensate — which is what used to clamp
+                                                        # delivery to max_threats_per_asset, an
+                                                        # unrelated per-call identification ceiling.
+                                                        max_threats=next_set_size - len(fresh))
                 except LLMSlotUnavailable:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -561,7 +569,9 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
                 
             scen_provs = tasks.write_scenarios(sess, scenario_session, subsystems, asset_context, threats, llm, task_id,
                                             epoch=epoch, target_threat_ids=set(fresh), require_lock=True,
-                                            on_before_commit=_stage_next_set_audit)
+                                            on_before_commit=_stage_next_set_audit,
+                                            # Concurrent for the same reason as regenerate above.
+                                            session_factory=db_session)
             if not scen_provs:
                 _settle_or_raise(sess, sid, subsystem_id, epoch, SubsystemLevel.SCENARIOS, "next_set")
             else:

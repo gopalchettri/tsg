@@ -663,6 +663,21 @@ def _build_retrieved_records(cand: dict, sid: str, tenant: str, ss: int,
     return row, summary
 
 
+def _gap_ask(shortfall: int) -> int:
+    """How many threats to REQUEST to reliably land `shortfall` NEW ones.
+
+    Generation loses proposals to dedup — the model re-proposes threats the session already
+    holds even though the exclusion list names every one of them. Asking for exactly the
+    shortfall therefore guarantees under-delivery; asking for a multiple of it absorbs the loss
+    inside the SAME single call.
+
+    Bounded below by `shortfall` so a factor of 1.0 disables the buffer rather than inverting it.
+    `gap_generation_buffer` is a setting so a deployment seeing shortfalls can raise it without a
+    code change — the right multiple depends on how repetitive the model is against that library.
+    """
+    return max(shortfall, math.ceil(shortfall * get_settings().gap_generation_buffer))
+
+
 def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
                 epoch: int = _EPOCH, categories: list[str] | None = None,
                 actor_examples: list[str] | None = None,
@@ -843,15 +858,28 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
             c = t.get("category")
             if c:
                 have[c] = have.get(c, 0) + 1
-        gap_quota = stride.allocate(shortfall, cats, existing=have)
+        # ASK FOR MORE THAN THE SHORTFALL. Generation used to ask for exactly `shortfall` and
+        # then drop proposals that duplicate what the session holds (the `identity` /
+        # validator_rejected continues in the consume loop below), with nothing refilling them —
+        # so find_threats(N) structurally returned fewer than N whenever the model repeated
+        # anything, and next-set's "give me 5" delivered 4.
+        #
+        # The consume loop already handles over-supply correctly: it skips duplicates and breaks
+        # at `len(rows) >= max_threats`, so a surplus costs nothing but the tokens to generate it
+        # and can never overshoot the caller's target. Sizing the ask HERE is what makes
+        # find_threats keep its promise — cascade._buffered_ask used to over-ask from OUTSIDE,
+        # which is why it collided with max_threats_per_asset, a per-call identification ceiling
+        # that has nothing to do with delivery.
+        gap_ask = _gap_ask(shortfall)
+        gap_quota = stride.allocate(gap_ask, cats, existing=have)
         gap_gen_messages = prompts.threats_prompt(
             scenario_session["AssetName"], asset_context, subsystems,
-            max_threats=shortfall, categories=cats, exclude=exclude_all or None,
+            max_threats=gap_ask, categories=cats, exclude=exclude_all or None,
             quota=gap_quota)
         # `messages` is deliberately NOT traced: _ask_ai already persists the whole prompt to
         # Prompt_Log, and dumping it again here would put the full asset context in a second
         # place that has no retention policy.
-        with trace_step("GAP GENERATION", sid, shortfall=shortfall, categories=cats,
+        with trace_step("GAP GENERATION", sid, shortfall=shortfall, gap_ask=gap_ask, categories=cats,
                         exclude=exclude_all, prompt_messages=len(gap_gen_messages)) as _t:
             proposals, prov = _ask_ai(sess, llm, gap_gen_messages,
                                         scenario_session=scenario_session, subsystem_id=ss, stage="threats",
@@ -877,9 +905,13 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     grounding.prime_query_embeddings(llm, to_ground, grounding_cache)
     rows_before_generation = len(rows)
     for p, gp in zip(proposals, to_ground):
-        if len(rows) >= max_threats:            
-            log.warning("threats.over_proposed", session_id=sid,
-                        proposed=len(proposals), cap=max_threats)
+        if len(rows) >= max_threats:
+            # Reached the target with proposals to spare — the buffered ask working as intended,
+            # NOT an anomaly. This was a warning back when generation asked for exactly the
+            # shortfall, where a surplus meant the model ignored the count.
+            log.info("threats.gap_buffer_absorbed", session_id=sid,
+                    proposed=len(proposals), used=len(rows) - rows_before_generation,
+                    cap=max_threats)
             break
         
         if not dal.renew_lease(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
@@ -2302,10 +2334,18 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
                                             require_lock=True,
                                             # Only the worker entry point hands over a real
                                             # factory, so ONLY the worker generates in
-                                            # parallel. Every other caller (tests, the
-                                            # targeted regen/next-set paths that arrive with
-                                            # uncommitted rows on `sess`) stays sequential on
-                                            # the session it already owns.
+                                            # parallel — as do regenerate and next-set
+                                            # (cascade.py). This comment used to claim the
+                                            # targeted paths "arrive with uncommitted rows on
+                                            # `sess`" and had to stay sequential. That was FALSE
+                                            # at the point it mattered: write_scenarios commits
+                                            # immediately after claim_stage, _prepare_scenario_batch
+                                            # writes nothing, and the only statement before the
+                                            # batch dispatches is an SSE publish — so `sess` is
+                                            # clean on EVERY path. The uncommitted rows it meant
+                                            # (_reconcile_targeted_regen) are written AFTER
+                                            # generation. Tests passing session_factory=None still
+                                            # get the sequential branch.
                                             session_factory=db_session)
                 dal.append_audit(sess, AuditID=guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
                                 EntityID=scenario_session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,

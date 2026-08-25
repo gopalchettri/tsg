@@ -7,18 +7,27 @@ Assert-based, no framework — same style as the other scripts/ self-checks.
 Guards the two halves of the one-call duplicate fix:
   1 _coverage_exclusions sends the FULL session history (no 50-item truncation), newest-first,
     deduped, blanks dropped — the model can never re-propose a threat it wasn't told about.
-  2 _buffered_ask sizes the single additive call to survive dedup loss: 2x the shortfall,
-    capped at max_threats_per_asset, floored at the shortfall.
+  2 tasks._gap_ask sizes the GENERATION call to survive dedup loss: a multiple of the shortfall,
+    floored at the shortfall, with NO foreign cap.
+
+    Revised deliberately. This half used to read "cascade._buffered_ask ... capped at
+    max_threats_per_asset". That cap silently defeated the buffer whenever
+    max_threats_per_asset < 2 x next_set_size (the shipped dev config), because it clamped a
+    DELIVERY buffer with a per-call IDENTIFICATION ceiling. The buffer now lives inside
+    find_threats' Stage 1b, where the loss actually happens, so every caller benefits and no two
+    settings have to be kept in a ratio.
 """
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import get_settings
-from app.pipeline.cascade import _buffered_ask, _coverage_exclusions
+from app.pipeline.cascade import _coverage_exclusions
+from app.pipeline.tasks import _gap_ask
 
 
 def main() -> None:
@@ -46,13 +55,16 @@ def main() -> None:
     assert _coverage_exclusions(mixed) == ["Lib A", "B"], _coverage_exclusions(mixed)
     print("2 OK  dedup first-wins, blank dropped, library label preferred")
 
-    # 3 — buffered ask arithmetic: 2x shortfall, capped, floored.
-    assert _buffered_ask(3, 10) == 6    # normal: double the shortfall
-    assert _buffered_ask(5, 10) == 10   # defaults: 2x5 hits the cap exactly
-    assert _buffered_ask(5, 8) == 8     # cap binds
-    assert _buffered_ask(5, 3) == 5     # floor: never below the shortfall (cap < shortfall tuning)
-    assert _buffered_ask(1, 10) == 2    # smallest shortfall still gets headroom
-    print("3 OK  ask=2x shortfall, capped at per-asset ceiling, floored at shortfall")
+    # 3 — generation ask arithmetic: a multiple of the shortfall, floored, uncapped.
+    factor = get_settings().gap_generation_buffer
+    assert _gap_ask(0) == 0                                  # nothing needed, nothing asked
+    assert _gap_ask(3) == max(3, math.ceil(3 * factor))       # normal: buffered
+    assert _gap_ask(1) >= 1                                   # smallest shortfall still valid
+    assert _gap_ask(5) >= 5 and _gap_ask(50) >= 50             # NEVER below the shortfall
+    # THE regression: the ask must not be clamped by max_threats_per_asset. That clamp is what
+    # made "show more 5" deliver 4 whenever the ceiling was below 2 x next_set_size.
+    assert _gap_ask(5) > get_settings().max_threats_per_asset or factor == 1.0         or 5 * factor <= get_settings().max_threats_per_asset,         "gap ask must be sized by the shortfall alone, never by max_threats_per_asset"
+    print(f"3 OK  ask={factor}x shortfall, floored at shortfall, no per-asset cap")
 
     print("\nnext-set overfetch self-check OK")
 

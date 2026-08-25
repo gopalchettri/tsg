@@ -184,3 +184,76 @@ def test_slot_exhaustion_commits_the_billed_work_before_raising(monkeypatch, tmp
     assert set(rows) == {TID[0], TID[1]}                    # committed before the raise
     assert all(str(r["Status"]) == "complete" for r in rows.values())
     assert TID[2] not in rows                              # no error card: it never failed
+
+
+def test_the_targeted_path_generates_concurrently_too(monkeypatch, tmp_path):
+    """Regenerate and next-set must parallelise like the full run does.
+
+    They passed no `session_factory`, so `_generate_scenario_batch` took its sequential branch and
+    those clicks wrote one scenario at a time no matter what TSG_SCENARIO_GENERATION_CONCURRENCY
+    said. The comment justifying that claimed the targeted paths "arrive with uncommitted rows on
+    `sess`" — false at the point that matters: write_scenarios commits immediately after
+    claim_stage, _prepare_scenario_batch writes nothing, and the only statement before the batch
+    dispatches is an SSE publish. The rows that comment meant (_reconcile_targeted_regen) are
+    written AFTER generation.
+
+    This drives the TARGETED branch (`target_threat_ids`) through the same barrier: the fake LLM
+    refuses to answer until all three calls are in flight at once, so a sequential regression
+    DEADLOCKS and fails here rather than quietly passing slower.
+    """
+    llm = _BarrierLLM(parties=3)
+    monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
+    monkeypatch.setattr(tasks, "_fetch_intel", lambda *a, **k: None)
+    monkeypatch.setattr(tasks, "_finalize_scenario_batch", lambda *a, **k: None)
+    monkeypatch.setattr(get_settings(), "scenario_generation_concurrency", 3)
+
+    Session = sessionmaker(bind=_create_all(_engine(tmp_path)), future=True)
+    with Session() as s:
+        scenario_session = _seed(s)
+        provs = tasks.write_scenarios(
+            s, scenario_session, json.loads(scenario_session["SubsystemsJSON"]),
+            {"name": "Pumping Station", "asset_type": "Pumping Station"},
+            THREATS, llm, TASK_ID,
+            target_threat_ids={t["threat_id"] for t in THREATS},   # <- the targeted branch
+            session_factory=Session)
+
+    assert len(provs) == 3, "targeted generation lost items"
+    assert len(llm.threads) == 3, "targeted path ran on one thread — it is still sequential"
+    # Pairing survives concurrency here too: a scenario landing on the wrong threat is invisible
+    # in the API and severe in a risk register.
+    for threat_id, row in _outputs(Session).items():
+        expected = next(t for t in THREATS if t["threat_id"] == threat_id)
+        assert json.loads(row["ScenarioJSON"])["scenario_title"] == f"Title for {expected['threat_name']}"
+
+
+def test_a_single_target_regen_stays_sequential_and_opens_no_worker_session(monkeypatch, tmp_path):
+    """The common regenerate case is ONE scenario. `_generate_scenario_batch` short-circuits on a
+    single item, so passing session_factory must not cost a pointless extra connection — the
+    reason the plan adds no guard of its own."""
+    opened = []
+
+    class _CountingSession:
+        def __init__(self, factory):
+            self._factory = factory
+        def __call__(self):
+            opened.append(1)
+            return self._factory()
+
+    llm = _BarrierLLM(parties=1)          # parties=1 => never blocks, whatever the branch
+    monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
+    monkeypatch.setattr(tasks, "_fetch_intel", lambda *a, **k: None)
+    monkeypatch.setattr(tasks, "_finalize_scenario_batch", lambda *a, **k: None)
+    monkeypatch.setattr(get_settings(), "scenario_generation_concurrency", 3)
+
+    Session = sessionmaker(bind=_create_all(_engine(tmp_path)), future=True)
+    with Session() as s:
+        scenario_session = _seed(s)
+        provs = tasks.write_scenarios(
+            s, scenario_session, json.loads(scenario_session["SubsystemsJSON"]),
+            {"name": "Pumping Station", "asset_type": "Pumping Station"},
+            THREATS[:1], llm, TASK_ID,
+            target_threat_ids={THREATS[0]["threat_id"]},
+            session_factory=_CountingSession(Session))
+
+    assert len(provs) == 1
+    assert opened == [], "a one-item batch opened a worker session it did not need"
