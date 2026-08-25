@@ -482,10 +482,38 @@ def _stored_texts(col, group: str) -> list[str]:
 
 def _active_names(sess: Session, table, name_col) -> list[str]:
     """Active (IsActive, not IsDeleted) names for one embedding group's table — the DB-side
-    counterpart to _GROUPS above."""
-    return list(sess.execute(
+    counterpart to _GROUPS above.
+
+    Over-limit rows are SKIPPED here, loudly. llm.embed rejects text above max_embed_chars rather
+    than truncating it, and it embeds in BATCHES — so without this one oversized row raises for the
+    whole call, the entire group fails to embed, and for control_library that stops control mapping
+    across every asset and every session until somebody finds the offending row.
+
+    The API caps control_name/control_description (schemas.py) so such a row cannot be CREATED
+    there, but scripts/Seed_to_Control_library.sql writes rows with direct INSERT and bypasses
+    Pydantic entirely. This is the guard that covers every writer, whatever route it took.
+
+    Deliberately generic rather than control-specific: an over-long threat-catalogue name fails the
+    same way, and this is the one gatherer every group already shares. Skipping costs that ONE row
+    its vector (it drops out of the semantic leg; the keyword leg still finds it); NOT skipping
+    costs the entire group.
+    """
+    limit = get_settings().max_embed_chars
+    names: list[str] = []
+    oversized: list[str] = []
+    for n in sess.execute(
         select(name_col).where(table.IsActive == True, table.IsDeleted == False)
-    ).scalars().all())
+    ).scalars().all():
+        if n is not None and len(str(n)) > limit:
+            oversized.append(str(n)[:120])
+            continue
+        names.append(n)
+    if oversized:
+        # ERROR, not warning: the row is silently absent from the corpus until it is fixed, and
+        # the prefix is included so it can actually be found.
+        log.error("embeddings.row_too_long_skipped", table=table.__tablename__,
+                limit=limit, skipped=len(oversized), samples=oversized[:3])
+    return names
 
 def _renew_group_lock_loop(r, key: str, token: str, interval: float, ttl: int,
                             stop_event: threading.Event) -> None:

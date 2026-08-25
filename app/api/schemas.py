@@ -41,6 +41,7 @@ class ApiClientInfo(BaseModel):
 
 # Typing the wire with these is what puts them in /openapi.json — the UI generates its own
 # string-literal unions from the spec instead of hand-copying codes out of the API guide.
+from app.core.config import CONTROL_DESCRIPTION_MAX_CHARS, CONTROL_NAME_MAX_CHARS
 from app.core.enums import (
     CandidateKind,
     CandidateStatus,
@@ -2151,8 +2152,16 @@ class ControlCreate(BaseModel):
     control_code: str = Field(min_length=1, max_length=20, description="Stable code, e.g. 'CII-CID-1289'. The natural key.")
     itot: str = Field(min_length=1, max_length=10, description="'IT' or 'OT' — drives grounding's asset-type pre-filter.")
     domain: str = Field(min_length=1, max_length=200, description="Control domain, reported as-is (free vocabulary, never joined on).")
-    control_name: str = Field(min_length=1, max_length=500, description="Official control name. Part of the text the AI matches against.")
-    control_description: str = Field(min_length=1, description="Full control text. ALSO part of the matched text — editing it re-embeds the row.")
+    control_name: str = Field(min_length=1, max_length=CONTROL_NAME_MAX_CHARS,
+                            description="Official control name. Part of the text the AI matches against.")
+    # CAPPED, and the cap is load-bearing. A control is embedded as name + ": " + description, and
+    # llm.embed REJECTS anything over max_embed_chars rather than truncating — in a BATCH call, so
+    # ONE over-long control fails the entire library embedding and stops control mapping for every
+    # asset and every session until someone finds that row. embeddings._active_names contains any
+    # row that still exceeds the limit (the seed SQL bypasses this schema entirely).
+    control_description: str = Field(min_length=1, max_length=CONTROL_DESCRIPTION_MAX_CHARS,
+                                    description="Full control text. ALSO part of the matched text — "
+                                                "editing it re-embeds the row.")
     sample_evidence: str | None = Field(default=None, description="Example evidence an assessor would accept. Not embedded.")
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
@@ -2170,8 +2179,9 @@ class ControlUpdate(BaseModel):
     control_code: str | None = Field(default=None, min_length=1, max_length=20)
     itot: str | None = Field(default=None, min_length=1, max_length=10)
     domain: str | None = Field(default=None, min_length=1, max_length=200)
-    control_name: str | None = Field(default=None, min_length=1, max_length=500)
-    control_description: str | None = Field(default=None, min_length=1)
+    control_name: str | None = Field(default=None, min_length=1, max_length=CONTROL_NAME_MAX_CHARS)
+    control_description: str | None = Field(default=None, min_length=1,
+                                            max_length=CONTROL_DESCRIPTION_MAX_CHARS)
     sample_evidence: str | None = Field(default=None)
     is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a code clash.")
 

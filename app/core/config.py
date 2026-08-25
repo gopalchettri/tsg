@@ -31,6 +31,19 @@ def _env_file() -> str:
     return chosen
 
 
+# Longest control_name / control_description the API accepts, so a curator cannot paste a document
+# into a control and break the embedding corpus (embed() REJECTS over-limit text and embeds in
+# BATCHES, so one oversized row fails the whole control library). Sized to fit inside the default
+# max_embed_chars of 4000: 500 + len(": ") + 3400 = 3902.
+#
+# DELIBERATELY NOT validated against max_embed_chars at boot. That coupling was tried and removed:
+# it imposed a FLOOR of 3902 on max_embed_chars, so a deployment whose provider accepts less could
+# not be configured at all — worse than the misconfiguration it guarded. embeddings._active_names
+# already skips any row that does not fit, whatever the limit is set to, so a mismatch degrades to
+# one skipped control rather than a broken corpus.
+CONTROL_NAME_MAX_CHARS = 500
+CONTROL_DESCRIPTION_MAX_CHARS = 3400
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="TSG_", env_file=_env_file(), extra="ignore", populate_by_name=True)
