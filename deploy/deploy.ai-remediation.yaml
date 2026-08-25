@@ -1,0 +1,136 @@
+# ================== DAY-ONE CAPACITY — applies in the same rollout window ====================
+# Worker-only capacity in ai-remediation, deployed FROM DAY ONE (deliberate decision:
+# concurrency from the start). Fleet total: 4 worker pods x --concurrency=10 = 40 concurrent
+# pipeline tasks. Apply right after ai-threatgen's rollout verifies clean.
+#
+# THE TURN-DOWN DIAL: at 40 tasks the LLM backend is the most likely bottleneck. If Grafana
+# shows celery_task_runtime_seconds rising toward the 180s timeout, scale down without any
+# redeploy:   oc -n ai-remediation scale deploy/celery-worker --replicas=1   (or 0).
+#
+# WHY this file works at all: workers are stateless consumers of the SAME external Redis broker
+# (10.228.146.4:6379/1) — they join the queue transparently, needing no Service, no Route, no
+# coordination. Deliberately NOT here: tsg-api (lives in ai-threatgen), tsg-beat (STRICT
+# singleton — a second beat double-fires every schedule), the Service.
+#
+# NAMESPACE-SCOPED PREREQUISITES — none of these cross namespaces on their own; create ALL
+# FOUR in ai-remediation before applying, or the workers start and consume nothing:
+#   1. Pull secret:   oc -n ai-threatgen get secret quay-pull -o yaml | sed 's/namespace: ai-threatgen/namespace: ai-remediation/' | oc apply -f -
+#   2. App Secret:    oc apply -f deploy/secrets.ai-remediation.yaml
+#      (GENERATED from .env.uat: scripts/gen_secret_from_env.py .env.uat deploy/secrets.ai-remediation.yaml --namespace ai-remediation
+#       — identical stringData to ai-threatgen's Secret by construction, so the fleets can't drift)
+#   3. ConfigMap:     oc -n ai-threatgen get cm tsg-api-config -o yaml | sed 's/namespace: ai-threatgen/namespace: ai-remediation/' | oc apply -f -
+#      (contents live-only; strip resourceVersion/uid/creationTimestamp if oc complains)
+#   4. Egress rules:  oc apply -f deploy/networkpolicy.ai-remediation.yaml
+#      (SELF-CONTAINED: DNS + proxy + Redis + SQL + Mongo — the worker's complete surface.
+#       Without it workers boot healthy but sit silently idle: no route to the broker.)
+#
+# This file is separate from deploy.yaml ON PURPOSE: tests/test_deploy_manifest.py pins the
+# main manifest to exactly {tsg-api, celery-worker, tsg-beat} and must keep guarding it.
+# =============================================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker
+  namespace: ai-remediation
+  labels:
+    app: tsg-api
+    component: celery
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: tsg-api
+      component: celery
+  template:
+    metadata:
+      labels:
+        app: tsg-api
+        component: celery
+    spec:
+      affinity:
+        podAntiAffinity:
+          # Preferred, not required — `required` leaves a replica Pending on a cluster with
+          # fewer nodes than replicas.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: tsg-api
+                    component: celery
+      # Cluster DNS can't resolve the UAT LLM gateway host — pin it; traffic still routes via
+      # HTTP_PROXY below (TSG_LITELLM_BYPASS_PROXY=false in the Secret).
+      hostAliases:
+        - ip: "10.231.255.253"
+          hostnames:
+            - "llmapi.govai.ae"
+      # One full LLM retry cycle on warm shutdown: llm_timeout(180) x (retries 3+1) = 720s,
+      # + 10s preStop + margin — keep in lockstep with deploy.yaml's worker (a call already in
+      # its FALLBACK chain can run to 1440s and be cut; the 2880s lease recovery absorbs it).
+      terminationGracePeriodSeconds: 740
+      imagePullSecrets:
+        - name: quay-pull
+      containers:
+        - name: celery-worker
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
+          imagePullPolicy: Always  # mutable ':latest' tag — IfNotPresent never repulls
+          command:
+            - celery
+            - -A
+            - app.pipeline.celery_worker:celery_app
+            - worker
+            - --loglevel=INFO
+            # Keep IDENTICAL to deploy.yaml's worker: mixed concurrency across the fleet makes
+            # queue-wait metrics unreadable.
+            - --concurrency=10
+            - --prefetch-multiplier=1
+            - --soft-time-limit=3300
+            - --time-limit=3600
+            - --pool=gevent
+          env:
+            - name: HTTP_PROXY
+              value: "http://10.61.192.2:8080"
+            - name: HTTPS_PROXY
+              value: "http://10.61.192.2:8080"
+          envFrom:
+            - configMapRef:
+                name: tsg-api-config
+            - secretRef:
+                name: tsg-api-secrets
+          resources:
+            requests:
+              cpu: "750m"
+              memory: "1536Mi"
+            limits:
+              # 1 CPU — same reasoning as deploy.yaml: I/O-bound gevent + limits-quota headroom.
+              cpu: "1"
+              memory: "3Gi"
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "sleep 10"
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: celery-worker
+  namespace: ai-remediation
+  labels:
+    app: tsg-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: tsg-api
+      component: celery

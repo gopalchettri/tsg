@@ -1,0 +1,71 @@
+# Egress rules for the ai-remediation worker pods — SELF-CONTAINED: this is the worker's
+# COMPLETE traffic surface, so it does not depend on copying the live-only
+# 'tsg-api-network-policy' from ai-threatgen (Step 0's capture still cross-checks that nothing
+# else was live-required there).
+#
+# WHY every rule exists — remove one and the failure it causes:
+#   DNS      -> everything by hostname fails at resolve time (obvious, loud)
+#   proxy    -> LLM + intel feeds unreachable (llmapi.govai.ae is proxy-only in this cluster)
+#   Redis    -> the SILENT one: workers boot healthy but never receive a single task — the
+#               broker, result backend, SSE bus and LLM slots all live here
+#   SQL      -> /ready fails, sessions cannot load or persist
+#   Mongo    -> embedding cache unreachable (breaker falls back to memory; slow, not down)
+#
+# NetworkPolicy semantics reminder: the moment ANY egress policy selects a pod, everything not
+# explicitly allowed is DROPPED. This file must therefore stay complete — a new external
+# dependency needs a rule here in the same change.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tsg-worker-egress
+  namespace: ai-remediation
+spec:
+  podSelector:
+    matchLabels:
+      app: tsg-api
+      component: celery
+  policyTypes:
+    - Egress
+  egress:
+    # DNS (OpenShift's resolver)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+    # Corporate proxy — litellm (llmapi.govai.ae via hostAliases) + intel feeds (KEV/ICS/OTX)
+    - to:
+        - ipBlock:
+            cidr: 10.61.192.2/32
+      ports:
+        - port: 8080
+          protocol: TCP
+
+    # External Redis — Celery broker (db 1), results (db 2), cache/SSE/locks (db 0)
+    - to:
+        - ipBlock:
+            cidr: 10.228.146.4/32
+      ports:
+        - port: 6379
+          protocol: TCP
+
+    # External SQL Server — the application database
+    - to:
+        - ipBlock:
+            cidr: 10.228.146.2/32
+      ports:
+        - port: 1444
+          protocol: TCP
+
+    # External MongoDB — embedding cache
+    - to:
+        - ipBlock:
+            cidr: 10.228.146.3/32
+      ports:
+        - port: 27018
+          protocol: TCP

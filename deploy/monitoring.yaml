@@ -1,0 +1,108 @@
+# Phase-1 observability: celery-exporter in ai-common — task metrics with ZERO app-code change
+# (celery_app.py already sets worker_send_task_events + task_send_sent_event).
+#
+# APPLY ORDER: deploy/monitoring-secrets.yaml first (gitignored — carries the authenticated
+# broker URL), then this file. Both target the ai-common namespace, where Prometheus lives —
+# so the scrape is IN-namespace: no cross-namespace RBAC needed at this stage.
+#
+# TWO THINGS TO RESOLVE FROM THE CLUSTER BEFORE APPLYING (Step 0 of the rollout plan):
+#   1. IMAGE — this cluster pulls from the private quay registry through a corporate proxy;
+#      docker.io is likely unreachable from nodes. Mirror the upstream image first, e.g.:
+#        podman pull docker.io/danihodovic/celery-exporter:<pinned-tag>
+#        podman tag  ... quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/celery-exporter:<pinned-tag>
+#        podman push ...
+#      then set that reference below (keep an immutable tag, not :latest).
+#   2. ServiceMonitor LABEL — prometheus-operator only ingests ServiceMonitors matched by the
+#      Prometheus CR's serviceMonitorSelector. Read it (`oc -n ai-common get prometheus -o yaml`)
+#      and set the required label below; without it the target is silently ABSENT (not DOWN).
+#
+# If ai-common already enforces egress NetworkPolicies, add a rule allowing this pod to reach
+# 10.228.146.4:6379 (+ DNS). Do NOT add a new egress policy where none exists — selecting a pod
+# with any policy default-denies everything unlisted.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-exporter
+  namespace: ai-common
+  labels:
+    app: celery-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: celery-exporter
+  template:
+    metadata:
+      labels:
+        app: celery-exporter
+    spec:
+      imagePullSecrets:
+        - name: quay-pull
+      containers:
+        - name: celery-exporter
+          # TODO(step-0): replace with the mirrored in-cluster reference + pinned tag (see header).
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/celery-exporter:MIRROR-ME
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CE_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: celery-exporter-secrets
+                  key: CE_BROKER_URL
+          ports:
+            - containerPort: 9808
+              name: metrics
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9808
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          # Explicit resources are MANDATORY here: ai-common carries a compute ResourceQuota,
+          # and a quota'd namespace rejects resource-less pods at admission (create-time error,
+          # not a scheduling delay). The exporter is tiny.
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: celery-exporter
+  namespace: ai-common
+  labels:
+    app: celery-exporter
+spec:
+  selector:
+    app: celery-exporter
+  ports:
+    - name: metrics
+      port: 9808
+      targetPort: 9808
+      protocol: TCP
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: celery-exporter
+  namespace: ai-common
+  labels:
+    app: celery-exporter
+    # TODO(step-0): add the label the Prometheus CR's serviceMonitorSelector requires
+    # (commonly `release: <helm-release-name>`). WITHOUT IT NOTHING SCRAPES — the target is
+    # silently absent from /targets, which reads as an exporter bug and is not one.
+spec:
+  selector:
+    matchLabels:
+      app: celery-exporter
+  endpoints:
+    - port: metrics
+      interval: 30s

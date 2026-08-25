@@ -105,3 +105,37 @@ def test_every_container_declares_resources(name: str) -> None:
     for c in _containers(_deployments()[name]):
         assert c.get("resources", {}).get("requests"), f"{name}/{c['name']} has no resource requests"
         assert c.get("resources", {}).get("limits"), f"{name}/{c['name']} has no resource limits"
+
+
+# --- PodDisruptionBudgets -------------------------------------------------------------------------
+def _pdbs() -> list[dict]:
+    return [d for d in _docs() if d.get("kind") == "PodDisruptionBudget"]
+
+
+def test_api_and_worker_have_component_scoped_pdbs() -> None:
+    """Replicas without a PDB do not survive the node maintenance they exist for. The selector
+    must be COMPONENT-scoped: every workload shares app=tsg-api, so an app-only selector covers
+    beat and double-covers the workers — and a pod matched by more than one PDB makes the
+    eviction API refuse outright, wedging every node drain. Existence-by-name would pass on
+    that broken selector; this asserts the exact selectors."""
+    selectors = {frozenset(p["spec"]["selector"]["matchLabels"].items()) for p in _pdbs()}
+    assert frozenset({("app", "tsg-api"), ("component", "fastapi")}) in selectors, (
+        "tsg-api needs a PDB selecting {app: tsg-api, component: fastapi}")
+    assert frozenset({("app", "tsg-api"), ("component", "celery")}) in selectors, (
+        "celery-worker needs a PDB selecting {app: tsg-api, component: celery}")
+    for pdb in _pdbs():
+        assert pdb["spec"].get("minAvailable") == 1, (
+            f"{pdb['metadata']['name']}: PDBs here use minAvailable 1 — anything stricter "
+            "blocks drains on a 2-replica deployment")
+
+
+def test_no_pdb_covers_beat() -> None:
+    """A minAvailable PDB over the beat singleton blocks every node drain forever — its
+    availability story is strategy Recreate + the schedule-mtime liveness probe. Checked
+    against the SELECTOR (what eviction actually evaluates), not PDB names."""
+    beat_labels = _deployments()["tsg-beat"]["spec"]["template"]["metadata"]["labels"]
+    for pdb in _pdbs():
+        sel = pdb["spec"]["selector"]["matchLabels"]
+        assert not all(beat_labels.get(k) == v for k, v in sel.items()), (
+            f"PDB {pdb['metadata']['name']} selector {sel} matches tsg-beat's pod labels "
+            f"{beat_labels} — a singleton under a minAvailable PDB wedges node drains")

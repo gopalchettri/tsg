@@ -1,8 +1,8 @@
-# TSG on OpenShift — api + worker + beat + Service.
-# tsg-api and celery-worker are reconciled to match what's actually live in UAT (envFrom via
-# tsg-api-config ConfigMap + tsg-api-secrets Secret, concurrency=2, single readinessProbe, no
-# startup/liveness probes) — see deploy/secrets.yaml comment for why. tsg-beat and the Service
-# below were not part of that reconciliation and still reflect the prior single-Secret design.
+# TSG on OpenShift — api + worker + beat + Service + PDBs. This file is the TARGET state and
+# only lands via `oc apply -f deploy/deploy.yaml` — a `rollout restart` alone never pushes this
+# template (live UAT ran --concurrency=2 with no liveness probe until this was applied). Roll
+# api and worker SEQUENTIALLY (oc rollout status between them): their combined surge pods
+# exceed a limits-capped 6-CPU namespace quota.
 #
 # NOTE on image tag: :latest + IfNotPresent only repulls when the tag is missing locally. Better:
 # have CI push immutable tags (git SHA) and set them here.
@@ -54,7 +54,7 @@ spec:
         - name: quay-pull
       containers:
         - name: fastapi
-          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
           imagePullPolicy: Always  # mutable ':latest' tag — IfNotPresent never repulls
           command:
             - gunicorn
@@ -164,13 +164,18 @@ spec:
         - ip: "10.231.255.253"
           hostnames:
             - "llmapi.govai.ae"
-      # compose stop_grace_period: 300s — covers one full LLM-call retry cycle on warm shutdown.
-      terminationGracePeriodSeconds: 300
+      # Covers one full LLM-call retry cycle on warm shutdown: llm_timeout(180) x (retries 3+1)
+      # = 720s, + the 10s preStop + margin. At the old 300 every rollout SIGKILLed a worker
+      # mid-retry and parked its session on lease recovery. A call already in its FALLBACK
+      # chain (TSG_INFERENCE_FALLBACK_MODEL) can run up to 1440s and still be cut — accepted:
+      # a ~1460s grace would stall node drains for 24 min per pod; the (now 2880s) lease
+      # recovery absorbs that rare case instead.
+      terminationGracePeriodSeconds: 740
       imagePullSecrets:
         - name: quay-pull
       containers:
         - name: celery-worker
-          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
           imagePullPolicy: Always  # mutable ':latest' tag — IfNotPresent never repulls
           command:
             - celery
@@ -181,9 +186,12 @@ spec:
             # gevent concurrency is GREENLETS, not CPU cores. This work is almost entirely spent
             # waiting on network I/O to the LLM proxy, so 2 was a hard ceiling of two in-flight
             # tasks per pod no matter how much CPU the pod was given (compose uses -c 50).
-            # Step 10 -> 20 while watching celery_task_queued_time_seconds; raise
-            # TSG_MAX_CONCURRENT_LLM_CALLS with it, because that Redis semaphore — not the pod
-            # count — is what should govern load on the shared GPU proxy.
+            # Step 10 -> 20 only while watching celery_task_queued_time_seconds AND runtime:
+            # queued-time falling with flat runtime = win; runtime rising = provider saturated,
+            # revert. TSG_MAX_CONCURRENT_LLM_CALLS stays 0 DELIBERATELY (see secrets source):
+            # the backend queues via continuous batching; a semaphore would turn that benign
+            # queuing into LLMSlotUnavailable task retries. Load is bounded by pods x this flag
+            # and vLLM/SGLang's own --max-num-seqs.
             - --concurrency=10
             # Keep at 1: pipeline tasks run for minutes, so prefetching would let one pod hoard
             # queued work that an idle pod could have taken.
@@ -212,7 +220,10 @@ spec:
               cpu: "750m"
               memory: "1536Mi"
             limits:
-              cpu: "1500m"
+              # 1 CPU, not more: gevent I/O-bound work rarely exceeds one core, and the lower
+              # limit is what keeps a rollout surge pod admissible under a limits-capped 6-CPU
+              # namespace quota (steady-state limits 4.5 + 1 surge = 5.5 of 6).
+              cpu: "1"
               memory: "3Gi"
           lifecycle:
             preStop:
@@ -257,7 +268,7 @@ spec:
           # mutable :latest on every beat restart while the executors keep their cached one).
           # Confirm the live repo spelling ('tsg-apii') against the cluster registry before
           # applying.
-          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
           imagePullPolicy: Always  # mutable ':latest' tag — IfNotPresent never repulls
           # compose.prod.yml:100 verbatim — celery_app, NOT celery_worker: beat runs on plain
           # asyncio and must never be monkey-patched (celery_app.py module docstring).
@@ -333,3 +344,41 @@ spec:
 #   tls:
 #     termination: edge
 #     insecureEdgeTerminationPolicy: Redirect
+
+---
+# PodDisruptionBudgets — what makes replicas: 2 survive the node maintenance it exists for
+# (without a PDB a drain may evict both replicas at once). Selectors are COMPONENT-scoped on
+# purpose: all three workloads share app=tsg-api (that is how the litellm NetworkPolicy selects
+# them), so an app-only selector would also cover tsg-beat AND double-cover these pods — and a
+# pod matched by more than one PDB makes the eviction API refuse outright, wedging every drain.
+# tsg-beat gets NO PDB: minAvailable 1 on a singleton blocks drains forever; strategy Recreate
+# plus the schedule-mtime liveness probe is its availability story.
+# Enforced by tests/test_deploy_manifest.py.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tsg-api
+  namespace: ai-threatgen
+  labels:
+    app: tsg-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: tsg-api
+      component: fastapi
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: celery-worker
+  namespace: ai-threatgen
+  labels:
+    app: tsg-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: tsg-api
+      component: celery

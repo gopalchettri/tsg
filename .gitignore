@@ -28,3 +28,5 @@ scripts/redis_acl_check.py
 *.zip
 uvicorn_*.log
 logs/
+deploy/monitoring-secrets.yaml
+deploy/secrets.ai-remediation.yaml
