@@ -1774,6 +1774,28 @@ def _generate_scenario_batch(sess: Session, scenario_session: dict, base_ctx: di
         return list(pool.map(_one, work))   # map preserves input order
 
 
+def _flag_same_batch_duplicates(by_scoped: dict, identities: dict, ratio: float) -> None:
+    """Flag any scenario in THIS batch that reads as a near-duplicate of one of its siblings.
+
+    The within-batch half of duplicate detection. The cross-ROUND half lives in
+    _generate_one_scenario (`cov.others`), which compares against text persisted by EARLIER
+    rounds — the two are deliberately separate because a reused library scenario skips that
+    function entirely and would otherwise only ever be checked against prior rounds, never
+    against the batch it just joined.
+
+    Deterministic string work with no model call, so comparing everything against everything
+    costs nothing and needs no sampling.
+    """
+    fresh = [(identities[sc_id], str((res[0] or {}).get("scenario_statement") or ""))
+            for sc_id, (res, _exc) in by_scoped.items() if res is not None]
+    for sc_id, (res, _exc) in by_scoped.items():
+        if res is None:
+            continue
+        others = [text for h, text in fresh if h != identities[sc_id]]
+        if others:
+            _flag_cross_threat_similarity(res[1], res[0], others, ratio)
+
+
 def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, threats: list[dict],
                 llm: LLMClient, task_id: str,
                 epoch: int = _EPOCH, target_threat_ids: set[str] | None = None,
@@ -1870,16 +1892,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
         if others:
             _flag_cross_threat_similarity(report, scenario, others, ratio)
 
-    # Same-batch cross-threat similarity, over the finished set. Deterministic string work,
-    # no model call, so it costs nothing to compare everything against everything.
-    fresh = [(identities[sc_id], str((res[0] or {}).get("scenario_statement") or ""))
-            for sc_id, (res, _exc) in by_scoped.items() if res is not None]
-    for sc_id, (res, _exc) in by_scoped.items():
-        if res is None:
-            continue
-        others = [text for h, text in fresh if h != identities[sc_id]]
-        if others:
-            _flag_cross_threat_similarity(res[1], res[0], others, ratio)
+    _flag_same_batch_duplicates(by_scoped, identities, ratio)
 
     # Persist SEQUENTIALLY, in the original order, on the caller's session.
     slot_unavailable: Exception | None = None
@@ -1959,12 +1972,6 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
         return []
     partial_error = (f"{len(failures)} of {len(failures) + len(provs)} scenario(s) failed to "
                     f"generate: {'; '.join(failures)}") if failures else None
-    # durable=not targeted: only the plain full-run path has nothing else uncommitted on `sess`
-    # at this point (see map_controls' durable docstring) — targeted regen/next-set still has
-    # buffered, uncommitted scenario rows here (_reconcile_targeted_regen), so it must keep
-    # riding this transaction instead of forcing an early commit of unvalidated writes.
-    _finalize_scenario_batch(sess, scenario_session, asset_context, subsystems, llm, task_id, epoch,
-                            durable=not targeted)
     if not dal.finish_stage(sess, sid, ss, SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION,
                             epoch, task_id, error=partial_error):
         sess.rollback()
@@ -1973,16 +1980,44 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     if on_before_commit is not None:
         on_before_commit(provs)
     sess.commit()
+    # AFTER the commit, deliberately — see _finalize_scenario_batch. It used to run above,
+    # inside this still-unvalidated transaction, where map_controls' own mid-function commit
+    # made a targeted regen's rows permanent and left the `sess.rollback()` above discarding
+    # nothing. Nothing is pending here, so that commit can no longer catch anyone else's writes.
+    _finalize_scenario_batch(sess, scenario_session, asset_context, subsystems, llm, task_id, epoch)
     _send_live_update(sid, SSEEventType.stage_completed, ss, SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION, epoch)
     log.info("stage.complete", session_id=sid, subsystem=ss, stage="SCENARIOS", scenarios=len(provs))
     return provs
 
 
 def _finalize_scenario_batch(sess: Session, scenario_session: dict, asset_context: dict,
-                            subsystems: list[dict], llm: LLMClient, task_id: str, epoch: int,
-                            *, durable: bool = False) -> None:
+                            subsystems: list[dict], llm: LLMClient, task_id: str,
+                            epoch: int) -> None:
+    """Step-4 control mapping, the tail of a scenario batch.
+
+    ALWAYS durable, and ALWAYS called after the caller has committed — those are one fix, not two.
+
+    THE BUG. map_controls commits mid-function (control_mapping.py) to end its lease transaction
+    before the slow rerank, and a commit cannot distinguish its own write from whatever else the
+    caller still has pending. While this ran INSIDE the caller's transaction, a targeted regen
+    passed durable=False to protect its unvalidated rows — and that mid-function commit made them
+    permanent regardless, so `sess.rollback()` on a lost finish_stage claim discarded NOTHING. A
+    regenerate that lost its claim left rows behind that the code believed it had thrown away.
+
+    Two smaller-looking fixes were rejected on evidence. Gating that commit on `durable` only
+    moves the damage: its comment states a real requirement, and holding a write transaction open
+    across the rerank keeps row locks for seconds. Moving the lease to its own session deadlocks:
+    write_scenarios renews the SAME stage row on `sess` mid-loop without committing, so a second
+    connection blocks on the caller's own lock and hangs the worker.
+
+    Running after the commit removes the conflict rather than choosing which side to damage —
+    there is nothing pending left for that commit to catch, on either path, which is why `durable`
+    stopped being a parameter here. If the worker dies in the gap, the row keeps ControlsMappedAt
+    NULL and tsg.map_controls_sweep maps it within one tick. That is what makes this reordering
+    safe now and would NOT have been safe before the sweep existed.
+    """
     control_mapping.map_controls(sess, scenario_session, asset_context, subsystems, llm,
-                                ASSET_UNIT_ID, task_id, epoch, durable=durable)
+                                ASSET_UNIT_ID, task_id, epoch, durable=True)
 
 
 def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id: int,
