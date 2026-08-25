@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import contextlib
 import sys
+import threading
+import time
 import types
 
 import httpx
@@ -295,7 +297,72 @@ def test_vectors_are_persisted_per_batch_not_only_at_the_end(monkeypatch):
     assert written == texts[:BATCH]
 
 
-# --- the worker-boot guard: a too-large batch must never reach production traffic ---
+# --- concurrency: get_vectors may overlap batches, but never beyond its bounds ---
+
+def _concurrency_probe(monkeypatch, conc, *, fail_on=None):
+    """Drive get_vectors through a fake LLM that records overlap.
+
+    Returns (peak_in_flight, batch_sizes, persisted_texts, result_or_exception).
+    """
+    lock, state = threading.Lock(), {"now": 0, "peak": 0}
+    sizes, persisted = [], []
+
+    class _Probe:
+        def embed(self, texts, *, kind="query"):
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+                sizes.append(len(texts))
+            try:
+                time.sleep(0.05)                       # long enough for real overlap to show
+                if fail_on is not None and fail_on in texts:
+                    raise RuntimeError("provider blew up on this batch")
+                return [[float(len(t))] for t in texts]
+            finally:
+                with lock:
+                    state["now"] -= 1
+
+    monkeypatch.setattr(embeddings, "_l2_write",
+                        lambda docs: persisted.extend(d["text"] for d in docs))
+    monkeypatch.setattr(embeddings, "_l2_read", lambda *a, **k: True)
+    monkeypatch.setattr(embeddings, "get_settings",
+                        lambda: _settings(embedding_concurrency=conc, embedding_store="mongo"))
+    embeddings._L1.clear()
+    texts = [f"text-{i}" for i in range(BATCH * 5)]     # 5 batches
+    try:
+        out = embeddings.get_vectors(_Probe(), texts, model_id="m", group="threat_type")
+    except Exception as exc:  # noqa: BLE001 — the probe REPORTS the failure; callers assert on it
+        return state["peak"], sizes, persisted, exc
+    return state["peak"], sizes, persisted, out
+
+
+def test_concurrency_1_stays_strictly_sequential(monkeypatch):
+    """The default must be byte-for-byte today's behaviour: one request in flight, ever."""
+    peak, sizes, _, out = _concurrency_probe(monkeypatch, 1)
+    assert peak == 1, f"concurrency=1 overlapped {peak} calls"
+    assert max(sizes) <= BATCH
+    assert len(out) == BATCH * 5
+
+
+def test_concurrency_overlaps_but_respects_its_bound(monkeypatch):
+    """Raised concurrency must actually overlap AND never exceed the configured ceiling — that
+    ceiling is what keeps the provider's request rate predictable."""
+    peak, sizes, _, out = _concurrency_probe(monkeypatch, 3)
+    assert peak > 1, "concurrency=3 never overlapped; the pool is not being used"
+    assert peak <= 3, f"peak in-flight {peak} exceeded the configured 3"
+    assert max(sizes) <= BATCH, "a concurrent run must still respect the provider batch cap"
+    assert len(out) == BATCH * 5
+    assert all(out[t][0] == float(len(t)) for t in out), "concurrency mispaired a text"
+
+
+def test_concurrent_failure_still_persists_the_batches_that_succeeded(monkeypatch):
+    """Durability must survive concurrency: a failing batch raises, but its siblings' vectors are
+    already in Mongo, so the retry re-embeds only the tail."""
+    _, _, persisted, exc = _concurrency_probe(monkeypatch, 3, fail_on="text-0")
+
+    assert isinstance(exc, RuntimeError) and "blew up" in str(exc)
+    assert persisted, "sibling batches were lost — the retry would redo all the work"
+    assert "text-0" not in persisted                   # the failed batch persisted nothing
 
 
 # --- the worker-boot guard: a too-large batch must never reach production traffic ---

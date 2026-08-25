@@ -233,13 +233,39 @@ def get_vectors(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: s
         # The cost is one LLM-slot acquisition per batch instead of one for the whole run (see
         # LiteLLMClient.embed). That trade is deliberate: losing a slot mid-run now costs only the
         # batch in flight, where before it discarded every vector already paid for.
-        batch = get_settings().embedding_batch_size
-        for i in range(0, len(missing), batch):
-            chunk = missing[i:i + batch]
+        s = get_settings()
+        batch, conc = s.embedding_batch_size, s.embedding_concurrency
+
+        def _embed_and_persist(chunk: list[str]) -> None:
+            """One batch, end to end: embed it, stage it, persist it. Safe to run concurrently —
+            _stage_for_write only assigns into l1/result by TEXT KEY and performs no I/O, so it
+            cannot interleave into a corrupt dict under gevent greenlets (cooperative, no yield
+            point inside it) or under real threads (each dict store is one atomic bytecode)."""
             vecs = _embed_missing(llm, chunk, kind)
             docs = _stage_for_write(l1, result, chunk, vecs, model_id, group, kind)
             if use_mongo and docs:
                 _l2_write(docs)
+
+        chunks = [missing[i:i + batch] for i in range(0, len(missing), batch)]
+        if conc <= 1 or len(chunks) == 1:
+            for chunk in chunks:  # sequential: no pool, no threads, no behaviour change
+                _embed_and_persist(chunk)
+        else:
+            # Bounded pool, same shape as llm.rerank_many: every concurrent embed() call takes
+            # its own _llm_slot, so the Redis semaphore stays the global authority and this is
+            # only a local politeness cap. Batches are independent — each persists its own work,
+            # and get_vectors returns a dict keyed by text, so completion order is irrelevant.
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(conc, len(chunks))) as pool:
+                futures = [pool.submit(_embed_and_persist, c) for c in chunks]
+            # Pool exited => every future is done (shutdown waits). Retrieve EVERY exception
+            # before re-raising the first: an unretrieved future logs a spurious warning when it
+            # is garbage-collected, and a sibling's failure must not mask the one we report.
+            # Batches that did succeed stay persisted, so the retry re-embeds only the tail.
+            failures = [e for e in (f.exception() for f in futures) if e is not None]
+            if failures:
+                raise failures[0]
 
     # returned vectors are the SAME list objects as the cache entries — callers must treat
     # them read-only (copy before mutating in place)

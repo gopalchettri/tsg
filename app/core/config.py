@@ -342,6 +342,28 @@ class Settings(BaseSettings):
     # scenarios would publish NO controls. Read-only; safe against production.
     control_map_min_score: float = Field(60.0, ge=0.0, le=100.0)
 
+    # TSG_CONTROL_MAP_SHORTLIST_K — how many controls reach the RERANKER per scenario.
+    #
+    # Control mapping used to borrow `grounding_shortlist_k` (10), and that was measured to be
+    # actively wrong. The shortlist is the CHEAP approximate stage (cosine top-K union BM25
+    # top-K); the reranker is the accurate one. At K=10 only 14-20 of 557 OT controls were ever
+    # reranked, so a control the reranker would have scored 65.86 (`Access Agreements`, for a
+    # real Historian-exfiltration scenario) was discarded before it could be scored at all — and
+    # the empty result published as `controls: []`, which schemas.py documents as a genuine
+    # library gap. At K=60 the same scenario reranks 102 candidates and that control clears the
+    # cutoff. Same library, same reranker, same threshold.
+    #
+    # SEPARATE from grounding_shortlist_k on purpose. That one serves THREAT grounding: a short
+    # label against a small candidate set, with thresholds auto-calibrated at its current value.
+    # This one serves a scenario PARAGRAPH against the whole control library. One number cannot
+    # be right for both, and raising the shared knob would silently move calibrated behaviour.
+    #
+    # Cost is provider-shaped: `LiteLLMClient.rerank_many` sends ONE request per query remotely
+    # (so K grows each request's payload, not the number of round trips), but flattens every
+    # (query, doc) pair into a single CPU batch locally (so K genuinely multiplies work). UAT and
+    # production use the reranker API; only the local dev path pays linearly.
+    control_map_shortlist_k: int = Field(60, ge=1)
+
     # TSG_CONTROL_MAP_SWEEP_INTERVAL_SECONDS — how often the retry queue is drained.
     # map_controls has three paths that deliberately leave an output unstamped "for the next run"
     # (no candidates, lost lease, a failed per-output rerank); the beat task tsg.map_controls_sweep
@@ -592,6 +614,18 @@ class Settings(BaseSettings):
     # provider documenting a higher cap — llm._verify_embedding_dimensions probes this exact
     # value at worker boot and refuses to start if the provider rejects it.
     embedding_batch_size: int = Field(32, ge=1)
+    # TSG_EMBEDDING_CONCURRENCY — how many of get_vectors' batches are in flight at once.
+    # 1 (default) is strictly sequential, i.e. byte-for-byte today's behaviour, so this is inert
+    # until deliberately raised. Above 1 it mirrors rerank_many's bounded pool: each concurrent
+    # embed() call takes its OWN _llm_slot, so max_concurrent_llm_calls stays the global authority
+    # and this is only a local politeness cap.
+    #
+    # Raising it multiplies the request RATE at the provider, so a 429 becomes likelier — and a
+    # 429 maps to LLMSlotUnavailable, which retries the whole Celery task. Step it up (4, then 8)
+    # while watching the worker log; the first sign of 429s is the real ceiling, whatever a
+    # benchmark predicted. And concurrency only helps if the provider serves requests in PARALLEL:
+    # a single-GPU backend with a serialised queue gains nothing from this.
+    embedding_concurrency: int = Field(1, ge=1, le=32)
 
     # TSG_LLM_SLOT_POLL_SECONDS / _POLL_JITTER_SECONDS — slot-wait poll interval; jitter avoids
     # synchronized thundering-herd wakeups.
@@ -642,14 +676,16 @@ class Settings(BaseSettings):
                 "truncating it, which would lose every threat in the batch.")
         return self
 
-    # grounding_shortlist_k >= control_map_top_k — control mapping now sends ONE scenario-text
+    # control_map_shortlist_k >= control_map_top_k — control mapping sends ONE scenario-text
     # query per output and takes its top_k matches from that single reranked shortlist, so a
     # shortlist smaller than top_k silently caps every scenario below the configured count.
+    # Guards the CONTROL knob, not the threat one: control mapping no longer reads
+    # grounding_shortlist_k, so checking that value here would pass while the real limit failed.
     @model_validator(mode="after")
     def _validate_shortlist_covers_control_top_k(self) -> Settings:
-        if self.grounding_shortlist_k < self.control_map_top_k:
+        if self.control_map_shortlist_k < self.control_map_top_k:
             raise ValueError(
-                f"grounding_shortlist_k ({self.grounding_shortlist_k}) must be >= "
+                f"control_map_shortlist_k ({self.control_map_shortlist_k}) must be >= "
                 f"control_map_top_k ({self.control_map_top_k}) — one scenario-text query per "
                 "output draws its top-K controls from a single shortlist, so a smaller "
                 "shortlist silently caps every scenario's mapped controls below the "
