@@ -87,7 +87,17 @@ if (-not (Test-Path $venvActivate)) {
 # so it silently hits whatever global Python is installed. That global has celery
 # but no gevent/fastapi, so the readiness probe below errored out and reported
 # "worker NOT READY" on every single run, even against a perfectly healthy worker.
-$celeryExe = Join-Path $ProjectRoot '.venv\Scripts\celery.exe'
+# NOT celery.exe. This checkout's .venv was created for a DIFFERENT directory and copied
+# here -- pyvenv.cfg still reads `-m venv ...\DESC\TSG\tsg\.venv` -- so the console-script
+# shim resolved a FOREIGN interpreter: the worker ran as a child of the stale venv's
+# python.exe, loading that venv's site-packages while this checkout's code sat on sys.path.
+# Confirmed live from the process tree (celery.exe -> ...\DESC\TSG\tsg\.venv\python.exe).
+# Naming the interpreter explicitly ends it for good: `python -m celery` cannot resolve
+# anywhere but this venv, whatever the shims, PATH or Activate.ps1 timing do.
+$venvPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+if (-not (Test-Path $venvPython)) {
+    throw "venv interpreter not found at $venvPython -- recreate the venv IN THIS DIRECTORY (do not copy one)."
+}
 
 $envFile = Join-Path $ProjectRoot '.env'
 if (-not (Test-Path $envFile)) {
@@ -258,7 +268,7 @@ function Start-InNewWindow {
 # 3. Celery worker (new window) -- gevent pool, matches compose.prod.yml's -c 50
 # ---------------------------------------------------------------------------
 
-# Full path, not a bare `celery` -- same reason $celeryExe exists above: if
+# Explicit interpreter, not a bare `celery` -- same reason $venvPython exists above: if
 # Activate.ps1 doesn't finish prepending .venv\Scripts to PATH before this line
 # runs in the spawned window (profile-script timing, execution-policy quirks,
 # etc.), a bare `celery` silently falls through to whatever global Python is on
@@ -275,7 +285,7 @@ function Start-InNewWindow {
 # AND a durable file, and never clobbers a previous run's evidence.
 # ponytail: no rotation -- logs/ grows unbounded; add size-capped rotation if it ever matters.
 $workerLog = Join-Path $logsDir 'celery.log'
-$celeryCmd = "& '$celeryExe' -A app.pipeline.celery_worker.celery_app worker -P gevent -c $Concurrency -l info -n tsg-worker-${PID}@%h 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$workerLog' -Append"
+$celeryCmd = "& '$venvPython' -m celery -A app.pipeline.celery_worker.celery_app worker -P gevent -c $Concurrency -l info -n tsg-worker-${PID}@%h 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$workerLog' -Append"
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
                   -InnerCommand $celeryCmd -WindowTitle 'tsg-celery'
 Write-Host "Celery worker starting in a new window (title: tsg-celery)..." -ForegroundColor Green
@@ -303,7 +313,7 @@ if ((Test-Path $beatScheduleDat) -and (Get-Item $beatScheduleDat).Length -eq 0) 
 # Full path -- same reason as $celeryCmd above. Same tee-to-file too: beat drives the reaper,
 # so its output is the other half of any worker-death post-mortem.
 $beatLog = Join-Path $logsDir 'beat.log'
-$beatCmd = "& '$celeryExe' -A app.pipeline.celery_app.celery_app beat -l info 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$beatLog' -Append"
+$beatCmd = "& '$venvPython' -m celery -A app.pipeline.celery_app.celery_app beat -l info 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$beatLog' -Append"
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
                   -InnerCommand $beatCmd -WindowTitle 'tsg-beat'
 Write-Host "Celery beat starting in a new window (title: tsg-beat)..." -ForegroundColor Green
@@ -315,7 +325,7 @@ Write-Host "Celery beat starting in a new window (title: tsg-beat)..." -Foregrou
 function Test-CeleryWorkerReady {
     param([int]$TimeoutSec = 3)
     try {
-        $output = & $celeryExe -A app.pipeline.celery_app.celery_app inspect ping -t $TimeoutSec 2>&1
+        $output = & $venvPython -m celery -A app.pipeline.celery_app.celery_app inspect ping -t $TimeoutSec 2>&1
         return ($output -match 'pong')
     } catch {
         return $false
@@ -361,8 +371,7 @@ if (-not $workerReady) {
 Stop-ProcessOnPort -Port $Port -Label 'uvicorn (pre-existing)'
 
 # Full path -- same reason as $celeryCmd/$beatCmd above.
-$uvicornExe = Join-Path $ProjectRoot '.venv\Scripts\uvicorn.exe'
-$uvicornCmd = "& '$uvicornExe' app.main:app --host 0.0.0.0 --port $Port"
+$uvicornCmd = "& '$venvPython' -m uvicorn app.main:app --host 0.0.0.0 --port $Port"
 if ($Reload.IsPresent) { $uvicornCmd += ' --reload' }
 
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
@@ -479,7 +488,7 @@ if (-not $NoFlower) {
     Stop-ProcessOnPort -Port $FlowerPort -Label 'flower (pre-existing)'
 
     Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
-                      -InnerCommand "& '$celeryExe' $flowerArgs" -WindowTitle 'tsg-flower'
+                      -InnerCommand "& '$venvPython' -m celery $flowerArgs" -WindowTitle 'tsg-flower'
     Write-Host "Flower starting in a new window (title: tsg-flower) -- http://127.0.0.1:$FlowerPort" -ForegroundColor Green
 }
 

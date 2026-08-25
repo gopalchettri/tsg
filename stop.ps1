@@ -61,6 +61,11 @@ $targets = [ordered]@{
     'tsg-api'    = @("'tsg-api'")
     'tsg-celery' = @("'tsg-celery'", 'celery_worker.celery_app worker')
     'tsg-beat'   = @("'tsg-beat'", 'celery_app.celery_app beat')
+    # Flower had NO entry here, so it survived every stop.ps1 and kept running indefinitely --
+    # found still up (with a stale-venv python child) after a stop reported "Done." Only the
+    # port pre-flight in start.ps1 ever touched it, which frees the PORT, not the process.
+    # Matched on 'flower', which cannot collide with the beat pattern above.
+    'tsg-flower' = @("'tsg-flower'", 'celery_app.celery_app flower')
 }
 
 foreach ($label in $targets.Keys) {
