@@ -401,19 +401,50 @@ class LiteLLMClient:
         # callers bypass that wrapper entirely — grounding._paraphrase (threshold calibration,
         # run at worker boot) and this module's own selfcheck. One hook on the client covers
         # every chat completion the process makes, including those two.
+        def _complete(kw: dict[str, Any]):
+            resp = litellm.completion(messages=messages, **kw)
+            # Suspenders to _chat_kwargs' stream=False belt: if the server streamed anyway (a
+            # proxy model entry pinning `"stream": true` overrides the client), assemble the
+            # chunks — chat()'s contract must never depend on a server-side config knob.
+            # Inside the slot: the stream is still an in-flight call until drained.
+            if isinstance(resp, litellm.CustomStreamWrapper):
+                resp = litellm.stream_chunk_builder(list(resp), messages=messages)
+                if resp is None:  # empty stream — fail loud, same posture as the parse guards
+                    raise RuntimeError("chat provider returned an empty stream")
+            return resp
+
+        fallback_from = ""
         with trace_step("LLM CALL", None, model=kwargs.get("model"),
                         messages=len(messages), prompt_chars=total_chars,
                         expected_type=getattr(expected_type, "__name__", None)) as _t:
             with _llm_slot(self.s), _provider_429_retryable():
-                resp = litellm.completion(messages=messages, **kwargs)
-                # Suspenders to _chat_kwargs' stream=False belt: if the server streamed anyway (a
-                # proxy model entry pinning `"stream": true` overrides the client), assemble the
-                # chunks — chat()'s contract must never depend on a server-side config knob.
-                # Inside the slot: the stream is still an in-flight call until drained.
-                if isinstance(resp, litellm.CustomStreamWrapper):
-                    resp = litellm.stream_chunk_builder(list(resp), messages=messages)
-                    if resp is None:  # empty stream — fail loud, same posture as the parse guards
-                        raise RuntimeError("chat provider returned an empty stream")
+                try:
+                    resp = _complete(kwargs)
+                except Exception as exc:
+                    # APP-SIDE model fallback (inference_fallback_model): retry THIS call once
+                    # on the second model, inside the same slot (still one in-flight call).
+                    # Only for calls that did not pin an explicit model — a pinned model is a
+                    # deliberate choice (boot probes, calibration) that must fail as itself.
+                    # If the fallback also rate-limits, the raise lands in
+                    # _provider_429_retryable and becomes LLMSlotUnavailable exactly as before.
+                    fb = self.s.inference_fallback_model
+                    if model is not None or not self._fallback_applies(fb, kwargs["model"], exc):
+                        raise
+                    log.warning("llm.fallback_model_used", primary=kwargs["model"], fallback=fb,
+                                error=f"{type(exc).__name__}: {exc}")
+                    fallback_from = kwargs["model"]
+                    kwargs = self._chat_kwargs(fb, temperature, expected_type)
+                    try:
+                        resp = _complete(kwargs)
+                    except Exception as fb_exc:
+                        # The fallback could not rescue the call: re-raise the PRIMARY's error —
+                        # it is the truthful signal for the retry machinery. A primary 429 must
+                        # still become LLMSlotUnavailable (retry later), not whatever unrelated
+                        # class the fallback happened to fail with, which would turn a transient
+                        # saturation into a permanent stage ERROR.
+                        log.warning("llm.fallback_also_failed", fallback=fb,
+                                    error=f"{type(fb_exc).__name__}: {fb_exc}")
+                        raise exc from fb_exc
             _t.result(served_model=str(resp.get("model", "") or ""),
                     response_chars=len(resp["choices"][0]["message"]["content"] or ""))
         return resp["choices"][0]["message"]["content"], Provenance(
@@ -431,8 +462,40 @@ class LiteLLMClient:
                 **({"temperature": kwargs["temperature"]} if "temperature" in kwargs else {}),
                 **({"reasoning_effort": self.s.llm_reasoning_effort}
                 if self.s.llm_reasoning_effort is not None else {}),
+                # Only present when the fallback actually served this answer — provenance is
+                # how a stored result stays traceable to the model that wrote it.
+                **({"fallback_from": fallback_from} if fallback_from else {}),
             },
         )
+
+    def _fallback_applies(self, fb: str, primary: str, exc: Exception) -> bool:
+        """Should this failed primary chat call be retried on `inference_fallback_model`?
+
+        Only for failures a DIFFERENT healthy model could plausibly answer: timeouts and
+        connection drops, a 429 that survived litellm's own num_retries (the primary is
+        saturated — its shared rpm may be consumed by other teams), and 5xx. Any other 4xx
+        (auth, bad request, content policy) fails identically on every model — falling back
+        would double the cost of the same error and hide its cause. Azure is excluded
+        wholesale: _chat_kwargs addresses a fixed DEPLOYMENT and ignores per-call models, so a
+        "fallback" there would silently re-call the same deployment and learn nothing.
+        """
+        if not fb or fb == primary or self.s.llm_provider == "azure_openai":
+            return False
+        import openai
+
+        if isinstance(exc, openai.RateLimitError):  # checked before APIStatusError: 429 < 500
+            return True
+        if isinstance(exc, openai.APIConnectionError):  # includes APITimeoutError
+            return True
+        if isinstance(exc, openai.APIStatusError):
+            return exc.status_code >= 500
+        # litellm wraps statuses it has no specific mapping for (501/505, CDN/gateway 520-524)
+        # in litellm.APIError, which subclasses openai.APIError but NOT APIStatusError — a
+        # gateway melting down in front of the proxy is exactly the failure a second model can
+        # answer. It always carries status_code; anything below 500 (or absent) stays no-fallback.
+        if isinstance(exc, openai.APIError):
+            return (getattr(exc, "status_code", 0) or 0) >= 500
+        return False
 
     def embed(self, texts, *, model=None, kind="query"):
         """Batch text → vectors, via `embedding_provider` ('local' runs in-process, so the
@@ -695,10 +758,18 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
     s = settings or get_settings()
     _ensure_litellm_proxy_bypassed(s)
     if s.llm_provider != "litellm_proxy":  # direct providers have no registration check below
-        _verify_chat_provider_reachable(s)
+        # openai-direct pins the model so a configured fallback cannot mask a broken primary
+        # (azure keeps None — it addresses a deployment and would only log the ignored model).
+        _verify_chat_provider_reachable(
+            s, model=s.inference_model if s.llm_provider == "openai" else None)
+        if s.inference_fallback_model and s.llm_provider == "openai":
+            _verify_fallback_model(s)
     wanted: dict[str, str] = {}
     if s.llm_provider == "litellm_proxy":
         wanted["inference_model"] = s.inference_model
+        # inference_fallback_model is deliberately NOT in `wanted`: it is a resilience layer,
+        # and a missing/broken fallback must never block a boot whose primary is healthy —
+        # _verify_fallback_model probes it warn-only instead.
     if s.embedding_provider == "litellm_proxy":
         wanted["embedding_model"] = s.embedding_model
     if s.reranker_provider == "litellm_proxy":
@@ -734,8 +805,12 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
     if s.llm_provider == "litellm_proxy":
         # Registration is NOT "answers usably": /v1/models proves the model is LISTED, never that
         # it returns something chat() can parse. Runs after the checks above so a missing model
-        # still reports the clearer "not registered" error first.
-        _verify_chat_provider_reachable(s)
+        # still reports the clearer "not registered" error first. Both probes PIN their model
+        # explicitly: chat() never falls back on a pinned model, so a broken primary cannot hide
+        # behind a healthy fallback here (and vice versa).
+        _verify_chat_provider_reachable(s, model=s.inference_model)
+        if s.inference_fallback_model:
+            _verify_fallback_model(s)
 
     # Observability, not verification: log each model's configured rate limit AT DEPLOY TIME so a
     # later rate-limit incident is checkable against real config instead of someone's memory.
@@ -754,7 +829,22 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
         log.warning("llm.model_config_check_failed", exc_info=True)
 
 
-def _verify_chat_provider_reachable(s: Settings) -> None:
+def _verify_fallback_model(s: Settings) -> None:
+    """Probe `inference_fallback_model` — WARN-ONLY, never a boot failure.
+
+    The fallback is a resilience layer, and fail-closed here would INVERT the feature: a
+    down/throttled fallback crash-looping workers whose primary is perfectly healthy is
+    strictly worse than having no fallback at all. Failures warn (llm.fallback_model_unverified)
+    and boot continues; the runtime guard — chat() re-raising the PRIMARY's error when the
+    fallback also fails — keeps live traffic correct even if the fallback stays broken."""
+    try:
+        _verify_chat_provider_reachable(s, model=s.inference_fallback_model)
+    except Exception:
+        log.warning("llm.fallback_model_unverified", model=s.inference_fallback_model,
+                    exc_info=True)
+
+
+def _verify_chat_provider_reachable(s: Settings, model: str | None = None) -> None:
     """One real chat completion at worker boot, for EVERY provider. Registration/reachability is
     not enough: a proxy entry pinning `"stream": true` (glm-5's does) returns a streaming wrapper
     where chat() expects a completed message; an expired Azure key or decommissioned deployment
@@ -769,7 +859,9 @@ def _verify_chat_provider_reachable(s: Settings) -> None:
     response_format={"type": "json_object"} to this call too, and OpenAI/Azure reject a
     json_object request with 400 unless "json" appears in the messages."""
     try:
-        LiteLLMClient(s).chat([{"role": "user", "content": 'Reply with any valid json, e.g. {"ok": true}.'}])
+        LiteLLMClient(s).chat(
+            [{"role": "user", "content": 'Reply with any valid json, e.g. {"ok": true}.'}],
+            model=model)  # pinned by litellm-proxy callers so fallback can't mask this probe
     except LLMSlotUnavailable:
         # Must stay itself: celery_app._init_worker retries `except LLMSlotUnavailable` so a
         # coordinated restart — many replicas booting at once under max_concurrent_llm_calls —
@@ -778,8 +870,8 @@ def _verify_chat_provider_reachable(s: Settings) -> None:
         raise
     except Exception as exc:
         raise RuntimeError(
-            f"{s.llm_provider} chat provider was unreachable or rejected a startup "
-            f"verification call: {exc}") from exc
+            f"{s.llm_provider} chat provider ({model or s.inference_model}) was unreachable or "
+            f"rejected a startup verification call: {exc}") from exc
 
 
 def _verify_embedding_dimensions(s: Settings) -> None:

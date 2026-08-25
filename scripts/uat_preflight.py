@@ -171,6 +171,8 @@ def main() -> int:
         if s.llm_provider != "litellm_proxy":
             raise SkipCheck(f"llm_provider={s.llm_provider} — no proxy in use")
         wanted = {s.inference_model}
+        # The fallback model is warn-only (mirrors boot): preflight must not fail a green
+        # deployment over an optional resilience layer — but it DOES surface the state below.
         if s.embedding_provider == "litellm_proxy":
             wanted.add(s.embedding_model)
         if s.reranker_provider == "litellm_proxy":
@@ -187,13 +189,34 @@ def main() -> int:
         missing = wanted - available
         if missing:
             raise RuntimeError(f"not registered on the proxy: {sorted(missing)}")
-        return f"registered: {sorted(wanted)}"
+        note = ""
+        if s.inference_fallback_model:
+            note = (f"; fallback {s.inference_fallback_model!r} "
+                    + ("registered" if s.inference_fallback_model in available
+                    else "NOT registered — boot will warn and the fallback stays inert"))
+        return f"registered: {sorted(wanted)}{note}"
 
     @check("REAL chat call returns a COMPLETED string (glm-5 stream:true)")
     def _chat():
         from app.pipeline.llm import get_llm
+        # PINNED on the proxy path: with a fallback configured, an unpinned call would let a
+        # broken primary pass this check by silently answering from the fallback — then boot's
+        # pinned probe fails on the same misconfiguration preflight just blessed.
         text, prov = get_llm().chat(
-            [{"role": "user", "content": 'Reply with only this json: {"ok": true}'}])
+            [{"role": "user", "content": 'Reply with only this json: {"ok": true}'}],
+            model=s.inference_model if s.llm_provider == "litellm_proxy" else None)
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError(f"expected non-empty text, got {type(text).__name__}: {text!r}")
+        return f"served by {prov.model_version or prov.model!r}: {text.strip()[:60]!r}"
+
+    @check("REAL chat call on the FALLBACK model (skipped when the feature is off)")
+    def _chat_fallback():
+        if not (s.llm_provider == "litellm_proxy" and s.inference_fallback_model):
+            raise SkipCheck("TSG_INFERENCE_FALLBACK_MODEL unset — feature off")
+        from app.pipeline.llm import get_llm
+        text, prov = get_llm().chat(
+            [{"role": "user", "content": 'Reply with only this json: {"ok": true}'}],
+            model=s.inference_fallback_model)
         if not isinstance(text, str) or not text.strip():
             raise RuntimeError(f"expected non-empty text, got {type(text).__name__}: {text!r}")
         return f"served by {prov.model_version or prov.model!r}: {text.strip()[:60]!r}"

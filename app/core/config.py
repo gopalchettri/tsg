@@ -235,6 +235,18 @@ class Settings(BaseSettings):
     # TSG_INFERENCE_MODEL — chat model name (litellm/OpenAI; Azure uses the deployment name).
     inference_model: str = "gpt-5"
 
+    # TSG_INFERENCE_FALLBACK_MODEL — second chat model the SAME call retries on when
+    # inference_model fails retryably (timeout/connection, 429 that survived litellm's own
+    # num_retries, 5xx). Empty (default) = off. APP-SIDE on purpose: this deployment owns its
+    # resilience instead of depending on proxy-side fallback config it cannot see or change.
+    # Applies only to calls that did NOT pin an explicit per-call model (calibration probes and
+    # boot checks pin one precisely so a broken primary cannot hide behind its fallback), and
+    # never under azure_openai (a deployment is a fixed address — "another model" cannot apply).
+    # Every use is logged (llm.fallback_model_used) and recorded in Provenance.fallback_from;
+    # note the consistency cost: fallback answers come from a different model family.
+    inference_fallback_model: str = ""
+
+
     # TSG_LLM_TIMEOUT_SECONDS / TSG_LLM_MAX_RETRIES — per-call timeout and retry cap.
     llm_timeout_seconds: float = 90.0
     llm_max_retries: int = 3
@@ -728,7 +740,15 @@ class Settings(BaseSettings):
     # unset -> derive (floor x 2); explicitly below the floor -> refuse to start.
     @model_validator(mode="after")
     def _derive_stage_lease_seconds(self) -> Settings:
-        floor = self.llm_timeout_seconds * (self.llm_max_retries + 1)
+        # One chat call can run TWO full retry chains when a fallback model is active — the
+        # primary's chain, then inference_fallback_model's with the same timeout/retry budget
+        # (llm.py chat()) — so the safe floor doubles with it. Azure ignores the fallback
+        # entirely (fixed deployment), so it keeps the single chain. Without this, the derived
+        # lease exactly EQUALED the worst-case call at UAT values (2 x 4 x 180 = 1440s) and a
+        # legitimate primary-timeout-then-slow-fallback sequence got reaped as crashed.
+        chains = 2 if (self.inference_fallback_model
+                    and self.llm_provider != "azure_openai") else 1
+        floor = self.llm_timeout_seconds * (self.llm_max_retries + 1) * chains
         if "stage_lease_seconds" not in self.model_fields_set:
             self.stage_lease_seconds = int(floor * 2)
         elif self.stage_lease_seconds < floor:
