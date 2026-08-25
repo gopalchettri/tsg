@@ -448,17 +448,28 @@ class LiteLLMClient:
         swallow the provider's rejection into a silently worse answer (keyword-only ranking, a
         dedup pass that reports "no duplicates", ...).
         """
+        texts = list(texts)
+        if not texts:
+            # Before ANY other work: no prefixing (which can raise on an ambiguous prefix style),
+            # no validation, and no LLM slot. Matches local_models.embed's []-in-[]-out.
+            return []
+
+        # Validate the CALLER'S text, before prefixing. max_embed_chars is a contract about what
+        # the caller may hand us; `passage: ` is our own internal addition that the caller cannot
+        # see or budget for. Checking after prefixing rejected callers who had correctly truncated
+        # to exactly max_embed_chars — threat_retrieval.py:296 does exactly that, and the ValueError
+        # was swallowed there into permanent keyword-only ranking.
         max_embed_chars = self.s.max_embed_chars
-        texts = _apply_embed_prefix(self.s, list(texts), kind)  # e5 prefixes, both providers
         too_long = [t for t in texts if len(t) > max_embed_chars]
         if too_long:
             raise ValueError(
                 f"embed() received {len(too_long)} text(s) over {max_embed_chars} chars "
                 f"(longest {max(len(t) for t in too_long)}) — refusing to send to the embedding "
                 "model; this is never legitimate input for a short library-matching label")
-        # Prefixing and the length check stay OUTSIDE the chunk loop below: prefixing a slice of
-        # the already-prefixed list would double it ("query: query: foo"), and validating up front
-        # keeps today's all-or-nothing contract — one over-long text still costs zero calls.
+        # Prefixing stays OUTSIDE the chunk loop below: prefixing a slice of the already-prefixed
+        # list would double it ("query: query: foo"). Validating up front keeps the all-or-nothing
+        # contract too — one over-long text still costs zero calls.
+        texts = _apply_embed_prefix(self.s, texts, kind)  # e5 prefixes, both providers
         if self.s.embedding_provider == "local":
             from app.pipeline import local_models
 
@@ -467,11 +478,6 @@ class LiteLLMClient:
             # reasons (get_vectors does, to persist as it goes) — that is the caller's choice,
             # never a cap enforced on this path.
             return local_models.embed(texts)  # in-process — no network timeout/retry applies
-
-        if not texts:
-            # Before the slot: acquiring a Redis ticket (and possibly raising LLMSlotUnavailable)
-            # to send zero texts is pure waste. Matches local_models.embed's []-in-[]-out.
-            return []
 
         model = model or self.s.embedding_model
         batch = self.s.embedding_batch_size

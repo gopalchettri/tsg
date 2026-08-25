@@ -1456,20 +1456,25 @@ class EmbeddingActionResponse(BaseModel):
     the calling route actually populates is non-null. Also the base shape `EmbeddingJobStatus`
     below extends with `state`/`error` — the eventual RESULT of a queued action, not what a
     route returns directly (see app/api/admin.py: actions now run via a Celery task)."""
-    # Counts only — never a per-group error string. These used to be `int | str` because a failed
-    # group rode along as "error: ..." inside an otherwise-SUCCESS payload; embeddings.
-    # _for_each_group now raises EmbeddingGroupsFailed instead, so a partial failure surfaces as
-    # state=FAILURE with the detail in `error`. Advertising the `str` half in OpenAPI would
-    # document a response clients can no longer receive.
-    rows_processed: dict[str, int] | None = Field(
+    # `int | str` is kept DELIBERATELY even though new writes can only produce ints: a failed
+    # group used to ride along as "error: ..." inside an otherwise-SUCCESS payload, and
+    # embeddings._for_each_group now raises EmbeddingGroupsFailed instead (state=FAILURE, detail
+    # in `error`). But admin.py builds this model in the route body from a Celery result that may
+    # PREDATE the deploy and still be inside the backend's TTL — narrowing to dict[str, int] turns
+    # every such poll into a pydantic ValidationError, i.e. a 500 for a job that actually
+    # succeeded. Tolerating the legacy shape on read costs one union member in the OpenAPI doc;
+    # rejecting it costs real 500s for the length of the result TTL after every deploy.
+    rows_processed: dict[str, int | str] | None = Field(
         default=None,
         description="Master rows processed, by group (create/update/recreate only). Present only "
-                    "when state is SUCCESS; on FAILURE see `error`."
+                    "when state is SUCCESS; on FAILURE see `error`. A string value is a legacy "
+                    "per-group error from a job queued before the FAILURE-reporting change."
     )
-    vectors_deleted: dict[str, int] | None = Field(
+    vectors_deleted: dict[str, int | str] | None = Field(
         default=None,
         description="Mongo vectors deleted, by group (delete only). Present only when state is "
-                    "SUCCESS; on FAILURE see `error`."
+                    "SUCCESS; on FAILURE see `error`. A string value is a legacy per-group error "
+                    "from a job queued before the FAILURE-reporting change."
     )
 
 

@@ -160,6 +160,47 @@ def test_empty_input_returns_before_taking_a_slot(monkeypatch):
     assert entered == [], "embed([]) acquired an LLM slot for zero work"
 
 
+def test_text_at_exactly_max_embed_chars_is_accepted(monkeypatch):
+    """max_embed_chars is a contract about the CALLER's text. The e5 prefix is our own internal
+    addition the caller cannot budget for, so validating after prefixing rejected callers who had
+    correctly truncated to exactly the cap — threat_retrieval.py:296 does precisely that, and the
+    resulting ValueError was swallowed into permanent keyword-only ranking."""
+    calls = _install_fake(monkeypatch)
+    cap = 200
+    text = "T: " + ("d" * (cap - 3))          # exactly cap chars, as the caller truncates to
+    assert len(text) == cap
+
+    vecs = LiteLLMClient(_settings(max_embed_chars=cap, max_proposal_chars=cap // 2,
+                                   embedding_prefix_style="e5")).embed([text], kind="passage")
+
+    assert len(vecs) == 1
+    assert calls[0][0].startswith("passage: ")     # prefix still applied on the wire
+    assert len(calls[0][0]) == cap + len("passage: ")
+
+
+def test_text_over_max_embed_chars_still_rejected(monkeypatch):
+    """The cap must still bite for genuinely over-long caller input — and before any network call."""
+    calls = _install_fake(monkeypatch)
+
+    with pytest.raises(ValueError, match="over 200 chars"):
+        LiteLLMClient(_settings(max_embed_chars=200, max_proposal_chars=100)).embed(
+            ["x" * 201], kind="passage")
+    assert calls == [], "rejected input must cost zero provider calls"
+
+
+def test_legacy_error_string_in_a_stored_result_does_not_500():
+    """admin.py builds EmbeddingJobStatus in the route body from a Celery result that may predate
+    the deploy. A job queued before the FAILURE-reporting change can still carry a per-group
+    "error: ..." string inside a SUCCESS payload; rejecting it would turn a succeeded job's poll
+    into a 500 for the length of the result TTL."""
+    from app.api.schemas import EmbeddingJobStatus
+
+    got = EmbeddingJobStatus(state="SUCCESS",
+                             rows_processed={"threat_type": 12, "control_library": "error: boom"})
+    assert got.rows_processed["threat_type"] == 12
+    assert got.rows_processed["control_library"] == "error: boom"
+
+
 def test_prefix_is_applied_once_not_per_chunk(monkeypatch):
     """Prefixing must stay outside the chunk loop — slicing an already-prefixed list and
     re-prefixing would produce 'query: query: foo'."""
