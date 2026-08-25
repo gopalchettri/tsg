@@ -64,7 +64,7 @@ from app.pipeline.tasks import ASSET_UNIT_ID
 
 log = get_logger(__name__)
 
-router = APIRouter(prefix="/v1", tags=["Treatment Plans"])
+router = APIRouter(prefix="/v1", tags=["Remediation Plans"])
 
 # Same declaration idea as sessions._CONFLICT_RESPONSES: typing the 409 puts
 # TreatmentGateReason into /openapi.json so the UI can generate the reason codes.

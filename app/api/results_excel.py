@@ -81,18 +81,22 @@ def _applicability_cell(entries: list[SupportingSystemApplicability]) -> str:
 def _row(results: SessionResults, scenario: ScenarioResult, *,
         is_replaced: bool, current_output_id: str | None) -> dict:
     narrative = scenario.scenario
+    threat = scenario.threat
     return {
         "session_id": results.session_id, "entity_id": results.entity_id,
         "asset_id": results.asset_id, "asset_name": results.asset_name, "user_id": results.user_id,
         "OutputID": scenario.OutputID, "ThreatID": scenario.ThreatID,
-        # These four ride in the scenario BODY (merged there by sessions._scenario_with_controls
-        # from the Identified_Threat row), which keeps the LLM's own snake_case keys — hence the
-        # spelling mismatch between the getattr and the column header. The header wins: it is
-        # what the reviewer reads.
-        "ThreatCategory": getattr(narrative, "threat_category", None),
-        "ThreatType": getattr(narrative, "threat_type", None),
-        "ThreatName": getattr(narrative, "threat_name", None),
-        "ThreatActors": "; ".join(getattr(narrative, "threat_actors", None) or []),
+        # Read off the ENVELOPE (ScenarioResult.threat), not the narrative body: a failure card
+        # has scenario=null, and reading through it left every threat column blank on exactly
+        # the rows a reviewer most needs to identify. The envelope survives that, and its field
+        # names match these column headers exactly instead of needing a snake_case translation.
+        "ThreatCategory": getattr(threat, "ThreatCategory", None),
+        "ThreatType": getattr(threat, "ThreatType", None),
+        "ThreatName": getattr(threat, "ThreatName", None),
+        # Derived from the KEYED list, the only one the API now carries. A spreadsheet cell
+        # cannot hold an id/name pair usefully, so the names are joined here — but they come
+        # from the same rows the API reports, not a parallel un-keyed copy that could disagree.
+        "ThreatActors": "; ".join(a.ThreatActorName for a in (getattr(threat, "Actors", None) or [])),
         "scenario_title": getattr(narrative, "scenario_title", None),
         "scenario_statement": getattr(narrative, "scenario_statement", None),
         "risk_statement": getattr(narrative, "risk_statement", None),

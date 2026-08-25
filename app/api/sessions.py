@@ -13,7 +13,7 @@ from typing import Literal, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response
 from fastapi.responses import JSONResponse
-from sqlalchemy import exists, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -44,8 +44,8 @@ from app.api.schemas import (
     SessionResults,
     StageCompletedEvent,
     StageStartedEvent,
+    StandardRef,
     SubsystemStartedEvent,
-    ThreatResult,
     TreatmentPlanResultEvent,
 )
 from app.core import tuning
@@ -355,6 +355,12 @@ def _scenario_select():
         # these, so the SAME scenario showed the model's wording on one endpoint and the
         # curator's on the other.
         it.LibraryThreatType, it.LibraryThreatName,
+        # Master identity + provenance + scoping — every column the envelope's threat block
+        # (ScenarioResult.threat / AcceptedScenario.threat, a full ThreatResult) needs, joined
+        # here so a card is self-contained without a second query. st.Score/st.ScopeRank are
+        # THIS scenario's own scoped row — the same join chain already in use.
+        it.ThreatCatalogueID, it.ThreatTypeID, it.GroundingStatus, it.GroundingScore,
+        st.Score, st.ScopeRank,
     ).select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                 .outerjoin(it, st.ThreatID == it.ThreatID))
 
@@ -442,27 +448,12 @@ def get_results(
                 select(*cols).where(table.SessionID == sid, dal.active(table.Superseded), *extra)
             ).mappings()]
 
-        st, out, it = m.Scoped_Threat, m.Threat_Scenario_Output, m.Identified_Threat
-        threats = get_current_rows(it,
-                        [it.ThreatID, it.ThreatCategory, it.ThreatType, it.ThreatName,
-                        it.ThreatTypeID, it.LibraryThreatType, it.LibraryThreatName,
-                        it.GroundingStatus, it.ThreatCatalogueID, it.ThreatActorsJSON,
-                        # read at source — deliberately NOT denormalised onto Scoped_Threat,
-                        # so the value can never drift from the row that owns it
-                        it.GroundingScore],
-                        # only threats with an ACTIVE scenario row — including a FAILURE CARD,
-                        # deliberately (no Status filter here): the card is returned in
-                        # scenarios[] with scenario:null, so its threat must stay in threats[]
-                        # or the card would reference a threat this same response says does not
-                        # exist. This comment used to claim failed threats were excluded — the
-                        # code never did that, and the claim was the drift, not the behaviour.
-                        exists().where(st.ThreatID == it.ThreatID,
-                                    st.SessionID == sid, dal.active(st.Superseded),
-                                    out.ScopedThreatID == st.ScopedThreatID,
-                                    out.SessionID == sid, dal.active(out.Superseded)))
-        # One grouped round trip — never a join, which would fan out per variant row.
-        scores = dal.threat_scores(sess, sid)
-        threats_by_id = {t["ThreatID"]: t for t in threats}
+        out = m.Threat_Scenario_Output
+        # No separate threats query. Every threat it could return was, by its own EXISTS
+        # predicate, one already backing an active scenario row — so each card now carries its
+        # own threat (ScenarioResult.threat, read from the SAME row via _scenario_select's
+        # join). That removes the two-lists-must-agree invariant entirely, along with the
+        # missing_tids backfill query that existed only to repair it.
         # Current rows PLUS the accepted one: the accepted version may be superseded
         # (Accepted is decoupled from generation recency), and the default view must never
         # hide the very row the reviewer accepted. TWO statements, not one OR: this table's
@@ -489,23 +480,14 @@ def get_results(
                 replaced = [dict(r) for r in sess.execute(
                     _scenario_select().where(out.OutputID.in_(wanted), out.SessionID == sid)
                 ).mappings()]
-        # Response invariant: threats[] must cover every ThreatID a returned card carries — a
-        # card must never "reference a threat this same response says does not exist" (the
-        # threats query's own comment). The accepted card may reference a threat the active-work
-        # exists above no longer matches (e.g. its scoped/output chain was fully superseded
-        # after the accepted version was generated), so backfill those by PK. Zero extra
-        # queries in the common case (the set is empty).
-        missing_tids = {s["ThreatID"] for s in scenarios if s["ThreatID"]} - set(threats_by_id)
-        if missing_tids:
-            threats += [dict(r) for r in sess.execute(
-                select(it.ThreatID, it.ThreatCategory, it.ThreatType, it.ThreatName,
-                       it.ThreatTypeID, it.LibraryThreatType, it.LibraryThreatName,
-                       it.GroundingStatus, it.ThreatCatalogueID, it.ThreatActorsJSON,
-                       it.GroundingScore)
-                .where(it.SessionID == sid, it.ThreatID.in_(missing_tids))
-            ).mappings()]
         controls = _controls_by_output(sess, [s["OutputID"] for s in scenarios]
                                             + [r["OutputID"] for r in replaced])
+        # One batched lookup for every actor name this response mentions — threats[] and every
+        # scenario's nested threat block share it, so the same name can never resolve to two
+        # different ids within one response.
+        actor_ids = _actor_ids_by_name(sess, {
+            n for rows_ in (scenarios, replaced) for r in rows_
+            for n in stored_actors(r.get("ThreatActorsJSON"))})
         by_id = {r["OutputID"]: r for r in replaced}
 
         def _nested(chain: list[str]) -> list[ScenarioResult]:
@@ -513,7 +495,7 @@ def get_results(
             without a `replaced` argument, which is what keeps nesting exactly one level deep.
             A chain id with no row (hard-deleted, or past _MAX_ANCESTRY_HOPS) is skipped rather
             than emitted as an entry with no body — the history truncates, it never lies."""
-            return [_scenario_result(by_id[oid], controls.get(oid))
+            return [_scenario_result(by_id[oid], controls.get(oid), actor_ids=actor_ids)
                     for oid in chain if oid in by_id]
 
         return SessionResults(
@@ -525,22 +507,9 @@ def get_results(
             # list indistinguishable from a completed one. Reuses build_board rather than
             # re-deriving, so /results and the board can never disagree.
             progress=build_board(sess, scenario_session)["progress"],
-            threats=[ThreatResult(ThreatID=t["ThreatID"],
-                                ThreatCategory=t["ThreatCategory"],
-                                ThreatType=t["ThreatType"], ThreatName=t["ThreatName"],
-                                ThreatTypeID=t["ThreatTypeID"],
-                                ThreatCatalogueID=t["ThreatCatalogueID"],
-                                # Reported ALONGSIDE the proposed spelling, never instead of it.
-                                LibraryThreatType=t["LibraryThreatType"],
-                                LibraryThreatName=t["LibraryThreatName"],
-                                GroundingStatus=t["GroundingStatus"],
-                                ThreatActors=stored_actors(t["ThreatActorsJSON"]),
-                                GroundingScore=t["GroundingScore"],
-                                Score=scores.get(t["ThreatID"], {}).get("score"),
-                                ScopeRank=scores.get(t["ThreatID"], {}).get("scope_rank"))
-                    for t in threats],
             scenarios=[_scenario_result(s, controls.get(s["OutputID"]),
-                                        _nested(chains.get(s["OutputID"]) or []))
+                                        _nested(chains.get(s["OutputID"]) or []),
+                                        actor_ids=actor_ids)
                     for s in scenarios],
         )
 
@@ -644,25 +613,78 @@ def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str
             lib.IsActive == True, lib.IsDeleted == False)
         .order_by(cmap.OutputID, cmap.MapRank)
     ).mappings().all()
-    std_names: dict[int, list[str]] = {}
+    std_refs: dict[int, list[StandardRef]] = {}
     if rows:
         smap, std = m.Control_Library_Standard_Map, m.Control_Standard
-        for cid, name in sess.execute(
-            select(smap.ControlLibraryID, std.StandardName)
+        for cid, standard_id, name in sess.execute(
+            select(smap.ControlLibraryID, std.StandardID, std.StandardName)
             .join(std, std.StandardID == smap.StandardID)
             .where(smap.ControlLibraryID.in_({r["ControlLibraryID"] for r in rows}),
                 std.IsActive == True, std.IsDeleted == False)
             .order_by(std.StandardName)
         ):
-            std_names.setdefault(cid, []).append(name)
+            std_refs.setdefault(cid, []).append(
+                StandardRef(StandardID=standard_id, StandardName=name))
     out: dict[str, list[MappedControl]] = {}
     for r in rows:
         out.setdefault(r["OutputID"], []).append(MappedControl(
             ControlLibraryID=r["ControlLibraryID"], ControlCode=r["ControlCode"],
             Domain=r["Domain"], ControlName=r["ControlName"], MapRank=r["MapRank"],
             Score=r["Score"],
-            StandardNames=std_names.get(r["ControlLibraryID"], [])))
+            Standards=std_refs.get(r["ControlLibraryID"], [])))
     return out
+
+
+def _actor_ids_by_name(sess: Session, names: set[str]) -> dict[str, int]:
+    """Threat_Actor primary keys for a page's actor names, one batched query. Actor names are
+    written from the library itself (the model never invents one), so an exact-name match is the
+    correct join; a name that no longer resolves stays absent and renders as ThreatActorID=null
+    — visible, never silent. Same degrade-loudly contract as _controls_by_output: a failed read
+    must never 500 the core results view."""
+    if not names:
+        return {}
+    ta = m.Threat_Actor
+    try:
+        return {name: int(actor_id) for actor_id, name in sess.execute(
+            select(ta.ThreatActorID, ta.ThreatActorName)
+            .where(ta.ThreatActorName.in_(names),
+                ta.IsActive == True, ta.IsDeleted == False))}
+    except Exception:
+        sess.rollback()  # leave the session clean for the caller's remaining work
+        log.warning("actors.read_failed", exc_info=True)
+        return {}
+
+
+def _threat_block(threat_row: dict | None, actor_ids: dict[str, int] | None = None) -> dict | None:
+    """The FULL threat a card was generated from, every database key included, shaped as
+    ThreatResult.
+
+    Built for the ENVELOPE (ScenarioResult.threat), never merged into the scenario narrative:
+    a failed generation returns scenario=null, and a reviewer must still be able to see WHICH
+    threat failed. Putting it inside the narrative made that information vanish exactly when it
+    mattered most, and forced a parallel top-level threats[] list to compensate.
+
+    None when the OUTER join found no Identified_Threat row — ThreatResult's required fields
+    (ThreatType, GroundingStatus) only exist when the row does."""
+    if not threat_row or not threat_row.get("ThreatID"):
+        return None
+    actor_names = stored_actors(threat_row.get("ThreatActorsJSON"))
+    return {
+        "ThreatID": threat_row.get("ThreatID"),
+        "ThreatCategory": threat_row.get("ThreatCategory"),
+        "ThreatType": threat_row.get("ThreatType"),
+        "ThreatName": threat_row.get("ThreatName"),
+        "ThreatTypeID": threat_row.get("ThreatTypeID"),
+        "LibraryThreatType": threat_row.get("LibraryThreatType"),
+        "LibraryThreatName": threat_row.get("LibraryThreatName"),
+        "GroundingStatus": threat_row.get("GroundingStatus"),
+        "ThreatCatalogueID": threat_row.get("ThreatCatalogueID"),
+        "Actors": [{"ThreatActorID": (actor_ids or {}).get(n), "ThreatActorName": n}
+                for n in actor_names],
+        "GroundingScore": threat_row.get("GroundingScore"),
+        "Score": threat_row.get("Score"),
+        "ScopeRank": threat_row.get("ScopeRank"),
+    }
 
 
 def _scenario_with_controls(scenario_json: str | None, controls: list[MappedControl],
@@ -697,12 +719,16 @@ def _scenario_with_controls(scenario_json: str | None, controls: list[MappedCont
 
 
 def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
-                    replaced: list[ScenarioResult] | None = None) -> ScenarioResult:
+                    replaced: list[ScenarioResult] | None = None,
+                    actor_ids: dict[str, int] | None = None) -> ScenarioResult:
     controls_mapped = row["ControlsMappedAt"] is not None
     checked, flagged, categories = _moderation_summary(row["ValidationJSON"])
     validation_status, validation_errors = _validation_summary(row["ValidationJSON"])
     return ScenarioResult(OutputID=row["OutputID"], ThreatID=row["ThreatID"],
                         scenario=_scenario_with_controls(row["ScenarioJSON"], controls or [], row),
+                        # On the ENVELOPE, so a failure card (scenario=null) still says which
+                        # threat failed — see _threat_block.
+                        threat=_threat_block(row, actor_ids),
                         Accepted=bool(row["Accepted"]),
                         moderation_checked=checked, moderation_flagged=flagged, moderation_categories=categories,
                         validation_status=validation_status, validation_errors=validation_errors,
@@ -1158,6 +1184,8 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
         scenario_session = get_authorized_session(sess, session_id, principal)
         rows = dal.accepted_scenarios(sess, scenario_session["SessionID"])
         controls = _controls_by_output(sess, [r["OutputID"] for r in rows])
+        actor_ids = _actor_ids_by_name(
+            sess, {n for r in rows for n in stored_actors(r["ThreatActorsJSON"])})
         return AcceptedScenariosResponse(
             asset_id=int(scenario_session["AssetID"]), entity_id=scenario_session["EntityID"],
             user_id=scenario_session["UserID"],
@@ -1175,6 +1203,7 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
                 # The row goes in whole; _scenario_with_controls owns the display preference.
                 scenario=_scenario_with_controls(
                     r["ScenarioJSON"], controls.get(r["OutputID"], []), r),
+                threat=_threat_block(r, actor_ids),
                 ThreatActors=stored_actors(r["ThreatActorsJSON"]),
             ) for r in rows],
         )
@@ -1196,7 +1225,8 @@ _SCN_SUPERSEDED = Query(
 )
 
 
-def _scenario_list_item(row: dict, controls: list[MappedControl]) -> ScenarioListItem:
+def _scenario_list_item(row: dict, controls: list[MappedControl],
+                        actor_ids: dict[str, int] | None = None) -> ScenarioListItem:
     """One dal.scenario_rows/scenario_row row → response item. Same both-spellings rule and
     controls merge as get_accepted_scenarios above."""
     return ScenarioListItem(
@@ -1205,6 +1235,7 @@ def _scenario_list_item(row: dict, controls: list[MappedControl]) -> ScenarioLis
         ThreatType=row["ThreatType"], ThreatName=row["ThreatName"],
         LibraryThreatType=row["LibraryThreatType"], LibraryThreatName=row["LibraryThreatName"],
         scenario=_scenario_with_controls(row["ScenarioJSON"], controls, row),
+        threat=_threat_block(row, actor_ids),
         session_id=row["SessionID"], entity_id=row["EntityID"], user_id=row["UserID"],
         session_status=row["SessionStatus"], ScenarioNumber=row["ScenarioNumber"],
         Accepted=bool(row["Accepted"]), Superseded=bool(row["Superseded"]),
@@ -1226,7 +1257,9 @@ def _list_scenarios(entity_ids: set[str], user_id: str | None, status: str | Non
         rows = dal.scenario_rows(sess, entity_ids=entity_ids, user_id=user_id, status=status,
                                 include_superseded=include_superseded, limit=limit, offset=offset)
         controls = _controls_by_output(sess, [r["OutputID"] for r in rows])  # one batch, no N+1
-        return [_scenario_list_item(r, controls.get(r["OutputID"], [])) for r in rows]
+        actor_ids = _actor_ids_by_name(
+            sess, {n for r in rows for n in stored_actors(r["ThreatActorsJSON"])})
+        return [_scenario_list_item(r, controls.get(r["OutputID"], []), actor_ids) for r in rows]
 
 
 @scenarios_router.get("/users/{user_id}/scenarios", response_model=list[ScenarioListItem])
@@ -1283,4 +1316,5 @@ def get_scenario(
         if row is None:
             raise dal.NotFoundError(f"scenario {output_id} not found")
         controls = _controls_by_output(sess, [row["OutputID"]])
-        return _scenario_list_item(dict(row), controls.get(row["OutputID"], []))
+        actor_ids = _actor_ids_by_name(sess, set(stored_actors(row["ThreatActorsJSON"])))
+        return _scenario_list_item(dict(row), controls.get(row["OutputID"], []), actor_ids)

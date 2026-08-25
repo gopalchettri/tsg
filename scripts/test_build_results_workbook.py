@@ -19,17 +19,19 @@ from app.api.schemas import (
     ScenarioNarrative,
     ScenarioResult,
     SessionResults,
+    StandardRef,
     SupportingSystemApplicability,
+    ThreatActorRef,
     ThreatResult,
 )
 
 CONTROL_A = MappedControl(
     ControlLibraryID=49, ControlCode="CII-CID-049", Domain="Business Continuity & Disaster Recovery",
     ControlName="Telecommunications Services Availability", MapRank=1, Score=99.9,
-    StandardNames=["DESC ISR v3"])
+    Standards=[StandardRef(StandardID=6, StandardName="DESC ISR v3")])
 CONTROL_B = MappedControl(
     ControlLibraryID=464, ControlCode="CII-CID-464", Domain="Secure Engineering & Architecture",
-    ControlName="Fail Safe", MapRank=3, Score=None, StandardNames=[])
+    ControlName="Fail Safe", MapRank=3, Score=None, Standards=[])
 
 APPLICABILITY = [
     SupportingSystemApplicability(supporting_system="OT Telecom Network", applicable=True,
@@ -47,12 +49,28 @@ NARRATIVE = ScenarioNarrative(
     scenario_title="PGS outage", scenario_statement="s", risk_statement="r",
 )
 
+THREAT_1 = ThreatResult(
+    ThreatID="threat-1", ThreatCategory="Denial of Service", ThreatType="loss of availability",
+    ThreatName="Loss of control and generation availability of PGS",
+    GroundingStatus="unverified", ThreatCatalogueID=None,
+    Actors=[ThreatActorRef(ThreatActorID=2, ThreatActorName="External attacker"),
+            ThreatActorRef(ThreatActorID=6, ThreatActorName="Nation-state/APT")])
+#: The failure card's threat. Its columns come from the ENVELOPE, so they render even though
+#: that card has no narrative at all — see _row's comment in results_excel.py.
+THREAT_2 = ThreatResult(
+    ThreatID="threat-2", ThreatCategory="Tampering", ThreatType="setpoint manipulation",
+    ThreatName="Unauthorised setpoint change", GroundingStatus="verified",
+    ThreatCatalogueID=418,
+    Actors=[ThreatActorRef(ThreatActorID=4, ThreatActorName="Malicious insider")])
+
 CURRENT = ScenarioResult(
-    OutputID="out-current", ThreatID="threat-1", scenario=NARRATIVE, Accepted=False,
+    OutputID="out-current", ThreatID="threat-1", scenario=NARRATIVE, threat=THREAT_1,
+    Accepted=False,
     moderation_checked=False, validation_status="ok", validation_errors=[],
     GenerationEpoch=1, ScenarioNumber=1, ControlsMapped=True,
     replaced_scenarios=[
         ScenarioResult(OutputID="out-old", ThreatID="threat-1", scenario=NARRATIVE,
+                    threat=THREAT_1,
                     Accepted=False, moderation_checked=False, validation_status="ok",
                     validation_errors=[], GenerationEpoch=1, ScenarioNumber=1,
                     ControlsMapped=True, replaced_scenarios=[]),
@@ -60,16 +78,13 @@ CURRENT = ScenarioResult(
 )
 
 FAILED = ScenarioResult(
-    OutputID="out-failed", ThreatID="threat-2", scenario=None, Accepted=False,
+    OutputID="out-failed", ThreatID="threat-2", scenario=None, threat=THREAT_2, Accepted=False,
     moderation_checked=False, validation_status=None, validation_errors=["missing scenario_title"],
     GenerationEpoch=1, ScenarioNumber=1, ControlsMapped=False, replaced_scenarios=[])
 
 RESULTS = SessionResults(
     session_id="sess-1", entity_id="78", asset_id=99, asset_name="Power Generation System (PGS)",
     user_id="gc", progress=None,
-    threats=[ThreatResult(ThreatID="threat-1", ThreatType="loss of availability",
-                        ThreatName="Loss of availability", GroundingStatus="unverified",
-                        ThreatCatalogueID=None)],
     scenarios=[CURRENT, FAILED],
 )
 
@@ -137,7 +152,14 @@ def main() -> None:
     assert row4[col["scenario_title"]] is None
     assert row4[col["controls"]] == ""
     assert row4[col["validation_errors"]] == "missing scenario_title"
-    print("9 OK  failed-generation scenario (scenario=None) gets a row, narrative fields blank")
+    # ...but its THREAT columns are populated, because _row reads them off the envelope
+    # (ScenarioResult.threat) rather than through the null narrative. Reading them through the
+    # narrative left a reviewer with a failed row they could not even identify.
+    assert row4[col["ThreatName"]] == "Unauthorised setpoint change"
+    assert row4[col["ThreatCategory"]] == "Tampering"
+    assert row4[col["ThreatType"]] == "setpoint manipulation"
+    assert row4[col["ThreatActors"]] == "Malicious insider"
+    print("9 OK  failed-generation row: narrative blank, THREAT columns still identify it")
 
     # 10 — formula-injection guard: a leading '=' gets neutralized with a leading quote
     assert _sanitize("=SUM(A1:A9)") == "'=SUM(A1:A9)"

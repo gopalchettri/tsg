@@ -490,6 +490,17 @@ class CreateSessionResponse(BaseModel):
     )
 
 
+class ThreatActorRef(BaseModel):
+    """One adversary WITH its database key. Actor names always come from the library (the model
+    never invents one), so a name normally resolves to a real Threat_Actor row; ThreatActorID is
+    null only when the stored name no longer matches an active row — visible, never silent."""
+    ThreatActorID: int | None = Field(
+        default=None,
+        description="Threat_Actor primary key. Null when the stored name no longer resolves to "
+                    "an active Threat_Actor row (renamed/deactivated since this threat was written).")
+    ThreatActorName: str = Field(description="The adversary's name (Threat_Actor.ThreatActorName).")
+
+
 class ThreatResult(BaseModel):
     """One threat identified for the session's asset, as returned to the client."""
     model_config = ConfigDict(
@@ -547,12 +558,16 @@ class ThreatResult(BaseModel):
                     "itself cleared the cutoff. Null whenever it did not — a close-but-unconfirmed "
                     "candidate is deliberately not reported as a match."
     )
-    ThreatActors: list[str] = Field(
-        default=[],
-        description="Adversary names for this threat, taken from the LIBRARY only - the actors a "
-                    "curator linked to the matched Threat_Type, or the nearest active Threat_Actor "
-                    "rows when none are linked. The model never names an adversary, so a name here "
-                    "always corresponds to a real Threat_Actor row. Empty when the table holds none."
+    # No bare `ThreatActors: list[str]`. Actors below carries the same names WITH their
+    # Threat_Actor keys, so a parallel un-keyed copy was pure duplication — and the kind that
+    # silently drifts, since nothing forced the two to be built from the same list.
+    Actors: list[ThreatActorRef] = Field(
+        default_factory=list,
+        description="Adversaries for this threat, each with its Threat_Actor database key. Taken "
+                    "from the LIBRARY only — the actors a curator linked to the matched "
+                    "Threat_Type, or the nearest active Threat_Actor rows when none are linked. "
+                    "The model never names an adversary, so a name here always corresponds to a "
+                    "real Threat_Actor row. Empty when the table holds none."
     )
     GroundingScore: float | None = Field(
         default=None,
@@ -570,6 +585,15 @@ class ThreatResult(BaseModel):
     )
 
 
+class StandardRef(BaseModel):
+    """One referred standard WITH its database key. A control can refer to several standards
+    (Control_Library_Standard_Map is many-to-many), and a bare name list cannot say which
+    Control_Standard row each came from — the same keys-alongside-names rule as
+    ThreatCatalogueID/ControlLibraryID."""
+    StandardID: int = Field(description="Control_Standard primary key.")
+    StandardName: str = Field(description="The standard's name (Control_Standard.StandardName).")
+
+
 #: One `scenario.controls` entry, for the OpenAPI examples below.
 _MAPPED_CONTROL_EXAMPLE: JsonDict = {
     "ControlLibraryID": 201,
@@ -578,7 +602,10 @@ _MAPPED_CONTROL_EXAMPLE: JsonDict = {
     "ControlName": "Multi-Factor Authentication",
     "MapRank": 1,
     "Score": 93.0,
-    "StandardNames": ["NIST SP 800-53 Rev. 5", "ISO 27001:2022"],
+    "Standards": [
+        {"StandardID": 3, "StandardName": "NIST SP 800-53 Rev. 5"},
+        {"StandardID": 7, "StandardName": "ISO 27001:2022"},
+    ],
 }
 
 #: The scenario narrative exactly as the pipeline produces it (prompts.py::scenario_prompt): these
@@ -630,9 +657,14 @@ class MappedControl(BaseModel):
     MapRank: int = Field(description="1 = best match for this scenario. Spelled as the "
                                     "Threat_Scenario_Control_Map column it is read from.")
     Score: float | None = Field(description="Raw match confidence 0-100 at mapping time.")
-    StandardNames: list[str] = Field(
+    # No bare `StandardNames: list[str]`. Standards below carries the same names WITH their
+    # Control_Standard keys; a control routinely refers to three or more standards, which is
+    # exactly where an un-keyed name list stops being usable and starts being ambiguous.
+    Standards: list[StandardRef] = Field(
         default_factory=list,
-        description="Referred standard names for this control (Control_Standard.StandardName).")
+        description="Referred standards for this control, each with its Control_Standard "
+                    "database key (Control_Library_Standard_Map is many-to-many, so a control "
+                    "commonly refers to several).")
 
 
 class SupportingSystemApplicability(BaseModel):
@@ -658,11 +690,17 @@ class ScenarioNarrative(BaseModel):
     hand-copied one is exactly how the smoke guides ended up documenting `title`/`narrative`, keys
     the API has never returned).
 
-    threat_category/threat_type/threat_name/threat_actors are NOT LLM output — they come from the
-    Identified_Threat row this scenario was generated from, merged in at read time
-    (sessions.py::_scenario_with_controls) by every current caller. Default to None/[] anyway: no
-    enforced foreign key guarantees the join found a row (see _scenario_select's OUTER join), and
-    a scenario written before this field existed carries none either."""
+    threat_category/threat_type/threat_name/threat_actors are NOT LLM output — they come from
+    the Identified_Threat row this scenario was generated from, merged in at read time
+    (sessions.py::_scenario_with_controls) by every current caller. Default to None/[] anyway:
+    no enforced foreign key guarantees the join found a row (see _scenario_select's OUTER join),
+    and a scenario written before this field existed carries none either.
+
+    The FULL typed threat — with database keys and actor ids — is NOT here. It is on the
+    ENVELOPE, as ScenarioResult.threat / AcceptedScenario.threat, deliberately: a failed
+    generation returns scenario=null, and the threat must survive that. Read it there, not
+    through this model (extra="allow" means `scenario.threat` would silently read as absent
+    rather than raise)."""
     model_config = ConfigDict(extra="allow", json_schema_extra={"example": _SCENARIO_EXAMPLE})
 
     threat_category: str | None = Field(default=None, description="This threat's STRIDE category, e.g. Spoofing, Tampering.")
@@ -691,6 +729,24 @@ _SCENARIO_RESULT_EXAMPLE: JsonDict = {
     "OutputID": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
     "ThreatID": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
     "scenario": _SCENARIO_EXAMPLE,
+    "threat": {
+        "ThreatID": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
+        "ThreatCategory": "Tampering",
+        "ThreatType": "unauthorized modification of firmware",
+        "ThreatName": "Unauthorized firmware update of Remote Terminal Unit (RTU)",
+        "ThreatTypeID": 3,
+        "LibraryThreatType": "Logic/Configuration Manipulation",
+        "LibraryThreatName": "Unauthorised firmware modification",
+        "GroundingStatus": "verified",
+        "ThreatCatalogueID": 42,
+        "Actors": [
+            {"ThreatActorID": 7, "ThreatActorName": "Nation-state/APT"},
+            {"ThreatActorID": 12, "ThreatActorName": "Malicious insider"},
+        ],
+        "GroundingScore": 100.0,
+        "Score": 70.0,
+        "ScopeRank": 3,
+    },
     "Accepted": False,
     "moderation_checked": False,
     "moderation_flagged": None,
@@ -711,8 +767,9 @@ class ScenarioResult(BaseModel):
 
     OutputID: str = Field(description="Generated scenario's unique id (GUID). Used to accept/regenerate this scenario.")
     ThreatID: str | None = Field(
-        description="Id of the threat this scenario was generated from. Matches a ThreatID in the "
-                    "session's threats list. Null only if the underlying threat/scoping link is "
+        description="Id of the threat this scenario was generated from. Matches the ThreatID on "
+                    "this card's own `threat` block — there is no session-level threats list to "
+                    "resolve it against. Null only if the underlying threat/scoping link is "
                     "missing (this schema has no enforced foreign keys) — the scenario itself is "
                     "still shown, never dropped, so it remains visible for review and accept."
     )
@@ -720,6 +777,19 @@ class ScenarioResult(BaseModel):
         description=(
             "Generated scenario narrative — scenario_title, scenario_statement, risk_statement, "
             "plus the Step-4 `controls` mapped from the control library. Null if generation failed."
+        )
+    )
+    threat: ThreatResult | None = Field(
+        default=None,
+        description=(
+            "The FULL threat this scenario was generated from, with every database key "
+            "(ThreatCatalogueID, ThreatTypeID, actor ids via Actors). Declared HERE, on the "
+            "envelope, and deliberately NOT inside `scenario`: a failed generation returns "
+            "scenario=null, and a reviewer must still be able to see WHICH threat failed. "
+            "GroundingStatus `verified` = a real library row backs this threat (keys set); "
+            "`unverified` = model-proposed with no confident library match (keys null). Null "
+            "only when no Identified_Threat row joined at all (the OUTER join in "
+            "sessions.py::_scenario_select)."
         )
     )
     Accepted: bool = Field(description="Whether a human reviewer has accepted this scenario.")
@@ -830,7 +900,7 @@ class ScenarioResult(BaseModel):
 
 
 class SessionResults(BaseModel):
-    """All threats and scenarios produced so far for a session."""
+    """The scenarios produced so far for a session, each carrying its own threat."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
@@ -839,15 +909,6 @@ class SessionResults(BaseModel):
                 "asset_id": 12345,
                 "asset_name": "SCADA Historian",
                 "user_id": "qa-user",
-                "threats": [
-                    {
-                        "threat_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
-                        "threat_type": "Spoofing",
-                        "threat_name": "Unauthorized RTU firmware update",
-                        "grounding_status": "verified",
-                        "threat_catalogue_id": 42,
-                    }
-                ],
                 "scenarios": [_SCENARIO_RESULT_EXAMPLE],
             }
         }
@@ -868,7 +929,12 @@ class SessionResults(BaseModel):
             "`progress.last_next_set.epoch` to confirm your own click has landed."
         ),
     )
-    threats: list[ThreatResult] = Field(description="All threats identified so far for this session.")
+    # No top-level `threats` list. It was REMOVED, not relocated: it only ever contained
+    # threats that already had an active scenario row (get_results' own EXISTS predicate), so
+    # every entry was a duplicate of some card's own threat — and keeping the two in sync was
+    # the reason for the missing_tids backfill query that used to live here. Each card now
+    # carries its threat on ScenarioResult.threat, which cannot drift from the card it
+    # describes because it is read from the same row.
     scenarios: list[ScenarioResult] = Field(
         description="All scenarios generated so far for this session. Versions that regeneration "
                     "replaced are nested inside the scenario that replaced them, in its "
@@ -1282,7 +1348,15 @@ class AcceptedScenario(BaseModel):
     ThreatActors: list[str] = Field(
         default=[],
         description="Library actors of the threat this scenario was generated from. Never "
-                    "model-invented - see ThreatResult.ThreatActors."
+                    "model-invented - see ThreatResult.Actors, which carries the same names "
+                    "with their Threat_Actor database keys."
+    )
+    threat: ThreatResult | None = Field(
+        default=None,
+        description="The FULL threat this scenario was generated from, identical shape and rules "
+                    "to ScenarioResult.threat — every database key, plus actor ids via Actors. "
+                    "The flat ThreatTypeID/ThreatCatalogueID/ThreatType/ThreatName/Library* "
+                    "fields above remain for existing clients and report the same values."
     )
 
 
@@ -1382,11 +1456,20 @@ class EmbeddingActionResponse(BaseModel):
     the calling route actually populates is non-null. Also the base shape `EmbeddingJobStatus`
     below extends with `state`/`error` — the eventual RESULT of a queued action, not what a
     route returns directly (see app/api/admin.py: actions now run via a Celery task)."""
-    rows_processed: dict[str, int | str] | None = Field(
-        default=None, description="Master rows processed, by group (create/update/recreate only)."
+    # Counts only — never a per-group error string. These used to be `int | str` because a failed
+    # group rode along as "error: ..." inside an otherwise-SUCCESS payload; embeddings.
+    # _for_each_group now raises EmbeddingGroupsFailed instead, so a partial failure surfaces as
+    # state=FAILURE with the detail in `error`. Advertising the `str` half in OpenAPI would
+    # document a response clients can no longer receive.
+    rows_processed: dict[str, int] | None = Field(
+        default=None,
+        description="Master rows processed, by group (create/update/recreate only). Present only "
+                    "when state is SUCCESS; on FAILURE see `error`."
     )
-    vectors_deleted: dict[str, int | str] | None = Field(
-        default=None, description="Mongo vectors deleted, by group (delete only)."
+    vectors_deleted: dict[str, int] | None = Field(
+        default=None,
+        description="Mongo vectors deleted, by group (delete only). Present only when state is "
+                    "SUCCESS; on FAILURE see `error`."
     )
 
 

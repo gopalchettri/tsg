@@ -16,8 +16,14 @@ import os
 import sys
 import time
 
+import structlog
 from celery import Celery, current_task  # type: ignore[import-untyped]
-from celery.signals import worker_init, worker_process_init  # type: ignore[import-untyped]
+from celery.signals import (  # type: ignore[import-untyped]
+    task_postrun,
+    task_prerun,
+    worker_init,
+    worker_process_init,
+)
 
 from app.api.admin_jobs import emb_job_channel_key, import_job_channel_key, intel_job_channel_key
 from app.core.config import get_settings
@@ -93,6 +99,10 @@ celery_app.conf.update(
         "reap-stuck-sessions": {"task": "tsg.reap", "schedule": _s.reaper_interval_seconds},
         "retry-failed-promotions": {"task": "tsg.retry_promotions",
                                     "schedule": _s.promotion_retry_interval_seconds},
+        # THE consumer of the control-mapping retry queue — without it, map_controls' three
+        # "leave it for the next run" paths have no next run. See cascade.run_control_map_sweep.
+        "map-controls-sweep": {"task": "tsg.map_controls_sweep",
+                            "schedule": _s.control_map_sweep_interval_seconds},
         "operational-self-check": {"task": "tsg.self_check", "schedule": _s.self_check_interval_seconds},
         # live threat-intel refresh — opt-in (TSG_INTEL_ENABLED); absent entirely when off
         **({"intel-refresh": {"task": "tsg.intel_refresh", "schedule": _s.intel_refresh_interval_seconds}}
@@ -203,6 +213,33 @@ def _init_worker(sender=None, **_):
             from app.core.logging import get_logger
             get_logger(__name__).warning("grounding.threshold_warmup_failed", exc_info=True)
             break
+
+
+@task_prerun.connect
+def _bind_task_context(task_id=None, task=None, args=None, **_kw) -> None:
+    """Bind the session onto the LOG CONTEXT once per task, so every line the worker emits
+    carries it without each call site passing it by hand.
+
+    This is what makes worker logs filterable in Loki: `| json | session_id="..."` only works if
+    the field is actually on the line, and today it is present only where somebody remembered to
+    add it. Bound HERE, at the one place every task passes through, rather than at each task body.
+
+    Every pipeline task takes session_id as its first positional argument; anything that does not
+    simply binds no session, which is correct rather than wrong.
+    """
+    structlog.contextvars.bind_contextvars(
+        task_id=task_id, task_name=getattr(task, "name", None))
+    if args:
+        structlog.contextvars.bind_contextvars(session_id=str(args[0]))
+
+
+@task_postrun.connect
+def _clear_task_context(**_kw) -> None:
+    """MANDATORY counterpart to _bind_task_context. The worker runs -P gevent and reuses its
+    greenlets, so without an explicit clear the previous task's session_id leaks into the next
+    task's log lines — worse than having no session_id at all, because it is wrong rather than
+    absent."""
+    structlog.contextvars.clear_contextvars()
 
 
 @celery_app.task(bind=True, name="tsg.run_pipeline",
@@ -362,6 +399,17 @@ def retry_promotions_task() -> list[str]:
     promotion_auto_retry_enabled is off)."""
     with db_session() as sess:
         return retry_failed_promotions(sess)
+
+
+@celery_app.task(name="tsg.map_controls_sweep")
+def map_controls_sweep_task() -> list[str]:
+    """Periodic control-mapping retry sweep; scheduled by `beat_schedule` above.
+
+    Unlike the reaper this one calls the model (grounding reranks), so it is bounded per tick by
+    `control_mapping.SWEEP_LIMIT` and takes the per-subsystem lock — a slow tick must not starve
+    foreground scenario generation of worker slots. run_control_map_sweep logs what it swept."""
+    with db_session() as sess:
+        return cascade.run_control_map_sweep(sess, get_llm())
 
 
 @celery_app.task(name="tsg.intel_refresh")

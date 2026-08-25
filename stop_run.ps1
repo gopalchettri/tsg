@@ -45,12 +45,27 @@ Write-Host "Verifying shutdown..." -ForegroundColor Cyan
 $stragglers = @()
 
 # ponytail: reuse stop.ps1's own matching rule (command line, not window title --
-# MainWindowTitle is empty in headless sessions). If stop.ps1 ever renames its
-# labels this check goes blind with it, which is the right coupling: one place to
-# change, not two that can silently disagree.
-foreach ($label in @('tsg-api', 'tsg-celery', 'tsg-beat')) {
-    $procs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like "*'$label'*" })
+# MainWindowTitle is empty in headless sessions -- AND, for celery/beat, the
+# underlying invocation directly, so a worker that outlived its launcher window
+# still counts as a straggler instead of a false "clean stop"). If stop.ps1 ever
+# changes its matching this check goes blind with it, which is the right
+# coupling: one place to change, not two that can silently disagree.
+# Restricted to the executables this stack ever runs as -- see stop.ps1 for why
+# scanning ALL processes false-positives on unrelated short-lived processes.
+$relevantProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -in @('powershell.exe', 'celery.exe', 'python.exe', 'pythonw.exe') }
+
+$verifyTargets = [ordered]@{
+    'tsg-api'    = @("'tsg-api'")
+    'tsg-celery' = @("'tsg-celery'", 'celery_worker.celery_app worker')
+    'tsg-beat'   = @("'tsg-beat'", 'celery_app.celery_app beat')
+}
+foreach ($label in $verifyTargets.Keys) {
+    $matches = $verifyTargets[$label]
+    $procs = @($relevantProcs | Where-Object {
+        $cmd = $_.CommandLine
+        $cmd -and ($matches | Where-Object { $cmd -like "*$_*" })
+    })
     if ($procs.Count -gt 0) {
         $stragglers += "$label still running (PID $($procs.ProcessId -join ', '))"
     }

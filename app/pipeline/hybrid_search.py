@@ -10,7 +10,7 @@ neither leg alone covers both. RRF fuses by RANK POSITION, so the two score scal
 reconciling. An exact normalized-name match short-circuits to the front — byte-identical names
 must match with certainty, which cosine cannot promise (two DIFFERENT threats once scored 0.969).
 
-# ponytail: in-process BM25 + cosine over in-memory candidates. Move to a real search engine
+# in-process BM25 + cosine over in-memory candidates. Move to a real search engine
 # (Atlas Search / OpenSearch) only when a corpus outgrows memory (~50k rows).
 """
 from __future__ import annotations
@@ -43,7 +43,7 @@ def normalize_name(text: str | None) -> str:
 
 def bm25_scores(query_tokens: Sequence[str], docs_tokens: Sequence[Sequence[str]],
                 k1: float = 1.5, b: float = 0.75) -> list[float]:
-    """Okapi BM25 of one query against every doc. Empty corpus -> []; all-empty docs -> zeros."""
+    """ BM25 of one query against every doc. Empty corpus -> []; all-empty docs -> zeros."""
     n_docs = len(docs_tokens)
     if n_docs == 0:
         return []
@@ -106,7 +106,7 @@ def hybrid_match(query_text: str, candidates: Sequence[dict[str, Any]],
       "text"   - the document text BM25 scores against (required)
       "vector" - its embedding, or None (vector leg skips it)
       "name"   - optional exact-match key; a candidate whose normalized name equals the
-                 normalized query is forced to the FRONT (score 1.0), before any fused result.
+                normalized query is forced to the FRONT (score 1.0), before any fused result.
 
     `query_vec` None -> keyword-only. All-zero legs -> []. Deterministic for fixed inputs."""
     if not candidates:
@@ -121,7 +121,7 @@ def hybrid_match(query_text: str, candidates: Sequence[dict[str, Any]],
 
     q_name = normalize_name(query_text)
     exact = [i for i, c in enumerate(candidates)
-             if q_name and normalize_name(c.get("name")) == q_name]
+            if q_name and normalize_name(c.get("name")) == q_name]
     ordered = sorted(fused, key=lambda i: (-fused[i], i))
     out: list[tuple[int, float]] = [(i, 1.0) for i in exact]
     out += [(i, fused[i]) for i in ordered if i not in set(exact)]

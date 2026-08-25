@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.api import sessions
-from app.api.schemas import MappedControl, ScenarioNarrative
+from app.api.schemas import MappedControl, ScenarioNarrative, StandardRef
 
 RAW_SCENARIO_JSON = json.dumps({
     "scenario_title": "PGS outage",
@@ -38,7 +38,7 @@ THREAT_ROW = {
 
 CONTROLS = [MappedControl(ControlLibraryID=28, ControlCode="CII-CID-028", Domain="BCDR",
                           ControlName="Testing for Reliability", MapRank=1, Score=99.0,
-                          StandardNames=["DESC ISR v3"])]
+                          Standards=[StandardRef(StandardID=6, StandardName="DESC ISR v3")])]
 
 
 def main() -> None:

@@ -173,6 +173,15 @@ def create_app() -> FastAPI:
                     "feed the threats-prompt hint. Requires the admin key."
                 ),
             },
+            {
+                "name": "API Clients Admin",
+                "description": (
+                    "Mint, list and revoke the API client keys callers authenticate with. "
+                    "Requires the admin key alone — issuing the first key must not itself need "
+                    "one. The secret is returned exactly once on create and never stored; a "
+                    "lost secret is revoked and re-minted, never recovered."
+                ),
+            },
 
         ],
         lifespan=lifespan,

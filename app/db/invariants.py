@@ -13,6 +13,7 @@ from sqlalchemy.engine import Engine
 from app.core.config import get_settings
 from app.core.enums import SessionStatus
 from app.core.logging import get_logger
+from app.core.stride import STRIDE_ORDER
 from app.db import models as m
 from app.db.dal import API_MODULE
 
@@ -126,7 +127,43 @@ def verify_startup(engine: Engine) -> None:
         _assert_rcsi_enabled(engine)
         _warn_dead_context_field_config(engine)
         _assert_api_client_configured(engine)
+        _assert_stride_categories(engine)
     _assert_no_duplicate_active(engine)
+
+
+def _assert_stride_categories(engine: Engine) -> None:
+    """Threat_Category must hold all six canonical STRIDE names, active.
+
+    Coverage, the quota that spreads threats across STRIDE (core.stride) and the per-category
+    narrative shapes in prompts._STRIDE_SCENARIO_SHAPES all key on these exact strings. Rename
+    or deactivate one and nothing raises: the category simply matches no shape line and falls
+    through to the generic RULE 4, the quota silently allocates one fewer category, and the
+    coverage grid stops asking a question it should be asking. Every one of those is a QUIETER
+    version of the bug this check exists because of — a threat model that looks complete while
+    a whole STRIDE category has gone missing from it. Fail the boot instead.
+
+    An EMPTY table is left alone deliberately: dal.active_category_names documents unseeded as
+    a supported state that falls back to the canonical defaults, so a fresh DB that has not run
+    the seed yet must still be able to start."""
+    with engine.connect() as c:
+        names = {r[0] for r in c.execute(text(
+            "SELECT ThreatCategoryName FROM Threat_Category "
+            "WHERE IsActive = 1 AND IsDeleted = 0"))}
+    if not names:
+        log.warning("invariants.threat_category_unseeded",
+                    note="Threat_Category is empty; prompts fall back to canonical STRIDE. "
+                        "Run scripts/Seed_to_Threat_library.sql.")
+        return
+    missing = [c for c in STRIDE_ORDER if c not in names]
+    if missing:
+        raise StartupInvariantError(
+            f"Threat_Category is missing active STRIDE categories: {missing}. The threat "
+            f"pipeline keys on these exact names — the coverage grid, the per-category quota "
+            f"(app/core/stride.py) and the scenario shapes in prompts.py all silently degrade "
+            f"without them, producing a threat model that looks complete while a whole "
+            f"category is absent. Present: {sorted(names)}. Fix with "
+            f"scripts/Seed_to_Threat_library.sql, or reactivate the renamed rows."
+        )
 
 
 def _assert_api_client_configured(engine: Engine) -> None:

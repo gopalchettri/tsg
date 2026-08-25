@@ -30,6 +30,25 @@ SET ANSI_NULLS ON;
 
 -- 1. Threat_Category (STRIDE, 6) -- ThreatCategoryID is NOT IDENTITY (TSG_Core.sql),
 -- every INSERT must supply it explicitly, same convention as Config_Threat_Rule below.
+--
+-- ThreatCategoryID ORDER IS NOT MEANINGFUL. These ids were assigned ALPHABETICALLY, so
+-- Denial of Service holds 1 and Spoofing/Tampering hold 5/6 -- nothing to do with STRIDE
+-- order. Reading them back with ORDER BY ThreatCategoryID therefore yields an order that
+-- looks canonical and is not, and that mistake once labelled 46 of 75 library threats
+-- "Denial of Service" while Spoofing, Tampering and Repudiation were labelled on none of
+-- them (every catalogue row is multi-category, and the lowest id won every tie).
+--
+-- The application no longer depends on this order at all: app/core/stride.py owns the
+-- canonical sequence, dal.active_category_names sorts by it, and the category a threat is
+-- STORED with is the coverage slot it was selected to fill. The ids are left exactly as they
+-- are on purpose -- they are FK targets in Threat_Type and Threat_Catalogue_Category_Map in
+-- already-deployed databases, and renumbering a primary key to encode an ordering the code
+-- must not read anyway would be risk without benefit. Every reference below resolves a
+-- category BY NAME for the same reason.
+--
+-- ThreatCategoryCode carries the STRIDE letter so the intended order is at least legible in
+-- the data. Written as idempotent UPDATEs, not INSERT values, so an already-seeded database
+-- picks them up on the next run; the column is nullable and no code reads it.
 IF NOT EXISTS (SELECT 1 FROM Threat_Category WHERE ThreatCategoryName = N'Denial of Service')
     INSERT INTO Threat_Category (ThreatCategoryID, ThreatCategoryName, IsActive, IsDeleted) VALUES (1, N'Denial of Service', 1, 0);
 IF NOT EXISTS (SELECT 1 FROM Threat_Category WHERE ThreatCategoryName = N'Elevation of Privilege')
@@ -42,6 +61,15 @@ IF NOT EXISTS (SELECT 1 FROM Threat_Category WHERE ThreatCategoryName = N'Spoofi
     INSERT INTO Threat_Category (ThreatCategoryID, ThreatCategoryName, IsActive, IsDeleted) VALUES (5, N'Spoofing', 1, 0);
 IF NOT EXISTS (SELECT 1 FROM Threat_Category WHERE ThreatCategoryName = N'Tampering')
     INSERT INTO Threat_Category (ThreatCategoryID, ThreatCategoryName, IsActive, IsDeleted) VALUES (6, N'Tampering', 1, 0);
+
+-- STRIDE letters. Idempotent and id-independent -- matched by name, so they land correctly
+-- whatever ids a given database happens to hold. Documentation in the data; no code reads it.
+UPDATE Threat_Category SET ThreatCategoryCode = N'S' WHERE ThreatCategoryName = N'Spoofing'               AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'S');
+UPDATE Threat_Category SET ThreatCategoryCode = N'T' WHERE ThreatCategoryName = N'Tampering'              AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'T');
+UPDATE Threat_Category SET ThreatCategoryCode = N'R' WHERE ThreatCategoryName = N'Repudiation'            AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'R');
+UPDATE Threat_Category SET ThreatCategoryCode = N'I' WHERE ThreatCategoryName = N'Information Disclosure' AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'I');
+UPDATE Threat_Category SET ThreatCategoryCode = N'D' WHERE ThreatCategoryName = N'Denial of Service'      AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'D');
+UPDATE Threat_Category SET ThreatCategoryCode = N'E' WHERE ThreatCategoryName = N'Elevation of Privilege' AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'E');
 
 -- 2. Threat_Type (27)
 IF NOT EXISTS (SELECT 1 FROM Threat_Type WHERE ThreatTypeName = N'AI Abuse' AND SectorID IS NULL)

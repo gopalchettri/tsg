@@ -60,7 +60,8 @@ def _engine():
     for table in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario_Output,
                 m.Scenario_Audit, m.Identified_Threat, m.Scoped_Threat, m.Threat_Type,
                 m.Threat_Catalogue, m.Risk_Treatment_Plan, m.Threat_Scenario_Control_Map,
-                m.Control_Library):
+                m.Control_Library, m.Threat_Actor, m.Control_Standard,
+                m.Control_Library_Standard_Map):
         table.__table__.create(engine)
     return engine
 
@@ -89,7 +90,11 @@ def _seed(Session) -> tuple[str, str]:
             ThreatName="Ransomware on OT support systems",
             ThreatTypeID=57, ThreatCatalogueID=418,
             LibraryThreatType="Malware/Ransomware", LibraryThreatName="OT ransomware",
-            GroundingStatus="verified", GroundingScore=100.0, Superseded=0, CreatedAt=NOW))
+            GroundingStatus="verified", GroundingScore=100.0, Superseded=0, CreatedAt=NOW,
+            ThreatActorsJSON=json.dumps({"actors": ["Nation-state/APT"], "validated": True})))
+        s.execute(m.Threat_Actor.__table__.insert().values(
+            ThreatActorID=7, ThreatActorName="Nation-state/APT", IsCapable=1,
+            IsActive=True, IsDeleted=False))
         s.execute(m.Scoped_Threat.__table__.insert().values(
             ScopedThreatID=scoped_id, SessionID=SID, TenantID="t", EntityID=ENTITY,
             SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=1, Selected=1,
@@ -99,7 +104,22 @@ def _seed(Session) -> tuple[str, str]:
             SubsystemID=0, ScopedThreatID=scoped_id, Status=ScenarioStatus.complete,
             ScenarioJSON=json.dumps({"scenario_title": "t", "scenario_statement": "s",
                                     "risk_statement": "r"}),
-            Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW))
+            Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW,
+            ControlsMappedAt=NOW))
+        # One mapped control referring to TWO standards — the multi-standard-per-control case
+        # the StandardRef keys exist to disambiguate.
+        s.execute(m.Control_Library.__table__.insert().values(
+            ControlLibraryID=201, ControlCode="CII-CID-201", ITOT="OT",
+            Domain="Identification & Authentication", ControlName="Multi-Factor Authentication",
+            ControlDescription="d", IsActive=True, IsDeleted=False))
+        s.execute(m.Threat_Scenario_Control_Map.__table__.insert().values(
+            OutputID=output_id, ControlLibraryID=201, SessionID=SID, Score=93.0, MapRank=1,
+            CreatedAt=NOW))
+        for std_id, std_name in ((3, "NIST SP 800-53 Rev. 5"), (7, "ISO 27001:2022")):
+            s.execute(m.Control_Standard.__table__.insert().values(
+                StandardID=std_id, StandardName=std_name, IsActive=True, IsDeleted=False))
+            s.execute(m.Control_Library_Standard_Map.__table__.insert().values(
+                ControlLibraryID=201, StandardID=std_id))
         s.commit()
     return threat_id, output_id
 
@@ -130,13 +150,93 @@ def test_get_results_does_not_crash_on_a_real_active_threat(monkeypatch):
     # THE regression: this used to raise KeyError('ThreatCategory') here.
     results = sessions_mod.get_results(SID, include_replaced=False, principal=principal)
 
-    assert len(results.threats) == 1
-    t = results.threats[0]
+    # No top-level threats[] any more: every entry it could have held was a duplicate of some
+    # card's own threat, so each card carries it instead (ScenarioResult.threat), read from the
+    # SAME row and therefore unable to drift from the card it describes.
+    assert not hasattr(results, "threats")
+    assert results.scenarios[0].OutputID == output_id
+
+    # THE threat block, on the ENVELOPE -- every database key, round-tripped with its REAL
+    # seeded value. Declared here rather than inside `scenario` precisely so a failure card
+    # (scenario=null) still reports which threat failed.
+    t = results.scenarios[0].threat
+    assert t is not None
     assert t.ThreatID == threat_id
-    # Every Phase-4 field, round-tripped with its REAL seeded value -- not just "didn't crash".
     assert t.ThreatCategory == "Denial of Service"
     assert t.ThreatTypeID == 57
     assert t.ThreatCatalogueID == 418
+    assert t.GroundingStatus == "verified"
+    assert t.GroundingScore == 100.0
     assert t.LibraryThreatType == "Malware/Ransomware"
     assert t.LibraryThreatName == "OT ransomware"
-    assert results.scenarios[0].OutputID == output_id
+    # Score/ScopeRank come from THIS scenario's own Scoped_Threat row, via the same join.
+    assert t.Score == 90.0
+    assert t.ScopeRank == 1
+    # Actors carry their DB keys. There is deliberately NO bare ThreatActors list beside them:
+    # a second, un-keyed copy of the same names is what drifts.
+    assert not hasattr(t, "ThreatActors")
+    assert [(a.ThreatActorID, a.ThreatActorName) for a in t.Actors] == [(7, "Nation-state/APT")]
+
+    # Standards carry their DB keys alongside the legacy name list — one control referring to
+    # several standards is ambiguous as bare names, which is the gap StandardRef closes.
+    control = results.scenarios[0].scenario.controls[0]
+    assert control.ControlLibraryID == 201
+    assert not hasattr(control, "StandardNames")   # keyed list only, no un-keyed duplicate
+    assert [(s.StandardID, s.StandardName) for s in control.Standards] == [
+        (7, "ISO 27001:2022"), (3, "NIST SP 800-53 Rev. 5")]
+
+
+def test_failure_card_still_reports_which_threat_failed(monkeypatch):
+    """THE reason `threat` sits on the envelope and not inside `scenario`.
+
+    A failed generation persists an error card: ScenarioJSON is NULL, so `scenario` is null in
+    the response. While the threat block lived inside `scenario`, that made the card's threat
+    identity vanish on exactly the rows a reviewer most needs to identify -- and it was the
+    reason a parallel top-level threats[] list had to exist at all (its own query carried a
+    no-Status-filter comment specifically to keep failure cards' threats reachable). On the
+    envelope, the card reports its threat whether or not the narrative exists, so removing
+    threats[] cannot resurrect that gap."""
+    import app.api.sessions as sessions_mod
+    from app.api.deps import Principal
+
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    threat_id, _output_id = _seed(Session)
+
+    failed_output, failed_scoped = str(uuid.uuid4()), str(uuid.uuid4())
+    with Session() as s:
+        # A second scoped row off the SAME threat, carrying an error card: ScenarioJSON NULL.
+        s.execute(m.Scoped_Threat.__table__.insert().values(
+            ScopedThreatID=failed_scoped, SessionID=SID, TenantID="t", EntityID=ENTITY,
+            SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=2, Selected=1,
+            Superseded=0, CreatedAt=NOW))
+        s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+            OutputID=failed_output, SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
+            SubsystemID=0, ScopedThreatID=failed_scoped, Status=ScenarioStatus.error,
+            ScenarioJSON=None, ErrorMessage="LLM call failed",
+            Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW))
+        s.commit()
+
+    @contextmanager
+    def fake_db_session():
+        with Session() as s:
+            yield s
+
+    with Session() as s:
+        board_row = dict(dal.load_session(s, SID))
+    monkeypatch.setattr(sessions_mod, "db_session", fake_db_session)
+    monkeypatch.setattr(sessions_mod, "get_authorized_session", lambda *a, **kw: board_row)
+    monkeypatch.setattr(sessions_mod, "build_board", lambda *a, **kw: {
+        "progress": {"threats": "COMPLETE", "scenarios": "COMPLETE",
+                    "overall": "completed", "error_message": {}}})
+
+    principal = Principal(claims={"sub": "u1"}, entities={ENTITY}, client_id="c", tenant_id="t")
+    results = sessions_mod.get_results(SID, include_replaced=False, principal=principal)
+
+    card = next(c for c in results.scenarios if c.OutputID == failed_output)
+    assert card.scenario is None                      # the failure card, as expected
+    assert card.threat is not None, "a failure card must still say WHICH threat failed"
+    assert card.threat.ThreatID == threat_id
+    assert card.threat.ThreatName == "Ransomware on OT support systems"
+    assert card.threat.ThreatCatalogueID == 418       # database keys survive too
+    assert card.threat.ThreatTypeID == 57

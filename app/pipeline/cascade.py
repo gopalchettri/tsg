@@ -30,7 +30,7 @@ from app.core.security import redact
 from app.db import dal
 from app.db import models as m
 from app.db.dal import RegenerateConflict, guid, now
-from app.pipeline import tasks
+from app.pipeline import control_mapping, tasks
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 from app.sse import bus
 
@@ -596,3 +596,50 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
     # Recompute session state after every path.
     outcome = tasks.decide_session_outcome(sess, scenario_session)
     return "no_new_threats_this_round" if signal == "no_new_threats_this_round" else outcome
+
+
+def run_control_map_sweep(sess: Session, llm: LLMClient) -> list[str]:
+    """Drain the control-mapping retry queue. Returns the session ids actually attempted.
+
+    THE QUEUE'S MISSING CONSUMER. See `control_mapping.sessions_awaiting_control_mapping` for why
+    it had none and what that cost: three `map_controls` paths return without stamping
+    `ControlsMappedAt` on the documented promise that "the next run retries it", but the only
+    caller is the tail of a scenario batch, so for a finished session there was no next run and
+    every transient failure became a permanent, authoritative-looking `controls: []`.
+
+    It lives HERE rather than in control_mapping because this is the module that owns
+    session-level execution: `_subsystem_lock` is the codebase's one-writer-per-subsystem fence
+    ([R5]) and the sweep needs exactly it. `_finalize_scenario_batch` settles the SCENARIOS stage
+    BEFORE mapping, so "settled" alone cannot prove the pipeline has finished with the session —
+    the lock closes that race against a concurrent regenerate/next-set, which would otherwise
+    both map the same outputs and lose the whole batch to one duplicate-key IntegrityError.
+
+    `map_controls` is reused UNCHANGED and deliberately: `no_candidates`, `lease_lost` and
+    per-output `unanswered` are then all retried by one consumer instead of needing a guard each.
+    """
+    swept: list[str] = []
+    for sid, subsystem_id, epoch in control_mapping.sessions_awaiting_control_mapping(sess):
+        task_id = guid()
+        with _subsystem_lock(sess, sid, subsystem_id, task_id, "control_map_sweep") as acquired:
+            if not acquired:
+                continue        # a live regenerate/next-set/accept owns this session — leave it
+            row = dal.load_session(sess, sid)
+            if row is None:     # deleted between the queue read and here
+                continue
+            scenario_session = dict(row)
+            try:
+                subsystems, asset_context = _resolve_regen_context(scenario_session)
+            except ValueError:  # one corrupt blob must not stall the whole sweep
+                log.warning("control_map_sweep.bad_session_json", session_id=sid, exc_info=True)
+                continue
+            # durable=True: the sweep owns its transaction outright, unlike the in-pipeline caller
+            # which may still be holding uncommitted scenario rows.
+            # task_id/epoch are the lease fence. The sweep holds no SCENARIOS claim, so
+            # map_controls' renew_lease correctly fails and its stage_settled_at_epoch fallback is
+            # what authorises the run — which is why the epoch comes from that settled row.
+            control_mapping.map_controls(sess, scenario_session, asset_context, subsystems, llm,
+                                        subsystem_id, task_id, epoch, durable=True)
+            swept.append(sid)
+    if swept:
+        log.info("control_map_sweep.ran", sessions=len(swept))
+    return swept

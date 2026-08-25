@@ -159,18 +159,17 @@ def _l2_read(l1: dict[str, list[float]], result: dict[str, list[float]], missing
 
 
 def _embed_missing(llm: LLMClient, missing: list[str], kind: str) -> list[list[float]]:
-    """External embedding-service tier: embed every text still missing after L1 + L2, in
-    Settings.embedding_batch_size-sized chunks (default 100) — caps one external call so a
-    large recreate can't exceed the provider's batch limit and fail with zero progress."""
-    batch = get_settings().embedding_batch_size
-    vecs: list[list[float]] = []
-    for i in range(0, len(missing), batch):
-        chunk = missing[i:i + batch]
-        chunk_vecs = llm.embed(chunk, kind=kind)
-        if len(chunk_vecs) != len(chunk):  # fail loud here, not as a confusing KeyError later
-            raise RuntimeError(
-                f"embed returned {len(chunk_vecs)} vectors for {len(chunk)} texts")
-        vecs.extend(chunk_vecs)
+    """External embedding-service tier: embed ONE batch of texts missing from L1 + L2.
+
+    Embeds exactly the slice get_vectors hands it and caps nothing of its own — the provider's
+    per-request limit belongs to LiteLLMClient.embed, which applies it to every caller rather than
+    only the ones that remember to. The length guard stays: embed() asserts alignment per provider
+    request, and this catches a non-conforming LLMClient implementation before it becomes a
+    confusing KeyError in _stage_for_write's zip.
+    """
+    vecs = llm.embed(missing, kind=kind)
+    if len(vecs) != len(missing):  # fail loud here, not as a confusing KeyError later
+        raise RuntimeError(f"embed returned {len(vecs)} vectors for {len(missing)} texts")
     return vecs
 
 
@@ -219,10 +218,28 @@ def get_vectors(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: s
     # (deterministic vectors, idempotent upsert), just redundant work. Add a lock only if
     # that cost matters.
     if missing:
-        vecs = _embed_missing(llm, missing, kind)
-        docs = _stage_for_write(l1, result, missing, vecs, model_id, group, kind)
-        if use_mongo and docs:
-            _l2_write(docs)
+        # Persist per batch, not once at the end. A full recreate is ~1100 distinct texts across
+        # ~37 provider calls, so writing only after ALL of them means a timeout or 429 on the last
+        # call discards every vector already paid for — and the Celery retry re-embeds all 1100.
+        # Writing as we go makes a retry cheap instead: _l2_read above finds whatever the failed
+        # run already persisted and only the genuinely missing tail is re-embedded.
+        #
+        # This loop exists for DURABLE PROGRESS, not to cap anything — the provider's per-request
+        # limit belongs solely to LiteLLMClient.embed, which enforces it whether or not anyone
+        # batches here. Reusing embedding_batch_size just keeps the two aligned 1:1 on the proxy
+        # path, so each pass is one provider call and one Mongo write; on the `local` path, where
+        # no request cap exists, the value is purely this write-back granularity.
+        #
+        # The cost is one LLM-slot acquisition per batch instead of one for the whole run (see
+        # LiteLLMClient.embed). That trade is deliberate: losing a slot mid-run now costs only the
+        # batch in flight, where before it discarded every vector already paid for.
+        batch = get_settings().embedding_batch_size
+        for i in range(0, len(missing), batch):
+            chunk = missing[i:i + batch]
+            vecs = _embed_missing(llm, chunk, kind)
+            docs = _stage_for_write(l1, result, chunk, vecs, model_id, group, kind)
+            if use_mongo and docs:
+                _l2_write(docs)
 
     # returned vectors are the SAME list objects as the cache entries — callers must treat
     # them read-only (copy before mutating in place)
@@ -499,12 +516,53 @@ def _group_lock(group: str):
             log.warning("embeddings.group_lock_release_failed", group=group, exc_info=True)
 
 
+class EmbeddingGroupsFailed(Exception):
+    """At least one group's action failed, after every group was attempted.
+
+    Raised by _for_each_group so admin_embedding_action_task's `except Exception` reports
+    state=FAILURE. Before this existed, a failed group was folded into the results dict as an
+    "error: ..." string and the job completed as SUCCESS carrying it — which is exactly how an
+    embedding batch exceeding the provider's per-request cap went unnoticed.
+
+    `results` holds the FULL per-group outcome (int rows, or an "error: ..." string) and is
+    rendered into str(self), because that string is the only surface that survives to the API:
+    Celery serializes results as JSON, admin.py renders a failed job via str(result.result), and
+    EmbeddingJobStatus.rows_processed is populated on SUCCESS only. Without it in the message the
+    operator cannot tell which groups did succeed.
+    """
+
+    def __init__(self, results: dict[str, int | str] | str) -> None:
+        # Celery's result backend reconstructs an exception as cls(*args) — i.e. with the MESSAGE
+        # STRING this class passes to super(), never the dict. Rejecting that form makes
+        # exception_to_python fall back to a generic Exception, and the operator polling
+        # GET .../embeddings/status/{job_id} sees a mangled "<class '...'>(('...',))" wrapper
+        # instead of the message. Accept both shapes so the round trip is lossless where it
+        # counts. `.results` is empty on the rebuilt side — nothing reads it cross-process
+        # (scripts/refresh_embeddings.py catches this in the SAME process).
+        if isinstance(results, str):
+            self.results: dict[str, int | str] = {}
+            super().__init__(results)
+            return
+        self.results = results
+        failed = {g: v for g, v in results.items() if isinstance(v, str)}
+        ok = {g: v for g, v in results.items() if not isinstance(v, str)}
+        super().__init__(
+            f"{len(failed)} of {len(results)} embedding group(s) failed: {failed}"
+            + (f"; succeeded: {ok}" if ok else ""))
+
+
 def _for_each_group(group: str | None, fn) -> dict[str, int | str]:
     """Fan-out for group=None ("all groups"): call fn(group) per group, isolating a per-group
-    failure into an error string so one group's failure doesn't sink the others.
+    failure into an error string so one group's failure doesn't sink the others — then raising
+    EmbeddingGroupsFailed at the END if any of them did fail.
 
-    The three re-raises below must run before the generic except — otherwise they'd get folded
-    into a results-dict string and read back as state=SUCCESS with error=null.
+    Isolate-then-raise, rather than raising on the spot, is deliberate: every group still gets
+    attempted (a later group isn't punished for an earlier one's failure), but the JOB still
+    reports the truth. Returning a dict with an error string in it, as this used to, meant a job
+    that embedded nothing still reported state=SUCCESS.
+
+    The three re-raises below must run before the generic except — they are per-group terminal
+    conditions with their own contracts, not "one group among several failed".
     """
     groups = sorted(_GROUPS) if group is None else [group]
     results: dict[str, int | str] = {}
@@ -520,6 +578,8 @@ def _for_each_group(group: str | None, fn) -> dict[str, int | str]:
         except Exception as exc:
             log.warning("embeddings.group_action_failed", group=g, exc_info=True)
             results[g] = f"error: {exc}"
+    if any(isinstance(v, str) for v in results.values()):
+        raise EmbeddingGroupsFailed(results)
     return results
 
 

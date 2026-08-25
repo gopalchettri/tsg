@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
+from app.core.tracing import trace_step
 
 log = get_logger(__name__)
 
@@ -396,16 +397,25 @@ class LiteLLMClient:
 
         _assert_no_db_keys(messages, self.s)
         kwargs = self._chat_kwargs(model, temperature, expected_type)
-        with _llm_slot(self.s), _provider_429_retryable():
-            resp = litellm.completion(messages=messages, **kwargs)
-            # Suspenders to _chat_kwargs' stream=False belt: if the server streamed anyway (a
-            # proxy model entry pinning `"stream": true` overrides the client), assemble the
-            # chunks — chat()'s contract must never depend on a server-side config knob. Inside
-            # the slot: the stream is still an in-flight call until drained.
-            if isinstance(resp, litellm.CustomStreamWrapper):
-                resp = litellm.stream_chunk_builder(list(resp), messages=messages)
-                if resp is None:  # empty stream — fail loud, same posture as the parse guards
-                    raise RuntimeError("chat provider returned an empty stream")
+        # THE trace hook for model calls, placed HERE rather than on tasks._ask_ai because two
+        # callers bypass that wrapper entirely — grounding._paraphrase (threshold calibration,
+        # run at worker boot) and this module's own selfcheck. One hook on the client covers
+        # every chat completion the process makes, including those two.
+        with trace_step("LLM CALL", None, model=kwargs.get("model"),
+                        messages=len(messages), prompt_chars=total_chars,
+                        expected_type=getattr(expected_type, "__name__", None)) as _t:
+            with _llm_slot(self.s), _provider_429_retryable():
+                resp = litellm.completion(messages=messages, **kwargs)
+                # Suspenders to _chat_kwargs' stream=False belt: if the server streamed anyway (a
+                # proxy model entry pinning `"stream": true` overrides the client), assemble the
+                # chunks — chat()'s contract must never depend on a server-side config knob.
+                # Inside the slot: the stream is still an in-flight call until drained.
+                if isinstance(resp, litellm.CustomStreamWrapper):
+                    resp = litellm.stream_chunk_builder(list(resp), messages=messages)
+                    if resp is None:  # empty stream — fail loud, same posture as the parse guards
+                        raise RuntimeError("chat provider returned an empty stream")
+            _t.result(served_model=str(resp.get("model", "") or ""),
+                    response_chars=len(resp["choices"][0]["message"]["content"] or ""))
         return resp["choices"][0]["message"]["content"], Provenance(
             model=kwargs["model"],
             # what the proxy ACTUALLY served (may be a dated snapshot / fallback of the
@@ -431,6 +441,12 @@ class LiteLLMClient:
         Every real caller embeds a SHORT LABEL (a library name, or the model's proposed type
         name), never a document. Anything over `max_embed_chars` is a bug upstream, so reject
         rather than truncate — a truncated name changes meaning with nobody noticing.
+
+        The provider caps texts PER REQUEST (32 for qwen3-embedding-8b-mig), so the list goes out
+        in `embedding_batch_size` chunks. That cap belongs HERE, not in the callers: every embed
+        path routes through this method, and five callers used to hand it unbounded lists and
+        swallow the provider's rejection into a silently worse answer (keyword-only ranking, a
+        dedup pass that reports "no duplicates", ...).
         """
         max_embed_chars = self.s.max_embed_chars
         texts = _apply_embed_prefix(self.s, list(texts), kind)  # e5 prefixes, both providers
@@ -440,23 +456,70 @@ class LiteLLMClient:
                 f"embed() received {len(too_long)} text(s) over {max_embed_chars} chars "
                 f"(longest {max(len(t) for t in too_long)}) — refusing to send to the embedding "
                 "model; this is never legitimate input for a short library-matching label")
+        # Prefixing and the length check stay OUTSIDE the chunk loop below: prefixing a slice of
+        # the already-prefixed list would double it ("query: query: foo"), and validating up front
+        # keeps today's all-or-nothing contract — one over-long text still costs zero calls.
         if self.s.embedding_provider == "local":
             from app.pipeline import local_models
 
+            # embed() applies no cap here: there is no per-request limit in-process, and encode()
+            # mini-batches internally. A caller may still invoke this in batches for its OWN
+            # reasons (get_vectors does, to persist as it goes) — that is the caller's choice,
+            # never a cap enforced on this path.
             return local_models.embed(texts)  # in-process — no network timeout/retry applies
-        import litellm
+
+        if not texts:
+            # Before the slot: acquiring a Redis ticket (and possibly raising LLMSlotUnavailable)
+            # to send zero texts is pure waste. Matches local_models.embed's []-in-[]-out.
+            return []
 
         model = model or self.s.embedding_model
+        batch = self.s.embedding_batch_size
+        vecs: list[list[float]] = []
+        # One slot per INVOCATION, covering every chunk of it — never one per chunk.
+        # llm_slot_wait_timeout_seconds is a per-call budget, so re-acquiring inside this loop
+        # would multiply it by the chunk count; the slot's heartbeat is what covers the whole span.
+        #
+        # How coarsely to invoke this is the CALLER's decision, and embeddings.get_vectors
+        # deliberately goes the other way — it calls once per batch so each batch is persisted as
+        # it lands. That buys durability at the price of more acquisitions, and it is safe
+        # precisely because a preemption there costs only the batch in flight. Do not "optimise"
+        # that caller back into a single call without also moving its write-back.
         with _llm_slot(self.s), _provider_429_retryable():
-            resp = litellm.embedding(
-                model=model, input=texts, custom_llm_provider="litellm_proxy",  # see _chat_kwargs
-                api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
-                **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
-                timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
-            )
-        # `data` MAY come back out of input order; sort by index so positional callers
-        # (embeddings.get_vectors's zip) never cache a text against the wrong vector. cf. rerank().
-        return [d["embedding"] for d in sorted(resp["data"], key=lambda d: d["index"])]
+            for i in range(0, len(texts), batch):
+                vecs.extend(self._embed_one_batch(texts[i:i + batch], model))
+        return vecs
+
+    def _embed_one_batch(self, texts: list[str], model: str) -> list[list[float]]:
+        """One provider request, already sliced to the batch cap. Caller holds the LLM slot."""
+        import litellm
+
+        resp = litellm.embedding(
+            model=model, input=texts, custom_llm_provider="litellm_proxy",  # see _chat_kwargs
+            api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
+            **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
+            timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
+        )
+        # `data` MAY come back out of input order, so vectors are PLACED by their own `index`,
+        # never appended in arrival order — identical posture to rerank() below.
+        #
+        # Placing by index rather than sorting is what makes this safe: a sort would happily
+        # accept duplicate indices ([0, 0, 2] for three texts passes any count check) and hand
+        # texts[1] the wrong vector. _stage_for_write's zip would then persist that pairing in
+        # Mongo under the wrong key — silently, permanently, poisoning every later cosine score.
+        # The missing-index check below catches duplicates, short responses and out-of-range
+        # indices in one go.
+        #
+        # `index` is PER-REQUEST — it restarts at 0 for every chunk — which is exactly why this
+        # happens HERE, per chunk, before embed() concatenates.
+        by_index = {d["index"]: d["embedding"] for d in resp["data"]}
+        missing = [i for i in range(len(texts)) if i not in by_index]
+        if missing:
+            raise RuntimeError(
+                f"embed returned {len(by_index)} usable vectors for {len(texts)} texts "
+                f"(model {model!r}, missing index(es): {missing}) — refusing to return a "
+                "misaligned batch")
+        return [by_index[i] for i in range(len(texts))]
 
     def rerank(self, query, docs, *, model=None):
         """Score each doc's relevance to `query`, 0-100, aligned position-for-position with
@@ -721,17 +784,50 @@ def _verify_embedding_dimensions(s: Settings) -> None:
     shorter vector, producing a plausible but meaningless cosine score.
 
     Costs one real embedding call at boot — same cadence validate_local_models already pays.
+
+    The probe deliberately sends a FULL `embedding_batch_size` batch rather than one text, so it
+    also proves the configured batch fits under the provider's per-request cap. A too-large batch
+    then fails HERE, at worker boot with the setting named, instead of inside a background
+    embedding job where _for_each_group would bury it. Note this is a COUNT check: identical short
+    strings cannot probe a token-budget limit, and it only guards the Celery worker — app/main.py's
+    lifespan does not call verify_litellm_models, so the API process (eager_embed_promoted) relies
+    on LiteLLMClient.embed's chunking instead.
     """
     import litellm
 
-    with _llm_slot(s):
-        resp = litellm.embedding(
-            model=s.embedding_model, input=["dimension check"],
-            custom_llm_provider="litellm_proxy",  # see _chat_kwargs
-            api_base=s.litellm_base_url, api_key=s.litellm_api_key,
-            **_litellm_key_header(s),  # gateway-safe alternate auth header, when configured
-            timeout=s.llm_timeout_seconds, num_retries=s.llm_max_retries,
-        )
+    probe = [f"dimension check {i}" for i in range(s.embedding_batch_size)]
+    try:
+        # _provider_429_retryable, same as embed(): without it a boot-time rate limit surfaces as
+        # a raw RateLimitError that nobody catches. Mapped to LLMSlotUnavailable it becomes a
+        # retry _init_worker already knows how to back off on — which matters most when a whole
+        # replica set boots at once and contends for the same proxy.
+        with _llm_slot(s), _provider_429_retryable():
+            resp = litellm.embedding(
+                model=s.embedding_model, input=probe,
+                custom_llm_provider="litellm_proxy",  # see _chat_kwargs
+                api_base=s.litellm_base_url, api_key=s.litellm_api_key,
+                **_litellm_key_header(s),  # gateway-safe alternate auth header, when configured
+                timeout=s.llm_timeout_seconds, num_retries=s.llm_max_retries,
+            )
+    except LLMSlotUnavailable:
+        # Must stay itself so celery_app._init_worker's boot-retry still backs off — same
+        # reasoning as _verify_chat_provider_reachable's own re-raise.
+        raise
+    except Exception as exc:
+        # Deliberately NEUTRAL about the cause: an auth failure, a decommissioned deployment and a
+        # network timeout all land here too, and naming only the batch size would send an operator
+        # after the wrong knob at boot, where diagnosis is hardest. Batch size is offered as ONE
+        # candidate because it is the one this probe uniquely exercises.
+        raise RuntimeError(
+            f"litellm proxy model '{s.embedding_model}' failed a {len(probe)}-text embedding "
+            f"probe: {exc} — check the model is reachable and the key is valid; if the provider "
+            f"rejected the request for its size, lower TSG_EMBEDDING_BATCH_SIZE (currently "
+            f"{s.embedding_batch_size}) to its per-request cap") from exc
+    if len(resp["data"]) != len(probe):
+        raise RuntimeError(
+            f"litellm proxy model '{s.embedding_model}' returned {len(resp['data'])} vectors for "
+            f"a {len(probe)}-text batch — TSG_EMBEDDING_BATCH_SIZE={s.embedding_batch_size} is "
+            "above what this provider serves in one request; lower it before starting")
     dim = len(resp["data"][0]["embedding"])
     if dim != s.embedding_dimensions:
         raise RuntimeError(

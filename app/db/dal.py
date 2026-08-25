@@ -45,6 +45,8 @@ from app.core.enums import (
     WorkflowStage,
 )
 from app.core.logging import get_logger
+from app.core.stride import in_stride_order
+from app.core.tracing import trace_step
 from app.db import models as m
 
 log = get_logger(__name__)
@@ -607,7 +609,16 @@ def claim_stage(
             UpdatedAt=_now,
         )
     )
-    return res.rowcount == 1
+    won = res.rowcount == 1
+    # Stage transitions are THE choke point for tracing the pipeline's skeleton: every stage of
+    # every path — full run, regenerate and next-set alike — passes through claim_stage and
+    # finish_stage, so two hooks here cover what would otherwise need a hook per stage scattered
+    # across tasks.py and cascade.py. `won=False` is the interesting case: it means another
+    # worker holds the claim, which is how a duplicate/stale worker shows up in the trace.
+    with trace_step("STAGE CLAIM", session_id, subsystem=subsystem_id, level=str(level),
+                    epoch=epoch, task_id=task_id) as _t:
+        _t.result(won=won)
+    return won
 
 
 def stage_attempt_count(
@@ -791,7 +802,11 @@ def finish_stage(
         )
         .values(Status=status, ErrorMessage=error, LeaseExpiresAt=None, UpdatedAt=now())
     )
-    return res.rowcount == 1
+    settled = res.rowcount == 1
+    with trace_step("STAGE FINISH", session_id, subsystem=subsystem_id, level=str(level),
+                    status=str(status), epoch=epoch, task_id=task_id) as _t:
+        _t.result(settled=settled, error=error)
+    return settled
 
 
 def stage_completed_at_epoch_or_newer(
@@ -1176,13 +1191,22 @@ def active_threat_rules(sess: Session, threat_type_ids: list[int]) -> list[dict]
 def active_category_names(sess: Session) -> list[str]:
     """Real STRIDE category names, read live so prompts.threats_prompt never drifts from
     Threat_Category — the same table grounding.find_category matches against. Empty result
-    means the table isn't seeded yet; the caller falls back to a hardcoded default."""
+    means the table isn't seeded yet; the caller falls back to a hardcoded default.
+
+    Returned in CANONICAL STRIDE order, not table order. ThreatCategoryID is seeded
+    ALPHABETICALLY (Seed_to_Threat_library.sql: Denial of Service = 1 ... Tampering = 6), so
+    `ORDER BY ThreatCategoryID` put Denial of Service first in every list built from this —
+    including threats_prompt's "category: exactly one of ..." line, where being first in an
+    enumerated option list is a real thumb on the model's scale. The id order carries no
+    meaning; core.stride.STRIDE_ORDER does. Sorting HERE rather than at the call sites is
+    deliberate: this is the single source every consumer reads, so a future caller cannot
+    reintroduce the alphabetical order by forgetting to sort."""
     tc = m.Threat_Category
-    return [r[0] for r in sess.execute(
+    return in_stride_order(r[0] for r in sess.execute(
         select(tc.ThreatCategoryName)
         .where(tc.IsActive == True, tc.IsDeleted == False)
         .order_by(tc.ThreatCategoryID)
-    )]
+    ))
 
 
 def _scenario_read_select():
@@ -1191,8 +1215,9 @@ def _scenario_read_select():
         select(out.OutputID, out.SessionID, out.SubsystemID, out.ScenarioJSON,
             out.Accepted, out.Superseded, out.ScenarioNumber, out.CreatedAt, out.ControlsMappedAt,
             ss.EntityID, ss.UserID, ss.SessionStatus,
-            it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
-            it.LibraryThreatType, it.LibraryThreatName,
+            it.ThreatID, it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
+            it.LibraryThreatType, it.LibraryThreatName, it.GroundingStatus, it.GroundingScore,
+            st.Score, st.ScopeRank,
             # treatment.build_treatment_input reads these two; every other consumer maps
             # fields by name through explicit Pydantic models, so the extra keys are inert.
             it.ThreatCategory, it.ThreatActorsJSON)
@@ -2612,7 +2637,9 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
     return [dict(r) for r in sess.execute(
         select(out.OutputID, out.SubsystemID, out.ScopedThreatID, out.ScenarioJSON,
             it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
-            it.LibraryThreatType, it.LibraryThreatName, it.ThreatCategory, it.ThreatActorsJSON)
+            it.LibraryThreatType, it.LibraryThreatName, it.GroundingStatus, it.GroundingScore,
+            it.ThreatCategory, it.ThreatActorsJSON, it.ThreatID,
+            st.Score, st.ScopeRank)
         .select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
         .where(out.SessionID == session_id, accepted(out.Accepted))

@@ -4,6 +4,8 @@ Celery worker init). JSON output so logs are queryable in production.
 from __future__ import annotations
 
 import logging
+import sys
+from typing import Any
 
 import structlog
 
@@ -37,14 +39,63 @@ def configure_logging(level: int | None = None) -> None:
         foreign_pre_chain=shared_processors,
     ))
     root = logging.getLogger()
-    root.handlers = [handler]  # replace, not add — configure_logging is safely re-callable
+    handlers: list[logging.Handler] = [handler]
+    # TSG_LOG_FILE: tee every line into app-<pid>.jsonl for Promtail -> Loki.
+    #
+    # It has to be done at the FACTORY, not as a processor. A processor appended after
+    # JSONRenderer never runs (the renderer returns a str and terminates the chain), and even
+    # wrapped it would only see structlog-native events — foreign records from uvicorn/
+    # sqlalchemy/pyodbc arrive through the ProcessorFormatter on the root handler above and
+    # never enter that chain at all. PrintLogger writes its already-rendered line to whatever
+    # file object it is given, so a tee catches every app line, and the same rotating handler on
+    # `root` catches the foreign half.
+    #
+    # This MUST happen inside configure_logging and be right at import time (see the call at the
+    # bottom of this module): cache_logger_on_first_use=True plus module-level
+    # `log = get_logger(__name__)` means any logger bound before a later re-call keeps the OLD
+    # factory, so a lifespan/worker re-call cannot retrofit the tee onto them.
+    stream: Any = sys.stdout
+    if get_settings().log_file:
+        from app.core.tracing import open_rotating_writer  # local: tracing imports config, not us
+        file_logger = open_rotating_writer("app-{pid}.jsonl")
+        handlers.append(file_logger.handlers[0])
+        stream = _Tee(sys.stdout, file_logger)
+    root.handlers = handlers  # replace, not add — configure_logging is safely re-callable
     root.setLevel(level)
     structlog.configure(
         processors=[*shared_processors, structlog.processors.format_exc_info, structlog.processors.JSONRenderer()],
         wrapper_class=structlog.make_filtering_bound_logger(level),
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.PrintLoggerFactory(file=stream),
         cache_logger_on_first_use=True,
     )
+
+
+class _Tee:
+    """Minimal file-like object: everything structlog prints goes to stdout AND to the rotating
+    file logger. Only write/flush are used by structlog's PrintLogger.
+
+    The file half receives the line with its trailing newline stripped — the handler adds its own
+    terminator, and without stripping every JSON object would be followed by a blank line, which
+    Promtail would ship to Loki as an empty entry."""
+
+    # __weakref__ is REQUIRED, not incidental: structlog's PrintLogger registers its file object
+    # in a WeakValueDictionary to share a write lock per file (structlog/_output.py), and a
+    # __slots__ class without it cannot be weakly referenced — get_logger() then dies with
+    # "cannot create weak reference" the moment the tee is installed.
+    __slots__ = ("__weakref__", "_logger", "_stdout")
+
+    def __init__(self, stdout: Any, file_logger: logging.Logger) -> None:
+        self._stdout, self._logger = stdout, file_logger
+
+    def write(self, text: str) -> int:
+        written = self._stdout.write(text)
+        line = text.rstrip("\n")
+        if line:
+            self._logger.info(line)
+        return written
+
+    def flush(self) -> None:
+        self._stdout.flush()
 
 
 def get_logger(name: str = "tsg"):

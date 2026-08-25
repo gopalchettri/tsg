@@ -18,6 +18,7 @@ from app.core.config import get_settings
 from app.core.enums import ActionPriority, ControlCoverage, ControlType, YesNo
 from app.core.logging import get_logger
 from app.core.security import redact, scrub_context
+from app.core.stride import STRIDE_ORDER
 
 log = get_logger(__name__)
 
@@ -30,7 +31,13 @@ log = get_logger(__name__)
 #
 # 2.0 — the library-first redesign: threats_prompt stopped asking for actors, scenario_prompt
 # stopped asking for controls, and threat_validation_prompt (new) judges library candidates.
-PROMPT_VERSION = "2.0"
+# 2.1 — STRIDE coverage quota: threats_prompt takes a per-category target instead of soft
+# "prioritize covering every category" prose, and the category list it offers is now in
+# canonical STRIDE order rather than the seed's alphabetical id order. Stored scenarios must
+# not be served across this: a threat's category picks its narrative shape
+# (_STRIDE_SCENARIO_SHAPES), and threats are no longer labelled the way they were when those
+# scenarios were written.
+PROMPT_VERSION = "2.1"
 
 # The stable key for "the threat reached the asset directly, through no supporting system".
 # Supporting-system ids are positive DB primary keys, so 0 is free. Deliberately NOT reusing
@@ -39,8 +46,10 @@ PROMPT_VERSION = "2.0"
 DIRECT_ENTRY_ID = 0
 
 # Used only when the caller passes no live Threat_Category rows (unseeded DB, or a test).
-_FALLBACK_STRIDE_CATEGORIES = ("Spoofing", "Tampering", "Repudiation", "Information Disclosure",
-                            "Denial of Service", "Elevation of Privilege")
+# Imported, not re-declared: core.stride.STRIDE_ORDER is the one canonical order, and
+# dal.active_category_names sorts the LIVE rows by it too, so the fallback and the real thing
+# can no longer disagree about what "STRIDE order" means.
+_FALLBACK_STRIDE_CATEGORIES = STRIDE_ORDER
 
 #  STRIDE TYPE HINTS FOR BETTER PROMPTING
 _STRIDE_TYPE_HINTS = {
@@ -179,9 +188,15 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
                     max_threats: int, categories: list[str] | None = None,
                     actor_examples: list[str] | None = None,
                     exclude: list[str] | None = None,
-                    canonical_types: dict[str, list[str]] | None = None) -> list[dict]:
+                    canonical_types: dict[str, list[str]] | None = None,
+                    quota: dict[str, int] | None = None) -> list[dict]:
     """The Stage 1 prompt: propose candidate threats to the asset, grounded in the context.
-    """
+
+    `quota` (category -> how many to write) is the STRIDE coverage target for THIS call. It
+    arrives already reduced to the gap: Stage 1a fills what the curated library can supply and
+    hands the shortfall here, so the quota names precisely the categories still uncovered.
+    Optional — without it the prompt keeps its original soft ordering prose, which is what
+    every non-find_threats caller and the tests still exercise."""
     cats = categories or _FALLBACK_STRIDE_CATEGORIES
 
     # Stage 1 CHOOSES the category; Stage 2 ACTS on it (_STRIDE_SCENARIO_SHAPES steers the
@@ -217,6 +232,23 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
                 "listed type fits, use it EXACTLY as given; never rename, paraphrase or create a "
                 "synonym of it. Only write a new, concise, generic, technology-independent type "
                 "of your own when nothing listed genuinely fits.")
+
+    # RULE 1's coverage clause. The soft branch is the original text: it asks the model to
+    # spread across categories and leaves it to judge how. That judgement is exactly what
+    # produced a DoS-heavy set, so when the caller knows the target it states it as counts
+    # instead. What deliberately does NOT change either way is the "never fabricate" clause
+    # below — a quota the model is allowed to satisfy by inventing a threat is worse than no
+    # quota at all, so the target is a request for coverage, never a licence to pad.
+    if quota:
+        spread = ("Write exactly this many threats per category: "
+                + "; ".join(f"{c} — {n}" for c, n in quota.items() if n > 0)
+                + ". These are the categories this asset still has no threat in, so they are "
+                "where the remaining analytical value is; a further threat in a category not "
+                "listed here adds nothing to the assessment. ")
+    else:
+        spread = ("Prioritize covering every category the evidence genuinely supports before "
+                "adding a further threat to a category that already has one — do not neglect "
+                "an evidenced category just because another is quicker to satisfy. ")
 
     coverage = ""
     if exclude:
@@ -292,10 +324,9 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         "evidenced category or dependency unexamined. A new dependency only produces a new "
         "threat when it leads to a genuinely different condition, not merely a different path "
         "to a condition you already found (see RULE 4) — walking more dependencies is a way to "
-        "find more distinct conditions, not a way to multiply the ones you have. Prioritize "
-        "covering every category the evidence genuinely supports before adding a further "
-        "threat to a category that already has one — do not neglect an evidenced category "
-        "just because another is quicker to satisfy. Only if, after this exhaustive search, "
+        "find more distinct conditions, not a way to multiply the ones you have. "
+        + spread +
+        "Only if, after this exhaustive search, "
         f"genuinely fewer than {max_threats} distinct, context-grounded conditions exist "
         "across every category, return the maximum number that are genuinely grounded — "
         "never fabricate, reword or split a threat to reach the count.\n"

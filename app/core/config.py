@@ -61,6 +61,36 @@ class Settings(BaseSettings):
     # LOG_LEVEL / TSG_LOG_LEVEL — logging verbosity.
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         "INFO", validation_alias=AliasChoices("LOG_LEVEL", "TSG_LOG_LEVEL"))
+    # TRACE_SINKS / TSG_TRACE_SINKS — where the step trace goes (app.core.tracing). Comma list of
+    # `console` (stdout), `log` (through structlog, so traces join the normal JSON stream) and
+    # `file` (trace-<pid>.jsonl + trace-<pid>.txt under trace_dir). Empty = tracing off entirely,
+    # which is the default: this is a debugging aid, opted into deliberately.
+    # RESTART-ONLY: get_settings() is @lru_cache'd, so editing this mid-run changes nothing.
+    trace_sinks: str = Field(
+        "", validation_alias=AliasChoices("TRACE_SINKS", "TSG_TRACE_SINKS"))
+    # TSG_TRACE_DIR — where the file sinks (and log_file below) write. Relative values resolve
+    # against the PROJECT ROOT, never the CWD: start.ps1 opens three windows and each would
+    # otherwise scatter its own logs/ tree wherever it happened to start.
+    trace_dir: str = Field(
+        "logs/trace", validation_alias=AliasChoices("TRACE_DIR", "TSG_TRACE_DIR"))
+    # Rotation, applied PER PROCESS — every file carries its writer's pid, because gunicorn -w 4
+    # plus the worker and beat all import configure_logging and would otherwise fight over one
+    # file. On Linux that silently loses whichever process did not roll; on Windows os.replace
+    # raises PermissionError, logging swallows it, and rotation NEVER HAPPENS — the file grows
+    # past the cap forever, which is the exact failure this setting exists to prevent.
+    # Budget disk as (processes x max_bytes x backups).
+    trace_max_bytes: int = Field(
+        52_428_800, ge=1024,
+        validation_alias=AliasChoices("TRACE_MAX_BYTES", "TSG_TRACE_MAX_BYTES"))
+    trace_backups: int = Field(
+        5, ge=0, validation_alias=AliasChoices("TRACE_BACKUPS", "TSG_TRACE_BACKUPS"))
+    # LOG_FILE / TSG_LOG_FILE — tee EVERY app log line (not just traces) into app-<pid>.jsonl
+    # under trace_dir, one JSON object per line, for Promtail -> Loki. Separate from trace_sinks
+    # on purpose: a Loki feed wants the whole log stream, and you may want it with tracing off
+    # entirely. Off by default; in Docker/K8s leave it off and let the json-file driver / kubelet
+    # rotate stdout instead — a container's files die with the pod.
+    log_file: bool = Field(
+        False, validation_alias=AliasChoices("LOG_FILE", "TSG_LOG_FILE"))
 
     # --- 2. Database (MSSQL) ---------------------------------------------------
 
@@ -311,6 +341,16 @@ class Settings(BaseSettings):
     # same query builder) over real scenarios and prints, per candidate threshold, how many
     # scenarios would publish NO controls. Read-only; safe against production.
     control_map_min_score: float = Field(60.0, ge=0.0, le=100.0)
+
+    # TSG_CONTROL_MAP_SWEEP_INTERVAL_SECONDS — how often the retry queue is drained.
+    # map_controls has three paths that deliberately leave an output unstamped "for the next run"
+    # (no candidates, lost lease, a failed per-output rerank); the beat task tsg.map_controls_sweep
+    # IS that next run. Ticking faster than stage_lease_seconds buys nothing: the sweep ignores
+    # anything settled more recently than one lease, so the in-pipeline mapping always goes first.
+    # ponytail: each tick scans Threat_Scenario_Output for ControlsMappedAt IS NULL — fine at
+    # current volume; add a filtered index on (SessionID) WHERE ControlsMappedAt IS NULL if it
+    # ever shows up in the slow-query log.
+    control_map_sweep_interval_seconds: float = 300.0
     # TSG_RERANK_CONCURRENCY — concurrent REMOTE rerank calls (local reranker ignores this).
     rerank_concurrency: int = Field(8, ge=1)
     # TSG_SCENARIO_GENERATION_CONCURRENCY — scenarios generated at once in one write_scenarios
@@ -545,8 +585,13 @@ class Settings(BaseSettings):
     embedding_group_lock_ttl_seconds: int = Field(30, ge=1)
     # TSG_MONGO_BREAKER_COOLDOWN_SECONDS — cooldown before retrying Mongo after a failure.
     mongo_breaker_cooldown_seconds: float = Field(30.0, ge=0.0)
-    # TSG_EMBEDDING_BATCH_SIZE — max texts per embed() call (provider batch-limit guard).
-    embedding_batch_size: int = Field(100, ge=1)
+    # TSG_EMBEDDING_BATCH_SIZE — max texts per PROVIDER REQUEST, enforced in LiteLLMClient.embed.
+    # 32 is the per-request cap of the proxy-served qwen3-embedding-8b-mig (uat/prod); the old
+    # default of 100 exceeded it, so every embed against that model failed. deploy/secrets.yaml
+    # carries no override, so THIS default is what uat actually runs on. Raise only against a
+    # provider documenting a higher cap — llm._verify_embedding_dimensions probes this exact
+    # value at worker boot and refuses to start if the provider rejects it.
+    embedding_batch_size: int = Field(32, ge=1)
 
     # TSG_LLM_SLOT_POLL_SECONDS / _POLL_JITTER_SECONDS — slot-wait poll interval; jitter avoids
     # synchronized thundering-herd wakeups.

@@ -10,7 +10,7 @@ from typing import Any, NamedTuple, overload
 from sqlalchemy import func, insert, update
 from sqlalchemy.orm import Session
 
-from app.core import tuning
+from app.core import stride, tuning
 from app.core.config import get_settings
 from app.core.enums import (
     AuditEventType,
@@ -27,6 +27,7 @@ from app.core.enums import (
 )
 from app.core.logging import get_logger
 from app.core.security import _redact_value, is_placeholder
+from app.core.tracing import trace_step
 from app.db import dal
 from app.db import models as m
 from app.db.dal import execute_dml, guid, now
@@ -623,19 +624,28 @@ def _validate_candidates(sess: Session, llm: LLMClient, scenario_session: dict,
 
 
 def _build_retrieved_records(cand: dict, sid: str, tenant: str, ss: int,
-                            scenario_session: dict) -> tuple[dict, dict]:
+                            scenario_session: dict, assigned_category: str) -> tuple[dict, dict]:
     """Identified_Threat row + pipeline summary for one VALIDATED library candidate.
 
     The candidate IS the library row, so grounding is identity, not similarity:
     verified, GroundingScore 100.0 (a real match confidence would imply a rerank that
     never ran), master ids and names on every column, and the type's LINKED actors with
-    validated=True. Reuses _build_threat_records so the row shape cannot drift."""
+    validated=True. Reuses _build_threat_records so the row shape cannot drift.
+
+    `assigned_category` is the STRIDE cell this threat was SELECTED to fill
+    (core.stride.assign), and it is what gets stored. It used to be `cand["categories"][0]`,
+    and that one piece of positional convenience is the entire "everything is Denial of
+    Service" bug: 74 of the 75 library rows are multi-category, the list arrived ordered by a
+    ThreatCategoryID that the seed numbers alphabetically, and DoS holds id 1 — so it won every
+    row it appeared on while Spoofing (5) and Tampering (6) won none. The caller now decides
+    which of a threat's genuine categories it is being used for, and passes it in. See
+    core/stride.py."""
     gr = grounding.GroundingResult(
         status=GroundingStatus.verified, type_id=cand["type_id"],
         catalogue_id=cand["catalogue_id"], library_type=cand["type_name"],
         library_name=cand["threat_name"], score=100.0,
         actors=cand["actors"], actors_validated=True)
-    pcat = (cand["categories"][0] if cand.get("categories") else "")[:200]
+    pcat = (assigned_category or "")[:200]
     row, summary = _build_threat_records(
         guid(), sid, tenant, ss, cand["type_name"][:300], pcat, cand["threat_name"][:500],
         gr, scenario_session["EntityID"], scenario_session.get("UserID"),
@@ -663,6 +673,9 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # those same threats as full rows (with category), needed for the near-duplicate scan.
     # The caller already has both, so passing them in costs no extra query.
     sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
+    with trace_step("ASSET CONTEXT", sid, asset_context=asset_context,
+                    subsystems=subsystems):
+        pass          # input-only marker: the context is already built when find_threats runs
     if not dal.claim_stage(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
         return [], None
     sess.commit()
@@ -695,9 +708,11 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         candidates = []
     validator_audit: dict = {}
     if candidates:
-        candidates, validator_audit = _validate_candidates(
-            sess, llm, scenario_session, subsystems, asset_context, candidates,
-            ss, epoch, task_id)
+        with trace_step("LLM VALIDATOR", sid, candidates=len(candidates)) as _t:
+            candidates, validator_audit = _validate_candidates(
+                sess, llm, scenario_session, subsystems, asset_context, candidates,
+                ss, epoch, task_id)
+            _t.result(kept=len(candidates), audit=validator_audit)
     # NOT_RELEVANT is documented as a HARD DROP (GAP-B) — but the drop only ever removed the
     # candidate from Stage 1a's own list. Stage 1b's generator has no knowledge of this
     # round's verdicts, so it can propose an equivalent threat that regrounds (via
@@ -723,11 +738,55 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     dup_rows: list[dict] = []  # Identified_Duplicate_Threat rows — audit-only, see _duplicate_row
     retrieved_summaries: list[dict] = []
     attribution: dict[str, list[int]] = {}  # ThreatID -> supporting systems it reaches
-    for cand in candidates:
-        if len(rows) >= max_threats:
-            log.info("threat_retrieval.cap_reached", session_id=sid, cap=max_threats)
-            break
-        row, summary = _build_retrieved_records(cand, sid, tenant, ss, scenario_session)
+
+    # --- STRIDE COVERAGE QUOTA -----------------------------------------------------------
+    # What the session ALREADY holds per category. An additive round (next-set, regen) must
+    # top up what is thin rather than restart at Spoofing, so the quota is computed against
+    # reality, not against an empty grid.
+    #
+    # Counted from the STORED category, one per threat — deliberately NOT from
+    # active_threat_grid_categories, which returns the full multi-category membership and would
+    # count a 3-category threat three times. That grid is the right unit for coverage
+    # accounting (does any threat answer this cell?) and the wrong one here, where a slot is
+    # what is being allocated. prior_threats is this same read, already done by the additive
+    # caller — reused rather than re-queried. Asset unit only: the subsystem rows are fan-out
+    # copies of these same threats (Phase 2b).
+    held: dict[str, int] = {}
+    if not supersede:
+        prior = prior_threats if prior_threats is not None else dal.active_threats(sess, sid, ss)
+        for t in prior:
+            c = t.get("category")
+            if c:
+                held[c] = held.get(c, 0) + 1
+    target = stride.allocate(max_threats, cats, existing=held)
+
+    # THE FIX. This loop used to walk `candidates` in retrieval-score order and stop at
+    # max_threats, which is category-blind: the cap filled with whatever ranked highest and
+    # the stored category was then read positionally off each row. Now the quota decides how
+    # many slots each category gets and assignment decides which candidate fills each slot —
+    # so selection and labelling are ONE decision and the spread is a property of the
+    # algorithm rather than something the prompt is asked to remember. Score still orders
+    # candidates WITHIN a category, so ranking keeps choosing which Spoofing threat wins the
+    # Spoofing slot; it just no longer decides how many Spoofing slots exist.
+    with trace_step("STRIDE QUOTA", sid, target=target, held=held,
+                    candidates=len(candidates)) as _t:
+        if target:
+            selected = stride.assign(candidates, target, lambda c: c.get("categories") or [])
+        else:
+            # No categories to allocate against — an UNSEEDED Threat_Category table, which
+            # dal.active_category_names documents as a supported state. Quota-driven selection
+            # would return nothing at all here (an empty quota selects zero candidates), so it
+            # degrades to the pre-quota behaviour: best-ranked first, up to the cap. Losing the
+            # spread on an unseeded DB is a weaker answer; returning no threats would be a
+            # silent outage, and this codebase never trades the second for the first.
+            # invariants._assert_stride_categories warns about this at boot.
+            log.warning("threats.quota_skipped_no_categories", session_id=sid, cap=max_threats)
+            selected = [(c, (c.get("categories") or [""])[0]) for c in candidates[:max_threats]]
+        _t.result(assigned=stride.achieved(selected), selected=len(selected))
+
+    for cand, assigned_category in selected:
+        row, summary = _build_retrieved_records(cand, sid, tenant, ss, scenario_session,
+                                                assigned_category)
         identity = dal.identity_hash(sid, ss, summary)
         if identity in existing_identities:
             # Already active on this session (an additive next-set round re-retrieving the
@@ -773,22 +832,41 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     if shortfall > 0:
         exclude_all = list(exclude or []) + [t["threat_name"] for t in retrieved_summaries
                                             if t.get("threat_name")]
-        proposals, prov = _ask_ai(sess, llm, prompts.threats_prompt(
-                                    scenario_session["AssetName"], asset_context, subsystems,
-                                    max_threats=shortfall,
-                                    categories=cats,
-                                    exclude=exclude_all or None),
-                                    scenario_session=scenario_session, subsystem_id=ss, stage="threats",
-                                    level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
-                                    temperature=get_settings().threat_identification_temperature)
-        # Filter untrusted LLM output once here (see _usable_proposal) rather than in every place
-        # that reads it below — that's both the smallest fix and the only one that covers every
-        # reader, including grounding.prime_query_embeddings.
-        usable = [p for p in proposals if _usable_proposal(p)]
-        if len(usable) != len(proposals):
-            log.warning("threats.proposals_dropped", session_id=sid,
-                        dropped=len(proposals) - len(usable), received=len(proposals))
-        proposals = usable
+        # The per-category target for the SHORTFALL, allocated against what the session holds
+        # now (what it already had, plus what assignment just retrieved). That is what makes
+        # this a gap-filling ask: the categories the curated library could not supply are
+        # exactly the ones still thin, so they are the ones this quota names. Re-allocating
+        # rather than subtracting the original target is what keeps it correct when the
+        # shortfall grew because a retrieved row was dropped as a duplicate above.
+        have = dict(held)
+        for t in retrieved_summaries:
+            c = t.get("category")
+            if c:
+                have[c] = have.get(c, 0) + 1
+        gap_quota = stride.allocate(shortfall, cats, existing=have)
+        gap_gen_messages = prompts.threats_prompt(
+            scenario_session["AssetName"], asset_context, subsystems,
+            max_threats=shortfall, categories=cats, exclude=exclude_all or None,
+            quota=gap_quota)
+        # `messages` is deliberately NOT traced: _ask_ai already persists the whole prompt to
+        # Prompt_Log, and dumping it again here would put the full asset context in a second
+        # place that has no retention policy.
+        with trace_step("GAP GENERATION", sid, shortfall=shortfall, categories=cats,
+                        exclude=exclude_all, prompt_messages=len(gap_gen_messages)) as _t:
+            proposals, prov = _ask_ai(sess, llm, gap_gen_messages,
+                                        scenario_session=scenario_session, subsystem_id=ss, stage="threats",
+                                        level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
+                                        temperature=get_settings().threat_identification_temperature)
+            # Filter untrusted LLM output once here (see _usable_proposal) rather than in every
+            # place that reads it below — that's both the smallest fix and the only one that
+            # covers every reader, including grounding.prime_query_embeddings.
+            raw_proposal_count = len(proposals)
+            usable = [p for p in proposals if _usable_proposal(p)]
+            if len(usable) != len(proposals):
+                log.warning("threats.proposals_dropped", session_id=sid,
+                            dropped=len(proposals) - len(usable), received=len(proposals))
+            proposals = usable
+            _t.result(raw_proposal_count=raw_proposal_count, usable_proposals=proposals)
     else:
         log.info("threats.generation_skipped_library_filled", session_id=sid, cap=max_threats)
     grounding_cache: dict = {}
@@ -797,6 +875,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     to_ground = [{**p, "name": _generic_name_of(p, scenario_session["AssetName"])}
                 for p in proposals]  # safe: _usable_proposal already guaranteed these are all dicts
     grounding.prime_query_embeddings(llm, to_ground, grounding_cache)
+    rows_before_generation = len(rows)
     for p, gp in zip(proposals, to_ground):
         if len(rows) >= max_threats:            
             log.warning("threats.over_proposed", session_id=sid,
@@ -815,7 +894,10 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         pname = _safe_text(p.get("name"), None)
         if pname:
             pname = pname[:500]
-        gr = grounding.find_threat_in_library(sess, llm, gp, sector_ids=sector_ids, cache=grounding_cache)
+        with trace_step("REGROUNDING", sid, proposal=p, generic_proposal=gp) as _t:
+            gr = grounding.find_threat_in_library(sess, llm, gp, sector_ids=sector_ids,
+                                                cache=grounding_cache)
+            _t.result(grounding_result=gr)
         tid = guid()
         row, summary = _build_threat_records(tid, sid, tenant, ss, ptype, pcat, pname, gr,
                                         scenario_session["EntityID"], scenario_session.get("UserID"),
@@ -837,6 +919,11 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         existing_identities[identity] = tid
         rows.append(row)
         threats.append(summary)
+    with trace_step("REGROUNDING SUMMARY", sid,
+                    proposals_considered=len(proposals)) as _t:
+        _t.result(validator_reversals_blocked=validator_reversals,
+                identity_duplicates=duplicates,
+                threats_added=len(rows) - rows_before_generation)
     # Run the near-duplicate check BEFORE inserting, so it can actually block bad rows — the
     # exact-match check above only catches identical wording, so two threats phrased
     # differently would both slip through and get generated (and billed) separately. Can be
@@ -914,8 +1001,17 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     actor_derived = [{"threat_name": t.get("threat_name"), "actors": t["actor_evidence"]}
                     for t in retrieved_summaries if t.get("actor_evidence")][:20]
 
-    grid_records = dal.active_threat_grid_categories(sess, sid, [ss, *grid_subsystem_ids])
-    cov = coverage.coverage_report([ss, *grid_subsystem_ids], cats, grid_records)
+    # The distribution this round actually produced, by STORED category — the number the
+    # "everything is Denial of Service" report was about. Recorded, not just logged, because
+    # the coverage grid below reads the FULL multi-category membership and therefore looked
+    # healthy the entire time every visible label said DoS. A skew has to be answerable from
+    # data afterwards, not from someone's impression of a report.
+    distribution = stride.achieved([(None, t["category"]) for t in threats if t.get("category")])
+    coverage_units = [ss, *grid_subsystem_ids]
+    with trace_step("COVERAGE", sid, unit_ids=coverage_units, categories=cats) as _t:
+        grid_records = dal.active_threat_grid_categories(sess, sid, coverage_units)
+        cov = coverage.coverage_report(coverage_units, cats, grid_records)
+        _t.result(grid_records=len(grid_records), coverage_report=cov)
     if cov["unexplained"]:
         log.warning("threats.coverage_gaps", session_id=sid, subsystem=ss,
                     units=1 + len(grid_subsystem_ids),
@@ -936,6 +1032,8 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                                         "validator_reversals_blocked": validator_reversals,
                                         "semantic_near_duplicates": near_dupes,
                                         "retrieved_semantic_duplicates": retrieved_near_dupes,
+                                        "stride_target": target,
+                                        "stride_distribution": distribution,
                                         "coverage": {**cov, "gaps": cov["gaps"][:50]}}))
     sess.commit()
     if dup_rows:
@@ -1470,11 +1568,15 @@ def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: 
     top_n = get_settings().scoping_top_n  # not session-tunable: None means let coverage decide
     if top_n is not None:
         top_n = min(top_n, tn.max_threats_per_asset)
-    scoped_all = scoping.score_threats(threats, subsystems=subsystems,
-                                    rules=dal.active_threat_rules(sess, type_ids),
-                                    score_threshold=tn.scoping_score_threshold,
-                                    base_score=tn.base_score,
-                                    default_rule_weight=tn.default_rule_weight)
+    with trace_step("SCORING", sid, threats=len(threats),
+                    score_threshold=tn.scoping_score_threshold, base_score=tn.base_score,
+                    default_rule_weight=tn.default_rule_weight) as _t:
+        scoped_all = scoping.score_threats(threats, subsystems=subsystems,
+                                        rules=dal.active_threat_rules(sess, type_ids),
+                                        score_threshold=tn.scoping_score_threshold,
+                                        base_score=tn.base_score,
+                                        default_rule_weight=tn.default_rule_weight)
+        _t.result(scored=scoped_all)
     enriched = {t["threat_id"]: t for t in threats}
     deduped = _select_unique_top_n(scoped_all, enriched, top_n) if not targeted else 0
     pairs, scoped_count = _build_work_items(scoped_all, target_threat_ids, regen_targets)

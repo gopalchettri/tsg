@@ -45,6 +45,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.enums import ThreatRuleType
 from app.core.logging import get_logger
+from app.core.stride import in_stride_order
+from app.core.tracing import trace_step
 from app.db import dal
 from app.db import models as m
 from app.pipeline import embeddings, hybrid_search
@@ -162,8 +164,17 @@ def _load_candidates(sess: Session, sector_ids: list[int],
     for r in rows:
         # The map is authoritative (multi-category by design); the type's default is the
         # fallback for unmapped rows so a threat is never grid-unplaceable.
+        #
+        # CANONICAL ORDER, not ThreatCategoryID order. The query above reads the map
+        # `ORDER BY ThreatCategoryID`, and those ids are seeded ALPHABETICALLY, so Denial of
+        # Service (id 1) sorted first on every row that carries it and Spoofing (5)/Tampering
+        # (6) sorted first on almost none. Nothing may treat `categories[0]` as "the" category
+        # any more — tasks.find_threats assigns one per coverage slot (core.stride.assign) —
+        # but this list is read by other consumers, so it leaves here in an order that means
+        # something rather than one that quietly encodes the seed's alphabet.
         fallback = cat_names.get(r["ThreatCategoryID"])
-        r["categories"] = mapped.get(r["ThreatCatalogueID"]) or ([fallback] if fallback else [])
+        r["categories"] = in_stride_order(
+            mapped.get(r["ThreatCatalogueID"]) or ([fallback] if fallback else []))
     return rows
 
 
@@ -253,19 +264,31 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
     s = get_settings()
     # Phase 2c: the actor leg runs FIRST, because it decides which types are eligible at all.
     # Pure DB joins - no model, no embeddings, negligible cost.
-    actor_types = actor_reachable_types(sess, sector_ids)
-    rows = _load_candidates(sess, sector_ids, set(actor_types))
-    if not rows:
-        log.warning("threat_retrieval.library_empty", sector_ids=sector_ids)
-        return []
-    # Which types the ordinary sector filter would have admitted on its own. Queried rather
-    # than recomputed in Python so the visibility rule lives in exactly one place
-    # (grounding.visible_to_this_sector) and the two can never drift apart.
-    sector_visible = {int(r[0]) for r in sess.execute(
-        select(m.Threat_Type.ThreatTypeID).where(
-            visible_to_this_sector(m.Threat_Type.SectorID, sector_ids)))}
-    passed, ungated, rules_by_type = _gate_types(sess, rows, subsystems, s.default_rule_weight)
-    rows = [r for r in rows if r["ThreatTypeID"] in passed]
+    with trace_step("ACTOR LEG", session_id, sector_ids=sector_ids) as _t:
+        actor_types = actor_reachable_types(sess, sector_ids)
+        _t.result(actor_reachable_type_ids=actor_types)
+    # The `return []` below sits INSIDE this block on purpose: a context manager still emits its
+    # END on an early return, where the paired IN/OUT calls this replaced left a dangling BEGIN
+    # and made an empty library look like a step that never finished.
+    with trace_step("METADATA FILTER", session_id, sector_ids=sector_ids,
+                    actor_type_ids=sorted(actor_types)) as _t:
+        rows = _load_candidates(sess, sector_ids, set(actor_types))
+        if not rows:
+            log.warning("threat_retrieval.library_empty", sector_ids=sector_ids)
+            _t.result(candidates_after_sector_filter=0, library_empty=True)
+            return []
+        sector_filtered_count = len(rows)
+        # Which types the ordinary sector filter would have admitted on its own. Queried rather
+        # than recomputed in Python so the visibility rule lives in exactly one place
+        # (grounding.visible_to_this_sector) and the two can never drift apart.
+        sector_visible = {int(r[0]) for r in sess.execute(
+            select(m.Threat_Type.ThreatTypeID).where(
+                visible_to_this_sector(m.Threat_Type.SectorID, sector_ids)))}
+        passed, ungated, rules_by_type = _gate_types(sess, rows, subsystems, s.default_rule_weight)
+        rows = [r for r in rows if r["ThreatTypeID"] in passed]
+        _t.result(candidates_after_sector_filter=sector_filtered_count,
+                candidates_after_gate=len(rows),
+                passed_type_ids=sorted(passed), ungated_type_ids=sorted(ungated))
     if not rows:
         log.warning("threat_retrieval.all_types_gated_out")
         return []
@@ -288,6 +311,14 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
             qvs = llm.embed(queries, kind="query")
             if len(qvs) == len(queries):
                 query_vecs = list(qvs)
+            else:
+                # Same outcome as the except below — every query vector stays None, so ranking
+                # falls back to BM25 alone. It has to be RECORDED the same way too: without this
+                # branch a short embed response produced keyword-only ranking that was
+                # indistinguishable from a healthy run in both the trace and the result payload.
+                ranking_degraded = True
+                log.warning("threat_retrieval.embed_length_mismatch_keyword_only",
+                            session_id=session_id, queries=len(queries), vectors=len(qvs))
     except Exception:
         # Keyword-only is a WEAKER ANSWER, not a failure — eligibility is untouched and the
         # session still completes. That is exactly why it has to be recorded: a run ranked by
@@ -300,7 +331,12 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
 
     best: dict[int, float] = {}  # row index -> best fused score across queries
     for q, qv in zip(queries, query_vecs):
-        for idx, score in hybrid_search.hybrid_match(q, corpus, query_vec=qv):
+        with trace_step("HYBRID SEARCH", session_id, query_text=q, candidate_count=len(corpus),
+                        query_vec_present=qv is not None,
+                        ranking_degraded=ranking_degraded) as _t:
+            results = hybrid_search.hybrid_match(q, corpus, query_vec=qv)
+            _t.result(matches=len(results), top=results[:5])
+        for idx, score in results:
             if score > best.get(idx, 0.0):
                 best[idx] = score
 

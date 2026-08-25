@@ -24,9 +24,19 @@ threshold would actually do.
     python scripts/measure_control_map_scores.py --text-file paras.txt # pre-first-session
     python scripts/measure_control_map_scores.py --itot OT             # narrow the library
 
-READ-ONLY. It opens a session, SELECTs, and never writes — safe against production. It does call
-the embedding and reranker models, which costs whatever your provider charges for `--limit`
-embeddings plus the reranks; the default limit is deliberately small.
+WRITES IT MAKES — read this before pointing it at production. It never writes to SQL Server
+(SELECTs only, and the DB session is closed before the model calls begin). It DOES write to the
+shared MongoDB embedding cache: embedding the control library goes through the same
+`embeddings.get_vectors` path production uses, which upserts any vector it had to compute into
+the `embeddings` collection (embeddings.py::_l2_write) and creates that collection's unique
+index on first touch. On a warm cache that is zero documents; on a COLD cache it is one document
+per control (~1288). Those documents are exactly what a real session would have written anyway
+— a cache fill, not corruption — but "READ-ONLY, never writes" was the wrong claim, and an
+earlier version of this docstring made it.
+
+Cost: the reranks plus the query embeddings for `--limit` scenarios, plus the library embedding
+on a cold cache (batched at embedding_batch_size by llm.embed, and `--limit` does NOT bound that
+part). The default limit is deliberately small.
 
 `--text-file` takes one scenario paragraph per line, for an environment that has the control
 library seeded but has not run a session yet. Use real prose, not labels: feeding it short
@@ -101,17 +111,26 @@ def _queries_from_db(sess, limit: int) -> list[tuple[str, str]]:
     """(label, query) from real completed scenarios, built with the SAME query builder
     production uses — a hand-rolled "title + statement" here would measure a query shape the
     pipeline never actually sends."""
+    # The threat joins in because collect_control_query takes it — measuring the narrative
+    # alone would measure a query shape production no longer sends, which is exactly the
+    # mismatch this script exists to catch.
+    out_t, st_t, it_t = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
     rows = sess.execute(
-        select(m.Threat_Scenario_Output.OutputID, m.Threat_Scenario_Output.ScenarioJSON)
-        .where(m.Threat_Scenario_Output.Status == "complete",
-            m.Threat_Scenario_Output.Superseded == 0,
-            m.Threat_Scenario_Output.ScenarioJSON.is_not(None))
-        .order_by(m.Threat_Scenario_Output.CreatedAt.desc())
+        select(out_t.OutputID, out_t.ScenarioJSON,
+            it_t.ThreatName, it_t.ThreatType, it_t.LibraryThreatName, it_t.LibraryThreatType)
+        .select_from(out_t.__table__
+                    .outerjoin(st_t, out_t.ScopedThreatID == st_t.ScopedThreatID)
+                    .outerjoin(it_t, st_t.ThreatID == it_t.ThreatID))
+        .where(out_t.Status == "complete",
+            out_t.Superseded == 0,
+            out_t.ScenarioJSON.is_not(None))
+        .order_by(out_t.CreatedAt.desc())
         .limit(limit)
     ).all()
     out = []
-    for output_id, scenario_json in rows:
-        query = control_mapping.collect_control_query(scenario_json)
+    for output_id, scenario_json, tname, ttype, ltname, lttype in rows:
+        query = control_mapping.collect_control_query(scenario_json, ltname or tname,
+                                                    lttype or ttype)
         if query:
             out.append((str(output_id)[:8], query))
     return out
@@ -172,16 +191,41 @@ def main() -> int:
         print(f"threshold NOW   {in_force:.1f}   ({origin})")
         print()
 
-        # The production call, unmodified: one query per scenario, full reranked shortlist back.
-        results = grounding.ground_control_queries(llm, [(q, None) for _, q in queries],
-                                                candidates, s)
+    # --- everything below is OUTSIDE the DB session, deliberately -------------------------
+    # The rerank + embed calls take minutes. Running them inside the `with db_session()` block
+    # held an open SQL Server transaction open for that whole time, against the same instance a
+    # live pipeline is using — a measurement script must not be the thing that blocks the system
+    # it is measuring. Everything needed below (`candidates`, `queries`, thresholds) is already
+    # materialised in memory.
+
+    # Prime the query vectors in ONE deduped call, exactly as control_mapping.map_controls does
+    # (llm.embed chunks to the provider's per-request cap internally). Passing None per query
+    # instead makes ground_control_queries embed them ONE HTTP CALL AT A TIME, which is both far
+    # slower and no longer "the production call unmodified" — the shape being measured would
+    # differ from the shape production sends.
+    texts = list(dict.fromkeys(q for _label, q in queries))
+    qv_map: dict[str, list[float]] = {}
+    try:
+        qv_map.update(zip(texts, llm.embed(texts, kind="query")))
+    except Exception as exc:  # noqa: BLE001 — degrade exactly as production does
+        print(f"NOTE  query-vector priming failed ({exc!r}); falling back to per-query embedding, "
+            "same as production's own except-branch. Scores are unaffected.")
+
+    # The production call: one query per scenario, full reranked shortlist back.
+    results = grounding.ground_control_queries(
+        llm, [(q, qv_map.get(q)) for _label, q in queries], candidates, s)
 
     # --- per-query score shape ------------------------------------------------------------
     # ControlMatches.answered separates "we reranked and nothing scored" (a real data point)
     # from "we never got an answer" (a failed rerank item — not a measurement). Folding the
     # second into the first would inflate the "0 controls" column at EVERY threshold and, with
     # one provider blip, suppress the recommendation entirely while blaming retrieval.
-    measured = [r.matches for r in results if r.answered]
+    # Labels ride along. _queries_from_db/_queries_from_file both return (label, query) and the
+    # report used to throw the label away, so it could say "3 scenarios publish no controls"
+    # without being able to name ONE of them — leaving the operator to go find them by hand.
+    measured_pairs = [(label, r.matches)
+                    for (label, _q), r in zip(queries, results) if r.answered]
+    measured = [ms for _label, ms in measured_pairs]
     unanswered = len(results) - len(measured)
     best: list[float] = []
     at_k: list[float] = []
@@ -199,10 +243,18 @@ def main() -> int:
             "rather than counted as 'no controls'; re-run if this number is not 0.")
         print()
     if not best:
-        print("FAIL  every measured query came back with an empty shortlist — that is a "
-            "retrieval problem, not a threshold one. Confirm the control_library embedding "
-            "group is populated (scripts/refresh_embeddings.py --group control_library) "
-            "before reading anything below.")
+        # Two different faults, two different fixes — the old single message blamed retrieval
+        # for both, sending an operator to re-embed a library that was fine.
+        if not measured:
+            print(f"FAIL  none of the {len(results)} queries got an answer at all — every rerank "
+                "item failed. That is a MODEL/PROVIDER fault, not retrieval and not the "
+                "threshold. Check the reranker endpoint and rerank_many.item_failed, then "
+                "re-run; nothing below could be measured.")
+        else:
+            print("FAIL  every measured query came back with an empty shortlist — that is a "
+                "retrieval problem, not a threshold one. Confirm the control_library embedding "
+                "group is populated (scripts/refresh_embeddings.py --group control_library) "
+                "before reading anything below.")
         return 2
 
     print("SCORE DISTRIBUTION  (reranker score, 0-100)")
@@ -226,18 +278,27 @@ def main() -> int:
     # The in-force value gets its OWN line, evaluated at the real float. Flagging the nearest
     # swept row instead left dead bands (nothing within 2.5 of, say, 35.0), and when the flag
     # missed, the single most decision-relevant number silently vanished from the report.
-    in_force_empty = sum(1 for ms in measured if not any(sc >= in_force for _r, sc in ms))
+    empty_now = [label for label, ms in measured_pairs
+                if not any(sc >= in_force for _r, sc in ms)]
+    in_force_empty = len(empty_now)
     print(f"  {in_force:>9.1f}   {in_force_empty:>25}   {'':>21}  <-- IN FORCE NOW")
+    if empty_now:
+        # Named, not just counted: these are the exact scenarios publishing `controls: []`
+        # today, so the operator can open one and judge whether the library really has nothing
+        # for it — the one check that tells a mis-set cutoff from a genuine gap.
+        shown = ", ".join(empty_now[:12])
+        more = f" (+{len(empty_now) - 12} more)" if len(empty_now) > 12 else ""
+        print(f"      publishing NO controls at {in_force:.1f}: {shown}{more}")
     print()
 
     # --- the recommendation -----------------------------------------------------------------
-    strict, p05_based = recommend(rows, best)
+    safe, p05_based = recommend(rows, best)
     print("RECOMMENDATION")
-    if strict is None:
+    if safe is None:
         print("  Even a threshold of 0 leaves scenarios with no controls, which means their "
             "shortlists were empty. Fix retrieval before tuning the cutoff.")
     else:
-        print(f"  TSG_CONTROL_MAP_MIN_SCORE={strict}")
+        print(f"  TSG_CONTROL_MAP_MIN_SCORE={safe}")
         print("    The highest swept value at which NO scenario loses all its controls — safe by "
             "construction against the silent-empty failure.")
         print(f"  Stricter alternative: {p05_based:.0f} (5th percentile of best-match scores), "

@@ -48,11 +48,23 @@ def main() -> int:
         with db_session() as sess:
             return action(sess, llm, group)
 
-    results = embeddings._for_each_group(args.group, run_one)
+    # _for_each_group attempts every group, then raises if any of them failed — so the summary
+    # below has to be printed from BOTH paths. Without the except, a single failed group would
+    # end this CLI in a bare traceback with no per-group breakdown and no row total.
+    failed = False
+    try:
+        results = embeddings._for_each_group(args.group, run_one)
+    except embeddings.EmbeddingGroupsFailed as exc:
+        results, failed = exc.results, True
+
     for group, result in results.items():
         print(f"{group}: {result}")
     total = sum(v for v in results.values() if isinstance(v, int))
     print(f"\nTotal rows processed: {total}")
+    if failed:
+        # Non-zero so a cron/CI caller notices; the per-group lines above say which group broke.
+        print("FAILED: at least one group did not complete — see its 'error: ...' line above")
+        return 1
     return 0
 
 

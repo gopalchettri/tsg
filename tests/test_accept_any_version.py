@@ -370,12 +370,14 @@ def test_results_default_view_shows_accepted_superseded_row(monkeypatch):
     assert b in ids          # accepted, though superseded
     assert d in ids          # current version still visible (flagged not-accepted)
     assert a not in ids and c not in ids  # plain history stays hidden by default
-    # Response invariant: every threat_id a returned card carries resolves in threats[] —
-    # a card must never reference a threat the same response says does not exist.
-    threat_ids = {t.ThreatID for t in results.threats}
+    # Response invariant, now structural rather than cross-checked: a card carries its OWN
+    # threat, read from the same row, so it cannot reference a threat the response does not
+    # describe. The old parallel threats[] list (and the backfill query that kept it in sync)
+    # is gone precisely because this cannot drift.
     for sc in results.scenarios:
         if sc.ThreatID is not None:
-            assert sc.ThreatID in threat_ids
+            assert sc.threat is not None
+            assert sc.threat.ThreatID == sc.ThreatID
 
 
 def test_treatment_gate_accepts_superseded_accepted_scenario(monkeypatch):
