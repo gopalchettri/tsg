@@ -14,14 +14,17 @@ longer exists. Every assertion below pins something that has already been got wr
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
+import sys
 
 import pytest
 
 from app.core import tracing
 from app.core.config import get_settings
+from app.core.logging import configure_logging
 
 
 @pytest.fixture
@@ -136,13 +139,33 @@ def test_file_sink_writes_both_forms_and_carries_the_pid(sinks, tmp_path):
     assert big in txt.read_text(encoding="utf-8")
 
 
-def test_log_sink_routes_through_structlog(sinks, capsys):
+def test_log_sink_routes_through_structlog(sinks):
     """The "show in logs / no logs" switch: with `log` on, a step becomes an ordinary structured
-    log event and so reaches Loki alongside every other line."""
+    log event and so reaches Loki alongside every other line.
+
+    NOT capsys, and NOT capfd — both were tried and both see NOTHING. configure_logging reads
+    `sys.stdout` at call time (app/core/logging.py) and hands it to PrintLoggerFactory, and
+    `cache_logger_on_first_use=True` freezes that binding. The real process configures logging at
+    startup, BEFORE pytest installs either capture layer, so the cached logger keeps writing to
+    the original stream and the fixtures never observe it. Re-pointing stdout and reconfiguring is
+    the only way to capture what this sink actually renders — and it is the better assertion
+    anyway: this exercises the real processor chain and the real JSONRenderer, so it proves the
+    line Promtail would ingest is genuinely parseable, not merely that an event was dispatched.
+    """
     sinks("log")
-    with tracing.trace_step("COVERAGE", "sess1234", units=[0, 41]) as t:
-        t.result(cells=24)
-    record = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    buf = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = buf
+    configure_logging()
+    try:
+        with tracing.trace_step("COVERAGE", "sess1234", units=[0, 41]) as t:
+            t.result(cells=24)
+    finally:
+        # Restore BEFORE reconfiguring, or structlog stays bound to this dead buffer and every
+        # later test in the process logs into it.
+        sys.stdout = real_stdout
+        configure_logging()
+    record = json.loads(buf.getvalue().strip().splitlines()[-1])
     assert record["event"] == "trace.step"
     assert record["step"] == "COVERAGE" and record["phase"] == "END"
     assert record["session_id"] == "sess1234"
