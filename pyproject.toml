@@ -22,7 +22,7 @@ dependencies = [
   # prometheus-client removed: it was declared but never imported, and no /metrics route exists
   # (`grep -rn "prometheus\|Counter(\|Histogram(" app/` finds nothing). Add it back together with
   # the endpoint and the instrumentation, not ahead of them.
-  "numpy>=2.5.1",
+  "numpy>=2.4.1",
   "httpx>=0.28.1",
   "ruff>=0.16.1",
   "pyyaml>=6.0.3",
