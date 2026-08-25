@@ -240,3 +240,86 @@ def test_failure_card_still_reports_which_threat_failed(monkeypatch):
     assert card.threat.ThreatName == "Ransomware on OT support systems"
     assert card.threat.ThreatCatalogueID == 418       # database keys survive too
     assert card.threat.ThreatTypeID == 57
+
+
+def test_a_failed_controls_read_is_not_published_as_a_library_gap(monkeypatch):
+    """THE read-side twin of the empty-controls bug.
+
+    `_controls_by_output` catches every exception, logs `controls.read_failed` and returns `{}` —
+    deliberately, because a secondary read must never 500 the core results view
+    (`_actor_ids_by_name` names that a shared contract). But `{}` was indistinguishable from
+    "mapping ran and matched nothing", and `ControlsMapped` is read straight off the row, so one
+    transient database error published EVERY scenario on the page as `ControlsMapped: true` with
+    an empty control list — which schemas.py documents in three places as a genuine library-gap
+    signal worth acting on. A reviewer could not tell a curated fact about the control library
+    from a database blip, and the natural response is to go author controls that already exist.
+
+    The fix is the house pattern for exactly this defect (grounding.ControlMatches.answered):
+    stop overloading the empty value. The response still degrades rather than failing — it just
+    degrades honestly now.
+    """
+    import app.api.sessions as sessions_mod
+    from app.api.deps import Principal
+
+    Session = sessionmaker(bind=_engine(), future=True)
+    _threat_id, output_id = _seed(Session)
+
+    @contextmanager
+    def fake_db_session():
+        with Session() as s:
+            yield s
+
+    with Session() as s:
+        board_row = dict(dal.load_session(s, SID))
+    monkeypatch.setattr(sessions_mod, "db_session", fake_db_session)
+    monkeypatch.setattr(sessions_mod, "get_authorized_session", lambda *a, **kw: board_row)
+    monkeypatch.setattr(sessions_mod, "build_board", lambda *a, **kw: {
+        "progress": {"threats": "COMPLETE", "scenarios": "COMPLETE",
+                    "overall": "completed", "error_message": {}}})
+
+    def _boom(*a, **k):
+        raise RuntimeError("transient database error while reading the control map")
+    monkeypatch.setattr(sessions_mod, "_query_controls", _boom)
+
+    principal = Principal(claims={"sub": "u1"}, entities={ENTITY}, client_id="c", tenant_id="t")
+    results = sessions_mod.get_results(SID, include_replaced=False, principal=principal)
+
+    card = results.scenarios[0]
+    assert card.OutputID == output_id
+    # The deliberate contract is intact: a failed secondary read still returns the page.
+    assert card.scenario is not None, "a failed controls read must not take down the results view"
+    assert card.scenario.controls == []
+    # ControlsMapped is correct — it reads ControlsMappedAt off the row, and mapping DID run.
+    assert card.ControlsMapped is True
+    # ...which is precisely why the empty list beside it needed to stop being ambiguous.
+    assert card.ControlsUnavailable is True, (
+        "an unreadable control list is being published as a genuine library gap")
+
+
+def test_a_healthy_read_never_claims_controls_are_unavailable(monkeypatch):
+    """Control for the test above: without it, `ControlsUnavailable = True` hard-coded would
+    pass. On a healthy page the flag must be false AND the mapped control must be present."""
+    import app.api.sessions as sessions_mod
+    from app.api.deps import Principal
+
+    Session = sessionmaker(bind=_engine(), future=True)
+    _threat_id, _output_id = _seed(Session)
+
+    @contextmanager
+    def fake_db_session():
+        with Session() as s:
+            yield s
+
+    with Session() as s:
+        board_row = dict(dal.load_session(s, SID))
+    monkeypatch.setattr(sessions_mod, "db_session", fake_db_session)
+    monkeypatch.setattr(sessions_mod, "get_authorized_session", lambda *a, **kw: board_row)
+    monkeypatch.setattr(sessions_mod, "build_board", lambda *a, **kw: {
+        "progress": {"threats": "COMPLETE", "scenarios": "COMPLETE",
+                    "overall": "completed", "error_message": {}}})
+
+    principal = Principal(claims={"sub": "u1"}, entities={ENTITY}, client_id="c", tenant_id="t")
+    card = sessions_mod.get_results(SID, include_replaced=False,
+                                    principal=principal).scenarios[0]
+    assert card.ControlsUnavailable is False
+    assert [c.ControlLibraryID for c in card.scenario.controls] == [201]

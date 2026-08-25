@@ -865,6 +865,19 @@ class ScenarioResult(BaseModel):
             "POST /regenerate/scenarios, which never serves from the library."
         ),
     )
+    ControlsUnavailable: bool = Field(
+        default=False,
+        description=(
+            "true = this response could NOT read the control mapping (a transient database "
+            "error), so `scenario.controls` is empty because we did not get to look — NOT because "
+            "the library has nothing. Treat the list as unknown and retry; do not read it as a "
+            "library gap. Always false on a healthy response, so an existing client that ignores "
+            "this field behaves exactly as before. It exists because `ControlsMapped: true` with "
+            "an empty list is documented as a genuine library-gap signal, and a failed read used "
+            "to be indistinguishable from one — the same overloaded-empty defect that "
+            "grounding.ControlMatches.answered was introduced to kill on the write side."
+        ),
+    )
     ControlsMapped: bool = Field(
         description=(
             "Whether Step-4 control mapping has been attempted for this scenario. true with an "
@@ -1316,6 +1329,14 @@ class AcceptedScenario(BaseModel):
     model_config = ConfigDict(json_schema_extra={"example": _ACCEPTED_SCENARIO_EXAMPLE})
 
     OutputID: str = Field(description="Accepted scenario's unique id (GUID).")
+    ControlsUnavailable: bool = Field(
+        default=False,
+        description=(
+            "true = the control mapping could not be read for this response, so "
+            "`scenario.controls` is empty because we did not get to look. See "
+            "ScenarioResult.ControlsUnavailable."
+        ),
+    )
     SubsystemID: int = Field(
         description="Unit of work this scenario belongs to: 0 = the asset itself, >= 1 = a specific "
                     "supporting system. Scenarios are written at the asset unit; a threat's reach "

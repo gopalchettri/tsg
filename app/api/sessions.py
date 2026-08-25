@@ -9,7 +9,7 @@ import asyncio
 import io
 import json
 from functools import lru_cache
-from typing import Literal, NoReturn
+from typing import Literal, NamedTuple, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response
 from fastapi.responses import JSONResponse
@@ -495,7 +495,8 @@ def get_results(
             without a `replaced` argument, which is what keeps nesting exactly one level deep.
             A chain id with no row (hard-deleted, or past _MAX_ANCESTRY_HOPS) is skipped rather
             than emitted as an entry with no body — the history truncates, it never lies."""
-            return [_scenario_result(by_id[oid], controls.get(oid), actor_ids=actor_ids)
+            return [_scenario_result(by_id[oid], controls.by_output.get(oid),
+                                    actor_ids=actor_ids, unavailable=controls.unavailable)
                     for oid in chain if oid in by_id]
 
         return SessionResults(
@@ -507,9 +508,9 @@ def get_results(
             # list indistinguishable from a completed one. Reuses build_board rather than
             # re-deriving, so /results and the board can never disagree.
             progress=build_board(sess, scenario_session)["progress"],
-            scenarios=[_scenario_result(s, controls.get(s["OutputID"]),
+            scenarios=[_scenario_result(s, controls.by_output.get(s["OutputID"]),
                                         _nested(chains.get(s["OutputID"]) or []),
-                                        actor_ids=actor_ids)
+                                        actor_ids=actor_ids, unavailable=controls.unavailable)
                     for s in scenarios],
         )
 
@@ -588,20 +589,39 @@ def _safe_scenario_json(scenario_json: str | None) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _controls_by_output(sess: Session, output_ids: list[str]) -> dict[str, list[MappedControl]]:
+class _Controls(NamedTuple):
+    """A page's mapped controls, WITH whether the read actually happened.
+
+    `by_output` empty + `unavailable` False = mapping ran and matched nothing, which schemas.py
+    documents in three places as a genuine library-gap signal worth acting on. `unavailable` True
+    = we never got to look. Those are different facts, and a bare `{}` could not tell them apart:
+    one transient read error published EVERY scenario on the page as a library gap, next to
+    `ControlsMapped: true`, which is read straight off the row and is perfectly correct. A
+    reviewer had no way to distinguish a curated fact about the control library from a database
+    blip — the same overloaded-empty defect grounding.ControlMatches.answered exists to kill on
+    the write side, here on the read side.
+    """
+    by_output: dict[str, list[MappedControl]]
+    unavailable: bool
+
+
+def _controls_by_output(sess: Session, output_ids: list[str]) -> _Controls:
     """Step-4 mapped controls for a page of scenarios, grouped per OutputID, best rank first.
     The Control_Library join filters to active rows — a control deactivated AFTER mapping must
     not keep surfacing. Standards ride along as names (Map → Control_Standard, active only)."""
     if not output_ids:
-        return {}
+        return _Controls({}, False)
     cmap, lib = m.Threat_Scenario_Control_Map, m.Control_Library
     try:
-        return _query_controls(sess, output_ids, cmap, lib)
+        return _Controls(_query_controls(sess, output_ids, cmap, lib), False)
     except Exception:
-        # hasn't run yet must degrade to controls=[] with a loud log, not 500 the core reads.
+        # STILL degrades rather than 500s: _actor_ids_by_name names that a shared contract, and a
+        # secondary read must never take down the core results view. What changed is that it now
+        # degrades HONESTLY — the fact rides out to the client instead of being swallowed into a
+        # `{}` that reads as "your library has nothing for these threats".
         sess.rollback()  # leave the session clean for the caller's remaining work/commit
         log.warning("controls.read_failed", exc_info=True)
-        return {}
+        return _Controls({}, True)
 
 
 def _query_controls(sess: Session, output_ids: list[str], cmap, lib) -> dict[str, list[MappedControl]]:
@@ -720,7 +740,8 @@ def _scenario_with_controls(scenario_json: str | None, controls: list[MappedCont
 
 def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                     replaced: list[ScenarioResult] | None = None,
-                    actor_ids: dict[str, int] | None = None) -> ScenarioResult:
+                    actor_ids: dict[str, int] | None = None,
+                    *, unavailable: bool = False) -> ScenarioResult:
     controls_mapped = row["ControlsMappedAt"] is not None
     checked, flagged, categories = _moderation_summary(row["ValidationJSON"])
     validation_status, validation_errors = _validation_summary(row["ValidationJSON"])
@@ -739,6 +760,10 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                         # is "generated", not "unknown".
                         ScenarioSource=row["ScenarioSource"] or "generated",
                         ControlsMapped=controls_mapped,
+                        # Without this, ControlsMapped=true beside an empty list is the API's
+                        # documented "the library genuinely has nothing" — a claim we cannot make
+                        # when the read never returned.
+                        ControlsUnavailable=unavailable,
                         replaced_scenarios=replaced or [])
 
 
@@ -1202,9 +1227,10 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
                 LibraryThreatName=r["LibraryThreatName"],
                 # The row goes in whole; _scenario_with_controls owns the display preference.
                 scenario=_scenario_with_controls(
-                    r["ScenarioJSON"], controls.get(r["OutputID"], []), r),
+                    r["ScenarioJSON"], controls.by_output.get(r["OutputID"], []), r),
                 threat=_threat_block(r, actor_ids),
                 ThreatActors=stored_actors(r["ThreatActorsJSON"]),
+                ControlsUnavailable=controls.unavailable,
             ) for r in rows],
         )
 
@@ -1226,7 +1252,8 @@ _SCN_SUPERSEDED = Query(
 
 
 def _scenario_list_item(row: dict, controls: list[MappedControl],
-                        actor_ids: dict[str, int] | None = None) -> ScenarioListItem:
+                        actor_ids: dict[str, int] | None = None,
+                        *, unavailable: bool = False) -> ScenarioListItem:
     """One dal.scenario_rows/scenario_row row → response item. Same both-spellings rule and
     controls merge as get_accepted_scenarios above."""
     return ScenarioListItem(
@@ -1243,6 +1270,7 @@ def _scenario_list_item(row: dict, controls: list[MappedControl],
         # _scenario_read_select already carries ThreatActorsJSON — without this kwarg the list
         # routes would permanently return [] while /accepted-scenarios returns real actors.
         ThreatActors=stored_actors(row["ThreatActorsJSON"]),
+        ControlsUnavailable=unavailable,
     )
 
 
@@ -1259,7 +1287,8 @@ def _list_scenarios(entity_ids: set[str], user_id: str | None, status: str | Non
         controls = _controls_by_output(sess, [r["OutputID"] for r in rows])  # one batch, no N+1
         actor_ids = _actor_ids_by_name(
             sess, {n for r in rows for n in stored_actors(r["ThreatActorsJSON"])})
-        return [_scenario_list_item(r, controls.get(r["OutputID"], []), actor_ids) for r in rows]
+        return [_scenario_list_item(r, controls.by_output.get(r["OutputID"], []), actor_ids,
+                                    unavailable=controls.unavailable) for r in rows]
 
 
 @scenarios_router.get("/users/{user_id}/scenarios", response_model=list[ScenarioListItem])
@@ -1317,4 +1346,5 @@ def get_scenario(
             raise dal.NotFoundError(f"scenario {output_id} not found")
         controls = _controls_by_output(sess, [row["OutputID"]])
         actor_ids = _actor_ids_by_name(sess, set(stored_actors(row["ThreatActorsJSON"])))
-        return _scenario_list_item(dict(row), controls.get(row["OutputID"], []), actor_ids)
+        return _scenario_list_item(dict(row), controls.by_output.get(row["OutputID"], []),
+                                    actor_ids, unavailable=controls.unavailable)
