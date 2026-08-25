@@ -42,7 +42,8 @@ def _engine():
 
 def _seed(s, *, created_offset_days: int = 1, stage_status: str = StageStatus.AWAITING_DECISION,
         settled_secs_ago: int = STALE, lock_status: str = StageStatus.IDLE,
-        lock_task: str | None = None) -> tuple[str, str]:
+        lock_task: str | None = None, accepted: int = 0,
+        superseded: int = 0) -> tuple[str, str]:
     """One session whose SCENARIOS stage is settled and whose single complete output was never
     control-mapped — i.e. exactly the state the old code stranded forever."""
     now = datetime.now(UTC)
@@ -64,7 +65,7 @@ def _seed(s, *, created_offset_days: int = 1, stage_status: str = StageStatus.AW
         SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
         ScenarioJSON=json.dumps({"scenario_title": "Setpoint manipulation on the HMI",
                                 "scenario_statement": "An attacker writes an unsafe setpoint."}),
-        Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=EPOCH,
+        Accepted=accepted, Superseded=superseded, ScenarioNumber=1, GenerationEpoch=EPOCH,
         ControlsMappedAt=None, CreatedAt=now))
     s.commit()
     return sid, output_id
@@ -140,9 +141,11 @@ def test_a_running_scenarios_stage_is_never_swept(monkeypatch):
 
 
 def test_a_just_settled_stage_is_never_swept(monkeypatch):
-    """_finalize_scenario_batch calls finish_stage BEFORE map_controls, so "settled" alone does
-    not mean mapping has run — there is a window where the in-pipeline mapping is still going.
-    One stage_lease_seconds is the codebase's own "this work step is no longer alive"."""
+    """write_scenarios settles the stage BEFORE it maps controls — even more so since mapping
+    moved after the commit — so "settled" alone does not mean mapping has run. There is a window
+    where the in-pipeline mapping is still going, and sweeping into it would put two writers on
+    one subsystem. One stage_lease_seconds is the codebase's own "this work step is no longer
+    alive", so no second grace knob is invented."""
     Session = sessionmaker(bind=_engine(), future=True)
     _stub_grounding(monkeypatch)
     with Session() as s:
@@ -161,3 +164,70 @@ def test_a_held_subsystem_lock_defers_the_sweep(monkeypatch):
         assert control_mapping.sessions_awaiting_control_mapping(s) == [(sid, 0, EPOCH)]
         assert cascade.run_control_map_sweep(s, _FakeLLM()) == []
         assert _mapped(s, output_id) == (0, None), "deferred, NOT stamped — it must retry later"
+
+
+def test_an_accepted_but_superseded_output_is_still_swept(monkeypatch):
+    """The predicate used to be `active(Superseded)` alone, which silently excluded these.
+
+    An ACCEPTED output that a later regenerate superseded is still rendered by /results — it is
+    the `replaced_scenarios` history a reviewer sees, and test_accept_any_version.py pins that it
+    is shown. Excluding it from the queue meant a scenario a reviewer had SIGNED OFF carried a
+    permanently empty control list. This is audit gap 20, which the first version of the sweep
+    was claimed to cover and did not.
+    """
+    Session = sessionmaker(bind=_engine(), future=True)
+    _stub_grounding(monkeypatch)
+    with Session() as s:
+        sid, output_id = _seed(s, accepted=1, superseded=1)
+        assert control_mapping.sessions_awaiting_control_mapping(s) == [(sid, 0, EPOCH)]
+        assert cascade.run_control_map_sweep(s, _FakeLLM()) == [sid]
+        n, stamp = _mapped(s, output_id)
+        assert n == 2 and stamp is not None
+
+
+def test_an_unaccepted_superseded_output_is_still_ignored(monkeypatch):
+    """Control for the test above: widening the predicate must not drag in every dead row.
+    A superseded output nobody accepted was replaced and is not shown — mapping it would be
+    rerank spend on a row no one will ever read."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    _stub_grounding(monkeypatch)
+    with Session() as s:
+        _seed(s, accepted=0, superseded=1)
+        assert control_mapping.sessions_awaiting_control_mapping(s) == []
+
+
+def test_the_queue_is_drained_oldest_first(monkeypatch):
+    """LIMIT with no ORDER BY is an arbitrary TOP-N on SQL Server — and an arbitrary set can be a
+    STABLE one. Paired with a session that always fails, the optimiser could hand back the same
+    doomed rows every tick while everything behind them starved forever. Oldest-first is
+    deterministic AND drains the queue."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    _stub_grounding(monkeypatch)
+    with Session() as s:
+        newer, _ = _seed(s, settled_secs_ago=STALE)
+        older, _ = _seed(s, settled_secs_ago=STALE * 3)
+        assert [sid for sid, _ss, _e in control_mapping.sessions_awaiting_control_mapping(s)] ==             [older, newer]
+
+
+def test_one_failing_session_does_not_stall_the_others(monkeypatch):
+    """Without per-session isolation the first raising session killed the whole tick — and since
+    the queue is ordered oldest-first, that same session would head every subsequent tick too.
+    One poison row would have blocked the entire queue permanently, which is exactly the class of
+    silent, self-perpetuating failure this sweep was built to end."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    _stub_grounding(monkeypatch)
+    with Session() as s:
+        poison, poison_out = _seed(s, settled_secs_ago=STALE * 3)   # ordered FIRST
+        healthy, healthy_out = _seed(s, settled_secs_ago=STALE)
+
+        real_load = cascade.dal.load_session
+
+        def _load(sess_, session_id):
+            if session_id == poison:
+                raise RuntimeError("transient read failure on this one session")
+            return real_load(sess_, session_id)
+
+        monkeypatch.setattr(cascade.dal, "load_session", _load)
+        assert cascade.run_control_map_sweep(s, _FakeLLM()) == [healthy]
+        assert _mapped(s, healthy_out)[0] == 2, "the healthy session must still be mapped"
+        assert _mapped(s, poison_out) == (0, None), "the failing one stays queued for the next tick"

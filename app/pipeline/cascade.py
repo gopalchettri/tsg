@@ -598,8 +598,40 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
     return "no_new_threats_this_round" if signal == "no_new_threats_this_round" else outcome
 
 
+def _sweep_one_session(sess: Session, llm: LLMClient, sid: str, subsystem_id: int,
+                    epoch: int) -> bool:
+    """Map one queued session's controls under the per-subsystem lock. True if mapping ran.
+
+    Split out of run_control_map_sweep so that ONE session's failure is contained to that session:
+    the caller wraps this call, not the loop. Everything that can raise for session-specific
+    reasons — the lock, the row read, the JSON blobs, the mapping itself — is inside here.
+    """
+    task_id = guid()
+    with _subsystem_lock(sess, sid, subsystem_id, task_id, "control_map_sweep") as acquired:
+        if not acquired:
+            # A live regenerate/next-set/accept owns this session. Correct to skip — but SAY so.
+            # A session losing this race every tick would otherwise be indistinguishable from one
+            # that was never queued, which is the silent-degradation class this whole effort
+            # exists to remove. The reaper reclaims expired _LOCK rows, so this cannot wedge.
+            log.info("control_map_sweep.deferred", session_id=sid, subsystem=subsystem_id)
+            return False
+        row = dal.load_session(sess, sid)
+        if row is None:                      # deleted between the queue read and here
+            return False
+        scenario_session = dict(row)
+        subsystems, asset_context = _resolve_regen_context(scenario_session)
+        # durable=True: the sweep owns its transaction outright, unlike the in-pipeline caller
+        # which may still hold uncommitted scenario rows.
+        # task_id/epoch are the lease fence. The sweep holds no SCENARIOS claim, so map_controls'
+        # renew_lease correctly fails and its stage_settled_at_epoch fallback is what authorises
+        # the run — which is why the epoch comes from that settled row.
+        control_mapping.map_controls(sess, scenario_session, asset_context, subsystems, llm,
+                                    subsystem_id, task_id, epoch, durable=True)
+        return True
+
+
 def run_control_map_sweep(sess: Session, llm: LLMClient) -> list[str]:
-    """Drain the control-mapping retry queue. Returns the session ids actually attempted.
+    """Drain the control-mapping retry queue. Returns the session ids actually mapped.
 
     THE QUEUE'S MISSING CONSUMER. See `control_mapping.sessions_awaiting_control_mapping` for why
     it had none and what that cost: three `map_controls` paths return without stamping
@@ -609,37 +641,26 @@ def run_control_map_sweep(sess: Session, llm: LLMClient) -> list[str]:
 
     It lives HERE rather than in control_mapping because this is the module that owns
     session-level execution: `_subsystem_lock` is the codebase's one-writer-per-subsystem fence
-    ([R5]) and the sweep needs exactly it. `_finalize_scenario_batch` settles the SCENARIOS stage
-    BEFORE mapping, so "settled" alone cannot prove the pipeline has finished with the session —
-    the lock closes that race against a concurrent regenerate/next-set, which would otherwise
-    both map the same outputs and lose the whole batch to one duplicate-key IntegrityError.
+    ([R5]) and the sweep needs exactly it. `write_scenarios` settles the SCENARIOS stage before it
+    maps, so "settled" alone cannot prove the pipeline has finished with the session — the lock
+    closes that race against a concurrent regenerate/next-set, which would otherwise both map the
+    same outputs and lose the whole batch to one duplicate-key IntegrityError.
 
     `map_controls` is reused UNCHANGED and deliberately: `no_candidates`, `lease_lost` and
     per-output `unanswered` are then all retried by one consumer instead of needing a guard each.
     """
     swept: list[str] = []
     for sid, subsystem_id, epoch in control_mapping.sessions_awaiting_control_mapping(sess):
-        task_id = guid()
-        with _subsystem_lock(sess, sid, subsystem_id, task_id, "control_map_sweep") as acquired:
-            if not acquired:
-                continue        # a live regenerate/next-set/accept owns this session — leave it
-            row = dal.load_session(sess, sid)
-            if row is None:     # deleted between the queue read and here
-                continue
-            scenario_session = dict(row)
-            try:
-                subsystems, asset_context = _resolve_regen_context(scenario_session)
-            except ValueError:  # one corrupt blob must not stall the whole sweep
-                log.warning("control_map_sweep.bad_session_json", session_id=sid, exc_info=True)
-                continue
-            # durable=True: the sweep owns its transaction outright, unlike the in-pipeline caller
-            # which may still be holding uncommitted scenario rows.
-            # task_id/epoch are the lease fence. The sweep holds no SCENARIOS claim, so
-            # map_controls' renew_lease correctly fails and its stage_settled_at_epoch fallback is
-            # what authorises the run — which is why the epoch comes from that settled row.
-            control_mapping.map_controls(sess, scenario_session, asset_context, subsystems, llm,
-                                        subsystem_id, task_id, epoch, durable=True)
-            swept.append(sid)
+        try:
+            if _sweep_one_session(sess, llm, sid, subsystem_id, epoch):
+                swept.append(sid)
+        except Exception:  # [R8] one session must never stall the whole queue
+            # Without this the first raising session killed the entire tick, and since the queue
+            # is now ordered oldest-first that same session would head every subsequent tick —
+            # a permanent block on everything behind it. Roll back so the next iteration starts
+            # on a clean session rather than inheriting a failed transaction.
+            sess.rollback()
+            log.warning("control_map_sweep.session_failed", session_id=sid, exc_info=True)
     if swept:
         log.info("control_map_sweep.ran", sessions=len(swept))
     return swept

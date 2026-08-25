@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -117,6 +118,145 @@ def collect_control_query(scenario_json: str | None, threat_name: str | None = N
     return text or None
 
 
+class MappingTally(NamedTuple):
+    """What one mapping pass did — the numbers the audit row and the log line both need.
+
+    A NamedTuple rather than four loose ints threaded through three functions: this module has
+    already been bitten once by positional data (`for oid, _ in outputs` silently became a
+    ValueError the moment the SELECT grew), and named fields make that class of slip impossible.
+    """
+    inserted: int
+    dropped: int
+    unanswered: int
+    skipped: int
+
+
+def eligible_outputs(sess: Session, session_id: str) -> list:
+    """Outputs this session still owes controls, each row carrying its own threat identity.
+
+    The threat rides along on the SAME row as the scenario text: collect_control_query needs
+    both, and a second lookup per output would be an N+1 on a batch endpoint. OUTER join — an
+    output whose scoped/threat chain is missing still maps on its narrative alone rather than
+    being silently skipped.
+    """
+    already_mapped = select(m.Threat_Scenario_Control_Map.OutputID).where(
+        m.Threat_Scenario_Control_Map.OutputID == m.Threat_Scenario_Output.OutputID)
+    out_t, st_t, it_t = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
+    return sess.execute(
+        select(out_t.OutputID, out_t.ScenarioJSON,
+            it_t.ThreatName, it_t.ThreatType,
+            it_t.LibraryThreatName, it_t.LibraryThreatType)
+        .select_from(out_t.__table__
+                    .outerjoin(st_t, out_t.ScopedThreatID == st_t.ScopedThreatID)
+                    .outerjoin(it_t, st_t.ThreatID == it_t.ThreatID))
+        .where(out_t.SessionID == session_id,
+            # Mirrors sessions_awaiting_control_mapping's predicate, and must: the sweep queues
+            # a session, then THIS select decides what to map. Widening only the queue left an
+            # accepted-but-superseded output queued forever and mapped never — the sweep
+            # reported success while writing nothing.
+            or_(dal.active(out_t.Superseded), out_t.Accepted == 1),
+            out_t.Status == ScenarioStatus.complete,
+            out_t.ControlsMappedAt.is_(None),
+            ~already_mapped.exists())
+    ).all()
+
+
+def build_output_queries(outputs) -> list[tuple[str, str]]:
+    """One grounding query per output, dropping the ones with nothing groundable to say.
+
+    An absent output is NOT a failure: an error card has a NULL ScenarioJSON and no query can be
+    built from it. The caller counts the difference as `skipped` and stamps those rows, because
+    "there was nothing to ask" is a definitive answer, not a retryable one.
+    """
+    per_output: list[tuple[str, str]] = []
+    for output_id, scenario_json, tname, ttype, ltname, lttype in outputs:
+        # Library spelling first, same preference the API uses for display: the curator's
+        # wording is the one the control library was written against.
+        query = collect_control_query(scenario_json, ltname or tname, lttype or ttype)
+        if query:
+            per_output.append((output_id, query))
+    return per_output
+
+
+def select_matching_controls(output_id: str, session_id: str, matches, min_score: float,
+                            top_k: int) -> tuple[list[dict], int]:
+    """Map rows for ONE answered output, best-first and rank-stamped, plus the dropped count.
+
+    KEEP the best[cid] dedup: the PK (OutputID, ControlLibraryID) turns any duplicate into an
+    IntegrityError the caller's except would swallow into controls.mapping_failed — losing the
+    whole output's mapping on one WARNING. One guard here is cheaper than trusting every
+    upstream path.
+    """
+    best: dict[int, dict] = {}
+    dropped = 0
+    for row, score in matches:
+        if score < min_score:
+            dropped += 1
+            continue
+        cid = row["ControlLibraryID"]
+        if cid not in best or score > best[cid]["Score"]:
+            # SuggestedControl deliberately not written (column stays, legacy rows keep theirs):
+            # the LLM no longer suggests controls.
+            best[cid] = {"OutputID": output_id, "ControlLibraryID": cid, "SessionID": session_id,
+                        "Score": score, "CreatedAt": now()}
+    keep = sorted(best.values(), key=lambda r: r["Score"], reverse=True)[:top_k]
+    for rank, rec in enumerate(keep, start=1):
+        rec["MapRank"] = rank
+    return keep, dropped
+
+
+def _stamp_mapped_outputs(sess: Session, outputs, per_output, answered: list[str]) -> None:
+    """Timestamp the outputs we ACTUALLY ANSWERED, plus those with no groundable query.
+
+    NOT the whole `outputs` list, which is what this used to be. The stamp is permanent (nothing
+    anywhere clears it) and `ControlsMappedAt IS NULL` is the ONLY thing keeping an output
+    eligible for a later run — so stamping an output whose rerank had merely FAILED converted one
+    transient 429 into a permanent, unrecoverable, authoritative-looking "the control library has
+    nothing for this threat". Leaving it NULL is the entire fix: the row stays in the queue and
+    tsg.map_controls_sweep retries it.
+    """
+    groundable = {oid for oid, _ in per_output}
+    # Index, not tuple-unpack: these rows carry the joined threat columns too, and a positional
+    # `for oid, _ in outputs` silently became a ValueError the moment the SELECT grew — swallowed
+    # into "controls.mapping_failed", i.e. every output left unstamped and unmapped.
+    to_stamp = answered + [row[0] for row in outputs if row[0] not in groundable]
+    if to_stamp:
+        sess.execute(update(m.Threat_Scenario_Output)
+                    .where(m.Threat_Scenario_Output.OutputID.in_(to_stamp))
+                    .values(ControlsMappedAt=now()))
+
+
+def _record_control_mapping(sess: Session, scenario_session: dict, subsystem_id: int,
+                            queried: int, tally: MappingTally, threshold: grounding.Threshold,
+                            itot: str | None) -> None:
+    """Persist what this pass did, then log it. The audit row is the only durable record."""
+    dal.append_audit(sess, AuditID=guid(), SessionID=scenario_session["SessionID"],
+                    TenantID=scenario_session["TenantID"], EntityID=scenario_session["EntityID"],
+                    Stage=WorkflowStage.SCENARIO_GENERATION, SubsystemID=subsystem_id,
+                    EventType=AuditEventType.controls_mapped,
+                    # fallback_queries dropped from the detail: every query is scenario-text now,
+                    # the metric was constant. Historical rows keep the old key.
+                    DetailJSON=json.dumps({"outputs": queried, "mapped": tally.inserted,
+                                            "dropped": tally.dropped,
+                                            # Same discipline as tasks._validate_candidates'
+                                            # `degraded`: a fail-open path must PERSIST how often
+                                            # it degraded, or afterwards a degraded run is
+                                            # indistinguishable from a clean one.
+                                            "unanswered": tally.unanswered,
+                                            "skipped": tally.skipped, "itot": itot or "",
+                                            "itot_filter_applied": itot is not None,
+                                            "min_score": threshold.value,
+                                            # WHERE the cutoff came from. Without it a stored
+                                            # 75.0 cannot be told apart from a measured one, and
+                                            # "static_default" means it was tuned for a different
+                                            # model pair AND a different question.
+                                            "min_score_origin": threshold.origin}))
+    log.info("controls.mapped", session_id=scenario_session["SessionID"], outputs=queried,
+            mapped=tally.inserted, dropped=tally.dropped, unanswered=tally.unanswered,
+            skipped=tally.skipped, itot=itot, min_score=threshold.value,
+            min_score_origin=threshold.origin)
+
+
 def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 subsystems: list[dict] | None, llm: LLMClient, subsystem_id: int,
                 task_id: str, epoch: int, *, durable: bool = False) -> None:
@@ -140,38 +280,12 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         if not candidates:
             log.warning("controls.no_candidates", session_id=sid, itot=itot)
             return
-        already_mapped = select(m.Threat_Scenario_Control_Map.OutputID).where(
-            m.Threat_Scenario_Control_Map.OutputID == m.Threat_Scenario_Output.OutputID)
-        # The threat rides along on the SAME row as the scenario text: collect_control_query
-        # needs both, and a second lookup per output would be an N+1 on a batch endpoint.
-        # OUTER join — an output whose scoped/threat chain is missing still gets mapped on its
-        # narrative alone rather than being silently skipped.
-        out_t, st_t, it_t = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
-        outputs = sess.execute(
-            select(out_t.OutputID, out_t.ScenarioJSON,
-                it_t.ThreatName, it_t.ThreatType,
-                it_t.LibraryThreatName, it_t.LibraryThreatType)
-            .select_from(out_t.__table__
-                        .outerjoin(st_t, out_t.ScopedThreatID == st_t.ScopedThreatID)
-                        .outerjoin(it_t, st_t.ThreatID == it_t.ThreatID))
-            .where(out_t.SessionID == sid,
-                dal.active(out_t.Superseded),
-                out_t.Status == ScenarioStatus.complete,
-                out_t.ControlsMappedAt.is_(None),
-                ~already_mapped.exists())
-        ).all()
+        outputs = eligible_outputs(sess, sid)
         if not outputs:
             return
         # ONE query per output — the threat identity plus the scenario's own text. Built before
         # calling the embedding service once per batch.
-        per_output: list[tuple[str, str]] = []
-        for output_id, scenario_json, tname, ttype, ltname, lttype in outputs:
-            # Library spelling first, same preference the API uses for display: the curator's
-            # wording is the one the control library was written against.
-            query = collect_control_query(scenario_json, ltname or tname, lttype or ttype)
-            if not query:
-                continue
-            per_output.append((output_id, query))
+        per_output = build_output_queries(outputs)
         skipped = len(outputs) - len(per_output)
         threshold = _min_score(sess, llm, s)
         min_score = threshold.value
@@ -203,47 +317,13 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                     unanswered += 1
                     continue
                 answered.append(output_id)
-                matches = result.matches
-                # KEEP the best[cid] dedup: the PK (OutputID, ControlLibraryID) turns any
-                # duplicate into an IntegrityError the outer except would swallow into
-                # controls.mapping_failed — losing the whole output's mapping on one
-                # WARNING. One guard here is cheaper than trusting every upstream path.
-                best: dict[int, dict] = {}
-                for row, score in matches:
-                    if score < min_score:
-                        dropped += 1
-                        continue
-                    cid = row["ControlLibraryID"]
-                    if cid not in best or score > best[cid]["Score"]:
-                        # SuggestedControl deliberately not written (column stays, legacy
-                        # rows keep theirs): the LLM no longer suggests controls.
-                        best[cid] = {"OutputID": output_id, "ControlLibraryID": cid, "SessionID": sid,
-                                    "Score": score, "CreatedAt": now()}
-                keep = sorted(best.values(), key=lambda r: r["Score"], reverse=True)[: s.control_map_top_k]
-                for rank, rec in enumerate(keep, start=1):
-                    rec["MapRank"] = rank
+                keep, fell_short = select_matching_controls(
+                    output_id, sid, result.matches, min_score, s.control_map_top_k)
+                dropped += fell_short
                 if keep:
                     sess.execute(insert(m.Threat_Scenario_Control_Map), keep)
                     inserted += len(keep)
-        # Timestamp the outputs we ACTUALLY ANSWERED, plus the ones that had no groundable
-        # query at all — those are answered by definition, there is nothing to retry for them.
-        #
-        # NOT the whole `outputs` list, which is what this used to be. The stamp is permanent
-        # (nothing anywhere clears it) and `ControlsMappedAt IS NULL` is the ONLY thing that
-        # keeps an output eligible for a later run — so stamping an output whose rerank had
-        # merely failed converted one transient 429 into a permanent, unrecoverable,
-        # authoritative-looking "the control library has nothing for this threat". Leaving it
-        # NULL is the entire fix: the row just stays in the queue and the next run retries it.
-        groundable = {oid for oid, _ in per_output}
-        # Index, not tuple-unpack: this row carries the joined threat columns too, and a
-        # positional `for oid, _ in outputs` silently became a ValueError the moment the SELECT
-        # grew — swallowed by the outer except into "controls.mapping_failed", i.e. every output
-        # left unstamped and unmapped.
-        to_stamp = answered + [row[0] for row in outputs if row[0] not in groundable]
-        if to_stamp:
-            sess.execute(update(m.Threat_Scenario_Output)
-                        .where(m.Threat_Scenario_Output.OutputID.in_(to_stamp))
-                        .values(ControlsMappedAt=now()))
+        _stamp_mapped_outputs(sess, outputs, per_output, answered)
         if unanswered:
             # Loud, attributable and joined to the session — unlike llm.rerank_many's
             # `rerank_item_failed`, which logs an anonymous batch index that joins to nothing.
@@ -254,30 +334,9 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 sess.commit()
             log.warning("controls.nothing_groundable", session_id=sid, skipped=skipped)
             return
-        dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
-                        EntityID=scenario_session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,
-                        SubsystemID=ss, EventType=AuditEventType.controls_mapped,
-                        # fallback_queries dropped from the detail: every query is scenario-text
-                        # now, the metric was constant. Historical rows keep the old key.
-                        DetailJSON=json.dumps({"outputs": len(per_output), "mapped": inserted,
-                                                "dropped": dropped,
-                                                # Same discipline as tasks._validate_candidates'
-                                                # `degraded`: a fail-open path must PERSIST how
-                                                # often it degraded, or afterwards a degraded run
-                                                # is indistinguishable from a clean one.
-                                                "unanswered": unanswered,
-                                                "skipped": skipped, "itot": itot or "",
-                                                "itot_filter_applied": itot is not None,
-                                                "min_score": min_score,
-                                                # WHERE the cutoff came from. Without it a
-                                                # stored 75.0 cannot be told apart from a
-                                                # measured one, and "static_default" means it
-                                                # was tuned for a different model pair AND a
-                                                # different question (label vs paragraph).
-                                                "min_score_origin": threshold.origin}))
-        log.info("controls.mapped", session_id=sid, outputs=len(per_output), mapped=inserted,
-                dropped=dropped, unanswered=unanswered, skipped=skipped, itot=itot,
-                min_score=min_score, min_score_origin=threshold.origin)
+        _record_control_mapping(sess, scenario_session, ss, len(per_output),
+                                MappingTally(inserted, dropped, unanswered, skipped),
+                                threshold, itot)
         if durable:
             sess.commit()
     except Exception:
@@ -336,12 +395,23 @@ def sessions_awaiting_control_mapping(sess: Session, limit: int = SWEEP_LIMIT) -
                 & (st.SubsystemID == out.SubsystemID)
                 & (st.Level == SubsystemLevel.SCENARIOS))
         .where(out.Status == ScenarioStatus.complete,
-            dal.active(out.Superseded),
+            # NOT `active(Superseded)` alone. An ACCEPTED output that was later superseded is
+            # still rendered by /results (its `replaced_scenarios` history, pinned by
+            # test_accept_any_version.py) — controls and all — so excluding it published a
+            # permanent empty control list on a scenario a reviewer can see and has signed off.
+            or_(dal.active(out.Superseded), out.Accepted == 1),
             out.ControlsMappedAt.is_(None),
             ses.CreatedAt >= CONTROL_MAP_SWEEP_FROM,
             st.Status.in_([StageStatus.AWAITING_DECISION, StageStatus.COMPLETE]),
             st.UpdatedAt < cutoff)
         .group_by(out.SessionID, out.SubsystemID, st.GenerationEpoch)
+        # LIMIT without ORDER BY is an arbitrary TOP-N on SQL Server, and an ARBITRARY set can be
+        # a STABLE one: pair that with a session that always fails and the optimiser can hand back
+        # the same doomed five every tick while everything behind them starves. Oldest first is
+        # deterministic AND serves the longest-waiting session, so the queue always drains.
+        # MIN() because UpdatedAt is not a GROUP BY key; the stage row is unique per
+        # (session, subsystem, level), so the aggregate is that row's own value.
+        .order_by(func.min(st.UpdatedAt))
         .limit(limit)
     ).all()
     return [(str(r[0]), int(r[1]), int(r[2])) for r in rows]
