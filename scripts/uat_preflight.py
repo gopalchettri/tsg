@@ -178,10 +178,14 @@ def main() -> int:
         if s.reranker_provider == "litellm_proxy":
             wanted.add(s.reranker_model)
         from app.pipeline.llm import _ensure_litellm_proxy_bypassed, _litellm_http_headers
-        # trust_env=False + the NO_PROXY bypass: a jump server with HTTP_PROXY/HTTPS_PROXY set
-        # routes this through a corporate proxy whose CONNECT tunnel never completes.
+        # Proxy posture must MATCH the app's own. bypass=true (jump server): ignore env proxies
+        # entirely — the corporate proxy's CONNECT tunnel never completes for this host.
+        # bypass=false (cluster pods): the proxy is the ONLY route to the LLM gateway, so
+        # trust_env must honor HTTP_PROXY/HTTPS_PROXY or this check false-fails in-pod against
+        # a perfectly healthy deployment.
         _ensure_litellm_proxy_bypassed(s)
-        with httpx.Client(timeout=s.llm_timeout_seconds, trust_env=False) as c:
+        with httpx.Client(timeout=s.llm_timeout_seconds,
+                        trust_env=not s.litellm_bypass_proxy) as c:
             resp = c.get(f"{s.litellm_base_url.rstrip('/')}/v1/models",
                         headers=_litellm_http_headers(s))
             resp.raise_for_status()

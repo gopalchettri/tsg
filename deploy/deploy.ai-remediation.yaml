@@ -79,7 +79,7 @@ spec:
         - name: quay-pull
       containers:
         - name: celery-worker
-          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-apii:latest
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
           imagePullPolicy: Always  # mutable ':latest' tag — IfNotPresent never repulls
           command:
             - celery

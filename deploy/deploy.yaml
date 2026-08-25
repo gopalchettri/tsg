@@ -266,8 +266,10 @@ spec:
           # schedules the sweeps the workers execute, so a different repo/tag/policy here means
           # the scheduler and the executors can run different builds (Always would repull the
           # mutable :latest on every beat restart while the executors keep their cached one).
-          # Confirm the live repo spelling ('tsg-apii') against the cluster registry before
-          # applying.
+          # Repo spelling: BOTH manifests (this + deploy.ai-remediation.yaml) and every push
+          # command must use ONE spelling — confirm it against the live registry before the
+          # first apply (runbook Phase 0). Split spellings make the two namespaces run
+          # different builds against the same queue.
           image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
           imagePullPolicy: Always  # mutable ':latest' tag — IfNotPresent never repulls
           # compose.prod.yml:100 verbatim — celery_app, NOT celery_worker: beat runs on plain
