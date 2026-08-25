@@ -16,7 +16,10 @@ metadata:
     app: tsg-api
     component: fastapi
 spec:
-  replicas: 1
+  # 2 replicas is what actually provides availability. A namespace is a quota boundary, not an
+  # availability boundary — a second copy in another namespace lands on the same nodes and dies
+  # with them, so replicas + anti-affinity is the mechanism, not namespace count.
+  replicas: 2
   selector:
     matchLabels:
       app: tsg-api
@@ -27,6 +30,19 @@ spec:
         app: tsg-api
         component: fastapi
     spec:
+      affinity:
+        podAntiAffinity:
+          # PREFERRED, not required: on a small cluster `required` leaves the second replica
+          # Pending forever rather than merely co-located — turning a resilience improvement into
+          # an outage. Weight 100 means the scheduler separates them whenever it can.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: tsg-api
+                    component: fastapi
       # Cluster DNS can't resolve this UAT LLM gateway host — pin it directly. Traffic still goes
       # through HTTP_PROXY/HTTPS_PROXY below (TSG_LITELLM_BYPASS_PROXY=false in the Secret makes
       # the app actually use them for this host instead of self-forcing a direct connection).
@@ -107,7 +123,13 @@ metadata:
     app: tsg-api
     component: celery
 spec:
-  replicas: 1
+  # Workers are stateless queue consumers: every replica pulls from the SAME external Redis
+  # broker (TSG_REDIS_CELERY_BROKER_URL), so scaling out needs no Service, no Route and no
+  # coordination between pods. Worker-only replicas may also run in ANOTHER namespace pointed at
+  # the same broker — they join this queue transparently, which is how a second namespace's quota
+  # becomes extra capacity for one application. Never copy tsg-beat alongside them (see its
+  # singleton note below).
+  replicas: 2
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -123,6 +145,18 @@ spec:
         app: tsg-api
         component: celery
     spec:
+      affinity:
+        podAntiAffinity:
+          # Preferred, not required — see the same note on tsg-api: `required` would leave a
+          # replica Pending on a cluster with fewer nodes than replicas.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: tsg-api
+                    component: celery
       # Cluster DNS can't resolve this UAT LLM gateway host — pin it directly. Traffic still goes
       # through HTTP_PROXY/HTTPS_PROXY below (TSG_LITELLM_BYPASS_PROXY=false in the Secret makes
       # the app actually use them for this host instead of self-forcing a direct connection).
@@ -144,7 +178,15 @@ spec:
             - app.pipeline.celery_worker:celery_app
             - worker
             - --loglevel=INFO
-            - --concurrency=2
+            # gevent concurrency is GREENLETS, not CPU cores. This work is almost entirely spent
+            # waiting on network I/O to the LLM proxy, so 2 was a hard ceiling of two in-flight
+            # tasks per pod no matter how much CPU the pod was given (compose uses -c 50).
+            # Step 10 -> 20 while watching celery_task_queued_time_seconds; raise
+            # TSG_MAX_CONCURRENT_LLM_CALLS with it, because that Redis semaphore — not the pod
+            # count — is what should govern load on the shared GPU proxy.
+            - --concurrency=10
+            # Keep at 1: pipeline tasks run for minutes, so prefetching would let one pod hoard
+            # queued work that an idle pod could have taken.
             - --prefetch-multiplier=1
             - --soft-time-limit=3300
             - --time-limit=3600
@@ -160,13 +202,18 @@ spec:
                 name: tsg-api-config
             - secretRef:
                 name: tsg-api-secrets
+          # Sized for the PROXY path, not the local-model path. With
+          # TSG_EMBEDDING_PROVIDER=litellm_proxy no sentence-transformers model is ever loaded, so
+          # the old 4Gi/8Gi was reserving memory nothing used. gevent is I/O-bound too, so many
+          # small workers beat one large one — and two replicas at these values fit the namespace
+          # quota where one at the old values did not.
           resources:
             requests:
-              cpu: "2"
-              memory: "4Gi"
+              cpu: "750m"
+              memory: "1536Mi"
             limits:
-              cpu: "4"
-              memory: "8Gi"
+              cpu: "1500m"
+              memory: "3Gi"
           lifecycle:
             preStop:
               exec:
