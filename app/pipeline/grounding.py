@@ -283,6 +283,11 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
     # never enter (hybrid_search._ranked_indices excludes them), so an all-miss query adds
     # nothing and behaves exactly as before.
     docs_tokens = [hybrid_search.tokenize(r["text"]) for r in rows]
+    # Control mapping's OWN shortlist width, never grounding_shortlist_k. At the shared value
+    # only ~3% of the library reached the reranker and controls it would have accepted were
+    # discarded unscored — see control_map_shortlist_k. Bound once: both the cosine legs and
+    # the BM25 leg must widen together, or the union is still capped by whichever stayed small.
+    ck = s.control_map_shortlist_k
     shortlists: list[list[dict[str, Any]]] = []
     for query, qv in queries:
         if qv is None:
@@ -290,14 +295,15 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
             if len(vecs) != 1:
                 raise RuntimeError(f"embed returned {len(vecs)} vectors for 1 query")
             qv = vecs[0]
-        sl = _shortlist_via_matrix(qv, rows, matrix_info, s) if matrix_info is not None else None
+        sl = (_shortlist_via_matrix(qv, rows, matrix_info, s, ck)
+            if matrix_info is not None else None)
         if sl is None:
             if name_vecs is None:
                 name_vecs = embeddings.get_vectors(llm, names, model_id=s.embedding_model,
                                                 group="control_library", kind="passage")
-            sl = _shortlist_candidates(qv, rows, name_vecs, "text", s)
+            sl = _shortlist_candidates(qv, rows, name_vecs, "text", s, ck)
         kw_scores = hybrid_search.bm25_scores(hybrid_search.tokenize(query), docs_tokens)
-        kw_top = hybrid_search._ranked_indices(kw_scores)[:s.grounding_shortlist_k]
+        kw_top = hybrid_search._ranked_indices(kw_scores)[:ck]
         seen_ids = {id(r) for r in sl}
         sl = sl + [rows[i] for i in kw_top if id(rows[i]) not in seen_ids]
         shortlists.append(sl)
@@ -403,7 +409,7 @@ def nearest_library_actors(sess: Session, llm: LLMClient, query: str,
 
 
 def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs: dict[str, list[float]],
-                        name_key: str, s: Settings) -> list[dict[str, Any]]:
+                        name_key: str, s: Settings, k: int | None = None) -> list[dict[str, Any]]:
     """Cosine-scores every candidate against the query embedding, best match first.
     Keeps only candidates above `semantic_match_threshold`, falling back to the top-K
     anyway if nothing clears it, so a bad match still reaches label_match_from_score
@@ -446,20 +452,29 @@ def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs
         # library (score 0.0 clears no threshold). ERROR, not raise: the session still yields
         # usable unverified threats, so degrading is fine — degrading silently is not.
         log.error("grounding.all_candidates_skipped", candidates=len(rows), name_key=name_key)
-    return _apply_shortlist(scored, s)
+    return _apply_shortlist(scored, s, k)
 
 
-def _apply_shortlist(scored: list[tuple[dict[str, Any], float]], s: Settings) -> list[dict[str, Any]]:
-    """Shared floor/top-K tail for both scoring paths (dict loop above, matrix below)."""
+def _apply_shortlist(scored: list[tuple[dict[str, Any], float]], s: Settings,
+                    k: int | None = None) -> list[dict[str, Any]]:
+    """Shared floor/top-K tail for both scoring paths (dict loop above, matrix below).
+
+    `k` defaults to `grounding_shortlist_k` (threat grounding, whose thresholds are calibrated
+    against that value) and is passed explicitly by control mapping, which matches a scenario
+    PARAGRAPH against the whole control library and needs a far wider shortlist — see
+    `control_map_shortlist_k`. Making the caller name its own K is the point: one shared number
+    silently starved control mapping, discarding controls the reranker would have accepted.
+    """
     scored.sort(key=lambda rc: rc[1], reverse=True)
     above = [rc for rc in scored if rc[1] >= s.semantic_match_threshold]
     # Prefer candidates that clear the similarity floor; if none do, fall back to the
     # top-K overall so we still return something (to be scored as "flagged" downstream).
-    return [r for r, _ in (above or scored)[: s.grounding_shortlist_k]]
+    return [r for r, _ in (above or scored)[: k if k is not None else s.grounding_shortlist_k]]
 
 
 def _shortlist_via_matrix(qv: list[float], rows: list[dict[str, Any]],
-                        matrix_info: tuple[Any, list[int]], s: Settings) -> list[dict[str, Any]] | None:
+                        matrix_info: tuple[Any, list[int]], s: Settings,
+                        k: int | None = None) -> list[dict[str, Any]] | None:
     """Matrix-path scoring: one `matrix @ q_unit` against embeddings.get_matrix's cached,
     pre-normalized matrix instead of len(rows) dot products. Returns None on a query/matrix
     dimension mismatch — caller falls back to the dict path, which logs per candidate."""
@@ -471,7 +486,8 @@ def _shortlist_via_matrix(qv: list[float], rows: list[dict[str, Any]],
     q = _np.asarray(qv, dtype=_np.float32)
     qn = _np.linalg.norm(q)
     sims = (mat @ (q / qn)) if qn else _np.zeros(mat.shape[0], dtype=_np.float32)
-    return _apply_shortlist([(rows[i], float(sim)) for i, sim in zip(row_indexes, sims.tolist())], s)
+    return _apply_shortlist([(rows[i], float(sim)) for i, sim in zip(row_indexes, sims.tolist())],
+                            s, k)
 
 
 def find_closest_match(llm: LLMClient, query: str, rows: list[dict[str, Any]], name_key: str, s: Settings,
