@@ -37,8 +37,15 @@ def test_prompt_maps_risk_level_to_urgency_and_ratings_to_control_emphasis():
     system = prompts.treatment_prompt({})[0]["content"]
     for level in RiskLevel:
         assert f"'{level}'" in system, f"rule 6 does not tell the model what {level} means"
-    for emphasis in ("Preventive", "Detective", "Corrective"):
-        assert emphasis in system
+    # LOWERCASE, matching ControlType exactly. This assertion used to require the capitalised
+    # forms and so pinned the bug: this rule is the one that decides WHICH type to pick, so the
+    # model copied its casing and emitted "Detective", which the vocabulary clamp then rejected
+    # ("control_type out of vocabulary: 'Detective'") on a real plan. The FIELDS block builds
+    # the allowed values from the enum, so the rule has to agree with it.
+    for emphasis in ("preventive", "detective", "corrective"):
+        assert emphasis in system, f"rule 6 must name {emphasis!r} in the enum's own casing"
+        assert emphasis.capitalize() not in system, (
+            f"{emphasis.capitalize()!r} contradicts the vocabulary this same prompt advertises")
     # The rollup must cite the verdict — this is what makes a plan explain its own urgency.
     assert "final_risk_rating" in system and "verbatim" in system
 
@@ -120,13 +127,18 @@ def test_prompt_handles_null_ratings_and_empty_library():
     assert "carries non-null" in system
     assert "OMIT it from the plan" in system
     assert "When library_mapped is EMPTY" in system
-    assert "day 0" in system  # C3: timelines anchored at plan start, chains fit the window
+    # C3 SUPERSEDED: timelines are now ABSOLUTE DATES, so "day 0" is gone — a duration had no
+    # origin and so no position on the register's calendar. The contract is pinned in
+    # tests/test_treatment_timeline_dates.py; this line asserts the old phrasing cannot return.
+    assert "day 0" not in system
 
 
 def test_zero_day_window_is_enforced_not_disabled():
     """C11/C22: a same-day window yields total_days=0 — the TIGHTEST budget, which the old falsy
     guard treated as 'no window' and switched every overrun check off."""
     from app.pipeline.treatment import _window_violations
+    # LEGACY path: a stored pre-dates-contract plan still carries a relative duration, and the
+    # total_days comparison is what still catches it.
     plan = {"mitigation_timeline": "within 30 days", "remediation_action_plan": []}
     warns = _window_violations(plan, {"total_days": 0})
     assert any("exceeds" in w for w in warns), warns

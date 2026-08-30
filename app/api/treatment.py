@@ -43,7 +43,14 @@ from app.api.schemas import (
     TreatmentReviewBody,
     TreatmentReviewResponse,
 )
-from app.api.sessions import _actor_block, _actor_ids_from_blobs, get_authorized_session
+from app.api.sessions import (
+    _actor_block,
+    _actor_ids_from_blobs,
+    _controls_by_output,
+    _scenario_narrative,
+    _threat_block,
+    get_authorized_session,
+)
 from app.core.enums import (
     AuditEventType,
     RiskLevel,
@@ -54,7 +61,6 @@ from app.core.enums import (
     TreatmentStrategy,
 )
 from app.core.logging import get_logger
-from app.core.naming import display_threat_names
 from app.db import dal
 from app.db import models as m
 from app.db.engine import db_session
@@ -325,19 +331,27 @@ def get_treatment_plan(session_id: str, scenario_id: str,
         # ONE batched resolve for this response. _actor_ids_from_blobs prefers the ids Stage 1
         # STORED in the blob (zero queries) and only falls back to a name lookup for legacy rows.
         actor_ids = _actor_ids_from_blobs(sess, [row.get("ThreatActorsJSON")])
+        # One batched read for this scenario's controls — the same source /results uses, so the
+        # two screens cannot disagree about which controls the scenario has.
+        _ctl = _controls_by_output(sess, [scenario_id])
+        controls = _ctl.by_output.get(scenario_id, [])
         older = None
         if include_superseded:
             # PlanID guard: two SELECTs under READ COMMITTED — a regeneration committing
             # between them would supersede the row just read as current, making it show up in
             # BOTH places on one response. Dropping it here keeps the reply self-consistent.
+            # History rows carry no scenario/threat join, so their blocks are null/[] by
+            # construction — the scenario is version-independent and served once, on the
+            # top-level object below.
             older = [_plan_status_from_row(r, stale_cutoff, actor_ids)
                     for r in dal.superseded_plan_rows(sess, session_id, scenario_id)
                     if r["PlanID"] != row["PlanID"]]
-        return _plan_status_from_row(row, stale_cutoff, actor_ids, superseded=older)
+        return _plan_status_from_row(row, stale_cutoff, actor_ids, controls, superseded=older)
 
 
 def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
                           actor_ids: dict[str, int] | None = None,
+                          controls: list | None = None,
                         superseded: list[TreatmentPlanStatus] | None = None) -> TreatmentPlanStatus:
     """One plan row -> the wire model. Shared by the single-plan GET, the Excel export, the
     versions history (?include_superseded) and the detailed register (?include_plan), so no
@@ -354,27 +368,25 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
     plan = _visible_plan(row["PlanJSON"], row["PlanID"])
     # .get, not []: history rows (dal.superseded_plan_rows) carry no scenario/threat join —
     # the scenario is version-independent, served once on the top-level object.
-    scenario_json = _safe_json_dict(row.get("ScenarioJSON"), row["PlanID"])
-    scenario = ({k: scenario_json.get(k) for k in
-                ("scenario_title", "scenario_statement", "risk_statement")}
-                if scenario_json else None)
-    if scenario is not None:
-        # The threat's identity comes from the joined Identified_Threat row, not the LLM's
-        # scenario JSON — same source split as sessions._build_scenario.
-        scenario["threat_category"] = row["ThreatCategory"]
-        # Same shared coalesce /results uses: curator's register wording when present, so the
-        # treatment plan and the results screen can never disagree on a threat's name.
-        scenario["threat_type"], scenario["threat_name"] = display_threat_names(row)
+    # THE SAME BUILDER /results USES, not a narrower local copy. This used to whitelist six
+    # keys, so a reviewer approving a remediation plan saw strictly LESS about the scenario than
+    # the results screen showed — no assumptions, no supporting_systems_involved, no threat ids.
+    # _scenario_narrative merges the threat's display wording through the same shared coalesce,
+    # so the two screens cannot disagree on a name.
+    scenario = _scenario_narrative(row.get("ScenarioJSON"), row if row.get("ScenarioJSON") else None)
     validation = _safe_json_dict(row.get("ValidationJSON"), row["PlanID"]) or {}
     moderation = validation.get("moderation") or {}
     return TreatmentPlanStatus(
         plan_id=row["PlanID"], session_id=row["SessionID"], scenario_id=row["ScenarioID"],
         status=status, treatment_strategy=row["TreatmentStrategy"],
         scenario=scenario,
-        # SIBLING of `scenario`, never inside it — same rule as ScenarioResult.actors.
-        # _actor_block reads ThreatActorsJSON with .get(), so a superseded-version row (which
-        # carries no threat join at all) yields [] rather than raising KeyError.
+        # SIBLINGS of `scenario`, never inside it — the same four-block shape /results publishes
+        # (scenario / threat / actors / controls). Every one of these reads the row with .get()
+        # or tolerates a missing ThreatID, so a superseded-version row (which carries no
+        # scenario/threat join at all) yields null/[] rather than raising KeyError.
+        threat=_threat_block(row),
         actors=_actor_block(row, actor_ids),
+        controls=controls or [],
         risk_level=row["RiskLevel"], review_status=row["ReviewStatus"],
         review_comment=row.get("ReviewComment"), reviewed_by=row["ReviewedBy"],
         reviewed_at=row["ReviewedAt"],
@@ -707,20 +719,25 @@ def list_entity_treatment_plans(entity_id: str,
         # Only the include_plan branch renders a scenario/actors block, so resolve for it only.
         actor_ids = (_actor_ids_from_blobs(sess, [r.get("ThreatActorsJSON") for r in rows])
                      if include_plan else {})
+        # ONE controls read for the whole page, never one per row — _controls_by_output takes a
+        # list precisely so this cannot become an N+1 as the register grows.
+        page_controls = (_controls_by_output(sess, [str(r["ScenarioID"]) for r in rows]).by_output
+                         if include_plan else {})
         items = []
         for r in rows:
             if include_plan:
                 # The poll GET's own presenter renders the detail — one projection, two pages,
                 # so the register can never disagree with GET .../treatment-plan.
-                ps = _plan_status_from_row(r, stale_cutoff, actor_ids)
+                ps = _plan_status_from_row(r, stale_cutoff, actor_ids,
+                                           page_controls.get(str(r["ScenarioID"]), []))
                 items.append(TreatmentRegisterRow(
                     plan_id=ps.plan_id, session_id=ps.session_id, scenario_id=ps.scenario_id,
                     asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
                     status=ps.status, risk_level=ps.risk_level,
                     review_status=ps.review_status, reviewed_by=ps.reviewed_by,
                     error_message=ps.error_message, reason=ps.reason,
-                    scenario=ps.scenario, actors=ps.actors,
-                    treatment_strategy=ps.treatment_strategy,
+                    scenario=ps.scenario, threat=ps.threat, actors=ps.actors,
+                    controls=ps.controls, treatment_strategy=ps.treatment_strategy,
                     risk_identification_date=ps.risk_identification_date, plan=ps.plan,
                     created_at=ps.created_at, completed_at=ps.completed_at))
                 continue

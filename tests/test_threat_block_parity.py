@@ -45,7 +45,12 @@ def test_all_scenario_reads_select_the_one_shared_threat_column_list():
     assert _threat_cols(dal._scenario_read_select()) == canonical
     # accepted_scenarios builds its select inline — pin at source that it unpacks the list.
     src = (_ROOT / "app" / "db" / "dal.py").read_text(encoding="utf-8")
-    assert src.count("*scenario_threat_columns(),") == 2  # _scenario_read_select + accepted
+    # 4, not 2: active_plan_row and entity_plan_rows joined the shared list in 2026-08. They
+    # had hand-rolled a six-column subset, so the treatment plan answered null where
+    # /results carried a value — the exact drift this list exists to prevent, in the two
+    # selects scenario_threat_columns() own docstring names as consumers.
+    assert src.count("*scenario_threat_columns(),") == 4, (
+        "_scenario_read_select, accepted_scenarios, active_plan_row, entity_plan_rows")
     ssrc = (_ROOT / "app" / "api" / "sessions.py").read_text(encoding="utf-8")
     assert "*dal.scenario_threat_columns()," in ssrc
     # And the list carries the catalogue-model fields; the register-era columns are gone.
@@ -158,14 +163,29 @@ def test_display_wording_coalesce_is_shared_and_prefers_the_curator():
            "LibraryThreatType": "Curated Type", "LibraryThreatName": "Curated Name"}
     assert display_threat_names(row) == ("Curated Type", "Curated Name")
     assert display_threat_names({"ThreatType": "model wording"}) == ("model wording", None)
-    # The treatment presenters and plan selects actually use it — the wording parity fix.
+    # The treatment presenter reaches it through _scenario_narrative now, not inline — the
+    # STRONGER guarantee, because there is one builder rather than two call sites that have to
+    # keep agreeing. Pinning the delegation is what keeps a future local re-implementation from
+    # quietly reintroducing the wording split this test exists to prevent.
     tsrc = (_ROOT / "app" / "api" / "treatment.py").read_text(encoding="utf-8")
-    assert "display_threat_names(row)" in tsrc
+    assert "_scenario_narrative(" in tsrc
+    assert "display_threat_names" not in tsrc, (
+        "the plan presenter must DELEGATE the coalesce, not call it itself — two callers is how "
+        "the two screens drifted apart in the first place")
+    # Both plan selects now take the SHARED column list, so LibraryThreat* is no longer spelled
+    # out here at all. That is the point: a hand-rolled subset is what let the plan response
+    # answer null where /results carried a value.
     dsrc = (_ROOT / "app" / "db" / "dal.py").read_text(encoding="utf-8")
-    # 1, not 2: the set-based active_plan_rows sibling was deleted with the Excel export it
-    # existed to serve (2026-08) — active_plan_row is the only remaining plan select of this shape.
-    assert dsrc.count("it.LibraryThreatType, it.LibraryThreatName)") == 1  # active_plan_row
-    assert dsrc.count("it.LibraryThreatType, it.LibraryThreatName]") == 1  # entity_plan_rows
+    # Score/ScopeRank are on Scoped_Threat, so the shared list cannot carry them and each plan
+    # select must add them explicitly. Missing, the plan's threat block answered null for two
+    # fields /results populates — found by diffing the two blocks on a real row, not by reading.
+    assert dsrc.count("st.Score, st.ScopeRank") >= 2, (
+        "both plan selects must add Score/ScopeRank — scenario_threat_columns() is an "
+        "Identified_Threat list and cannot supply them")
+    assert dsrc.count("*scenario_threat_columns()") >= 4, (
+        "_scenario_read_select, accepted_scenarios, active_plan_row and entity_plan_rows must "
+        "ALL read the one canonical list")
+    assert "it.LibraryThreatType, it.LibraryThreatName]" not in dsrc
     ssrc = (_ROOT / "app" / "api" / "sessions.py").read_text(encoding="utf-8")
     assert "display_threat_names(threat_row)" in ssrc
 

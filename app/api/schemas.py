@@ -2303,8 +2303,10 @@ class TreatmentPlanBody(ApiModel):
                     "Provide together with mitigation_end_date, or neither.")
     mitigation_end_date: date | None = Field(
         default=None,
-        description="End of that window — every mitigation action's schedule and the overall "
-                    "mitigation_timeline must fit inside [start, end].")
+        description="End of that window. Every action's `timeline` and the overall "
+                    "`mitigation_timeline` are ISO YYYY-MM-DD dates inside [start, end] — these "
+                    "two dates ARE the schedule's bounds, and the plan schedules inside them "
+                    "even when part of the window has already passed.")
 
     @field_validator("risk_identification_date", "risk_owner", "impacted_business_division",
                      "existing_controls_all_subsystems",
@@ -2454,7 +2456,7 @@ class TreatmentPlanStatus(ApiModel):
                           "priority": "Critical",
                           "control_code": "CII-CID-070",
                           "control_library_id": 70}]},
-                 "mitigation_timeline": "90 days overall; critical actions within 30 days",
+                 "mitigation_timeline": "2026-09-28",
                  "mitigation_owner": "OT Security Team",
                  "risk_owner": "Head of OT Operations",
                  "impacted_business_division": "Water Treatment Operations"}}})
@@ -2464,16 +2466,19 @@ class TreatmentPlanStatus(ApiModel):
     scenario_id: str = Field(description="The accepted scenario this plan treats.")
     status: str = Field(description="RUNNING | COMPLETE | ERROR — the poll signal (stale RUNNING projects as ERROR).")
     treatment_strategy: str = Field(description="The strategy this plan was generated for — server-stamped 'Mitigate'.")
-    scenario: dict[str, Any] | None = Field(
+    scenario: ScenarioNarrative | None = Field(
         default=None,
-        description=("The accepted scenario this plan treats: scenario_title, "
-                     "scenario_statement, risk_statement — plus the underlying threat's own "
-                     "identity (threat_category, threat_type, threat_name), which comes from "
-                     "the joined Identified_Threat row, NOT the LLM's scenario JSON. Threat "
-                     "fields are null if the threat linkage is broken (outer join). Adversaries "
-                     "are NOT in here — see the sibling `actors` block, same rule as "
-                     "ScenarioResult. Null only if the scenario row is unreadable (defensive "
-                     "parse)."))
+        description="The accepted scenario this plan treats — IDENTICAL shape to "
+                    "ScenarioResult.scenario, built by the same builder, so the plan screen and "
+                    "the results screen cannot show different detail for one scenario. Null "
+                    "only if the scenario row is unreadable (defensive parse), or on a "
+                    "superseded-version row, which carries no scenario join: the scenario is "
+                    "version-independent and served once on the top-level object.")
+    threat: ThreatResult | None = Field(
+        default=None,
+        description="The threat this scenario was generated from, with every database key — "
+                    "identical shape and rules to ScenarioResult.threat. Null when no "
+                    "Identified_Threat row joined, or on a superseded-version row.")
     actors: list[ThreatActorRef] = Field(
         default_factory=list,
         description="Adversaries for this plan's underlying threat, each with its Threat_Actor "
@@ -2482,6 +2487,12 @@ class TreatmentPlanStatus(ApiModel):
                     "adversaries in one identical shape. Empty when the threat linkage is "
                     "broken, when the threat names none, or on a superseded-version row (which "
                     "carries no threat join at all).")
+    controls: list[MappedControl] = Field(
+        default_factory=list,
+        description="Step-4 controls mapped to this scenario — identical shape and source to "
+                    "ScenarioResult.controls. These are the controls the plan's gap analysis "
+                    "reasons about, so showing them beside the plan is what lets a reviewer "
+                    "check the analysis rather than take it on trust.")
     risk_level: str | None = Field(
         default=None, description="The register risk level this plan was generated against (from the request).")
     review_status: str | None = Field(
@@ -2648,16 +2659,22 @@ class TreatmentRegisterRow(ApiModel):
     reason: TreatmentOutcomeReason | None = Field(
         default=None, description="Why it ended this way when status is ERROR — see "
                                   "TreatmentPlanStatus.reason. Null otherwise.")
-    scenario: dict[str, Any] | None = Field(
+    scenario: ScenarioNarrative | None = Field(
         default=None,
-        description="Same block as TreatmentPlanStatus.scenario (scenario_title / "
-                    "scenario_statement / risk_statement + threat identity). Adversaries are "
-                    "the sibling `actors` block, not in here. Populated only with "
+        description="Same block as TreatmentPlanStatus.scenario. Populated only with "
+                    "?include_plan=true.")
+    threat: ThreatResult | None = Field(
+        default=None,
+        description="Same block as TreatmentPlanStatus.threat. Populated only with "
                     "?include_plan=true.")
     actors: list[ThreatActorRef] = Field(
         default_factory=list,
         description="Same block as TreatmentPlanStatus.actors — adversaries with their "
                     "Threat_Actor keys. Populated only with ?include_plan=true.")
+    controls: list[MappedControl] = Field(
+        default_factory=list,
+        description="Same block as TreatmentPlanStatus.controls. Populated only with "
+                    "?include_plan=true.")
     treatment_strategy: str | None = Field(
         default=None,
         description="Server-stamped 'Mitigate' — see TreatmentPlanStatus. Populated only with "

@@ -30,6 +30,10 @@ _JOINED_ROW = {
     "LibraryThreatType": None, "LibraryThreatName": None,
     "ScenarioJSON": json.dumps({
         "scenario_title": "Firmware push", "scenario_statement": "s", "risk_statement": "r",
+        "assumptions": ["the RTU accepts unsigned firmware"],
+        "supporting_systems_involved": [
+            {"supporting_system_id": 306, "supporting_system": "SCADA System",
+             "is_entry_point": True, "justification": "Entry point."}],
         # A legacy blob may even carry its own actors key; it must not survive either.
         "threat_actors": ["stale copy from the raw blob"],
     }),
@@ -50,14 +54,20 @@ def test_actors_are_a_sibling_and_never_inside_the_scenario_block():
     # The sibling carries names WITH their Threat_Actor keys, same shape as ScenarioResult.actors.
     assert [(a.actor_id, a.actor_name) for a in ps.actors] == [(3, "APT33"), (9, "Malicious insider")]
 
-    # `scenario` is an untyped dict, so absence is the only real contract here — and note the
-    # raw blob DID carry a threat_actors key, which the whitelist build must not have copied.
+    # `scenario` is now the SAME ScenarioNarrative /results publishes, so the contract is no
+    # longer a six-key whitelist: every detail the results screen shows must be here too. The
+    # raw blob DID carry a threat_actors key, and _scenario_narrative's pop is what keeps it out.
     assert ps.scenario is not None
-    assert "threat_actors" not in ps.scenario, (
+    dumped = ps.scenario.model_dump()
+    assert "threat_actors" not in dumped, (
         "adversaries must not ride inside the scenario block — including a legacy blob's own copy")
-    assert set(ps.scenario) == {
-        "scenario_title", "scenario_statement", "risk_statement",
-        "threat_category", "threat_type", "threat_name"}
+    assert "controls" not in dumped, "controls are an envelope sibling, not narrative"
+    # The detail a reviewer approving a plan needs, and used to be denied by the whitelist.
+    assert dumped["scenario_title"] == "Firmware push"
+    assert dumped["supporting_systems_involved"], "the whitelist used to drop this entirely"
+    assert dumped["assumptions"], "and this"
+    # Threat display wording still merged in, through the one shared coalesce.
+    assert dumped["threat_category"] == "Tampering"
 
 
 def test_a_superseded_row_with_no_threat_join_yields_no_actors_rather_than_raising():

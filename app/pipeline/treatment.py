@@ -403,36 +403,66 @@ _DURATION_UNIT_DAYS = {"day": 1, "week": 7, "month": 30}
 
 def _window_violations(parsed: dict[str, Any], window: dict[str, Any] | None) -> list[str]:
     """Advisory check that the plan fits the assessment window (Part 3 of the register spec):
-    every parsable relative duration — the overall mitigation_timeline and each action's
-    timeline — must fit within total_days. Flags, never blocks, same posture as the
-    vocabulary clamps: the reviewer sees exactly which line overran and by what."""
-    # `is None`, not falsy: a same-day window is legal (end == start) and yields total_days=0 —
-    # the TIGHTEST budget there is, and exactly the one the falsy guard used to switch off.
-    if not window or window.get("total_days") is None:
+    the overall mitigation_timeline and each action's timeline must be a DATE inside
+    [timeline_start_date, timeline_end_date]. Flags, never blocks, same posture as the
+    vocabulary clamps: the reviewer sees exactly which line falls outside and by which end.
+
+    WHY DATES, and why this check could not work before. Timelines used to be relative
+    durations measured from "the plan's start (day 0)" — an origin the prompt never defined.
+    A duration has no POSITION on a calendar, so the only comparison available was its LENGTH
+    against the window's length: a 60-day plan passed a 91-day window even when 61 of those
+    days had already elapsed and only 30 remained. That was a property of the representation,
+    not a bug in the comparison, so the fix was to change what the model emits. A date is
+    either inside the window or outside it, and there is no origin left to get wrong.
+
+    The bounds are the REGISTER'S OWN dates and nothing else — deliberately not "today".
+    The window is chosen by the risk owner, so a plan schedules inside it even when part of it
+    has already passed; a window opened in the past is a register-data question for a human,
+    never something to silently re-date around.
+
+    LEGACY: plans written before this carry "within 60 days" and are read back by the evidence
+    endpoint and by regenerate. A date-only parser would report every one of them as
+    unparsable, so a relative duration still falls through to the old total_days comparison.
+    """
+    if not window:
         return []
-    budget = int(window["total_days"])
+    start = _as_date(window.get("timeline_start_date"))
+    end = _as_date(window.get("timeline_end_date"))
+    # `is None`, not falsy: a same-day window is legal (end == start) and yields total_days=0 —
+    # the TIGHTEST budget there is, and exactly the one a falsy guard would switch off.
+    budget = window.get("total_days")
+    budget = int(budget) if budget is not None else None
+    if start is None and end is None and budget is None:
+        return []
 
     def worst_days(text: str | None) -> int | None:
         hits = [_DURATION_UNIT_DAYS[u.lower()] * int(n)
                 for n, u in _DURATION_DAYS.findall(str(text or ""))]
         return max(hits) if hits else None
 
-    out: list[str] = []
-    overall = worst_days(parsed.get("mitigation_timeline"))
-    if overall is None:
-        out.append(f"mitigation_timeline ({parsed.get('mitigation_timeline')!r}) carries no "
-                f"parsable duration — compliance with the {budget}-day assessment window "
-                "could not be checked")
-    if overall is not None and overall > budget:
-        out.append(f"mitigation_timeline ({parsed.get('mitigation_timeline')!r}) exceeds the "
-                f"assessment window of {budget} days")
+    def check(label: str, value: Any) -> list[str]:
+        when = _as_date(value)
+        if when is not None:
+            if end is not None and when > end:
+                return [f"{label} ({value!r}) falls AFTER the assessment window closes "
+                        f"({end.isoformat()})"]
+            if start is not None and when < start:
+                return [f"{label} ({value!r}) falls BEFORE the assessment window opens "
+                        f"({start.isoformat()})"]
+            return []
+        # Not a date — a pre-dates-contract plan, or prose. Fall back to the old length check.
+        days = worst_days(value)
+        if days is None:
+            return [f"{label} ({value!r}) is not a date and carries no parsable duration — "
+                    "compliance with the assessment window could not be checked"]
+        if budget is not None and days > budget:
+            return [f"{label} ({value!r}) exceeds the assessment window of {budget} days"]
+        return []
+
+    out: list[str] = check("mitigation_timeline", parsed.get("mitigation_timeline"))
     for i, act in enumerate(parsed.get("remediation_action_plan") or []):
-        if not isinstance(act, dict):
-            continue
-        d = worst_days(act.get("timeline"))
-        if d is not None and d > budget:
-            out.append(f"remediation_action_plan[{i}].timeline ({act.get('timeline')!r}) "
-                    f"exceeds the assessment window of {budget} days")
+        if isinstance(act, dict):
+            out += check(f"remediation_action_plan[{i}].timeline", act.get("timeline"))
     return out
 
 

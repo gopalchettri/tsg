@@ -2446,11 +2446,19 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
             # The threat's own identity — NOT part of the LLM's scenario JSON (same split as
             # sessions._build_scenario). OUTER for the same reason as _scenario_read_select:
             # no enforced FKs, so a broken linkage must null these, never drop the plan row.
-            it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON,
-            # Curator's register wording, so naming.display_threat_names shows the SAME name
-            # here as /results does -- without these the treatment plan rendered the model's
-            # wording for a scenario the register shows under the curator's.
-            it.LibraryThreatType, it.LibraryThreatName)
+            #
+            # THE SHARED LIST, not a hand-rolled subset. This used to select six columns by
+            # hand, which is exactly the drift scenario_threat_columns() exists to prevent —
+            # and its own docstring names "the treatment presenters" as a consumer. The plan
+            # response could therefore answer null where /results carried a value, on the very
+            # screen a reviewer signs off. Widening it here is what lets the presenter reuse
+            # sessions._threat_block instead of reimplementing a narrower one.
+            *scenario_threat_columns(),
+            # Score/ScopeRank live on Scoped_Threat, NOT Identified_Threat, so the shared list
+            # cannot carry them — and _threat_block reads both. Without them the plan's threat
+            # block answered null for two fields /results populates, which is the drift this
+            # whole change removes. Verified by diffing the two blocks on a real row.
+            st.Score, st.ScopeRank)
         .select_from(p.__table__.outerjoin(out, out.ScenarioID == p.ScenarioID)
                     .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
@@ -2525,10 +2533,12 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
         st, it = m.Scoped_Threat, m.Identified_Threat
         # No ValidationJSON/ReviewComment: they feed only wire-hidden (exclude=True) fields —
         # a blob per row for bytes nobody can see. The presenter reads them with .get.
+        # Same shared list as active_plan_row — the register's detail view and the poll GET
+        # render through ONE presenter, so a narrower subset here would make the same plan
+        # answer differently on two pages.
         cols += [p.PlanJSON, p.TreatmentStrategy, p.RiskIdentificationDate,
-                 out.ScenarioJSON,
-                 it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON,
-                 it.LibraryThreatType, it.LibraryThreatName]
+                 out.ScenarioJSON, *scenario_threat_columns(),
+                 st.Score, st.ScopeRank]   # Scoped_Threat, not in the shared list — see above
         joined = (joined
                   .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                   .outerjoin(it, st.ThreatID == it.ThreatID))
