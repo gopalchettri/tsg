@@ -338,7 +338,18 @@ class ReviewGateReason(StrEnum):
     exception's own message, and adding entries would reshape every gate 409 body."""
     session_completed = "session_completed"              # terminal: the session is not at a review barrier
     session_cancelled = "session_cancelled"              # terminal: start a new session for the asset
-    generation_in_progress = "generation_in_progress"    # transient: not at the REVIEW barrier yet
+    generation_in_progress = "generation_in_progress"    # transient: a worker holds a LIVE lease on this
+                                                         # session right now. ensure_review_gate PROVES
+                                                         # that with dal.session_has_live_lease before
+                                                         # using this code — CurrentStage/StageStatus are
+                                                         # a denormalised cache and go stale the moment a
+                                                         # worker dies or hangs, so trusting them alone
+                                                         # reported "still generating" for runs that had
+                                                         # stopped hours earlier
+    generation_abandoned = "generation_abandoned"        # the previous run died or hung (no live lease) AND
+                                                         # recovery could not park the session at REVIEW —
+                                                         # e.g. every stage errored, so it finalised to
+                                                         # cancelled. NOT fixed by waiting: the run is over
     asset_busy = "asset_busy"                            # transient: next-set could not re-reserve the
                                                          # asset — another execution holds it right now.
                                                          # The one member NOT produced by

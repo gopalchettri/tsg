@@ -451,6 +451,24 @@ class Settings(BaseSettings):
     reaper_stale_grace_seconds: float = 300.0
     # TSG_STAGE_MAX_ATTEMPTS — retry cap per stage before it is abandoned.
     stage_max_attempts: int = 5
+    # TSG_BROKER_VISIBILITY_TIMEOUT_SECONDS — how long a message from a genuinely killed worker
+    # sits unredelivered. ALSO the hard ceiling for every task time limit: past this the broker
+    # redelivers anyway, so a limit above it would let the original attempt and its successor run
+    # together. celery_app.py reads it for BOTH broker_transport_options and the task limits, so
+    # the two can never drift into that overlap.
+    broker_visibility_timeout_seconds: int = 3600
+    # TSG_SUBSYSTEM_TASK_SOFT_LIMIT_SECONDS — wall-clock soft limit for the SINGLE-SUBSYSTEM tasks
+    # (tsg.regenerate, tsg.next_set). The global task_soft_time_limit (~55 min) is sized for
+    # run_pipeline, which may legitimately grind through 50 subsystems; these two finish in
+    # minutes, so it left a frozen one holding its `_LOCK` far past the lease.
+    #
+    # NOT a substitute for the lease. reaper._revoke_zombie_tasks is the precise frozen-detector
+    # (an unrenewed lease); this is only the backstop for when a control message cannot reach the
+    # worker. LEAVE UNSET: derived per environment by _derive_subsystem_task_limits below, because
+    # a constant cannot be right in more than one — dev/prod derive a 720s lease, UAT derives 2880s
+    # (180s timeout x 2 provider chains), so any hardcoded value either kills healthy UAT work or
+    # is useless in dev.
+    subsystem_task_soft_limit_seconds: int = 0   # 0 = derive
     # --- 19. Health monitoring / self-check ----------------------------------------------
 
     # TSG_SELF_CHECK_INTERVAL_SECONDS — periodic self-check cadence.
@@ -671,6 +689,45 @@ class Settings(BaseSettings):
         if "reaper_stale_grace_seconds" not in self.model_fields_set:
             self.reaper_stale_grace_seconds = self.stage_lease_seconds
         return self
+
+    # Single-subsystem task limits, derived per environment (must run AFTER
+    # _derive_stage_lease_seconds so it reads the derived lease, not the class default).
+    #
+    # Two lease windows: one window is what a healthy task may take between LLM calls, so a whole
+    # run is comfortably several. Then CLAMPED under the broker's visibility timeout, which is the
+    # real ceiling — without the clamp UAT's 2880s lease derives 5760s, past the 3600s at which the
+    # broker redelivers, so the original and its successor would run side by side.
+    #
+    # Resolved values: dev/prod (lease 720s) -> 1440s soft / 1800s hard; UAT (lease 2880s) ->
+    # 3240s / 3600s, i.e. clamped back to the global limit, which is correct: UAT genuinely needs
+    # the time (180s LLM timeout, two provider chains).
+    @model_validator(mode="after")
+    def _derive_subsystem_task_limits(self) -> Settings:
+        ceiling = self.broker_visibility_timeout_seconds
+        if "subsystem_task_soft_limit_seconds" not in self.model_fields_set:
+            self.subsystem_task_soft_limit_seconds = min(int(self.stage_lease_seconds * 2),
+                                                        int(ceiling * 0.9))
+        elif self.subsystem_task_soft_limit_seconds < self.stage_lease_seconds:
+            # Below one lease window a merely-slow task is killed before the lease it keeps
+            # renewing has even lapsed — the reaper would never have called it dead.
+            raise ValueError(
+                f"subsystem_task_soft_limit_seconds ({self.subsystem_task_soft_limit_seconds}s) is "
+                f"below one stage lease ({self.stage_lease_seconds}s) — a live, renewing task would "
+                "be killed mid-work. Raise it, or leave it unset to derive.")
+        if self.subsystem_task_soft_limit_seconds > ceiling:
+            raise ValueError(
+                f"subsystem_task_soft_limit_seconds ({self.subsystem_task_soft_limit_seconds}s) "
+                f"exceeds broker_visibility_timeout_seconds ({ceiling}s) — the broker would "
+                "redeliver the message while the original attempt is still running.")
+        return self
+
+    @property
+    def subsystem_task_hard_limit_seconds(self) -> int:
+        """Hard kill for the single-subsystem tasks: 25% headroom over the soft limit so the soft
+        signal (which lets the task unwind and RELEASE ITS LOCK) always gets to fire first, never
+        above the broker ceiling."""
+        return min(int(self.subsystem_task_soft_limit_seconds * 1.25),
+                self.broker_visibility_timeout_seconds)
 
     # Cross-category dedup ceiling must sit at/above the same-category threshold.
     @model_validator(mode="after")

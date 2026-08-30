@@ -19,8 +19,12 @@ import time
 import structlog
 from celery import Celery  # type: ignore[import-untyped]
 from celery.signals import (  # type: ignore[import-untyped]
+    task_failure,
     task_postrun,
     task_prerun,
+    task_rejected,
+    task_revoked,
+    task_unknown,
     worker_init,
     worker_process_init,
 )
@@ -94,7 +98,7 @@ celery_app.conf.update(
     # point, not derived from real P99 session duration (a run can process up to 50 subsystems
     # sequentially). Too short redelivers a still-running task (wasteful; claim_stage's CAS
     # prevents actual double-work), too long leaves an orphaned message idle.
-    broker_transport_options={"visibility_timeout": 3600},
+    broker_transport_options={"visibility_timeout": _s.broker_visibility_timeout_seconds},
 
     # Global runaway backstop for EVERY task (per-task limits like intel_refresh_feed's 600/660
     # still override). Hard limit = visibility_timeout on purpose: past 3600s the broker
@@ -103,8 +107,12 @@ celery_app.conf.update(
     # claim_stage's CAS + the reaper treat it exactly like a crashed worker, and COMPLETE stages
     # are skipped on the retry. Enforced under gevent via gevent.Timeout (the -P gevent pool's
     # time-limit mechanism); the soft limit fires 5 minutes early where the pool honors it.
-    task_soft_time_limit=3300,
-    task_time_limit=3600,
+    # Both are now DERIVED from the same setting as visibility_timeout above, so the "hard limit =
+    # visibility_timeout" rule above cannot silently break if that timeout is retuned per
+    # environment (defaults unchanged: 3300 / 3600). The two single-subsystem tasks override BOTH
+    # with a much tighter budget — see next_set_task / regenerate_task.
+    task_soft_time_limit=_s.broker_visibility_timeout_seconds - 300,
+    task_time_limit=_s.broker_visibility_timeout_seconds,
     beat_schedule={                    # the reaper must run on a schedule in production
         "reap-stuck-sessions": {"task": "tsg.reap", "schedule": _s.reaper_interval_seconds},
         # THE consumer of the control-mapping retry queue — without it, map_controls' three
@@ -374,6 +382,58 @@ def _bind_task_context(task_id=None, task=None, args=None, **_kw) -> None:
         structlog.contextvars.bind_contextvars(session_id=str(args[0]))
 
 
+# --- Terminal-outcome visibility -------------------------------------------------------------
+# WHY THESE EXIST. A task could previously leave the worker with NO record of its death: a
+# next-set task was seen logging "received", running to its last stage write, and then producing
+# nothing at all — no succeeded, no failed, no traceback — while the worker stayed healthy. The
+# only evidence it ever ran was a `_LOCK` row it never released. Without a terminal signal there
+# is nothing to alert on and nothing to debug from, so the four ways a task can end badly each get
+# a log line here. `shadow=` renames tasks in Celery's own INFO lines, so `sender.name` is recorded
+# explicitly — grepping for "tsg.next_set" in the raw log finds nothing.
+def _session_of(args) -> str | None:
+    """Every pipeline task takes session_id first; anything else simply has none."""
+    return str(args[0]) if args else None
+
+
+@task_failure.connect
+def _log_task_failure(sender=None, task_id=None, exception=None, args=None, einfo=None, **_kw) -> None:
+    """A task raised out of its body. Celery logs this too, but without session_id."""
+    from app.core.logging import get_logger
+    get_logger(__name__).error(
+        "task.failed", task_name=getattr(sender, "name", None), task_id=task_id,
+        session_id=_session_of(args), error=repr(exception), exc_info=einfo)
+
+
+@task_revoked.connect
+def _log_task_revoked(sender=None, request=None, terminated=None, signum=None, expired=None, **_kw) -> None:
+    """A task was revoked — including reaper._revoke_zombie_tasks killing a frozen greenlet, which
+    is the expected path for a task whose lease lapsed. `terminated` distinguishes a kill from a
+    revoke-before-start; `expired` from the broker's own expiry."""
+    from app.core.logging import get_logger
+    get_logger(__name__).warning(
+        "task.revoked", task_name=getattr(sender, "name", None),
+        task_id=getattr(request, "id", None), session_id=_session_of(getattr(request, "args", None)),
+        terminated=terminated, signum=str(signum), expired=expired)
+
+
+@task_rejected.connect
+def _log_task_rejected(sender=None, message=None, exc=None, **_kw) -> None:
+    """The worker could not accept a message at all — it never became a task, so no other handler
+    here will ever fire for it."""
+    from app.core.logging import get_logger
+    get_logger(__name__).error("task.rejected", error=repr(exc), message=repr(message)[:500],
+                            exc_info=exc is not None)
+
+
+@task_unknown.connect
+def _log_task_unknown(sender=None, name=None, id=None, message=None, exc=None, **_kw) -> None:
+    """A message named a task this worker does not have registered — a deploy skew, and otherwise
+    completely silent: the sender got its 202 and nothing ever runs."""
+    from app.core.logging import get_logger
+    get_logger(__name__).error("task.unknown", task_name=name, task_id=id, error=repr(exc),
+                            message=repr(message)[:500])
+
+
 @task_postrun.connect
 def _clear_task_context(**_kw) -> None:
     """MANDATORY counterpart to _bind_task_context. The worker runs -P gevent and reuses its
@@ -397,8 +457,16 @@ def run_pipeline_task(self, session_id: str) -> None:
         _process_all_supporting_systems(sess, session_id, get_llm(), self.request.id or guid())
 
 
+# soft/time limits OVERRIDE the global ~55 minute pair: this task handles ONE subsystem and
+# finishes in minutes, so the global budget let a frozen greenlet hold its `_LOCK` for the best
+# part of an hour. Derived per environment (see Settings._derive_subsystem_task_limits) because no
+# constant is right in both dev (720s lease) and UAT (2880s). The soft limit is what matters — it
+# raises INSIDE the greenlet, so cascade._subsystem_lock's `finally` runs and the lock is released
+# properly; the hard limit is only the backstop if the soft signal is ignored.
 @celery_app.task(bind=True, name="tsg.regenerate",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None,
+                soft_time_limit=_s.subsystem_task_soft_limit_seconds,
+                time_limit=_s.subsystem_task_hard_limit_seconds)
 def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
                     target_ids: list[str] | list[int] | None, epoch: int, user_note: str | None = None) -> None:
     """Redoes one or more scenarios of a session. Same `autoretry_for` reasoning as above.
@@ -412,8 +480,13 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
                                 target_ids, epoch, get_llm(), self.request.id or guid(), user_note=user_note)
 
 
+# Same per-subsystem limit override and the same reasoning as regenerate_task above. THIS is the
+# task that hung in the field: it settled its SCENARIOS stage, then stopped without releasing the
+# `_LOCK` or finalising the session, and nothing forced it out for the rest of the worker's life.
 @celery_app.task(bind=True, name="tsg.next_set",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None,
+                soft_time_limit=_s.subsystem_task_soft_limit_seconds,
+                time_limit=_s.subsystem_task_hard_limit_seconds)
 def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_epoch: int) -> None:
     """Adds the next batch of unique, accumulating scenarios for one subsystem. Same
     `autoretry_for` and caller-reserved `epoch` reasoning as above. `threats_epoch` is the

@@ -10,6 +10,7 @@ from app.core.config import get_settings
 from app.core.enums import (
     AuditDecision,
     AuditEventType,
+    ReviewGateReason,
     ScenarioDecisionReason,
     SessionStatus,
     StageStatus,
@@ -124,7 +125,7 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
     if scenario_session is None:
         raise EntityForbidden(f"session {session_id} not in entity {entity_id}")
 
-    _ensure_session_ready_to_accept(scenario_session)
+    scenario_session = _ensure_session_ready_to_accept(sess, scenario_session)
 
     subsystem_ids = dal.subsystem_ids_at_level(sess, session_id, SubsystemLevel.LOCK)
     good_subs = dal.subsystem_ids_at_level(
@@ -243,7 +244,7 @@ def reject_scenarios(sess: Session, session_id: str, entity_id: str, user_id: st
     if scenario_session is None:
         raise EntityForbidden(f"session {session_id} not in entity {entity_id}")
 
-    _ensure_session_ready_to_accept(scenario_session)
+    scenario_session = _ensure_session_ready_to_accept(sess, scenario_session)
 
     subsystem_ids = dal.subsystem_ids_at_level(sess, session_id, SubsystemLevel.LOCK)
     good_subs = dal.subsystem_ids_at_level(
@@ -305,8 +306,78 @@ def review_gate_reason(scenario_session: RowMapping | dict) -> tuple[str, str] |
             f"status={scenario_session['StageStatus']}) — generation still in progress"))
 
 
-def _ensure_session_ready_to_accept(scenario_session: RowMapping) -> None:
+def ensure_review_gate(sess: Session, scenario_session: RowMapping | dict) -> RowMapping | dict:
+    """`review_gate_reason`, but reconciled against whether a worker is ACTUALLY alive.
+
+    Returns the session row to keep working with — the reloaded one if recovery ran — and raises
+    AcceptConflict otherwise. Shared by the accept/reject gate and sessions.py's regenerate/next-set
+    gate, so every decision route reconciles identically.
+
+    WHY THIS EXISTS. `CurrentStage`/`StageStatus` on Scenario_Session are a denormalised CACHE of
+    pipeline progress; `Subsystem_Stage_State` is the authority. When a worker dies or hangs
+    mid-run, nothing writes the cache back, and the reaper — the only reconciler — cannot act until
+    the lease expires, and only while worker AND beat are running. Every route that trusted the
+    cache alone therefore answered "generation still in progress" for runs that had stopped hours
+    earlier, leaving the session acceptable by nobody and advanceable by nothing. Observed live:
+    a next-set task hung after committing its work but before releasing the `_LOCK`, and accept +
+    regenerate both 409'd on a session whose scenarios were finished and sitting in the DB.
+
+    So: a live lease is required to CLAIM something is running (dal.live_lease_exists explains why
+    that signal is exact rather than heuristic). Without one, the run is abandoned, and this
+    finalises it on the spot through the very same `recover_abandoned_session` the reaper uses —
+    same `_LOCK` mutex, same decide_session_outcome — so an in-flight worker can never be raced.
+    Recovery is idempotent and returns None untouched if any lock is genuinely held."""
+    gate = review_gate_reason(scenario_session)
+    if gate is None:
+        return scenario_session
+    reason, message = gate
+    # session_completed / session_cancelled are terminal facts, not stale cache — nothing to
+    # reconcile, and recovery could not change them.
+    if reason != ReviewGateReason.generation_in_progress:
+        raise AcceptConflict(message, reason=reason)
+
+    sid = scenario_session["SessionID"]
+    if dal.session_has_live_lease(sess, sid):
+        raise AcceptConflict(message, reason=reason)   # a worker really is running: the message is true
+
+    log.warning("review_gate.recovering_abandoned_run", session_id=sid,
+                stage=str(scenario_session["CurrentStage"]),
+                stage_status=str(scenario_session["StageStatus"]),
+                note="no live lease — previous run died or hung; finalising it now")
+    # recover_session_now, NOT recover_abandoned_session: the latter is only the sweep's step 3 and
+    # bails out on a held `_LOCK` — which is exactly the state an abandoned run leaves behind.
+    from app.pipeline.reaper import recover_session_now  # local: reaper -> tasks -> accept
+    try:
+        recover_session_now(sess, dict(scenario_session))
+    except Exception:  # a failed recovery must still produce an honest 409, not a 500
+        sess.rollback()
+        log.warning("review_gate.recovery_failed", session_id=sid, exc_info=True)
+
+    fresh = dal.get_session(sess, sid, str(scenario_session["EntityID"]))
+    if fresh is None:  # deleted underneath us — treat as the caller's original refusal
+        raise AcceptConflict(message, reason=reason)
+    gate = review_gate_reason(fresh)
+    if gate is None:
+        log.info("review_gate.recovered", session_id=sid, stage=str(fresh["CurrentStage"]))
+        return fresh
+    reason, message = gate
+    # Recovery resolved it to a terminal state (e.g. every stage errored -> cancelled). Report THAT
+    # — it is accurate and tells the caller what to do next; generation_abandoned would lose it.
+    if reason != ReviewGateReason.generation_in_progress:
+        raise AcceptConflict(message, reason=reason)
+    raise AcceptConflict(
+        f"the previous generation run was abandoned — no worker has held a lease on session {sid} "
+        f"since it stopped — and automatic recovery could not park it at REVIEW "
+        f"(stage={fresh['CurrentStage']}, status={fresh['StageStatus']}). Waiting will not help; "
+        f"cancel the session and start a new one for asset {fresh['AssetID']}",
+        reason=ReviewGateReason.generation_abandoned)
+
+
+def _ensure_session_ready_to_accept(sess: Session, scenario_session: RowMapping) -> RowMapping | dict:
     """The review gate every decision route must pass: is this session AT a review barrier?
+
+    Returns the session row to use from here on — recovery may have reloaded it, and the caller
+    must not keep reading the pre-recovery snapshot.
 
     Deliberately NOT an ownership check. Any authenticated colleague in the entity may decide this
     assessment; who actually did is recorded per scenario by dal.decide_scenarios. An owner check
@@ -314,10 +385,7 @@ def _ensure_session_ready_to_accept(scenario_session: RowMapping) -> None:
 
     A guard in scripts/test_pipeline_guards.py fails the build if a function that decides
     scenarios does not call this first, so a new decision route cannot skip the barrier."""
-    gate = review_gate_reason(scenario_session)
-    if gate is not None:
-        reason, message = gate
-        raise AcceptConflict(message, reason=reason)
+    return ensure_review_gate(sess, scenario_session)
 
 
 def _ensure_threat_data_still_active(sess: Session, session_id: str, good_subs: list[int]) -> None:

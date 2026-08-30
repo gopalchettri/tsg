@@ -853,6 +853,37 @@ def stage_settled_at_epoch(
     ).first() is not None
 
 
+def live_lease_exists(session_id_col: Any, _now: datetime | None = None) -> Any:
+    """EXISTS clause: "some worker is still actively working on this session".
+
+    `session_id_col` is whatever the caller correlates against — a literal session id for a
+    standalone check, or `m.Scenario_Session.SessionID` for the reaper's correlated sweep. A live
+    lease is the ONLY positive proof a worker is alive: `_ask_ai` renews both the stage lease and
+    the `_LOCK` lease before every LLM call, so a holder that has gone a full lease window without
+    renewing has stopped running — whether it crashed, was killed, or hung.
+
+    Sole definition, shared by reaper._find_abandoned_sessions and accept.ensure_review_gate: the
+    reaper's "leave a live worker alone" rule and the review gate's "is this really still
+    generating?" question are the same question, and they must never drift apart."""
+    ss = m.Subsystem_Stage_State
+    return (select(1).select_from(ss)
+            .where(ss.SessionID == session_id_col, ss.LeaseExpiresAt > (_now or now()))
+            .exists())
+
+
+def session_has_live_lease(sess: Session, session_id: str) -> bool:
+    """True iff a worker currently holds an unexpired lease on any stage of this session.
+
+    False means every claim has lapsed: nothing is running, whatever the session's denormalised
+    CurrentStage/StageStatus columns still say.
+
+    `SELECT 1 WHERE EXISTS (...)`, NOT `SELECT EXISTS (...)`: T-SQL has no boolean type, so EXISTS
+    is legal only in a predicate position — selecting it directly compiles fine and then fails at
+    the server with "Incorrect syntax near the keyword 'EXISTS'". Same `.first() is not None` shape
+    as every other existence check in this module."""
+    return sess.execute(select(1).where(live_lease_exists(session_id))).first() is not None
+
+
 def stage_rows(sess: Session, session_id: str) -> list[RowMapping]:
     """Per-subsystem stage rows for the status board (§6.1), excluding `_LOCK`. `ErrorMessage`
     rides along: on a revived AWAITING_DECISION row it is the "review set may be partial" marker."""

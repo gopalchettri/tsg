@@ -2177,10 +2177,28 @@ def decide_session_outcome(sess: Session, scenario_session: dict) -> str | None:
     if dal.has_active_scenarios(sess, sid):
         dal.revive_errored_scenarios_to_review(sess, sid)
         statuses = [str(r["Status"]) for r in dal.stage_rows(sess, sid)]
+    # Both branches below LOG a declined CAS instead of returning None silently. A finalize that
+    # quietly does nothing is how a session ends up stranded outside REVIEW with every stage row
+    # terminal and nothing in the logs to say why — the exact dead end that made the abandoned-run
+    # bug invisible until someone read the DB by hand. `rowcount != 1` means the row moved under us
+    # (already at REVIEW, or no longer `active`): usually benign, occasionally the only breadcrumb
+    # there is. Either way it must be visible.
     if any(s == StageStatus.AWAITING_DECISION for s in statuses):
-        return "review" if _send_to_review(sess, scenario_session) else None
+        if _send_to_review(sess, scenario_session):
+            return "review"
+        log.warning("finalize.send_to_review_declined", session_id=sid, statuses=statuses,
+                    session_status=str(scenario_session.get("SessionStatus")),
+                    current_stage=str(scenario_session.get("CurrentStage")),
+                    note="CAS matched no row — session already at REVIEW, or no longer active")
+        return None
     if any(s == StageStatus.ERROR for s in statuses):
-        return "cancelled" if _mark_session_failed(sess, scenario_session) else None
+        if _mark_session_failed(sess, scenario_session):
+            return "cancelled"
+        log.warning("finalize.mark_failed_declined", session_id=sid, statuses=statuses,
+                    session_status=str(scenario_session.get("SessionStatus")),
+                    current_stage=str(scenario_session.get("CurrentStage")),
+                    note="CAS matched no row — session already terminal, or no longer active")
+        return None
     log.warning("finalize.no_terminal_state", session_id=sid, statuses=statuses)
     return None
 

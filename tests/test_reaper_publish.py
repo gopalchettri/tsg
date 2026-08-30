@@ -85,7 +85,7 @@ def test_expired_lease_below_grace_does_not_publish(monkeypatch):
 
 
 def test_close_out_abandoned_session_publishes_error(monkeypatch):
-    """Site 3 (`_close_out_one_abandoned_session`): a session finalized under the reaper's own
+    """Site 3 (`recover_abandoned_session`): a session finalized under the reaper's own
     lock, with leftover un-runnable rows flipped to ERROR, must publish once -- and only once
     that flip is durable (it runs the update, then `decide_session_outcome`, then publishes).
     `decide_session_outcome` itself is plan item 4/27's territory (tasks.py), stubbed here so
@@ -108,7 +108,7 @@ def test_close_out_abandoned_session_publishes_error(monkeypatch):
 
     scenario_session = {"SessionID": sid, "TenantID": "t", "EntityID": "e"}
     with Session() as s:
-        outcome = reaper._close_out_one_abandoned_session(s, scenario_session)
+        outcome = reaper.recover_abandoned_session(s, scenario_session)
 
     assert outcome == "cancelled"
     assert len(published) == 1
@@ -132,7 +132,7 @@ def test_close_out_publishes_nothing_when_no_rows_changed(monkeypatch):
 
     scenario_session = {"SessionID": sid, "TenantID": "t", "EntityID": "e"}
     with Session() as s:
-        reaper._close_out_one_abandoned_session(s, scenario_session)
+        reaper.recover_abandoned_session(s, scenario_session)
 
     assert published == []
 

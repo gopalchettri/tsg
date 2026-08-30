@@ -46,6 +46,40 @@ def _split_into_batches(items):
         yield items[i:i + chunk]
 
 
+def _revoke_zombie_tasks(expired_rows) -> None:
+    """Terminate the Celery tasks that were still holding the rows this pass just reclaimed.
+
+    An expired lease is an EXACT frozen-detector, not a heuristic: `tasks._ask_ai` renews both the
+    stage lease and the `_LOCK` lease before every single LLM call, so a healthy task — however
+    long it legitimately runs — never stops renewing. A holder that has gone a full lease window
+    without one has stopped executing. That is why this needs no wall-clock budget and no tuned
+    constant: it reads the same signal in dev, UAT and prod, and it can never fire on live work.
+
+    Reclaiming the DB row alone frees the SESSION but leaves the greenlet pinning a worker slot and
+    a DB connection for good, with a redelivery free to run beside it. `terminate=True` kills the
+    greenlet, which unwinds through `_subsystem_lock`'s `finally` and releases the lock properly.
+
+    Best-effort by design: revoking is an optimisation on top of the row reclaim above, which has
+    already happened and is already durable. A broker that will not take the control message must
+    never fail the sweep. (A GUID that is a session id rather than a Celery task id — accept and
+    the reaper both lock under `task_id=session_id` — simply matches no task; ids are never reused.)
+
+    KNOWN LIMIT: gevent can only kill a greenlet at a yield point, so a task blocked in a truly
+    non-yielding native call (pyodbc, the local-model threadpool) survives this. The session is
+    still recovered; only the slot leaks."""
+    task_ids = {row[3] for row in expired_rows if row[3]}
+    if not task_ids:
+        return
+    try:
+        from app.pipeline.celery_app import celery_app  # local: celery_app imports THIS module
+        celery_app.control.revoke(list(task_ids), terminate=True)
+    except Exception:  # see "best-effort" above
+        log.warning("reaper.revoke_failed", task_ids=sorted(task_ids), exc_info=True)
+        return
+    log.warning("reaper.revoked_zombie_tasks", task_ids=sorted(task_ids),
+                note="lease expired while still RUNNING — task was not executing")
+
+
 def clean_up_abandoned_sessions(sess: Session) -> list[str]:
     """The main cleanup pass. Returns the session ids driven to a terminal 'cancelled' state."""
     ss = m.Subsystem_Stage_State
@@ -54,12 +88,13 @@ def clean_up_abandoned_sessions(sess: Session) -> list[str]:
     expired = and_(lease.isnot(None), lease < _now)
 
     # Read-only candidate scan (see module docstring) — a plain SELECT never locks what it reads.
-    # SubsystemID rides along so the publish below can include it.
+    # SubsystemID rides along so the publish below can include it; ActiveTaskID so _revoke_zombie_
+    # tasks below can kill the greenlet that is still holding the row.
     expired_work = sess.execute(
-        select(ss.StateID, ss.SessionID, ss.SubsystemID).where(
+        select(ss.StateID, ss.SessionID, ss.SubsystemID, ss.ActiveTaskID).where(
             ss.Level != SubsystemLevel.LOCK, ss.Status == StageStatus.RUNNING, expired)).all()
     expired_locks = sess.execute(
-        select(ss.StateID, ss.SessionID, ss.SubsystemID).where(
+        select(ss.StateID, ss.SessionID, ss.SubsystemID, ss.ActiveTaskID).where(
             ss.Level == SubsystemLevel.LOCK, ss.Status == StageStatus.RUNNING, expired)).all()
 
     # Capture proven-dead sessions BEFORE steps 1/2 run: a terminal transition clears
@@ -89,22 +124,28 @@ def clean_up_abandoned_sessions(sess: Session) -> list[str]:
     # Publish AFTER commit, so a client's refetch (triggered by the event) sees this write
     # already durable — never publish-then-commit. (Item 5: the reaper's first two publish
     # sites — a client watching live no longer waits for the next board refetch.)
-    for _, session_id, subsystem_id in expired_work:
+    for _, session_id, subsystem_id, _tid in expired_work:
         bus.publish(session_id, {"type": str(SSEEventType.error), "session_id": session_id,
                                 "subsystem_id": subsystem_id,
                                 "message": "stage lease expired: worker presumed dead",
                                 "ts": _now.isoformat()})
-    for _, session_id, subsystem_id in expired_locks:
+    for _, session_id, subsystem_id, _tid in expired_locks:
         bus.publish(session_id, {"type": str(SSEEventType.error), "session_id": session_id,
                                 "subsystem_id": subsystem_id,
                                 "message": "asset lock reclaimed: worker presumed dead",
                                 "ts": _now.isoformat()})
 
+    # 2b. Kill the greenlets that were still holding those rows. Reclaiming the DB row frees the
+    # SESSION, but a task frozen mid-flight keeps its worker slot and DB connection forever, and
+    # a redelivery would then run beside it. See _revoke_zombie_tasks for why an expired lease is
+    # an exact frozen-detector rather than a heuristic.
+    _revoke_zombie_tasks(expired_work + expired_locks)
+
     # 3. Finalize every abandoned session through the SAME rule the pipeline uses.
     cancelled: list[str] = []
     for c in _find_abandoned_sessions(sess, _now, proven_dead):
         try:
-            if _close_out_one_abandoned_session(sess, dict(c)) == "cancelled":
+            if recover_abandoned_session(sess, dict(c)) == "cancelled":
                 cancelled.append(c["SessionID"])
         except Exception:  # one broken session must never stop the pass ([R8])
             log.warning("reaper.finalize_failed", session_id=c["SessionID"], exc_info=True)
@@ -121,11 +162,10 @@ def _find_abandoned_sessions(sess: Session, _now: datetime, proven_dead: set[str
     and are never reaped; a finished stage's lease is always NULL, so briefly sitting outside
     REVIEW alone never looks abandoned."""
     grace = _now - timedelta(seconds=get_settings().reaper_stale_grace_seconds)
-    ss = m.Subsystem_Stage_State
-    # some worker is still actively working on this session
-    live_lease = (select(1).select_from(ss)
-                .where(ss.SessionID == m.Scenario_Session.SessionID, ss.LeaseExpiresAt > _now)
-                .exists())
+    # some worker is still actively working on this session. dal.live_lease_exists is the SOLE
+    # definition of "a worker is alive" — accept.ensure_review_gate asks the same question before
+    # it tells a caller that generation is still running, and the two must never diverge.
+    live_lease = dal.live_lease_exists(m.Scenario_Session.SessionID, _now)
     base = (select(m.Scenario_Session.SessionID, m.Scenario_Session.TenantID, m.Scenario_Session.EntityID)
             .where(dal.session_active(),  # literal — only IX_Session_Active makes this sweep O(active)
                 m.Scenario_Session.CurrentStage != WorkflowStage.REVIEW,
@@ -141,7 +181,50 @@ def _find_abandoned_sessions(sess: Session, _now: datetime, proven_dead: set[str
     return list(out.values())
 
 
-def _close_out_one_abandoned_session(sess: Session, scenario_session: dict) -> str | None:
+def recover_session_now(sess: Session, scenario_session: dict) -> str | None:
+    """A whole reaper pass, scoped to ONE session, run on demand. Returns decide_session_outcome's
+    verdict ("review" / "cancelled" / None).
+
+    THE ORDER IS THE POINT. `recover_abandoned_session` below is only step 3 of the sweep: it
+    acquires every `_LOCK` first and bails out untouched if one is held. But a session abandoned by
+    a dead or hung worker is stuck *precisely because* its `_LOCK` is still RUNNING, so step 3 on
+    its own can never recover the very case it exists for — it needs steps 1/2 to have reclaimed
+    the expired rows first. clean_up_abandoned_sessions gets that for free by running them in
+    sequence; an on-demand caller does not, and calling step 3 alone silently returns None forever.
+
+    Same predicates and same SELECT-then-UPDATE discipline as the batched sweep (see the module
+    docstring for why a blind UPDATE deadlocks under gevent) — just narrowed to one SessionID,
+    which also makes the batching unnecessary: one session has a handful of rows, not thousands."""
+    sid = scenario_session["SessionID"]
+    ss = m.Subsystem_Stage_State
+    _now = now()
+    expired = and_(ss.LeaseExpiresAt.isnot(None), ss.LeaseExpiresAt < _now)
+    rows = sess.execute(
+        select(ss.StateID, ss.SessionID, ss.SubsystemID, ss.ActiveTaskID, ss.Level)
+        .where(ss.SessionID == sid, ss.Status == StageStatus.RUNNING, expired)).all()
+    if rows:
+        # Work stages the dead worker left mid-flight can never finish -> ERROR, so the board is
+        # fully terminal and decide_session_outcome is not left waiting on them.
+        work_ids = [r[0] for r in rows if r[4] != SubsystemLevel.LOCK]
+        lock_ids = [r[0] for r in rows if r[4] == SubsystemLevel.LOCK]
+        if work_ids:
+            sess.execute(
+                update(ss).where(ss.StateID.in_(work_ids), ss.Status == StageStatus.RUNNING, expired)
+                .values(Status=StageStatus.ERROR, ErrorMessage="reaped: worker gone",
+                        LeaseExpiresAt=None, UpdatedAt=_now))
+        if lock_ids:
+            sess.execute(
+                update(ss).where(ss.StateID.in_(lock_ids), ss.Status == StageStatus.RUNNING, expired)
+                .values(Status=StageStatus.IDLE, ActiveTaskID=None, LeaseExpiresAt=None,
+                        UpdatedAt=_now))
+        sess.commit()  # durable before recover_abandoned_session tries to take the lock
+        log.warning("reaper.on_demand_reclaim", session_id=sid,
+                    work_rows=len(work_ids), lock_rows=len(lock_ids))
+        _revoke_zombie_tasks(rows)
+    return recover_abandoned_session(sess, scenario_session)
+
+
+def recover_abandoned_session(sess: Session, scenario_session: dict) -> str | None:
     """Finalize ONE abandoned session under the `_LOCK` mutex. Acquires every `_LOCK`; if any is
     already held, a live worker or in-flight accept owns the session, so leave it untouched
     (return None). Once every lock is held the session is provably quiescent: flag its leftover
