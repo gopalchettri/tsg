@@ -58,7 +58,7 @@ def _dispatch(feeds: list[str], user_id: str | None) -> IntelRefreshAccepted:
         task = intel_refresh_feed_task.apply_async(args=(feed,), shadow=(
             f"intel-refresh: {feed} · by {user_id} · "
             f"{dal.now():%Y-%m-%d %H:%M} UTC"))
-        mark_admin_job(task.id, FAMILY_INTEL)  # best-effort — see admin_jobs.mark_admin_job
+        mark_admin_job(task.id, FAMILY_INTEL, user_id)  # best-effort — see admin_jobs.mark_admin_job
         jobs[feed] = task.id
     return IntelRefreshAccepted(jobs=jobs)
 

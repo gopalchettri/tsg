@@ -3,13 +3,18 @@
 Each family's status route answers ONLY for ids its own family marked, so no status route can
 surface another task type's result.
 
-DEPENDENCY-LIGHT ON PURPOSE (redis + settings + logging only, no FastAPI, no Celery): worker
-tasks in celery_app.py mark jobs too, so this must import without an api<->pipeline cycle.
+DEPENDENCY-LIGHT ON PURPOSE (redis + settings + logging + dal only, no FastAPI, no Celery):
+worker tasks in celery_app.py mark jobs too, so this must import without an api<->pipeline
+cycle. dal.py itself only imports app.core.*/app.db.models, so pulling in dal.now() for the
+marker timestamp below does not reopen that cycle.
 """
 from __future__ import annotations
 
+import json
+
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.db import dal
 from app.pipeline.llm import _slot_redis
 
 log = get_logger(__name__)
@@ -27,32 +32,39 @@ def _key(job_id: str, family: str) -> str:
 def emb_job_channel_key(job_id: str) -> str:
     """SSE bus channel id for one embeddings job — the ONE convention the worker publisher
     (celery_app.py::admin_embedding_action_task) and the API subscriber (admin.py::job_events)
-    share, mirroring bus.channel()'s role for sessions. Namespaced so it can never collide
-    with a session channel (session ids are bare UUIDs)."""
-    return f"admin-emb:{job_id}"
-
+    share, mirroring bus.channel()'s role for sessions. Joins the same tsg:sse: family as
+    bus.channel()'s session channels — these ARE SSE channels, just admin-family ones — spelled
+    out to match the SSEEventType name (embedding_job_update) rather than an abbreviation."""
+    return f"tsg:sse:embedding-job:{job_id}"
 
 
 def intel_job_channel_key(job_id: str) -> str:
     """Same convention as emb_job_channel_key, for one threat-intel feed-refresh job — shared
     by celery_app.py::intel_refresh_feed_task (publisher) and threat_intel.py::job_events
     (subscriber)."""
-    return f"admin-intel:{job_id}"
+    return f"tsg:sse:intel-job:{job_id}"
 
 
 def grounding_job_channel_key(job_id: str) -> str:
     """Same convention as emb_job_channel_key, for one grounding-calibration sweep — shared by
     celery_app.py::calibrate_grounding_task (publisher) and admin.py::calibration_events
     (subscriber)."""
-    return f"admin-grounding:{job_id}"
+    return f"tsg:sse:grounding-job:{job_id}"
 
 
-def mark_admin_job(job_id: str, family: str) -> None:
+def mark_admin_job(job_id: str, family: str, user_id: str | None = None) -> None:
     """Best-effort marker write (same TTL as the Celery result backend, so marker and
     result expire together). Fails open on the QUEUE side — a Redis blip must not block
-    the job itself; the job merely becomes unpollable via its status route."""
+    the job itself; the job merely becomes unpollable via its status route.
+
+    The value carries who queued it and when — admin_job_exists below only ever calls
+    r.exists(...) and never reads the value, so this is purely for an operator inspecting
+    Redis directly (e.g. via RedisInsight) to see. No entity_id: admin actions are
+    cross-tenant by design (same reasoning as the Celery shadow labels in admin.py/
+    threat_intel.py)."""
+    value = json.dumps({"user_id": user_id, "created_at": dal.now().isoformat()})
     try:
-        _slot_redis().setex(_key(job_id, family), get_settings().result_expires_seconds, "1")
+        _slot_redis().setex(_key(job_id, family), get_settings().result_expires_seconds, value)
     except Exception:
         log.warning("admin.job_marker_write_failed", job_id=job_id, family=family, exc_info=True)
 

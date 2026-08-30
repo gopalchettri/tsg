@@ -97,7 +97,7 @@ def _enqueue(action: str, body: EmbeddingActionBody, user_id: str | None) -> Emb
         args=(action, body.group, body.names), shadow=(
             f"embeddings {action}: {body.group or 'all groups'} · by {user_id} · "
             f"{dal.now():%Y-%m-%d %H:%M} UTC"))
-    mark_admin_job(task.id, FAMILY_EMBEDDINGS)  # best-effort — see admin_jobs.mark_admin_job
+    mark_admin_job(task.id, FAMILY_EMBEDDINGS, user_id)  # best-effort — see admin_jobs.mark_admin_job
     return EmbeddingJobAccepted(job_id=task.id)
 
 
@@ -288,7 +288,7 @@ def calibrate(request: Request, body: GroundingCalibrationBody | None = None,
         # and settling it from here would race a live sweep.
         grounding.record_calibration_finished(run_id, error=f"queueing failed: {exc!r}")
         raise
-    mark_admin_job(task.id, FAMILY_GROUNDING)  # best-effort — see admin_jobs.mark_admin_job
+    mark_admin_job(task.id, FAMILY_GROUNDING, principal.user_id)  # best-effort — see admin_jobs.mark_admin_job
     _attach_job_id(run_id, task.id)
     # AFTER .delay() for the same reason _audit fires after _enqueue: logging first would leave a
     # permanent record of a sweep that never ran when the broker was unreachable. The ledger row
