@@ -117,11 +117,11 @@ class ScenarioStatus(StrEnum):
 
 
 class ActorType(StrEnum):
-    """`Scenario_Audit.ActorType` — who PERFORMED the event, kept separate from ActorUserID's
-    "who is ACCOUNTABLE". Worker rows are back-filled with the session owner, so ActorUserID
-    alone cannot distinguish the two. NULL on rows written before this column existed."""
-    user = "user"      # a human performed it
-    system = "system"  # a worker/the pipeline performed it; ActorUserID names who is answerable
+    """`Scenario_Audit.ActorType` — who PERFORMED the event, stated outright so a consumer never
+    has to infer it from a NULL ActorUserID. Worker rows carry ActorUserID = NULL; this says so
+    explicitly. NULL on rows written before this column existed."""
+    user = "user"      # a human performed it; ActorUserID names them
+    system = "system"  # a worker/the pipeline performed it; ActorUserID is NULL
 
 
 class ValidationStatus(StrEnum):

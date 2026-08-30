@@ -610,7 +610,8 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
         return
     # The four columns _ask_ai reads for its Prompt_Log row — all denormalized onto the plan
     # row at insert, so no Scenario_Session re-read is needed here. Scenario_Audit has no
-    # UserID column (only ActorUserID, back-filled by audit_row), hence the narrower dict.
+    # UserID column (only ActorUserID, which stays NULL on these worker rows), hence the
+    # narrower dict.
     audit_ident = {"SessionID": row["SessionID"], "TenantID": row["TenantID"],
                 "EntityID": row["EntityID"], "UserID": row["UserID"]}
     # ScenarioID included: without it these worker-written treatment_plan_outcome rows leave the

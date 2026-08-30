@@ -1385,7 +1385,6 @@ def decide_scenarios(
     res = execute_dml(sess, update(out).where(*where).values(**values))
 
     if changed:
-        # Resolve the actor ONCE; audit_row's own back-fill would do a PK lookup per row.
         # No session-owner fallback: a decision with no acting user is a SYSTEM decision, and
         # naming the session owner would put a person's name on something they did not do — the
         # same lie audit_row used to tell. NULL here is the honest answer, and ActorType says so.

@@ -635,11 +635,13 @@ class Scenario_Audit(Base):
     Granularity: Mapped[str | None] = mapped_column(Unicode(100))  # regeneration_completed only
     ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)  # library_promoted +
     # candidate_reconciled (approvals: the minted/linked type)
-    # WHO IS ACCOUNTABLE, not who typed the command: human actions record the authenticated
-    # principal, worker rows are back-filled from Scenario_Session.UserID by dal.append_audit.
+    # WHO ACTUALLY DID IT: the authenticated principal on human actions, NULL on worker-written
+    # rows. NULL is INFORMATION, not missing data — read ActorType beside it. This used to be
+    # back-filled from Scenario_Session.UserID, which stamped every pipeline step with the session
+    # owner's name and made the timeline unreadable; audit_row no longer does that.
     ActorUserID: Mapped[str | None] = mapped_column(Unicode(200))
-    # WHO PERFORMED it, which ActorUserID above deliberately cannot answer once worker rows are
-    # back-filled with the session owner. NULL on rows predating the column — never back-filled,
+    # WHO PERFORMED it, stated outright so a consumer never has to infer that a NULL ActorUserID
+    # means the pipeline. NULL on rows predating the column — never back-filled,
     # since rewriting an append-only ledger would falsify records that were true when written.
     ActorType: Mapped[str | None] = mapped_column(Unicode(100))
     DetailJSON: Mapped[str | None] = mapped_column(UnicodeText)

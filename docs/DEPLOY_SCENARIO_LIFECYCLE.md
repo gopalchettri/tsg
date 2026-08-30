@@ -29,7 +29,7 @@ Guarded and idempotent; safe to re-run. It applies:
 |---|---|
 | `Threat_Scenario_Output.RejectedAt` / `RejectedBy` | Records who declined a scenario and when |
 | `CK_ScenarioOutput_DecisionExclusive` | A scenario cannot be both accepted and rejected |
-| `Scenario_Audit.OutputID` | Which scenario a decision event is about |
+| `Scenario_Audit.ScenarioID` | Which scenario a decision event is about |
 | `IX_ScenarioAudit_Output` | Makes "the decision history of this scenario" a seek, not a scan |
 
 **Customer/UAT sites provision from the mirrors instead** — `scripts/eyshield_handoff/1. TSG_Core.sql`
@@ -70,7 +70,7 @@ loudly at deploy rather than quietly at runtime. Migrate first and it is a non-e
 |---|---|
 | A session reports `SessionStatus = completed` while its scenarios still await decisions | **Do not treat `completed` as "review finished".** The status rollup reports `awaiting_review` for exactly this state — poll that. |
 | Accept is repeatable | Calling accept again with different scenario ids is normal, not an error |
-| New: `POST /v1/sessions/{session_id}/scenarios/reject` | Body `{"output_ids": [...]}`. Records a decision; does not delete anything |
+| New: `POST /v1/sessions/{session_id}/scenarios/reject` | Body `{"scenario_ids": [...]}`. Records a decision; does not delete anything |
 | Accept's 404 body may carry `already_rejected`; reject's may carry `already_accepted` | Both are typed values in `details.unacceptable[].reason` |
 | `session_entered_review` SSE event | Unchanged name. It now also means the asset has been released |
 
@@ -105,7 +105,7 @@ Then, against the deployed environment:
 2. Accept one scenario → the others stay `undecided`
 3. Accept another → succeeds (this is the behaviour the release exists for)
 4. Reject an accepted one → 404 `already_accepted`
-5. `GET /v1/sessions/{id}/scenarios/{output_id}/treatment-plan/audit` → one row per decision,
+5. `GET /v1/sessions/{id}/scenarios/{scenario_id}/treatment-plan/audit` → one row per decision,
    each naming the scenario and the person
 
 ## Rollback
