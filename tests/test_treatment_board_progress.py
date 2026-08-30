@@ -8,13 +8,20 @@ rules for "is planning finished", and two screens can disagree about the same se
 The PRIORITY ORDER is the whole design, and each rule below exists because the obvious
 alternative is wrong:
 
-  * error outranks in_progress — a board with one failed and one running plan must surface the
+  * error outranks generating — a board with one failed and one running plan must surface the
     failure NOW, not once the other finishes;
-  * awaiting_review outranks complete — for the same reason SessionProgress does it. Plans that
-    are generated but unreviewed are not finished, and calling them complete empties the review
+  * awaiting_review outranks approved — for the same reason SessionProgress does it. Plans that
+    are generated but unreviewed are not finished, and calling them done empties the review
     queue;
-  * an empty board is `pending`, not `complete` — "no scenarios accepted yet" folded to complete
-    would announce a session as done before any work existed.
+  * REJECTED IS ITS OWN STATE, not folded into approved — regenerate operates on the active
+    version whatever its verdict, so a rejected plan is work still outstanding. Folding it away
+    would hide the one state that needs a person to act;
+  * an empty board is `pending`, not `approved` — "no scenarios accepted yet" folded to done
+    would announce a session finished before any work existed.
+
+Every overall value names a state of the real flow AND the action it implies, so the tests below
+double as the UI's switch table: pending -> Generate, generating -> spinner, awaiting_review ->
+Review, rejected -> Regenerate, approved -> done, error -> Retry.
 
 _board_progress is pure, so none of this needs a database.
 """
@@ -22,7 +29,10 @@ from __future__ import annotations
 
 from app.api.schemas import TreatmentBoardRow
 from app.api.treatment import _board_progress
-from app.core.enums import TreatmentProgress
+from app.core.enums import TreatmentProgress, TreatmentStageStatus
+
+PENDING, RUNNING = TreatmentStageStatus.PENDING, TreatmentStageStatus.RUNNING
+COMPLETE, ERROR = TreatmentStageStatus.COMPLETE, TreatmentStageStatus.ERROR
 
 
 def _row(status: str | None = None, review: str | None = None) -> TreatmentBoardRow:
@@ -34,69 +44,97 @@ def _row(status: str | None = None, review: str | None = None) -> TreatmentBoard
 
 def test_an_empty_board_is_pending_not_complete():
     """A session with nothing accepted has no planning to do YET. Folding an empty list to
-    `complete` would report it as finished before any work existed."""
-    assert _board_progress([]).overall == TreatmentProgress.pending
+    COMPLETE would report it finished before any work existed."""
+    p = _board_progress([])
+    assert (p.generation, p.review, p.overall) == (PENDING, PENDING, TreatmentProgress.pending)
 
 
 def test_no_plans_requested_is_pending():
     p = _board_progress([_row(), _row()])
-    assert p.overall == TreatmentProgress.pending
-    assert p.not_requested == 2
+    assert (p.generation, p.review, p.overall) == (PENDING, PENDING, TreatmentProgress.pending)
 
 
-def test_some_requested_some_not_is_still_in_progress():
-    """The bucket a naive rollup misses: nothing is running, but a scenario has no plan at all,
-    so planning is not finished — it is waiting on a human to press Generate."""
+def test_a_scenario_with_no_plan_keeps_GENERATION_unfinished():
+    """THE case a naive fold gets wrong. Nothing is running and the one plan that exists is
+    approved — but another accepted scenario has no plan at all, so generation is not done.
+    Reporting COMPLETE here would tell the UI to stop offering Generate."""
     p = _board_progress([_row("COMPLETE", "approved"), _row()])
-    assert p.overall == TreatmentProgress.in_progress
-    assert (p.not_requested, p.complete) == (1, 1)
+    assert p.generation == RUNNING
+    assert p.overall == TreatmentProgress.generating
 
 
-def test_a_running_plan_is_in_progress():
-    p = _board_progress([_row("RUNNING"), _row("COMPLETE", "approved")])
-    assert p.overall == TreatmentProgress.in_progress
-    assert p.running == 1
+def test_generating_is_running_and_review_stays_pending():
+    """Review is PENDING while generation is in flight — there is nothing to review yet."""
+    p = _board_progress([_row("RUNNING"), _row("RUNNING")])
+    assert (p.generation, p.review) == (RUNNING, PENDING)
+    assert p.overall == TreatmentProgress.generating
 
 
-def test_an_error_outranks_a_running_plan():
-    """Priority, not counting. Reporting in_progress here would hide the failure until the other
-    plan finished — and on a board where the running one never finishes, forever."""
-    p = _board_progress([_row("ERROR"), _row("RUNNING")])
+def test_a_failure_shows_as_ERROR_and_outranks_everything():
+    """Priority, not counting: one failed plan beside a healthy approved one must surface the
+    failure now. Reporting COMPLETE would bury it."""
+    p = _board_progress([_row("ERROR"), _row("COMPLETE", "approved")])
+    assert p.generation == ERROR
     assert p.overall == TreatmentProgress.error
-    assert (p.error, p.running) == (1, 1)
 
 
-def test_generated_but_unreviewed_is_awaiting_review_never_complete():
-    """THE review-queue rule. Both plans generated cleanly; nobody has approved or rejected
-    either, so the session still owes a human decision."""
+def test_generated_but_unreviewed_is_review_PENDING_and_awaiting_review():
+    """Generation is finished; the humans are not. This is the review-queue state, and the
+    reason `overall` is not simply `complete` once the machine's work ends."""
     p = _board_progress([_row("COMPLETE"), _row("COMPLETE")])
+    assert (p.generation, p.review) == (COMPLETE, PENDING)
     assert p.overall == TreatmentProgress.awaiting_review
-    assert p.awaiting_review == 2
-    assert (p.approved, p.rejected) == (0, 0)
 
 
-def test_every_plan_reviewed_is_complete_whether_approved_or_rejected():
-    """A REJECTED plan is still a decided one. Treating only approvals as done would leave a
-    rejected plan sitting in the review queue with nothing left for a reviewer to do."""
+def test_partially_reviewed_is_still_pending():
+    """One decided, one not. Review is all-or-nothing: a half-reviewed session must not drop
+    off the queue while a plan still needs a decision."""
+    p = _board_progress([_row("COMPLETE", "approved"), _row("COMPLETE")])
+    assert p.review == PENDING
+    assert p.overall == TreatmentProgress.awaiting_review
+
+
+def test_a_rejection_is_its_own_state_not_folded_into_approved():
+    """THE state a generic "complete" would hide. Both plans are decided, so REVIEW is done —
+    but regenerate operates on the active version whatever its verdict, so a rejected plan is
+    work still outstanding and the UI must offer Regenerate, not call the session finished."""
     p = _board_progress([_row("COMPLETE", "approved"), _row("COMPLETE", "rejected")])
-    assert p.overall == TreatmentProgress.complete
-    assert (p.approved, p.rejected, p.awaiting_review) == (1, 1, 0)
+    assert (p.generation, p.review) == (COMPLETE, COMPLETE)
+    assert p.overall == TreatmentProgress.rejected, "a rejection must not read as done"
 
 
-def test_the_four_generation_buckets_partition_the_accepted_scenarios():
-    """not_requested + running + complete + error must equal the row count: every scenario lands
-    in exactly one. The three review buckets deliberately RE-SPLIT `complete`, so they are not
-    part of that sum — a client adding all seven would double-count."""
-    plans = [_row(), _row("RUNNING"), _row("ERROR"),
-             _row("COMPLETE"), _row("COMPLETE", "approved"), _row("COMPLETE", "rejected")]
-    p = _board_progress(plans)
-    assert p.not_requested + p.running + p.complete + p.error == len(plans)
-    assert p.awaiting_review + p.approved + p.rejected == p.complete
+def test_every_plan_approved_is_the_only_terminal_success():
+    p = _board_progress([_row("COMPLETE", "approved"), _row("COMPLETE", "approved")])
+    assert (p.generation, p.review) == (COMPLETE, COMPLETE)
+    assert p.overall == TreatmentProgress.approved
 
 
-def test_the_rollup_reads_the_PRESENTED_status_not_the_stored_one():
+def test_every_lifecycle_state_is_reachable():
+    """The enum must describe the real flow, not aspire to it: a value nothing can produce is a
+    promise to a UI that will never be kept."""
+    reached = {
+        _board_progress([]).overall,
+        _board_progress([_row("RUNNING")]).overall,
+        _board_progress([_row("COMPLETE")]).overall,
+        _board_progress([_row("COMPLETE", "rejected")]).overall,
+        _board_progress([_row("COMPLETE", "approved")]).overall,
+        _board_progress([_row("ERROR")]).overall,
+    }
+    assert reached == set(TreatmentProgress)
+
+
+def test_review_is_never_RUNNING():
+    """A person either has decided or has not — there is no in-flight review, so the stage only
+    ever reports PENDING or COMPLETE. RUNNING here would imply a machine step that does not
+    exist."""
+    for plans in ([], [_row()], [_row("RUNNING")], [_row("ERROR")],
+                  [_row("COMPLETE")], [_row("COMPLETE", "approved")]):
+        assert _board_progress(plans).review in (PENDING, COMPLETE)
+
+
+def test_the_fold_reads_the_PRESENTED_status_not_the_stored_one():
     """_present_status projects a STALE RUNNING row to ERROR before the board row is built, and
     this fold consumes that. Reading Risk_Treatment_Plan.Status directly would report a dead
-    plan as generating forever — the staleness projection would be defeated one layer up."""
-    assert _board_progress([_row("ERROR")]).overall == TreatmentProgress.error
-    assert _board_progress([_row("RUNNING")]).overall == TreatmentProgress.in_progress
+    plan as generating forever — defeating the staleness projection one layer up."""
+    assert _board_progress([_row("ERROR")]).generation == ERROR
+    assert _board_progress([_row("RUNNING")]).generation == RUNNING

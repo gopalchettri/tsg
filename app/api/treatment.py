@@ -60,6 +60,7 @@ from app.core.enums import (
     TreatmentOutcomeReason,
     TreatmentProgress,
     TreatmentReviewStatus,
+    TreatmentStageStatus,
     TreatmentStrategy,
 )
 from app.core.logging import get_logger
@@ -352,55 +353,66 @@ def get_treatment_plan(session_id: str, scenario_id: str,
 
 
 def _board_progress(plans: list[TreatmentBoardRow]) -> TreatmentPlanProgress:
-    """Fold the board's rows into one planning status — the plan-board counterpart of
-    SessionProgress.overall.
+    """Fold the board's rows into REMEDIATION's own two stages plus a rolled-up status.
 
-    A PURE function over the rows the route already built, so it costs no query and can be
-    tested without a database. It reads the PRESENTED status, not the stored one: _present_status
-    projects a stale RUNNING to ERROR, and a rollup that read Risk_Treatment_Plan.Status directly
-    would report a dead plan as still generating forever.
+    A PURE function over rows the route already built, so it costs no query and needs no
+    database to test. It reads the PRESENTED status, not the stored one: _present_status
+    projects a stale RUNNING to ERROR before the row is built, and folding
+    Risk_Treatment_Plan.Status directly would report a dead plan as generating forever.
 
-    not_requested + running + complete + error partition the accepted scenarios; the three review
-    buckets re-split `complete` by verdict and deliberately overlap it. Priority order lives in
-    TreatmentProgress — error outranks running, and awaiting_review outranks complete.
+    The two stages are the plan's own lifecycle — a machine writes it, then a person decides on
+    it — NOT a copy of the generation board's threats/scenarios/controls. They answer different
+    questions and a client needs both: "still being written" and "written, waiting on me" look
+    identical if you only have one.
+
+    A scenario with NO plan requested counts against GENERATION, not review: the work is
+    outstanding, and reporting generation COMPLETE while a scenario has nothing would tell a UI
+    to stop offering Generate.
     """
-    n = {"not_requested": 0, "running": 0, "complete": 0, "error": 0,
-         "awaiting_review": 0, "approved": 0, "rejected": 0}
-    for p in plans:
-        if p.plan_id is None or p.status is None:
-            n["not_requested"] += 1
-            continue
-        if p.status == str(StageStatus.ERROR):
-            n["error"] += 1
-            continue
-        if p.status == str(StageStatus.RUNNING):
-            n["running"] += 1
-            continue
-        n["complete"] += 1
-        if p.review_status == str(TreatmentReviewStatus.approved):
-            n["approved"] += 1
-        elif p.review_status == str(TreatmentReviewStatus.rejected):
-            n["rejected"] += 1
-        else:
-            n["awaiting_review"] += 1
+    total = len(plans)
+    requested = [p for p in plans if p.plan_id is not None and p.status is not None]
+    errored = [p for p in requested if p.status == str(StageStatus.ERROR)]
+    running = [p for p in requested if p.status == str(StageStatus.RUNNING)]
+    generated = [p for p in requested if p.status == str(StageStatus.COMPLETE)]
+    undecided = [p for p in generated if p.review_status not in
+                 (str(TreatmentReviewStatus.approved), str(TreatmentReviewStatus.rejected))]
 
-    if n["error"]:
-        overall = TreatmentProgress.error
-    elif n["running"]:
-        overall = TreatmentProgress.in_progress
-    elif not plans or n["not_requested"] == len(plans):
-        # No accepted scenario has a plan yet — including a session with nothing accepted, where
-        # "pending" is the honest answer rather than the vacuous "complete" an empty board would
-        # otherwise fold to.
-        overall = TreatmentProgress.pending
-    elif n["not_requested"]:
-        # Some planned, some not: work remains, and it is a human's to start.
-        overall = TreatmentProgress.in_progress
-    elif n["awaiting_review"]:
-        overall = TreatmentProgress.awaiting_review
+    if errored:
+        generation = TreatmentStageStatus.ERROR
+    elif not requested:
+        # Nothing requested at all — including a session with nothing accepted, where PENDING is
+        # the honest answer rather than the vacuous COMPLETE an empty board would fold to.
+        generation = TreatmentStageStatus.PENDING
+    elif running or len(generated) < total:
+        # Still running, OR some accepted scenario has no plan at all. Both mean generation is
+        # unfinished; calling it COMPLETE would tell the UI to stop offering Generate.
+        generation = TreatmentStageStatus.RUNNING
     else:
-        overall = TreatmentProgress.complete
-    return TreatmentPlanProgress(**n, overall=overall)
+        generation = TreatmentStageStatus.COMPLETE
+
+    # Never RUNNING: a person either has decided or has not. PENDING while generation is still
+    # in flight too — there is nothing to review yet.
+    review = (TreatmentStageStatus.COMPLETE
+              if generation is TreatmentStageStatus.COMPLETE and not undecided
+              else TreatmentStageStatus.PENDING)
+
+    # The lifecycle rollup. Order is priority, first match wins — see TreatmentProgress.
+    if errored:
+        overall = TreatmentProgress.error
+    elif generation is TreatmentStageStatus.PENDING:
+        overall = TreatmentProgress.pending
+    elif generation is not TreatmentStageStatus.COMPLETE:
+        overall = TreatmentProgress.generating
+    elif undecided:
+        overall = TreatmentProgress.awaiting_review
+    elif any(p.review_status == str(TreatmentReviewStatus.rejected) for p in generated):
+        # Everyone has decided and someone said no. NOT terminal: regenerate operates on the
+        # active version whatever its verdict, so this is work still outstanding — folding it
+        # into `approved` would hide the one state that needs a person to act.
+        overall = TreatmentProgress.rejected
+    else:
+        overall = TreatmentProgress.approved
+    return TreatmentPlanProgress(generation=generation, review=review, overall=overall)
 
 
 def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,

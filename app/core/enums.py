@@ -414,33 +414,54 @@ class UnacceptGateReason(StrEnum):
                                                          # undoing beneath it would orphan the plan
 
 
-class TreatmentProgress(StrEnum):
-    """How far REMEDIATION PLANNING has got for a whole session, DERIVED — never stored.
+class TreatmentStageStatus(StrEnum):
+    """How far ONE stage of remediation planning has got for a session, DERIVED — never stored.
 
-    The scenario-generation side has SessionProgress.overall (`/v1/sessions/{id}`), so a UI can
-    render one status without reading a list. The plan board had no equivalent: it returned a row
-    per accepted scenario and left every client to fold them itself — which means each client
-    invents its own rules for "is planning done", and two screens can disagree about one session.
-
-    Computed from the board rows the route already holds, so it costs no extra query. Evaluated
-    top-to-bottom, FIRST MATCH WINS — the order is the point:
-
-      any plan ERROR                          -> error       (a failure outranks progress)
-      any plan RUNNING                        -> in_progress (work is still happening)
-      no plan requested for any scenario      -> pending     (the UI shows Generate)
-      any COMPLETE plan with no review verdict-> awaiting_review
-      otherwise                               -> complete    (every plan reviewed)
-
-    `error` before `in_progress` deliberately: a board with one failed and one running plan needs
-    the failure surfaced now, not after the other finishes. And `awaiting_review` before
-    `complete` for the same reason SessionProgress does it — a session whose plans are all
-    generated but unreviewed is NOT finished, and reporting it as such empties the review queue.
+    The same vocabulary SessionProgress publishes for threats/scenarios/controls, so a UI reads
+    the plan board's stages exactly the way it reads the generation board's: one status string
+    per named stage, no arithmetic. Values match ControlMappingStatus plus ERROR — planning can
+    fail, control mapping cannot (it fails open to an empty list).
     """
-    pending = "pending"                  # nothing requested yet for any accepted scenario
-    in_progress = "in_progress"          # at least one plan generating
-    awaiting_review = "awaiting_review"   # generated, a human still owes approve/reject
-    complete = "complete"                # every plan generated AND reviewed
-    error = "error"                      # at least one plan failed
+    PENDING = "PENDING"      # nothing started: no plan requested / nothing generated to review
+    RUNNING = "RUNNING"      # at least one plan generating
+    COMPLETE = "COMPLETE"    # every accepted scenario planned / every plan decided
+    ERROR = "ERROR"          # at least one plan failed (a stale RUNNING projects to this)
+
+
+class TreatmentProgress(StrEnum):
+    """Where a session's remediation planning sits in its END-TO-END LIFECYCLE, DERIVED — never
+    stored. The plan board's counterpart of SessionProgress.overall.
+
+    Every value names a distinct state of the real flow AND the action it implies, so a UI can
+    switch on this one field to decide what button to show:
+
+        pending          no plan requested yet ................. show Generate
+        generating       at least one plan being written ....... show a spinner
+        awaiting_review  generated, a human must decide ........ show Review
+        rejected         decided, and at least one rejected .... show Regenerate
+        approved         every plan approved ................... done
+        error            at least one plan failed .............. show Retry
+
+    REJECTED IS NOT TERMINAL, which is why it is its own state rather than folded into a generic
+    "complete". POST .../treatment-plan/regenerate operates on the ACTIVE version whatever its
+    verdict, so a rejected plan is work still outstanding — collapsing it into "done" would hide
+    the one state that needs a person to act.
+
+    Priority, FIRST MATCH WINS. The order is the design:
+      error       — a failure outranks progress; a board with one failed and one running plan
+                    must surface the failure now, not after the other finishes.
+      generating  — work genuinely in flight, including a scenario with no plan yet.
+      pending     — nothing requested at all.
+      awaiting_review — the machine is done, the humans are not.
+      rejected    — everyone has decided, and someone said no.
+      approved    — the only terminal success.
+    """
+    pending = "pending"                  # nothing requested for any accepted scenario
+    generating = "generating"            # at least one plan in flight, or one scenario unplanned
+    awaiting_review = "awaiting_review"  # generated; a human still owes approve/reject
+    rejected = "rejected"                # all decided, at least one rejected -> regenerate
+    approved = "approved"                # every plan approved -> terminal success
+    error = "error"                      # at least one plan failed -> retry
 
 
 class TreatmentGateReason(StrEnum):

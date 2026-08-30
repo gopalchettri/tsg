@@ -92,6 +92,7 @@ from app.core.enums import (
     TreatmentOutcomeReason,
     TreatmentProgress,
     TreatmentReviewStatus,
+    TreatmentStageStatus,
     YesNo,
 )
 from app.db.dal import canonical_guid
@@ -2592,38 +2593,38 @@ class TreatmentBoardRow(ApiModel):
 
 class TreatmentPlanProgress(ApiModel):
     """The session's remediation-planning progress — the plan board's answer to
-    SessionProgress, so a UI can render one status line without folding the rows itself.
+    SessionProgress, and deliberately the SAME SHAPE: one status string per named stage plus a
+    derived overall, so a UI reads this board the way it already reads the generation board.
 
-    Every count is over the session's ACCEPTED scenarios, and they sum to accepted_scenarios:
-    each scenario lands in exactly one bucket. Derived from the same rows the board already
-    returns, so this costs no extra query.
+    Planning has two stages, and they are genuinely different questions: the machine writes the
+    plans, then a human decides on them. Splitting them is what lets a client tell "still
+    generating" from "generated, waiting on me" without inspecting a single row.
     """
     model_config = ConfigDict(json_schema_extra={"example": {
-        "not_requested": 3, "running": 1, "complete": 3, "error": 1,
-        "awaiting_review": 2, "approved": 1, "rejected": 0, "overall": "in_progress"}})
+        "generation": "COMPLETE", "review": "PENDING", "overall": "awaiting_review"}})
 
-    not_requested: int = Field(
-        description="Accepted scenarios with no plan yet — what the UI's Generate button "
-                    "counts.")
-    running: int = Field(description="Plans currently generating.")
-    complete: int = Field(
-        description="Plans that finished generating, REVIEWED OR NOT — the generation total. "
-                    "It therefore OVERLAPS awaiting_review/approved/rejected, which split this "
-                    "same set by review verdict; only the four buckets not_requested + running "
-                    "+ complete + error sum to accepted_scenarios.")
-    error: int = Field(description="Plans that failed (a stale RUNNING projects as ERROR).")
-    awaiting_review: int = Field(
-        description="COMPLETE plans with no approve/reject decision yet — THE review-queue "
-                    "count, and the reason `overall` is not simply 'complete' once generation "
-                    "finishes.")
-    approved: int = Field(description="COMPLETE plans a reviewer approved.")
-    rejected: int = Field(description="COMPLETE plans a reviewer rejected.")
+
+    generation: TreatmentStageStatus = Field(
+        description="Plan GENERATION across every accepted scenario. PENDING = none requested "
+                    "yet (the UI shows Generate); RUNNING = at least one generating, or some "
+                    "scenario still has no plan; COMPLETE = every accepted scenario has a "
+                    "generated plan; ERROR = at least one failed. Mirrors "
+                    "SessionProgress.scenarios.")
+    review: TreatmentStageStatus = Field(
+        description="The HUMAN half. PENDING while any generated plan still lacks an "
+                    "approve/reject decision, COMPLETE once every one has been decided — a "
+                    "REJECTED plan counts as decided. Stays PENDING while generation is still "
+                    "running, because there is nothing to review yet. Never RUNNING: a person "
+                    "either has decided or has not.")
     overall: TreatmentProgress = Field(
-        description="One rolled-up status for the whole session's planning — the plan-board "
-                    "counterpart of SessionProgress.overall. See TreatmentProgress for the "
-                    "priority order; an ERROR outranks work still running, and a session whose "
-                    "plans are all generated but unreviewed reports `awaiting_review`, never "
-                    "`complete`.")
+        description="One rolled-up status for the whole session's planning — the counterpart of "
+                    "SessionProgress.overall, and the field a review queue filters on. See "
+                    "TreatmentProgress for the priority order. Every value names a state of "
+                    "the real flow AND the action it implies, so a UI can switch on this one "
+                    "field: pending -> Generate, generating -> spinner, awaiting_review -> "
+                    "Review, rejected -> Regenerate, approved -> done, error -> Retry. "
+                    "`rejected` is deliberately NOT folded into `approved`: regenerate works on "
+                    "a rejected plan, so it is work still outstanding.")
 
 
 class TreatmentBoard(ApiModel):
