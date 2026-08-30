@@ -109,8 +109,8 @@ class FakeLLM:
         self.chat_calls.append((system, user))
         if "VALIDATING pre-selected library threats" in system:
             payload = json.loads(user[user.index("{"):])
-            return json.dumps([self.validator_verdict(c)
-                               for c in payload["candidate_threats"]]), None
+            return json.dumps({"verdicts": [self.validator_verdict(c)
+                               for c in payload["candidate_threats"]]}), None
         # Stage-1b gap generation: one proposal that regrounds onto the validator-rejected
         # catalogue row (the reversal the hard drop must block) + one genuinely novel one.
         return json.dumps([

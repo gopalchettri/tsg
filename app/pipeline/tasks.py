@@ -634,22 +634,49 @@ def _validate_candidates(sess: Session, llm: LLMClient, scenario_session: dict,
         batch = candidates[start:start + s.validator_batch_size]
         messages = prompts.threat_validation_prompt(
             scenario_session["AssetName"], asset_context, subsystems, batch)
-        try:
-            parsed, _prov = _ask_ai(sess, llm, messages, scenario_session=scenario_session,
-                                    subsystem_id=subsystem_id, stage="threat_validation",
-                                    level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id,
-                                    expected_type=list,
-                                    temperature=s.threat_identification_temperature)
-        except LLMSlotUnavailable:
-            raise
-        except Exception:
-            sess.rollback()
-            degraded += 1
-            log.warning("threat_validation.batch_failed_fail_open",
-                        session_id=scenario_session["SessionID"],
-                        batch_start=start, batch_size=len(batch), exc_info=True)
+        # ONE retry before failing open. A malformed reply costs the WHOLE batch's verdicts
+        # (every candidate in it degrades to POTENTIALLY_RELEVANT), and the failure that
+        # prompted this was a one-off syntax slip — azure/gpt-5-mini emitting {"index:3", ...}
+        # in an otherwise well-formed 4,882-char reply. Re-asking is far cheaper than losing
+        # 20 verdicts. Bounded at ONE extra attempt: a model that malforms twice is not having
+        # a bad roll, and the fail-open path below is the correct answer for that.
+        # expected_type=dict is load-bearing, not cosmetic: it is what makes llm._chat_kwargs
+        # request provider-side JSON mode, which is what stops this class of slip at source.
+        parsed = None
+        for attempt in (1, 2):
+            try:
+                parsed, _prov = _ask_ai(sess, llm, messages, scenario_session=scenario_session,
+                                        subsystem_id=subsystem_id, stage="threat_validation",
+                                        level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id,
+                                        expected_type=dict,
+                                        temperature=s.threat_identification_temperature)
+                break
+            except LLMSlotUnavailable:
+                raise
+            except Exception:
+                sess.rollback()
+                if attempt == 1:
+                    log.warning("threat_validation.batch_retrying",
+                                session_id=scenario_session["SessionID"],
+                                batch_start=start, batch_size=len(batch), exc_info=True)
+                    continue
+                degraded += 1
+                log.warning("threat_validation.batch_failed_fail_open",
+                            session_id=scenario_session["SessionID"],
+                            batch_start=start, batch_size=len(batch), exc_info=True)
+        if parsed is None:
             continue
-        for item in parsed:
+        # The wire shape is {"verdicts": [...]} — see threat_validation_prompt. A reply that
+        # parses as an object but omits the key (or hands back something that is not a list)
+        # is treated exactly like a malformed one: no verdicts, fail open, never a crash.
+        items = parsed.get("verdicts")
+        if not isinstance(items, list):
+            degraded += 1
+            log.warning("threat_validation.batch_missing_verdicts",
+                        session_id=scenario_session["SessionID"], batch_start=start,
+                        batch_size=len(batch), got=sorted(parsed)[:8])
+            continue
+        for item in items:
             if not isinstance(item, dict):
                 continue
             idx = item.get("index")

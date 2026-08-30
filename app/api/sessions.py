@@ -933,11 +933,11 @@ def post_reject_scenarios(session_id: str, body: RejectBody,
 
 
 def enqueue_regeneration(session_id: str, subsystem_id: int, granularity: RegenGranularity,
-                        target_ids: list[str] | list[int] | None, epoch: int, user_note: str | None,
+                        target_ids: list[str] | list[int] | None, epoch: int,
                         entity_id: str, user_id: str | None) -> None:
     """Indirection so tests can run the cascade synchronously instead of via a broker."""
     regenerate_task.apply_async(
-        args=(session_id, subsystem_id, str(granularity), target_ids, epoch, user_note),
+        args=(session_id, subsystem_id, str(granularity), target_ids, epoch),
         shadow=(f"regenerate: session {session_id} · subsystem {subsystem_id} · "
                 f"entity {entity_id} · by {user_id} · {dal.now():%Y-%m-%d %H:%M} UTC"))
 
@@ -986,7 +986,7 @@ def _recover_from_enqueue_failure(session_id: str, subsystem_id: int, epoch: int
 
 
 def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, granularity: RegenGranularity,
-                target_ids: list[str] | list[int] | None, user_note: str | None) -> RegenerateResponse:
+                target_ids: list[str] | list[int] | None) -> RegenerateResponse:
     """Validates eligibility, guards against a concurrent regen/accept via a lock check plus a
     conditional UPDATE, resets the affected stage rows, hands off to the async regenerate task."""
     with db_session() as sess:
@@ -1017,7 +1017,7 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
         dal.reset_stage_for_regen(sess, session_id, subsystem_id, levels, epoch)
 
     try:
-        enqueue_regeneration(session_id, subsystem_id, granularity, target_ids, epoch, user_note,
+        enqueue_regeneration(session_id, subsystem_id, granularity, target_ids, epoch,
                             str(scenario_session["EntityID"]), scenario_session["UserID"])
     except Exception as exc:  # noqa: BLE001 — broker unreachable must not wedge SCENARIOS at IDLE
         _recover_from_enqueue_failure(session_id, subsystem_id, epoch, exc, "regen.enqueue_failed")
@@ -1035,7 +1035,7 @@ def post_regenerate_scenarios(session_id: str, body: RegenerateScenariosBody,
     to the session's asset (`session_id` in the URL is the sole identifier); `scenario_ids` alone
     picks which scenarios to redo."""
     return _do_regenerate(session_id, principal, ASSET_UNIT_ID, RegenGranularity.scenario,
-                        body.scenario_ids, body.user_note)
+                        body.scenario_ids)
 
 
 def enqueue_next_set(session_id: str, subsystem_id: int, epoch: int, threats_epoch: int,

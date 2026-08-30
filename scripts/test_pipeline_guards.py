@@ -318,12 +318,12 @@ def check_regen_audit_detail_carries_partial_failure_reasons() -> None:
     import json
 
     detail = json.loads(_build_regen_audit_detail(
-        {"t1", "t2", "t3"}, ["o1", "o2", "o3"], epoch=5, user_note=None,
+        {"t1", "t2", "t3"}, ["o1", "o2", "o3"], epoch=5,
         failed_threat_ids={"t2"}, rescored_threat_ids={"t3"}))
     assert detail["failed_threat_ids"] == ["t2"], detail
     assert detail["rescored_threat_ids"] == ["t3"], detail
 
-    bare = json.loads(_build_regen_audit_detail({"t1"}, ["o1"], epoch=1, user_note=None))
+    bare = json.loads(_build_regen_audit_detail({"t1"}, ["o1"], epoch=1))
     assert bare["failed_threat_ids"] == [], bare
     assert bare["rescored_threat_ids"] == [], bare
     print("ok  _build_regen_audit_detail carries partial-batch failed/rescored ids")

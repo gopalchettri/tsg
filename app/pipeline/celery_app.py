@@ -468,7 +468,7 @@ def run_pipeline_task(self, session_id: str) -> None:
                 soft_time_limit=_s.subsystem_task_soft_limit_seconds,
                 time_limit=_s.subsystem_task_hard_limit_seconds)
 def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
-                    target_ids: list[str] | list[int] | None, epoch: int, user_note: str | None = None) -> None:
+                    target_ids: list[str] | list[int] | None, epoch: int) -> None:
     """Redoes one or more scenarios of a session. Same `autoretry_for` reasoning as above.
     `epoch` is reserved once by the endpoint's session-level CAS and never minted here, so a
     redelivery re-executes at the SAME epoch and the CAS no-ops an already-terminal level."""
@@ -477,7 +477,7 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
         if session is None:
             return  # deleted or never existed by the time this task ran
         cascade.run_regeneration(sess, dict(session), subsystem_id, RegenGranularity(granularity),
-                                target_ids, epoch, get_llm(), self.request.id or guid(), user_note=user_note)
+                                target_ids, epoch, get_llm(), self.request.id or guid())
 
 
 # Same per-subsystem limit override and the same reasoning as regenerate_task above. THIS is the

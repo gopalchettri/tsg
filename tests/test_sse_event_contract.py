@@ -61,7 +61,7 @@ def test_last_regen_round_trips_the_audit_detail_shape():
     """RegenSummary must validate straight off _build_regen_audit_detail's DetailJSON keys
     (cascade.py) with no renaming -- build_board() passes that dict through unmodified."""
     detail = {"target_ids": ["t1"], "requested_ids": ["o1"], "replacements": [{"old": "o1", "new": "o2"}],
-            "failed_threat_ids": [], "rescored_threat_ids": [], "epoch": 3, "user_note": None}
+            "failed_threat_ids": [], "rescored_threat_ids": [], "epoch": 3}
     summary = RegenSummary.model_validate(detail)
     assert summary.epoch == 3
     assert summary.replacements == [{"old": "o1", "new": "o2"}]

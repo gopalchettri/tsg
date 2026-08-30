@@ -113,7 +113,9 @@ class FakeLLM:
                 verdict = "NOT_RELEVANT" if c["name"] in self.reject else "RELEVANT"
                 verdicts.append({"index": c["index"], "verdict": verdict,
                                  "justification": "the asset context settles it"})
-            return json.dumps(verdicts), None
+            # The validator contract is an OBJECT keyed by "verdicts" (prompts.py) — that is
+            # what lets the stage declare expected_type=dict and get provider-side JSON mode.
+            return json.dumps({"verdicts": verdicts}), None
         return json.dumps(self.proposals), None
 
 

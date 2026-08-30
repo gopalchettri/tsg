@@ -26,7 +26,6 @@ from app.core.enums import (
     WorkflowStage,
 )
 from app.core.logging import get_logger
-from app.core.security import redact
 from app.db import dal
 from app.db import models as m
 from app.db.dal import RegenerateConflict, guid, now
@@ -309,14 +308,14 @@ def _resolve_regen_context(scenario_session: dict) -> tuple[list[dict], dict]:
 
 
 def _build_regen_audit_detail(threat_ids: set[str] | None, target_ids: list[str] | list[int] | None,
-                            epoch: int, user_note: str | None,
+                            epoch: int,
                             replacements: list[dict] | None = None,
                             failed_threat_ids: set[str] | None = None,
                             rescored_threat_ids: set[str] | None = None) -> str:
     """Build audit JSON for a completed regeneration.
 
-    Include target and requested IDs, replacements, failed and rescored threat IDs, the epoch,
-    and a redacted user note. Return the JSON string.
+    Include target and requested IDs, replacements, failed and rescored threat IDs, and the
+    epoch. Return the JSON string.
     """
     return json.dumps({
         "target_ids": sorted(threat_ids) if threat_ids else None,
@@ -324,11 +323,11 @@ def _build_regen_audit_detail(threat_ids: set[str] | None, target_ids: list[str]
         "replacements": replacements or [],
         "failed_threat_ids": sorted(failed_threat_ids) if failed_threat_ids else [],
         "rescored_threat_ids": sorted(rescored_threat_ids) if rescored_threat_ids else [],
-        "epoch": epoch, "user_note": redact(user_note)})
+        "epoch": epoch})
 
 def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, granularity: RegenGranularity,
-                    target_ids: list[str] | list[int] | None, epoch: int, llm: LLMClient, task_id: str,
-                    user_note: str | None = None) -> str | None:
+                    target_ids: list[str] | list[int] | None, epoch: int, llm: LLMClient,
+                    task_id: str) -> str | None:
     """Regenerate selected scenarios for one subsystem.
 
     Validate target outputs, write replacements, record failures, publish advisory events, and
@@ -352,8 +351,7 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
     except Exception as exc:  # noqa: BLE001
         log.error("regen.pre_lock_error", session_id=sid, subsystem=subsystem_id, error=repr(exc))
         # Record this failure directly because no stage claim exists yet.
-        tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch,
-                            extra={"user_note": redact(user_note)} if user_note else None)
+        tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch)
         sess.commit()
         return tasks.decide_session_outcome(sess, scenario_session)
 
@@ -373,7 +371,7 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
                                 Stage=WorkflowStage.SCENARIO_GENERATION,
                                 EventType=AuditEventType.regeneration_completed, Granularity=str(granularity),
                                 DetailJSON=_build_regen_audit_detail(
-                                    {t.threat_id for t in targets.values()}, target_ids, epoch, user_note,
+                                    {t.threat_id for t in targets.values()}, target_ids, epoch,
                                     replacements=[p for p in _regen_replacements(sess, sid, subsystem_id, epoch)
                                                 if p["old"]],
                                     failed_threat_ids=unresolved.get("failed_ids"),
@@ -405,8 +403,7 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
             # Let task retry handling process this transient capacity error.
             raise
         except Exception as exc:  # noqa: BLE001
-            tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch,
-                                extra={"user_note": redact(user_note)} if user_note else None)
+            tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch)
             sess.commit()
 
     return tasks.decide_session_outcome(sess, scenario_session)

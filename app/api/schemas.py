@@ -260,7 +260,6 @@ class RegenerateScenariosBody(ApiModel):
         json_schema_extra={
             "example": {
                 "scenario_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"],
-                "user_note": "Please emphasize the insider-threat vector.",
             }
         }
     )
@@ -268,9 +267,10 @@ class RegenerateScenariosBody(ApiModel):
     scenario_ids: list[str] = Field(
         min_length=1, max_length=_MAX_BATCH, description="Output ids of the scenarios to regenerate. 1-50 ids."
     )
-    user_note: str | None = Field(
-        default=None, description="Optional free-text note from the reviewer guiding the regeneration (e.g. what to change)."
-    )
+    # No `user_note`. It was accepted here for a year and NEVER reached the model: it appears
+    # nowhere in prompts.py, and cascade.py only stamped it into a FAILURE audit record. A field
+    # whose description promises steering it cannot do is worse than no field, so it is gone —
+    # same call as the treatment-plan regenerate body, for the same reason.
 
     _canonicalize_scenario_ids = field_validator("scenario_ids")(_canonical_scenario_ids)
 
@@ -337,7 +337,7 @@ class RegenSummary(ApiModel):
                 "requested_ids": ["6ba7b810-9dad-11d1-80b4-00c04fd430c8"],
                 "replacements": [{"old": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
                                 "new": "b3fc2c96-3f66-4562-8fa6-5717afa63f66"}],
-                "failed_threat_ids": [], "rescored_threat_ids": [], "epoch": 4, "user_note": None,
+                "failed_threat_ids": [], "rescored_threat_ids": [], "epoch": 4,
             }
         }
     )
@@ -359,8 +359,6 @@ class RegenSummary(ApiModel):
     epoch: int = Field(
         description="Generation epoch this summary describes — compare against the `epoch` "
                     "returned by the POST that started the regenerate request.")
-    user_note: str | None = Field(
-        default=None, description="Free-text note the client supplied with the request, redacted.")
 
 
 class CoverageCell(ApiModel):

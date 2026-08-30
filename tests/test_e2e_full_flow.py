@@ -343,7 +343,7 @@ def test_regenerate_over_real_http(client, monkeypatch):
     sid, oid, _tid = _seed_reviewable_session(client)
     calls = []
     monkeypatch.setattr(sessions_mod, "enqueue_regeneration",
-                        lambda session_id, subsystem_id, granularity, target_ids, epoch, user_note,
+                        lambda session_id, subsystem_id, granularity, target_ids, epoch,
                             entity_id, user_id: calls.append((session_id, target_ids)))
 
     r = client.post(f"/v1/sessions/{sid}/regenerate/scenarios", json={"scenario_ids": [oid]})

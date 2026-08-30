@@ -391,9 +391,17 @@ def threat_validation_prompt(asset_name: str, asset_context: dict[str, Any],
         "supporting system, the sector, a rule) the verdict rests on — never a restatement "
         "of the threat.\n"
         "3) Use ONLY the supplied context — do not invent technologies or exposures.\n"
-        "\nOutput ONLY a JSON array of {\"index\": <int>, \"verdict\": \"RELEVANT\"|"
-        "\"POTENTIALLY_RELEVANT\"|\"NOT_RELEVANT\", \"justification\": \"<one sentence>\"} "
-        "— no markdown code fences, no text before or after it.")
+        # An OBJECT, not a bare array, SO THAT provider-side JSON mode can protect this stage:
+        # llm._chat_kwargs only sends response_format={"type":"json_object"} when the caller
+        # declares expected_type is dict, because that mode forces a top-level object. While
+        # this returned an array the stage ran unprotected, and azure/gpt-5-mini duly emitted
+        # {"index:3", ...} — a transposed quote/colon 499 chars in — which voided the verdicts
+        # for all 20 candidates in that batch. The word "json" must stay in this text: Azure
+        # rejects a json_object request with 400 unless it appears in the messages.
+        "\nOutput ONLY a JSON object of the form {\"verdicts\": [{\"index\": <int>, "
+        "\"verdict\": \"RELEVANT\"|\"POTENTIALLY_RELEVANT\"|\"NOT_RELEVANT\", "
+        "\"justification\": \"<one sentence>\"}]} — exactly one entry per candidate index, "
+        "no markdown code fences, no text before or after it.")
     return [
         {"role": "system", "content": system_content},
         {"role": "user", "content": _context_message(payload)},
