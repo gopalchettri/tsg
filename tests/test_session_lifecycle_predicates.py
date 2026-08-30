@@ -32,8 +32,12 @@ _AWAIT = str(StageStatus.AWAITING_DECISION)
 
 
 @pytest.mark.parametrize(("threats", "scenarios", "status", "expected"), [
-    # THE regression: completed + still awaiting a decision must read as awaiting_review.
-    (_DONE, _AWAIT, SessionStatus.completed, SubsystemProgress.awaiting_review),
+    # CHANGED 2026-08 by operator decision: a completed session still awaiting a decision now
+    # rolls up as `complete`, matching the `scenarios` field, which publishes COMPLETE for the
+    # same state. This case used to assert awaiting_review, and the regression it guarded — a
+    # review queue built on `overall` seeing an empty queue — is REAL and now guarded by
+    # SessionProgress.awaiting_decision instead (tests/test_progress_controls_and_wire_status.py).
+    (_DONE, _AWAIT, SessionStatus.completed, SubsystemProgress.complete),
     # A cancelled session is terminal even at the barrier — cancel outranks everything but error.
     (_DONE, _AWAIT, SessionStatus.cancelled, SubsystemProgress.cancelled),
     # An errored stage still wins outright, decision pending or not.

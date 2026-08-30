@@ -124,12 +124,15 @@ def get_overall_status(threats: str, scenarios: str, session_status: str) -> Sub
         return SubsystemProgress.error
     if session_status == SessionStatus.cancelled:
         return SubsystemProgress.cancelled
-    # AWAITING_DECISION is tested BEFORE `completed`, and the order is load-bearing: generation now
-    # completes the session at its review barrier (tasks._send_to_review) to release the asset, so
-    # a session with scenarios still waiting on a human is `completed` too. Testing `completed`
-    # first would report every such session as `complete` and the review queue would look empty.
-    if scenarios == StageStatus.AWAITING_DECISION:
-        return SubsystemProgress.awaiting_review
+    # `awaiting_review` is NO LONGER PRODUCED HERE (operator decision, 2026-08). A session whose
+    # scenarios sit at the review barrier now rolls up as `complete`, matching the `scenarios`
+    # field, which publishes COMPLETE for the same state.
+    #
+    # THE CAPABILITY THIS WOULD OTHERWISE DESTROY, and where it went: this branch used to be the
+    # only session-level signal that a human still owed an accept/reject, so dropping it alone
+    # would make the review queue look empty — every generated-but-undecided session reporting
+    # `complete`. That fact now rides on SessionProgress.awaiting_decision, a boolean computed
+    # from the same raw stage status. A review queue MUST filter on that, not on `overall`.
     if session_status == SessionStatus.completed:
         return SubsystemProgress.complete
     if all(v == StageStatus.IDLE for v in vals):
@@ -187,10 +190,11 @@ def _wire_stage_status(status: str) -> str:
     repeats "SCENARIOS" inside a field already called `scenarios`, while the published OpenAPI
     example has always said AWAITING_DECISION, so docs and wire already disagreed.
 
-    The review barrier is NOT lost: it is a SESSION-level fact and `progress.overall` still
-    reports `awaiting_review` for exactly this state (get_overall_status). A client asking "is
-    generation done" reads this field; a client asking "may I stop waiting for a human" reads
-    `overall`. Internally nothing moves — Subsystem_Stage_State keeps SCENARIOS_AWAITING_DECISION,
+    The review barrier is NOT lost, but it moved: `overall` no longer reports `awaiting_review`
+    (operator decision — it reports `complete` too), so the surviving signal is the explicit
+    boolean `progress.awaiting_decision`. A client asking "is generation done" reads this field;
+    a client asking "does a human still owe a decision" reads `awaiting_decision`. Internally
+    nothing moves — Subsystem_Stage_State keeps SCENARIOS_AWAITING_DECISION,
     which every claim, sweep predicate and stage_settled_at_epoch check still keys on. Changing
     the stored value would silently reopen the review barrier.
     """
@@ -228,10 +232,11 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
             error_messages[level] = str(row["ErrorMessage"])
     t = stages.get("threats", StageStatus.IDLE)
     sc = stages.get("scenarios", StageStatus.IDLE)
-    # `overall` is computed from the RAW statuses, before the wire mapping below — it is the
-    # field that still reports awaiting_review, and deriving it from a COMPLETE-ified value
-    # would erase the review barrier from the response entirely.
     overall = str(get_overall_status(t, sc, scenario_session["SessionStatus"]))
+    # Computed from the RAW status, never the wire value: _wire_stage_status maps
+    # AWAITING_DECISION to COMPLETE, so reading the mapped value here would report False for
+    # every session actually awaiting a decision — the exact signal this field exists to carry.
+    awaiting_decision = sc == StageStatus.AWAITING_DECISION
     return {
         "session_id": scenario_session["SessionID"], "entity_id": scenario_session["EntityID"],
         "asset_id": int(scenario_session["AssetID"]), "asset_name": scenario_session["AssetName"],
@@ -242,6 +247,7 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
         "progress": {
             "threats": _wire_stage_status(t), "scenarios": _wire_stage_status(sc),
             "overall": overall,
+            "awaiting_decision": awaiting_decision,
             # Control mapping is the tail of scenario generation and the longest step in the
             # pipeline, so scenarios go visible well before their controls do. This is the
             # session-level roll-up a UI waits on before rendering the finished card.

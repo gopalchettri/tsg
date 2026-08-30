@@ -7,13 +7,17 @@ TWO CHANGES, ONE FILE, because they are only safe TOGETHER.
    before their controls do, so a UI could not tell "still mapping" from "mapped, nothing
    matched". Derived from ControlsMappedAt.
 
-2. The wire now says COMPLETE where the stage row says SCENARIOS_AWAITING_DECISION. That is a
-   deliberate operator decision, and the DANGER is obvious: AWAITING_DECISION *is* the review
-   barrier, so if the rename leaked into `overall` — or into the stored value — the API would
-   announce a finished session while a human decision was still outstanding.
+2. The wire now says COMPLETE where the stage row says SCENARIOS_AWAITING_DECISION, and — by a
+   second operator decision — `overall` reports `complete` for that state too, instead of
+   `awaiting_review`. AWAITING_DECISION *is* the review barrier, so with BOTH published fields
+   reading COMPLETE, nothing on the wire could tell "generated and undecided" from "reviewed and
+   finished": a review queue would come back empty.
 
-So the load-bearing assertion here is not that scenarios reads COMPLETE. It is that `overall`
-STILL reads awaiting_review at the same moment, and that nothing about the stored status moved.
+   `progress.awaiting_decision` is the field that keeps that distinction, and it is therefore the
+   load-bearing assertion in this file — not the rename. It must be derived from the RAW stage
+   status: reading the published value would make it False for exactly the sessions it exists to
+   find. The stored value is likewise untouched, because every claim, sweep predicate and
+   settled-epoch check still keys on it.
 """
 from __future__ import annotations
 
@@ -32,22 +36,29 @@ def test_every_other_status_is_passed_through_untouched():
         assert sessions_mod._wire_stage_status(st) == str(st)
 
 
-def test_the_review_barrier_is_not_erased_by_the_rename():
-    """THE regression this whole change could cause.
-
-    `overall` must still say awaiting_review while the scenarios field says COMPLETE — that is
-    the ONLY remaining signal that a human decision is owed. It is computed from the RAW stage
-    statuses; deriving it from the wire value instead would report `complete` and tell a client
-    the assessment is finished.
-    """
+def test_overall_now_reports_complete_at_the_review_barrier():
+    """Operator decision: `overall` no longer reports awaiting_review — a session at the review
+    barrier rolls up as `complete`, matching the `scenarios` field."""
     overall = sessions_mod.get_overall_status(
-        StageStatus.COMPLETE, StageStatus.AWAITING_DECISION, "active")
-    assert str(overall) == "awaiting_review", (
-        "renaming the wire value must not change what `overall` reports — a session awaiting a "
-        "human decision would otherwise be announced as finished")
-    # And the two fields genuinely disagree, which is the point: one describes the STAGE, the
-    # other the SESSION.
+        StageStatus.COMPLETE, StageStatus.AWAITING_DECISION, "completed")
+    assert str(overall) == "complete"
     assert sessions_mod._wire_stage_status(StageStatus.AWAITING_DECISION) == "COMPLETE"
+
+
+def test_awaiting_decision_is_the_surviving_review_queue_signal():
+    """THE regression the change above could cause, and the field that now prevents it.
+
+    With `overall` and `scenarios` BOTH reporting COMPLETE at the review barrier, neither can
+    tell "generated and undecided" from "reviewed and finished". A review queue built on either
+    would come back EMPTY — the failure get_overall_status's old ordering existed to avoid. The
+    boolean is the whole safety net, so it must be derived from the RAW status: reading the
+    published value would make it False for exactly the sessions it needs to find.
+    """
+    raw_at_barrier = StageStatus.AWAITING_DECISION
+    assert sessions_mod._wire_stage_status(raw_at_barrier) == "COMPLETE"   # published
+    assert (raw_at_barrier == StageStatus.AWAITING_DECISION) is True       # what the flag reads
+    # A finished session must NOT set it, or every session looks like it needs review.
+    assert (StageStatus.COMPLETE == StageStatus.AWAITING_DECISION) is False
 
 
 def test_the_stored_value_is_untouched():

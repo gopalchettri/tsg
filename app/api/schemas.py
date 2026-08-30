@@ -410,7 +410,7 @@ class SessionProgress(ApiModel):
         json_schema_extra={
             "example": {
                 "threats": "COMPLETE", "scenarios": "COMPLETE", "controls": "COMPLETE",
-                "overall": "awaiting_review", "error_message": {},
+                "overall": "complete", "awaiting_decision": True, "error_message": {},
                 "last_next_set": {
                     "outcome": "partial_retryable", "requested": 5, "delivered": 3,
                     "variants": 0, "reason": None, "epoch": 4,
@@ -430,10 +430,25 @@ class SessionProgress(ApiModel):
         description="SCENARIOS stage status: IDLE, RUNNING, COMPLETE, ERROR, or CANCELLED. "
                     "COMPLETE means GENERATION finished — scenarios written and their controls "
                     "mapped. It does NOT mean the session is finished: a human still has to "
-                    "accept or reject, and `overall` reports `awaiting_review` for exactly that "
-                    "state. Internally the stage row still records the review barrier; this "
-                    "field answers 'is generation done', `overall` answers 'is anything owed'.")
-    overall: str = Field(description="Computed overall status: pending, in_progress, awaiting_review, complete, error, or cancelled.")
+                    "accept or reject, and `awaiting_decision` below reports true for exactly "
+                    "that state. Internally the stage row still records the review barrier; this "
+                    "field answers 'is generation done', `awaiting_decision` answers 'does a "
+                    "human still owe a decision'.")
+    overall: str = Field(
+        description="Computed overall status: pending, in_progress, complete, error, or "
+                    "cancelled. `awaiting_review` is NO LONGER PRODUCED — a session whose "
+                    "scenarios sit at the review barrier now reports `complete`, matching the "
+                    "`scenarios` field. DO NOT build a review queue on this field: use "
+                    "`awaiting_decision` below, which is the only remaining session-level signal "
+                    "that a human still owes an accept/reject.")
+    awaiting_decision: bool = Field(
+        default=False,
+        description="True while generated scenarios are still waiting on a human accept/reject. "
+                    "THE review-queue field. It exists because `overall` and `scenarios` both "
+                    "report COMPLETE for this state, so neither can distinguish 'generated and "
+                    "undecided' from 'reviewed and finished' — this boolean is what keeps that "
+                    "distinction on the wire. Computed from the raw stage status, never the "
+                    "published one.")
     controls: str = Field(
         default="PENDING",
         description="Step-4 control mapping, rolled up for the session: PENDING (nothing mapped "
@@ -456,7 +471,8 @@ class SessionProgress(ApiModel):
         description=(
             "Client-safe failure reason(s) for the most recent stage error(s), keyed by stage "
             "('threats'/'scenarios'). Empty on a clean board. A non-empty dict on an "
-            "awaiting_review board means the run failed mid-batch after generating some "
+            "board whose scenarios await a decision means the run failed mid-batch after "
+            "generating some "
             "scenarios — the review set may be PARTIAL, not a complete run. BREAKING CHANGE: "
             "this was a single `str | None` before — see the SSE contract guide."
         ),
@@ -508,7 +524,7 @@ class SessionBoard(ApiModel):
                 "stage_status": "COMPLETE",
                 "progress": {
                     "threats": "COMPLETE", "scenarios": "AWAITING_DECISION",
-                    "overall": "awaiting_review", "error_message": {},
+                    "overall": "complete", "awaiting_decision": True, "error_message": {},
                 },
             }
         }
