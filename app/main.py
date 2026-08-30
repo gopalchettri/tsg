@@ -52,7 +52,7 @@ def create_app() -> FastAPI:
         openapi_tags=[
             {"name": "Health", "description": "Liveness/readiness probes for orchestrators. No authentication required."},
             {
-                "name": "Sessions",
+                "name": "Threat Scenario Generation",
                 "description": (
                     "Create and drive a threat-scenario-generation session: identify threats, "
                     "generate scenarios, accept/regenerate/cancel, stream live progress, and "

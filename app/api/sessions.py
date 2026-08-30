@@ -84,7 +84,7 @@ from app.sse import bus
 
 log = get_logger(__name__)
 
-router = APIRouter(prefix="/v1", tags=["Sessions"])
+router = APIRouter(prefix="/v1", tags=["Threat Scenario Generation"])
 
 # Cross-session scenario reads get their own Swagger group. A SEPARATE router, not per-route
 # tags: FastAPI APPENDS route tags to router tags, which would list these under BOTH groups.
