@@ -179,6 +179,24 @@ def _coverage_verdict(sess: Session, session_id: str) -> dict | None:
     }
 
 
+def _wire_stage_status(status: str) -> str:
+    """DB status -> the value published on the wire.
+
+    SCENARIOS_AWAITING_DECISION becomes COMPLETE. The generation STAGE genuinely is finished at
+    that point — scenarios are written, controls are mapped — and the DB value redundantly
+    repeats "SCENARIOS" inside a field already called `scenarios`, while the published OpenAPI
+    example has always said AWAITING_DECISION, so docs and wire already disagreed.
+
+    The review barrier is NOT lost: it is a SESSION-level fact and `progress.overall` still
+    reports `awaiting_review` for exactly this state (get_overall_status). A client asking "is
+    generation done" reads this field; a client asking "may I stop waiting for a human" reads
+    `overall`. Internally nothing moves — Subsystem_Stage_State keeps SCENARIOS_AWAITING_DECISION,
+    which every claim, sweep predicate and stage_settled_at_epoch check still keys on. Changing
+    the stored value would silently reopen the review barrier.
+    """
+    return str(StageStatus.COMPLETE) if status == StageStatus.AWAITING_DECISION else str(status)
+
+
 def build_board(sess: Session, scenario_session: dict) -> dict:
     """The GET /sessions/{id} payload and the SSE reconnect-reconcile source.
 
@@ -210,15 +228,24 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
             error_messages[level] = str(row["ErrorMessage"])
     t = stages.get("threats", StageStatus.IDLE)
     sc = stages.get("scenarios", StageStatus.IDLE)
+    # `overall` is computed from the RAW statuses, before the wire mapping below — it is the
+    # field that still reports awaiting_review, and deriving it from a COMPLETE-ified value
+    # would erase the review barrier from the response entirely.
+    overall = str(get_overall_status(t, sc, scenario_session["SessionStatus"]))
     return {
         "session_id": scenario_session["SessionID"], "entity_id": scenario_session["EntityID"],
         "asset_id": int(scenario_session["AssetID"]), "asset_name": scenario_session["AssetName"],
         "user_id": scenario_session["UserID"],
         "session_status": scenario_session["SessionStatus"],
-        "current_stage": scenario_session["CurrentStage"], "stage_status": scenario_session["StageStatus"],
+        "current_stage": scenario_session["CurrentStage"],
+        "stage_status": _wire_stage_status(scenario_session["StageStatus"]),
         "progress": {
-            "threats": t, "scenarios": sc,
-            "overall": str(get_overall_status(t, sc, scenario_session["SessionStatus"])),
+            "threats": _wire_stage_status(t), "scenarios": _wire_stage_status(sc),
+            "overall": overall,
+            # Control mapping is the tail of scenario generation and the longest step in the
+            # pipeline, so scenarios go visible well before their controls do. This is the
+            # session-level roll-up a UI waits on before rendering the finished card.
+            "controls": dal.control_mapping_progress(sess, scenario_session["SessionID"]),
             "error_message": error_messages,
             # The DURABLE answer to "what did my last 'generate next set' click do?". The SSE
             # next_set_result event says the same thing, but publishing is best-effort with no

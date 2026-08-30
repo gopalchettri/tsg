@@ -33,6 +33,7 @@ from app.core.enums import (
     ActorType,
     AuditDecision,
     AuditEventType,
+    ControlMappingStatus,
     ScenarioDecisionReason,
     ScenarioStatus,
     SessionStatus,
@@ -1865,6 +1866,31 @@ def latest_coverage_verdict(sess: Session, session_id: str) -> dict | None:
         log.warning("audit.grounding_summary_unparseable", session_id=session_id)
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def control_mapping_progress(sess: Session, session_id: str) -> str:
+    """Session-level roll-up of Step-4 control mapping — see ControlMappingStatus.
+
+    DERIVED from Threat_Scenario.ControlsMappedAt, not stored: control mapping is the tail of
+    scenario generation and owns no stage row, so there is nothing to read a status from. One
+    aggregate over the session's ACTIVE scenarios — the same visibility rule /results uses, so
+    a superseded row cannot hold the session at RUNNING forever.
+
+    PENDING when there is nothing to map yet, which is also the honest answer before scenarios
+    exist: mapping has not started, and reporting COMPLETE for an empty set would tell a client
+    the card is ready to render when nothing has been generated.
+    """
+    total, mapped = sess.execute(
+        select(func.count(),
+               func.sum(case((m.Threat_Scenario.ControlsMappedAt.is_(None), 0), else_=1)))
+        .where(m.Threat_Scenario.SessionID == session_id,
+               m.Threat_Scenario.Status == ScenarioStatus.complete,
+               or_(active(m.Threat_Scenario.Superseded), m.Threat_Scenario.Accepted == 1))
+    ).one()
+    total, mapped = int(total or 0), int(mapped or 0)
+    if total == 0 or mapped == 0:
+        return str(ControlMappingStatus.PENDING)
+    return str(ControlMappingStatus.COMPLETE if mapped >= total else ControlMappingStatus.RUNNING)
 
 
 def latest_regen_outcome(sess: Session, session_id: str, subsystem_id: int) -> dict | None:

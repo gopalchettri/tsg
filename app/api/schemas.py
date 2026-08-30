@@ -409,7 +409,7 @@ class SessionProgress(ApiModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "threats": "COMPLETE", "scenarios": "AWAITING_DECISION",
+                "threats": "COMPLETE", "scenarios": "COMPLETE", "controls": "COMPLETE",
                 "overall": "awaiting_review", "error_message": {},
                 "last_next_set": {
                     "outcome": "partial_retryable", "requested": 5, "delivered": 3,
@@ -425,9 +425,24 @@ class SessionProgress(ApiModel):
         }
     )
 
-    threats: str = Field(description="THREATS stage status: IDLE, RUNNING, AWAITING_DECISION, COMPLETE, ERROR, or CANCELLED.")
-    scenarios: str = Field(description="SCENARIOS stage status: IDLE, RUNNING, AWAITING_DECISION, COMPLETE, ERROR, or CANCELLED.")
+    threats: str = Field(description="THREATS stage status: IDLE, RUNNING, COMPLETE, ERROR, or CANCELLED.")
+    scenarios: str = Field(
+        description="SCENARIOS stage status: IDLE, RUNNING, COMPLETE, ERROR, or CANCELLED. "
+                    "COMPLETE means GENERATION finished — scenarios written and their controls "
+                    "mapped. It does NOT mean the session is finished: a human still has to "
+                    "accept or reject, and `overall` reports `awaiting_review` for exactly that "
+                    "state. Internally the stage row still records the review barrier; this "
+                    "field answers 'is generation done', `overall` answers 'is anything owed'.")
     overall: str = Field(description="Computed overall status: pending, in_progress, awaiting_review, complete, error, or cancelled.")
+    controls: str = Field(
+        default="PENDING",
+        description="Step-4 control mapping, rolled up for the session: PENDING (nothing mapped "
+                    "yet), RUNNING (some scenarios mapped, some not), COMPLETE (every active "
+                    "scenario mapped). DERIVED from ControlsMappedAt — control mapping is the "
+                    "tail of scenario generation and owns no stage row. It is also the longest "
+                    "step in the pipeline, and scenarios become visible BEFORE their controls "
+                    "do, so poll this before rendering a finished card. The per-scenario twin is "
+                    "ScenarioResult.controls_mapped.")
     # BREAKING REST API CHANGE (plan item 7, deliberately shipped last and separately from the
     # rest of this file's changes): was `str | None`, last-row-wins across stages, so two
     # simultaneous stage failures silently dropped one message. Now a dict keyed by stage
@@ -490,7 +505,7 @@ class SessionBoard(ApiModel):
                 "user_id": "qa-user",
                 "session_status": "active",
                 "current_stage": "SCENARIO_GENERATION",
-                "stage_status": "AWAITING_DECISION",
+                "stage_status": "COMPLETE",
                 "progress": {
                     "threats": "COMPLETE", "scenarios": "AWAITING_DECISION",
                     "overall": "awaiting_review", "error_message": {},

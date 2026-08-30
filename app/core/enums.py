@@ -47,6 +47,24 @@ class StageStatus(StrEnum):
                                         # Subsystem_Stage_State row
 
 
+class ControlMappingStatus(StrEnum):
+    """How far Step-4 control mapping has got for a session, DERIVED — never stored.
+
+    Control mapping is the tail of scenario generation, not a stage of its own: it has no
+    Subsystem_Stage_State row, no claim and no lease. But it is also the longest single step in
+    the pipeline (604s of one 724s run), and scenarios become visible BEFORE it finishes — so a
+    UI polling the session sees complete scenarios carrying an empty `controls` list and cannot
+    tell "still mapping" from "mapped, nothing matched".
+
+    That distinction already exists per scenario as ScenarioResult.controls_mapped; this is the
+    session-level roll-up of the same fact, computed from Threat_Scenario.ControlsMappedAt, so a
+    client can wait for COMPLETE before rendering the finished card.
+    """
+    PENDING = "PENDING"    # scenarios not written yet, or written and none mapped
+    RUNNING = "RUNNING"    # some scenarios mapped, some not
+    COMPLETE = "COMPLETE"  # every active scenario carries a ControlsMappedAt stamp
+
+
 class SubsystemLevel(StrEnum):
     """One work cell within a subsystem (`Subsystem_Stage_State.Level`) — NOT a mirror of
     `WorkflowStage`, which is a different enum on a different column. Never conflate the two."""
