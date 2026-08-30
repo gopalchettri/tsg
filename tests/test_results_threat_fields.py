@@ -89,7 +89,7 @@ def _seed(Session) -> tuple[str, str]:
             ThreatCategory="Denial of Service", ThreatType="Ransomware on OT support systems",
             ThreatName="Ransomware on OT support systems",
             ThreatTypeID=57, ThreatCatalogueID=418, ThreatCategoryID=5,
-            Description="Ransomware encrypts OT support systems.", IsAIGenerated=False,
+            Description="Ransomware encrypts OT support systems.", IsThreatAIGenerated=False,
             LibraryThreatType="Malware/Ransomware", LibraryThreatName="OT ransomware",
             GroundingStatus="verified", GroundingScore=100.0, Superseded=0, CreatedAt=NOW,
             ThreatActorsJSON=json.dumps({"actors": ["Nation-state/APT"], "validated": True})))

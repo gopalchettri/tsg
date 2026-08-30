@@ -1202,7 +1202,7 @@ def scenario_threat_columns():
     return (it.ThreatID, it.ThreatTypeID, it.ThreatCatalogueID,
             it.ThreatCategory, it.ThreatCategoryID, it.ThreatType, it.ThreatName,
             it.Description, it.ThreatActorsJSON, it.LibraryThreatType, it.LibraryThreatName,
-            it.GroundingStatus, it.GroundingScore, it.IsAIGenerated)
+            it.GroundingStatus, it.GroundingScore, it.IsThreatAIGenerated, it.IsThreatTypeAIGenerated)
 
 
 def _scenario_read_select():

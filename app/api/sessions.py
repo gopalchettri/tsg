@@ -725,13 +725,15 @@ def _threat_block(threat_row: dict | None,
         # Independent facts: a threat's TYPE and its specific catalogue entry are matched
         # against the library separately (tasks.py sets ThreatTypeID/ThreatCatalogueID from
         # two different grounding results) — a threat can invent a new catalogue entry under
-        # an existing, already-curated type. threat_type_id has no own column to read this
-        # from; it derives straight from whether the type match itself is present.
-        "is_threat_type_ai_generated": threat_row.get("ThreatTypeID") is None,
-        # bool() so SQLite's 0/1 and MSSQL's bit serialize identically; None stays None
-        # (rows written before the column existed).
-        "is_threat_ai_generated": (None if threat_row.get("IsAIGenerated") is None
-                                else bool(threat_row.get("IsAIGenerated"))),
+        # an existing, already-curated type. Read from IsThreatTypeAIGenerated/IsThreatAIGenerated
+        # — dedicated immutable columns, NOT derived from ThreatTypeID/ThreatCatalogueID, because
+        # promote.py mutates both of those when it mints a new library row. bool() so SQLite's
+        # 0/1 and MSSQL's bit serialize identically; None stays None (rows written before the
+        # column existed).
+        "is_threat_type_ai_generated": (None if threat_row.get("IsThreatTypeAIGenerated") is None
+                                    else bool(threat_row.get("IsThreatTypeAIGenerated"))),
+        "is_threat_ai_generated": (None if threat_row.get("IsThreatAIGenerated") is None
+                                else bool(threat_row.get("IsThreatAIGenerated"))),
         "actors": [{"actor_id": (actor_ids or {}).get(n), "actor_name": n}
                 for n in actor_names],
         "grounding_score": threat_row.get("GroundingScore"),

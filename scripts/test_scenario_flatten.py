@@ -96,7 +96,7 @@ def main() -> None:
         # ThreatID present: _threat_block returns None without it, and an OUTER join on
         # ThreatID cannot produce a row that has the other threat columns but not this one.
         "ThreatID": "threat-1", "GroundingStatus": "matched", "GroundingScore": 91.0,
-        "IsAIGenerated": 0, "Description": None,
+        "IsThreatAIGenerated": 0, "Description": None,
         "ThreatTypeID": None, "ThreatCatalogueID": None,
         "ThreatType": "loss of availability", "ThreatName": "raw stage-1 name",
         "LibraryThreatType": "Loss of Availability (curated)", "LibraryThreatName": "Curated name",

@@ -5,7 +5,7 @@ What must hold, and why:
 
   - LIBRARY CANDIDATES ENTER FIRST: a validated catalogue candidate lands as an
     Identified_Threat row with GroundingStatus verified / GroundingScore 100.0 and the
-    catalogue's own identity (a real ThreatCatalogueID, IsAIGenerated False) — grounding is
+    catalogue's own identity (a real ThreatCatalogueID, IsThreatAIGenerated False) — grounding is
     identity, not similarity, so a rerank score here would be a fiction and downstream
     promote/scenario reads depend on the id being real.
   - the validator's NOT_RELEVANT is a HARD DROP, enforced twice: the candidate is removed
@@ -250,7 +250,7 @@ def test_library_first_end_to_end(monkeypatch):
             assert r.Description is None
             # Immutable provenance: this threat came FROM the catalogue, so it is not
             # AI-generated — the one column promotion must never rewrite.
-            assert r.IsAIGenerated is False
+            assert r.IsThreatAIGenerated is False
         # Catalogue identity stored: the real type id — the promote API is a pure writer
         # and reads these instead of guessing.
         assert retrieved[418].ThreatTypeID == 7 and retrieved[205].ThreatTypeID == 9
@@ -275,7 +275,7 @@ def test_library_first_end_to_end(monkeypatch):
         assert "operator attribution" in novel[0].ThreatName
         assert str(novel[0].GroundingStatus) == str(GroundingStatus.unverified)
         # Provenance IS the id: no catalogue row -> AI-generated.
-        assert novel[0].IsAIGenerated is True
+        assert novel[0].IsThreatAIGenerated is True
 
         # Ineligible catalogue rows never surface anywhere.
         assert 555 not in rows and 777 not in rows

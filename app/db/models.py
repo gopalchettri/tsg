@@ -169,7 +169,14 @@ class Identified_Threat(Base):
     # and grounding-verified rows are library threats -> False. Promotion later stamps
     # ThreatCatalogueID but must NOT touch this -- it answers "was this invented by the
     # AI?", which promotion doesn't change.
-    IsAIGenerated: Mapped[bool] = mapped_column(Boolean, default=False)
+    IsThreatAIGenerated: Mapped[bool] = mapped_column(Boolean, default=False)
+    # SAME rule, one level up: True <=> ThreatTypeID was NOT a library match at identification
+    # time. A SEPARATE fact from IsThreatAIGenerated above -- a threat can invent a new catalogue
+    # entry under an EXISTING, already-curated type (IsThreatAIGenerated True, this False). Without
+    # its own column this would have to be derived from live ThreatTypeID, which promotion DOES
+    # mutate (mints a new Threat_Type and stamps its id here) -- exactly the trap this column
+    # exists to avoid, mirroring IsThreatAIGenerated's own reasoning above.
+    IsThreatTypeAIGenerated: Mapped[bool] = mapped_column(Boolean, default=False)
     GroundingStatus: Mapped[str] = mapped_column(Unicode(100))
     GroundingScore: Mapped[float | None] = mapped_column(Float)
     # WHICH cutoff judged this row: 'calibrated' (measured for this exact model pair),

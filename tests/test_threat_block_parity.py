@@ -3,9 +3,9 @@
   * ONE shared Identified_Threat column list (dal.scenario_threat_columns) feeds all three
     scenario reads — the drift where /accepted-scenarios answered null while /results
     carried the value can never come back; the list now carries ThreatCatalogueID and
-    IsAIGenerated (ThemeID/AssetTypeID left with the register);
+    IsThreatAIGenerated (ThemeID/AssetTypeID left with the register);
   * the SAME threat row produces the SAME _threat_block through both read paths;
-  * _build_threat_records stamps the immutable IsAIGenerated provenance flag from
+  * _build_threat_records stamps the immutable IsThreatAIGenerated provenance flag from
     gr.catalogue_id alone, whichever door the threat entered;
   * the treatment presenters coalesce the curator's wording exactly like /results;
   * the prompt-redaction net covers the pipeline dicts' own key spellings;
@@ -50,7 +50,7 @@ def test_all_scenario_reads_select_the_one_shared_threat_column_list():
     assert "*dal.scenario_threat_columns()," in ssrc
     # And the list carries the catalogue-model fields; the register-era columns are gone.
     assert {"ThreatCatalogueID", "ThreatCategoryID", "Description",
-            "IsAIGenerated"} <= canonical
+            "IsThreatAIGenerated"} <= canonical
     assert not {"ThemeID", "AssetTypeID"} & canonical
 
 
@@ -75,16 +75,16 @@ def _record(gr):
 
 def test_catalogue_verified_threat_is_not_ai_generated():
     """A generated proposal VERIFIED onto a live catalogue row is library provenance:
-    IsAIGenerated False, and the row stores the catalogue id it verified onto."""
+    IsThreatAIGenerated False, and the row stores the catalogue id it verified onto."""
     row, summary = _record(_gr(catalogue_id=418))
     assert row["ThreatCatalogueID"] == 418
-    assert row["IsAIGenerated"] is False and summary["is_ai_generated"] is False
+    assert row["IsThreatAIGenerated"] is False and summary["is_ai_generated"] is False
 
 
 def test_unverified_generated_threat_is_ai_generated():
     row, summary = _record(_gr())
     assert row["ThreatCatalogueID"] is None
-    assert row["IsAIGenerated"] is True and summary["is_ai_generated"] is True
+    assert row["IsThreatAIGenerated"] is True and summary["is_ai_generated"] is True
 
 
 def test_retrieved_style_grounding_is_library_provenance():
@@ -92,7 +92,7 @@ def test_retrieved_style_grounding_is_library_provenance():
     match, no cutoff consulted) — the SAME catalogue_id-is-None rule must brand every
     retrieved threat as library, never AI."""
     row, summary = _record(_gr(catalogue_id=418))
-    assert row["IsAIGenerated"] is False
+    assert row["IsThreatAIGenerated"] is False
     assert summary["catalogue_id"] == 418
 
 
@@ -130,7 +130,7 @@ def _seeded_session(tmp_path):
 
 def test_both_read_paths_serve_the_identical_threat_block(tmp_path):
     """The wire-level bite for the original defect: /accepted-scenarios' row and /results'
-    row build byte-identical threat blocks — ThreatCatalogueID and IsAIGenerated
+    row build byte-identical threat blocks — ThreatCatalogueID and IsThreatAIGenerated
     populated on BOTH, not just one."""
     Session, sid = _seeded_session(tmp_path)
     with Session() as s:
@@ -143,6 +143,7 @@ def test_both_read_paths_serve_the_identical_threat_block(tmp_path):
     assert block_a == block_r
     assert block_a["threat_catalogue_id"] == 418
     assert block_a["is_threat_ai_generated"] is False
+    assert block_a["is_threat_type_ai_generated"] is False
     assert block_a["actors"] == [{"actor_id": 3, "actor_name": "APT33"}]
 
 
@@ -177,7 +178,13 @@ def test_calibration_script_no_longer_passes_the_deleted_sector_kwarg():
 
 
 def test_promotion_never_touches_the_provenance_flag():
-    """IsAIGenerated is immutable history — promote stamps ThreatCatalogueID but a
-    promoted AI threat must keep answering True to 'was this invented by the AI?'."""
+    """IsThreatAIGenerated/IsThreatTypeAIGenerated are immutable history — promote stamps
+    ThreatCatalogueID/ThreatTypeID but a promoted AI threat must keep answering True to
+    'was this invented by the AI?' at both the catalogue AND the type level. Cross-check
+    finding: the type-level flag was ORIGINALLY derived live from ThreatTypeID, which
+    promote.py DOES mutate — silently flipping it after promotion. Fixed by giving it its
+    own dedicated column, mirroring IsThreatAIGenerated exactly; this guard is what would have
+    caught that bug before it shipped."""
     src = (_ROOT / "app" / "pipeline" / "promote.py").read_text(encoding="utf-8")
-    assert "IsAIGenerated" not in src
+    assert "IsThreatAIGenerated" not in src
+    assert "IsThreatTypeAIGenerated" not in src

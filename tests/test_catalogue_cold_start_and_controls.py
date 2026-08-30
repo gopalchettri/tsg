@@ -4,7 +4,7 @@ COLD START (half A): with Threat_Catalogue AND Threat_Type both empty — a fres
 deployment before eyshield seeds anything — no stage may hard-depend on library data.
 Retrieval must return [] (loudly, not raise), and find_threats must still deliver a full
 round of AI-generated threats: every row unverified, no ThreatTypeID/ThreatCatalogueID
-claimed against a library that holds nothing, IsAIGenerated True (the immutable
+claimed against a library that holds nothing, IsThreatAIGenerated True (the immutable
 provenance bit), the AI's own type names stored. If any stage threw or silently claimed
 library ids here, an empty system could never bootstrap itself — the documented
 cold-start guarantee ("the AI generates everything, types included").
@@ -127,7 +127,7 @@ def test_cold_start_find_threats_generates_everything_unverified(monkeypatch):
     """THE cold-start guarantee. With both library tables empty, find_threats must still
     deliver the AI's proposals as Identified_Threat rows — all unverified, with NO library
     ids claimed (ThreatTypeID/ThreatCatalogueID None: there is nothing to verify against),
-    IsAIGenerated True, the AI's own type names stored. A verified status or a non-NULL
+    IsThreatAIGenerated True, the AI's own type names stored. A verified status or a non-NULL
     catalogue id here would fabricate library provenance that promote/accept/dedup all
     trust."""
     engine, _ = _cold_engine()
@@ -178,7 +178,7 @@ def test_cold_start_find_threats_generates_everything_unverified(monkeypatch):
         assert row.LibraryThreatType is None and row.LibraryThreatName is None
         # Immutable provenance: nothing came from the (empty) catalogue, so every row is
         # the AI's own invention — the bit promote must never rewrite.
-        assert row.IsAIGenerated is True
+        assert row.IsThreatAIGenerated is True
     # The AI's own type wording is what got stored — there was no library type to substitute.
     assert {r.ThreatType for r in rows} == {p["type"] for p in _PROPOSALS}
     # Coverage fan-out still works with zero library data (grid copies on the subsystem).
@@ -230,7 +230,7 @@ def _seed_output(s, sid: str, out_id: str, *, catalogue_id=None, library_name=No
         ThreatCatalogueID=catalogue_id, LibraryThreatName=library_name,
         LibraryThreatType=library_type,
         GroundingStatus="verified" if catalogue_id is not None else "unverified",
-        IsAIGenerated=catalogue_id is None))
+        IsThreatAIGenerated=catalogue_id is None))
     s.execute(m.Scoped_Threat.__table__.insert().values(
         ScopedThreatID=st_id, SessionID=sid, SubsystemID=0, ThreatID=tid,
         Score=1.0, ScopeRank=1, Selected=1))

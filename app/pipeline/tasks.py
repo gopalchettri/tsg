@@ -428,7 +428,11 @@ def _build_threat_records(tid: str, sid: str, tenant: str, ss: int, ptype: str |
         # Immutable provenance, set once here (the ONLY threat-row writer): True <=> not in
         # the catalogue at identification. Promotion stamps ThreatCatalogueID later but
         # must not rewrite history by touching this.
-        "IsAIGenerated": gr.catalogue_id is None,
+        "IsThreatAIGenerated": gr.catalogue_id is None,
+        # Same rule, type-level: True <=> the TYPE was not a library match at identification.
+        # A separate fact from the catalogue-level one above — promotion mints ThreatTypeID
+        # later but must not rewrite history by touching this either.
+        "IsThreatTypeAIGenerated": gr.type_id is None,
         "GroundingStatus": gr.status, "GroundingScore": gr.score,
         # WHICH cutoff produced GroundingStatus. Without it, a 78 graded `verified` under the
         # untuned default 75.0 is indistinguishable from one graded under a measured 86.25 — so

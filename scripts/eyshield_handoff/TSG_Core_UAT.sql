@@ -235,7 +235,8 @@ CREATE TABLE Identified_Threat (
     LibraryThreatName  nvarchar(500) NULL,
     ThreatTypeID       int           NULL,
     ThreatCatalogueID  int           NULL,   -- Threat_Catalogue.ThreatCatalogueID; set <=> GroundingStatus verified
-    IsAIGenerated      bit           NOT NULL DEFAULT 0, -- immutable provenance: 1 = NOT in the catalogue at identification (invented by the AI); promotion never flips it
+    IsThreatAIGenerated bit          NOT NULL DEFAULT 0, -- immutable provenance: 1 = NOT in the catalogue at identification (invented by the AI); promotion never flips it
+    IsThreatTypeAIGenerated bit      NOT NULL DEFAULT 0, -- same rule, type-level: 1 = ThreatTypeID was NOT a library match at identification; separate fact from IsAIGenerated, promotion never flips it either
     GroundingStatus    nvarchar(100)  NOT NULL,
     GroundingScore     float         NULL,
     Superseded         int           NOT NULL,
@@ -320,9 +321,21 @@ IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Identified_Threat', 'ThreatCatalogueID') IS NULL
     ALTER TABLE Identified_Threat ADD ThreatCatalogueID int NULL;
 
+-- Legacy name here on purpose: this guard is "does an ancient DB have the column AT ALL",
+-- for a deployment that predates IsAIGenerated existing. The rename block further down
+-- (positioned AFTER this, per this file's own POSITION IS LOAD-BEARING rule) converts
+-- whatever this leaves behind -- freshly-added or already-present -- to IsThreatAIGenerated.
+-- Renaming this guard's own target to the NEW name would let it fire on an existing DB that
+-- already has IsAIGenerated with real data, adding a SECOND, freshly-defaulted column before
+-- the rename ever runs and silently orphaning the real history in the old one.
 IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Identified_Threat', 'IsAIGenerated') IS NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'IsThreatAIGenerated') IS NULL
     ALTER TABLE Identified_Threat ADD IsAIGenerated bit NOT NULL DEFAULT 0;
+
+IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'IsThreatTypeAIGenerated') IS NULL
+    ALTER TABLE Identified_Threat ADD IsThreatTypeAIGenerated bit NOT NULL DEFAULT 0;
 
 IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NULL
 CREATE TABLE Threat_Scenario (
@@ -551,6 +564,13 @@ IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'OutputID') IS NOT NULL
     AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'ScenarioID') IS NULL
     EXEC sp_rename 'dbo.Risk_Treatment_Plan.OutputID', 'ScenarioID', 'COLUMN';
+
+-- IsAIGenerated -> IsThreatAIGenerated: matches IsThreatTypeAIGenerated's naming (added
+-- alongside it, same table) instead of leaving the older column the one inconsistent name.
+IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'IsAIGenerated') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'IsThreatAIGenerated') IS NULL
+    EXEC sp_rename 'dbo.Identified_Threat.IsAIGenerated', 'IsThreatAIGenerated', 'COLUMN';
 
 
 -- One row per grounding-threshold calibration sweep, and the THRESHOLD STORE:
