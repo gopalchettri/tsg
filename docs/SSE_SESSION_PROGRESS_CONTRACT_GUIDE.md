@@ -104,8 +104,7 @@ Sent exactly once per connect/reconnect, **before** any live event, as the full 
   "stage_status": "COMPLETE",
   "progress": {
     "threats": "COMPLETE", "scenarios": "COMPLETE", "controls": "COMPLETE",
-    "overall": "complete",
-    "awaiting_decision": true,
+    "overall": "awaiting_review",
     "error_message": {},
     "last_next_set": {"outcome": "partial_retryable", "requested": 5, "delivered": 3,
                     "variants": 0, "reason": null, "epoch": 4},

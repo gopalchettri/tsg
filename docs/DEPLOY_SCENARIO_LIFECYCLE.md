@@ -68,7 +68,7 @@ loudly at deploy rather than quietly at runtime. Migrate first and it is a non-e
 
 | Change | What clients must do |
 |---|---|
-| A session reports `SessionStatus = completed` while its scenarios still await decisions | **Do not treat `completed` as "review finished".** As of 2026-08 the rollup reports `complete` here too, and `progress.scenarios` reads `COMPLETE` — so NEITHER distinguishes it. Poll the boolean `progress.awaiting_decision`: it is true while a human still owes an accept/reject, and it is the only field that says so. `overall: awaiting_review` is no longer produced. |
+| A session reports `SessionStatus = completed` while its scenarios still await decisions | **Do not treat `completed` as "review finished".** Poll `progress.overall`: it reports `awaiting_review` while any scenario is still undecided and `complete` once every one has been accepted or rejected. Note `progress.scenarios` reads `COMPLETE` from the moment GENERATION finishes — that field answers "is generation done", not "has anyone reviewed it". |
 | Accept is repeatable | Calling accept again with different scenario ids is normal, not an error |
 | New: `POST /v1/sessions/{session_id}/scenarios/reject` | Body `{"scenario_ids": [...]}`. Records a decision; does not delete anything |
 | Accept's 404 body may carry `already_rejected`; reject's may carry `already_accepted` | Both are typed values in `details.unacceptable[].reason` |

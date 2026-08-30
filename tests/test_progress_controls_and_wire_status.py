@@ -7,17 +7,16 @@ TWO CHANGES, ONE FILE, because they are only safe TOGETHER.
    before their controls do, so a UI could not tell "still mapping" from "mapped, nothing
    matched". Derived from ControlsMappedAt.
 
-2. The wire now says COMPLETE where the stage row says SCENARIOS_AWAITING_DECISION, and — by a
-   second operator decision — `overall` reports `complete` for that state too, instead of
-   `awaiting_review`. AWAITING_DECISION *is* the review barrier, so with BOTH published fields
-   reading COMPLETE, nothing on the wire could tell "generated and undecided" from "reviewed and
-   finished": a review queue would come back empty.
+2. The wire says COMPLETE where the stage row says SCENARIOS_AWAITING_DECISION, so `scenarios`
+   answers exactly one question: is GENERATION done. The stored value is untouched — every
+   claim, sweep predicate and settled-epoch check still keys on it.
 
-   `progress.awaiting_decision` is the field that keeps that distinction, and it is therefore the
-   load-bearing assertion in this file — not the rename. It must be derived from the RAW stage
-   status: reading the published value would make it False for exactly the sessions it exists to
-   find. The stored value is likewise untouched, because every claim, sweep predicate and
-   settled-epoch check still keys on it.
+   That leaves `overall` to answer the other question: does a human still owe a decision. It
+   CANNOT do that from the stage status, because SCENARIOS parks at the barrier permanently
+   (accept never rewrites it, deliberately, so decisions stay changeable) — keyed on the stage
+   alone, an untouched session and a fully reviewed one report the same value forever. So it is
+   derived from the SCENARIO DECISIONS, and the load-bearing assertion in this file is that
+   those two sessions come back DIFFERENT.
 """
 from __future__ import annotations
 
@@ -36,35 +35,41 @@ def test_every_other_status_is_passed_through_untouched():
         assert sessions_mod._wire_stage_status(st) == str(st)
 
 
-def test_overall_now_reports_complete_at_the_review_barrier():
-    """Operator decision: `overall` no longer reports awaiting_review — a session at the review
-    barrier rolls up as `complete`, matching the `scenarios` field."""
-    overall = sessions_mod.get_overall_status(
-        StageStatus.COMPLETE, StageStatus.AWAITING_DECISION, "completed")
-    assert str(overall) == "complete"
-    assert sessions_mod._wire_stage_status(StageStatus.AWAITING_DECISION) == "COMPLETE"
+def test_overall_tells_an_unreviewed_session_from_a_fully_reviewed_one():
+    """THE point of this field, and the thing a stage-only rollup could never do.
+
+    Both sessions below are `completed` with SCENARIOS parked at the review barrier — that
+    stage is NEVER moved off it, because accept deliberately leaves decisions changeable. So
+    the ONLY thing separating "nobody has looked at this" from "every scenario decided" is
+    whether undecided rows remain.
+    """
+    at_barrier = (StageStatus.COMPLETE, StageStatus.AWAITING_DECISION, "completed")
+    nobody_reviewed = sessions_mod.get_overall_status(*at_barrier, undecided=True)
+    all_decided = sessions_mod.get_overall_status(*at_barrier, undecided=False)
+
+    assert str(nobody_reviewed) == "awaiting_review"
+    assert str(all_decided) == "complete"
+    assert nobody_reviewed != all_decided, (
+        "these two sessions must not report the same status — that identity is the bug this "
+        "parameter exists to remove, and it is what a stage-only rollup produced")
 
 
-def test_awaiting_decision_reads_the_raw_status_not_the_published_one():
-    """With `overall` and `scenarios` BOTH reporting COMPLETE at the review barrier, this
-    boolean is the only thing left that can tell "generated and undecided" from "reviewed and
-    finished". Reading the PUBLISHED value would make it False for exactly the sessions it
-    exists to find."""
-    assert sessions_mod._wire_stage_status(StageStatus.AWAITING_DECISION) == "COMPLETE"
-    assert StageStatus.AWAITING_DECISION != StageStatus.COMPLETE, (
-        "the flag distinguishes these two; if the enum ever collapses them it is unbuildable")
+def test_a_terminal_state_still_outranks_the_review_barrier():
+    """Priority order is load-bearing: an error or a cancellation is the answer even when a
+    decision is outstanding, or a dead session sits in the review queue forever."""
+    at_barrier = (StageStatus.AWAITING_DECISION, "completed")
+    assert str(sessions_mod.get_overall_status(
+        StageStatus.ERROR, *at_barrier, undecided=True)) == "error"
+    assert str(sessions_mod.get_overall_status(
+        StageStatus.COMPLETE, StageStatus.AWAITING_DECISION, "cancelled",
+        undecided=True)) == "cancelled"
 
 
 def test_undecided_predicate_turns_off_once_everything_is_decided():
-    """THE bug this predicate exists for, and it is NOT hypothetical.
-
-    Subsystem_Stage_State.SCENARIOS is parked at AWAITING_DECISION when generation hits the
-    review barrier and is NEVER moved off it — accept_session() does not rewrite that row. A
-    flag keyed on the stage alone therefore reads true FOREVER, and a review queue fed by it
-    never empties. The scenarios themselves are the honest source.
-    """
+    """The source `undecided` comes from. Keyed on the stage instead, it would read true
+    FOREVER — the stage never leaves the barrier — and the review queue would never empty."""
     assert dal.has_undecided_scenarios(_CountSession(3), "s") is True   # 3 still undecided
-    assert dal.has_undecided_scenarios(_CountSession(0), "s") is False  # all decided -> queue empties
+    assert dal.has_undecided_scenarios(_CountSession(0), "s") is False  # all decided -> empties
 
 
 def test_the_stored_value_is_untouched():

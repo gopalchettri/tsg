@@ -116,23 +116,36 @@ def enqueue_pipeline(session_id: str, entity_id: str, user_id: str | None) -> No
 
 
 # --- status board ---
-def get_overall_status(threats: str, scenarios: str, session_status: str) -> SubsystemProgress:
+def get_overall_status(threats: str, scenarios: str, session_status: str,
+                       *, undecided: bool = False) -> SubsystemProgress:
     """Rolls the threat stage, scenario stage and session status into one display status.
-    Checks run in priority order — first match wins."""
+    Checks run in priority order — first match wins.
+
+    `undecided` — does any active scenario still lack an accept/reject (dal.has_undecided_
+    scenarios). It is a PARAMETER rather than something derived here because this function is
+    pure and stage-only, while the answer lives in the scenario rows.
+
+    It is also what makes this rollup able to tell two genuinely different sessions apart. The
+    stage status CANNOT: Subsystem_Stage_State.SCENARIOS parks at AWAITING_DECISION when
+    generation reaches the review barrier and is never moved off it (accept_session does not
+    rewrite it — deliberately, so decisions stay changeable). Keyed on the stage alone, a
+    fully-reviewed session and an untouched one look identical forever.
+    """
     vals = (threats, scenarios)
     if StageStatus.ERROR in vals:
         return SubsystemProgress.error
     if session_status == SessionStatus.cancelled:
         return SubsystemProgress.cancelled
-    # `awaiting_review` is NO LONGER PRODUCED HERE (operator decision, 2026-08). A session whose
-    # scenarios sit at the review barrier now rolls up as `complete`, matching the `scenarios`
-    # field, which publishes COMPLETE for the same state.
+    # Tested BEFORE `completed`, and the order is load-bearing: generation completes the session
+    # at its review barrier (tasks._send_to_review) to release the asset, so a session still
+    # awaiting a human is `completed` too. Testing `completed` first would report every one of
+    # them as `complete` and the review queue would look empty.
     #
-    # THE CAPABILITY THIS WOULD OTHERWISE DESTROY, and where it went: this branch used to be the
-    # only session-level signal that a human still owed an accept/reject, so dropping it alone
-    # would make the review queue look empty — every generated-but-undecided session reporting
-    # `complete`. That fact now rides on SessionProgress.awaiting_decision, a boolean computed
-    # from the same raw stage status. A review queue MUST filter on that, not on `overall`.
+    # The `undecided` half is what the earlier stage-only version got wrong. Without it this
+    # branch fires for a FULLY REVIEWED session as well — the stage never leaves the barrier —
+    # so "nobody has reviewed this" and "every scenario accepted" reported the same value.
+    if scenarios == StageStatus.AWAITING_DECISION and undecided:
+        return SubsystemProgress.awaiting_review
     if session_status == SessionStatus.completed:
         return SubsystemProgress.complete
     if all(v == StageStatus.IDLE for v in vals):
@@ -232,15 +245,12 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
             error_messages[level] = str(row["ErrorMessage"])
     t = stages.get("threats", StageStatus.IDLE)
     sc = stages.get("scenarios", StageStatus.IDLE)
-    overall = str(get_overall_status(t, sc, scenario_session["SessionStatus"]))
-    # TWO conditions, and the second is the one that makes this field usable. The RAW status
-    # (never the wire value — _wire_stage_status maps AWAITING_DECISION to COMPLETE) says
-    # generation reached the review barrier. But that stage row is NEVER moved off
-    # AWAITING_DECISION again: accept_session() does not rewrite it, so on its own this flag
-    # would read true forever and the review queue would never empty. The scenarios themselves
-    # are the honest source of "is anything still undecided".
-    awaiting_decision = (sc == StageStatus.AWAITING_DECISION
-                         and dal.has_undecided_scenarios(sess, scenario_session["SessionID"]))
+    # Read from the scenario rows, not the stage: the stage parks at the barrier permanently, so
+    # it cannot distinguish "nobody reviewed" from "all reviewed". Computed from the RAW status
+    # too — _wire_stage_status maps AWAITING_DECISION to COMPLETE for publication only.
+    undecided = (sc == StageStatus.AWAITING_DECISION
+                 and dal.has_undecided_scenarios(sess, scenario_session["SessionID"]))
+    overall = str(get_overall_status(t, sc, scenario_session["SessionStatus"], undecided=undecided))
     return {
         "session_id": scenario_session["SessionID"], "entity_id": scenario_session["EntityID"],
         "asset_id": int(scenario_session["AssetID"]), "asset_name": scenario_session["AssetName"],
@@ -251,7 +261,6 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
         "progress": {
             "threats": _wire_stage_status(t), "scenarios": _wire_stage_status(sc),
             "overall": overall,
-            "awaiting_decision": awaiting_decision,
             # Control mapping is the tail of scenario generation and the longest step in the
             # pipeline, so scenarios go visible well before their controls do. This is the
             # session-level roll-up a UI waits on before rendering the finished card.

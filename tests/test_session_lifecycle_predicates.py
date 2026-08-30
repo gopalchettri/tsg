@@ -31,25 +31,26 @@ _DONE = str(StageStatus.COMPLETE)
 _AWAIT = str(StageStatus.AWAITING_DECISION)
 
 
-@pytest.mark.parametrize(("threats", "scenarios", "status", "expected"), [
-    # CHANGED 2026-08 by operator decision: a completed session still awaiting a decision now
-    # rolls up as `complete`, matching the `scenarios` field, which publishes COMPLETE for the
-    # same state. This case used to assert awaiting_review, and the regression it guarded — a
-    # review queue built on `overall` seeing an empty queue — is REAL and now guarded by
-    # SessionProgress.awaiting_decision instead (tests/test_progress_controls_and_wire_status.py).
-    (_DONE, _AWAIT, SessionStatus.completed, SubsystemProgress.complete),
+@pytest.mark.parametrize(("threats", "scenarios", "status", "expected", "undecided"), [
+    # THE regression, and it now takes TWO rows because the stage alone cannot express it:
+    # SCENARIOS parks at the barrier permanently (accept never rewrites it, so decisions stay
+    # changeable), so `undecided` is what separates a session nobody has reviewed from one that
+    # is fully decided. Keyed on the stage alone these two collapse into one value and a review
+    # queue built on `overall` is either empty or never empties.
+    (_DONE, _AWAIT, SessionStatus.completed, SubsystemProgress.awaiting_review, True),
+    (_DONE, _AWAIT, SessionStatus.completed, SubsystemProgress.complete, False),
     # A cancelled session is terminal even at the barrier — cancel outranks everything but error.
-    (_DONE, _AWAIT, SessionStatus.cancelled, SubsystemProgress.cancelled),
+    (_DONE, _AWAIT, SessionStatus.cancelled, SubsystemProgress.cancelled, True),
     # An errored stage still wins outright, decision pending or not.
-    (str(StageStatus.ERROR), _AWAIT, SessionStatus.completed, SubsystemProgress.error),
+    (str(StageStatus.ERROR), _AWAIT, SessionStatus.completed, SubsystemProgress.error, True),
     # Legacy shape: completed with no decision outstanding (pre-lifecycle APPROVED rows).
-    (_DONE, _DONE, SessionStatus.completed, SubsystemProgress.complete),
+    (_DONE, _DONE, SessionStatus.completed, SubsystemProgress.complete, False),
     # Mid-generation.
-    (_DONE, str(StageStatus.RUNNING), SessionStatus.active, SubsystemProgress.in_progress),
-    (str(StageStatus.IDLE), str(StageStatus.IDLE), SessionStatus.active, SubsystemProgress.pending),
+    (_DONE, str(StageStatus.RUNNING), SessionStatus.active, SubsystemProgress.in_progress, False),
+    (str(StageStatus.IDLE), str(StageStatus.IDLE), SessionStatus.active, SubsystemProgress.pending, False),
 ])
-def test_overall_status_rollup(threats, scenarios, status, expected) -> None:
-    assert get_overall_status(threats, scenarios, str(status)) == expected
+def test_overall_status_rollup(threats, scenarios, status, expected, undecided) -> None:
+    assert get_overall_status(threats, scenarios, str(status), undecided=undecided) == expected
 
 
 def _row(*, session_status, stage=WorkflowStage.REVIEW, stage_status=StageStatus.AWAITING_DECISION):

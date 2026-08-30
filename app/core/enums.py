@@ -212,13 +212,14 @@ class RegenGranularity(StrEnum):
 class SubsystemProgress(StrEnum):
     """Fully derived by `get_overall_status()` in app/api/sessions.py — never a stored column.
     Evaluated top-to-bottom, FIRST MATCH WINS: any stage ERROR -> error; session cancelled ->
-    cancelled; session completed -> complete; both IDLE -> pending; otherwise -> in_progress."""
+    cancelled; scenarios at the barrier WITH undecided rows -> awaiting_review; session
+    completed -> complete; both IDLE -> pending; otherwise -> in_progress."""
     pending = "pending"
     in_progress = "in_progress"          # the fallback rollup
-    # NO LONGER PRODUCED (operator decision, 2026-08). A session at the review barrier now rolls
-    # up as `complete`, matching the `scenarios` field. Kept as a member so a client or stored
-    # payload carrying the old string still deserializes — same reason WorkflowStage.APPROVED
-    # survives. The review-queue signal moved to SessionProgress.awaiting_decision.
+    # Generation finished and at least one scenario is still UNDECIDED. Derived from the
+    # scenario rows, not the stage: SCENARIOS parks at AWAITING_DECISION permanently (accept
+    # never rewrites it, so decisions stay changeable), so a stage-only rollup reported this
+    # same value for a fully reviewed session too.
     awaiting_review = "awaiting_review"
     complete = "complete"                # from SessionStatus.completed — accept_session() never rewrites
                                         # Subsystem_Stage_State, so SCENARIOS never reaches COMPLETE
