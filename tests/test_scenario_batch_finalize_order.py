@@ -81,7 +81,7 @@ class _FakeLLM:
             "scenario_title": "Compromised vendor firmware on the SCADA HMI",
             "scenario_statement": "An attacker ships signed-looking firmware to the site.",
             "risk_statement": "Loss of view and control at the pumping station.",
-            "supporting_system_applicability": [],
+            "supporting_systems_involved": [],
         }), None
 
     def embed(self, texts, kind=None):

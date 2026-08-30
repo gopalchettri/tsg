@@ -1237,25 +1237,46 @@ def _fetch_intel(terms: list[str] | None, is_ot: bool,
 
 def _ground_entry_points(scenario: dict, vocab: dict[str, int],
                         frozen: list[int] | None = None) -> None:
-    
+    """Resolves the AI's two returned lists against `vocab`, attaching real ids and enforcing
+    at most one `is_entry_point: true`. `supporting_systems_involved` is the PUBLIC field — only
+    what this scenario's own narrative is actually about. `plausible_entry_point_ids` stays
+    internal (schemas.py excludes it from the API response): it is
+    dal.variant_eligible_primaries's coverage target for whether a THREAT needs another scenario
+    variant, not a claim about what THIS scenario is about."""
     by_fold = {label.casefold(): (label, sid) for label, sid in vocab.items()}
 
     def _resolve(raw: Any) -> tuple[str, int] | None:
         return by_fold.get(raw.strip().casefold()) if isinstance(raw, str) else None
 
-    used = _resolve(scenario.get("entry_point"))
-    scenario["entry_point"] = used[0] if used else None
-    scenario["entry_point_id"] = used[1] if used else None
-    ids: list[int] = []
-    labels: list[str] = []
-    for hit in ([used] if used else []) + [_resolve(r) for r in
-                                        (scenario.get("other_plausible_entry_points") or [])
-                                        if isinstance(scenario.get("other_plausible_entry_points"), list)]:
-        if hit and hit[1] not in ids:
-            ids.append(hit[1])
-            labels.append(hit[0])
-    scenario["other_plausible_entry_points"] = labels
-    scenario["plausible_entry_point_ids"] = list(frozen) if frozen else ids
+    raw_involved = scenario.get("supporting_systems_involved")
+    involved: list[dict] = []
+    entry_id: int | None = None
+    saw_primary = False
+    for row in (raw_involved if isinstance(raw_involved, list) else []):
+        if not isinstance(row, dict):
+            continue
+        hit = _resolve(row.get("supporting_system"))
+        if not hit:
+            continue  # never invented — a name outside vocab is dropped, not stamped through
+        label, sid = hit
+        claims_primary = bool(row.get("is_entry_point"))
+        is_primary = claims_primary and not saw_primary
+        if claims_primary and not is_primary:
+            log.warning("scenario.multiple_primary_entry_points_demoted", supporting_system=label)
+        saw_primary = saw_primary or is_primary
+        if is_primary:
+            entry_id = sid
+        involved.append({"supporting_system_id": sid, "supporting_system": label,
+                        "is_entry_point": is_primary, "justification": row.get("justification")})
+    scenario["supporting_systems_involved"] = involved
+
+    plausible_ids: list[int] = [entry_id] if entry_id is not None else []
+    for raw in (scenario.get("plausible_entry_points") or []):
+        hit = _resolve(raw)
+        if hit and hit[1] not in plausible_ids:
+            plausible_ids.append(hit[1])
+    scenario["plausible_entry_point_ids"] = list(frozen) if frozen else plausible_ids
+    scenario.pop("plausible_entry_points", None)  # coverage-planning names, superseded by _ids
 
 
 def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict, sc,
@@ -1353,16 +1374,19 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
             # Merge the repair into the original, never replace it outright. The model is
             # asked for "the corrected JSON object" but can legally return just a partial one
             # (e.g. only {"risk_statement": "..."}). Replacing wholesale would then silently
-            # delete fields like entry_point, which would permanently cap this threat at one
-            # scenario without any visible error. Merging means a repair can only overwrite
-            # fields it actually returned — it can never accidentally delete one.
+            # delete fields like supporting_systems_involved, which would permanently cap this
+            # threat at one scenario without any visible error. Merging means a repair can only
+            # overwrite fields it actually returned — it can never accidentally delete one.
             merged = {**scenario, **repaired}
             # A merge can still accidentally EMPTY a field, though, which is just as bad as
-            # deleting it: if the repair explicitly returns "other_plausible_entry_points": [],
-            # that's a valid value that would overwrite the original and freeze the threat at
-            # one scenario. So keep the original list whenever the repair's version is empty.
-            if not merged.get("other_plausible_entry_points"):
-                merged["other_plausible_entry_points"] = scenario.get("other_plausible_entry_points") or []
+            # deleting it: if the repair explicitly returns "supporting_systems_involved": [] or
+            # "plausible_entry_points": [], that's a valid value that would overwrite the
+            # original and freeze the threat at one scenario. So keep the original list whenever
+            # the repair's version is empty, for both raw AI-output lists _ground_entry_points
+            # (called AFTER this) still needs to read.
+            for key in ("supporting_systems_involved", "plausible_entry_points"):
+                if not merged.get(key):
+                    merged[key] = scenario.get(key) or []
             # Validate the MERGED scenario, not just the raw repair — otherwise the saved
             # validation report could describe a different scenario than what actually gets
             # saved as ScenarioJSON.

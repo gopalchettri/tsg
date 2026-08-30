@@ -108,7 +108,7 @@ class _BarrierLLM:
                     "scenario_title": f"Title for {t['threat_name']}",
                     "scenario_statement": f"An attacker exploits {t['threat_name']} at the site.",
                     "risk_statement": f"Loss of service via {t['threat_name']}.",
-                    "supporting_system_applicability": [],
+                    "supporting_systems_involved": [],
                 }), None
         raise AssertionError("prompt matched no seeded threat: " + user[:200])
 

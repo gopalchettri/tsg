@@ -684,11 +684,10 @@ _SCENARIO_EXAMPLE: JsonDict = {
         "could cause a sustained outage."
     ),
     "controls": [_MAPPED_CONTROL_EXAMPLE],
-    "supporting_system_applicability": [
-        {"supporting_system": "OT Telecom Network", "applicable": True,
+    "supporting_systems_involved": [
+        {"supporting_system_id": 306, "supporting_system": "OT Telecom Network",
+         "is_entry_point": True,
          "justification": "The firmware push travels over this network to reach the RTU."},
-        {"supporting_system": "SCADA System", "applicable": False,
-         "justification": "The RTU accepts firmware updates directly; SCADA plays no role."},
     ],
 }
 
@@ -723,14 +722,21 @@ class MappedControl(ApiModel):
                     "commonly refers to several).")
 
 
-class SupportingSystemApplicability(ApiModel):
-    """The LLM's own judgment (prompts.py::scenario_prompt) of whether this scenario involves a
-    given supporting system in the session's scope, one entry per system. Rides straight through
-    from the LLM's own JSON, same treatment as entry_point: no DB enrichment, no separate
-    persistence (Threat_Scenario.ScenarioJSON already stores the whole scenario dict)."""
+class SupportingSystemInvolved(ApiModel):
+    """One supporting system this scenario's own narrative is actually about — its entry point,
+    or a system whose data/availability/integrity the scenario's consequences affect. Resolved
+    and id-stamped by tasks.py::_ground_entry_points; a system the scenario doesn't involve at
+    all simply has no entry here, never a `false`-flavoured row. Replaces the five-field spread
+    this used to be split across (entry_point/entry_point_id/other_plausible_entry_points/
+    plausible_entry_point_ids/supporting_system_applicability) — one list, id and name always
+    together, nothing to zip against a second array by position."""
+    supporting_system_id: int = Field(description="onboarding_supporting_systems primary key.")
     supporting_system: str = Field(description="Supporting system name, copied exactly from the session's scope.")
-    applicable: bool = Field(description="Whether this scenario meaningfully involves or affects this system.")
-    justification: str = Field(description="One-sentence rationale for the applicable value.")
+    is_entry_point: bool = Field(
+        description="True for the ONE system through which this scenario's threat reaches the "
+                    "asset (at most one true per scenario). False means affected but not the "
+                    "entry path.")
+    justification: str = Field(description="One-sentence rationale, grounded in the context.")
 
 
 class ScenarioNarrative(ApiModel):
@@ -741,7 +747,7 @@ class ScenarioNarrative(ApiModel):
     else a future prompt adds — ride through unvalidated and unmodified, exactly as the bare dict
     this replaced did. Deliberately so: these are model-authored strings, and validating text the
     code doesn't control just converts an odd LLM response into a 500. `controls` and
-    `supporting_system_applicability` are declared because they're structured, not bare strings,
+    `supporting_systems_involved` are declared because they're structured, not bare strings,
     and benefit from typed OpenAPI components rather than a hand-copied prose description (a
     hand-copied one is exactly how the smoke guides ended up documenting `title`/`narrative`, keys
     the API has never returned).
@@ -770,13 +776,21 @@ class ScenarioNarrative(ApiModel):
             "nothing matched well enough — but only once `controls_mapped` is true; see there."
         ),
     )
-    supporting_system_applicability: list[SupportingSystemApplicability] = Field(
+    supporting_systems_involved: list[SupportingSystemInvolved] = Field(
         default_factory=list,
         description=(
-            "The LLM's judgment of whether this scenario involves each supporting system in the "
-            "session's scope, one entry per system. Empty for scenarios written before this field "
+            "Only the supporting systems this scenario's own narrative is actually about — its "
+            "entry point plus any system it meaningfully affects. A system not listed here has "
+            "no involvement in this scenario. Empty for scenarios written before this field "
             "existed, or when the session has no supporting systems in scope."
         ),
+    )
+    plausible_entry_point_ids: list[int] = Field(
+        default_factory=list, exclude=True,
+        description="INTERNAL — never serialized. Coverage target for "
+                    "dal.variant_eligible_primaries: every system this same underlying threat "
+                    "could ALSO credibly enter through, not just the one this scenario is about. "
+                    "Kept off the wire because it describes a future scenario, not this one.",
     )
 
 
@@ -1534,7 +1548,7 @@ class AcceptedScenario(ApiModel):
         description="Unit of work this scenario belongs to: 0 = the asset itself, >= 1 = a specific "
                     "supporting system. Scenarios are written at the asset unit; a threat's reach "
                     "across supporting systems is reported per scenario in "
-                    "`scenario.supporting_system_applicability`."
+                    "`scenario.supporting_systems_involved`."
     )
     scenario: ScenarioNarrative | None = Field(
         description=(

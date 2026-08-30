@@ -104,10 +104,11 @@ _EXCLUDE_DB_KEY_TO_PROMPT = frozenset({
     "catalogue_id", "threat_catalogue_id", "register_id", "threat_code", "type_id",
     "category_id",
     # --- fields that CARRY a pk value under a NON-pk name: derived from column names alone
-    # these would be missed. _ground_entry_points stamps the first two onto the scenario dict;
+    # these would be missed. _ground_entry_points stamps supporting_system_id (inside each
+    # supporting_systems_involved entry) and plausible_entry_point_ids onto the scenario dict;
     # the repair turn is safe today only because it runs BEFORE grounding — listing them here
     # removes that implicit-ordering dependency.
-    "entry_point_id", "plausible_entry_point_ids", "replaces_scenario_id",
+    "supporting_system_id", "plausible_entry_point_ids", "replaces_scenario_id",
     # --- CamelCase forms, in case a raw DB row ever reaches a payload unmapped ---
     "ScenarioID", "ControlLibraryID", "SessionID", "ThreatID", "ScopedThreatID", "PlanID",
     "StandardID", "ThreatCatalogueID", "ThreatRiskRegisterID", "ThreatActorID", "ThreatTypeID", "ThreatCategoryID",
@@ -494,47 +495,46 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
     # multi-paragraph, untrusted feed descriptions that must not reach stdout.
     intel_text = _intel_block(intel_items)
 
-    # Empty/absent vocabulary → these two fields are never asked for and the prompt stays
+    # Empty/absent vocabulary → these fields are never asked for and the prompt stays
     # byte-identical to the pre-entry-point one (fail-open, same contract as _intel_block).
     # Sits in FIELDS rather than at the tail because the vocabulary is per-SESSION, not
     # per-threat: it is identical for every scenario in a batch, so it costs no prefix-cache
     # reuse the way actor_clause would.
+    #
+    # ONE list on the wire (supporting_systems_involved), plus one internal-only list
+    # (plausible_entry_points) the API never exposes — replaces the old five-field spread
+    # (entry_point/entry_point_id/other_plausible_entry_points/plausible_entry_point_ids/
+    # supporting_system_applicability). The split matters: supporting_systems_involved must
+    # describe ONLY what THIS scenario's own narrative is actually about (its one entry point,
+    # plus anything genuinely impacted) — a system that could ALSO be an entry point for a
+    # DIFFERENT, not-yet-written scenario belongs in the coverage-planning list, not here, or a
+    # reader has no way to tell "part of this story" from "a note for later."
     if entry_points:
         _eps = "; ".join(entry_points)
-        entry_point_fields = (
-            "entry_point: the ONE system through which the threat primarily reaches the asset, "
-            "named EXACTLY as written and chosen ONLY from this list: " + _eps + ". Never a name "
-            "outside the list, never a description. null when the context evidences none.\n"
-            "other_plausible_entry_points: actively check EVERY OTHER name in that SAME list — "
-            "different supporting systems often lead to the exact same impact, which is why a "
-            "single threat can already combine more than one underlying path. Include every one "
-            "through which this same threat could ALSO credibly reach the asset; omit only a "
-            "system that could not credibly lead to it. This list is a coverage target, so "
-            "padding it with implausible systems creates analysis that can never be completed, "
-            "and skipping a genuinely plausible one hides a path this threat could actually "
-            "take. Empty array when none.\n")
+        involvement_fields = (
+            "supporting_systems_involved: list ONLY the supporting systems this scenario's own "
+            "narrative is actually about — its one entry point, plus any system whose data, "
+            "availability or integrity this scenario's consequences meaningfully affect. Choose "
+            "system names ONLY from this list: " + _eps + ". Never a name outside the list, "
+            "never a description, never a system this scenario doesn't actually involve. Each "
+            "entry {\"supporting_system\": <name copied EXACTLY from the list>, "
+            "\"is_entry_point\": <true for the ONE system through which the threat primarily "
+            "reaches the asset — at most one true per scenario, false for every other entry>, "
+            "\"justification\": <one sentence, grounded in the context, never invented>}. Empty "
+            "array only when the context evidences no supporting-system involvement at all.\n"
+            "plausible_entry_points: SEPARATE from the list above — actively check EVERY name in "
+            "the SAME list for whether this same underlying threat could ALSO credibly reach the "
+            "asset through it, whether or not this particular scenario is about that path. "
+            "Different supporting systems often lead to the exact same impact, so a threat can "
+            "have more than one realistic way in even though this one scenario only tells one of "
+            "them. Include every system that's genuinely plausible; omit only one that could not "
+            "credibly lead to this threat. This list is a coverage target, so padding it with "
+            "implausible systems creates analysis that can never be completed, and skipping a "
+            "genuinely plausible one hides a path this threat could actually take. Names only, "
+            "no justification needed. Empty array when none besides the entry point already "
+            "named above.\n")
     else:
-        entry_point_fields = ""
-
-    # Same placement/gating rationale as entry_point_fields above: the supporting-system list is
-    # per-SESSION (base_ctx is built once per batch), not per-threat, so this stays in FIELDS
-    # rather than at the tail and costs no prefix-cache reuse across the threats in a batch.
-    supporting_system_names = [
-        s.get("name") for s in (base_ctx.get("supporting_systems") or []) if s.get("name")]
-    if supporting_system_names:
-        _sys_list = "; ".join(supporting_system_names)
-        applicability_fields = (
-            "supporting_system_applicability: judge this scenario against EVERY supporting "
-            "system in this list, one entry per system, none omitted and none added: " + _sys_list
-            + ". Each entry {\"supporting_system\": <name copied EXACTLY from that list>, "
-            "\"applicable\": <true if this scenario's threat meaningfully involves or affects "
-            "that system — as the entry point, an intermediate path, or a system whose data, "
-            "availability or integrity the scenario impacts — false otherwise>, "
-            "\"justification\": <one sentence for your applicable value, grounded in the context, "
-            "never invented>}.\n"
-        )
-    else:
-        applicability_fields = ""
+        involvement_fields = ""
 
     safe_actors = [redact(a) for a in (actors or []) if a]
     
@@ -572,7 +572,7 @@ def scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, threat_na
             "if the threat materializes. 1-3 sentences.\n"
             "assumptions: short strings — assumptions you had to make because the context "
             "leaves them unstated. Empty if none.\n"
-            + entry_point_fields + applicability_fields +
+            + involvement_fields +
             "\nRULES\n"
             "1) Use ONLY the supplied context — do not invent assets, technologies, or facts. "
             "If the context is too thin to be specific, one short sentence saying so plainly IS "
@@ -729,11 +729,11 @@ def treatment_prompt(snapshot: dict[str, Any]) -> list[dict]:
         "— a role, never a person's name.\n"
         f"applicable_to_all_subsystems: exactly one of {yes_no}. 'Yes' only when every "
         "supporting system this scenario actually involves is covered by the plan. The "
-        "context's scenario.supporting_system_applicability carries the scenario's own "
-        "per-system verdict: a system marked applicable false is outside this scenario's "
-        "scope and does NOT block 'Yes'. When that list is absent or empty, judge against the "
-        "full supporting_systems list instead. Also weigh the context's "
-        "existing_controls.applied_to_all_subsystems answer and its justification.\n"
+        "context's scenario.supporting_systems_involved carries the scenario's own list: a "
+        "system NOT in that list is outside this scenario's scope and does NOT block 'Yes'. "
+        "When that list is absent or empty, judge against the full supporting_systems list "
+        "instead. Also weigh the context's existing_controls.applied_to_all_subsystems answer "
+        "and its justification.\n"
         "\nRULES\n"
         "1) Use ONLY the supplied context — do not invent assets, systems, scores, or facts. "
         "If the context is too thin to be specific, one short sentence saying so plainly IS a "

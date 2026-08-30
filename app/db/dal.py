@@ -1651,6 +1651,26 @@ def _entry_ids(scenario_json: str | None, key: str) -> list[int]:
     return [v for v in raw if isinstance(v, int) and not isinstance(v, bool)]
 
 
+def _entry_point_id(scenario_json: str | None) -> int | None:
+    """The one supporting_system_id marked is_entry_point: true in this scenario's
+    supporting_systems_involved, or None. Replaces the old flat entry_point_id key now that the
+    entry point lives inside each scenario's involvement list rather than its own top-level
+    field (tasks.py::_ground_entry_points)."""
+    try:
+        data = json.loads(scenario_json or "{}") or {}
+    except (TypeError, ValueError):
+        return None
+    involved = data.get("supporting_systems_involved")
+    if not isinstance(involved, list):
+        return None
+    for row in involved:
+        if isinstance(row, dict) and row.get("is_entry_point") is True:
+            sid = row.get("supporting_system_id")
+            if isinstance(sid, int) and not isinstance(sid, bool):
+                return sid
+    return None
+
+
 def variant_eligible_primaries(sess: Session, session_id: str, n: int, *,
                             rows: list, attempt_slack: int,
                             exclude_threat_ids: set[str] | None = None) -> list[dict]:
@@ -1687,7 +1707,7 @@ def variant_eligible_primaries(sess: Session, session_id: str, n: int, *,
         plausible = set(_entry_ids(primary.ScenarioJSON, "plausible_entry_point_ids"))
         if not plausible:
             continue  # no coverage target derivable — fail closed, see docstring
-        used = {eid for r in group for eid in _entry_ids(r.ScenarioJSON, "entry_point_id")}
+        used = {eid for r in group if (eid := _entry_point_id(r.ScenarioJSON)) is not None}
         if not plausible - used:
             continue  # every plausible entry point covered — this threat is DONE
         if len(group) >= len(plausible) + attempt_slack:

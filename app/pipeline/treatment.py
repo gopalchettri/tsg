@@ -290,16 +290,18 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
             "scenario_title": redact(scenario_json.get("scenario_title")),
             "scenario_statement": redact(scenario_json.get("scenario_statement")),
             "risk_statement": redact(scenario_json.get("risk_statement")),
-            # The scenario's OWN per-system verdicts. Without these the model must judge
+            # The scenario's OWN involved systems. Without these the model must judge
             # applicable_to_all_subsystems against `supporting_systems` — the session's whole
             # raw scope — and so is asked to cover systems this scenario already ruled out.
-            # Empty for pre-v1.3 scenarios and for sessions with no supporting systems; the
-            # prompt names that fallback explicitly, so no warning is warranted.
-            "supporting_system_applicability": [
+            # Empty for pre-rename scenarios and for sessions with no supporting systems; the
+            # prompt names that fallback explicitly, so no warning is warranted. A system absent
+            # here is out of scope for this scenario — there is no separate "applicable: false"
+            # entry any more (tasks.py::_ground_entry_points only ever records involvement).
+            "supporting_systems_involved": [
                 {"supporting_system": redact((a or {}).get("supporting_system")),
-                "applicable": (a or {}).get("applicable"),
+                "is_entry_point": bool((a or {}).get("is_entry_point")),
                 "justification": redact((a or {}).get("justification"))}
-                for a in scenario_json.get("supporting_system_applicability") or []
+                for a in scenario_json.get("supporting_systems_involved") or []
                 if isinstance(a, dict)],
         },
         "existing_controls": {

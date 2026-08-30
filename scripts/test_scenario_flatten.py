@@ -1,5 +1,5 @@
 """Self-check: scenarios[] in GET /sessions/{id}/results nests threat_category/type/name/actors
-and supporting_system_applicability inside `scenario`, alongside the existing controls.
+and supporting_systems_involved inside `scenario`, alongside the existing controls.
 
 Run:  .venv/Scripts/python.exe scripts/test_scenario_flatten.py
 
@@ -23,10 +23,13 @@ RAW_SCENARIO_JSON = json.dumps({
     "scenario_statement": "s",
     "risk_statement": "r",
     "controls": [{"name": "Network segmentation", "why": "Limits pivot."}],
-    "supporting_system_applicability": [
-        {"supporting_system": "SCADA System", "applicable": True, "justification": "Entry point."},
-        {"supporting_system": "OT Telecom Network", "applicable": False, "justification": "Not involved."},
+    # OT Telecom Network is deliberately absent — not involved in this scenario, so it does not
+    # appear at all (no more explicit applicable=false rows).
+    "supporting_systems_involved": [
+        {"supporting_system_id": 306, "supporting_system": "SCADA System",
+         "is_entry_point": True, "justification": "Entry point."},
     ],
+    "plausible_entry_point_ids": [306, 307],
 })
 
 THREAT_ROW = {
@@ -52,15 +55,19 @@ def main() -> None:
     assert merged["controls"][0]["control_code"] == "CII-CID-028"
     print("1 OK  threat fields merged in alongside the existing controls merge")
 
-    # 2 — the merged dict validates as ScenarioNarrative, with supporting_system_applicability
-    #     parsed from the LLM's own scenario JSON (untouched by the merge).
+    # 2 — the merged dict validates as ScenarioNarrative, with supporting_systems_involved
+    #     parsed from the LLM's own scenario JSON (untouched by the merge). plausible_entry_
+    #     point_ids validates in (it's real internal data) but must never reach model_dump() —
+    #     it describes a FUTURE scenario, not this one.
     narrative = ScenarioNarrative(**merged)
     assert narrative.threat_category == "Denial of Service"
-    assert len(narrative.supporting_system_applicability) == 2
-    assert narrative.supporting_system_applicability[0].supporting_system == "SCADA System"
-    assert narrative.supporting_system_applicability[0].applicable is True
-    assert narrative.supporting_system_applicability[1].applicable is False
-    print("2 OK  ScenarioNarrative validates threat fields + supporting_system_applicability")
+    assert len(narrative.supporting_systems_involved) == 1
+    assert narrative.supporting_systems_involved[0].supporting_system == "SCADA System"
+    assert narrative.supporting_systems_involved[0].is_entry_point is True
+    assert narrative.plausible_entry_point_ids == [306, 307]
+    assert "plausible_entry_point_ids" not in narrative.model_dump(), \
+        "internal coverage-planning data leaked into the serialized response"
+    print("2 OK  ScenarioNarrative validates involved systems; plausible_entry_point_ids stays internal")
 
     # 3 — threat_row=None (the accepted-scenarios/scenario-list call sites, unchanged by this
     #     work) must still validate: new fields default to None/[], not a validation error.
@@ -71,13 +78,13 @@ def main() -> None:
     assert narrative_no_threat.threat_actors == []
     print("3 OK  threat_row=None still validates — existing call sites unaffected")
 
-    # 4 — a pre-existing scenario written before this field existed (no supporting_system_
-    #     applicability key at all) still validates, defaulting to an empty list.
+    # 4 — a pre-existing scenario written before this field existed (no supporting_systems_
+    #     involved key at all) still validates, defaulting to an empty list.
     old_json = json.dumps({"scenario_title": "t", "scenario_statement": "s", "risk_statement": "r"})
     old = sessions._scenario_with_controls(old_json, [], THREAT_ROW)
     narrative_old = ScenarioNarrative(**old)
-    assert narrative_old.supporting_system_applicability == []
-    print("4 OK  pre-existing scenarios (no applicability key) default to an empty list")
+    assert narrative_old.supporting_systems_involved == []
+    print("4 OK  pre-existing scenarios (no involved-systems key) default to an empty list")
 
     # 5 — Phase 4 wiring: _scenario_list_item reports BOTH spellings side by side (proposed
     #     vs matched, no coalesce), while the nested display prose keeps preferring the

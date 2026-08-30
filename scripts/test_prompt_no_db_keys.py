@@ -48,13 +48,12 @@ def snapshot(base):
                        "name": "Loss of availability of PGS", "actors": ["External attacker"]},
             "scenario": {"scenario_title": "PGS outage", "scenario_statement": "s",
                          "risk_statement": "r",
-                         # One applicable, one not — check 14 pins that BOTH reach the model,
-                         # since the false verdict is what narrows applicable_to_all_subsystems.
-                         "supporting_system_applicability": [
-                             {"supporting_system": "SCADA System", "applicable": True,
-                              "justification": "Primary control path for the outage."},
-                             {"supporting_system": "Billing Portal", "applicable": False,
-                              "justification": "No control or data path to generation."}]},
+                         # Only SCADA System listed — Billing Portal is deliberately ABSENT.
+                         # Check 14 pins that absence is what narrows applicable_to_all_subsystems
+                         # now (no more explicit applicable=false rows to carry that signal).
+                         "supporting_systems_involved": [
+                             {"supporting_system": "SCADA System", "is_entry_point": True,
+                              "justification": "Primary control path for the outage."}]},
             "existing_controls": {
                 "library_mapped": [                                    # depth 3: the second leak
                     {"control_library_id": 28, "control_code": "CII-CID-028", "domain": "BCDR",
@@ -81,8 +80,11 @@ def render_all():
         "treatment": prompts.treatment_prompt(snapshot(base))[1]["content"],
         # the repair turn re-sends the model's own output, scrubbed the same way
         "repair": json.dumps(prompts._scrub_db_keys(
-            {"scenario_title": "t", "entry_point": "SCADA System",
-             "entry_point_id": 7, "plausible_entry_point_ids": [7, 8]})),
+            {"scenario_title": "t",
+             "supporting_systems_involved": [
+                 {"supporting_system": "SCADA System", "supporting_system_id": 7,
+                  "is_entry_point": True, "justification": "j"}],
+             "plausible_entry_point_ids": [7, 8]})),
     }
 
 
@@ -133,9 +135,13 @@ def main() -> None:
 
     # 6 — grounded scenario (Gap A): safe even if repair is ever reordered after grounding
     assert prompts._scrub_db_keys(
-        {"entry_point": "SCADA System", "entry_point_id": 7,
-         "plausible_entry_point_ids": [7, 8]}) == {"entry_point": "SCADA System"}
-    print("6 OK  entry_point_id / plausible_entry_point_ids stripped, label kept")
+        {"supporting_systems_involved": [
+            {"supporting_system": "SCADA System", "supporting_system_id": 7,
+             "is_entry_point": True}],
+         "plausible_entry_point_ids": [7, 8]}) == {
+        "supporting_systems_involved": [
+            {"supporting_system": "SCADA System", "is_entry_point": True}]}
+    print("6 OK  supporting_system_id / plausible_entry_point_ids stripped, label kept")
 
     # 7 — framing intact (Gap C): prefix first, intel fence AFTER the JSON, never inside it
     s = rendered["scenario"]
@@ -220,38 +226,38 @@ def main() -> None:
         prompts._STRIDE_SCENARIO_SHAPES = real_shapes
     print("12 OK drift detection is real — removing a shape drops it from Stage 1 and is flagged")
 
-    # 13 — supporting_system_applicability FIELDS text lives in the SYSTEM message (like
-    #      entry_point_fields), not the user context — lists every in-scope system by name,
-    #      omitted when there are none, and (session-level, not per-threat) already covered by
-    #      check 9's byte-identical-batch assertion above.
+    # 13 — supporting_systems_involved FIELDS text lives in the SYSTEM message, not the user
+    #      context — lists every in-scope system by name (as candidates the model may choose
+    #      from), omitted when there are none, and (session-level, not per-threat) already
+    #      covered by check 9's byte-identical-batch assertion above.
     sys_with_subs = prompts.scenario_prompt(base, "Denial of Service", "Loss of availability of PGS",
                                             actors=["Sandworm"], intel_items=INTEL,
                                             entry_points=["SCADA System"])[0]["content"]
-    assert "supporting_system_applicability" in sys_with_subs
-    assert "SCADA System" in sys_with_subs.split("supporting_system_applicability", 1)[1][:200]
+    assert "supporting_systems_involved" in sys_with_subs
+    assert "SCADA System" in sys_with_subs.split("supporting_systems_involved", 1)[1][:400]
     empty_ctx = prompts.build_base_context("Asset with no subsystems", ASSET_CTX, [])
     no_sub = prompts.scenario_prompt(empty_ctx, "Denial of Service", "Loss of availability of PGS",
                                       actors=["Sandworm"])[0]["content"]
-    assert "supporting_system_applicability" not in no_sub, \
+    assert "supporting_systems_involved" not in no_sub, \
         "field requested with no supporting systems to judge against"
-    print("13 OK supporting_system_applicability lists in-scope systems; omitted when none exist")
+    print("13 OK supporting_systems_involved lists in-scope systems; omitted when none exist")
 
-    # 14 — the three scenario-side context fields the TREATMENT prompt must carry. Each was a
-    #      real gap: actors arrived [] through validated_actors, applicability was never read
-    #      at all, and supporting_systems was only ever asserted for the scenario prompt
-    #      (check 2), so nothing proved it survived into this one.
+    # 14 — the two scenario-side context fields the TREATMENT prompt must carry. Each was a
+    #      real gap: actors arrived [] through validated_actors, and supporting_systems was only
+    #      ever asserted for the scenario prompt (check 2), so nothing proved it survived here.
     treat = rendered["treatment"]
     assert "External attacker" in treat, "threat.actors missing — plan is blind to the adversary"
-    assert "supporting_system_applicability" in treat
-    assert "Billing Portal" in treat, \
-        "the applicable=false verdict must reach the model — it is what narrows 'Yes'"
-    assert "No control or data path to generation." in treat
-    assert '"applicable":false' in treat, f"bool verdict lost: {treat[-400:]}"
-    assert "SCADA System" in treat, "supporting_systems dropped out of the treatment context"
-    # And the prompt must actually TELL the model to use it, else the key is inert payload.
-    assert "scenario.supporting_system_applicability" in prompts.treatment_prompt(
-        snapshot(base))[0]["content"]
-    print("14 OK treatment prompt carries actors + applicability (both verdicts) + systems")
+    assert "supporting_systems_involved" in treat
+    assert "Primary control path for the outage." in treat
+    assert '"is_entry_point":true' in treat, f"bool verdict lost: {treat[-400:]}"
+    assert "SCADA System" in treat, "the involved system dropped out of the treatment context"
+    # And the prompt must actually TELL the model that ABSENCE from the list means out of scope
+    # — there is no more explicit false verdict to carry that signal, so the instruction itself
+    # is the only thing narrowing applicable_to_all_subsystems for an uninvolved system now.
+    treat_sys = prompts.treatment_prompt(snapshot(base))[0]["content"]
+    assert "scenario.supporting_systems_involved" in treat_sys
+    assert "NOT in that list is outside this scenario's scope" in treat_sys
+    print("14 OK treatment prompt carries actors + involved systems, and instructs on absence")
 
     print("\nprompt db-key self-check OK")
 
