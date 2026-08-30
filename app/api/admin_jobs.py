@@ -20,8 +20,8 @@ from app.pipeline.llm import _slot_redis
 log = get_logger(__name__)
 
 _JOB_KEY_PREFIX = "tsg:admin:job:"
-FAMILY_EMBEDDINGS = "emb"
-FAMILY_INTEL = "intel"   # per-feed threat-intel refresh jobs (app/api/threat_intel.py)
+FAMILY_EMBEDDINGS = "embedding"
+FAMILY_INTEL = "threat-intel"   # per-feed threat-intel refresh jobs (app/api/threat_intel.py)
 FAMILY_GROUNDING = "grounding"  # grounding-threshold calibration sweeps (app/api/admin.py)
 
 
@@ -52,17 +52,21 @@ def grounding_job_channel_key(job_id: str) -> str:
     return f"tsg:sse:grounding-job:{job_id}"
 
 
-def mark_admin_job(job_id: str, family: str, user_id: str | None = None) -> None:
+def mark_admin_job(job_id: str, family: str, job_type: str, user_id: str | None = None) -> None:
     """Best-effort marker write (same TTL as the Celery result backend, so marker and
     result expire together). Fails open on the QUEUE side — a Redis blip must not block
     the job itself; the job merely becomes unpollable via its status route.
 
-    The value carries who queued it and when — admin_job_exists below only ever calls
-    r.exists(...) and never reads the value, so this is purely for an operator inspecting
-    Redis directly (e.g. via RedisInsight) to see. No entity_id: admin actions are
-    cross-tenant by design (same reasoning as the Celery shadow labels in admin.py/
-    threat_intel.py)."""
-    value = json.dumps({"user_id": user_id, "created_at": dal.now().isoformat()})
+    The value carries what the job is, who queued it and when — admin_job_exists below only
+    ever calls r.exists(...) and never reads the value, so this is purely for an operator
+    inspecting Redis directly (e.g. via RedisInsight) to see. `job_type` is required (no
+    default) so a caller can't silently omit it; `family` (FAMILY_EMBEDDINGS/_INTEL/_GROUNDING)
+    is already in the KEY, so job_type carries the SPECIFIC action within it instead of repeating family —
+    same wording as the Celery shadow labels these same call sites already set, so an operator
+    cross-referencing Flower and Redis sees consistent labels. No entity_id: admin actions are
+    cross-tenant by design (same reasoning as those shadow labels)."""
+    value = json.dumps({"job_type": job_type, "user_id": user_id,
+                        "created_at": dal.now().isoformat()})
     try:
         _slot_redis().setex(_key(job_id, family), get_settings().result_expires_seconds, value)
     except Exception:
