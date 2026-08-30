@@ -605,7 +605,15 @@ class ThreatResult(ApiModel):
                     "itself cleared the cutoff. Null whenever it did not — a close-but-unconfirmed "
                     "candidate is deliberately not reported as a match."
     )
-    is_ai_generated: bool | None = Field(
+    is_threat_type_ai_generated: bool | None = Field(
+        default=None,
+        description="True when the threat's TYPE matched no Threat_Type library row at "
+                    "identification time (the AI's own wording, threat_type_id null); False "
+                    "when it matched (threat_type_id set, library_threat_type names the row). "
+                    "Independent of is_threat_ai_generated below — a threat can invent a new "
+                    "specific catalogue entry under an EXISTING, already-curated type."
+    )
+    is_threat_ai_generated: bool | None = Field(
         default=None,
         description="True when the threat was NOT in the threat catalogue at identification "
                     "time (invented by the AI); False for library threats -- retrieved, or "

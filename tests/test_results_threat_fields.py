@@ -170,7 +170,8 @@ def test_get_results_does_not_crash_on_a_real_active_threat(monkeypatch):
     assert t.threat_catalogue_id == 418
     assert t.threat_category_id == 5
     assert t.description == "Ransomware encrypts OT support systems."
-    assert t.is_ai_generated is False
+    assert t.is_threat_ai_generated is False
+    assert t.is_threat_type_ai_generated is False  # threat_type_id == 57, a real library match
     assert t.grounding_status == "verified"
     assert t.grounding_score == 100.0
     assert t.library_threat_type == "Malware/Ransomware"

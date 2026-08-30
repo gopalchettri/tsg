@@ -142,7 +142,7 @@ def test_both_read_paths_serve_the_identical_threat_block(tmp_path):
     block_r = sessions_mod._threat_block(results_row, {"APT33": 3})
     assert block_a == block_r
     assert block_a["threat_catalogue_id"] == 418
-    assert block_a["is_ai_generated"] is False
+    assert block_a["is_threat_ai_generated"] is False
     assert block_a["actors"] == [{"actor_id": 3, "actor_name": "APT33"}]
 
 
