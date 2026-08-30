@@ -35,6 +35,7 @@ from app.core.enums import (
     AuditEventType,
     ControlCoverage,
     ControlType,
+    RiskLevel,
     SSEEventType,
     StageStatus,
     TreatmentGateReason,
@@ -400,6 +401,33 @@ def _window_violations(parsed: dict[str, Any], window: dict[str, Any] | None) ->
     return out
 
 
+def _risk_alignment_warnings(parsed: dict[str, Any],
+                            risk_assessment: dict[str, Any] | None) -> list[str]:
+    """Advisory check that the plan's urgency matches the register's verdict (prompt rule 6).
+
+    ONE check, deliberately: a Critical or High risk whose plan carries no Critical/High
+    priority anywhere — across recommended controls AND actions — is the model ignoring the
+    scores, which is exactly the defect rule 6 exists to prevent. Flags, never blocks, same
+    posture as the vocabulary clamps. Prose checks (does action_plan cite the rating?) are
+    NOT attempted: string-matching LLM prose would warn on legitimate wording.
+
+    A missing/legacy risk_assessment block returns [] — snapshots frozen before the block
+    existed must not start warning on regenerate."""
+    level = (risk_assessment or {}).get("risk_level")
+    if level not in (str(RiskLevel.critical), str(RiskLevel.high)):
+        return []
+    urgent = {str(ActionPriority.critical), str(ActionPriority.high)}
+    cti = parsed.get("controls_to_be_implemented")
+    controls = cti.get("controls") if isinstance(cti, dict) else None
+    rows = [r for r in (controls or []) if isinstance(r, dict)] + \
+           [r for r in (parsed.get("remediation_action_plan") or []) if isinstance(r, dict)]
+    if rows and not any(r.get("priority") in urgent for r in rows):
+        return [f"risk_level is {level} but no recommended control or action carries "
+                "Critical/High priority — the plan's urgency does not reflect the register's "
+                "scored verdict"]
+    return []
+
+
 def _validate_plan(parsed: dict[str, Any]) -> list[str]:
     """Structural requirement + advisory vocabulary clamps (SDD §6.2 step 4). Both tables MUST
     be present — controls_to_be_implemented.controls (nested under the coverage verdict) and
@@ -638,7 +666,8 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
             expected_type=dict, temperature=settings.treatment_temperature)
         warnings = (list(snapshot.get("warnings") or []) + _validate_plan(parsed)
                     + _window_violations(parsed,
-                                        (snapshot.get("risk_assessment") or {}).get("assessment_window")))
+                                        (snapshot.get("risk_assessment") or {}).get("assessment_window"))
+                    + _risk_alignment_warnings(parsed, snapshot.get("risk_assessment")))
         parsed = _inject_reserved(parsed, snapshot)
         moderation = llm_mod.moderate(_narrative_text(parsed))  # free function, NOT a client method
         validation_json = json.dumps({
