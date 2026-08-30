@@ -108,9 +108,11 @@ def _conflict(reason: TreatmentGateReason) -> treatment.TreatmentConflict:
 _VISIBLE_PLAN_KEYS = tuple(TreatmentPlanDocument.model_fields)
 
 
-def enqueue_treatment_plan(plan_id: str) -> None:
+def enqueue_treatment_plan(plan_id: str, entity_id: str, user_id: str | None) -> None:
     """Indirection so tests can run the generation synchronously instead of via a broker."""
-    generate_treatment_plan_task.delay(plan_id)
+    generate_treatment_plan_task.apply_async(args=(plan_id,), shadow=(
+        f"treatment-plan: {plan_id} · entity {entity_id} · by {user_id} · "
+        f"{dal.now():%Y-%m-%d %H:%M} UTC"))
 
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan", status_code=202,
@@ -266,7 +268,7 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
     # (only the capacity handlers in errors.py do), and adding it here alone would just move the
     # inconsistency rather than remove it.
     try:
-        enqueue_treatment_plan(plan_id)
+        enqueue_treatment_plan(plan_id, str(session_row["EntityID"]), principal.user_id)
     except Exception as exc:
         with db_session() as sess:
             # task_id=None: nothing has claimed this row yet (inserted with ActiveTaskID=None

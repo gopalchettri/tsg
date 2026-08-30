@@ -16,8 +16,10 @@ principal) and cross-tenant by nature: the intel cache is shared, not entity-sco
 """
 from __future__ import annotations
 
+from typing import Annotated
+
 from celery.result import AsyncResult
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
 from app.api.admin_jobs import FAMILY_INTEL, intel_job_channel_key, mark_admin_job
 from app.api.admin_sse import admin_job_event_stream
@@ -28,10 +30,12 @@ from app.api.schemas import (
     IntelFeedStatus,
     IntelItem,
     IntelItemsResponse,
+    IntelJobEvent,
     IntelRefreshAccepted,
 )
 from app.core.enums import SSEEventType
 from app.core.logging import get_logger
+from app.db import dal
 from app.db.dal import NotFoundError
 from app.intel.fetchers import ALL_FEEDS, enabled_feed_names, feed_status, list_intel
 from app.pipeline.celery_app import intel_refresh_feed_task
@@ -44,12 +48,16 @@ router = APIRouter(
 log = get_logger(__name__)
 
 
-def _dispatch(feeds: list[str]) -> IntelRefreshAccepted:
+def _dispatch(feeds: list[str], user_id: str | None) -> IntelRefreshAccepted:
     """Queue one job per feed — the fan-out. Indirection so tests can run refreshes
-    synchronously, same pattern as the import router's _enqueue."""
+    synchronously, same pattern as admin.py's _enqueue.
+
+    No entity_id in the shadow label: this is an admin action, cross-tenant by design."""
     jobs = {}
     for feed in feeds:
-        task = intel_refresh_feed_task.delay(feed)
+        task = intel_refresh_feed_task.apply_async(args=(feed,), shadow=(
+            f"intel-refresh: {feed} · by {user_id} · "
+            f"{dal.now():%Y-%m-%d %H:%M} UTC"))
         mark_admin_job(task.id, FAMILY_INTEL)  # best-effort — see admin_jobs.mark_admin_job
         jobs[feed] = task.id
     return IntelRefreshAccepted(jobs=jobs)
@@ -87,34 +95,63 @@ def list_items(source: str | None = None,
                             total=total, limit=limit, offset=offset)
 
 
-@router.post("/feeds/refresh", response_model=IntelRefreshAccepted, status_code=202)
+@router.post("/feeds/refresh", response_model=IntelRefreshAccepted, status_code=202,
+            summary="Refresh every enabled threat-intel feed now")
 def refresh_all_feeds(request: Request,
                     principal: Principal = Depends(get_admin_principal)) -> IntelRefreshAccepted:
-    """Refresh every ENABLED feed now, without waiting for the daily schedule.
+    """Fetch is admin-triggered only — there is no automatic schedule. Fans out to one job
+    per feed rather than one job doing all of them, so a slow or broken feed can neither
+    delay nor fail the others. Returns the job id queued per feed; read the outcomes from
+    GET /feeds, which survives the jobs expiring, or watch one live via
+    GET /feeds/events/{job_id}.
 
-    Fans out to one job per feed rather than one job doing all of them, so a slow or
-    broken feed can neither delay nor fail the others. Returns the job id queued per feed;
-    read the outcomes from GET /feeds, which survives the jobs expiring."""
+    **No request body.** Copy-paste:
+    ```
+    curl -X POST "https://<host>/v1/tsg/threat-intel/feeds/refresh" \\
+         -H "X-Admin-Key: <your-admin-key>"
+    ```"""
     feeds = enabled_feed_names()
-    accepted = _dispatch(feeds)
+    accepted = _dispatch(feeds, principal.user_id)
     log.warning("admin.threat_intel_refresh", action="refresh_all", feeds=feeds,
                 user_id=principal.user_id,
                 source_ip=request.client.host if request.client else None)
     return accepted
 
 
-@router.post("/feeds/{feed}/refresh", response_model=IntelRefreshAccepted, status_code=202)
-def refresh_feed(feed: str, request: Request,
-                principal: Principal = Depends(get_admin_principal)) -> IntelRefreshAccepted:
+@router.post("/feeds/{feed}/refresh", response_model=IntelRefreshAccepted, status_code=202,
+            summary="Refresh one threat-intel feed")
+def refresh_feed(
+    feed: Annotated[str, Path(
+        description="One of the known feed names. GET /feeds lists live status for all of "
+                    "them, including whether each is currently enabled. A name outside this "
+                    "list, or a known name that's disabled in configuration, both 404.",
+        examples={
+            "otx": {"summary": "AlienVault OTX", "value": "otx"},
+            "cisa_kev": {"summary": "CISA Known Exploited Vulnerabilities", "value": "cisa_kev"},
+            "cisa_ics": {"summary": "CISA ICS advisories", "value": "cisa_ics"},
+            "urlhaus": {"summary": "URLhaus (disabled by default)", "value": "urlhaus"},
+            "taxii": {"summary": "Configured TAXII source(s)", "value": "taxii"},
+        },
+    )],
+    request: Request,
+    principal: Principal = Depends(get_admin_principal),
+) -> IntelRefreshAccepted:
     """Refresh ONE feed — the targeted retry after a failure, instead of re-pulling
     everything. Unknown feed → 404 (it is the addressed resource); a known but disabled
     feed → 404 as well, with a message naming it as disabled, since there is nothing to
-    refresh until configuration switches it on."""
+    refresh until configuration switches it on.
+
+    **No request body** — the feed name is the URL path segment above. Copy-paste:
+    ```
+    curl -X POST "https://<host>/v1/tsg/threat-intel/feeds/otx/refresh" \\
+         -H "X-Admin-Key: <your-admin-key>"
+    ```
+    Swap `otx` for `cisa_kev`, `cisa_ics`, `urlhaus`, or `taxii` to refresh a different one."""
     if feed not in ALL_FEEDS:
         raise NotFoundError(f"unknown intel feed: {feed!r} — valid: {sorted(ALL_FEEDS)}")
     if feed not in enabled_feed_names():
         raise NotFoundError(f"intel feed {feed!r} is not enabled — switch it on in configuration first")
-    accepted = _dispatch([feed])
+    accepted = _dispatch([feed], principal.user_id)
     log.warning("admin.threat_intel_refresh", action="refresh_feed", feeds=[feed],
                 user_id=principal.user_id,
                 source_ip=request.client.host if request.client else None)
@@ -129,7 +166,9 @@ def _extend_intel_terminal(result: AsyncResult) -> dict:
 
 
 @router.get("/feeds/events/{job_id}",
-            responses={200: {"content": {"text/event-stream": {}}}} | UNAVAILABLE_RESPONSES)
+            responses={200: {"model": IntelJobEvent, "content": {"text/event-stream": {}},
+                        "description": "SSE stream; each `data:` line is one IntelJobEvent."}}
+                    | UNAVAILABLE_RESPONSES)
 async def job_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE stream for one queued per-feed refresh job (one of the ids in
     IntelRefreshAccepted.jobs): a state snapshot on connect, then the worker's live
@@ -138,8 +177,12 @@ async def job_events(job_id: str, _principal: Principal = Depends(get_admin_prin
     same hint-layer/AsyncResult-backstop contract as admin.py::job_events. GET /feeds (per-feed
     last_success_at/last_error) remains the durable truth; there is no separate per-job GET
     status route for intel today, so this stream reads AsyncResult directly, same as it does.
-    Streaming mechanics live in admin_sse.py, shared with the embeddings and import job-events
-    routes."""
+    Streaming mechanics live in admin_sse.py, shared with the embeddings and grounding-calibration
+    job-events routes.
+
+    Same header requirement as GET /v1/sessions/{session_id}/events: this is a fetch()+
+    ReadableStream stream sent with the admin auth headers this API requires, so the browser's
+    native `EventSource` API cannot consume it (it cannot set custom headers)."""
     return await admin_job_event_stream(
         job_id, FAMILY_INTEL, intel_job_channel_key, str(SSEEventType.intel_job_update),
         extend_terminal=_extend_intel_terminal)

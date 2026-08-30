@@ -98,9 +98,15 @@ scenarios_router = APIRouter(prefix="/v1", tags=["Scenarios"])
 _MAX_ANCESTRY_HOPS = 100
 
 
-def enqueue_pipeline(session_id: str) -> None:
+def enqueue_pipeline(session_id: str, entity_id: str, user_id: str | None) -> None:
     """Indirection so tests can run the pipeline synchronously instead of via a broker."""
-    run_pipeline_task.delay(session_id)
+    # shadow is an apply_async-level option, not a task kwarg — .delay(x, shadow=...) would pass
+    # shadow straight into run_pipeline_task's own signature and crash it. Flower/`celery
+    # inspect` display name only; routing and task args are unaffected. entity_id/user_id/
+    # timestamp are purely for at-a-glance identification in Flower's task list.
+    run_pipeline_task.apply_async(args=(session_id,), shadow=(
+        f"generate: session {session_id} · entity {entity_id} · by {user_id} · "
+        f"{dal.now():%Y-%m-%d %H:%M} UTC"))
 
 
 # --- status board ---
@@ -319,7 +325,7 @@ def create_session(
         dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant, EntityID=str(body.entity_id),
                         EventType=AuditEventType.session_started, ActorUserID=principal.user_id)
     try:
-        enqueue_pipeline(sid)
+        enqueue_pipeline(sid, str(body.entity_id), principal.user_id)
     except Exception as exc:
         # Pattern A (see app/api/treatment.py's request_treatment_plan): the row is already
         # committed and holding the one-active-session-per-asset slot, so a bare re-raise would
@@ -878,9 +884,13 @@ def post_reject_scenarios(session_id: str, body: RejectBody,
 
 
 def enqueue_regeneration(session_id: str, subsystem_id: int, granularity: RegenGranularity,
-                        target_ids: list[str] | list[int] | None, epoch: int, user_note: str | None) -> None:
+                        target_ids: list[str] | list[int] | None, epoch: int, user_note: str | None,
+                        entity_id: str, user_id: str | None) -> None:
     """Indirection so tests can run the cascade synchronously instead of via a broker."""
-    regenerate_task.delay(session_id, subsystem_id, str(granularity), target_ids, epoch, user_note)
+    regenerate_task.apply_async(
+        args=(session_id, subsystem_id, str(granularity), target_ids, epoch, user_note),
+        shadow=(f"regenerate: session {session_id} · subsystem {subsystem_id} · "
+                f"entity {entity_id} · by {user_id} · {dal.now():%Y-%m-%d %H:%M} UTC"))
 
 
 def _assert_regen_eligible(scenario_session: dict) -> None:
@@ -950,7 +960,8 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
         dal.reset_stage_for_regen(sess, session_id, subsystem_id, levels, epoch)
 
     try:
-        enqueue_regeneration(session_id, subsystem_id, granularity, target_ids, epoch, user_note)
+        enqueue_regeneration(session_id, subsystem_id, granularity, target_ids, epoch, user_note,
+                            str(scenario_session["EntityID"]), scenario_session["UserID"])
     except Exception as exc:  # noqa: BLE001 — broker unreachable must not wedge SCENARIOS at IDLE
         _recover_from_enqueue_failure(session_id, subsystem_id, epoch, exc, "regen.enqueue_failed")
     # `epoch` goes back to the caller: a 202 only says "accepted", and this is the token that
@@ -970,9 +981,13 @@ def post_regenerate_scenarios(session_id: str, body: RegenerateScenariosBody,
                         body.scenario_ids, body.user_note)
 
 
-def enqueue_next_set(session_id: str, subsystem_id: int, epoch: int, threats_epoch: int) -> None:
+def enqueue_next_set(session_id: str, subsystem_id: int, epoch: int, threats_epoch: int,
+                    entity_id: str, user_id: str | None) -> None:
     """Indirection so tests can run the cascade synchronously instead of via a broker."""
-    next_set_task.delay(session_id, subsystem_id, epoch, threats_epoch)
+    next_set_task.apply_async(
+        args=(session_id, subsystem_id, epoch, threats_epoch),
+        shadow=(f"next-set: session {session_id} · subsystem {subsystem_id} · "
+                f"entity {entity_id} · by {user_id} · {dal.now():%Y-%m-%d %H:%M} UTC"))
 
 
 def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> RegenerateResponse:
@@ -1026,7 +1041,8 @@ def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> Re
         threats_epoch = dal.next_epoch(sess, session_id, subsystem_id, (SubsystemLevel.THREATS,))
 
     try:
-        enqueue_next_set(session_id, subsystem_id, epoch, threats_epoch)
+        enqueue_next_set(session_id, subsystem_id, epoch, threats_epoch,
+                        str(scenario_session["EntityID"]), scenario_session["UserID"])
     except Exception as exc:  # noqa: BLE001 — broker unreachable must not wedge SCENARIOS at IDLE
         _recover_from_enqueue_failure(session_id, subsystem_id, epoch, exc, "next_set.enqueue_failed")
     # The SCENARIOS epoch, not the THREATS one: it is the epoch run_next_set stamps on the

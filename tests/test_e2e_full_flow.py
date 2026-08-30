@@ -261,7 +261,8 @@ def test_create_session_over_real_http(client, monkeypatch):
     _seed_asset_and_subsystem(asset_id, subsystem_id)
 
     calls = []
-    monkeypatch.setattr(sessions_mod, "enqueue_pipeline", lambda sid: calls.append(sid))
+    monkeypatch.setattr(sessions_mod, "enqueue_pipeline",
+                        lambda sid, entity_id, user_id: calls.append(sid))
 
     r = client.post("/v1/sessions", json={
         "asset_id": asset_id, "entity_id": ENTITY, "supporting_system_id": [subsystem_id]})
@@ -324,7 +325,7 @@ def test_next_set_over_real_http(client, monkeypatch):
     sid, _oid, _tid = _seed_reviewable_session(client)
     calls = []
     monkeypatch.setattr(sessions_mod, "enqueue_next_set",
-                        lambda session_id, subsystem_id, epoch, threats_epoch:
+                        lambda session_id, subsystem_id, epoch, threats_epoch, entity_id, user_id:
                         calls.append((session_id, subsystem_id, epoch, threats_epoch)))
 
     r = client.post(f"/v1/sessions/{sid}/scenarios/next-set")
@@ -342,8 +343,8 @@ def test_regenerate_over_real_http(client, monkeypatch):
     sid, oid, _tid = _seed_reviewable_session(client)
     calls = []
     monkeypatch.setattr(sessions_mod, "enqueue_regeneration",
-                        lambda session_id, subsystem_id, granularity, target_ids, epoch, user_note:
-                        calls.append((session_id, target_ids)))
+                        lambda session_id, subsystem_id, granularity, target_ids, epoch, user_note,
+                            entity_id, user_id: calls.append((session_id, target_ids)))
 
     r = client.post(f"/v1/sessions/{sid}/regenerate/scenarios", json={"scenario_ids": [oid]})
     assert r.status_code == 202, r.text

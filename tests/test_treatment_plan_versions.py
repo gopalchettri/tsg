@@ -84,7 +84,8 @@ def _wire(Session, monkeypatch) -> list:
     monkeypatch.setattr(treatment_api, "db_session", fake_db_session)
     monkeypatch.setattr(treatment_api, "get_authorized_session",
                         lambda sess, sid, principal: {"SessionID": sid, "EntityID": "86"})
-    monkeypatch.setattr(treatment_api, "enqueue_treatment_plan", lambda plan_id: None)
+    monkeypatch.setattr(treatment_api, "enqueue_treatment_plan",
+                        lambda plan_id, entity_id, user_id: None)
     monkeypatch.setattr(bus, "publish", lambda sid, ev: published.append(ev))
     return published
 
@@ -162,7 +163,7 @@ def test_enqueue_failure_answers_503_not_500(monkeypatch):
     _seed(Session)
     _wire(Session, monkeypatch)
 
-    def _broker_down(_plan_id):
+    def _broker_down(_plan_id, _entity_id, _user_id):
         raise RuntimeError("kombu.exceptions.OperationalError: [Errno 111] Connection refused")
 
     monkeypatch.setattr(treatment_api, "enqueue_treatment_plan", _broker_down)

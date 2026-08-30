@@ -28,12 +28,14 @@ from app.api.schemas import (
     UNAVAILABLE_RESPONSES,
     EmbeddingActionBody,
     EmbeddingJobAccepted,
+    EmbeddingJobEvent,
     EmbeddingJobStatus,
     GroundingCalibrationAccepted,
     GroundingCalibrationBody,
     GroundingCalibrationHistory,
     GroundingCalibrationRun,
     GroundingCalibrationStatus,
+    GroundingJobEvent,
     GroundingThresholdResponse,
 )
 from app.core.config import get_settings
@@ -43,6 +45,7 @@ from app.core.enums import (
     SSEEventType,
 )
 from app.core.logging import get_logger
+from app.db import dal
 from app.db import models as m
 from app.db.dal import NotFoundError
 from app.db.engine import db_session
@@ -80,15 +83,20 @@ def _require_group_when_names_given(body: EmbeddingActionBody) -> None:
         raise AdminValidationError("names requires a specific group — cannot scope names across all groups")
 
 
-def _enqueue(action: str, body: EmbeddingActionBody) -> EmbeddingJobAccepted:
+def _enqueue(action: str, body: EmbeddingActionBody, user_id: str | None) -> EmbeddingJobAccepted:
     """Queues the action (indirection so tests can run it synchronously) and records the
     provenance marker get_status below requires.
 
     Every other task shares this Celery app and result backend, so without the marker a bare
     AsyncResult(job_id) lookup cannot tell an admin job from any other task's id — get_status
     would return another tenant's pipeline exception text, or crash trying to `**` a list.
-    The marker write is best-effort: an unreachable Redis leaves the job merely unpollable."""
-    task = admin_embedding_action_task.delay(action, body.group, body.names)
+    The marker write is best-effort: an unreachable Redis leaves the job merely unpollable.
+
+    No entity_id in the shadow label: this is an admin action, cross-tenant by design."""
+    task = admin_embedding_action_task.apply_async(
+        args=(action, body.group, body.names), shadow=(
+            f"embeddings {action}: {body.group or 'all groups'} · by {user_id} · "
+            f"{dal.now():%Y-%m-%d %H:%M} UTC"))
     mark_admin_job(task.id, FAMILY_EMBEDDINGS)  # best-effort — see admin_jobs.mark_admin_job
     return EmbeddingJobAccepted(job_id=task.id)
 
@@ -99,7 +107,7 @@ def create(body: EmbeddingActionBody, request: Request,
     """Fingerprint specific NEW item(s) you name — for right after a threat is added."""
     if not body.group or not body.names:
         raise AdminValidationError("create requires both group and names")
-    accepted = _enqueue("create", body)
+    accepted = _enqueue("create", body, principal.user_id)
     _audit(request, "create", body, principal, accepted.job_id)
     return accepted
 
@@ -110,7 +118,7 @@ def update(body: EmbeddingActionBody, request: Request,
     """Whole-group sync: embed whatever's missing across every active row (`group=None` =
     every group). `names` isn't part of this action's contract — see /create for targeted
     embedding of specific items."""
-    accepted = _enqueue("update", body)
+    accepted = _enqueue("update", body, principal.user_id)
     _audit(request, "update", body, principal, accepted.job_id)
     return accepted
 
@@ -120,7 +128,7 @@ def recreate(body: EmbeddingActionBody, request: Request,
         principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobAccepted:
     """Wipe a group's (or named items') cached vectors, then re-embed them from scratch."""
     _require_group_when_names_given(body)
-    accepted = _enqueue("recreate", body)
+    accepted = _enqueue("recreate", body, principal.user_id)
     _audit(request, "recreate", body, principal, accepted.job_id)
     return accepted
 
@@ -136,7 +144,7 @@ def delete(body: EmbeddingActionBody, request: Request,
         raise AdminValidationError(
             "delete requires group and/or names — refusing to wipe the entire cache with an empty request")
     _require_group_when_names_given(body)
-    accepted = _enqueue("delete", body)
+    accepted = _enqueue("delete", body, principal.user_id)
     _audit(request, "delete", body, principal, accepted.job_id)
     return accepted
 
@@ -164,7 +172,9 @@ def get_status(job_id: str, _principal: Principal = Depends(get_admin_principal)
 
 
 @router.get("/events/{job_id}",
-            responses={200: {"content": {"text/event-stream": {}}}} | UNAVAILABLE_RESPONSES)
+            responses={200: {"model": EmbeddingJobEvent, "content": {"text/event-stream": {}},
+                        "description": "SSE stream; each `data:` line is one EmbeddingJobEvent."}}
+                    | UNAVAILABLE_RESPONSES)
 async def job_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE stream for one queued embedding action: a state snapshot on connect (a late
     subscriber to a finished job gets the terminal state immediately and the stream closes),
@@ -175,7 +185,11 @@ async def job_events(job_id: str, _principal: Principal = Depends(get_admin_prin
     open publish breaker sends nothing, so the shared implementation's tick backstop re-reads
     the real AsyncResult state on a fixed cadence and closes the stream itself once terminal —
     get_status remains the durable truth. Streaming mechanics live in admin_sse.py, shared with
-    the import and intel-refresh job-events routes."""
+    the grounding-calibration and intel-refresh job-events routes.
+
+    Same header requirement as GET /v1/sessions/{session_id}/events: this is a fetch()+
+    ReadableStream stream sent with the admin auth headers this API requires, so the browser's
+    native `EventSource` API cannot consume it (it cannot set custom headers)."""
     return await admin_job_event_stream(
         job_id, FAMILY_EMBEDDINGS, emb_job_channel_key, str(SSEEventType.embedding_job_update))
 
@@ -262,7 +276,10 @@ def calibrate(request: Request, body: GroundingCalibrationBody | None = None,
             run_id=str(live.RunID) if live is not None else None) from exc
 
     try:
-        task = calibrate_grounding_task.delay(force, principal.user_id, principal.client_id, run_id)
+        task = calibrate_grounding_task.apply_async(
+            args=(force, principal.user_id, principal.client_id, run_id), shadow=(
+                f"grounding-calibrate: run {run_id} · by {principal.user_id} · "
+                f"{dal.now():%Y-%m-%d %H:%M} UTC" + (" (forced)" if force else "")))
     except BaseException as exc:
         # The row is the lock, and it is opened BEFORE the queue on purpose. If the broker refuses
         # the publish there is no worker to close it, so close it here — otherwise every calibrate
@@ -393,7 +410,9 @@ def _status_from_row(row) -> GroundingCalibrationStatus:
 
 
 @grounding_router.get("/calibrate/events/{job_id}",
-            responses={200: {"content": {"text/event-stream": {}}}} | UNAVAILABLE_RESPONSES)
+            responses={200: {"model": GroundingJobEvent, "content": {"text/event-stream": {}},
+                        "description": "SSE stream; each `data:` line is one GroundingJobEvent."}}
+                    | UNAVAILABLE_RESPONSES)
 async def calibration_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE stream for one calibration sweep: a state snapshot on connect, then the worker's live
     `grounding_job_update` hints — STARTED, then phase/done/total ticks as the negatives and
@@ -401,6 +420,10 @@ async def calibration_events(job_id: str, _principal: Principal = Depends(get_ad
 
     Worth streaming rather than polling precisely because a sweep runs for MINUTES: the progress
     ticks are the only way to tell "still measuring" from "wedged". Same hint-layer contract as
-    every other admin job stream — get_calibration_status stays the durable truth."""
+    every other admin job stream — get_calibration_status stays the durable truth.
+
+    Same header requirement as GET /v1/sessions/{session_id}/events: this is a fetch()+
+    ReadableStream stream sent with the admin auth headers this API requires, so the browser's
+    native `EventSource` API cannot consume it (it cannot set custom headers)."""
     return await admin_job_event_stream(
         job_id, FAMILY_GROUNDING, grounding_job_channel_key, str(SSEEventType.grounding_job_update))
