@@ -154,6 +154,28 @@ def test_hyphenated_durations_parse_and_unparsable_timelines_warn():
     assert any("no parsable duration" in w for w in _window_violations(prose, {"total_days": 14}))
 
 
+def test_recommended_controls_carry_the_library_domain_stamped_server_side():
+    """`domain` is curated Control_Library metadata (an un-normalised ~96-value vocabulary), so
+    it is stamped from the resolved library row rather than asked of the model. Asked for, a
+    plausible near-miss like 'Identity & Access' for 'Identification & Authentication' would
+    read fine and silently mis-bucket the control on any report grouped by domain — the same
+    reason control_library_id and the canonical control_code are server-owned."""
+    from app.pipeline.treatment import _resolve_control_library_ids
+    snap = {"existing_controls": {"library_mapped": [
+        {"control_library_id": 106, "control_code": "CII-CID-106",
+         "domain": "Audit & Accountability", "control_name": "Time Stamps"}]}}
+    plan = {"controls_to_be_implemented": {"controls": [
+        # lower-cased code on purpose: the fold must still resolve, and the canonical spelling
+        # and the domain must both come back from the library row.
+        {"control_type": "detective", "control_name": "Time Stamps",
+         "control_code": "cii-cid-106", "priority": "Critical"}]}}
+    assert _resolve_control_library_ids(plan, snap) == []
+    kept = plan["controls_to_be_implemented"]["controls"][0]
+    assert kept["domain"] == "Audit & Accountability"
+    assert kept["control_code"] == "CII-CID-106"
+    assert kept["control_library_id"] == 106
+
+
 def test_covered_verdict_with_no_library_controls_warns():
     """C2 server half: with zero library-mapped controls, 'covered' is vacuously true — the
     verdict is unverifiable and the reviewer must be told."""

@@ -598,6 +598,13 @@ def _resolve_control_library_ids(parsed: dict[str, Any],
             continue
         ctl["control_library_id"] = hit["control_library_id"]
         ctl["control_code"] = hit["control_code"]   # canonical spelling, not the echo
+        # `domain` comes from the LIBRARY ROW, never from the model — same rule as the id and
+        # the canonical code. It is real curated metadata (Control_Library.Domain, an
+        # un-normalised 96-value vocabulary), so asking the model for it would invite an
+        # invented near-miss like "Identity & Access" for "Identification & Authentication",
+        # which reads plausible and silently mis-buckets the control on any report grouped by
+        # domain. Stamping it costs nothing: `hit` is already the resolved row.
+        ctl["domain"] = hit.get("domain")
         kept.append(ctl)
     cti["controls"] = kept
     # A dropped control means the model invented/mistyped a code — either way it isn't a
