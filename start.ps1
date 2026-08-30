@@ -21,6 +21,14 @@
 .PARAMETER ProjectRoot
     Path to the tsg/ folder. Defaults to the directory this script lives in.
 
+.PARAMETER EnvFile
+    Which env file the whole stack loads -- '.env' (dev) by default, '.env.uat' for UAT. The
+    script exports it as TSG_ENV_FILE (app/core/config.py::_env_file reads that), so the worker,
+    beat, uvicorn and Flower windows all resolve the SAME file. A session-level
+    $env:TSG_ENV_FILE is honoured when this parameter is not passed; the parameter wins when it
+    is. A path that does not exist is a hard error, never a silent fall back to dev config.
+    The chosen file's own APP_ENV is printed at launch, so the environment is visible up front.
+
 .PARAMETER Port
     HTTP port for the FastAPI server. Default 8000.
 
@@ -53,6 +61,9 @@
     .\start.ps1
 
 .EXAMPLE
+    .\start.ps1 -EnvFile .env.uat
+
+.EXAMPLE
     .\start.ps1 -Reload -Concurrency 10
 
 .EXAMPLE
@@ -62,6 +73,9 @@
 [CmdletBinding()]
 param(
     [string]$ProjectRoot = $PSScriptRoot,
+    # Session env var is the default, so an operator who already exported TSG_ENV_FILE keeps
+    # working unchanged; -EnvFile overrides it. Either way the value ends up SET, never guessed.
+    [string]$EnvFile = $(if ($env:TSG_ENV_FILE) { $env:TSG_ENV_FILE } else { '.env' }),
     [int]$Port = 8000,
     [int]$Concurrency = 50,
     [switch]$Reload,
@@ -72,6 +86,27 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Reads ONE key out of a .env file -- deliberately not a general dotenv loader: a broad loader
+# here could shadow the app's own pydantic-settings resolution and make the two disagree about
+# what is configured. Used for APP_ENV (below) and TSG_FLOWER_BASIC_AUTH (Flower section).
+function Get-EnvValue {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string[]]$Keys
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { continue }
+        $eq = $trimmed.IndexOf('=')          # FIRST '=' only: a password may contain '='
+        if ($eq -lt 1) { continue }
+        if ($Keys -notcontains $trimmed.Substring(0, $eq).Trim()) { continue }
+        $value = $trimmed.Substring($eq + 1).Trim().Trim('"', "'")
+        if ($value) { return $value }        # keep scanning if the line was blank/empty
+    }
+    return $null
+}
 
 # ---------------------------------------------------------------------------
 # Pre-flight
@@ -99,18 +134,32 @@ if (-not (Test-Path $venvPython)) {
     throw "venv interpreter not found at $venvPython -- recreate the venv IN THIS DIRECTORY (do not copy one)."
 }
 
-$envFile = Join-Path $ProjectRoot '.env'
-if (-not (Test-Path $envFile)) {
-    Write-Warning "$envFile not found. Copy .env.example to .env and fill in real values first."
+# Which env file the APP will actually read. config.py::_env_file() honours TSG_ENV_FILE and
+# falls back to '.env'. Leaving that variable purely ambient was the silent-failure hole: a UAT
+# launch from a shell that forgot to export it looked identical to a correct one right up until
+# Mongo (localhost:27017) and the LLM provider turned out to be the dev ones -- at which point
+# the symptom reads as "calibration keeps failing", not "wrong config file". The old fix printed
+# a warning on every dev launch and hoped the operator read it. It is a PARAMETER now: always
+# set, resolved to an absolute path, exported so every spawned window agrees, and printed with
+# the APP_ENV the file declares. Nothing left to forget, so nothing left to warn about.
+$envPath = if ([System.IO.Path]::IsPathRooted($EnvFile)) { $EnvFile }
+           else { Join-Path $ProjectRoot $EnvFile }
+if (-not (Test-Path -LiteralPath $envPath)) {
+    throw "Env file '$EnvFile' not found at $envPath -- refusing to start on another environment's config. For dev: copy .env.example to .env and fill in real values. For UAT: .\start.ps1 -EnvFile .env.uat"
 }
 
-# Which env file the APP will actually read. config.py::_env_file() honours TSG_ENV_FILE and
-# falls back to '.env'; this script neither sets nor validates it. That is silent-failure
-# territory because '.env' (dev) ALSO carries APP_ENV=staging -- so a UAT launch from a shell
-# that forgot the variable looks identical to a correct one right up until Mongo
-# (localhost:27017) and the LLM provider (azure_openai) turn out to be the dev ones, at which
-# point the symptom reads as "calibration keeps failing", not "wrong config file". Print it.
-$effectiveEnvFile = if ($env:TSG_ENV_FILE) { $env:TSG_ENV_FILE } else { '.env  (TSG_ENV_FILE not set)' }
+# Absolute path, so every spawned window resolves the same file whatever its cwd; Start-Process
+# hands this process's environment to all of them (worker, beat, uvicorn, Flower).
+$env:TSG_ENV_FILE = $envPath
+
+# APP_ENV is the env file's own declaration of which deployment it describes (config.py:64), and
+# what the boot posture guard enforces (config.py GATE 1: a dev/local build pointed at
+# non-loopback infrastructure is refused outright). Printing it shows the operator the
+# environment they are ACTUALLY starting rather than just the filename they typed -- which is
+# what the removed warning was groping at. Unset means the config default, prod, the strictest.
+$appEnv = Get-EnvValue -Path $envPath -Keys 'APP_ENV', 'TSG_APP_ENV'
+if (-not $appEnv) { $appEnv = 'unset -> config default: prod' }
+$effectiveEnvFile = "$EnvFile  (APP_ENV=$appEnv)"
 
 # Refuse to double-launch. Two workers on one box race the same queue (and, before -n below,
 # under identical broker hostnames). NOTE: ONE healthy stack normally shows a celery.exe +
@@ -135,9 +184,6 @@ Write-Host "Env file     : $effectiveEnvFile" -ForegroundColor Cyan
 Write-Host "FastAPI port : $Port"        -ForegroundColor Cyan
 Write-Host "Concurrency  : $Concurrency" -ForegroundColor Cyan
 Write-Host "Auto-reload  : $($Reload.IsPresent)" -ForegroundColor Cyan
-if (-not $env:TSG_ENV_FILE) {
-    Write-Warning "TSG_ENV_FILE is not set -- the app will load .env (DEV config: azure_openai, mongodb://localhost:27017). For UAT/staging, stop and relaunch with:  `$env:TSG_ENV_FILE='.env.uat'"
-}
 Write-Host ""
 
 # ---------------------------------------------------------------------------
@@ -471,32 +517,16 @@ if (-not $NoFlower) {
     $flowerAuth = $env:TSG_FLOWER_BASIC_AUTH
     if (-not $flowerAuth) { $flowerAuth = $env:FLOWER_BASIC_AUTH }
     if (-not $flowerAuth) {
-        # Deliberately parses ONE key, not a general dotenv loader: a broad loader here could
-        # shadow the app's own pydantic-settings resolution and make the two disagree.
-        # Honours TSG_ENV_FILE the same way app/core/config.py::_env_file() does.
-        $envName = $env:TSG_ENV_FILE
-        if (-not $envName) { $envName = '.env' }
-        $envPath = if ([System.IO.Path]::IsPathRooted($envName)) { $envName }
-                   else { Join-Path $ProjectRoot $envName }
-        if (Test-Path -LiteralPath $envPath) {
-            foreach ($line in (Get-Content -LiteralPath $envPath -ErrorAction SilentlyContinue)) {
-                $trimmed = $line.Trim()
-                if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { continue }
-                $eq = $trimmed.IndexOf('=')          # FIRST '=' only: a password may contain '='
-                if ($eq -lt 1) { continue }
-                $key = $trimmed.Substring(0, $eq).Trim()
-                if ($key -ne 'TSG_FLOWER_BASIC_AUTH' -and $key -ne 'FLOWER_BASIC_AUTH') { continue }
-                $flowerAuth = $trimmed.Substring($eq + 1).Trim().Trim('"', "'")
-                if ($flowerAuth) { break }           # keep scanning if the line was blank/empty
-            }
-        }
+        # $envPath is the file the APP itself is loading (resolved in pre-flight), so this can
+        # never disagree with pydantic-settings about which environment's password it read.
+        $flowerAuth = Get-EnvValue -Path $envPath -Keys 'TSG_FLOWER_BASIC_AUTH', 'FLOWER_BASIC_AUTH'
     }
 
     if ($flowerAuth) {
         $flowerArgs += " --basic-auth=$flowerAuth"
         Write-Host "Flower: basic auth enabled." -ForegroundColor Green
     } else {
-        Write-Host "Flower: no TSG_FLOWER_BASIC_AUTH set (checked session env and .env) -- starting WITHOUT auth, bound to 127.0.0.1 only." -ForegroundColor DarkYellow
+        Write-Host "Flower: no TSG_FLOWER_BASIC_AUTH set (checked session env and $EnvFile) -- starting WITHOUT auth, bound to 127.0.0.1 only." -ForegroundColor DarkYellow
     }
 
     # Free the port first, exactly as the uvicorn launch above does. Flower now starts on EVERY
