@@ -211,7 +211,50 @@ USER_ID="&lt;user id&gt;"     ENTITY_ID="78"      HOST="http://localhost:8000"</
     &quot;error_message&quot;: {},
     &quot;overall&quot;: &quot;awaiting_review&quot;,
     &quot;scenarios&quot;: &quot;AWAITING_DECISION&quot;,
-    &quot;threats&quot;: &quot;COMPLETE&quot;
+    &quot;threats&quot;: &quot;COMPLETE&quot;,
+    &quot;last_next_set&quot;: {
+      &quot;outcome&quot;: &quot;complete&quot;,
+      &quot;requested&quot;: 0,
+      &quot;delivered&quot;: 0,
+      &quot;variants&quot;: 0,
+      &quot;reason&quot;: &quot;no_new_threats_found&quot;,
+      &quot;epoch&quot;: 0
+    },
+    &quot;last_regen&quot;: {
+      &quot;target_ids&quot;: [
+        &quot;&lt;target_ids&gt;&quot;
+      ],
+      &quot;requested_ids&quot;: [
+        &quot;&lt;requested_ids&gt;&quot;
+      ],
+      &quot;replacements&quot;: [
+        {}
+      ],
+      &quot;failed_threat_ids&quot;: [
+        &quot;&lt;failed_threat_ids&gt;&quot;
+      ],
+      &quot;rescored_threat_ids&quot;: [
+        &quot;&lt;rescored_threat_ids&gt;&quot;
+      ],
+      &quot;epoch&quot;: 0,
+      &quot;user_note&quot;: &quot;&lt;user_note&gt;&quot;
+    },
+    &quot;coverage&quot;: {
+      &quot;cells&quot;: 0,
+      &quot;covered&quot;: 0,
+      &quot;justified_na&quot;: 0,
+      &quot;unexplained&quot;: 0,
+      &quot;complete&quot;: false,
+      &quot;units&quot;: [
+        0
+      ],
+      &quot;gaps&quot;: [
+        {
+          &quot;subsystem_id&quot;: 0,
+          &quot;category&quot;: &quot;&lt;category&gt;&quot;
+        }
+      ]
+    }
   },
   &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   &quot;session_status&quot;: &quot;active&quot;,
@@ -336,14 +379,80 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
         &quot;grounding_status&quot;: &quot;verified&quot;,
         &quot;scope_rank&quot;: 3,
         &quot;score&quot;: 70.0,
-        &quot;threat_category&quot;: &quot;Tampering&quot;
+        &quot;threat_category&quot;: &quot;Tampering&quot;,
+        &quot;threat_id&quot;: &quot;&lt;threat_id&gt;&quot;,
+        &quot;threat_category_id&quot;: 0,
+        &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+        &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+        &quot;description&quot;: &quot;&lt;description&gt;&quot;,
+        &quot;threat_type_id&quot;: 0,
+        &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
+        &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
+        &quot;threat_catalogue_id&quot;: 0,
+        &quot;is_threat_type_ai_generated&quot;: false,
+        &quot;is_threat_ai_generated&quot;: false
       },
       &quot;validation_errors&quot;: [],
-      &quot;validation_status&quot;: &quot;ok&quot;
+      &quot;validation_status&quot;: &quot;ok&quot;,
+      &quot;accepted_by&quot;: &quot;&lt;accepted_by&gt;&quot;,
+      &quot;accepted_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;rejected_by&quot;: &quot;&lt;rejected_by&gt;&quot;,
+      &quot;rejected_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;moderation_flagged&quot;: false,
+      &quot;controls_unavailable&quot;: false
     }
   ],
   &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-  &quot;user_id&quot;: &quot;qa-user&quot;
+  &quot;user_id&quot;: &quot;qa-user&quot;,
+  &quot;progress&quot;: {
+    &quot;threats&quot;: &quot;&lt;threats&gt;&quot;,
+    &quot;scenarios&quot;: &quot;&lt;scenarios&gt;&quot;,
+    &quot;overall&quot;: &quot;&lt;overall&gt;&quot;,
+    &quot;error_message&quot;: {},
+    &quot;last_next_set&quot;: {
+      &quot;outcome&quot;: &quot;complete&quot;,
+      &quot;requested&quot;: 0,
+      &quot;delivered&quot;: 0,
+      &quot;variants&quot;: 0,
+      &quot;reason&quot;: &quot;no_new_threats_found&quot;,
+      &quot;epoch&quot;: 0
+    },
+    &quot;last_regen&quot;: {
+      &quot;target_ids&quot;: [
+        &quot;&lt;target_ids&gt;&quot;
+      ],
+      &quot;requested_ids&quot;: [
+        &quot;&lt;requested_ids&gt;&quot;
+      ],
+      &quot;replacements&quot;: [
+        {}
+      ],
+      &quot;failed_threat_ids&quot;: [
+        &quot;&lt;failed_threat_ids&gt;&quot;
+      ],
+      &quot;rescored_threat_ids&quot;: [
+        &quot;&lt;rescored_threat_ids&gt;&quot;
+      ],
+      &quot;epoch&quot;: 0,
+      &quot;user_note&quot;: &quot;&lt;user_note&gt;&quot;
+    },
+    &quot;coverage&quot;: {
+      &quot;cells&quot;: 0,
+      &quot;covered&quot;: 0,
+      &quot;justified_na&quot;: 0,
+      &quot;unexplained&quot;: 0,
+      &quot;complete&quot;: false,
+      &quot;units&quot;: [
+        0
+      ],
+      &quot;gaps&quot;: [
+        {
+          &quot;subsystem_id&quot;: 0,
+          &quot;category&quot;: &quot;&lt;category&gt;&quot;
+        }
+      ]
+    }
+  }
 }</pre>
   </div>
   <div class="blk verify">
@@ -423,7 +532,30 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
         &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;
       },
       &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
-      &quot;subsystem_id&quot;: 101
+      &quot;subsystem_id&quot;: 101,
+      &quot;accepted_by&quot;: &quot;&lt;accepted_by&gt;&quot;,
+      &quot;accepted_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;rejected_by&quot;: &quot;&lt;rejected_by&gt;&quot;,
+      &quot;rejected_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;controls_unavailable&quot;: false,
+      &quot;threat&quot;: {
+        &quot;threat_id&quot;: &quot;&lt;threat_id&gt;&quot;,
+        &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+        &quot;threat_category_id&quot;: 0,
+        &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+        &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+        &quot;description&quot;: &quot;&lt;description&gt;&quot;,
+        &quot;threat_type_id&quot;: 0,
+        &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
+        &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
+        &quot;grounding_status&quot;: &quot;&lt;grounding_status&gt;&quot;,
+        &quot;threat_catalogue_id&quot;: 0,
+        &quot;is_threat_type_ai_generated&quot;: false,
+        &quot;is_threat_ai_generated&quot;: false,
+        &quot;grounding_score&quot;: 0.0,
+        &quot;score&quot;: 0.0,
+        &quot;scope_rank&quot;: 0
+      }
     }
   ],
   &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
@@ -463,7 +595,12 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
       &quot;audit_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
       &quot;detail&quot;: {},
       &quot;event&quot;: &quot;session_started&quot;,
-      &quot;subject_type&quot;: &quot;session&quot;
+      &quot;subject_type&quot;: &quot;session&quot;,
+      &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+      &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+      &quot;stage&quot;: &quot;&lt;stage&gt;&quot;,
+      &quot;subsystem_id&quot;: 0,
+      &quot;decision&quot;: &quot;&lt;decision&gt;&quot;
     }
   ],
   &quot;limit&quot;: 100,
@@ -492,7 +629,10 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   <div class="blk">
     <h3>Request</h3>
     <pre>{
-  &quot;mode&quot;: &quot;all&quot;
+  &quot;mode&quot;: &quot;all&quot;,
+  &quot;scenario_ids&quot;: [
+    &quot;&lt;scenario_ids&gt;&quot;
+  ]
 }</pre>
   </div>
   <div class="blk">
@@ -639,7 +779,13 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;control_name&quot;: &quot;Privileged access review&quot;,
       &quot;domain&quot;: &quot;Access Control&quot;,
       &quot;map_rank&quot;: 1,
-      &quot;score&quot;: 82.4
+      &quot;score&quot;: 82.4,
+      &quot;standards&quot;: [
+        {
+          &quot;standard_id&quot;: 0,
+          &quot;standard_name&quot;: &quot;&lt;standard_name&gt;&quot;
+        }
+      ]
     }
   ],
   &quot;controls_mapped&quot;: true,
@@ -652,7 +798,9 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     &quot;id&quot;: 187,
     &quot;name&quot;: &quot;Ransomware encrypts historian data at rest&quot;,
     &quot;status&quot;: &quot;inserted&quot;,
-    &quot;type_id&quot;: 42
+    &quot;type_id&quot;: 42,
+    &quot;error&quot;: &quot;&lt;error&gt;&quot;,
+    &quot;linked&quot;: false
   },
   &quot;threat_actors&quot;: [
     {
@@ -660,14 +808,19 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;linked&quot;: true,
       &quot;name&quot;: &quot;APT-Nova&quot;,
       &quot;status&quot;: &quot;existing&quot;,
-      &quot;type_id&quot;: 42
+      &quot;type_id&quot;: 42,
+      &quot;error&quot;: &quot;&lt;error&gt;&quot;,
+      &quot;category_id&quot;: 0
     }
   ],
   &quot;threat_type&quot;: {
     &quot;category_id&quot;: 2,
     &quot;id&quot;: 42,
     &quot;name&quot;: &quot;Ransomware&quot;,
-    &quot;status&quot;: &quot;existing&quot;
+    &quot;status&quot;: &quot;existing&quot;,
+    &quot;error&quot;: &quot;&lt;error&gt;&quot;,
+    &quot;type_id&quot;: 0,
+    &quot;linked&quot;: false
   }
 }</pre>
   </div>
@@ -781,7 +934,30 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   &quot;session_status&quot;: &quot;completed&quot;,
   &quot;subsystem_id&quot;: 101,
   &quot;superseded&quot;: false,
-  &quot;user_id&quot;: &quot;qa-user&quot;
+  &quot;user_id&quot;: &quot;qa-user&quot;,
+  &quot;accepted_by&quot;: &quot;&lt;accepted_by&gt;&quot;,
+  &quot;accepted_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+  &quot;rejected_by&quot;: &quot;&lt;rejected_by&gt;&quot;,
+  &quot;rejected_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+  &quot;controls_unavailable&quot;: false,
+  &quot;threat&quot;: {
+    &quot;threat_id&quot;: &quot;&lt;threat_id&gt;&quot;,
+    &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+    &quot;threat_category_id&quot;: 0,
+    &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+    &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+    &quot;description&quot;: &quot;&lt;description&gt;&quot;,
+    &quot;threat_type_id&quot;: 0,
+    &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
+    &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
+    &quot;grounding_status&quot;: &quot;&lt;grounding_status&gt;&quot;,
+    &quot;threat_catalogue_id&quot;: 0,
+    &quot;is_threat_type_ai_generated&quot;: false,
+    &quot;is_threat_ai_generated&quot;: false,
+    &quot;grounding_score&quot;: 0.0,
+    &quot;score&quot;: 0.0,
+    &quot;scope_rank&quot;: 0
+  }
 }</pre>
   </div>
   <div class="blk verify">
@@ -810,62 +986,74 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     <h3>Response <span class="status">200 (403 if entity_id not authorized)</span></h3>
     <pre>[
   {
-    &quot;accepted&quot;: true,
+    &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+    &quot;accepted_by&quot;: &quot;&lt;accepted_by&gt;&quot;,
+    &quot;accepted_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+    &quot;rejected_by&quot;: &quot;&lt;rejected_by&gt;&quot;,
+    &quot;rejected_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+    &quot;controls_unavailable&quot;: false,
+    &quot;subsystem_id&quot;: 0,
+    &quot;scenario&quot;: {
+      &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+      &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+      &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+      &quot;supporting_systems_involved&quot;: [
+        {
+          &quot;supporting_system_id&quot;: 0,
+          &quot;supporting_system&quot;: &quot;&lt;supporting_system&gt;&quot;,
+          &quot;is_entry_point&quot;: false,
+          &quot;justification&quot;: &quot;&quot;
+        }
+      ]
+    },
+    &quot;threat&quot;: {
+      &quot;threat_id&quot;: &quot;&lt;threat_id&gt;&quot;,
+      &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+      &quot;threat_category_id&quot;: 0,
+      &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+      &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+      &quot;description&quot;: &quot;&lt;description&gt;&quot;,
+      &quot;threat_type_id&quot;: 0,
+      &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
+      &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
+      &quot;grounding_status&quot;: &quot;&lt;grounding_status&gt;&quot;,
+      &quot;threat_catalogue_id&quot;: 0,
+      &quot;is_threat_type_ai_generated&quot;: false,
+      &quot;is_threat_ai_generated&quot;: false,
+      &quot;grounding_score&quot;: 0.0,
+      &quot;score&quot;: 0.0,
+      &quot;scope_rank&quot;: 0
+    },
     &quot;actors&quot;: [
       {
-        &quot;actor_id&quot;: 12,
-        &quot;actor_name&quot;: &quot;Nation-state/APT&quot;
-      },
-      {
-        &quot;actor_id&quot;: 31,
-        &quot;actor_name&quot;: &quot;Malicious insider&quot;
+        &quot;actor_id&quot;: 0,
+        &quot;actor_name&quot;: &quot;&lt;actor_name&gt;&quot;
       }
     ],
     &quot;controls&quot;: [
       {
-        &quot;control_code&quot;: &quot;CII-CID-201&quot;,
-        &quot;control_id&quot;: 201,
-        &quot;control_name&quot;: &quot;Multi-Factor Authentication&quot;,
-        &quot;domain&quot;: &quot;Identification &amp; Authentication&quot;,
-        &quot;map_rank&quot;: 1,
-        &quot;score&quot;: 93.0,
+        &quot;control_id&quot;: 0,
+        &quot;control_code&quot;: &quot;&lt;control_code&gt;&quot;,
+        &quot;domain&quot;: &quot;&lt;domain&gt;&quot;,
+        &quot;control_name&quot;: &quot;&lt;control_name&gt;&quot;,
+        &quot;map_rank&quot;: 0,
+        &quot;score&quot;: 0.0,
         &quot;standards&quot;: [
           {
-            &quot;standard_id&quot;: 3,
-            &quot;standard_name&quot;: &quot;NIST SP 800-53 Rev. 5&quot;
-          },
-          {
-            &quot;standard_id&quot;: 7,
-            &quot;standard_name&quot;: &quot;ISO 27001:2022&quot;
+            &quot;standard_id&quot;: 0,
+            &quot;standard_name&quot;: &quot;&lt;standard_name&gt;&quot;
           }
         ]
       }
     ],
-    &quot;created_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;,
-    &quot;entity_id&quot;: &quot;ENT-001&quot;,
-    &quot;scenario&quot;: {
-      &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
-      &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
-      &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;,
-      &quot;supporting_systems_involved&quot;: [
-        {
-          &quot;is_entry_point&quot;: true,
-          &quot;justification&quot;: &quot;The firmware push travels over this network to reach the RTU.&quot;,
-          &quot;supporting_system&quot;: &quot;OT Telecom Network&quot;,
-          &quot;supporting_system_id&quot;: 306
-        }
-      ],
-      &quot;threat_category&quot;: &quot;Tampering&quot;,
-      &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;,
-      &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;
-    },
-    &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
-    &quot;scenario_number&quot;: 1,
-    &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-    &quot;session_status&quot;: &quot;completed&quot;,
-    &quot;subsystem_id&quot;: 101,
+    &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
+    &quot;entity_id&quot;: &quot;&lt;entity_id&gt;&quot;,
+    &quot;user_id&quot;: &quot;&lt;user_id&gt;&quot;,
+    &quot;session_status&quot;: &quot;&lt;session_status&gt;&quot;,
+    &quot;scenario_number&quot;: 0,
+    &quot;accepted&quot;: false,
     &quot;superseded&quot;: false,
-    &quot;user_id&quot;: &quot;qa-user&quot;
+    &quot;created_at&quot;: &quot;2026-08-30T12:00:00&quot;
   }
 ]</pre>
   </div>
@@ -895,62 +1083,74 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     <h3>Response <span class="status">200</span></h3>
     <pre>[
   {
-    &quot;accepted&quot;: true,
+    &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+    &quot;accepted_by&quot;: &quot;&lt;accepted_by&gt;&quot;,
+    &quot;accepted_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+    &quot;rejected_by&quot;: &quot;&lt;rejected_by&gt;&quot;,
+    &quot;rejected_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+    &quot;controls_unavailable&quot;: false,
+    &quot;subsystem_id&quot;: 0,
+    &quot;scenario&quot;: {
+      &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+      &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+      &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+      &quot;supporting_systems_involved&quot;: [
+        {
+          &quot;supporting_system_id&quot;: 0,
+          &quot;supporting_system&quot;: &quot;&lt;supporting_system&gt;&quot;,
+          &quot;is_entry_point&quot;: false,
+          &quot;justification&quot;: &quot;&quot;
+        }
+      ]
+    },
+    &quot;threat&quot;: {
+      &quot;threat_id&quot;: &quot;&lt;threat_id&gt;&quot;,
+      &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+      &quot;threat_category_id&quot;: 0,
+      &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+      &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+      &quot;description&quot;: &quot;&lt;description&gt;&quot;,
+      &quot;threat_type_id&quot;: 0,
+      &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
+      &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
+      &quot;grounding_status&quot;: &quot;&lt;grounding_status&gt;&quot;,
+      &quot;threat_catalogue_id&quot;: 0,
+      &quot;is_threat_type_ai_generated&quot;: false,
+      &quot;is_threat_ai_generated&quot;: false,
+      &quot;grounding_score&quot;: 0.0,
+      &quot;score&quot;: 0.0,
+      &quot;scope_rank&quot;: 0
+    },
     &quot;actors&quot;: [
       {
-        &quot;actor_id&quot;: 12,
-        &quot;actor_name&quot;: &quot;Nation-state/APT&quot;
-      },
-      {
-        &quot;actor_id&quot;: 31,
-        &quot;actor_name&quot;: &quot;Malicious insider&quot;
+        &quot;actor_id&quot;: 0,
+        &quot;actor_name&quot;: &quot;&lt;actor_name&gt;&quot;
       }
     ],
     &quot;controls&quot;: [
       {
-        &quot;control_code&quot;: &quot;CII-CID-201&quot;,
-        &quot;control_id&quot;: 201,
-        &quot;control_name&quot;: &quot;Multi-Factor Authentication&quot;,
-        &quot;domain&quot;: &quot;Identification &amp; Authentication&quot;,
-        &quot;map_rank&quot;: 1,
-        &quot;score&quot;: 93.0,
+        &quot;control_id&quot;: 0,
+        &quot;control_code&quot;: &quot;&lt;control_code&gt;&quot;,
+        &quot;domain&quot;: &quot;&lt;domain&gt;&quot;,
+        &quot;control_name&quot;: &quot;&lt;control_name&gt;&quot;,
+        &quot;map_rank&quot;: 0,
+        &quot;score&quot;: 0.0,
         &quot;standards&quot;: [
           {
-            &quot;standard_id&quot;: 3,
-            &quot;standard_name&quot;: &quot;NIST SP 800-53 Rev. 5&quot;
-          },
-          {
-            &quot;standard_id&quot;: 7,
-            &quot;standard_name&quot;: &quot;ISO 27001:2022&quot;
+            &quot;standard_id&quot;: 0,
+            &quot;standard_name&quot;: &quot;&lt;standard_name&gt;&quot;
           }
         ]
       }
     ],
-    &quot;created_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;,
-    &quot;entity_id&quot;: &quot;ENT-001&quot;,
-    &quot;scenario&quot;: {
-      &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
-      &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
-      &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;,
-      &quot;supporting_systems_involved&quot;: [
-        {
-          &quot;is_entry_point&quot;: true,
-          &quot;justification&quot;: &quot;The firmware push travels over this network to reach the RTU.&quot;,
-          &quot;supporting_system&quot;: &quot;OT Telecom Network&quot;,
-          &quot;supporting_system_id&quot;: 306
-        }
-      ],
-      &quot;threat_category&quot;: &quot;Tampering&quot;,
-      &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;,
-      &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;
-    },
-    &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
-    &quot;scenario_number&quot;: 1,
-    &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-    &quot;session_status&quot;: &quot;completed&quot;,
-    &quot;subsystem_id&quot;: 101,
+    &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
+    &quot;entity_id&quot;: &quot;&lt;entity_id&gt;&quot;,
+    &quot;user_id&quot;: &quot;&lt;user_id&gt;&quot;,
+    &quot;session_status&quot;: &quot;&lt;session_status&gt;&quot;,
+    &quot;scenario_number&quot;: 0,
+    &quot;accepted&quot;: false,
     &quot;superseded&quot;: false,
-    &quot;user_id&quot;: &quot;qa-user&quot;
+    &quot;created_at&quot;: &quot;2026-08-30T12:00:00&quot;
   }
 ]</pre>
   </div>
@@ -1076,7 +1276,20 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
   &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;,
   &quot;status&quot;: &quot;COMPLETE&quot;,
-  &quot;treatment_strategy&quot;: &quot;Mitigate&quot;
+  &quot;treatment_strategy&quot;: &quot;Mitigate&quot;,
+  &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
+  &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
+  &quot;reviewed_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+  &quot;created_by&quot;: &quot;&lt;created_by&gt;&quot;,
+  &quot;cancelled_by&quot;: &quot;&lt;cancelled_by&gt;&quot;,
+  &quot;cancelled_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+  &quot;warnings&quot;: [
+    &quot;&lt;warnings&gt;&quot;
+  ],
+  &quot;moderation_flagged&quot;: false,
+  &quot;error_message&quot;: &quot;&lt;error_message&gt;&quot;,
+  &quot;reason&quot;: &quot;generation_failed&quot;,
+  &quot;superseded&quot;: []
 }</pre>
   </div>
   <div class="blk verify">
@@ -1132,7 +1345,8 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     <h3>Request</h3>
     <pre>{
   &quot;comment&quot;: &quot;A3 timeline extended per operations.&quot;,
-  &quot;decision&quot;: &quot;approved&quot;
+  &quot;decision&quot;: &quot;approved&quot;,
+  &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;
 }</pre>
   </div>
   <div class="blk">
@@ -1288,11 +1502,89 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;risk_level&quot;: &quot;Critical&quot;,
       &quot;scenario_id&quot;: &quot;1a2b…&quot;,
       &quot;scenario_title&quot;: &quot;Ransomware via exposed RDP&quot;,
-      &quot;status&quot;: &quot;COMPLETE&quot;
+      &quot;status&quot;: &quot;COMPLETE&quot;,
+      &quot;error_message&quot;: &quot;&lt;error_message&gt;&quot;,
+      &quot;reason&quot;: &quot;generation_failed&quot;,
+      &quot;plan&quot;: {},
+      &quot;superseded&quot;: [
+        {
+          &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+          &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
+          &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+          &quot;status&quot;: &quot;&lt;status&gt;&quot;,
+          &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
+          &quot;scenario&quot;: {},
+          &quot;actors&quot;: [
+            {
+              &quot;actor_id&quot;: 0,
+              &quot;actor_name&quot;: &quot;&lt;actor_name&gt;&quot;
+            }
+          ],
+          &quot;risk_level&quot;: &quot;&lt;risk_level&gt;&quot;,
+          &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
+          &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
+          &quot;reviewed_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+          &quot;created_by&quot;: &quot;&lt;created_by&gt;&quot;,
+          &quot;cancelled_by&quot;: &quot;&lt;cancelled_by&gt;&quot;,
+          &quot;cancelled_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+          &quot;risk_identification_date&quot;: &quot;2026-08-30T12:00:00&quot;,
+          &quot;plan&quot;: {},
+          &quot;warnings&quot;: [
+            &quot;&lt;warnings&gt;&quot;
+          ],
+          &quot;moderation_flagged&quot;: false,
+          &quot;error_message&quot;: &quot;&lt;error_message&gt;&quot;,
+          &quot;reason&quot;: &quot;generation_failed&quot;,
+          &quot;superseded&quot;: []
+        }
+      ],
+      &quot;created_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;completed_at&quot;: &quot;2026-08-30T12:00:00&quot;
     },
     {
       &quot;scenario_id&quot;: &quot;9f3c…&quot;,
-      &quot;scenario_title&quot;: &quot;Insider tampering&quot;
+      &quot;scenario_title&quot;: &quot;Insider tampering&quot;,
+      &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+      &quot;status&quot;: &quot;&lt;status&gt;&quot;,
+      &quot;risk_level&quot;: &quot;&lt;risk_level&gt;&quot;,
+      &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
+      &quot;error_message&quot;: &quot;&lt;error_message&gt;&quot;,
+      &quot;reason&quot;: &quot;generation_failed&quot;,
+      &quot;plan&quot;: {},
+      &quot;superseded&quot;: [
+        {
+          &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+          &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
+          &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+          &quot;status&quot;: &quot;&lt;status&gt;&quot;,
+          &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
+          &quot;scenario&quot;: {},
+          &quot;actors&quot;: [
+            {
+              &quot;actor_id&quot;: 0,
+              &quot;actor_name&quot;: &quot;&lt;actor_name&gt;&quot;
+            }
+          ],
+          &quot;risk_level&quot;: &quot;&lt;risk_level&gt;&quot;,
+          &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
+          &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
+          &quot;reviewed_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+          &quot;created_by&quot;: &quot;&lt;created_by&gt;&quot;,
+          &quot;cancelled_by&quot;: &quot;&lt;cancelled_by&gt;&quot;,
+          &quot;cancelled_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+          &quot;risk_identification_date&quot;: &quot;2026-08-30T12:00:00&quot;,
+          &quot;plan&quot;: {},
+          &quot;warnings&quot;: [
+            &quot;&lt;warnings&gt;&quot;
+          ],
+          &quot;moderation_flagged&quot;: false,
+          &quot;error_message&quot;: &quot;&lt;error_message&gt;&quot;,
+          &quot;reason&quot;: &quot;generation_failed&quot;,
+          &quot;superseded&quot;: []
+        }
+      ],
+      &quot;created_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;completed_at&quot;: &quot;2026-08-30T12:00:00&quot;
     }
   ],
   &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;
@@ -1425,16 +1717,15 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     <pre>{
   &quot;feeds&quot;: [
     {
-      &quot;enabled&quot;: true,
-      &quot;feed&quot;: &quot;cisa_kev&quot;,
-      &quot;item_count&quot;: 1653,
-      &quot;kinds&quot;: {
-        &quot;cve&quot;: 1653
-      },
-      &quot;last_attempt_at&quot;: &quot;2026-07-27T03:00:00Z&quot;,
-      &quot;last_fetched_at&quot;: &quot;2026-07-27T03:00:00Z&quot;,
-      &quot;last_success_at&quot;: &quot;2026-07-27T03:00:00Z&quot;,
-      &quot;prompted&quot;: true
+      &quot;feed&quot;: &quot;&lt;feed&gt;&quot;,
+      &quot;enabled&quot;: false,
+      &quot;item_count&quot;: 0,
+      &quot;kinds&quot;: {},
+      &quot;prompted&quot;: false,
+      &quot;last_fetched_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;last_attempt_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;last_success_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;last_error&quot;: &quot;&lt;last_error&gt;&quot;
     }
   ]
 }</pre>
@@ -1468,18 +1759,18 @@ db.intel_feed_status.findOne({ feed: &quot;cisa_kev&quot; });</pre>
     <pre>{
   &quot;items&quot;: [
     {
-      &quot;adversary&quot;: &quot;Armored Likho&quot;,
-      &quot;description&quot;: &quot;BusySnake is a new stealer attributed to ...&quot;,
-      &quot;external_id&quot;: &quot;6a6c1a2b3c4d5e6f7a8b9c0d&quot;,
-      &quot;fetched_at&quot;: &quot;2026-08-03T07:44:27Z&quot;,
-      &quot;kind&quot;: &quot;pulse&quot;,
-      &quot;source&quot;: &quot;otx&quot;,
+      &quot;source&quot;: &quot;&lt;source&gt;&quot;,
+      &quot;kind&quot;: &quot;&lt;kind&gt;&quot;,
+      &quot;external_id&quot;: &quot;&lt;external_id&gt;&quot;,
+      &quot;title&quot;: &quot;&lt;title&gt;&quot;,
+      &quot;adversary&quot;: &quot;&lt;adversary&gt;&quot;,
+      &quot;description&quot;: &quot;&quot;,
+      &quot;url&quot;: &quot;&quot;,
       &quot;tags&quot;: [
-        &quot;armored likho&quot;,
-        &quot;stealer&quot;
+        &quot;&lt;tags&gt;&quot;
       ],
-      &quot;title&quot;: &quot;[Armored Likho] Armored Likho&#x27;s new weapon: BusySnake Stealer&quot;,
-      &quot;url&quot;: &quot;https://otx.alienvault.com/pulse/6a6c1a2b3c4d5e6f7a8b9c0d&quot;
+      &quot;fetched_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;published_at&quot;: &quot;2026-08-30T12:00:00&quot;
     }
   ],
   &quot;total&quot;: 0,
@@ -1748,7 +2039,9 @@ db.intel_feed_status.findOne({ feed: &quot;{feed_from_the_event_payload}&quot; }
     &quot;threat_catalogue&quot;: 8,
     &quot;threat_type&quot;: 12
   },
-  &quot;state&quot;: &quot;SUCCESS&quot;
+  &quot;state&quot;: &quot;SUCCESS&quot;,
+  &quot;vectors_deleted&quot;: {},
+  &quot;error&quot;: &quot;&lt;error&gt;&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -1845,7 +2138,10 @@ data: {&quot;type&quot;: &quot;embedding_job_update&quot;, &quot;job_id&quot;: &
   &quot;positives&quot;: 200,
   &quot;quality&quot;: 0.94,
   &quot;reranker_model&quot;: &quot;bge-reranker-v2-m3&quot;,
-  &quot;state&quot;: &quot;SUCCESS&quot;
+  &quot;state&quot;: &quot;SUCCESS&quot;,
+  &quot;run_id&quot;: &quot;&lt;run_id&gt;&quot;,
+  &quot;skipped&quot;: &quot;&lt;skipped&gt;&quot;,
+  &quot;error&quot;: &quot;&lt;error&gt;&quot;
 }</pre>
   </div>
   <div class="blk verify">
