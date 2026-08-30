@@ -33,7 +33,16 @@ from app.core.config import Settings
 #: Settings whose value DERIVES from other settings when left unset (model_fields_set
 #: detection) — a live line freezes the derivation. Documented COMMENTED with "LEAVE UNSET".
 DERIVED_SETTINGS: tuple[str, ...] = (
-    "stage_lease_seconds", "reaper_stale_grace_seconds", "control_map_min_score",
+    "stage_lease_seconds", "reaper_stale_grace_seconds",
+    # Derived per environment by Settings._derive_subsystem_task_limits (lease x 2, capped at
+    # 90% of broker_visibility_timeout_seconds). A constant cannot be right in both dev and UAT.
+    "subsystem_task_soft_limit_seconds",
+    # control_map_min_score is DELIBERATELY NOT LISTED, though it does derive when unset. Its
+    # derivation resolves to the GROUNDING threshold — calibrated label-vs-label, while Step-4
+    # matches a scenario PARAGRAPH against control labels. Left unset against a 90 grounding pin
+    # it dropped every match and published `controls: []` as a healthy "library gap": 7 of 13
+    # mapped scenarios came back empty. Pinning it is now the CORRECT posture, so warning that a
+    # live line "disables its derivation" would push an operator straight back into that bug.
 )
 
 
