@@ -123,3 +123,14 @@ def test_unverified_llm_model_also_kills_the_process(monkeypatch):
     with pytest.raises(_Exited) as caught:
         celery_app._init_worker(sender=None)
     assert caught.value.args[0] == 1, "an unverified model must exit non-zero, not report ready"
+
+
+def test_intel_refresh_is_never_auto_scheduled():
+    """threat-intel fetching is admin-triggered only (POST /v1/tsg/threat-intel/feeds/refresh
+    and .../feeds/{feed}/refresh) — same posture as grounding calibration. beat_schedule builds
+    this dict unconditionally at import time (no intel_enabled branch left in it at all), so a
+    single check pins the guarantee — intel_enabled now only gates prompt injection
+    (tasks.py::_fetch_intel), never scheduling."""
+    from app.pipeline import celery_app
+
+    assert "intel-refresh" not in celery_app.celery_app.conf.beat_schedule

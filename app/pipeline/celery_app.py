@@ -112,9 +112,8 @@ celery_app.conf.update(
         "map-controls-sweep": {"task": "tsg.map_controls_sweep",
                             "schedule": _s.control_map_sweep_interval_seconds},
         "operational-self-check": {"task": "tsg.self_check", "schedule": _s.self_check_interval_seconds},
-        # live threat-intel refresh — opt-in (TSG_INTEL_ENABLED); absent entirely when off
-        **({"intel-refresh": {"task": "tsg.intel_refresh", "schedule": _s.intel_refresh_interval_seconds}}
-        if _s.intel_enabled else {}),
+        # threat-intel refresh is deliberately NOT scheduled here — see intel_refresh_task's
+        # docstring: it is admin-triggered only, same posture as calibrate_grounding_task.
     },
 )
 
@@ -575,8 +574,11 @@ def map_controls_sweep_task() -> list[str]:
 
 @celery_app.task(name="tsg.intel_refresh")
 def intel_refresh_task() -> dict[str, str]:
-    """Scheduled pull of the open threat-intel feeds into the Mongo `threat_intel` cache. Gated
-    by `intel_enabled`.
+    """Pull of the open threat-intel feeds into the Mongo `threat_intel` cache. NEVER queued
+    automatically — the only triggers are `POST /v1/tsg/threat-intel/feeds/refresh` and
+    `POST /v1/tsg/threat-intel/feeds/{feed}/refresh` (both admin-gated). `intel_enabled` no
+    longer gates this task; it now only gates whether `_fetch_intel` injects cached intel into
+    a scenario-generation prompt (app/pipeline/tasks.py).
 
     DISPATCHER, not a worker: one `tsg.intel_refresh_feed` job per enabled feed, returning
     {feed: job_id}. The fan-out buys per-feed isolation — a slow or broken feed can't delay the

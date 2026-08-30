@@ -133,12 +133,12 @@ class Settings(BaseSettings):
 
     # --- 5. Live threat intel (open feeds cached in Mongo; enrichment is fail-open) ---
 
-    # TSG_INTEL_ENABLED — master switch for the daily intel-refresh task.
+    # TSG_INTEL_ENABLED — whether cached intel data is injected into scenario-generation
+    # prompts (app/pipeline/tasks.py::_fetch_intel). Fetching itself is admin-triggered only,
+    # via POST /v1/tsg/threat-intel/feeds/refresh or .../feeds/{feed}/refresh — never scheduled.
     intel_enabled: bool = True
     # TSG_INTEL_TTL_DAYS — purges only items a feed has DROPPED; present items never expire.
     intel_ttl_days: int = 30
-    # TSG_INTEL_REFRESH_INTERVAL_SECONDS — refresh cadence (default daily).
-    intel_refresh_interval_seconds: int = 86400
 
     # TSG_INTEL_KEV_ENABLED / _URL — CISA Known Exploited Vulnerabilities feed (no auth).
     intel_kev_enabled: bool = True
