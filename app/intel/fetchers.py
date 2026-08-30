@@ -17,8 +17,10 @@ The store accessor mirrors embeddings._vector_store (same settings, same breaker
 idea) but is its own handle: that one is @lru_cache'd onto the `embeddings`
 collection and can't serve a second collection.
 
-Scheduling: `tsg.intel_refresh` (celery_app.py beat, gated on TSG_INTEL_ENABLED).
-Manual:     python -m app.intel.fetchers --once
+Fetching is admin-triggered only, never scheduled — POST /v1/tsg/threat-intel/feeds/refresh
+and .../feeds/{feed}/refresh (see app/api/threat_intel.py::_dispatch), which fans out one
+`tsg.intel_refresh_feed` Celery job per enabled feed.
+Manual, out-of-band: python -m app.intel.fetchers --once
 """
 from __future__ import annotations
 
@@ -271,8 +273,8 @@ def _enabled_fetchers(s) -> list[tuple[str, Any]]:
 
 
 def enabled_feed_names() -> list[str]:
-    """Names of the feeds switched on right now — the fan-out list the dispatcher task
-    spawns one job per (celery_app.intel_refresh_task) and the status API reports on."""
+    """Names of the feeds switched on right now — the fan-out list app/api/threat_intel.py::
+    _dispatch spawns one job per and the status API reports on."""
     return [name for name, _ in _enabled_fetchers(get_settings())]
 
 
@@ -362,7 +364,7 @@ def refresh_all() -> dict[str, int]:
     """Every enabled feed, in-process and sequential — the CLI/back-compat path.
 
     Production refreshes go through the fan-out instead (one Celery task per feed, see
-    celery_app.intel_refresh_task), which gets parallelism, per-feed retry and per-feed
+    app/api/threat_intel.py::_dispatch), which gets parallelism, per-feed retry and per-feed
     isolation this loop cannot offer. Kept fail-soft (a dead feed reports -1 and the rest
     still run) so a direct caller kicking every feed by hand behaves as it always did."""
     col = _store_if_healthy()

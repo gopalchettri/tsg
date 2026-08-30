@@ -112,8 +112,9 @@ celery_app.conf.update(
         "map-controls-sweep": {"task": "tsg.map_controls_sweep",
                             "schedule": _s.control_map_sweep_interval_seconds},
         "operational-self-check": {"task": "tsg.self_check", "schedule": _s.self_check_interval_seconds},
-        # threat-intel refresh is deliberately NOT scheduled here — see intel_refresh_task's
-        # docstring: it is admin-triggered only, same posture as calibrate_grounding_task.
+        # threat-intel refresh is deliberately NOT scheduled here — it is admin-triggered only
+        # via POST /v1/tsg/threat-intel/feeds/refresh and .../feeds/{feed}/refresh (see
+        # threat_intel.py::_dispatch), same posture as calibrate_grounding_task.
     },
 )
 
@@ -570,27 +571,6 @@ def map_controls_sweep_task() -> list[str]:
     foreground scenario generation of worker slots. run_control_map_sweep logs what it swept."""
     with db_session() as sess:
         return cascade.run_control_map_sweep(sess, get_llm())
-
-
-@celery_app.task(name="tsg.intel_refresh")
-def intel_refresh_task() -> dict[str, str]:
-    """Pull of the open threat-intel feeds into the Mongo `threat_intel` cache. NEVER queued
-    automatically — the only triggers are `POST /v1/tsg/threat-intel/feeds/refresh` and
-    `POST /v1/tsg/threat-intel/feeds/{feed}/refresh` (both admin-gated). `intel_enabled` no
-    longer gates this task; it now only gates whether `_fetch_intel` injects cached intel into
-    a scenario-generation prompt (app/pipeline/tasks.py).
-
-    DISPATCHER, not a worker: one `tsg.intel_refresh_feed` job per enabled feed, returning
-    {feed: job_id}. The fan-out buys per-feed isolation — a slow or broken feed can't delay the
-    others, and each records its own outcome for the per-feed status API."""
-    # This module has no module-level logger; a bare `log` raises NameError on every scheduled run
-    # AFTER the jobs are dispatched, so the feeds refresh but the dispatcher always ends FAILURE.
-    from app.core.logging import get_logger
-    from app.intel.fetchers import enabled_feed_names  # local import, mirrors admin-task style
-
-    jobs = {feed: intel_refresh_feed_task.delay(feed).id for feed in enabled_feed_names()}
-    get_logger(__name__).info("intel.refresh_dispatched", feeds=list(jobs))
-    return jobs
 
 
 def _publish_intel_job_event(job_id: str | None, state: CeleryJobState, **fields) -> None:
