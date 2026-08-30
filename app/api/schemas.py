@@ -621,18 +621,11 @@ class ThreatResult(ApiModel):
                     "promoting the threat later does NOT flip it. Null only for rows written "
                     "before this field existed."
     )
-    # No bare `ThreatActors: list[str]`. Actors below carries the same names WITH their
-    # Threat_Actor keys, so a parallel un-keyed copy was pure duplication — and the kind that
-    # silently drifts, since nothing forced the two to be built from the same list.
-    actors: list[ThreatActorRef] = Field(
-        default_factory=list,
-        description="Adversaries for this threat, each with its Threat_Actor database key. Taken "
-                    "from the LIBRARY only — the actors curated on the matched threat's TYPE "
-                    "(ThreatType_ThreatActor_Map), or the nearest active library "
-                    "actors when none are linked. "
-                    "The model never names an adversary, so a name here always corresponds to a "
-                    "real Threat_Actor row. Empty when the table holds none."
-    )
+    # Actors are NOT here. They sit beside this block, as ScenarioResult.actors /
+    # AcceptedScenario.actors — one flat list per scenario entry, next to `controls`. Keeping
+    # them out of the threat object means neither list depends on a threat row having joined:
+    # _threat_block returns None on an OUTER-join miss, which would otherwise take the actors
+    # with it. See ScenarioResult.actors for why actors and controls are two lists, not one.
     grounding_score: float | None = Field(
         default=None,
         description="Library-match confidence (reranker score, 0-100) against the threat "
@@ -658,7 +651,7 @@ class StandardRef(ApiModel):
     standard_name: str = Field(description="The standard's name (Control_Standard.StandardName).")
 
 
-#: One `scenario.controls` entry, for the OpenAPI examples below.
+#: One `controls` entry, for the OpenAPI examples below.
 _MAPPED_CONTROL_EXAMPLE: JsonDict = {
     "control_id": 201,
     "control_code": "CII-CID-201",
@@ -681,7 +674,6 @@ _SCENARIO_EXAMPLE: JsonDict = {
     "threat_category": "Tampering",
     "threat_type": "unauthorized modification of firmware",
     "threat_name": "Unauthorized firmware update of Remote Terminal Unit (RTU)",
-    "threat_actors": ["Nation-state/APT", "Malicious insider"],
     "scenario_title": "Remote Terminal Unit (RTU) — Unauthorized firmware push",
     "scenario_statement": (
         "An attacker with OT network access pushes unsigned firmware to the RTU, "
@@ -691,13 +683,20 @@ _SCENARIO_EXAMPLE: JsonDict = {
         "The RTU provides the Substation Control critical service; corrupted firmware "
         "could cause a sustained outage."
     ),
-    "controls": [_MAPPED_CONTROL_EXAMPLE],
     "supporting_systems_involved": [
         {"supporting_system_id": 306, "supporting_system": "OT Telecom Network",
          "is_entry_point": True,
          "justification": "The firmware push travels over this network to reach the RTU."},
     ],
 }
+
+#: Actors and controls are ENVELOPE siblings, so the examples live here rather than inside
+#: _SCENARIO_EXAMPLE — reused by _SCENARIO_RESULT_EXAMPLE and _ACCEPTED_SCENARIO_EXAMPLE so the
+#: two envelopes cannot drift apart the way hand-copied examples already have once (§7b G2).
+_ACTORS_EXAMPLE: list[JsonDict] = [
+    {"actor_id": 12, "actor_name": "Nation-state/APT"},
+    {"actor_id": 31, "actor_name": "Malicious insider"},
+]
 
 
 class MappedControl(ApiModel):
@@ -706,11 +705,18 @@ class MappedControl(ApiModel):
     library and this real library control matched. Ordered by rank (1 = best). The LLM never
     proposes controls (library-first redesign).
 
-    Delivered nested, as `scenario.controls` — it replaces whatever a legacy scenario's raw JSON
-    carried under that key (sessions.py::_scenario_with_controls), so a scenario carries one
-    control list, not two. An empty `scenario.controls` means nothing in the library matched well
-    enough — a library-gap signal, not an error, but only once `ControlsMapped` is true (see
-    ScenarioResult)."""
+    Delivered as an ENVELOPE sibling — `ScenarioResult.controls` / `AcceptedScenario.controls` —
+    NOT inside `scenario` and NOT inside `threat`. Both placements were wrong for the same
+    reason: mapping is keyed by Threat_Scenario_Control_Map.ScenarioID, so controls belong to the
+    SCENARIO, while a threat can father several scenarios that each map different controls.
+    Nesting them under `threat` invited exactly the de-duplication that would cross-wire them.
+
+    A legacy scenario's raw JSON may still carry a model-authored `{name, why}` list under a
+    `controls` key; sessions.py::_scenario_narrative POPS it, so it can never reach the wire
+    through ScenarioNarrative's `extra="allow"`.
+
+    An empty list means nothing in the library matched well enough — a library-gap signal, not an
+    error, but only once `controls_mapped` is true (see ScenarioResult)."""
     model_config = ConfigDict(json_schema_extra={"example": _MAPPED_CONTROL_EXAMPLE})
 
     control_id: int = Field(description="Control_Library primary key.")
@@ -761,42 +767,39 @@ class SupportingSystemInvolved(ApiModel):
 
 
 class ScenarioNarrative(ApiModel):
-    """The LLM's scenario JSON passed through verbatim, with `controls` replaced by the Step-4
-    grounded library matches (sessions.py::_scenario_with_controls).
+    """The LLM's scenario JSON passed through verbatim — the model's own prose, nothing else.
 
     `extra="allow"` is the point: scenario_title/scenario_statement/risk_statement — and anything
     else a future prompt adds — ride through unvalidated and unmodified, exactly as the bare dict
     this replaced did. Deliberately so: these are model-authored strings, and validating text the
-    code doesn't control just converts an odd LLM response into a 500. `controls` and
-    `supporting_systems_involved` are declared because they're structured, not bare strings,
-    and benefit from typed OpenAPI components rather than a hand-copied prose description (a
+    code doesn't control just converts an odd LLM response into a 500.
+    `supporting_systems_involved` is declared because it's structured, not a bare string, and
+    benefits from a typed OpenAPI component rather than a hand-copied prose description (a
     hand-copied one is exactly how the smoke guides ended up documenting `title`/`narrative`, keys
     the API has never returned).
 
-    threat_category/threat_type/threat_name/threat_actors are NOT LLM output — they come from
-    the Identified_Threat row this scenario was generated from, merged in at read time
-    (sessions.py::_scenario_with_controls) by every current caller. Default to None/[] anyway:
-    no enforced foreign key guarantees the join found a row (see _scenario_select's OUTER join),
+    NEITHER `controls` NOR `threat_actors` live here any more. Both are ENVELOPE siblings now —
+    ScenarioResult.controls / .actors — so each block answers exactly one question. Because
+    `extra="allow"` passes through any key the builder writes, removing the declarations was not
+    enough on its own: sessions.py::_scenario_narrative POPS both keys, which also stops a LEGACY
+    row's model-authored `{name, why}` controls list from surfacing. Do not re-add either field
+    here, and do not delete those pops.
+
+    threat_category/threat_type/threat_name are NOT LLM output — they come from the
+    Identified_Threat row this scenario was generated from, merged in at read time
+    (sessions.py::_scenario_narrative) by every current caller. Default to None anyway: no
+    enforced foreign key guarantees the join found a row (see _scenario_select's OUTER join),
     and a scenario written before this field existed carries none either.
 
-    The FULL typed threat — with database keys and actor ids — is NOT here. It is on the
-    ENVELOPE, as ScenarioResult.threat / AcceptedScenario.threat, deliberately: a failed
-    generation returns scenario=null, and the threat must survive that. Read it there, not
-    through this model (extra="allow" means `scenario.threat` would silently read as absent
-    rather than raise)."""
+    The FULL typed threat — with database keys — is NOT here. It is on the ENVELOPE, as
+    ScenarioResult.threat / AcceptedScenario.threat, deliberately: a failed generation returns
+    scenario=null, and the threat must survive that. Read it there, not through this model
+    (extra="allow" means `scenario.threat` would silently read as absent rather than raise)."""
     model_config = ConfigDict(extra="allow", json_schema_extra={"example": _SCENARIO_EXAMPLE})
 
     threat_category: str | None = Field(default=None, description="This threat's STRIDE category, e.g. Spoofing, Tampering.")
     threat_type: str | None = Field(default=None, description="STRIDE threat type this scenario was generated from.")
     threat_name: str | None = Field(default=None, description="Human-readable threat name this scenario was generated from.")
-    threat_actors: list[str] = Field(default_factory=list, description="Adversary types proposed for the underlying threat.")
-    controls: list[MappedControl] = Field(
-        default_factory=list,
-        description=(
-            "Step-4 mitigating controls mapped from the control library, best first. Empty means "
-            "nothing matched well enough — but only once `controls_mapped` is true; see there."
-        ),
-    )
     supporting_systems_involved: list[SupportingSystemInvolved] = Field(
         default_factory=list,
         description=(
@@ -822,14 +825,12 @@ _SCENARIO_RESULT_EXAMPLE: JsonDict = {
     "threat": {
         "threat_category": "Tampering",
         "grounding_status": "verified",
-        "actors": [
-            {"actor_id": 7, "actor_name": "Nation-state/APT"},
-            {"actor_id": 12, "actor_name": "Malicious insider"},
-        ],
         "grounding_score": 100.0,
         "score": 70.0,
         "scope_rank": 3,
     },
+    "actors": _ACTORS_EXAMPLE,
+    "controls": [_MAPPED_CONTROL_EXAMPLE],
     "accepted": False,
     "moderation_checked": False,
     "moderation_flagged": None,
@@ -851,22 +852,48 @@ class ScenarioResult(ApiModel):
     scenario_id: str = Field(description="Generated scenario's unique id (GUID). Used to accept/regenerate this scenario.")
     scenario: ScenarioNarrative | None = Field(
         description=(
-            "Generated scenario narrative — scenario_title, scenario_statement, risk_statement, "
-            "plus the Step-4 `controls` mapped from the control library. Null if generation failed."
+            "Generated scenario narrative — the model's own prose only: scenario_title, "
+            "scenario_statement, risk_statement, supporting_systems_involved. Null if generation "
+            "failed. Actors and controls are NOT in here; they are the sibling `actors` and "
+            "`controls` blocks below."
         )
     )
     threat: ThreatResult | None = Field(
         default=None,
         description=(
             "The FULL threat this scenario was generated from, with every database key "
-            "(ThreatCatalogueID, ThreatTypeID, actor ids via Actors). Declared HERE, on the "
-            "envelope, and deliberately NOT inside `scenario`: a failed generation returns "
-            "scenario=null, and a reviewer must still be able to see WHICH threat failed. "
+            "(ThreatCatalogueID, ThreatTypeID). Declared HERE, on the envelope, and deliberately "
+            "NOT inside `scenario`: a failed generation returns scenario=null, and a reviewer "
+            "must still be able to see WHICH threat failed. "
             "GroundingStatus `verified` = a real library row backs this threat (keys set); "
             "`unverified` = model-proposed with no confident library match (keys null). Null "
             "only when no Identified_Threat row joined at all (the OUTER join in "
-            "sessions.py::_scenario_select)."
+            "sessions.py::_scenario_select) — note `actors` and `controls` are siblings, so they "
+            "survive that miss rather than disappearing with the threat object."
         )
+    )
+    actors: list[ThreatActorRef] = Field(
+        default_factory=list,
+        description=(
+            "Adversaries for this scenario's threat, each with its Threat_Actor database key. "
+            "Taken from the LIBRARY only — the actors curated on the matched threat's TYPE "
+            "(ThreatType_ThreatActor_Map), or the nearest active library actors when none are "
+            "linked. The model never names an adversary, so a name here always corresponds to a "
+            "real Threat_Actor row. Empty when the table holds none. "
+            "A property of the THREAT: two scenarios generated from the same threat carry "
+            "IDENTICAL actors — unlike `controls`, which are mapped per scenario. That asymmetry "
+            "is why these are two separate lists and not one nested block."
+        ),
+    )
+    controls: list[MappedControl] = Field(
+        default_factory=list,
+        description=(
+            "Step-4 mitigating controls mapped from the control library, best first. A property "
+            "of the SCENARIO — keyed by Threat_Scenario_Control_Map.ScenarioID, so two scenarios "
+            "from the same threat routinely carry DIFFERENT controls. Empty means nothing matched "
+            "well enough, but that only reads as a library gap once `controls_mapped` is true — "
+            "check `controls_mapped` and `controls_unavailable` before concluding anything."
+        ),
     )
     accepted: bool = Field(description="Whether a human reviewer has accepted this scenario.")
     # WHO decided, beside the flag that says a decision happened. `Accepted: true` with no
@@ -962,7 +989,7 @@ class ScenarioResult(ApiModel):
         default=False,
         description=(
             "true = this response could NOT read the control mapping (a transient database "
-            "error), so `scenario.controls` is empty because we did not get to look — NOT because "
+            "error), so `controls` is empty because we did not get to look — NOT because "
             "the library has nothing. Treat the list as unknown and retry; do not read it as a "
             "library gap. Always false on a healthy response, so an existing client that ignores "
             "this field behaves exactly as before. It exists because `ControlsMapped: true` with "
@@ -974,7 +1001,7 @@ class ScenarioResult(ApiModel):
     controls_mapped: bool = Field(
         description=(
             "Whether Step-4 control mapping has been attempted for this scenario. true with an "
-            "empty `scenario.controls` = mapping ran and nothing in the library matched, a genuine "
+            "empty `controls` = mapping ran and nothing in the library matched, a genuine "
             "library-gap signal. false = not attempted, for one of two reasons: SCENARIO_GENERATION "
             "is still running (mapping is its tail step, so controls appear once the session's "
             "status reaches REVIEW), or the control library was empty/unreachable when the stage "
@@ -1229,7 +1256,13 @@ class ErrorDetails(ApiModel):
             "request never ran (wrong session state); a ClickOutcomeReason means it ran and "
             "resolved to nothing; a TreatmentGateReason means a treatment-plan request was "
             "refused. Absent on raise sites with no stable cause, e.g. the "
-            "target-went-stale race."
+            "target-went-stale race. "
+            "RETRY SEMANTICS, for a client deciding between a spinner and a dead end: "
+            "`generation_in_progress` is the ONLY one worth waiting on — a worker is provably "
+            "alive (it holds an unexpired lease), so polling will clear it. "
+            "`generation_abandoned` is its opposite and is NOT retryable: the previous run died "
+            "or hung and automatic recovery could not return the session to REVIEW, so waiting "
+            "changes nothing — start a new session for the asset."
         ),
     )
     detail: str | None = Field(default=None, description="Developer-facing explanation. Never show this to an end user.")
@@ -1534,6 +1567,8 @@ _ACCEPTED_SCENARIO_EXAMPLE: JsonDict = {
     "scenario_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
     "subsystem_id": 101,
     "scenario": _SCENARIO_EXAMPLE,
+    "actors": _ACTORS_EXAMPLE,
+    "controls": [_MAPPED_CONTROL_EXAMPLE],
 }
 
 
@@ -1561,7 +1596,7 @@ class AcceptedScenario(ApiModel):
         default=False,
         description=(
             "true = the control mapping could not be read for this response, so "
-            "`scenario.controls` is empty because we did not get to look. See "
+            "`controls` is empty because we did not get to look. See "
             "ScenarioResult.ControlsUnavailable."
         ),
     )
@@ -1573,17 +1608,29 @@ class AcceptedScenario(ApiModel):
     )
     scenario: ScenarioNarrative | None = Field(
         description=(
-            "Accepted scenario narrative — scenario_title, scenario_statement, risk_statement, plus "
-            "the Step-4 `controls` mapped from the control library. Identical shape to "
-            "ScenarioResult.scenario."
+            "Accepted scenario narrative — the model's own prose only: scenario_title, "
+            "scenario_statement, risk_statement, supporting_systems_involved. Identical shape to "
+            "ScenarioResult.scenario. Actors and controls are the sibling blocks below."
         )
     )
     threat: ThreatResult | None = Field(
         default=None,
         description="The FULL threat this scenario was generated from, identical shape and rules "
-                    "to ScenarioResult.threat — every database key, plus actor ids via Actors. "
+                    "to ScenarioResult.threat — every database key. "
                     "The flat ThreatTypeID/ThreatCatalogueID/ThreatType/ThreatName/Library* "
                     "fields above remain for existing clients and report the same values."
+    )
+    actors: list[ThreatActorRef] = Field(
+        default_factory=list,
+        description="Adversaries for this scenario's threat, each with its Threat_Actor database "
+                    "key. Identical shape and rules to ScenarioResult.actors — a property of the "
+                    "THREAT, so scenarios sharing a threat carry identical actors.",
+    )
+    controls: list[MappedControl] = Field(
+        default_factory=list,
+        description="Step-4 mitigating controls mapped from the control library, best first. "
+                    "Identical shape and rules to ScenarioResult.controls — a property of the "
+                    "SCENARIO, so scenarios sharing a threat routinely carry different controls.",
     )
 
 
@@ -2394,10 +2441,20 @@ class TreatmentPlanStatus(ApiModel):
         default=None,
         description=("The accepted scenario this plan treats: scenario_title, "
                      "scenario_statement, risk_statement — plus the underlying threat's own "
-                     "identity (threat_category, threat_type, threat_name, threat_actors[]), "
-                     "which comes from the joined Identified_Threat row, NOT the LLM's scenario "
-                     "JSON. Threat fields are null/empty if the threat linkage is broken (outer "
-                     "join). Null only if the scenario row is unreadable (defensive parse)."))
+                     "identity (threat_category, threat_type, threat_name), which comes from "
+                     "the joined Identified_Threat row, NOT the LLM's scenario JSON. Threat "
+                     "fields are null if the threat linkage is broken (outer join). Adversaries "
+                     "are NOT in here — see the sibling `actors` block, same rule as "
+                     "ScenarioResult. Null only if the scenario row is unreadable (defensive "
+                     "parse)."))
+    actors: list[ThreatActorRef] = Field(
+        default_factory=list,
+        description="Adversaries for this plan's underlying threat, each with its Threat_Actor "
+                    "database key. A SIBLING of `scenario`, never inside it — the same rule as "
+                    "ScenarioResult.actors, so the plan screen and the results screen report "
+                    "adversaries in one identical shape. Empty when the threat linkage is "
+                    "broken, when the threat names none, or on a superseded-version row (which "
+                    "carries no threat join at all).")
     risk_level: str | None = Field(
         default=None, description="The register risk level this plan was generated against (from the request).")
     review_status: str | None = Field(
@@ -2567,8 +2624,13 @@ class TreatmentRegisterRow(ApiModel):
     scenario: dict[str, Any] | None = Field(
         default=None,
         description="Same block as TreatmentPlanStatus.scenario (scenario_title / "
-                    "scenario_statement / risk_statement + threat identity). Populated only "
-                    "with ?include_plan=true.")
+                    "scenario_statement / risk_statement + threat identity). Adversaries are "
+                    "the sibling `actors` block, not in here. Populated only with "
+                    "?include_plan=true.")
+    actors: list[ThreatActorRef] = Field(
+        default_factory=list,
+        description="Same block as TreatmentPlanStatus.actors — adversaries with their "
+                    "Threat_Actor keys. Populated only with ?include_plan=true.")
     treatment_strategy: str | None = Field(
         default=None,
         description="Server-stamped 'Mitigate' — see TreatmentPlanStatus. Populated only with "

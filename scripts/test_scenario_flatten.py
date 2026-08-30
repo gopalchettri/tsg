@@ -1,5 +1,9 @@
-"""Self-check: scenarios[] in GET /sessions/{id}/results nests threat_category/type/name/actors
-and supporting_systems_involved inside `scenario`, alongside the existing controls.
+"""Self-check: scenarios[] in GET /sessions/{id}/results keeps `scenario` to the model's own
+prose, and reports actors + controls as ENVELOPE SIBLINGS of the threat block.
+
+ScenarioNarrative is extra="allow", so a key the builder writes ships whether or not the model
+declares it. That makes "the key is ABSENT" the only assertion that actually proves actors and
+controls left the narrative — checking the model declaration alone would pass either way.
 
 Run:  .venv/Scripts/python.exe scripts/test_scenario_flatten.py
 
@@ -47,13 +51,14 @@ CONTROLS = [MappedControl(control_id=28, control_code="CII-CID-028", domain="BCD
 def main() -> None:
     # 1 — threat_row merges threat_category/type/name/actors into the scenario dict, alongside
     #     the existing controls merge.
-    merged = sessions._scenario_with_controls(RAW_SCENARIO_JSON, CONTROLS, THREAT_ROW)
+    merged = sessions._scenario_narrative(RAW_SCENARIO_JSON, THREAT_ROW)
     assert merged["threat_category"] == "Denial of Service"
     assert merged["threat_type"] == "loss of availability"
     assert merged["threat_name"] == "Loss of control and generation availability of PGS"
-    assert merged["threat_actors"] == ["External attacker", "Nation-state/APT"]
-    assert merged["controls"][0]["control_code"] == "CII-CID-028"
-    print("1 OK  threat fields merged in alongside the existing controls merge")
+    # extra="allow" means a leftover key would ship untyped, so absence is the real contract.
+    assert "threat_actors" not in merged, "actors must leave the narrative, not just the model"
+    assert "controls" not in merged, "controls must leave the narrative, not just the model"
+    print("1 OK  threat prose merged in; actors/controls popped out of the narrative")
 
     # 2 — the merged dict validates as ScenarioNarrative, with supporting_systems_involved
     #     parsed from the LLM's own scenario JSON (untouched by the merge). plausible_entry_
@@ -61,6 +66,8 @@ def main() -> None:
     #     it describes a FUTURE scenario, not this one.
     narrative = ScenarioNarrative(**merged)
     assert narrative.threat_category == "Denial of Service"
+    assert "controls" not in narrative.model_dump()
+    assert "threat_actors" not in narrative.model_dump()
     assert len(narrative.supporting_systems_involved) == 1
     assert narrative.supporting_systems_involved[0].supporting_system == "SCADA System"
     assert narrative.supporting_systems_involved[0].is_entry_point is True
@@ -71,17 +78,16 @@ def main() -> None:
 
     # 3 — threat_row=None (the accepted-scenarios/scenario-list call sites, unchanged by this
     #     work) must still validate: new fields default to None/[], not a validation error.
-    no_threat = sessions._scenario_with_controls(RAW_SCENARIO_JSON, CONTROLS, None)
+    no_threat = sessions._scenario_narrative(RAW_SCENARIO_JSON, None)
     assert no_threat.get("threat_category") is None
     narrative_no_threat = ScenarioNarrative(**no_threat)
     assert narrative_no_threat.threat_category is None
-    assert narrative_no_threat.threat_actors == []
     print("3 OK  threat_row=None still validates — existing call sites unaffected")
 
     # 4 — a pre-existing scenario written before this field existed (no supporting_systems_
     #     involved key at all) still validates, defaulting to an empty list.
     old_json = json.dumps({"scenario_title": "t", "scenario_statement": "s", "risk_statement": "r"})
-    old = sessions._scenario_with_controls(old_json, [], THREAT_ROW)
+    old = sessions._scenario_narrative(old_json, THREAT_ROW)
     narrative_old = ScenarioNarrative(**old)
     assert narrative_old.supporting_systems_involved == []
     print("4 OK  pre-existing scenarios (no involved-systems key) default to an empty list")
@@ -116,8 +122,25 @@ def main() -> None:
     assert item.scenario.threat_type == "Loss of Availability (curated)"
     assert item.scenario.threat_name == "Curated name"
     assert item.scenario.threat_category == "Denial of Service"
-    assert item.scenario.threat_actors == ["External attacker"]
-    print("5 OK  both threat spellings reported; only the display prose coalesces")
+    assert [(a.actor_id, a.actor_name) for a in item.actors] == [(None, "External attacker")]
+    assert [c.control_code for c in item.controls] == ["CII-CID-028"]
+    print("5 OK  both threat spellings reported; actors/controls are envelope siblings")
+
+    # 6 — THE REGRESSION THE POPS EXIST FOR. A pre-redesign row still carries a model-authored
+    #     {name, why} controls list, and ScenarioNarrative is extra="allow" — so deleting the
+    #     field declaration alone would have republished that legacy text as though it were a
+    #     Step-4 library match. Same for any stored threat_actors key. Both must be stripped.
+    legacy_json = json.dumps({
+        "scenario_title": "t", "scenario_statement": "s", "risk_statement": "r",
+        "controls": [{"name": "Legacy suggestion", "why": "model-authored, pre-redesign"}],
+        "threat_actors": ["stale actor copy"],
+    })
+    legacy = sessions._scenario_narrative(legacy_json, THREAT_ROW)
+    assert "controls" not in legacy, "legacy model-authored controls leaked through extra=allow"
+    assert "threat_actors" not in legacy, "legacy threat_actors leaked through extra=allow"
+    dumped = ScenarioNarrative(**legacy).model_dump()
+    assert "controls" not in dumped and "threat_actors" not in dumped
+    print("6 OK  legacy model-authored controls/actors stripped, not republished")
 
     print("\nscenario flatten self-check OK")
 

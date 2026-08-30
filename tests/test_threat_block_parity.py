@@ -138,13 +138,19 @@ def test_both_read_paths_serve_the_identical_threat_block(tmp_path):
         results_row = dict(s.execute(
             sessions_mod._scenario_select().where(
                 m.Threat_Scenario.SessionID == sid)).mappings().one())
-    block_a = sessions_mod._threat_block(accepted_row, {"APT33": 3})
-    block_r = sessions_mod._threat_block(results_row, {"APT33": 3})
+    block_a = sessions_mod._threat_block(accepted_row)
+    block_r = sessions_mod._threat_block(results_row)
     assert block_a == block_r
     assert block_a["threat_catalogue_id"] == 418
     assert block_a["is_threat_ai_generated"] is False
     assert block_a["is_threat_type_ai_generated"] is False
-    assert block_a["actors"] == [{"actor_id": 3, "actor_name": "APT33"}]
+    # Actors are an ENVELOPE sibling, not part of the threat block — same parity requirement,
+    # just checked on the builder that now owns them.
+    assert "actors" not in block_a
+    actors_a = sessions_mod._actor_block(accepted_row, {"APT33": 3})
+    actors_r = sessions_mod._actor_block(results_row, {"APT33": 3})
+    assert actors_a == actors_r
+    assert actors_a == [{"actor_id": 3, "actor_name": "APT33"}]
 
 
 def test_display_wording_coalesce_is_shared_and_prefers_the_curator():

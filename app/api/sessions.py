@@ -74,7 +74,13 @@ from app.db import models as m
 from app.db.dal import EntityForbidden, IdempotencyKeyConflict, RegenerateConflict, now
 from app.db.engine import db_session
 from app.pipeline import cascade, grounding, tasks
-from app.pipeline.accept import accept_session, reject_scenarios, review_gate_reason
+from app.pipeline.accept import (
+    AcceptConflict,
+    accept_session,
+    ensure_review_gate,
+    reject_scenarios,
+    review_gate_reason,
+)
 from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
 from app.pipeline.context import gather_asset_details
 from app.pipeline.grounding import stored_actors
@@ -364,7 +370,7 @@ def get_session(session_id: str, principal: Principal = Depends(get_principal)) 
 def _scenario_select():
     """Scenario columns LEFT-joined via Scoped_Threat -> Identified_Threat (the chain
     dal.accepted_scenarios uses) so every row carries the threat_id it was generated from — plus
-    the threat's own category/type/name/actors, so _scenario_with_controls can merge them into
+    the threat's own category/type/name/actors, so _scenario_narrative can merge them into
     the returned scenario body without a second query. ControlsMappedAt is NULL until Step-4 has
     been ATTEMPTED, which is what separates "still generating" from "nothing in the library
     matched".
@@ -694,8 +700,23 @@ def _actor_ids_from_blobs(sess: Session, blobs: Iterable[str | None]) -> dict[st
     return resolved
 
 
-def _threat_block(threat_row: dict | None,
-                  actor_ids: dict[str, int] | None = None) -> dict | None:
+def _actor_block(threat_row: dict | None,
+                 actor_ids: dict[str, int] | None = None) -> list[dict]:
+    """The scenario's adversaries, shaped as list[ThreatActorRef].
+
+    A SIBLING of the threat block, not a field inside it — see ScenarioResult.actors. Built
+    straight off the row rather than inside _threat_block so it survives the case _threat_block
+    cannot: an OUTER-join miss returns threat=null, and actors stored on the row would otherwise
+    vanish with it.
+
+    `actor_ids` maps name -> Threat_Actor key, resolved in ONE batch by _actor_ids_from_blobs;
+    a name with no id still appears, with actor_id null, because dropping it would silently
+    shorten the adversary list."""
+    actor_names = stored_actors((threat_row or {}).get("ThreatActorsJSON"))
+    return [{"actor_id": (actor_ids or {}).get(n), "actor_name": n} for n in actor_names]
+
+
+def _threat_block(threat_row: dict | None) -> dict | None:
     """The FULL threat a card was generated from, every database key included, shaped as
     ThreatResult.
 
@@ -704,11 +725,16 @@ def _threat_block(threat_row: dict | None,
     threat failed. Putting it inside the narrative made that information vanish exactly when it
     mattered most, and forced a parallel top-level threats[] list to compensate.
 
+    Carries NO actors and NO controls — both are envelope siblings (_actor_block, and the
+    controls list threaded through from _controls_by_output). Controls are keyed by ScenarioID,
+    so they belong to the scenario, not the threat: one threat can father several scenarios that
+    each map different controls, and nesting them here invited a de-duplication that would
+    cross-wire them.
+
     None when the OUTER join found no Identified_Threat row — ThreatResult's required fields
     (ThreatType, GroundingStatus) only exist when the row does."""
     if not threat_row or not threat_row.get("ThreatID"):
         return None
-    actor_names = stored_actors(threat_row.get("ThreatActorsJSON"))
     return {
         "threat_id": threat_row.get("ThreatID"),
         "threat_category": threat_row.get("ThreatCategory"),
@@ -734,28 +760,29 @@ def _threat_block(threat_row: dict | None,
                                     else bool(threat_row.get("IsThreatTypeAIGenerated"))),
         "is_threat_ai_generated": (None if threat_row.get("IsThreatAIGenerated") is None
                                 else bool(threat_row.get("IsThreatAIGenerated"))),
-        "actors": [{"actor_id": (actor_ids or {}).get(n), "actor_name": n}
-                for n in actor_names],
         "grounding_score": threat_row.get("GroundingScore"),
         "score": threat_row.get("Score"),
         "scope_rank": threat_row.get("ScopeRank"),
     }
 
 
-def _scenario_with_controls(scenario_json: str | None, controls: list[MappedControl],
+def _scenario_narrative(scenario_json: str | None,
                         threat_row: dict | None = None) -> dict | None:
-    """Projects one ScenarioJSON row for the API: `controls` becomes the Step-4 grounded
-    Control_Library matches. Presentation-layer merge only — Threat_Scenario_Control_Map stays
-    the single source of truth and ScenarioJSON is never rewritten.
+    """Projects one ScenarioJSON row for the API: the model's own prose, and nothing else.
+    Presentation-layer only — ScenarioJSON is never rewritten.
 
-    The overwrite of `controls` MUST stay even though the LLM no longer proposes controls:
-    LEGACY rows still carry a model-authored `{name, why}` list under that key, and without the
-    overwrite they would publish it where ScenarioNarrative.controls declares list[MappedControl]
-    — a validation 500 on every pre-redesign session. Legacy suggestion text stops being
-    surfaced; the raw ScenarioJSON blob remains the archival copy.
+    THE TWO POPS ARE LOAD-BEARING, do not delete them as dead code. ScenarioNarrative is
+    `extra="allow"`, so ANY key left in this dict ships to the client whether or not the model
+    declares it — removing the field declarations alone would have changed nothing on the wire.
+    `controls` and `threat_actors` are envelope siblings now (ScenarioResult.controls/.actors),
+    so they must be removed HERE to actually leave the narrative.
+    `controls` additionally has to go because LEGACY rows still carry a model-authored
+    `{name, why}` list under that key: this pop is what stops pre-redesign suggestion text
+    resurfacing as though it were a Step-4 library match. The raw ScenarioJSON blob remains the
+    archival copy.
 
-    `threat_row` (a _scenario_select() row) carries the threat's own category/type/name/actors —
-    NOT part of the LLM's scenario JSON — merged in here so a caller only has one dict to read.
+    `threat_row` (a _scenario_select() row) carries the threat's own category/type/name — NOT
+    part of the LLM's scenario JSON — merged in here so a caller only has one dict to read.
     None for callers with no threat context (a scenario built for logging/preview, say)."""
     # Silent on a corrupt blob (no warn_event): one bad row degrades to None and drops out of the
     # view rather than 500-ing it and hiding every other scenario in the session.
@@ -770,8 +797,8 @@ def _scenario_with_controls(scenario_json: str | None, controls: list[MappedCont
         # preferring one here hides nothing - and doing it in one place is what stops the
         # endpoints drifting apart again.
         scenario["threat_type"], scenario["threat_name"] = display_threat_names(threat_row)
-        scenario["threat_actors"] = stored_actors(threat_row.get("ThreatActorsJSON"))
-    scenario["controls"] = [c.model_dump() for c in controls]
+    scenario.pop("controls", None)
+    scenario.pop("threat_actors", None)
     return scenario
 
 
@@ -783,10 +810,13 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
     checked, flagged, categories = _moderation_summary(row["ValidationJSON"])
     validation_status, validation_errors = _validation_summary(row["ValidationJSON"])
     return ScenarioResult(scenario_id=row["ScenarioID"],
-                        scenario=_scenario_with_controls(row["ScenarioJSON"], controls or [], row),
+                        scenario=_scenario_narrative(row["ScenarioJSON"], row),
                         # On the ENVELOPE, so a failure card (scenario=null) still says which
-                        # threat failed — see _threat_block.
-                        threat=_threat_block(row, actor_ids),
+                        # threat failed — see _threat_block. actors/controls are siblings of it,
+                        # so they survive an OUTER-join miss that nulls the threat.
+                        threat=_threat_block(row),
+                        actors=_actor_block(row, actor_ids),
+                        controls=controls or [],
                         accepted=bool(row["Accepted"]),
                         # .get(): this builder is fed by more than one select, and a row that did
                         # not carry the column must publish null rather than KeyError a whole view.
@@ -821,7 +851,11 @@ def _subset_from_accept_body(body: AcceptBody) -> list[str] | None:
 # `responses` is not decoration: these 409 bodies are the ONLY place ReviewGateReason appears, and
 # FastAPI emits a schema only for models reachable from a route. Without this declaration the enum
 # never reaches /openapi.json, and a UI cannot generate the codes that tell it whether a blocked
-# action is a dead end (session_completed/cancelled) or a spinner (generation_in_progress).
+# action is a dead end (session_completed/cancelled/generation_abandoned) or a spinner
+# (generation_in_progress). That split is only trustworthy because accept.ensure_review_gate now
+# PROVES a live lease before emitting generation_in_progress: while the code was inferred from the
+# session's cached stage columns alone, a UI showing a spinner on it could spin forever against a
+# worker that had already died.
 _CONFLICT_RESPONSES: dict[int | str, dict] = {409: {"model": ErrorResponse, "description": "Conflict — see details.reason."}}
 
 
@@ -908,12 +942,20 @@ def enqueue_regeneration(session_id: str, subsystem_id: int, granularity: RegenG
                 f"entity {entity_id} · by {user_id} · {dal.now():%Y-%m-%d %H:%M} UTC"))
 
 
-def _assert_regen_eligible(scenario_session: dict) -> None:
-    """Regeneration is only allowed while the session is parked at REVIEW waiting on a human decision."""
-    gate = review_gate_reason(scenario_session)
-    if gate is not None:
-        reason, message = gate
-        raise RegenerateConflict(message, reason=reason)
+def _assert_regen_eligible(sess: Session, scenario_session: dict) -> dict:
+    """Regeneration is only allowed while the session is parked at REVIEW waiting on a human decision.
+
+    Returns the session row to use from here on: `ensure_review_gate` may have recovered an
+    abandoned run and reloaded it, and the caller must not keep reading the stale snapshot.
+
+    Delegates to the SAME gate the accept route uses, so "is this session decidable?" has exactly
+    one answer everywhere — including the liveness check that stops a dead or hung worker being
+    reported as "generation still in progress" (see accept.ensure_review_gate). Only the exception
+    type differs, because these routes answer `regenerate_conflict`, not `accept_conflict`."""
+    try:
+        return dict(ensure_review_gate(sess, scenario_session))
+    except AcceptConflict as exc:
+        raise RegenerateConflict(str(exc), reason=exc.reason) from None
 
 
 def _recover_from_enqueue_failure(session_id: str, subsystem_id: int, epoch: int,
@@ -949,7 +991,7 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
     conditional UPDATE, resets the affected stage rows, hands off to the async regenerate task."""
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
-        _assert_regen_eligible(scenario_session)
+        scenario_session = _assert_regen_eligible(sess, scenario_session)
 
         cascade.get_threat_id_to_redo(sess, session_id, subsystem_id, granularity, target_ids)
 
@@ -1011,7 +1053,7 @@ def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> Re
     decided server-side by cascade.run_next_set."""
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
-        _assert_regen_eligible(scenario_session)
+        scenario_session = _assert_regen_eligible(sess, scenario_session)
 
         # bail out if another regenerate/accept/next-set already holds this subsystem's mutex lock
         lock_status = sess.execute(
@@ -1375,10 +1417,11 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
                 # BOTH spellings, no coalesce: what the model proposed and what it matched
                 # are different facts, and a GRC reviewer defending this register needs to see
                 # the difference rather than a silently-preferred one of the two.
-                # The row goes in whole; _scenario_with_controls owns the display preference.
-                scenario=_scenario_with_controls(
-                    r["ScenarioJSON"], controls.by_output.get(r["ScenarioID"], []), r),
-                threat=_threat_block(r, actor_ids),
+                # The row goes in whole; _scenario_narrative owns the display preference.
+                scenario=_scenario_narrative(r["ScenarioJSON"], r),
+                threat=_threat_block(r),
+                actors=_actor_block(r, actor_ids),
+                controls=controls.by_output.get(r["ScenarioID"], []),
                 # The accepted register is precisely where "who signed this off" belongs.
                 # rejected_* stay null by construction: this endpoint returns accepted rows only,
                 # and the two decisions are mutually exclusive in the database.
@@ -1408,11 +1451,13 @@ def _scenario_list_item(row: dict, controls: list[MappedControl],
                         actor_ids: dict[str, int] | None = None,
                         *, unavailable: bool = False) -> ScenarioListItem:
     """One dal.scenario_rows/scenario_row row → response item. Same both-spellings rule and
-    controls merge as get_accepted_scenarios above."""
+    sibling actors/controls blocks as get_accepted_scenarios above."""
     return ScenarioListItem(
         scenario_id=row["ScenarioID"], subsystem_id=row["SubsystemID"],
-        scenario=_scenario_with_controls(row["ScenarioJSON"], controls, row),
-        threat=_threat_block(row, actor_ids),
+        scenario=_scenario_narrative(row["ScenarioJSON"], row),
+        threat=_threat_block(row),
+        actors=_actor_block(row, actor_ids),
+        controls=controls,
         session_id=row["SessionID"], entity_id=row["EntityID"], user_id=row["UserID"],
         session_status=row["SessionStatus"], scenario_number=row["ScenarioNumber"],
         accepted=bool(row["Accepted"]), superseded=bool(row["Superseded"]),

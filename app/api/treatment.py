@@ -43,7 +43,7 @@ from app.api.schemas import (
     TreatmentReviewBody,
     TreatmentReviewResponse,
 )
-from app.api.sessions import get_authorized_session
+from app.api.sessions import _actor_block, _actor_ids_from_blobs, get_authorized_session
 from app.core.enums import (
     AuditEventType,
     RiskLevel,
@@ -60,7 +60,6 @@ from app.db import models as m
 from app.db.engine import db_session
 from app.pipeline import treatment
 from app.pipeline.celery_app import generate_treatment_plan_task
-from app.pipeline.grounding import stored_actors
 from app.pipeline.tasks import ASSET_UNIT_ID
 
 log = get_logger(__name__)
@@ -323,18 +322,22 @@ def get_treatment_plan(session_id: str, scenario_id: str,
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
         # ONE cutoff for the current row and every history row (see _present_status).
         stale_cutoff = treatment._stale_cutoff()
+        # ONE batched resolve for this response. _actor_ids_from_blobs prefers the ids Stage 1
+        # STORED in the blob (zero queries) and only falls back to a name lookup for legacy rows.
+        actor_ids = _actor_ids_from_blobs(sess, [row.get("ThreatActorsJSON")])
         older = None
         if include_superseded:
             # PlanID guard: two SELECTs under READ COMMITTED — a regeneration committing
             # between them would supersede the row just read as current, making it show up in
             # BOTH places on one response. Dropping it here keeps the reply self-consistent.
-            older = [_plan_status_from_row(r, stale_cutoff)
+            older = [_plan_status_from_row(r, stale_cutoff, actor_ids)
                     for r in dal.superseded_plan_rows(sess, session_id, scenario_id)
                     if r["PlanID"] != row["PlanID"]]
-        return _plan_status_from_row(row, stale_cutoff, superseded=older)
+        return _plan_status_from_row(row, stale_cutoff, actor_ids, superseded=older)
 
 
 def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
+                          actor_ids: dict[str, int] | None = None,
                         superseded: list[TreatmentPlanStatus] | None = None) -> TreatmentPlanStatus:
     """One plan row -> the wire model. Shared by the single-plan GET, the Excel export, the
     versions history (?include_superseded) and the detailed register (?include_plan), so no
@@ -362,13 +365,16 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
         # Same shared coalesce /results uses: curator's register wording when present, so the
         # treatment plan and the results screen can never disagree on a threat's name.
         scenario["threat_type"], scenario["threat_name"] = display_threat_names(row)
-        scenario["threat_actors"] = stored_actors(row["ThreatActorsJSON"])
     validation = _safe_json_dict(row.get("ValidationJSON"), row["PlanID"]) or {}
     moderation = validation.get("moderation") or {}
     return TreatmentPlanStatus(
         plan_id=row["PlanID"], session_id=row["SessionID"], scenario_id=row["ScenarioID"],
         status=status, treatment_strategy=row["TreatmentStrategy"],
         scenario=scenario,
+        # SIBLING of `scenario`, never inside it — same rule as ScenarioResult.actors.
+        # _actor_block reads ThreatActorsJSON with .get(), so a superseded-version row (which
+        # carries no threat join at all) yields [] rather than raising KeyError.
+        actors=_actor_block(row, actor_ids),
         risk_level=row["RiskLevel"], review_status=row["ReviewStatus"],
         review_comment=row.get("ReviewComment"), reviewed_by=row["ReviewedBy"],
         reviewed_at=row["ReviewedAt"],
@@ -503,11 +509,13 @@ def get_treatment_board(session_id: str,
         stale_cutoff = treatment._stale_cutoff()
         # Whole-session history in ONE round trip, bucketed by scenario — the query's global
         # newest-first order keeps every bucket newest-first.
+        # One batched resolve for every row on the page — see get_treatment_plan.
+        actor_ids = _actor_ids_from_blobs(sess, [r.get("ThreatActorsJSON") for r in rows])
         history: dict[str, list[TreatmentPlanStatus]] = {}
         if include_superseded:
             for h in dal.superseded_plan_rows(sess, session_id):
                 history.setdefault(h["ScenarioID"], []).append(
-                    _plan_status_from_row(h, stale_cutoff))
+                    _plan_status_from_row(h, stale_cutoff, actor_ids))
         plans = []
         for r in rows:
             # All three default to None together: a scenario with no plan yet leaves every one
@@ -696,19 +704,23 @@ def list_entity_treatment_plans(entity_id: str,
                                     status=status, review_status=review_status,
                                     risk_level=risk_level, include_plan=include_plan,
                                     limit=limit, offset=offset)
+        # Only the include_plan branch renders a scenario/actors block, so resolve for it only.
+        actor_ids = (_actor_ids_from_blobs(sess, [r.get("ThreatActorsJSON") for r in rows])
+                     if include_plan else {})
         items = []
         for r in rows:
             if include_plan:
                 # The poll GET's own presenter renders the detail — one projection, two pages,
                 # so the register can never disagree with GET .../treatment-plan.
-                ps = _plan_status_from_row(r, stale_cutoff)
+                ps = _plan_status_from_row(r, stale_cutoff, actor_ids)
                 items.append(TreatmentRegisterRow(
                     plan_id=ps.plan_id, session_id=ps.session_id, scenario_id=ps.scenario_id,
                     asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
                     status=ps.status, risk_level=ps.risk_level,
                     review_status=ps.review_status, reviewed_by=ps.reviewed_by,
                     error_message=ps.error_message, reason=ps.reason,
-                    scenario=ps.scenario, treatment_strategy=ps.treatment_strategy,
+                    scenario=ps.scenario, actors=ps.actors,
+                    treatment_strategy=ps.treatment_strategy,
                     risk_identification_date=ps.risk_identification_date, plan=ps.plan,
                     created_at=ps.created_at, completed_at=ps.completed_at))
                 continue

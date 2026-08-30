@@ -180,13 +180,15 @@ def test_get_results_does_not_crash_on_a_real_active_threat(monkeypatch):
     assert t.score == 90.0
     assert t.scope_rank == 1
     # Actors carry their DB keys. There is deliberately NO bare ThreatActors list beside them:
-    # a second, un-keyed copy of the same names is what drifts.
+    # a second, un-keyed copy of the same names is what drifts. They are an ENVELOPE sibling of
+    # the threat block, not a field inside it, so an OUTER-join miss cannot take them with it.
     assert not hasattr(t, "ThreatActors")
-    assert [(a.actor_id, a.actor_name) for a in t.actors] == [(7, "Nation-state/APT")]
+    assert not hasattr(t, "actors"), "actors moved to the envelope; the threat block must not keep a copy"
+    assert [(a.actor_id, a.actor_name) for a in results.scenarios[0].actors] == [(7, "Nation-state/APT")]
 
     # Standards carry their DB keys alongside the legacy name list — one control referring to
     # several standards is ambiguous as bare names, which is the gap StandardRef closes.
-    control = results.scenarios[0].scenario.controls[0]
+    control = results.scenarios[0].controls[0]
     assert control.control_id == 201
     assert not hasattr(control, "StandardNames")   # keyed list only, no un-keyed duplicate
     assert [(s.standard_id, s.standard_name) for s in control.standards] == [
@@ -295,7 +297,7 @@ def test_a_failed_controls_read_is_not_published_as_a_library_gap(monkeypatch):
     assert card.scenario_id == scenario_id
     # The deliberate contract is intact: a failed secondary read still returns the page.
     assert card.scenario is not None, "a failed controls read must not take down the results view"
-    assert card.scenario.controls == []
+    assert card.controls == []
     # ControlsMapped is correct — it reads ControlsMappedAt off the row, and mapping DID run.
     assert card.controls_mapped is True
     # ...which is precisely why the empty list beside it needed to stop being ambiguous.
@@ -329,4 +331,4 @@ def test_a_healthy_read_never_claims_controls_are_unavailable(monkeypatch):
     card = sessions_mod.get_results(SID, include_replaced=False,
                                     principal=principal).scenarios[0]
     assert card.controls_unavailable is False
-    assert [c.control_id for c in card.scenario.controls] == [201]
+    assert [c.control_id for c in card.controls] == [201]
