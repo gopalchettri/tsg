@@ -433,8 +433,6 @@ def _intel_block(intel_items: list[dict[str, Any]] | None) -> str:
         "\n".join(lines) + "\n<<<END_CURRENT_THREAT_INTEL>>>"
 
 
-
-
 def entry_point_vocabulary(subsystems: list[dict[str, Any]],
                         asset_name: str) -> tuple[dict[str, int], list[str]]:
     """Build the closed vocabulary of supporting-system names that reach the model."""

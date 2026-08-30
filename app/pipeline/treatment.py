@@ -181,7 +181,7 @@ def regen_risk_input_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     controls = snapshot.get("existing_controls") or {}
     assessment = snapshot.get("risk_assessment") or {}
     register = snapshot.get("register") or {}
-    # [Fix] The window used to be dropped here entirely, so every regenerate silently discarded
+    # The window used to be dropped here entirely, so every regenerate silently discarded
     # the deadline the original plan was written against. The STORED keys are timeline_* (a frozen
     # record format, unchanged by the mitigation_* request rename — see _assessment_window), and
     # what _assessment_window READS is mitigation_*, so this is a deliberate translation: it
@@ -205,8 +205,8 @@ def regen_risk_input_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
-                          risk_input: dict[str, Any]) -> dict[str, Any]:
-    """The frozen LLM context (SDD §7.2), persisted verbatim as InputSnapshotJSON.
+                        risk_input: dict[str, Any]) -> dict[str, Any]:
+    """The frozen LLM context, persisted verbatim as InputSnapshotJSON.
 
     `risk_input` is the validated TreatmentPlanBody as a dict — the register's half of the
     context; everything else is extracted from TSG's own tables. Every free-text value
@@ -269,7 +269,7 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
     # Register-consistency advisories — flag, never block: the register owns its numbers, but
     # a contradiction the model will cite verbatim (rule 6) must reach the reviewer's warnings.
     _lr, _ir, _fr = (risk_input.get("likelihood_rating"), risk_input.get("impact_rating"),
-                     risk_input.get("final_risk_rating"))
+                    risk_input.get("final_risk_rating"))
     if None not in (_lr, _ir, _fr) and _fr != _lr * _ir:
         warnings.append(f"final_risk_rating {_fr} does not equal likelihood x impact "
                         f"({_lr}x{_ir}={_lr * _ir}); register values taken as-is")
@@ -297,8 +297,8 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
             # prompt names that fallback explicitly, so no warning is warranted.
             "supporting_system_applicability": [
                 {"supporting_system": redact((a or {}).get("supporting_system")),
-                 "applicable": (a or {}).get("applicable"),
-                 "justification": redact((a or {}).get("justification"))}
+                "applicable": (a or {}).get("applicable"),
+                "justification": redact((a or {}).get("justification"))}
                 for a in scenario_json.get("supporting_system_applicability") or []
                 if isinstance(a, dict)],
         },
@@ -348,7 +348,7 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
 def _as_date(v: Any):
     """A `date` from a date, a datetime, or an ISO string — None if it is none of those.
 
-    [Fix] The request path hands ISO STRINGS here: api/treatment.py dumps the body with
+    The request path hands ISO STRINGS here: api/treatment.py dumps the body with
     mode="json", which serializes pydantic's `date` fields to "YYYY-MM-DD". The old code only
     handled real date objects, so on the ONLY path that actually runs it computed no day count at
     all (see _assessment_window). Normalizing every accepted shape HERE — rather than changing the
@@ -419,8 +419,8 @@ def _window_violations(parsed: dict[str, Any], window: dict[str, Any] | None) ->
     overall = worst_days(parsed.get("mitigation_timeline"))
     if overall is None:
         out.append(f"mitigation_timeline ({parsed.get('mitigation_timeline')!r}) carries no "
-                   f"parsable duration — compliance with the {budget}-day assessment window "
-                   "could not be checked")
+                f"parsable duration — compliance with the {budget}-day assessment window "
+                "could not be checked")
     if overall is not None and overall > budget:
         out.append(f"mitigation_timeline ({parsed.get('mitigation_timeline')!r}) exceeds the "
                 f"assessment window of {budget} days")
@@ -435,7 +435,7 @@ def _window_violations(parsed: dict[str, Any], window: dict[str, Any] | None) ->
 
 
 def _coverage_vs_library_warnings(parsed: dict[str, Any],
-                                  snapshot: dict[str, Any]) -> list[str]:
+                                snapshot: dict[str, Any]) -> list[str]:
     """Advisory: a 'covered' verdict with NO library-mapped controls is vacuously true — there
     was nothing to cover. The prompt now forbids it (empty library -> 'gaps'); this is the
     server-side check that the instruction was followed. Flags, never blocks."""
@@ -469,7 +469,7 @@ def _risk_alignment_warnings(parsed: dict[str, Any],
     cti = parsed.get("controls_to_be_implemented")
     controls = cti.get("controls") if isinstance(cti, dict) else None
     rows = [r for r in (controls or []) if isinstance(r, dict)] + \
-           [r for r in (parsed.get("remediation_action_plan") or []) if isinstance(r, dict)]
+            [r for r in (parsed.get("remediation_action_plan") or []) if isinstance(r, dict)]
     # No `rows and` guard: an EMPTY plan for a Critical/High risk is the least urgent possible
     # response and must warn the loudest, not the least.
     if not any(str(r.get("priority") or "").casefold() in urgent for r in rows):
@@ -531,7 +531,7 @@ def _validate_plan(parsed: dict[str, Any]) -> list[str]:
 
 
 def _resolve_control_library_ids(parsed: dict[str, Any],
-                                 snapshot: dict[str, Any]) -> list[str]:
+                                snapshot: dict[str, Any]) -> list[str]:
     """Put `control_library_id` on each recommended control, and DROP any control that
     doesn't resolve to one — every control in the persisted plan must be a real
     Control_Library row, never text the model invented.
@@ -578,7 +578,7 @@ def _resolve_control_library_ids(parsed: dict[str, Any],
 
 
 def _inject_reserved(parsed: dict[str, Any],
-                     snapshot: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+                    snapshot: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Stamp/echo the server-owned plan keys (_RESERVED_PLAN_KEYS), OVERWRITING any
     same-named key the model emitted — AI output can never impersonate register data:
     - treatment_plan: the server-side strategy stamp;
@@ -732,7 +732,7 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
                     + _risk_alignment_warnings(parsed, snapshot.get("risk_assessment"))
                     + _coverage_vs_library_warnings(parsed, snapshot)
                     + [f"recommended control {c!r} matched no library control and was removed "
-                       "from the plan" for c in dropped_codes])
+                    "from the plan" for c in dropped_codes])
         moderation = llm_mod.moderate(_narrative_text(parsed))  # free function, NOT a client method
         validation_json = json.dumps({
             "warnings": warnings,
