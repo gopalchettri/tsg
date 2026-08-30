@@ -2195,7 +2195,18 @@ class TreatmentPlanBody(ApiModel):
         for item in v:
             if len(item) > 500:
                 raise ValueError("each existing_controls entry must be 500 characters or fewer")
-        return v
+        # Blank/whitespace entries and duplicates are dropped, order preserved: this list is the
+        # gap-analysis BASELINE the model matches library controls against, and a "" can cover
+        # nothing — the documented "[] means a risk with no controls" semantics must hold even
+        # when a UI sends ["",""] (the shipped sample did exactly that).
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for item in v:
+            s = item.strip()
+            if s and s not in seen:
+                seen.add(s)
+                cleaned.append(s)
+        return cleaned
 
     @field_validator("risk_identification_date")
     @classmethod
@@ -2343,11 +2354,17 @@ class TreatmentPlanStatus(ApiModel):
                      "the server stamp (treatment_plan), and register echoes (risk_owner, "
                      "impacted_business_division). JSON is the wire contract; markdown "
                      "rendering is the client's job."))
+    # UNHIDDEN 2026-08-30 (was exclude=True since the 06-Aug presentation trim): these are the
+    # ONLY surface where the risk-calibration, window-overrun, dropped-control and vocabulary
+    # advisories reach the human who signs off the plan — hidden, the whole advisory layer was
+    # decorative. Additive wire change; same reversal already applied to reviewed_by/created_by.
     warnings: list[str] = Field(
-        default_factory=list, exclude=True,
-        description="Advisory validation warnings (vocabulary clamps, empty control map, ...). Never blocking.")
+        default_factory=list,
+        description="Advisory validation warnings (risk-urgency alignment, window overruns, "
+                    "dropped unresolvable controls, vocabulary clamps, ...). Never blocking — "
+                    "review before implementing the plan.")
     moderation_flagged: bool = Field(
-        default=False, exclude=True,
+        default=False,
         description="Advisory content-moderation flag for a human reviewer, when moderation ran.")
     error_message: str | None = Field(
         default=None, description="Client-safe failure reason when status is ERROR.")

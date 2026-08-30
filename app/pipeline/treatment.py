@@ -89,7 +89,10 @@ def _clip(text: str | None) -> str | None:
     cleaned = redact(text)
     cap = get_settings().treatment_free_text_cap
     if cleaned and len(cleaned) > cap:
-        return cleaned[:cap]
+        # Marked and logged, never silent: an unmarked mid-word cut can invert the meaning of a
+        # control description the model then gap-analyses against.
+        log.warning("treatment.free_text_truncated", cap=cap, length=len(cleaned))
+        return cleaned[:cap] + " [truncated]"
     return cleaned
 
 
@@ -145,8 +148,8 @@ def _library_controls(sess: Session, scenario_id: str) -> list[dict[str, Any]]:
             std_names.setdefault(cid, []).append(name)
     return [
         {"control_library_id": r["ControlLibraryID"], "control_code": r["ControlCode"],
-         "domain": r["Domain"], "control_name": r["ControlName"],
-         "standards": std_names.get(r["ControlLibraryID"], [])}
+        "domain": r["Domain"], "control_name": r["ControlName"],
+        "standards": std_names.get(r["ControlLibraryID"], [])}
         for r in rows
     ]
 
@@ -263,6 +266,22 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
     if not library_mapped and not lookup_failed:
         warnings.append("no library-mapped controls for this scenario (Step-4 map is empty)")
 
+    # Register-consistency advisories — flag, never block: the register owns its numbers, but
+    # a contradiction the model will cite verbatim (rule 6) must reach the reviewer's warnings.
+    _lr, _ir, _fr = (risk_input.get("likelihood_rating"), risk_input.get("impact_rating"),
+                     risk_input.get("final_risk_rating"))
+    if None not in (_lr, _ir, _fr) and _fr != _lr * _ir:
+        warnings.append(f"final_risk_rating {_fr} does not equal likelihood x impact "
+                        f"({_lr}x{_ir}={_lr * _ir}); register values taken as-is")
+    if (_lr, _ir, _fr) == (None, None, None) and risk_input.get("risk_level") is None:
+        warnings.append("risk_assessment carries no register scores (legacy snapshot) — "
+                        "the plan is NOT risk-calibrated")
+    _window = _assessment_window(risk_input)
+    _wend = _as_date((_window or {}).get("timeline_end_date"))
+    if _wend is not None and _wend < dal.now().date():
+        warnings.append(f"mitigation window ended {_wend.isoformat()} — already in the past "
+                        "at plan creation")
+
     date = risk_input.get("risk_identification_date")
     snap: dict[str, Any] = {
         **base,
@@ -287,10 +306,18 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
             "library_mapped": library_mapped,
             "library_mapped_count": len(library_mapped),
             # The register's controls, verbatim from the request (the gap-analysis baseline).
-            "register_controls": [_clip(c) for c in risk_input.get("existing_controls") or []],
+            # Blank-stripped AND deduped HERE, not only in the schema validator: the regenerate
+            # path rebuilds risk_input from the stored snapshot and never re-enters the schema,
+            # so a legacy snapshot's blanks/dupes would otherwise re-enter the baseline forever.
+            "register_controls": list(dict.fromkeys(
+                _clip(c) for c in risk_input.get("existing_controls") or []
+                if (c or "").strip())),
             "applied_to_all_subsystems": risk_input.get("existing_controls_all_subsystems"),
+            # A justification whose Yes/No answer is absent justifies nothing — dropped rather
+            # than handed to the model as an orphan (the schema does not pair-validate the two).
             "applied_to_all_subsystems_justification":
-                _clip(risk_input.get("existing_controls_all_subsystems_justification")),
+                _clip(risk_input.get("existing_controls_all_subsystems_justification"))
+                if risk_input.get("existing_controls_all_subsystems") is not None else None,
         },
         "risk_assessment": {
             "likelihood_rating": risk_input.get("likelihood_rating"),
@@ -301,7 +328,7 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
             # The window the ENTIRE assessment must complete within (request pair, validated
             # both-or-neither). PROMPT-VISIBLE on purpose: the model must schedule inside it;
             # _validate_plan then cross-checks the answer against total_days.
-            "assessment_window": _assessment_window(risk_input),
+            "assessment_window": _window,
         },
         "treatment_strategy": str(TreatmentStrategy.mitigate),
         # Echo-only block — stripped from the prompt, injected into PlanJSON at finish.
@@ -368,7 +395,7 @@ def _assessment_window(risk_input: dict[str, Any]) -> dict[str, Any] | None:
             "total_days": (end - start).days}
 
 
-_DURATION_DAYS = re.compile(r"(\d+)\s*(day|week|month)", re.IGNORECASE)
+_DURATION_DAYS = re.compile(r"(?<![\d.])(\d+)[\s-]*(day|week|month)", re.IGNORECASE)
 _DURATION_UNIT_DAYS = {"day": 1, "week": 7, "month": 30}
 
 
@@ -377,7 +404,9 @@ def _window_violations(parsed: dict[str, Any], window: dict[str, Any] | None) ->
     every parsable relative duration — the overall mitigation_timeline and each action's
     timeline — must fit within total_days. Flags, never blocks, same posture as the
     vocabulary clamps: the reviewer sees exactly which line overran and by what."""
-    if not window or not window.get("total_days"):
+    # `is None`, not falsy: a same-day window is legal (end == start) and yields total_days=0 —
+    # the TIGHTEST budget there is, and exactly the one the falsy guard used to switch off.
+    if not window or window.get("total_days") is None:
         return []
     budget = int(window["total_days"])
 
@@ -388,6 +417,10 @@ def _window_violations(parsed: dict[str, Any], window: dict[str, Any] | None) ->
 
     out: list[str] = []
     overall = worst_days(parsed.get("mitigation_timeline"))
+    if overall is None:
+        out.append(f"mitigation_timeline ({parsed.get('mitigation_timeline')!r}) carries no "
+                   f"parsable duration — compliance with the {budget}-day assessment window "
+                   "could not be checked")
     if overall is not None and overall > budget:
         out.append(f"mitigation_timeline ({parsed.get('mitigation_timeline')!r}) exceeds the "
                 f"assessment window of {budget} days")
@@ -399,6 +432,19 @@ def _window_violations(parsed: dict[str, Any], window: dict[str, Any] | None) ->
             out.append(f"remediation_action_plan[{i}].timeline ({act.get('timeline')!r}) "
                     f"exceeds the assessment window of {budget} days")
     return out
+
+
+def _coverage_vs_library_warnings(parsed: dict[str, Any],
+                                  snapshot: dict[str, Any]) -> list[str]:
+    """Advisory: a 'covered' verdict with NO library-mapped controls is vacuously true — there
+    was nothing to cover. The prompt now forbids it (empty library -> 'gaps'); this is the
+    server-side check that the instruction was followed. Flags, never blocks."""
+    lib = (snapshot.get("existing_controls") or {}).get("library_mapped") or []
+    coverage = (parsed.get("controls_to_be_implemented") or {}).get("control_coverage")
+    if not lib and coverage == str(ControlCoverage.covered):
+        return ["control_coverage says 'covered' but the scenario has no library-mapped "
+                "controls — there was nothing to cover; the verdict is unverifiable"]
+    return []
 
 
 def _risk_alignment_warnings(parsed: dict[str, Any],
@@ -416,12 +462,17 @@ def _risk_alignment_warnings(parsed: dict[str, Any],
     level = (risk_assessment or {}).get("risk_level")
     if level not in (str(RiskLevel.critical), str(RiskLevel.high)):
         return []
-    urgent = {str(ActionPriority.critical), str(ActionPriority.high)}
+    # Casefolded on the plan's side: a mis-cased 'HIGH' is a vocabulary defect (the clamp in
+    # _validate_plan reports it) but it IS urgency — warning 'no Critical/High priority' over
+    # a casing slip would be factually wrong.
+    urgent = {str(ActionPriority.critical).casefold(), str(ActionPriority.high).casefold()}
     cti = parsed.get("controls_to_be_implemented")
     controls = cti.get("controls") if isinstance(cti, dict) else None
     rows = [r for r in (controls or []) if isinstance(r, dict)] + \
            [r for r in (parsed.get("remediation_action_plan") or []) if isinstance(r, dict)]
-    if rows and not any(r.get("priority") in urgent for r in rows):
+    # No `rows and` guard: an EMPTY plan for a Critical/High risk is the least urgent possible
+    # response and must warn the loudest, not the least.
+    if not any(str(r.get("priority") or "").casefold() in urgent for r in rows):
         return [f"risk_level is {level} but no recommended control or action carries "
                 "Critical/High priority — the plan's urgency does not reflect the register's "
                 "scored verdict"]
@@ -447,6 +498,9 @@ def _validate_plan(parsed: dict[str, Any]) -> list[str]:
     actions = parsed.get("remediation_action_plan")
     if not isinstance(actions, list) or not all(isinstance(r, dict) for r in actions):
         raise TreatmentPlanInvalid("LLM plan is missing required table 'remediation_action_plan'")
+    if not actions:
+        warnings.append("remediation_action_plan is empty — the prompt mandates at least one "
+                        "action (verification actions when coverage is 'covered')")
     # Every clamp is an EXACT match against the vocabulary the prompt advertises (built from
     # the same enums) — one posture for all four, so any case-variant draws a warning rather
     # than silently violating the wire vocabulary.
@@ -476,7 +530,8 @@ def _validate_plan(parsed: dict[str, Any]) -> list[str]:
     return warnings
 
 
-def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any]) -> None:
+def _resolve_control_library_ids(parsed: dict[str, Any],
+                                 snapshot: dict[str, Any]) -> list[str]:
     """Put `control_library_id` on each recommended control, and DROP any control that
     doesn't resolve to one — every control in the persisted plan must be a real
     Control_Library row, never text the model invented.
@@ -519,9 +574,11 @@ def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any
     if dropped:
         log.info("treatment.control_code_unresolved_dropped", codes=dropped,
                 known=sorted(c["control_code"] for c in by_code.values()))
+    return dropped
 
 
-def _inject_reserved(parsed: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+def _inject_reserved(parsed: dict[str, Any],
+                     snapshot: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Stamp/echo the server-owned plan keys (_RESERVED_PLAN_KEYS), OVERWRITING any
     same-named key the model emitted — AI output can never impersonate register data:
     - treatment_plan: the server-side strategy stamp;
@@ -534,8 +591,8 @@ def _inject_reserved(parsed: dict[str, Any], snapshot: dict[str, Any]) -> dict[s
     parsed["risk_identification_date"] = register.get("risk_identification_date")
     parsed["risk_owner"] = register.get("risk_owner")
     parsed["impacted_business_division"] = register.get("impacted_business_division")
-    _resolve_control_library_ids(parsed, snapshot)
-    return parsed
+    dropped = _resolve_control_library_ids(parsed, snapshot)
+    return parsed, dropped
 
 
 def _narrative_text(parsed: dict[str, Any]) -> str:
@@ -664,11 +721,18 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
             subsystem_id=ASSET_UNIT_ID, stage="treatment_plan",
             correlation_id=plan_id,  # stamps the Prompt_Log receipt for the evidence API
             expected_type=dict, temperature=settings.treatment_temperature)
+        # Inject FIRST, warn SECOND: _inject_reserved drops unresolved controls, and every
+        # advisory below must describe the plan the reviewer actually sees — a Critical plan
+        # whose only urgent control was dropped must WARN, not pass on the ghost of that row.
+        # (_validate_plan's structural raises are unaffected: injection never removes a table.)
+        parsed, dropped_codes = _inject_reserved(parsed, snapshot)
         warnings = (list(snapshot.get("warnings") or []) + _validate_plan(parsed)
                     + _window_violations(parsed,
                                         (snapshot.get("risk_assessment") or {}).get("assessment_window"))
-                    + _risk_alignment_warnings(parsed, snapshot.get("risk_assessment")))
-        parsed = _inject_reserved(parsed, snapshot)
+                    + _risk_alignment_warnings(parsed, snapshot.get("risk_assessment"))
+                    + _coverage_vs_library_warnings(parsed, snapshot)
+                    + [f"recommended control {c!r} matched no library control and was removed "
+                       "from the plan" for c in dropped_codes])
         moderation = llm_mod.moderate(_narrative_text(parsed))  # free function, NOT a client method
         validation_json = json.dumps({
             "warnings": warnings,
@@ -811,7 +875,7 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     # assert makes adding a key to _RESERVED_PLAN_KEYS without teaching the injector fail here.
     ai_controls = [{"control_name": "MFA", "control_code": "CII-CID-028"},
                 {"control_name": "Made-up control", "control_code": "NOT-REAL"}]
-    injected = _inject_reserved(
+    injected, sc_dropped = _inject_reserved(
         {"treatment_plan": "Avoid", "risk_owner": "Dr. Evil",
         "controls_to_be_implemented": {"control_coverage": "gaps", "controls": ai_controls}},
         {"register": {"risk_identification_date": "2026-06-14T08:31:00",
@@ -820,6 +884,7 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
         "existing_controls": {"library_mapped": [
             {"control_library_id": 28, "control_code": "CII-CID-028"}]}})
     assert injected["treatment_plan"] == "Mitigate"
+    assert sc_dropped == ["NOT-REAL"]  # the dropped code is REPORTED, not just logged
     kept = injected["controls_to_be_implemented"]["controls"]
     assert [c["control_name"] for c in kept] == ["MFA"]  # unresolved control dropped
     assert kept[0]["control_library_id"] == 28

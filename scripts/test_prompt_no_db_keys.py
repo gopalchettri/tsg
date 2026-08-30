@@ -118,8 +118,10 @@ def main() -> None:
         "treatment_prompt mutated the snapshot — _inject_reserved will resolve controls to None"
     parsed = {"controls_to_be_implemented": {"control_coverage": "gaps",
         "controls": [{"control_code": "CII-CID-028"}, {"control_code": "CII-CID-999"}, {}]}}
-    kept = treatment._inject_reserved(parsed, snap)["controls_to_be_implemented"]["controls"]
+    injected, dropped = treatment._inject_reserved(parsed, snap)
+    kept = injected["controls_to_be_implemented"]["controls"]
     assert [c.get("control_library_id") for c in kept] == [28], kept
+    assert dropped == ["CII-CID-999", "<no control_code>"], dropped  # reported, not just logged
     print("4 OK  snapshot unmutated; control_code -> control_library_id resolves, unmatched dropped", kept)
 
     # 5 — ordering guard: a subsystem holding only id/criticality must be ABSENT, not {}
