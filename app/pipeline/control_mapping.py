@@ -6,6 +6,7 @@ library and stores the highest-scoring matches — the LLM never proposes contro
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
@@ -336,7 +337,15 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 return
             sess.commit()  # End the lease transaction before the slow grounding call.
             flat = [(q, qv_map.get(q)) for _, q in per_output]
+            # TIMED. This one call is where control mapping actually spends its wall clock —
+            # a real run took 604s of a 724s pipeline here, and there was NO instrumentation
+            # inside it, so "83% of the run" was one opaque block that could not be attributed
+            # to the shortlist, the library embed or the cross-encoder. perf_counter (not
+            # dal.now) because this is a DURATION, not a timestamp: it is monotonic and immune
+            # to a clock step mid-run.
+            _t0 = time.perf_counter()
             match_lists = grounding.ground_control_queries(llm, flat, candidates, s)
+            _ground_seconds = time.perf_counter() - _t0
             for (scenario_id, _query), result in zip(per_output, match_lists):
                 if not result.answered:
                     # NO ANSWER for this output (its rerank item failed) — as opposed to an
@@ -352,6 +361,14 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 if keep:
                     sess.execute(insert(m.Threat_Scenario_Control_Map), keep)
                     inserted += len(keep)
+        # queries x shortlist_k is the upper bound on cross-encoder pairs, and pairs — not
+        # queries alone — is what predicts cost. Reported beside the duration so a future
+        # tuning decision on control_map_shortlist_k comes from measurement, not arithmetic.
+        log.info("controls.grounding_timing", session_id=sid, queries=len(per_output),
+                 max_pairs=len(per_output) * s.control_map_shortlist_k,
+                 candidates=len(candidates), shortlist_k=s.control_map_shortlist_k,
+                 seconds=round(_ground_seconds, 2),
+                 seconds_per_query=round(_ground_seconds / max(1, len(per_output)), 2))
         _stamp_mapped_outputs(sess, outputs, per_output, answered)
         if unanswered:
             # Loud, attributable and joined to the session — unlike llm.rerank_many's

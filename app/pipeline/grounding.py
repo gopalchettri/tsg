@@ -239,10 +239,12 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
     rerank_many still raises when the WHOLE batch failed, which map_controls turns into a
     rollback with nothing stamped — already correct, and pinned by a test.
 
-    HYBRID shortlist: the cosine leg (existing) is UNIONED with a BM25 keyword leg over the
-    same "ControlName: Description" corpus — rare exact tokens (product names, acronyms)
-    carry strong signal that embeddings dilute. The reranker stays the final arbiter of
-    order, so no score fusion is needed; the legs only decide what gets reranked.
+    HYBRID shortlist: a cosine leg and a BM25 keyword leg over the same
+    "ControlName: Description" corpus — rare exact tokens (product names, acronyms) carry
+    strong signal that embeddings dilute — FUSED by reciprocal-rank fusion into a single
+    ranked `control_map_shortlist_k`. Rank-based fusion, so the two legs' incomparable score
+    scales never need calibrating against each other. The reranker stays the final arbiter of
+    order; the legs only decide what gets reranked.
     Falls back to per-query llm.rerank when the client has no rerank_many (test fakes)."""
     if not rows or not queries:
         # ANSWERED, not failed: an empty library (or an empty query list) is a definitive
@@ -260,15 +262,16 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
                                         group="control_library", kind="passage")
     name_vecs = None if matrix_info is not None else embeddings.get_vectors(
         llm, names, model_id=s.embedding_model, group="control_library", kind="passage")
-    # BM25 keyword leg: corpus tokenized once per batch; per query, the top-shortlist_k
-    # keyword hits are UNIONED into the cosine shortlist before the rerank. Zero-score docs
-    # never enter (hybrid_search._ranked_indices excludes them), so an all-miss query adds
-    # nothing and behaves exactly as before.
+    # BM25 keyword leg: corpus tokenized once per batch; per query its top-ck hits are one of
+    # the two rankings fed to RRF below. Zero-score docs never enter
+    # (hybrid_search._ranked_indices excludes them), so an all-miss query contributes no
+    # ranking and the fused order collapses to the cosine leg's — exactly as before.
     docs_tokens = [hybrid_search.tokenize(r["text"]) for r in rows]
     # Control mapping's OWN shortlist width, never grounding_shortlist_k. At the shared value
     # only ~3% of the library reached the reranker and controls it would have accepted were
-    # discarded unscored — see control_map_shortlist_k. Bound once: both the cosine legs and
-    # the BM25 leg must widen together, or the union is still capped by whichever stayed small.
+    # discarded unscored — see control_map_shortlist_k. Each leg is bounded by ck and the FUSED
+    # result is bounded by ck too, so this is now the true number of cross-encoder pairs per
+    # query — it used to be up to 2x this, because the legs were unioned rather than fused.
     ck = s.control_map_shortlist_k
     shortlists: list[list[dict[str, Any]]] = []
     for query, qv in queries:
@@ -286,8 +289,22 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
             sl = _shortlist_candidates(qv, rows, name_vecs, "text", s, ck)
         kw_scores = hybrid_search.bm25_scores(hybrid_search.tokenize(query), docs_tokens)
         kw_top = hybrid_search._ranked_indices(kw_scores)[:ck]
-        seen_ids = {id(r) for r in sl}
-        sl = sl + [rows[i] for i in kw_top if id(rows[i]) not in seen_ids]
+        # RRF, not a union. The union appended the BM25 top-ck to the cosine top-ck, so the
+        # shortlist was up to 2*ck — `control_map_shortlist_k` did not mean what it said, and
+        # the reranker (the expensive part: a CPU cross-encoder) silently did ~40% more work
+        # than the configured number implies. Fusing to ONE ranked ck makes the setting honest
+        # and cuts cross-encoder pairs, WITHOUT the recall loss of simply truncating the union:
+        # RRF is rank-based, so a control the keyword leg ranks first still lands near the top
+        # even when cosine misses it — the exact case the BM25 leg was added for. What drops
+        # out is the tail ranked weak by BOTH legs.
+        # This is also the fusion threat retrieval and threat grounding already use
+        # (hybrid_search.hybrid_match); control mapping was the one path doing its own thing.
+        # Both legs arrive in RANK order — _apply_shortlist sorts descending before truncating
+        # — which is all rrf_fuse needs; it never compares the two legs' raw scores.
+        idx_of = {id(r): i for i, r in enumerate(rows)}
+        cos_rank = [idx_of[id(r)] for r in sl]
+        fused = hybrid_search.rrf_fuse([cos_rank, kw_top])
+        sl = [rows[i] for i in sorted(fused, key=lambda i: (-fused[i], i))[:ck]]
         shortlists.append(sl)
     # Rerank only the queries that actually have a shortlist; map results back by position.
     todo = [i for i, sl in enumerate(shortlists) if sl]
