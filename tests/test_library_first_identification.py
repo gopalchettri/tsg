@@ -38,6 +38,7 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
+from app.core.config import get_settings
 from app.core.enums import GroundingStatus, StageStatus, SubsystemLevel
 from app.db import models as m
 from app.pipeline import embeddings, tasks, threat_retrieval
@@ -421,3 +422,31 @@ def test_not_relevant_drop_is_recorded_with_justification(monkeypatch):
             "catalogue_id": 900,
             "threat_name": "Payment card skimming at POS terminals",
             "justification": "this threat does not apply to this asset"}]
+
+
+def test_coverage_reporting_off_by_default_computes_and_stores_nothing(monkeypatch):
+    """TSG_COVERAGE_REPORTING_ENABLED defaults False: the audit row must carry NEITHER
+    "units" NOR "coverage" — genuinely absent, not computed-and-empty."""
+    assert get_settings().coverage_reporting_enabled is False
+    llm = FakeLLM()
+    _threats, Session, _sid = _run(monkeypatch, llm, max_threats=4)
+    with Session() as s:
+        audit = [json.loads(a.DetailJSON) for a in s.execute(
+            select(m.Scenario_Audit)).scalars() if a.DetailJSON]
+        summary = next(d for d in audit if "retrieved" in d)
+        assert "units" not in summary and "coverage" not in summary
+
+
+def test_coverage_reporting_enabled_restores_the_prior_shape(monkeypatch):
+    """Flipping the flag on must genuinely restore the old computation, not just leave it
+    permanently disabled behind an inert toggle."""
+    monkeypatch.setattr(get_settings(), "coverage_reporting_enabled", True)
+    llm = FakeLLM()
+    _threats, Session, _sid = _run(monkeypatch, llm, max_threats=4)
+    with Session() as s:
+        audit = [json.loads(a.DetailJSON) for a in s.execute(
+            select(m.Scenario_Audit)).scalars() if a.DetailJSON]
+        summary = next(d for d in audit if "retrieved" in d)
+        assert "units" in summary and "coverage" in summary
+        assert summary["units"][0] == 0  # ASSET_UNIT_ID leads the grid, same as before
+        assert "cells" in summary["coverage"] and "unexplained" in summary["coverage"]

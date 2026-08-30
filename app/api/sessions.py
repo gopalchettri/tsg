@@ -145,7 +145,14 @@ def _coverage_verdict(sess: Session, session_id: str) -> dict | None:
     trail disagree about the same session. Same durable-mirror pattern as last_next_set.
 
     Absent/short rows return None rather than a zero verdict: "nobody has measured this yet" and
-    "measured, nothing missing" must never look alike on a safety signal."""
+    "measured, nothing missing" must never look alike on a safety signal.
+
+    TSG_COVERAGE_REPORTING_ENABLED, off by default (config.py) — an early return here, before the
+    query, so a disabled deployment pays nothing extra per poll; find_threats already skips writing
+    this data at all while the flag is off, so this guard is belt-and-suspenders against a stale
+    row from before a flip, not the only thing making this safe."""
+    if not get_settings().coverage_reporting_enabled:
+        return None
     detail = dal.latest_coverage_verdict(sess, session_id)
     cov = (detail or {}).get("coverage")
     if not isinstance(cov, dict) or "cells" not in cov:

@@ -381,6 +381,19 @@ class Settings(BaseSettings):
     # 0.98 sits above the measured 0.969 trap (two REAL threats one word apart).
     semantic_cross_category_threshold: float = Field(0.98, ge=0.0, le=1.0)
 
+    # TSG_COVERAGE_REPORTING_ENABLED — the (supporting-system x STRIDE-category) completeness
+    # check on GET /sessions/{id} ("did identification check everything, or could it have missed
+    # something"). Off (default) is a deliberate decision, not a placeholder: this signal never
+    # gates any action (accept/reject/treatment-plan generation all work identically either way)
+    # — it is purely advisory, and repeated attempts to make its detailed shape self-explanatory
+    # on a frequently-polled endpoint kept trading one point of confusion for another. While off,
+    # NOTHING related to it runs: no extra DB query, no computation, no audit-trail entry — not
+    # a display-only toggle. Flip to true only if a real consumer needs the completeness signal;
+    # see app/pipeline/tasks.py::find_threats and app/api/sessions.py::_coverage_verdict.
+    coverage_reporting_enabled: bool = Field(
+        False, validation_alias=AliasChoices(
+            "COVERAGE_REPORTING_ENABLED", "TSG_COVERAGE_REPORTING_ENABLED"))
+
     # --- 13. Scoring & scoping ------------------------------------------------------
 
     # TSG_SCOPING_SCORE_THRESHOLD — a threat scoring below this gets no scenario.

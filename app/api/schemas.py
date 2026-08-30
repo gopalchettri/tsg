@@ -472,7 +472,11 @@ class SessionProgress(ApiModel):
             "the per-supporting-system dimension of the board: stage status stays asset-level "
             "because generation IS asset-level (one scenario covers a threat across every "
             "system it reaches), but COVERAGE genuinely varies per system and is what a "
-            "reviewer needs per system. Null until threat identification has run."
+            "reviewer needs per system. Null until threat identification has run, AND null "
+            "whenever TSG_COVERAGE_REPORTING_ENABLED is off (the default) — an advisory-only "
+            "signal that never gates accept/reject/treatment-plan generation, disabled because "
+            "it never found a shape that stayed both complete and easy to read on a polled "
+            "endpoint. Nothing is computed or stored while it's off, not just hidden here."
         ),
     )
 

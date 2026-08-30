@@ -1098,15 +1098,22 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     # healthy the entire time every visible label said DoS. A skew has to be answerable from
     # data afterwards, not from someone's impression of a report.
     distribution = stride.achieved([(None, t["category"]) for t in threats if t.get("category")])
-    coverage_units = [ss, *grid_subsystem_ids]
-    with trace_step("COVERAGE", sid, unit_ids=coverage_units, categories=cats) as _t:
-        grid_records = dal.active_threat_grid_categories(sess, sid, coverage_units)
-        cov = coverage.coverage_report(coverage_units, cats, grid_records)
-        _t.result(grid_records=len(grid_records), coverage_report=cov)
-    if cov["unexplained"]:
-        log.warning("threats.coverage_gaps", session_id=sid, subsystem=ss,
-                    units=1 + len(grid_subsystem_ids),
-                    unexplained=cov["unexplained"], gaps=cov["gaps"][:12])
+    # TSG_COVERAGE_REPORTING_ENABLED, off by default (config.py) — an advisory-only completeness
+    # signal that never gates any action. While off, nothing below runs at all: no
+    # active_threat_grid_categories query, no coverage_report computation, no log line, and the
+    # audit row's DetailJSON simply omits "units"/"coverage" rather than storing them empty.
+    coverage_detail: dict[str, Any] = {}
+    if get_settings().coverage_reporting_enabled:
+        coverage_units = [ss, *grid_subsystem_ids]
+        with trace_step("COVERAGE", sid, unit_ids=coverage_units, categories=cats) as _t:
+            grid_records = dal.active_threat_grid_categories(sess, sid, coverage_units)
+            cov = coverage.coverage_report(coverage_units, cats, grid_records)
+            _t.result(grid_records=len(grid_records), coverage_report=cov)
+        if cov["unexplained"]:
+            log.warning("threats.coverage_gaps", session_id=sid, subsystem=ss,
+                        units=1 + len(grid_subsystem_ids),
+                        unexplained=cov["unexplained"], gaps=cov["gaps"][:12])
+        coverage_detail = {"units": coverage_units, "coverage": {**cov, "gaps": cov["gaps"][:50]}}
     dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.THREAT_IDENTIFICATION, SubsystemID=ss,
                     EventType=AuditEventType.grounding_summary,
@@ -1114,7 +1121,6 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                                         "selection_sources": selection_sources,
                                         "ranking_degraded": ranking_degraded,
                                         "subsystem_records": len(fanout_rows),
-                                        "units": [ss, *grid_subsystem_ids],
                                         "retrieved": len(retrieved_summaries),
                                         "generated": len(threats) - len(retrieved_summaries),
                                         "validator": validator_audit,
@@ -1124,7 +1130,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                                         "retrieved_semantic_duplicates": retrieved_near_dupes,
                                         "stride_target": target,
                                         "stride_distribution": distribution,
-                                        "coverage": {**cov, "gaps": cov["gaps"][:50]}}))
+                                        **coverage_detail}))
     sess.commit()
     if dup_rows:
         # Deliberately OUTSIDE the transaction above, in its own try/except: this is an
