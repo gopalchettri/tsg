@@ -21,7 +21,7 @@ CREATE TABLE #tsg_verify (
     Seq      int IDENTITY(1,1),
     Category nvarchar(40),
     Status   nvarchar(8),
-    Check_   nvarchar(200),
+    Check_   nvarchar(400),
     Detail   nvarchar(1000)
 );
 
