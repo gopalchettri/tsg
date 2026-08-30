@@ -67,10 +67,33 @@ def test_last_regen_round_trips_the_audit_detail_shape():
     assert summary.replacements == [{"old": "o1", "new": "o2"}]
 
 
+_SSE_PATHS = (
+    ("get", "/v1/sessions/{session_id}/events"),
+    ("get", "/v1/tsg/threat-library/embeddings/events/{job_id}"),
+    ("get", "/v1/tsg/grounding/calibrate/events/{job_id}"),
+    ("get", "/v1/tsg/threat-intel/feeds/events/{job_id}"),
+)
+
+
+def test_sse_routes_never_publish_a_phantom_json_content_type():
+    """2026-08-30 audit finding: FastAPI's own OpenAPI generator adds an application/json
+    sibling to any 200 response that declares a `model`, even when `content` already overrides
+    it to text/event-stream — so all 4 SSE routes were publishing a content-type they can never
+    actually answer with. _finalize_openapi (app/main.py) strips it; this pins that it stays
+    stripped for every current SSE route."""
+    from app.main import create_app
+
+    spec = create_app().openapi()
+    for method, path in _SSE_PATHS:
+        content = spec["paths"][path][method]["responses"]["200"]["content"]
+        assert list(content.keys()) == ["text/event-stream"], (path, content.keys())
+
+
 if __name__ == "__main__":
     test_stage_completed_accepts_both_real_statuses()
     test_stage_completed_rejects_running()
     test_error_event_scope_optional_but_constrained()
     test_session_progress_error_message_is_dict_keyed_by_stage()
     test_last_regen_round_trips_the_audit_detail_shape()
+    test_sse_routes_never_publish_a_phantom_json_content_type()
     print("ok")

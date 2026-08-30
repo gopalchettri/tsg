@@ -1,5 +1,5 @@
-"""Shared SSE-streaming machinery for admin job-status routes (embeddings, threat-library
-import, threat-intel feed-refresh).
+"""Shared SSE-streaming machinery for admin job-status routes (embeddings, grounding
+calibration, threat-intel feed-refresh).
 
 Each admin router keeps its own `job_events` endpoint — the auth dependency, URL path, and
 docstring are legitimately per-router — but the streaming mechanics underneath (authorize via
@@ -36,7 +36,7 @@ from app.sse import bus
 
 
 def _default_extend(result: AsyncResult) -> dict:
-    """Covers 2 of 3 current job types (embeddings, import): both return a plain dict from
+    """Covers 2 of 3 current job types (embeddings, grounding): both return a plain dict from
     the task, spread verbatim into the terminal event — same shape their GET status route
     already returns. A job type whose result isn't naturally a dict (intel's bare item count)
     passes its own `extend_terminal` instead of forcing an unnatural shape here."""

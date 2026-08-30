@@ -1771,6 +1771,22 @@ class IntelRefreshAccepted(ApiModel):
     jobs: dict[str, str] = Field(description="feed name -> Celery job id for the refresh queued for it.")
 
 
+class IntelJobEvent(ApiModel):
+    """One `data:` line on GET .../threat-intel/feeds/events/{job_id} (event type
+    intel_job_update). Envelope fields are guaranteed on every event; `feed`/`item_count` are
+    verified against celery_app.py's `_publish_intel_job_event` call sites."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "type": "intel_job_update", "job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "state": "SUCCESS", "feed": "otx", "item_count": 42, "error": None}})
+
+    type: Literal["intel_job_update"]
+    job_id: str
+    state: str = Field(description="Celery state name: PENDING/STARTED/SUCCESS/FAILURE/RETRY.")
+    feed: str = Field(description="Which feed this event is about — always present.")
+    item_count: int | None = Field(default=None, description="Present only on the SUCCESS event.")
+    error: str | None = Field(default=None, description="Present only on FAILURE/RETRY.")
+
+
 class IntelItem(ApiModel):
     """One cached intel item (GET /v1/tsg/threat-intel/items) — a KEV CVE, an ICS
     advisory, or an OTX pulse, in the store's normalized shape."""
@@ -1841,6 +1857,27 @@ class EmbeddingJobStatus(EmbeddingActionResponse):
         description="Job's current state, mirrors Celery's AsyncResult.state — see CeleryJobState (app/core/enums.py)."
     )
     error: str | None = Field(default=None, description="Error message when state is FAILURE. Null otherwise.")
+
+
+class EmbeddingJobEvent(ApiModel):
+    """One `data:` line on GET .../embeddings/events/{job_id} (event type
+    embedding_job_update). Envelope + confirmed per-state fields are typed; `extra="allow"`
+    because a multi-group sweep's per-group progress ticks are not exhaustively enumerated here."""
+    model_config = ConfigDict(extra="allow", json_schema_extra={"example": {
+        "type": "embedding_job_update", "job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "state": "SUCCESS", "action": "recreate",
+        "rows_processed": {"threat_type": 12, "threat_catalogue": 8},
+        "vectors_deleted": None, "error": None}})
+
+    type: Literal["embedding_job_update"]
+    job_id: str
+    state: str = Field(description="Celery state name: PENDING/STARTED/SUCCESS/FAILURE/RETRY.")
+    action: str | None = Field(default=None, description="create|update|recreate|delete — present from STARTED onward.")
+    group: str | None = Field(default=None, description="Present on a per-group progress tick during a multi-group sweep.")
+    rows: int | None = Field(default=None, description="Rows processed for `group`, on that same progress tick.")
+    rows_processed: dict[str, int] | None = Field(default=None, description="Present only on the terminal SUCCESS event.")
+    vectors_deleted: int | str | None = Field(default=None, description="Present only on a SUCCESS delete action.")
+    error: str | None = Field(default=None, description="Present only on FAILURE/RETRY.")
 
 
 # ---------------------------------------------------------------------------
@@ -2606,6 +2643,27 @@ class GroundingCalibrationAccepted(ApiModel):
                                     "job_id, which expires with the Celery result after an hour, "
                                     "this identifies the run permanently — it is what "
                                     "GET /calibrations reports.")
+
+
+class GroundingJobEvent(ApiModel):
+    """One `data:` line on GET .../calibrate/events/{job_id} (event type grounding_job_update).
+    Envelope + confirmed fields are typed; `extra="allow"` because the terminal SUCCESS event
+    spreads a measurement namedtuple's fields verbatim (not exhaustively enumerated here) plus
+    embedding_model/reranker_model/run_id."""
+    model_config = ConfigDict(extra="allow", json_schema_extra={"example": {
+        "type": "grounding_job_update", "job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "state": "STARTED", "run_id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "phase": "negatives", "done": 40, "total": 100, "force": False, "error": None}})
+
+    type: Literal["grounding_job_update"]
+    job_id: str
+    state: str = Field(description="Celery state name: PENDING/STARTED/RETRY/SUCCESS/FAILURE.")
+    run_id: str | None = Field(default=None, description="Grounding_Calibration_Run.RunID once known.")
+    force: bool | None = Field(default=None, description="Present on the very first STARTED event.")
+    phase: str | None = Field(default=None, description="'negatives' or 'positives' — present on progress ticks.")
+    done: int | None = Field(default=None, description="Samples measured so far, on a progress tick.")
+    total: int | None = Field(default=None, description="Samples planned for this phase, on a progress tick.")
+    error: str | None = Field(default=None, description="Present only on FAILURE.")
 
 
 class GroundingCalibrationStatus(ApiModel):

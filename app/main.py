@@ -174,7 +174,7 @@ def _finalize_openapi(app: FastAPI) -> None:
     """Make the PUBLISHED spec match what the app actually does: one error envelope, declared
     authentication, and the error statuses each route can really return.
 
-    Three defects this closes, all of the same kind — the document promised something untrue:
+    Four defects this closes, all of the same kind — the document promised something untrue:
 
     1. FastAPI auto-adds a 422 documented as `HTTPValidationError` (`{"detail": [...]}`), but this
        app registers its own RequestValidationError handler, so the real body is the
@@ -186,6 +186,13 @@ def _finalize_openapi(app: FastAPI) -> None:
     3. 401/403/404 were returned but never declared. (503 is declared by the ROUTES
        themselves via schemas.UNAVAILABLE_RESPONSES — a central path list here went
        stale the moment a route was renamed, silently.)
+    4. Every SSE route (`.../events/{job_id}` x3, `/v1/sessions/{session_id}/events`) declares its
+       200 with BOTH a `"model"` and a `"content": {"text/event-stream": {}}` override — FastAPI's
+       own generator adds an `application/json` sibling for the `model` regardless, so the
+       published spec claims these routes can answer with JSON, which none of them ever do (they
+       stream exclusively). Verified live via `app.openapi()` before this fix. Stripped below for
+       any response that declares `text/event-stream` — covers today's 4 routes and any future one
+       without a per-route override to forget.
 
     Done HERE, over the finished schema, rather than as `responses=`/`dependencies=` on each of
     the 8 routers: a per-router kwarg is one more thing a NEW router can forget, and forgetting is
@@ -233,6 +240,14 @@ def _finalize_openapi(app: FastAPI) -> None:
                 r422["description"] = "Validation error — the standard error envelope."
                 for media in r422["content"].values():
                     media["schema"] = ref
+
+            # Fix 4: an SSE-only response never actually answers application/json — FastAPI adds
+            # it anyway whenever the response declares a "model". Drop it wherever the route also
+            # declares text/event-stream, so "Try it out" and generated clients see only the
+            # content-type this route can really produce.
+            for resp in responses.values():
+                if isinstance(resp, dict) and "text/event-stream" in resp.get("content", {}):
+                    resp["content"].pop("application/json", None)
 
             # setdefault throughout: a route that already declares a status (accept/reject's own
             # 409, the SSE routes' 200) keeps its more specific text.
