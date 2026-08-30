@@ -83,14 +83,6 @@ class DuplicateReason(StrEnum):
                                                         # (tasks.py::_semantic_duplicates)
 
 
-class ThreatRuleType(StrEnum):
-    """`Config_Threat_Rule.RuleType`. Any other value in the column is ignored by the engine
-    (logged, no effect) — same never-silently-false rule as an unknown RuleKey."""
-    tech_gate = "tech_gate"                              # hard gate — failing it forces Selected=0
-    relevance_flag = "relevance_flag"                    # additive score from a yes/no flag
-    relevance_context_value = "relevance_context_value"  # additive score from a specific context value
-
-
 class ScopingRejection(StrEnum):
     """`Scoped_Threat.RejectionKind` — WHY a threat was not selected, as a value code may branch
     on. `Reason` is the free-prose half for reviewers; prose may change, a kind is a contract.
@@ -106,14 +98,6 @@ class ScopingRejection(StrEnum):
 # refusing (the "no new threats" wedge). A tuple, not a set — the SQL text stays byte-stable
 # so the plan cache isn't churned by set-iteration order.
 RESERVABLE_REJECTIONS: tuple[ScopingRejection, ...] = (ScopingRejection.top_n_cutoff,)
-
-
-class TriageVerdict(StrEnum):
-    """Library-promotion triage outcome for one candidate generic name (accept.py). Stored in
-    Scenario_Audit DetailJSON, so the values are a persistence contract."""
-    auto_reject = "auto_reject"    # >= reject band: same idea reworded — link to the existing entry
-    auto_approve = "auto_approve"  # < approve band vs everything: genuinely novel — insert active
-    review = "review"              # between the bands, or any doubt — the curator decides
 
 
 class SelectionReason(StrEnum):
@@ -140,26 +124,6 @@ class ActorType(StrEnum):
     system = "system"  # a worker/the pipeline performed it; ActorUserID names who is answerable
 
 
-class CandidateStatus(StrEnum):
-    """`Threat_Candidate_Review.Status`. accept.py queues BOTH kinds of admin-gated proposal
-    here — threat cards (a type+name pair; the asset-embedded name is never library-shaped, so
-    only its generic form is ever minted) and actor cards (CandidateKind='actor'). Under the
-    promotion_auto_approve_enabled master switch OFF (default) this queue is the ONLY way any
-    of it enters the shared library."""
-    pending = "pending"    # what accept.py writes — awaiting an admin's approve/reject
-    accepted = "accepted"  # written by dal.close_candidate_review via resolve_candidate (approve)
-    rejected = "rejected"  # written by the same CAS close on reject — nothing minted
-
-
-class RetryOutcome(StrEnum):
-    """Result of one library-promotion retry or dismiss attempt (reaper.py's
-    retry_one_promotion/dismiss_promotion), surfaced verbatim on the admin API's
-    PromotionRetryResult.outcome."""
-    succeeded = "succeeded"  # the promotion attempt ran and committed cleanly
-    failed = "failed"        # the attempt ran but raised — see the session's PromotionError
-    skipped = "skipped"      # a live worker or another retry already holds this session's lock
-
-
 class ValidationStatus(StrEnum):
     """Deterministic output-validation result. These checks FLAG, never block — a parse failure
     is a stage ERROR upstream and never reaches them, so there is no `error` member."""
@@ -171,7 +135,6 @@ class AuditEventType(StrEnum):
     """`Scenario_Audit.EventType` — the append-only trail. Every member is written from exactly
     one place; some are defined with no current producer (reserved for a later milestone)."""
     session_started = "session_started"                # POST /sessions, after the stage rows are seeded
-    auto_run_enqueued = "auto_run_enqueued"            # reserved — no current producer
     grounding_summary = "grounding_summary"            # per subsystem after Stage 1; DetailJSON: threat count
     scoping_complete = "scoping_complete"              # per subsystem after Stage 2 scoring; scoped/selected counts
     controls_mapped = "controls_mapped"                # per write_scenarios run; outputs/mapped/dropped/fallback counts
@@ -180,27 +143,19 @@ class AuditEventType(StrEnum):
     review_decision = "review_decision"                # the human's verdict at the review gate
     scenarios_accepted = "scenarios_accepted"          # Stage-2 outputs flipped Accepted=1 — NOT written on a
                                                     # mode="none" reject (nothing flipped)
-    scenario_accepted = "scenario_accepted"            # ONE row per scenario accepted, carrying OutputID. The
+    scenario_accepted = "scenario_accepted"            # ONE row per scenario accepted, carrying scenario id. The
                                                     # session-scoped rows above say a review action happened;
                                                     # these say WHICH scenario, by WHOM, WHEN — the question a
                                                     # GRC reviewer asks, now that decisions land days apart
     scenario_rejected = "scenario_rejected"            # ONE row per scenario explicitly declined, carrying
-                                                    # OutputID. Written by the same dal.decide_scenarios call
+                                                    # scenario id. Written by the same dal.decide_scenarios call
                                                     # that sets RejectedAt, so the two cannot diverge
     regeneration_completed = "regeneration_completed"  # one regenerate request finished its stage re-runs
-    threat_regrounded = "threat_regrounded"            # reserved — only `scenario` regen is implemented
     subsystem_advanced = "subsystem_advanced"          # written at the START of a subsystem's work
-    auto_fanout_review = "auto_fanout_review"          # reserved — no current producer
     library_promoted = "library_promoted"              # on accept, per threat whose library resolution CHANGED —
                                                     # a minted type/name (auto mode) or a link/adoption of an
                                                     # existing entry (the only form under switch OFF);
                                                     # DetailJSON.triage_verdict tells which
-    promotion_triage = "promotion_triage"              # on accept, ONE row listing every candidate's
-                                                    # {generic_name, cosine, matched id, verdict} — the record
-                                                    # the triage bands are tightened from
-    candidate_reconciled = "candidate_reconciled"      # a Threat_Candidate_Review row was CLOSED — written by
-                                                    # resolve_candidate on EVERY resolution, approve AND
-                                                    # reject; DetailJSON.decision carries which
     session_cancelled = "session_cancelled"            # explicit cancel, or _mark_session_failed's total-failure
                                                     # path — either way releases the M4 lock
     stage_error = "stage_error"                        # a stage failed after retries
@@ -292,18 +247,29 @@ class SSEEventType(StrEnum):
                                                     # CeleryJobState `state`, per-group progress
                                                     # (group/rows), and the terminal result fields
                                                     # (rows_processed/vectors_deleted or error)
-    import_job_update = "import_job_update"            # ADMIN-scope: one threat-library-import job's state
+    grounding_job_update = "grounding_job_update"      # ADMIN-scope: one grounding-calibration job's state
                                                     # change on its own job channel (admin_jobs.py::
-                                                    # import_job_channel_key) — payload carries job_id + a
-                                                    # CeleryJobState `state`, and on SUCCESS the same stats
-                                                    # dict ImportJobStatus.result exposes (ot_rules,
-                                                    # embeddings_job_id, etc.) or `error` on FAILURE
+                                                    # grounding_job_channel_key) — payload carries job_id +
+                                                    # a CeleryJobState `state`, sweep progress (phase
+                                                    # "negatives"/"positives" with done/total), and the
+                                                    # terminal result (match_th/quality/...) or error
     intel_job_update = "intel_job_update"              # ADMIN-scope: one threat-intel feed-refresh job's state
                                                     # change on its own job channel (admin_jobs.py::
                                                     # intel_job_channel_key) — payload carries job_id + feed +
                                                     # a CeleryJobState `state` (RETRY is non-terminal, since
                                                     # this task retries on any exception up to max_retries),
                                                     # item_count on SUCCESS or error on terminal FAILURE
+
+
+class CalibrationStatus(StrEnum):
+    """`Grounding_Calibration_Run.Status` — one calibration sweep's lifecycle. (Reconstructed
+    2026-08-28 after an editing accident removed the uncommitted original; the members are the
+    exact set the code reads.)"""
+    running = "running"      # in flight — UX_GroundingCalibration_Running admits one per model pair
+    success = "success"      # measured and stored
+    no_signal = "no_signal"  # ran, but the two classes did not separate — nothing stored
+    skipped = "skipped"      # declined to re-measure; the value already in force stands
+    failed = "failed"        # crashed; ErrorMessage carries why
 
 
 class CeleryJobState(StrEnum):
@@ -354,7 +320,7 @@ class ClickOutcomeReason(StrEnum):
     no_new_threats_found = "no_new_threats_found"                      # tasks.py: empty candidate pool from the start
     new_threat_did_not_qualify = "new_threat_did_not_qualify"          # tasks.py: candidate found, rescored out
     no_target_ids = "no_target_ids"                                    # cascade.py: regen request with zero targets
-    output_not_found_or_superseded = "output_not_found_or_superseded"  # cascade.py: stale/foreign OutputIDs
+    output_not_found_or_superseded = "output_not_found_or_superseded"  # cascade.py: stale/foreign scenario ids
     generation_failed = "generation_failed"                            # the LLM call itself failed — targets stay
                                                                     # Selected=1, the next click retries. A
                                                                     # transient provider error is NOT a scoping
@@ -381,7 +347,7 @@ class ReviewGateReason(StrEnum):
 
 
 class ScenarioDecisionReason(StrEnum):
-    """Why one OutputID could not be DECIDED — accepted or rejected. Per-id codes inside the
+    """Why one scenario id could not be DECIDED — accepted or rejected. Per-id codes inside the
     404's `details.unacceptable` (produced by dal.undecidable_subset_reasons);
     `duplicate_identity` instead rides the accept 409's `details.reason`, raised pre-flight by
     accept.py::_assert_one_version_per_scenario — ClickOutcomeReason-style, one vocabulary across
@@ -403,15 +369,6 @@ class ScenarioDecisionReason(StrEnum):
                                                                     # decision on this scenario
     already_rejected = "already_rejected"                              # accept refused: rejecting is the standing
                                                                     # decision on this scenario
-
-
-class CandidateKind(StrEnum):
-    """`Threat_Candidate_Review.CandidateKind` — what kind of admin-gated proposal a queue row
-    is. A NULL column value reads as `threat` (legacy rows predate the column)."""
-    threat = "threat"    # a proposed threat (type+name pair) — the original queue shape
-    actor = "actor"      # a proposed actor: ProposedName is the actor, ProposedType names the
-                         # threat type it was proposed for (approval's link target; NULL only
-                         # on legacy rows), ProposedCategory is NULL
 
 
 class UnacceptGateReason(StrEnum):

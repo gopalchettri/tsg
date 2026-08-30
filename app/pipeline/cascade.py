@@ -71,12 +71,12 @@ _REASON_INFO: dict[str, dict[str, str]] = {
     },
     "no_target_ids": {
         "detail": "The regenerate request specified zero target ids after canonicalization — "
-                "normally rejected by the request schema itself (output_ids requires at least "
+                "normally rejected by the request schema itself (scenario_ids requires at least "
                 "one item), so only reachable via a direct/internal caller that bypasses it.",
         "message": "Please select at least one scenario to regenerate.",
     },
     "output_not_found_or_superseded": {
-        "detail": "One or more requested OutputIDs did not resolve to an active "
+        "detail": "One or more requested ScenarioIDs did not resolve to an active "
                 "(non-superseded) Threat_Scenario_Output row for this session/subsystem — "
                 "most often stale ids captured before a prior regeneration already replaced "
                 "them, or ids that belong to a different session.",
@@ -107,8 +107,13 @@ def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, ki
                 if not dal.release_lock(sess, sid, subsystem_id, task_id):
                     log.warning(f"{kind}.lock_lost", session_id=sid, subsystem=subsystem_id, task_id=task_id)  # noqa: G004
                 sess.commit()
-            except Exception:  # noqa: BLE001
-                log.warning(f"{kind}.lock_release_failed", session_id=sid, subsystem=subsystem_id)  # noqa: G004
+            except Exception:  # BLE001 no longer fires: exc_info below makes this a handled catch
+                # exc_info, same as reaper.py's own release handler: a lock left held blocks
+                # every later run on this subsystem until the lease expires, so the cause is
+                # what an operator needs — the event name alone cannot distinguish a Redis blip
+                # from a DB failure inside release_lock's UPDATE.
+                log.warning(f"{kind}.lock_release_failed", session_id=sid,  # noqa: G004
+                            subsystem=subsystem_id, exc_info=True)
 
 
 def _settle_or_raise(sess: Session, sid: str, subsystem_id: int, epoch: int,
@@ -178,7 +183,7 @@ def _settle_next_set_click(sess: Session, scenario_session: dict, subsystem_id: 
 
 
 def _publish_regen_result(sid: str, subsystem_id: int, requested_ids: list[str] | list[int] | None,
-                        new_output_ids: list[str], *, reason: str | None = None,
+                        new_scenario_ids: list[str], *, reason: str | None = None,
                         replacements: list[dict] | None = None,
                         failed_threat_ids: set[str] | None = None,
                         rescored_threat_ids: set[str] | None = None) -> None:
@@ -189,8 +194,8 @@ def _publish_regen_result(sid: str, subsystem_id: int, requested_ids: list[str] 
     """
     bus.publish(sid, {"type": str(SSEEventType.regen_result), "session_id": sid,
                     "subsystem_id": subsystem_id, "reason": reason, **_reason_info(reason),
-                    "requested_output_ids": [str(i) for i in (requested_ids or [])],
-                    "new_output_ids": new_output_ids,
+                    "requested_scenario_ids": [str(i) for i in (requested_ids or [])],
+                    "new_scenario_ids": new_scenario_ids,
                     "replacements": replacements or [],
                     "failed_threat_ids": sorted(failed_threat_ids or ()),
                     "rescored_threat_ids": sorted(rescored_threat_ids or ()),
@@ -204,7 +209,7 @@ def _regen_replacements(sess: Session, sid: str, subsystem_id: int, epoch: int) 
     """
     out = m.Threat_Scenario_Output
     return [{"old": str(old) if old else None, "new": str(new)} for new, old in sess.execute(
-        select(out.OutputID, out.ReplacesOutputID).where(
+        select(out.ScenarioID, out.ReplacesScenarioID).where(
             out.SessionID == sid, out.SubsystemID == subsystem_id,
             dal.active(out.Superseded), out.GenerationEpoch == epoch)
     ).all()]
@@ -261,7 +266,7 @@ def get_threat_id_to_redo(sess: Session, session_id: str, subsystem_id: int,
                 target_ids: list[str] | list[int] | None) -> dict[str, tasks.RegenTarget]:
     """Resolve active output IDs to regeneration targets.
 
-    Return `{OutputID: RegenTarget}` for this session and subsystem. Raise `RegenerateConflict`
+    Return `{ScenarioID: RegenTarget}` for this session and subsystem. Raise `RegenerateConflict`
     when no IDs are supplied or any requested ID is missing, malformed, or superseded.
     """
     ids, lookup_ids = _split_target_ids(target_ids)
@@ -270,16 +275,16 @@ def get_threat_id_to_redo(sess: Session, session_id: str, subsystem_id: int,
                                 reason="no_target_ids")
     out = m.Threat_Scenario_Output
     rows = sess.execute(
-        select(out.OutputID, m.Scoped_Threat.ThreatID, out.ScopedThreatID,
+        select(out.ScenarioID, m.Scoped_Threat.ThreatID, out.ScopedThreatID,
             out.ScenarioNumber, out.IdentityHash)
         .select_from(out.__table__.join(
             m.Scoped_Threat, out.ScopedThreatID == m.Scoped_Threat.ScopedThreatID))
-        .where(out.OutputID.in_(lookup_ids),
+        .where(out.ScenarioID.in_(lookup_ids),
             out.SessionID == session_id,
             out.SubsystemID == subsystem_id,
             out.Superseded == 0)
     ).all()
-    found = {r.OutputID: tasks.RegenTarget(output_id=r.OutputID, threat_id=r.ThreatID,
+    found = {r.ScenarioID: tasks.RegenTarget(scenario_id=r.ScenarioID, threat_id=r.ThreatID,
                                         scoped_threat_id=r.ScopedThreatID,
                                         scenario_number=r.ScenarioNumber,
                                         identity_hash=r.IdentityHash)

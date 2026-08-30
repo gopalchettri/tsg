@@ -18,6 +18,7 @@ _JOB_KEY_PREFIX = "tsg:admin:job:"
 FAMILY_EMBEDDINGS = "emb"
 FAMILY_IMPORT = "import"
 FAMILY_INTEL = "intel"   # per-feed threat-intel refresh jobs (app/api/threat_intel.py)
+FAMILY_GROUNDING = "grounding"  # grounding-threshold calibration sweeps (app/api/admin.py)
 
 
 def _key(job_id: str, family: str) -> str:
@@ -32,18 +33,19 @@ def emb_job_channel_key(job_id: str) -> str:
     return f"admin-emb:{job_id}"
 
 
-def import_job_channel_key(job_id: str) -> str:
-    """Same convention as emb_job_channel_key, for one threat-library-import job — shared by
-    celery_app.py::import_threat_library_task (publisher) and
-    threat_library_import.py::job_events (subscriber)."""
-    return f"admin-import:{job_id}"
-
 
 def intel_job_channel_key(job_id: str) -> str:
     """Same convention as emb_job_channel_key, for one threat-intel feed-refresh job — shared
     by celery_app.py::intel_refresh_feed_task (publisher) and threat_intel.py::job_events
     (subscriber)."""
     return f"admin-intel:{job_id}"
+
+
+def grounding_job_channel_key(job_id: str) -> str:
+    """Same convention as emb_job_channel_key, for one grounding-calibration sweep — shared by
+    celery_app.py::calibrate_grounding_task (publisher) and admin.py::calibration_events
+    (subscriber)."""
+    return f"admin-grounding:{job_id}"
 
 
 def mark_admin_job(job_id: str, family: str) -> None:

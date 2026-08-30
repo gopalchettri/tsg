@@ -11,7 +11,7 @@ and safe to re-run.
                                      hazard the scripts cannot fix themselves. Send the result
                                      set back before continuing. Any FAIL row is a stop.
   1. TSG_Core.sql                 -- baseline tables (TSG's own session/pipeline tables)
-  2. Threat_library.sql           -- threat-library master tables + extras (maps, rules, context config)
+  2. Threat_library.sql           -- threat-library master tables (Category/Type/Catalogue/Actor) + the two junction maps + Source columns
   3. Seed_to_Threat_library.sql   -- curated threat library data
   4. Control_library.sql          -- control library tables + Threat_Scenario_Control_Map (Step-4 control mapping)
   5. Seed_to_Control_library.sql  -- 30 standards, 1288 controls, 6105 control-standard links
@@ -47,17 +47,12 @@ NOT PART OF THE INSTALL — do not run:
     destroyed and cannot be recovered. It self-guards (nothing happens until a variable inside
     it is changed to 'YES'), but it should not be in this package at all — it is named here so
     that if a copy ever travels with these files, you know to delete it.
-  * TSG_Migration_ScenarioLifecycle.sql -- a convenience extract of the scenario-lifecycle
-    changes, for sites applying just that release without re-running the full script 1.
-    Redundant here: script 1 already contains every statement in it. Harmless if run (guarded
-    and idempotent), but unnecessary.
-  * backfill_null_platform_fields_for_testing.sql -- developer fixture. Writes FABRICATED
-    values into PLATFORM tables. It now refuses to run unless the database name looks like
-    dev/test, but do not run it regardless.
-  * backfill_rejection_kind.sql -- one-off repair for databases created before 2026-08-03.
-    Not needed for a fresh install; it self-guards and reports if it is not applicable.
 
 UPGRADING AN EXISTING TSG DATABASE (not a fresh install)
+
+  * Config_Threat_Rule was REMOVED from the product (2026-08). The scripts no longer create
+    or read it. If an older database still has the table, it is a harmless orphan; you MAY
+    drop it manually (DROP TABLE Config_Threat_Rule) but nothing requires it.
 
   Script 1 is additive and guarded, so the same seven files upgrade in place. One thing to
   know: the scenario-lifecycle release changed when a session ends. Generation now completes a
@@ -67,6 +62,7 @@ UPGRADING AN EXISTING TSG DATABASE (not a fresh install)
   permanently, blocking every new assessment for it. Script 6 checks this and FAILs if any
   remain, so run it and read the 'Scenario lifecycle' rows before signing off.
 
-This package was generated fresh from the TSG repo's scripts/ folder on 2026-08-23.
-Regenerate it from source rather than reusing an old copy — do not keep a standing
-duplicate of these files anywhere else.
+Since 2026-08-27 this folder IS the source: the one and only copy of the deployment
+SQL in the repo (the unnumbered duplicates in scripts/ were deleted, and a test fails
+if one reappears). Edit the numbered files here; do not keep a standing duplicate of
+these files anywhere else.

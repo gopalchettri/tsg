@@ -80,7 +80,8 @@ SELECT 'Database', 'INFO', 'Target database / server',
 -- 3. PLATFORM DEPENDENCIES — tables TSG READS but never creates.
 -- ---------------------------------------------------------------------------
 -- These belong to the onboarding/CTM platform. The install scripts do NOT
--- create them; the application only reads them. If one is missing, or exists
+-- create them; the application only reads them (ctm_scan_category feeds the
+-- data-driven control ITOT filter and the session context). If one is missing, or exists
 -- but is missing a column, the API refuses to start — it checks every column
 -- listed here at boot. Resolve with the platform team, not by editing TSG.
 DECLARE @platform_cols TABLE (TableName sysname, ColumnName sysname);
@@ -89,7 +90,7 @@ INSERT INTO @platform_cols (TableName, ColumnName) VALUES
     (N'ctm_scan_category', N'parent_id'),
     (N'ctm_scan_category', N'code'),
     (N'ctm_scan_category', N'name'),
-    (N'ctm_scan_entity', N'id'),
+        (N'ctm_scan_entity', N'id'),
     (N'ctm_scan_entity', N'type'),
     (N'ctm_scan_entity', N'name'),
     (N'ctm_scan_entity', N'description'),
@@ -101,6 +102,7 @@ INSERT INTO @platform_cols (TableName, ColumnName) VALUES
     (N'ctm_scan_entity', N'target_rpo_hours'),
     (N'ctm_scan_entity', N'tier1_critical_service_id'),
     (N'ctm_scan_entity', N'data_handled'),
+    (N'ctm_scan_entity', N'ctm_category_id'),
     (N'ctm_scan_entity_bu', N'id'),
     (N'ctm_scan_entity_bu', N'ctm_scan_entity_id'),
     (N'ctm_scan_entity_bu', N'group_id'),
@@ -191,7 +193,7 @@ WHERE EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES i WHERE i.TABLE_NAME = p.T
 -- 3c. All-clear line, so a clean run still produces visible evidence.
 INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
 SELECT 'Platform dependency', 'PASS',
-       N'All 11 platform tables present with all 85 required columns',
+       N'All 10 platform tables present with all 81 required columns',
        N'Verified against the application''s own boot-time assertion list.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_preflight WHERE Category = 'Platform dependency');
 
@@ -201,52 +203,30 @@ WHERE NOT EXISTS (SELECT 1 FROM #tsg_preflight WHERE Category = 'Platform depend
 DECLARE @tsg_existing int = (
     SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
     WHERE TABLE_NAME IN (
-        N'Config_Threat_Rule', N'Config_Tuning', N'Control_Library',
+        N'Config_Tuning', N'Control_Library',
         N'Control_Library_Standard_Map', N'Control_Standard', N'Identified_Threat',
         N'Prompt_Log', N'Risk_Treatment_Plan', N'Scenario_Audit', N'Scenario_Session',
-        N'Scoped_Threat', N'Subsystem_Stage_State', N'ThreatType_ThreatActor_Map',
-        N'Threat_Actor', N'Threat_Candidate_Review', N'Threat_Catalogue',
-        N'Threat_Catalogue_Category_Map', N'Threat_Category', N'Threat_Library_Import_Run',
+        N'Scenario_Library', N'Grounding_Calibration_Run',
+        N'Scoped_Threat', N'Subsystem_Stage_State',
+        N'Threat_Actor', N'Threat_Catalogue', N'Threat_Catalogue_Category_Map',
+        N'Threat_Category', N'ThreatType_ThreatActor_Map',
         N'Threat_Scenario_Control_Map', N'Threat_Scenario_Output', N'Threat_Type'));
 
 INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
 SELECT 'Install type', 'INFO',
        CASE WHEN @tsg_existing = 0 THEN N'FRESH INSTALL — no TSG tables present'
-            WHEN @tsg_existing = 22 THEN N'UPGRADE — all 22 TSG tables already present'
+            WHEN @tsg_existing = 21 THEN N'UPGRADE — all 21 TSG tables already present'
             ELSE N'PARTIAL — some TSG tables present' END,
-       N'Found ' + CAST(@tsg_existing AS nvarchar(10)) + N' of 22 TSG tables. '
+       N'Found ' + CAST(@tsg_existing AS nvarchar(10)) + N' of 21 TSG tables. '
      + CASE WHEN @tsg_existing = 0
             THEN N'Run all five install scripts in order.'
-            WHEN @tsg_existing = 22
+            WHEN @tsg_existing = 21
             THEN N'Every CREATE is guarded by IF OBJECT_ID(...) IS NULL, so re-running is safe '
                + N'and applies any new columns via the guarded ALTERs.'
             ELSE N'A previous install may have stopped part-way. Re-running the scripts in order '
                + N'is safe and will complete it — but review the earlier run''s output first.'
        END;
 
--- ---------------------------------------------------------------------------
--- 5. KNOWN UPGRADE HAZARD — Config_Threat_Rule primary key.
--- ---------------------------------------------------------------------------
--- On a fresh install this table is created with an IDENTITY primary key and
--- there is nothing to do. But on a database created before 2026-08, the table
--- may exist with a PLAIN INT key. The CREATE is guarded by IF OBJECT_ID(...)
--- IS NULL, so it is skipped, and NOTHING converts the column — the scripts
--- cannot fix this automatically. The threat-library import then fails on every
--- rule it writes, because it inserts without supplying the key and reads the
--- generated value back.
-INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
-SELECT 'Upgrade hazard',
-       CASE WHEN COLUMNPROPERTY(OBJECT_ID('dbo.Config_Threat_Rule'), 'ThreatRuleID', 'IsIdentity') = 1
-            THEN 'PASS' ELSE 'FAIL' END,
-       N'Config_Threat_Rule.ThreatRuleID is an IDENTITY column',
-       CASE WHEN COLUMNPROPERTY(OBJECT_ID('dbo.Config_Threat_Rule'), 'ThreatRuleID', 'IsIdentity') = 1
-            THEN N'IDENTITY confirmed — no action needed.'
-            ELSE N'NOT an IDENTITY column. The install scripts cannot convert it (the CREATE is '
-               + N'skipped because the table already exists). The threat-library import will fail '
-               + N'on every auto-written rule. Report this to the application team BEFORE '
-               + N'proceeding — a one-off conversion is required.'
-       END
-WHERE OBJECT_ID('dbo.Config_Threat_Rule') IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- RESULT

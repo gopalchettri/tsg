@@ -13,6 +13,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.api.schemas import LivenessReport, ReadinessReport
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.engine import get_engine
@@ -21,10 +22,10 @@ router = APIRouter(tags=["Health"])
 logger = get_logger(__name__)
 
 
-@router.get("/health")
-def healthz() -> dict:
+@router.get("/health", response_model=LivenessReport)
+def healthz() -> LivenessReport:
     """Liveness probe — returns 200 unconditionally, does not check DB reachability (that's readyz's job)."""
-    return {"status": "ok"}
+    return LivenessReport(status="ok")
 
 
 def _check_database() -> bool:
@@ -105,7 +106,7 @@ def _check_workers() -> bool:
         return False
 
 
-@router.get("/ready")
+@router.get("/ready", response_model=ReadinessReport)
 def readyz():
     """Readiness probe — checks every dependency this app actually needs. Any one of
     them being unreachable (except Mongo when this deployment doesn't use it) returns
@@ -129,5 +130,10 @@ def readyz():
     failing = [name for name, ok in results.items() if ok is False and name != "workers"]
     if failing:
         logger.warning("readyz.not_ready", failing=failing)
-        return JSONResponse(status_code=503, content={"status": "not_ready", "checks": checks})
-    return {"status": "ready", "checks": checks}
+        # A plain JSONResponse, NOT a raise: this body is the ReadinessReport shape, not the
+        # ErrorResponse envelope, because an orchestrator reads the per-dependency detail.
+        # That is also why /ready must not take the shared UNAVAILABLE_RESPONSES fragment.
+        return JSONResponse(status_code=503,
+                            content=ReadinessReport(status="not_ready",
+                                                    checks=checks).model_dump())
+    return ReadinessReport(status="ready", checks=checks)

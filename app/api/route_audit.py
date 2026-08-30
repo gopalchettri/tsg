@@ -33,31 +33,31 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     ("POST", "/v1/sessions"),
     ("GET", "/v1/sessions/{session_id}"),
     ("GET", "/v1/sessions/{session_id}/results"),
-    ("GET", "/v1/sessions/{session_id}/results.xlsx"),
     ("POST", "/v1/sessions/{session_id}/accept"),
     ("POST", "/v1/sessions/{session_id}/regenerate/scenarios"),
     ("POST", "/v1/sessions/{session_id}/scenarios/next-set"),
     ("POST", "/v1/sessions/{session_id}/scenarios/reject"),
+    ("POST", "/v1/sessions/{session_id}/scenarios/{scenario_id}/promote-to-library"),
     ("POST", "/v1/sessions/{session_id}/cancel"),
     ("GET", "/v1/sessions/{session_id}/events"),
+    ("GET", "/v1/sessions/{session_id}/audit"),
     ("GET", "/v1/sessions/{session_id}/accepted-scenarios"),
-    ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}"),
+    ("GET", "/v1/sessions/{session_id}/scenarios/{scenario_id}"),
     ("GET", "/v1/users/{user_id}/scenarios"),
     ("GET", "/v1/entities/{entity_id}/scenarios"),
     # Treatment plans (app/api/treatment.py) — mounted only when risk_module_enabled. Entries
     # for an unmounted router are inert (the audit walks LIVE app routes), so these stay
     # unconditional; when the router IS mounted, missing entries would fail the boot.
-    ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan"),
-    ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan"),
+    ("POST", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan"),
+    ("GET", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan"),
     ("GET", "/v1/sessions/{session_id}/treatment-plans"),
-    ("GET", "/v1/sessions/{session_id}/treatment-plans.xlsx"),
-    ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/regenerate"),
-    ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/cancel"),
-    ("POST", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/review"),
+    ("POST", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/regenerate"),
+    ("POST", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/cancel"),
+    ("POST", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/review"),
     ("GET", "/v1/entities/{entity_id}/treatment-plans"),
-    ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/audit"),
+    ("GET", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/audit"),
     ("GET", "/v1/entities/{entity_id}/treatment-plans/audit"),
-    ("GET", "/v1/sessions/{session_id}/scenarios/{output_id}/treatment-plan/evidence"),
+    ("GET", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/evidence"),
 }
 
 # Routes deliberately outside the entity model, each mapped to the dependency CALLABLE whose
@@ -85,59 +85,18 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     # All 6 above: admin-key gated (router-level Depends(require_admin) in admin.py), shared
     # cross-tenant threat-library data — not one entity's data, so the per-entity JWT model
     # doesn't apply. Same rationale for every require_admin entry below.
-    ("GET", "/v1/tsg/sessions/promotions"): require_admin,
-    ("GET", "/v1/tsg/sessions/promotions/{session_id}"): require_admin,
-    ("POST", "/v1/tsg/sessions/promotions/{session_id}/retry"): require_admin,
-    ("DELETE", "/v1/tsg/sessions/promotions/{session_id}"): require_admin,
-    ("GET", "/v1/tsg/threat-library/candidates"): require_admin,
-    ("GET", "/v1/tsg/threat-library/candidates/{candidate_id}"): require_admin,
-    ("POST", "/v1/tsg/threat-library/candidates/{candidate_id}/approve"): require_admin,
-    ("POST", "/v1/tsg/threat-library/candidates/{candidate_id}/reject"): require_admin,
-    ("GET", "/v1/tsg/threat-library/sources"): require_admin,
-    ("POST", "/v1/tsg/threat-library/sources/{source}/import"): require_admin,
-    ("GET", "/v1/tsg/threat-library/imports/{job_id}"): require_admin,
-    ("GET", "/v1/tsg/threat-library/imports/events/{job_id}"): require_admin,
+    # Grounding-threshold calibration — admin-scoped, never entity-scoped: the threshold is a
+    # property of the deployment's embedding+reranker pair, shared by every entity's sessions.
+    ("GET", "/v1/tsg/grounding/threshold"): require_admin,
+    ("POST", "/v1/tsg/grounding/calibrate"): require_admin,
+    ("GET", "/v1/tsg/grounding/calibrations"): require_admin,
+    ("GET", "/v1/tsg/grounding/calibrate/status/{job_id}"): require_admin,
+    ("GET", "/v1/tsg/grounding/calibrate/events/{job_id}"): require_admin,
     ("GET", "/v1/tsg/threat-intel/feeds"): require_admin,
     ("GET", "/v1/tsg/threat-intel/items"): require_admin,
     ("POST", "/v1/tsg/threat-intel/feeds/refresh"): require_admin,
     ("POST", "/v1/tsg/threat-intel/feeds/{feed}/refresh"): require_admin,
     ("GET", "/v1/tsg/threat-intel/feeds/events/{job_id}"): require_admin,
-    # Threat-library master CRUD (routers in app/api/threat_library_crud.py; shared impl in library_crud.py). One entry PER VERB; a missing one
-    # fails the boot, not a request.
-    ("GET", "/v1/tsg/threat-library/threat-categories"): require_admin,
-    ("POST", "/v1/tsg/threat-library/threat-categories"): require_admin,
-    ("PATCH", "/v1/tsg/threat-library/threat-categories/{threat_category_id}"): require_admin,
-    ("DELETE", "/v1/tsg/threat-library/threat-categories/{threat_category_id}"): require_admin,
-    ("GET", "/v1/tsg/threat-library/threat-types"): require_admin,
-    ("POST", "/v1/tsg/threat-library/threat-types"): require_admin,
-    ("PATCH", "/v1/tsg/threat-library/threat-types/{threat_type_id}"): require_admin,
-    ("DELETE", "/v1/tsg/threat-library/threat-types/{threat_type_id}"): require_admin,
-    ("GET", "/v1/tsg/threat-library/threat-catalogue"): require_admin,
-    ("POST", "/v1/tsg/threat-library/threat-catalogue"): require_admin,
-    ("PATCH", "/v1/tsg/threat-library/threat-catalogue/{threat_catalogue_id}"): require_admin,
-    ("DELETE", "/v1/tsg/threat-library/threat-catalogue/{threat_catalogue_id}"): require_admin,
-    ("GET", "/v1/tsg/threat-library/threat-actors"): require_admin,
-    ("POST", "/v1/tsg/threat-library/threat-actors"): require_admin,
-    ("PATCH", "/v1/tsg/threat-library/threat-actors/{threat_actor_id}"): require_admin,
-    ("DELETE", "/v1/tsg/threat-library/threat-actors/{threat_actor_id}"): require_admin,
-    # Scoping-rule CRUD (threat_library_crud.py's dedicated tail — Config_Threat_Rule breaks the
-    # shared framework's audit-column assumptions, see the comment there).
-    ("GET", "/v1/tsg/threat-library/threat-rules"): require_admin,
-    ("POST", "/v1/tsg/threat-library/threat-rules"): require_admin,
-    ("PATCH", "/v1/tsg/threat-library/threat-rules/{threat_rule_id}"): require_admin,
-    ("DELETE", "/v1/tsg/threat-library/threat-rules/{threat_rule_id}"): require_admin,
-    # Control-library master CRUD (routers in app/api/control_library_crud.py; shared impl in library_crud.py). The last two are the
-    # control<->standard link.
-    ("GET", "/v1/tsg/control-library/standards"): require_admin,
-    ("POST", "/v1/tsg/control-library/standards"): require_admin,
-    ("PATCH", "/v1/tsg/control-library/standards/{standard_id}"): require_admin,
-    ("DELETE", "/v1/tsg/control-library/standards/{standard_id}"): require_admin,
-    ("GET", "/v1/tsg/control-library/controls"): require_admin,
-    ("POST", "/v1/tsg/control-library/controls"): require_admin,
-    ("PATCH", "/v1/tsg/control-library/controls/{control_id}"): require_admin,
-    ("DELETE", "/v1/tsg/control-library/controls/{control_id}"): require_admin,
-    ("POST", "/v1/tsg/control-library/controls/{control_id}/standards/{standard_id}"): require_admin,
-    ("DELETE", "/v1/tsg/control-library/controls/{control_id}/standards/{standard_id}"): require_admin,
 }
 
 
@@ -149,7 +108,7 @@ def _assert_registries_disjoint(
     collision = entity_scoped & exempt.keys()
     if collision:
         raise StartupInvariantError(
-            f"[R2] route(s) {sorted(collision)} appear in BOTH _ENTITY_SCOPED_ROUTES and "
+            f"route(s) {sorted(collision)} appear in BOTH _ENTITY_SCOPED_ROUTES and "
             "_EXEMPT_ROUTES in app/api/route_audit.py — a route cannot be both. Fix the registry."
         )
 

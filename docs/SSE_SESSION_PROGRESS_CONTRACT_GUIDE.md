@@ -432,12 +432,12 @@ section 6: a typed client reading the old names fails to parse rather than silen
 
 | Model | Was | Now |
 |---|---|---|
-| `ThreatResult` | `threat_id`, `threat_type`, `threat_name`, `grounding_status`, `threat_catalogue_id`, `threat_actors`, `grounding_score`, `score`, `scope_rank` | `ThreatID`, `ThreatType`, `ThreatName`, `GroundingStatus`, `ThreatCatalogueID`, `ThreatActors`, `GroundingScore`, `Score`, `ScopeRank` |
-| `ThreatResult` | — | **new:** `ThreatCategory`, `ThreatTypeID`, `LibraryThreatType`, `LibraryThreatName` |
+| `ThreatResult` | `threat_id`, `threat_type`, `threat_name`, `grounding_status`, `threat_catalogue_id`, `threat_actors`, `grounding_score`, `score`, `scope_rank` | `ThreatID`, `ThreatType`, `ThreatName`, `GroundingStatus`, `ThreatCatalogueID`, `Actors` (keyed refs), `GroundingScore`, `Score`, `ScopeRank` |
+| `ThreatResult` | — | **new:** `ThreatCategory`, `ThreatCategoryID`, `Description`, `ThreatTypeID`, `LibraryThreatType`, `LibraryThreatName`, `IsAIGenerated` |
 | `MappedControl` | `control_library_id`, `control_code`, `domain`, `control_name`, `rank`, `score`, `standards` | `ControlLibraryID`, `ControlCode`, `Domain`, `ControlName`, `MapRank`, `Score`, `StandardNames` |
 | `ScenarioResult` | `output_id`, `threat_id`, `accepted`, `generation_epoch`, `scenario_number`, `controls_mapped` | `OutputID`, `ThreatID`, `Accepted`, `GenerationEpoch`, `ScenarioNumber`, `ControlsMapped` |
 | `AcceptedScenario` / `ScenarioListItem` | `output_id`, `supporting_system_id`, `threat_type_id`, `threat_catalogue_id`, `threat_type`, `threat_name`, `threat_actors`, `scenario_number`, `accepted`, `superseded`, `created_at` | `OutputID`, `SubsystemID`, `ThreatTypeID`, `ThreatCatalogueID`, `ThreatType`, `ThreatName`, `ThreatActors`, `ScenarioNumber`, `Accepted`, `Superseded`, `CreatedAt` |
-| `AcceptedScenario` / `ScenarioListItem` | — | **new:** `LibraryThreatType`, `LibraryThreatName` |
+| `AcceptedScenario` / `ScenarioListItem` | — | **new:** `LibraryThreatType`, `LibraryThreatName`, nested `threat` block (a full `ThreatResult`) |
 
 ### What did NOT change, and why
 

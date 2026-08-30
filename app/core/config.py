@@ -2,10 +2,9 @@
 # never hard-coded elsewhere. One shared Settings object: injected in the API, imported
 # directly by Celery workers.
 #
-# HOW ENV VARS LINK TO FIELDS: env_prefix="TSG_" maps each field to TSG_<FIELD_NAME
-# uppercased> automatically (next_set_size <- TSG_NEXT_SET_SIZE); fields with extra accepted
-# spellings list them explicitly via AliasChoices. Each field's comment below starts with its
-# env variable name. Keep the env files in sync: python -m app.core.env_selfcheck
+# env_prefix="TSG_" maps each field to TSG_<FIELD_NAME uppercased>; extra spellings are listed
+# via AliasChoices. Each field's comment starts with its env variable name. Keep the env files
+# in sync: python -m app.core.env_selfcheck
 from __future__ import annotations
 
 import os
@@ -18,8 +17,8 @@ from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-# Which env file to load: TSG_ENV_FILE if set, else .env. A missing TSG_ENV_FILE fails loudly
-# rather than silently falling back to another environment's config.
+# TSG_ENV_FILE if set, else .env. A missing TSG_ENV_FILE fails loudly rather than silently
+# falling back to another environment's config.
 def _env_file() -> str:
     chosen = os.environ.get("TSG_ENV_FILE", "").strip()
     if not chosen:
@@ -31,16 +30,9 @@ def _env_file() -> str:
     return chosen
 
 
-# Longest control_name / control_description the API accepts, so a curator cannot paste a document
-# into a control and break the embedding corpus (embed() REJECTS over-limit text and embeds in
-# BATCHES, so one oversized row fails the whole control library). Sized to fit inside the default
-# max_embed_chars of 4000: 500 + len(": ") + 3400 = 3902.
-#
-# DELIBERATELY NOT validated against max_embed_chars at boot. That coupling was tried and removed:
-# it imposed a FLOOR of 3902 on max_embed_chars, so a deployment whose provider accepts less could
-# not be configured at all — worse than the misconfiguration it guarded. embeddings._active_names
-# already skips any row that does not fit, whatever the limit is set to, so a mismatch degrades to
-# one skipped control rather than a broken corpus.
+# Longest control_name / control_description the API accepts (500 + ": " + 3400 fits the default
+# max_embed_chars of 4000). DELIBERATELY not validated against max_embed_chars at boot: that
+# coupling floored max_embed_chars at 3902; an oversized row now degrades to one skipped control.
 CONTROL_NAME_MAX_CHARS = 500
 CONTROL_DESCRIPTION_MAX_CHARS = 3400
 
@@ -63,52 +55,39 @@ class Settings(BaseSettings):
     # TSG_TENANT_ID — the customer/organization this instance serves (one at a time).
     tenant_id: str = "DESC"
 
-    # TSG_API_MODULE / API_MODULE — this deployment's module identity; an API_Client key
-    # authenticates ONLY for its own Module. min_length guards a blank that would 401 everything.
+    # TSG_API_MODULE — this deployment's module identity; an API_Client key authenticates ONLY
+    # for its own Module. min_length guards a blank that would 401 everything.
     api_module: str = Field(
         "tsg", min_length=1, validation_alias=AliasChoices("API_MODULE", "TSG_API_MODULE"))
 
-    # APP_ENV / TSG_APP_ENV — deployment environment; gates dev-only routes and posture warnings.
+    # APP_ENV — deployment environment; gates dev-only routes and posture warnings.
     app_env: Literal["local", "dev", "staging", "prod"] = Field(
         "prod", validation_alias=AliasChoices("APP_ENV", "TSG_APP_ENV"))
-    # LOG_LEVEL / TSG_LOG_LEVEL — logging verbosity.
+    # LOG_LEVEL — logging verbosity.
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         "INFO", validation_alias=AliasChoices("LOG_LEVEL", "TSG_LOG_LEVEL"))
-    # TRACE_SINKS / TSG_TRACE_SINKS — where the step trace goes (app.core.tracing). Comma list of
-    # `console` (stdout), `log` (through structlog, so traces join the normal JSON stream) and
-    # `file` (trace-<pid>.jsonl + trace-<pid>.txt under trace_dir). Empty = tracing off entirely,
-    # which is the default: this is a debugging aid, opted into deliberately.
-    # RESTART-ONLY: get_settings() is @lru_cache'd, so editing this mid-run changes nothing.
+    # TRACE_SINKS — comma list of console|log|file for the step trace (app.core.tracing);
+    # empty (default) = off. RESTART-ONLY: get_settings() is @lru_cache'd.
     trace_sinks: str = Field(
         "", validation_alias=AliasChoices("TRACE_SINKS", "TSG_TRACE_SINKS"))
-    # TSG_TRACE_DIR — where the file sinks (and log_file below) write. Relative values resolve
-    # against the PROJECT ROOT, never the CWD: start.ps1 opens three windows and each would
-    # otherwise scatter its own logs/ tree wherever it happened to start.
+    # TSG_TRACE_DIR — where file sinks (and log_file) write; relative = PROJECT ROOT, never CWD.
     trace_dir: str = Field(
         "logs/trace", validation_alias=AliasChoices("TRACE_DIR", "TSG_TRACE_DIR"))
-    # Rotation, applied PER PROCESS — every file carries its writer's pid, because gunicorn -w 4
-    # plus the worker and beat all import configure_logging and would otherwise fight over one
-    # file. On Linux that silently loses whichever process did not roll; on Windows os.replace
-    # raises PermissionError, logging swallows it, and rotation NEVER HAPPENS — the file grows
-    # past the cap forever, which is the exact failure this setting exists to prevent.
-    # Budget disk as (processes x max_bytes x backups).
+    # TRACE_MAX_BYTES / TRACE_BACKUPS — rotation, PER PROCESS (files carry the writer's pid;
+    # shared files rotate wrongly on Linux and never on Windows). Disk = procs x bytes x backups.
     trace_max_bytes: int = Field(
         52_428_800, ge=1024,
         validation_alias=AliasChoices("TRACE_MAX_BYTES", "TSG_TRACE_MAX_BYTES"))
     trace_backups: int = Field(
         5, ge=0, validation_alias=AliasChoices("TRACE_BACKUPS", "TSG_TRACE_BACKUPS"))
-    # LOG_FILE / TSG_LOG_FILE — tee EVERY app log line (not just traces) into app-<pid>.jsonl
-    # under trace_dir, one JSON object per line, for Promtail -> Loki. Separate from trace_sinks
-    # on purpose: a Loki feed wants the whole log stream, and you may want it with tracing off
-    # entirely. Off by default; in Docker/K8s leave it off and let the json-file driver / kubelet
-    # rotate stdout instead — a container's files die with the pod.
+    # LOG_FILE — tee EVERY app log line into app-<pid>.jsonl under trace_dir (Promtail -> Loki).
+    # Leave off in containers: stdout is already rotated there and files die with the pod.
     log_file: bool = Field(
         False, validation_alias=AliasChoices("LOG_FILE", "TSG_LOG_FILE"))
 
     # --- 2. Database (MSSQL) ---------------------------------------------------
 
-    # TSG_DB_DSN — main application DB. The default is a placeholder so a missing value fails
-    # loudly instead of silently connecting to the wrong database.
+    # TSG_DB_DSN — main application DB; placeholder default so a missing value fails loudly.
     db_dsn: str = (
         r"mssql+pyodbc://@CONFIGURE_TSG_DB_DSN_IN_ENV\SQLEXPRESS/CONFIGURE_TSG_DB_DSN_IN_ENV?driver=ODBC+Driver+17+for+SQL+Server&Trusted_Connection=yes&TrustServerCertificate=yes"
     )
@@ -126,18 +105,16 @@ class Settings(BaseSettings):
 
     # --- 3. Redis & Celery -----------------------------------------------------
 
-    # TSG_REDIS_URL / REDIS_URL — main Redis: SSE pub/sub, LLM slots, embedding locks.
+    # TSG_REDIS_URL — main Redis: SSE pub/sub, LLM slots, embedding locks.
     redis_url: str = Field(
         "redis://127.0.0.1:6379/0", validation_alias=AliasChoices("REDIS_URL", "TSG_REDIS_URL"))
 
-    # TSG_REDIS_CELERY_BROKER_URL (+ CELERY_BROKER_URL spellings) — the job queue; falls back
-    # to redis_url when unset.
+    # TSG_REDIS_CELERY_BROKER_URL — the job queue; falls back to redis_url when unset.
     celery_broker_url: str = Field(
         "", validation_alias=AliasChoices(
             "CELERY_BROKER_URL", "TSG_CELERY_BROKER_URL", "TSG_REDIS_CELERY_BROKER_URL"))
 
-    # TSG_REDIS_CELERY_RESULT_BACKEND (+ CELERY_RESULT_BACKEND spellings) — where finished job
-    # results are stored; same fallback as the broker.
+    # TSG_REDIS_CELERY_RESULT_BACKEND — finished-job result store; same fallback as the broker.
     celery_result_backend: str = Field(
         "", validation_alias=AliasChoices(
             "CELERY_RESULT_BACKEND", "TSG_CELERY_RESULT_BACKEND", "TSG_REDIS_CELERY_RESULT_BACKEND"))
@@ -167,8 +144,8 @@ class Settings(BaseSettings):
     intel_kev_enabled: bool = True
     intel_kev_url: str = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
-    # TSG_INTEL_ICS_ADVISORIES_ENABLED / _URL — CISA ICS advisories, read from CISA's official
-    # GitHub CSAF mirror (cisa.gov's own endpoint bot-blocks non-browser TLS stacks).
+    # TSG_INTEL_ICS_ADVISORIES_ENABLED / _URL — CISA ICS advisories via the official GitHub CSAF
+    # mirror (cisa.gov's own endpoint bot-blocks non-browser TLS stacks).
     intel_ics_advisories_enabled: bool = True
     intel_ics_advisories_url: str = "https://raw.githubusercontent.com/cisagov/CSAF/develop/csaf_files/OT/white/changes.csv"
 
@@ -176,7 +153,7 @@ class Settings(BaseSettings):
     intel_urlhaus_enabled: bool = False
     intel_urlhaus_url: str = "https://urlhaus.abuse.ch/downloads/json_recent/"
 
-    # OTX_API_KEY / TSG_INTEL_OTX_API_KEY — AlienVault OTX; the fetcher is skipped while empty.
+    # OTX_API_KEY — AlienVault OTX; the fetcher is skipped while empty.
     intel_otx_api_key: str = Field("", validation_alias=AliasChoices("OTX_API_KEY", "TSG_INTEL_OTX_API_KEY"))
     # TSG_INTEL_OTX_URL — pulses endpoint.
     intel_otx_url: str = "https://otx.alienvault.com/api/v1/pulses/subscribed"
@@ -184,25 +161,24 @@ class Settings(BaseSettings):
     intel_otx_page_size: int = 50
     # TSG_INTEL_OTX_MAX_PAGES — safety bound on the paginated walk (~178 real pages today).
     intel_otx_max_pages: int = 200
-    # TSG_INTEL_OTX_SYNC_SECONDS — per-run time budget; each run resumes from a stored cursor.
-    # Must stay well under the task's 600s soft limit (one deep page can take ~45s).
+    # TSG_INTEL_OTX_SYNC_SECONDS — per-run time budget (resumes from a stored cursor); keep well
+    # under the task's 600s soft limit.
     intel_otx_sync_seconds: int = 400
-    # TSG_INTEL_OTX_FRESH_PAGES — head pages re-read EVERY run, so brand-new pulses are cached
-    # without waiting for the rolling cursor to come back around (~9 days).
+    # TSG_INTEL_OTX_FRESH_PAGES — head pages re-read EVERY run so new pulses don't wait ~9 days
+    # for the rolling cursor.
     intel_otx_fresh_pages: int = 2
 
-    # TSG_INTEL_TAXII_SERVERS — generic TAXII 2.1 sources as a JSON list, e.g.
-    # [{"label": "org-opencti", "url": "https://cti.example/taxii2/root/", "collection": "<id>"}].
+    # TSG_INTEL_TAXII_SERVERS — TAXII 2.1 sources as a JSON list of
+    # {"label", "url", "collection"} objects.
     intel_taxii_servers: str = ""
 
     # --- 6. LLM chat provider ----------------------------------------------------
 
-    # LLM_PROVIDER / TSG_LLM_PROVIDER — which AI service handles chat.
+    # LLM_PROVIDER — which AI service handles chat.
     llm_provider: Literal["litellm_proxy", "azure_openai", "openai"] = Field(
         "azure_openai", validation_alias=AliasChoices("LLM_PROVIDER", "TSG_LLM_PROVIDER"))
 
-    # AZURE_OPENAI_API_KEY / _ENDPOINT / _DEPLOYMENT_NAME / _API_VERSION — Azure OpenAI
-    # credentials; only read when llm_provider=azure_openai.
+    # AZURE_OPENAI_* — Azure OpenAI credentials; only read when llm_provider=azure_openai.
     azure_openai_api_key: str = Field(
         "", validation_alias=AliasChoices("AZURE_OPENAI_API_KEY", "TSG_AZURE_OPENAI_API_KEY"))
     azure_openai_endpoint: str = Field(
@@ -216,38 +192,31 @@ class Settings(BaseSettings):
     openai_api_key: str = Field("", validation_alias=AliasChoices("OPENAI_API_KEY", "TSG_OPENAI_API_KEY"))
     openai_base_url: str = ""
 
-    # TSG_LITELLM_BASE_URL / TSG_LITELLM_API_KEY — litellm proxy connection; only when
-    # llm_provider=litellm_proxy.
+    # TSG_LITELLM_BASE_URL / _API_KEY — litellm proxy; only when llm_provider=litellm_proxy.
     litellm_base_url: str = "http://localhost:4000"
     litellm_api_key: str = "sk-local"
 
     # LITELLM_API_KEY_HEADER — optional ALTERNATE header for the key (e.g. "x-litellm-api-key")
-    # when a gateway consumes the Authorization header; the key is then sent in BOTH headers.
+    # when a gateway consumes Authorization; the key is then sent in BOTH headers.
     litellm_api_key_header: str = Field(
         "", validation_alias=AliasChoices("LITELLM_API_KEY_HEADER", "TSG_LITELLM_API_KEY_HEADER"))
 
-    # TSG_LITELLM_BYPASS_PROXY — true (default) sets NO_PROXY for litellm traffic (heals a
-    # corporate proxy that hangs the CONNECT tunnel); set false ONLY where routing litellm
-    # through the proxy is required by the network.
+    # TSG_LITELLM_BYPASS_PROXY — true (default) sets NO_PROXY for litellm traffic; set false only
+    # where the network requires routing litellm through the corporate proxy.
     litellm_bypass_proxy: bool = Field(
         True, validation_alias=AliasChoices("LITELLM_BYPASS_PROXY", "TSG_LITELLM_BYPASS_PROXY"))
 
     # TSG_INFERENCE_MODEL — chat model name (litellm/OpenAI; Azure uses the deployment name).
     inference_model: str = "gpt-5"
 
-    # TSG_INFERENCE_FALLBACK_MODEL — second chat model the SAME call retries on when
-    # inference_model fails retryably (timeout/connection, 429 that survived litellm's own
-    # num_retries, 5xx). Empty (default) = off. APP-SIDE on purpose: this deployment owns its
-    # resilience instead of depending on proxy-side fallback config it cannot see or change.
-    # Applies only to calls that did NOT pin an explicit per-call model (calibration probes and
-    # boot checks pin one precisely so a broken primary cannot hide behind its fallback), and
-    # never under azure_openai (a deployment is a fixed address — "another model" cannot apply).
-    # Every use is logged (llm.fallback_model_used) and recorded in Provenance.fallback_from;
-    # note the consistency cost: fallback answers come from a different model family.
+    # TSG_INFERENCE_FALLBACK_MODEL — second model the SAME call retries ONCE on a retryable
+    # failure; empty (default) = off. Never under azure_openai; calls that pin an explicit model
+    # are exempt. Every use is logged and recorded in Provenance.fallback_from.
     inference_fallback_model: str = ""
 
 
-    # TSG_LLM_TIMEOUT_SECONDS / TSG_LLM_MAX_RETRIES — per-call timeout and retry cap.
+    # TSG_LLM_TIMEOUT_SECONDS / TSG_LLM_MAX_RETRIES — per-call timeout and retry cap. NOTE:
+    # these feed the stage-lease/treatment-staleness derivation (_derive_stage_lease_seconds).
     llm_timeout_seconds: float = 90.0
     llm_max_retries: int = 3
 
@@ -284,17 +253,16 @@ class Settings(BaseSettings):
         0.0, ge=0.0, le=2.0, validation_alias=AliasChoices(
             "TREATMENT_TEMPERATURE", "TSG_TREATMENT_TEMPERATURE"))
 
-    # TSG_TREATMENT_STALE_SECONDS — a RUNNING plan with no progress for this long is treated as
-    # abandoned (measures "no progress", not wall time). Leave unset to derive from the LLM
-    # timeout x retries. ponytail: staleness-on-next-POST instead of a reaper sweep.
+    # TSG_TREATMENT_STALE_SECONDS — a RUNNING plan with no progress for this long is abandoned.
+    # Leave unset to derive from llm timeout x retries.
     treatment_stale_seconds: int = Field(
         900, ge=60, validation_alias=AliasChoices(
             "TREATMENT_STALE_SECONDS", "TSG_TREATMENT_STALE_SECONDS"))
 
     # --- 8. Optional proxy-side safety (litellm only, off by default) -------------
 
-    # LLM_MODERATION_ENABLED — a soft flag for a reviewer, NEVER a hard block: this app's job
-    # is describing attacks, which some moderation categories would misfire on.
+    # LLM_MODERATION_ENABLED — a soft flag for a reviewer, NEVER a hard block: this app's job is
+    # describing attacks, which some moderation categories would misfire on.
     llm_moderation_enabled: bool = Field(
         False, validation_alias=AliasChoices("LLM_MODERATION_ENABLED", "TSG_LLM_MODERATION_ENABLED"))
     # LLM_MODERATION_MODEL — unset = the proxy's default moderation model.
@@ -339,110 +307,60 @@ class Settings(BaseSettings):
     # --- 10. Matching & grounding ---------------------------------------------------
 
     # TSG_GROUNDING_MATCH_THRESHOLD — trust gate 0-100: at/above = 'verified' (library wording
-    # and ids adopted); below = 'unverified' (novel; feeds library promotion on accept).
-    # MODEL-SPECIFIC: leave UNSET to auto-calibrate per model pair; setting it disables that.
+    # and ids adopted); below = 'unverified'. BOOTSTRAP only: a stored calibration for the model
+    # pair always wins (grounding.resolve_thresholds, DB-first since 2026-08).
     grounding_match_threshold: float = 75.0
     # TSG_GROUNDING_SHORTLIST_K — shortlisted entries sent to the precise scorer.
     grounding_shortlist_k: int = 10
-
-    # TSG_LIBRARY_PROMOTION_THRESHOLD — curation cutoff, SEPARATE from the match threshold:
-    # that one asks "trust this match?", this one asks "add this threat to the library?".
-    library_promotion_threshold: float = 75.0
 
     # --- 11. Controls mapping (Step 4) ------------------------------------------------
 
     # TSG_CONTROL_MAP_TOP_K — most controls kept per scenario ("up to K", never padded).
     control_map_top_k: int = Field(5, ge=1)
-    # TSG_CONTROL_MAP_MIN_SCORE — drop matches reranking below this. SET IT EXPLICITLY once
-    # measured: the query is now the SCENARIO PARAGRAPH (library-first redesign), not a short
-    # control label, and the auto-derived fallback threshold was calibrated label-vs-label — a
-    # materially different score distribution. Left unset it follows the model pair's match
-    # threshold, which risks silently dropping every match (controls=[] reading as a healthy
-    # "library gap").
-    #
-    # DO NOT GUESS THIS NUMBER — measure it against the deployed library:
-    #     python scripts/measure_control_map_scores.py
-    # It runs the real production path (same candidates, same hybrid shortlist, same reranker,
-    # same query builder) over real scenarios and prints, per candidate threshold, how many
-    # scenarios would publish NO controls. Read-only; safe against production.
+    # TSG_CONTROL_MAP_MIN_SCORE — drop matches reranking below this. SET EXPLICITLY once
+    # measured (python scripts/measure_control_map_scores.py — read-only, runs the real path):
+    # the query is a scenario PARAGRAPH, and the unset fallback was calibrated label-vs-label,
+    # risking every match silently dropped (controls=[] reading as a healthy "library gap").
     control_map_min_score: float = Field(60.0, ge=0.0, le=100.0)
 
-    # TSG_CONTROL_MAP_SHORTLIST_K — how many controls reach the RERANKER per scenario.
-    #
-    # Control mapping used to borrow `grounding_shortlist_k` (10), and that was measured to be
-    # actively wrong. The shortlist is the CHEAP approximate stage (cosine top-K union BM25
-    # top-K); the reranker is the accurate one. At K=10 only 14-20 of 557 OT controls were ever
-    # reranked, so a control the reranker would have scored 65.86 (`Access Agreements`, for a
-    # real Historian-exfiltration scenario) was discarded before it could be scored at all — and
-    # the empty result published as `controls: []`, which schemas.py documents as a genuine
-    # library gap. At K=60 the same scenario reranks 102 candidates and that control clears the
-    # cutoff. Same library, same reranker, same threshold.
-    #
-    # SEPARATE from grounding_shortlist_k on purpose. That one serves THREAT grounding: a short
-    # label against a small candidate set, with thresholds auto-calibrated at its current value.
-    # This one serves a scenario PARAGRAPH against the whole control library. One number cannot
-    # be right for both, and raising the shared knob would silently move calibrated behaviour.
-    #
-    # Cost is provider-shaped: `LiteLLMClient.rerank_many` sends ONE request per query remotely
-    # (so K grows each request's payload, not the number of round trips), but flattens every
-    # (query, doc) pair into a single CPU batch locally (so K genuinely multiplies work). UAT and
-    # production use the reranker API; only the local dev path pays linearly.
+    # TSG_CONTROL_MAP_SHORTLIST_K — controls reaching the RERANKER per scenario. SEPARATE from
+    # grounding_shortlist_k on purpose (scenario paragraph vs short label; grounding's thresholds
+    # are calibrated at its own K). At the old shared K=10 only 14-20 of 557 OT controls were
+    # ever reranked and real matches were discarded unscored — never set it back to 10.
+    # Cost: remote reranker = payload per request; local = CPU work scales ~linearly with K.
     control_map_shortlist_k: int = Field(60, ge=1)
 
-    # TSG_CONTROL_MAP_SWEEP_INTERVAL_SECONDS — how often the retry queue is drained.
-    # map_controls has three paths that deliberately leave an output unstamped "for the next run"
-    # (no candidates, lost lease, a failed per-output rerank); the beat task tsg.map_controls_sweep
-    # IS that next run. Ticking faster than stage_lease_seconds buys nothing: the sweep ignores
-    # anything settled more recently than one lease, so the in-pipeline mapping always goes first.
-    # ponytail: each tick scans Threat_Scenario_Output for ControlsMappedAt IS NULL — fine at
-    # current volume; add a filtered index on (SessionID) WHERE ControlsMappedAt IS NULL if it
-    # ever shows up in the slow-query log.
+    # TSG_CONTROL_MAP_SWEEP_INTERVAL_SECONDS — retry-queue drain cadence (tsg.map_controls_sweep
+    # is the "next run" for outputs mapping deliberately left unstamped). Ticking faster than
+    # stage_lease_seconds buys nothing.
     control_map_sweep_interval_seconds: float = 300.0
     # TSG_RERANK_CONCURRENCY — concurrent REMOTE rerank calls (local reranker ignores this).
     rerank_concurrency: int = Field(8, ge=1)
-    # TSG_SCENARIO_GENERATION_CONCURRENCY — scenarios generated at once in one write_scenarios
-    # batch. They are independent calls, so a session's ~10 scenarios serialised into ~10x one
-    # call for no reason. 1 restores the strictly sequential behaviour.
-    #
-    # A LOCAL POLITENESS CAP ONLY: every call still takes its own Redis _llm_slot, so
-    # max_concurrent_llm_calls stays the global authority across replicas — same contract as
-    # rerank_concurrency. Raise it only alongside the provider's rpm headroom; a batch that
-    # exhausts the slot pool raises LLMSlotUnavailable and Celery retries the whole stage.
+    # TSG_SCENARIO_GENERATION_CONCURRENCY — scenarios generated at once per write_scenarios
+    # batch (1 = strictly sequential). A LOCAL politeness cap only: every call still takes its
+    # own Redis _llm_slot, so max_concurrent_llm_calls stays the global authority.
     scenario_generation_concurrency: int = Field(5, ge=1, le=32)
 
     # --- 12. Threat volume & scenario coverage ------------------------------------------
 
-    # TSG_MAX_THREATS_PER_ASSET (or legacy TSG_MAX_THREATS_PER_SUBSYSTEM) — most threats the AI
-    # may propose PER IDENTIFICATION CALL; next-set shortfalls may run more calls per session.
+    # TSG_MAX_THREATS_PER_ASSET — most threats the AI may propose PER IDENTIFICATION CALL;
+    # next-set shortfalls may run more calls per session.
     max_threats_per_asset: int = Field(
         10, validation_alias=AliasChoices("TSG_MAX_THREATS_PER_ASSET", "TSG_MAX_THREATS_PER_SUBSYSTEM"))
 
-    # TSG_GAP_GENERATION_BUFFER — how many threats to REQUEST per NEW one needed.
-    # Gap generation loses proposals to dedup: the model re-proposes threats the session already
-    # holds even though the exclusion list names every one of them. Asking for exactly the
-    # shortfall therefore guarantees under-delivery ("show more 5" returning 4), so the ask is
-    # multiplied by this and the surplus is discarded by the consume loop at no cost beyond the
-    # tokens. 2.0 absorbs a 50% repeat rate. Raise it if a deployment still sees short next-set
-    # clicks against its library; 1.0 disables the buffer.
+    # TSG_GAP_GENERATION_BUFFER — threats REQUESTED per new one needed: dedup eats re-proposals,
+    # so asking for exactly the shortfall under-delivers. 2.0 absorbs a 50% repeat rate;
+    # 1.0 disables the buffer.
     gap_generation_buffer: float = Field(2.0, ge=1.0)
 
-    # TSG_MAX_ACTORS_PER_THREAT — caps actor names from one threat to limit candidate rows and
-    # triage work. A higher value keeps more actors but increases processing and review work.
+    # TSG_MAX_ACTORS_PER_THREAT — caps actor names per threat (candidate rows + triage work).
     max_actors_per_threat: int = Field(10, ge=1)
 
-    # TSG_THREAT_RETRIEVAL_TOP_K — cap on library candidates the retrieval funnel forwards to
-    # the LLM validator. LEAVE UNSET at today's library size (~75 rows): every gate-passing
-    # candidate is validated, which is what makes the coverage claim EXHAUSTIVE rather than
-    # sampled. Set only once the library outgrows validate-everything (post-MITRE import);
-    # gate-ungated ("always-eligible") types bypass the cap so universal threats survive it.
-    threat_retrieval_top_k: int | None = Field(None, ge=1)
-    # TSG_VALIDATOR_BATCH_SIZE — library candidates judged per LLM validation call. One batched
-    # call for the whole set is the norm at today's size; batches only split above this.
+    # TSG_VALIDATOR_BATCH_SIZE — library candidates judged per LLM validation call.
     validator_batch_size: int = Field(20, ge=1)
 
     # TSG_COVERAGE_ATTEMPT_SLACK — extra generation attempts beyond a threat's coverage target
-    # (its AI-declared plausible entry points). A NON-TERMINATION GUARD, not a depth policy:
-    # an identity stops at (plausible entry points + this slack) scenario rows.
+    # (its AI-declared plausible entry points). A non-termination guard, not a depth policy.
     coverage_attempt_slack: int = Field(2, ge=0)
 
     # TSG_EXCLUSIONS_CHAR_BUDGET — maximum characters used for prior threat labels in a prompt.
@@ -455,14 +373,12 @@ class Settings(BaseSettings):
     # TSG_NEXT_SET_SIZE — scenarios served/generated per "generate next set" click.
     next_set_size: int = Field(5, ge=1)
 
-    # TSG_SEMANTIC_NEAR_DUPLICATE_THRESHOLD — session-tunable FLOOR of the dedup bar; every
-    # pair is judged at max(cross_category, this), so values below 0.98 are inert; 1.0 disables
-    # the gate. MODEL-SPECIFIC.
+    # TSG_SEMANTIC_NEAR_DUPLICATE_THRESHOLD — session-tunable FLOOR of the dedup bar; pairs are
+    # judged at max(cross_category, this), so values below 0.98 are inert; 1.0 disables.
     semantic_near_duplicate_threshold: float = Field(0.92, ge=0.0, le=1.0)
 
-    # TSG_SEMANTIC_CROSS_CATEGORY_THRESHOLD — BASE of that bar: cosine at/above which a
-    # proposed threat is dropped as a restatement, whatever the categories. 0.98 sits above the
-    # measured 0.969 trap (two REAL threats one word apart); the ordering validator enforces it.
+    # TSG_SEMANTIC_CROSS_CATEGORY_THRESHOLD — BASE of that bar, whatever the categories.
+    # 0.98 sits above the measured 0.969 trap (two REAL threats one word apart).
     semantic_cross_category_threshold: float = Field(0.98, ge=0.0, le=1.0)
 
     # --- 13. Scoring & scoping ------------------------------------------------------
@@ -470,11 +386,9 @@ class Settings(BaseSettings):
     # TSG_SCOPING_SCORE_THRESHOLD — a threat scoring below this gets no scenario.
     scoping_score_threshold: float | None = Field(55.0, ge=0.0, le=100.0)
 
-    # TSG_BASE_SCORE — every threat's starting score. Coupled to the two below by
-    # _validate_scoring_floor_invariant — read it before changing any of the three.
+    # TSG_BASE_SCORE — every threat's starting score; coupled to the threshold by
+    # _validate_scoring_floor_invariant.
     base_score: float = Field(50.0, ge=0.0, le=100.0)
-    # TSG_DEFAULT_RULE_WEIGHT — points a scoping rule adds when it defines no weight of its own.
-    default_rule_weight: float = Field(10.0)
     # TSG_SIBLING_SIMILARITY_RATIO — text similarity that flags a scenario for the reviewer
     # (warning, never a rejection).
     sibling_similarity_ratio: float = Field(0.85, ge=0.0, le=1.0)
@@ -482,29 +396,11 @@ class Settings(BaseSettings):
     prompt_intel_limit: int = Field(5, ge=0)
     # TSG_INTEL_MIN_TERM_LENGTH — shortest word used in intel keyword search.
     intel_min_term_length: int = Field(4, ge=1)
-    # TSG_AUTO_OT_RELEVANCE_WEIGHT — weight of the auto-written OT rules (boost-only, no gate).
-    auto_ot_relevance_weight: float = Field(10.0)
     # TSG_NEAR_DUPLICATE_SCORE — rerank score at/above which two LIBRARY entries count as
-    # near-twins and threshold auto-calibration gives up.
+    # near-twins (reported as curation work by calibration).
     near_duplicate_score: float = Field(99.0, ge=0.0, le=100.0)
-    # TSG_TRIAGE_AUTO_REJECT_COSINE / TSG_TRIAGE_AUTO_APPROVE_COSINE — library-promotion triage
-    # bands; approve must stay BELOW reject (the gap IS the human-review band). REJECT governs
-    # catalogue names only (embedding cosine); APPROVE also splits ACTOR names into novel vs
-    # review (string ratio, accept._triage_actor_name — actor DUPLICATES merge on normalized
-    # spelling identity only, never on a ratio: char-similarity would merge near-opposites).
-    # MODEL-SPECIFIC for the cosine use; the actor string use is model-independent.
-    triage_auto_reject_cosine: float = Field(0.95, ge=0.0, le=1.0)
-    triage_auto_approve_cosine: float = Field(0.80, ge=0.0, le=1.0)
-
-    # TSG_SCOPING_TOP_N — only the best N unique threats get scenarios; None (default) = no cap
-    # (with defaults, only tech_gate rules and dedup actually drop threats).
+    # TSG_SCOPING_TOP_N — only the best N unique threats get scenarios; None (default) = no cap.
     scoping_top_n: int | None = Field(None, ge=1)
-
-    # --- 14. Threat-library import (admin) -------------------------------------------
-
-    # TSG_THREAT_LIBRARY_IMPORT_MAX_UPLOAD_MB — upload cap sized for the largest real source
-    # (enterprise-attack.json ~51 MB raw, larger JSON-escaped); a guard, not a memory bound.
-    threat_library_import_max_upload_mb: int = Field(128, ge=1)
 
     # --- 15. Session capacity ----------------------------------------------------------
 
@@ -542,27 +438,6 @@ class Settings(BaseSettings):
     reaper_stale_grace_seconds: float = 300.0
     # TSG_STAGE_MAX_ATTEMPTS — retry cap per stage before it is abandoned.
     stage_max_attempts: int = 5
-
-    # --- 18. Library-promotion retry sweep -----------------------------------------------
-
-    # TSG_PROMOTION_RETRY_INTERVAL_SECONDS — how often the sweep retries failed promotions.
-    promotion_retry_interval_seconds: float = 60.0
-    # TSG_PROMOTION_MAX_ATTEMPTS — sweep-only cap ("exhausted" after); manual admin retry is
-    # never blocked by it.
-    promotion_max_attempts: int = 5
-    # TSG_PROMOTION_AUTO_RETRY_ENABLED — false = failures wait for an admin retry.
-    promotion_auto_retry_enabled: bool = True
-    # TSG_PROMOTION_SWEEP_BATCH_LIMIT — max sessions retried per sweep pass.
-    promotion_sweep_batch_limit: int = 200
-    # TSG_PROMOTION_LIST_MAX_LIMIT — page-size cap for the admin promotions list.
-    promotion_list_max_limit: int = 500
-
-    # TSG_PROMOTION_AUTO_APPROVE_ENABLED — MASTER SWITCH for AI-driven library growth.
-    # False (default): every novel type/name/actor waits as an admin review card; links are
-    # written only at approval. True: full auto-promotion at accept (ai_auto_promoted).
-    # Read LIVE via get_settings() at accept/retry time, never frozen into session snapshots.
-    promotion_auto_approve_enabled: bool = False
-
     # --- 19. Health monitoring / self-check ----------------------------------------------
 
     # TSG_SELF_CHECK_INTERVAL_SECONDS — periodic self-check cadence.
@@ -605,29 +480,26 @@ class Settings(BaseSettings):
     admin_api_key: str = Field(
         "", validation_alias=AliasChoices("ADMIN_API_KEY", "TSG_ADMIN_API_KEY"))
 
-    # VERIFY_MEMBERSHIP / TSG_VERIFY_MEMBERSHIP — when True, each request's (user, entity) pair
-    # is additionally verified against user_scope_assignment (defence-in-depth); default False
-    # authenticates by X-API-Key only and trusts the identity headers.
+    # VERIFY_MEMBERSHIP — OFF by design, and expected to stay off. X-API-Key is the credential;
+    # the identity headers are request input the calling service supplies. True would add a
+    # per-request user_scope_assignment check. Kept as the migration path if per-user entity
+    # scoping is ever wanted — not because the current model is unfinished.
     verify_membership: bool = Field(
         False, validation_alias=AliasChoices("VERIFY_MEMBERSHIP", "TSG_VERIFY_MEMBERSHIP"))
 
-    # TSG_ALLOW_REMOTE_IN_DEV — escape hatch for the dev/prod-infrastructure gate in
-    # assert_security_posture. APP_ENV=local/dev disables four production guards at once, so
-    # pointing such a build at a real (non-loopback) database or Redis is refused by default.
-    # Set this True to say "yes, I really am developing against shared infrastructure" — the
-    # point is that it has to be DELIBERATE, not that it is impossible.
+    # TSG_ALLOW_REMOTE_IN_DEV — deliberate escape hatch: lets APP_ENV=local/dev point at
+    # non-loopback DB/Redis, which assert_security_posture otherwise refuses.
     allow_remote_in_dev: bool = Field(
         False, validation_alias=AliasChoices("ALLOW_REMOTE_IN_DEV", "TSG_ALLOW_REMOTE_IN_DEV"))
 
-    # FLOWER_BASIC_AUTH / TSG_FLOWER_BASIC_AUTH — "user:password" for Flower's --basic-auth.
-    # Read by docker/compose.prod.yml and start.ps1, never by Python; kept here so config stays
-    # discoverable in one surface and env_selfcheck enforces its presence in every template.
+    # FLOWER_BASIC_AUTH — "user:password" for Flower's --basic-auth. Read by
+    # docker/compose.prod.yml and start.ps1, never by Python; declared here so env_selfcheck
+    # keeps it documented in every template.
     flower_basic_auth: str = Field(
         "", validation_alias=AliasChoices("FLOWER_BASIC_AUTH", "TSG_FLOWER_BASIC_AUTH"))
 
     # (Auth is the header model — X-API-Key + X-User-Id + X-Entity-Id, see app/api/deps.py.
-    # The old jwt_*/auth_dev_mode settings no longer exist; if still set they are silently
-    # ignored via extra='ignore'.)
+    # The old jwt_*/auth_dev_mode settings no longer exist; extra='ignore' swallows them.)
 
     # --- 22. Former hardcoded module constants (defaults unchanged from the old values) ------
 
@@ -635,30 +507,23 @@ class Settings(BaseSettings):
     calibration_sample_size: int = Field(100, ge=5)
     # TSG_CALIBRATION_PARAPHRASES_PER_NAME — LLM rewordings generated per sampled name.
     calibration_paraphrases_per_name: int = Field(2, ge=1)
+    # TSG_CALIBRATION_STALE_AFTER_SECONDS — how long a `running` calibration row is believed
+    # before it reads as abandoned (a killed worker must not block all future sweeps). Keep
+    # comfortably above a real 10-15 minute sweep.
+    calibration_stale_after_seconds: int = Field(3600, ge=60)
 
     # TSG_EMBEDDING_GROUP_LOCK_TTL_SECONDS — Redis mutex TTL for a group's cache rebuild.
     # MUST stay an int: redis-py rejects a float for EXPIRE.
     embedding_group_lock_ttl_seconds: int = Field(30, ge=1)
     # TSG_MONGO_BREAKER_COOLDOWN_SECONDS — cooldown before retrying Mongo after a failure.
     mongo_breaker_cooldown_seconds: float = Field(30.0, ge=0.0)
-    # TSG_EMBEDDING_BATCH_SIZE — max texts per PROVIDER REQUEST, enforced in LiteLLMClient.embed.
-    # 32 is the per-request cap of the proxy-served qwen3-embedding-8b-mig (uat/prod); the old
-    # default of 100 exceeded it, so every embed against that model failed. deploy/secrets.yaml
-    # carries no override, so THIS default is what uat actually runs on. Raise only against a
-    # provider documenting a higher cap — llm._verify_embedding_dimensions probes this exact
-    # value at worker boot and refuses to start if the provider rejects it.
+    # TSG_EMBEDDING_BATCH_SIZE — max texts per PROVIDER REQUEST. 32 is the per-request cap of
+    # uat/prod's proxy-served embedding model; the boot probe (_verify_embedding_dimensions)
+    # sends exactly this many and refuses to start if the provider rejects it.
     embedding_batch_size: int = Field(32, ge=1)
-    # TSG_EMBEDDING_CONCURRENCY — how many of get_vectors' batches are in flight at once.
-    # 1 (default) is strictly sequential, i.e. byte-for-byte today's behaviour, so this is inert
-    # until deliberately raised. Above 1 it mirrors rerank_many's bounded pool: each concurrent
-    # embed() call takes its OWN _llm_slot, so max_concurrent_llm_calls stays the global authority
-    # and this is only a local politeness cap.
-    #
-    # Raising it multiplies the request RATE at the provider, so a 429 becomes likelier — and a
-    # 429 maps to LLMSlotUnavailable, which retries the whole Celery task. Step it up (4, then 8)
-    # while watching the worker log; the first sign of 429s is the real ceiling, whatever a
-    # benchmark predicted. And concurrency only helps if the provider serves requests in PARALLEL:
-    # a single-GPU backend with a serialised queue gains nothing from this.
+    # TSG_EMBEDDING_CONCURRENCY — get_vectors batches in flight at once (1 = sequential). Each
+    # call still takes its own _llm_slot, so max_concurrent_llm_calls stays the global authority.
+    # Step up 4 -> 8 while watching for 429s (a 429 retries the whole Celery task).
     embedding_concurrency: int = Field(1, ge=1, le=32)
 
     # TSG_LLM_SLOT_POLL_SECONDS / _POLL_JITTER_SECONDS — slot-wait poll interval; jitter avoids
@@ -680,18 +545,13 @@ class Settings(BaseSettings):
     llm_verify_max_attempts: int = Field(3, ge=1)
     llm_verify_retry_backoff_seconds: float = Field(5.0, ge=0.0)
 
-    # TSG_ADMIN_EMBEDDING_MAX_RETRIES — embedding-admin job retries on slot shortage; bounded
-    # on purpose (0 = fail on the first shortage). Read once at import — worker restart to change.
+    # TSG_ADMIN_EMBEDDING_MAX_RETRIES — embedding-admin job retries on slot shortage (0 = fail
+    # on first). Read once at import — worker restart to change.
     admin_embedding_max_retries: int = Field(10, ge=0)
 
     # TSG_ACCEPT_NAMED_IN_MESSAGE — offending ids named in the human-readable accept 404 message.
     accept_named_in_message: int = Field(3, ge=1)
 
-    # TSG_LIBRARY_IMPORT_STALE_AFTER_SECONDS — window after which a "running" import row counts
-    # as abandoned; should match the Celery broker's visibility_timeout (3600s).
-    library_import_stale_after_seconds: int = Field(3600, ge=1)
-    # TSG_LIBRARY_IMPORT_SKIPPED_CAP — max skipped-item entries in an import result payload.
-    library_import_skipped_cap: int = Field(50, ge=0)
 
     # TSG_MAX_PROPOSAL_CHARS — max combined type+name chars for a usable LLM threat proposal;
     # kept <= max_embed_chars by the validator below.
@@ -699,8 +559,7 @@ class Settings(BaseSettings):
 
     # --- Boot validators: coupled-setting invariants (raise = refuse to start) ---------------
 
-    # max_proposal_chars <= max_embed_chars — embed() errors (never truncates) over the limit,
-    # which would lose the whole batch.
+    # embed() errors (never truncates) over the limit, which would lose the whole batch.
     @model_validator(mode="after")
     def _validate_proposal_below_embed_cap(self) -> Settings:
         if self.max_proposal_chars > self.max_embed_chars:
@@ -710,11 +569,8 @@ class Settings(BaseSettings):
                 "truncating it, which would lose every threat in the batch.")
         return self
 
-    # control_map_shortlist_k >= control_map_top_k — control mapping sends ONE scenario-text
-    # query per output and takes its top_k matches from that single reranked shortlist, so a
+    # One scenario-text query per output draws its top-K from a single reranked shortlist, so a
     # shortlist smaller than top_k silently caps every scenario below the configured count.
-    # Guards the CONTROL knob, not the threat one: control mapping no longer reads
-    # grounding_shortlist_k, so checking that value here would pass while the real limit failed.
     @model_validator(mode="after")
     def _validate_shortlist_covers_control_top_k(self) -> Settings:
         if self.control_map_shortlist_k < self.control_map_top_k:
@@ -740,12 +596,8 @@ class Settings(BaseSettings):
     # unset -> derive (floor x 2); explicitly below the floor -> refuse to start.
     @model_validator(mode="after")
     def _derive_stage_lease_seconds(self) -> Settings:
-        # One chat call can run TWO full retry chains when a fallback model is active — the
-        # primary's chain, then inference_fallback_model's with the same timeout/retry budget
-        # (llm.py chat()) — so the safe floor doubles with it. Azure ignores the fallback
-        # entirely (fixed deployment), so it keeps the single chain. Without this, the derived
-        # lease exactly EQUALED the worst-case call at UAT values (2 x 4 x 180 = 1440s) and a
-        # legitimate primary-timeout-then-slow-fallback sequence got reaped as crashed.
+        # A fallback model doubles the worst case: the primary's full retry chain, then the
+        # fallback's, with the same timeout/retry budget each. Azure ignores the fallback.
         chains = 2 if (self.inference_fallback_model
                     and self.llm_provider != "azure_openai") else 1
         floor = self.llm_timeout_seconds * (self.llm_max_retries + 1) * chains
@@ -819,21 +671,21 @@ class Settings(BaseSettings):
                 "0.969 cross-class trap).")
         return self
 
-    # scoping_score_threshold must sit between base_score and base_score + default_rule_weight
-    # ("no rule vouched -> drop; any rule vouched -> keep"). The session-snapshot resolver
-    # (core/tuning.py) re-runs the same arithmetic on Config_Tuning overrides.
+    # scoping_score_threshold must sit below base_score + the smallest grounding-confidence
+    # weight, or every NOVEL threat is dropped before a curator ever sees it.
     @model_validator(mode="after")
     def _validate_scoring_floor_invariant(self) -> Settings:
+        _min_confidence_weight = 15.0  # scoping._CONFIDENCE_WEIGHT[unverified]; not imported —
+        #                                config must not depend on the pipeline package
         if self.scoping_score_threshold is None:
             return self  # None = "no cutoff, keep everything, rank only"
-        if self.base_score + self.default_rule_weight <= self.scoping_score_threshold:
+        if self.base_score + _min_confidence_weight <= self.scoping_score_threshold:
             raise ValueError(
                 f"scoping_score_threshold ({self.scoping_score_threshold}) is at or above "
-                f"base_score ({self.base_score}) + default_rule_weight "
-                f"({self.default_rule_weight}) = {self.base_score + self.default_rule_weight} — "
-                "a threat that a scoping rule DID match would still be dropped. Lower the "
-                f"threshold below {self.base_score + self.default_rule_weight}, or raise the "
-                "weight.")
+                f"base_score ({self.base_score}) + the unverified confidence weight "
+                f"({_min_confidence_weight}) = {self.base_score + _min_confidence_weight} — "
+                "every novel (unverified) threat would be silently dropped. Lower the "
+                "threshold or raise base_score.")
         if self.scoping_score_threshold <= self.base_score:
             from app.core.logging import get_logger  # lazy: logging imports config
             get_logger(__name__).warning(
@@ -845,18 +697,6 @@ class Settings(BaseSettings):
                     "floor real, or leave as-is if keep-everything is intended.")
         return self
 
-    # approve < reject — the gap between the triage bands IS the human-review band.
-    @model_validator(mode="after")
-    def _validate_triage_bands(self) -> Settings:
-        if self.triage_auto_approve_cosine >= self.triage_auto_reject_cosine:
-            raise ValueError(
-                f"triage_auto_approve_cosine ({self.triage_auto_approve_cosine}) must be below "
-                f"triage_auto_reject_cosine ({self.triage_auto_reject_cosine}) — the gap between "
-                "them IS the human-review band; equal or inverted bands make automation "
-                "contradict itself.")
-        return self
-
-    # stale_after >= 2x heartbeat, or a live call's slot is pruned before its first renewal.
     @model_validator(mode="after")
     def _validate_llm_slot_heartbeat_margin(self) -> Settings:
         if self.llm_slot_stale_after_seconds < self.llm_slot_heartbeat_seconds * 2:
@@ -867,18 +707,6 @@ class Settings(BaseSettings):
                 "Keep stale_after at least 2x heartbeat.")
         return self
 
-    # promotion <= match, or a 'verified' threat gets promoted, duplicating its own match.
-    @model_validator(mode="after")
-    def _validate_promotion_below_match(self) -> Settings:
-        if self.library_promotion_threshold > self.grounding_match_threshold:
-            raise ValueError(
-                f"library_promotion_threshold ({self.library_promotion_threshold}) must not exceed "
-                f"grounding_match_threshold ({self.grounding_match_threshold}) — otherwise a "
-                "`verified` threat gets promoted, duplicating the library entry it just matched.")
-        return self
-
-
-# The one shared settings object, built once.
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
@@ -929,20 +757,15 @@ def _dsn_host(url: str) -> str:
     return host.split(":", 1)[0].strip().lower()
 
 
-# Startup posture check. Two HARD gates plus the historical membership warning. Called first in
-# the FastAPI lifespan — before db.invariants.verify_startup — so it is the earliest gate there
-# is. The >=1-API-key hard gate lives in db.invariants.
+# Startup posture check: two HARD gates plus the membership warning. Called first in the FastAPI
+# lifespan, so it is the earliest gate there is (the >=1-API-key gate lives in db.invariants).
 def assert_security_posture(settings: Settings | None = None) -> None:
     s = settings or get_settings()
 
-    # GATE 1 — a dev/local build must not run against shared infrastructure.
-    #
-    # APP_ENV is not a label, it is a switch: at local/dev it echoes raw exception text to
-    # clients (api/errors.py), mounts the /dev/sse-test harness (main.py), skips the
-    # "at least one active API_Client" boot check (db/invariants.py), and silences the
-    # membership warning below. A deployment that sets APP_ENV=dev against a real database
-    # therefore turns off four protections at once, silently and with no other signal.
-    # Nothing prevented that, which is exactly how it reached a shared environment.
+    # GATE 1 — a dev/local build must not run against shared infrastructure. APP_ENV is a
+    # switch, not a label: at local/dev the app echoes raw exception text to clients, mounts
+    # /dev/sse-test, skips the active-API_Client boot check, and silences the membership
+    # warning — four protections off at once, so pointing such a build at real infra is refused.
     if s.app_env in ("local", "dev") and not s.allow_remote_in_dev:
         remote = {name: host for name, host in
                 (("TSG_DB_DSN", _dsn_host(s.db_dsn)), ("TSG_REDIS_URL", _dsn_host(s.redis_url)))
@@ -957,11 +780,8 @@ def assert_security_posture(settings: Settings | None = None) -> None:
                 f"posture), or set TSG_ALLOW_REMOTE_IN_DEV=true to state deliberately that you "
                 f"are developing against shared infrastructure.")
 
-    # GATE 2 — TLS posture on the database connection.
-    #
-    # TrustServerCertificate=yes negotiates TLS and then does not verify the certificate, so it
-    # stops MITM being detectable. Hard-fail in prod only: a staging SQL Server may legitimately
-    # still be on a self-signed cert, and failing that boot would be an outage rather than a fix.
+    # GATE 2 — TLS posture: TrustServerCertificate=yes skips certificate verification (MITM
+    # undetectable). Hard-fail in prod only; staging may legitimately run self-signed.
     if "trustservercertificate=yes" in s.db_dsn.lower():
         if s.app_env == "prod":
             raise RuntimeError(
@@ -976,23 +796,26 @@ def assert_security_posture(settings: Settings | None = None) -> None:
                     "validated. Acceptable on a self-signed staging box; this is a HARD FAILURE "
                     "at APP_ENV=prod, so fix it before promoting.")
 
+    # INFO, not a warning, and deliberately so. This is the ACCEPTED auth model, not a pending
+    # remediation — the previous text told every reader to "set TSG_VERIFY_MEMBERSHIP=true once
+    # the prod scope table is confirmed", an instruction nobody will ever act on. A warning that
+    # fires on every boot and can never be resolved only trains operators to skip this channel,
+    # which also carries db.tls_certificate_unverified above. Stated once, at the right level.
     if s.app_env in ("staging", "prod") and not s.verify_membership:
         from app.core.logging import get_logger
-        get_logger(__name__).warning(
-            "auth.membership_check_disabled",
+        get_logger(__name__).info(
+            "auth.posture_api_key_only",
             app_env=s.app_env,
-            note="TSG_VERIFY_MEMBERSHIP is OFF: X-User-Id/X-Entity-Id are trusted, not verified "
-                "against user_scope_assignment. Set TSG_VERIFY_MEMBERSHIP=true once the prod "
-                "scope table is confirmed.")
+            note="X-API-Key is the credential. X-User-Id/X-Entity-Id are request INPUT the "
+                "calling service is trusted to populate, not verified against "
+                "user_scope_assignment. One key therefore reaches every entity in every tenant, "
+                "so keys are server-side only — never shipped to a browser or mobile client.")
 
 
-# Startup check that graceful SSE shutdown still works. sse_starlette finds the running uvicorn
-# Server by introspecting the live SIGTERM handler; that only works when uvicorn's Server.serve()
-# drives this process (bare uvicorn, or gunicorn -k uvicorn.workers.UvicornWorker). We run the
-# SAME introspection at boot so a drift to another worker class fails loudly instead of silently
-# losing SSE drain-on-shutdown. Deliberately NOT an "is uvicorn importable" check — uvicorn is a
-# hard dependency regardless of which worker class actually runs, so an import check would pass
-# even after the worker class drifted.
+# Startup check that graceful SSE shutdown still works: sse_starlette finds the running uvicorn
+# Server by introspecting the live SIGTERM handler, which only works when uvicorn's Server.serve()
+# drives this process. Run the SAME introspection at boot so a drift to another worker class
+# fails loudly instead of silently losing SSE drain-on-shutdown.
 def assert_sse_graceful_shutdown_wired(get_signal_handler=None) -> None:
     import signal as _signal
 

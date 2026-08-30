@@ -3,13 +3,15 @@ and a status-code mapping registered on the FastAPI app.
 """
 from __future__ import annotations
 
+from http import HTTPStatus
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.admin import AdminValidationError
+from app.api.admin import AdminValidationError, CalibrationConflict
 from app.api.sessions import SSEStreamCapacityExceeded
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -27,7 +29,6 @@ from app.pipeline import cascade
 from app.pipeline.accept import AcceptConflict, MasterInactive
 from app.pipeline.embeddings import EmbeddingBusy
 from app.pipeline.llm import LLMSlotUnavailable
-from app.pipeline.threat_library_import import ThreatLibraryImportError
 from app.pipeline.treatment import TreatmentConflict
 
 log = get_logger(__name__)
@@ -49,18 +50,6 @@ async def _handle_auth_error(_: Request, exc: AuthError):
 async def _handle_forbidden(_: Request, exc: EntityForbidden):
     """Caller is authenticated but not entitled to the target entity -> 403."""
     return JSONResponse(status_code=403, content=_env("forbidden", str(exc)))
-
-
-async def _handle_library_conflict(_: Request, exc):  # exc: library_crud.LibraryConflict
-    """Threat-library CRUD write would violate a master's natural-key index -> 409.
-
-    Carries the colliding row's id so a client can PATCH the existing row instead of retrying a
-    create that can never succeed. Best-effort null: the indexes cover a triple, and a
-    category/sector-only clash isn't findable by name alone."""
-    return JSONResponse(
-        status_code=409,
-        content=_env("library_conflict", str(exc), existing_id=exc.existing_id),
-    )
 
 
 async def _handle_session_conflict(_: Request, exc: SessionConflict):
@@ -94,7 +83,7 @@ async def _handle_treatment_conflict(_: Request, exc: TreatmentConflict):
 async def _handle_not_found(_: Request, exc: NotFoundError):
     """Requested entity doesn't exist (or isn't visible to this caller) -> 404, with whatever
     machine-readable payload the raise site attached as `details` (accept's partial-subset 404
-    names each unacceptable OutputID and why). getattr, not exc.details: NotFoundError is raised
+    names each unacceptable scenario_id and why). getattr, not exc.details: NotFoundError is raised
     from ~a dozen sites and may still arrive as a bare Exception subclass instance."""
     details = getattr(exc, "details", None)
     body = _env("not_found", str(exc))
@@ -160,16 +149,20 @@ async def _handle_embedding_busy(_: Request, exc: EmbeddingBusy):
     return JSONResponse(status_code=409, content=_env("embedding_busy", str(exc)))
 
 
+async def _handle_calibration_conflict(_: Request, exc: CalibrationConflict):
+    """A grounding calibration for this model pair is already running -> 409.
+
+    Raised when the DATABASE refuses the second INSERT (UX_GroundingCalibration_Running), never
+    from a check-then-act, so it cannot be a false positive. Carries the in-flight run_id so the
+    caller polls that one instead of starting a second 10-15 minute, ~100-billed-call sweep."""
+    extra = {"run_id": exc.run_id} if exc.run_id is not None else {}
+    return JSONResponse(status_code=409, content=_env("calibration_running", str(exc), **extra))
+
+
 async def _handle_admin_validation_error(_: Request, exc: AdminValidationError):
     """A structurally-valid but business-rule-invalid admin embedding request -> 422."""
     return JSONResponse(status_code=422, content=_env("admin_validation_error", str(exc)))
 
-
-async def _handle_threat_library_import_error(_: Request, exc: ThreatLibraryImportError):
-    """A structurally-valid but business-rule-invalid threat-library import request
-    (unknown source, bad via_taxii combo, oversized/unparseable/mismatched file
-    content) -> 422 — one error class, one status code (see app/api/threat_library_import.py)."""
-    return JSONResponse(status_code=422, content=_env("threat_library_import_error", str(exc)))
 
 
 async def _handle_validation_error(_: Request, exc: RequestValidationError):
@@ -182,6 +175,26 @@ async def _handle_validation_error(_: Request, exc: RequestValidationError):
     errors = [{k: v for k, v in e.items() if k != "ctx"} for e in exc.errors()]
     return JSONResponse(status_code=422, content=_env("validation_error", "request validation failed",
                                                     errors=errors))
+
+
+async def _handle_http_exception(_: Request, exc: StarletteHTTPException):
+    """Every HTTPException -> the SAME envelope as every other error.
+
+    Without this, Starlette's default handler answers with `{"detail": ...}` — a SECOND,
+    undocumented error shape that clients had to handle blind. It covers more than the in-app
+    `raise HTTPException` sites: the framework's own 404 (unrouted path) and 405 (wrong method)
+    are HTTPExceptions too, so those were the most common way a caller met the other shape.
+
+    `error_code` is derived from the status so it stays a stable machine-readable token
+    (404 -> not_found, 405 -> method_not_allowed) rather than echoing prose. `exc.headers` is
+    preserved — 405 carries `Allow`, and 401 may carry `WWW-Authenticate`; dropping them would
+    break those responses' own contracts.
+    """
+    code = HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_") \
+        if exc.status_code in {s.value for s in HTTPStatus} else "http_error"
+    return JSONResponse(status_code=exc.status_code,
+                        content=_env(code, str(exc.detail)),
+                        headers=getattr(exc, "headers", None))
 
 
 async def _handle_unhandled_exception(request: Request, exc: Exception):
@@ -218,11 +231,10 @@ def register_error_handlers(app: FastAPI) -> None:
     app.exception_handler(RegenerateConflict)(_handle_regenerate_conflict)
     app.exception_handler(CancelConflict)(_handle_cancel_conflict)
     app.exception_handler(EmbeddingBusy)(_handle_embedding_busy)
+    app.exception_handler(CalibrationConflict)(_handle_calibration_conflict)
     app.exception_handler(AdminValidationError)(_handle_admin_validation_error)
-    app.exception_handler(ThreatLibraryImportError)(_handle_threat_library_import_error)
-    # Imported here, not at module scope: library_crud imports admin.py, which would make
-    # an errors.py -> crud -> admin -> errors cycle at import time.
-    from app.api.library_crud import LibraryConflict
-    app.exception_handler(LibraryConflict)(_handle_library_conflict)
     app.exception_handler(RequestValidationError)(_handle_validation_error)
+    # StarletteHTTPException, not fastapi.HTTPException: the latter subclasses it, so registering
+    # the BASE catches both the app's own raises and the framework's 404/405.
+    app.exception_handler(StarletteHTTPException)(_handle_http_exception)
     app.exception_handler(Exception)(_handle_unhandled_exception)

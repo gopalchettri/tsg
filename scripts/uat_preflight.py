@@ -124,11 +124,11 @@ def main() -> int:
         from app.db import models as m
         from app.db.engine import db_session
         with db_session() as sess:
-            oid = sess.execute(select(m.Threat_Scenario_Output.OutputID).limit(1)).scalar()
+            oid = sess.execute(select(m.Threat_Scenario_Output.ScenarioID).limit(1)).scalar()
             if oid is None:
                 raise SkipCheck("no Threat_Scenario_Output rows yet — run one session first")
             hits = sess.execute(select(func.count()).select_from(m.Threat_Scenario_Output)
-                                .where(m.Threat_Scenario_Output.OutputID == str(oid).upper())).scalar()
+                                .where(m.Threat_Scenario_Output.ScenarioID == str(oid).upper())).scalar()
         if hits != 1:
             raise RuntimeError(f"uppercase form of {oid} matched {hits} rows, expected 1")
         return "uppercase form resolves to the same row"
@@ -248,26 +248,28 @@ def main() -> int:
 
     print("\nI. Grounding threshold for THIS model pair")
 
-    @check("threshold resolved (calibrating now if not stored)")
+    @check("threshold resolved for this model pair")
     def _thresholds():
         from app.db.engine import db_session
         from app.pipeline import grounding
         from app.pipeline.llm import get_llm
-        if "grounding_match_threshold" in s.model_fields_set:
-            raise SkipCheck(f"pinned in env: verified>={s.grounding_match_threshold} "
-                            "(auto-calibration disabled)")
-        # Report what ACTUALLY happened. This used to guess from a pre-read
+        # Report what ACTUALLY resolved. This used to guess from a pre-read
         # (`"already stored" if was_stored else "CALIBRATED NOW and stored"`), so when
         # calibration silently failed - library under 5 entries, class overlap, Mongo down -
         # it printed "CALIBRATED NOW and stored" over a static fallback. The one check whose
         # purpose is confirming provenance, asserting the opposite of the truth, in exactly
-        # the failure mode it exists to catch.
+        # the failure mode it exists to catch. (It also passed a long-deleted
+        # allow_calibration=True kwarg, a TypeError lying in wait whenever the env value was
+        # unset - resolve_thresholds is a pure reader now; only POST /calibrate measures.)
         with db_session() as sess:
-            th = grounding.resolve_thresholds(sess, get_llm(), allow_calibration=True)
+            th = grounding.resolve_thresholds(sess, get_llm())
         if th.origin == "static_default":
             raise SkipCheck(f"NOT calibrated: verified>={th.value:.1f} is the static default, "
                             "tuned for a DIFFERENT model pair. Seed the threat library "
-                            "(>=5 entries) so boot can calibrate, or pin it deliberately.")
+                            "(>=5 entries) and run POST /v1/tsg/grounding/calibrate.")
+        if th.origin == "env_pinned":
+            return (f"verified>={th.value:.1f} (env bootstrap - no calibration stored for this "
+                    "pair yet; a stored one takes over the moment it exists)")
         return f"verified>={th.value:.1f}  ({th.origin})"
 
     print("\n" + "=" * 90)

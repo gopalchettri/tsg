@@ -90,14 +90,11 @@ class Scenario_Session(Base):
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CompletedAt: Mapped[datetime | None] = mapped_column(DateTime)
-    # Library-promotion retry tracking (accept.py's isolated Phase 2). NULL = never failed, or
-    # already resolved by a successful attempt/retry — this is the ONLY state a fresh session has.
-    PromotionFailedAt: Mapped[datetime | None] = mapped_column(DateTime)
-    PromotionAttempts: Mapped[int] = mapped_column(Integer, default=0)
-    PromotionError: Mapped[str | None] = mapped_column(UnicodeText)
-    # The accepting user at the moment promotion first failed, so a later retry (automatic or
-    # admin-triggered) attributes promoted threats to that SAME person, never to a system identity.
-    PromotionUserID: Mapped[str | None] = mapped_column(Unicode(200))
+    # Cancellation attribution. CompletedAt covers the SUCCESS path only — a cancelled session had
+    # no row-level record of who stopped it or when, only a session_cancelled ledger event.
+    # NULL on sessions cancelled before these columns existed.
+    CancelledAt: Mapped[datetime | None] = mapped_column(DateTime)
+    CancelledBy: Mapped[str | None] = mapped_column(Unicode(200))
 
 
 class Subsystem_Stage_State(Base):
@@ -148,13 +145,40 @@ class Identified_Threat(Base):
     # validated server-side. Persisted at Stage 1 because accept-time triage runs days later;
     # NULL on legacy rows, where triage falls back to the string-strip.
     GenericName: Mapped[str | None] = mapped_column(Unicode(500))
+    # The AI's description OF THE THREAT (not of its type), written at Stage 1 and copied into
+    # Threat_Catalogue.Description on promotion. Capped at the column so an over-long
+    # AI value is impossible to store rather than merely discouraged. Asset-agnostic by
+    # construction: tasks._description_of drops it when the asset name appears, because the
+    # register is a shared cross-tenant library. NULL on legacy rows.
+    Description: Mapped[str | None] = mapped_column(Unicode(200))
+    # The category id grounding.find_threat_in_library ALREADY resolves to narrow its type search
+    # and used to discard, forcing accept.py to re-derive it from text three separate times.
+    # Persisted so every later consumer reads an id instead of matching a string. NULL when the
+    # AI's category text matched no master row — previously silent, now visible.
+    ThreatCategoryID: Mapped[int | None] = mapped_column(Integer)
     ThreatActorsJSON: Mapped[str | None] = mapped_column(UnicodeText)
     LibraryThreatType: Mapped[str | None] = mapped_column(Unicode(300))
     LibraryThreatName: Mapped[str | None] = mapped_column(Unicode(500))
     ThreatTypeID: Mapped[int | None] = mapped_column(Integer)
+    # Threat_Catalogue.ThreatCatalogueID when this threat came from / verified against the
+    # library. Set ⟺ GroundingStatus == 'verified' — the invariant every "is it a library
+    # threat?" gate relies on (dedup's cat: rung, accept's liveness gate, promote's reuse gate).
     ThreatCatalogueID: Mapped[int | None] = mapped_column(Integer)
+    # Immutable provenance, set ONCE by tasks._build_threat_records (the only threat-row
+    # writer): True <=> the threat was NOT in the catalogue at identification time. Retrieved
+    # and grounding-verified rows are library threats -> False. Promotion later stamps
+    # ThreatCatalogueID but must NOT touch this -- it answers "was this invented by the
+    # AI?", which promotion doesn't change.
+    IsAIGenerated: Mapped[bool] = mapped_column(Boolean, default=False)
     GroundingStatus: Mapped[str] = mapped_column(Unicode(100))
     GroundingScore: Mapped[float | None] = mapped_column(Float)
+    # WHICH cutoff judged this row: 'calibrated' (measured for this exact model pair),
+    # 'static_default' (the built-in 75.0, tuned for a DIFFERENT pair — provisional),
+    # 'env_pinned', or 'not_applicable' (library-first identity match — no cutoff was consulted). The score alone cannot answer it, and the three collide numerically, so
+    # after a deployment finally calibrates there is otherwise NO way to find the threats that
+    # were graded on the wrong number. Same reasoning and same shape as
+    # Threat_Scenario_Control_Map's min_score_origin. NULL ONLY on rows written before this column.
+    GroundingThresholdOrigin: Mapped[str | None] = mapped_column(Unicode(100))
     Superseded: Mapped[int] = mapped_column(Integer, default=0)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -179,30 +203,6 @@ class Identified_Duplicate_Threat(Base):
     DuplicateOfThreatID: Mapped[str | None] = mapped_column(GUID)
     DuplicateReason: Mapped[str] = mapped_column(Unicode(100))  # DuplicateReason enum (app/core/enums.py)
     SimilarityScore: Mapped[float | None] = mapped_column(Float)
-    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
-
-
-class Scenario_Library(Base):
-    """Generated scenario text, reusable by every asset of one PROFILE — the zero-AI path.
-
-    Keyed by (ProfileKey, ThreatCatalogueID, ScenarioNumber). ProfileKey is a digest of
-    CLASSIFICATION CODES ONLY (scenario_profile.profile_key), so a row is safe to serve across
-    tenants; SourceNamesJSON carries the ordered names that were live when the text was written
-    so the serve path can swap them positionally — and REFUSE if the swap is not provably
-    complete. Library threats only: a novel, unpromoted threat has no stable identity to key on.
-
-    PromptVersion + ModelID are the invalidation key. A prompt or model change simply stops
-    matching, so stale text ages out instead of needing a purge.
-    """
-    __tablename__ = "Scenario_Library"
-    ScenarioLibraryID: Mapped[str] = mapped_column(GUID, primary_key=True)
-    ProfileKey: Mapped[str] = mapped_column(Unicode(100))
-    ThreatCatalogueID: Mapped[int] = mapped_column(Integer)
-    ScenarioNumber: Mapped[int] = mapped_column(Integer, default=1)
-    ScenarioJSON: Mapped[str] = mapped_column(UnicodeText)
-    SourceNamesJSON: Mapped[str] = mapped_column(UnicodeText)
-    PromptVersion: Mapped[str | None] = mapped_column(Unicode(100))
-    ModelID: Mapped[str | None] = mapped_column(Unicode(200))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
@@ -243,7 +243,7 @@ class Threat_Scenario_Output(Base):
         CheckConstraint("RejectedAt IS NULL OR Accepted = 0",
                         name="CK_ScenarioOutput_DecisionExclusive"),
     )
-    OutputID: Mapped[str] = mapped_column(GUID, primary_key=True)
+    ScenarioID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
@@ -262,16 +262,16 @@ class Threat_Scenario_Output(Base):
     # setting: dal.variant_eligible_primaries derives it from that threat's own plausible entry
     # points — no other code path assigns a number.
     ScenarioNumber: Mapped[int] = mapped_column(Integer, default=1)
-    # The OutputID this row replaced; NULL for first-run, next-set and variant rows. Backward-
+    # The ScenarioID this row replaced; NULL for first-run, next-set and variant rows. Backward-
     # linked, so following it yields the revision chain. Stamped from what the supersede actually
     # retired, never the requested target — the two are keyed differently. Not indexed by design.
-    ReplacesOutputID: Mapped[str | None] = mapped_column(GUID, nullable=True)
+    ReplacesScenarioID: Mapped[str | None] = mapped_column(GUID, nullable=True)
     GenerationEpoch: Mapped[int] = mapped_column(Integer, default=1)
     ErrorMessage: Mapped[str | None] = mapped_column(UnicodeText)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     # Step-4 attempt stamp (control_mapping.map_controls): NULL = mapping not yet attempted for
     # this output; set on every attempt EVEN when zero controls matched, so an output is never
-    # re-scanned/re-reranked on later runs. Regen mints a new OutputID (stamp NULL) naturally.
+    # re-scanned/re-reranked on later runs. Regen mints a new ScenarioID (stamp NULL) naturally.
     ControlsMappedAt: Mapped[datetime | None] = mapped_column(DateTime)
     # Per-scenario review decision, independent of the session that produced the row: a reviewer
     # decides each scenario on their own schedule, so the verdict lives here, not on the session.
@@ -283,34 +283,61 @@ class Threat_Scenario_Output(Base):
     # Mutually exclusive with Accepted=1, enforced in the DATABASE by
     # CK_ScenarioOutput_DecisionExclusive — accept and reject are independent routes reachable in
     # either order, so the row itself is the one place both orderings must meet.
-    # WHERE THE TEXT CAME FROM: "library" = served from Scenario_Library (written for another
-    # asset of the SAME profile, with system names swapped in), anything else / NULL = written
-    # for this asset. A reviewer signing a risk register must be able to tell the difference,
-    # so this is a column, not an inference. See app/pipeline/scenario_profile.py.
+    # WHERE THE TEXT CAME FROM. Always "generated" now — the cross-tenant scenario-reuse
+    # feature (Scenario_Library, "library" values) was removed 2026-08-29. Column kept, not
+    # dropped: existing rows written before the removal may still say "library", and that's
+    # real history a reviewer signing a risk register can still rely on.
     ScenarioSource: Mapped[str | None] = mapped_column(Unicode(100))
     RejectedAt: Mapped[datetime | None] = mapped_column(DateTime)
     RejectedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    # The ACCEPT half of the same fact. Reject recorded who/when from the start; accept recorded
+    # neither, so the acceptor was answerable only from the Scenario_Audit ledger while the
+    # rejecter was a column read — one class of fact in two places. Written by dal.decide_scenarios
+    # ONLY, alongside Accepted, using the same coalesce(first-decider-wins) idiom as the pair above.
+    # NULL on rows decided before these columns existed; no backfill runs.
+    AcceptedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    AcceptedBy: Mapped[str | None] = mapped_column(Unicode(200))
 
 
-class Threat_Library_Import_Run(Base):
-    """One row per threat-library import attempt (celery_app.import_threat_library_task), so
-    "which sources imported, when, and did any fail?" survives the Celery result expiring. The
-    terminal row is committed in its own transaction so a FAILED import still leaves a record."""
-    __tablename__ = "Threat_Library_Import_Run"
+class Grounding_Calibration_Run(Base):
+    """One row per grounding-threshold calibration sweep (celery_app.calibrate_grounding_task),
+    so "when was this calibrated, by whom, and did it pass?" survives the Celery result expiring
+    after an hour. The terminal row is
+    likewise committed in its own transaction so a FAILED sweep still leaves a record.
+
+    THIS TABLE IS ALSO THE THRESHOLD ITSELF. `MatchTh` on the latest `success` row for a model
+    pair is what grounding.resolve_thresholds reads — there is no second store. That is
+    deliberate: the value used to live only in Mongo, written by a separate best-effort call that
+    swallowed its own failures, so a 15-minute sweep could finish, lose its answer to a Mongo
+    blip, and leave nothing but a log line. Making the measurement a COLUMN of the record of the
+    measurement removes "measured but not saved" as a reachable state.
+
+    Keyed by model pair because the cutoff is model-specific: a different embedding+reranker
+    scores the same threat pair differently, so a calibration is only valid for the pair that
+    produced it. A new pair simply has no successful row and falls back to the static default."""
+    __tablename__ = "Grounding_Calibration_Run"
     RunID: Mapped[str] = mapped_column(GUID, primary_key=True)
-    Source: Mapped[str] = mapped_column(Unicode(100))              # API source name
-    SourceTag: Mapped[str | None] = mapped_column(Unicode(100))    # provenance tag on the imported rows
-    DryRun: Mapped[bool] = mapped_column(Boolean, default=False)
-    Status: Mapped[str] = mapped_column(Unicode(100))              # running | success | failed
-    JobID: Mapped[str | None] = mapped_column(Unicode(100))
+    JobID: Mapped[str | None] = mapped_column(Unicode(100))        # Celery task id
+    Status: Mapped[str] = mapped_column(Unicode(100))              # core.enums.CalibrationStatus
+    # WHO ASKED, in two halves, because only one of them is proof. StartedBy is the X-User-Id
+    # header: on admin routes it is trusted, never verified (deps.get_admin_principal), exactly
+    # like every other CreatedBy/StartedBy column here. StartedByClient is the API_Client the
+    # request authenticated as — that one IS verified. Recording both stops the claimed id from
+    # reading as though it were established.
     StartedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    StartedByClient: Mapped[str | None] = mapped_column(Unicode(200))
     StartedAt: Mapped[datetime | None] = mapped_column(DateTime)
     FinishedAt: Mapped[datetime | None] = mapped_column(DateTime)
-    TypesImported: Mapped[int | None] = mapped_column(Integer)
-    ThreatsImported: Mapped[int | None] = mapped_column(Integer)
-    ActorsUpserted: Mapped[int | None] = mapped_column(Integer)
-    OtRules: Mapped[int | None] = mapped_column(Integer)
-    SkippedCount: Mapped[int | None] = mapped_column(Integer)
+    EmbeddingModel: Mapped[str | None] = mapped_column(Unicode(500))
+    RerankerModel: Mapped[str | None] = mapped_column(Unicode(500))
+    Forced: Mapped[bool] = mapped_column(Boolean, default=False)   # re-measured over an existing run
+    MatchTh: Mapped[float | None] = mapped_column(Float)           # the cutoff; NULL unless success
+    Quality: Mapped[float | None] = mapped_column(Float)           # Youden's J at MatchTh, 0-1
+    NegativesCount: Mapped[int | None] = mapped_column(Integer)
+    PositivesCount: Mapped[int | None] = mapped_column(Integer)
+    HighestNegative: Mapped[float | None] = mapped_column(Float)
+    LowestPositive: Mapped[float | None] = mapped_column(Float)
+    NearDuplicatesJSON: Mapped[str | None] = mapped_column(UnicodeText)  # curation to-do, not an error
     ErrorMessage: Mapped[str | None] = mapped_column(UnicodeText)
 
 
@@ -319,7 +346,7 @@ class Threat_Scenario_Control_Map(Base):
     No Superseded/epoch columns — visibility follows the parent Threat_Scenario_Output row,
     same posture as Scoped_Threat. Composite PK doubles as the dedup guard."""
     __tablename__ = "Threat_Scenario_Control_Map"
-    OutputID: Mapped[str] = mapped_column(GUID, primary_key=True)
+    ScenarioID: Mapped[str] = mapped_column(GUID, primary_key=True)
     ControlLibraryID: Mapped[int] = mapped_column(Integer, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
     MapRank: Mapped[int] = mapped_column(Integer)             # 1 = best match
@@ -330,7 +357,7 @@ class Threat_Scenario_Control_Map(Base):
 
 class Risk_Treatment_Plan(Base):
     """One LLM-generated Risk Treatment Plan attempt for an ACCEPTED scenario
-    (docs/RISK_TREATMENT_PLAN_SDD.md). At most one active (Superseded=0) row per OutputID —
+    (docs/RISK_TREATMENT_PLAN_SDD.md). At most one active (Superseded=0) row per ScenarioID —
     UX_TreatmentPlan_ActiveOutput is the concurrent-POST race arbiter. Deliberately OUTSIDE the
     Subsystem_Stage_State machinery: accepted scenarios live on completed sessions, where
     acquire_lock/claim_stage refuse to run, so this row's own Status column is the state.
@@ -338,7 +365,7 @@ class Risk_Treatment_Plan(Base):
     __tablename__ = "Risk_Treatment_Plan"
     PlanID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
-    OutputID: Mapped[str] = mapped_column(GUID)               # the accepted Threat_Scenario_Output
+    ScenarioID: Mapped[str] = mapped_column(GUID)               # the accepted Threat_Scenario_Output
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))  # copied from the session (authz boundary)
     UserID: Mapped[str | None] = mapped_column(Unicode(200))    # requesting principal (provenance)
@@ -360,6 +387,11 @@ class Risk_Treatment_Plan(Base):
     ReviewComment: Mapped[str | None] = mapped_column(UnicodeText)
     ReviewedBy: Mapped[str | None] = mapped_column(Unicode(200))  # from the reviewer's login token
     ReviewedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    # Cancellation attribution. /treatment-plan/cancel and the treatment_plan_cancelled audit event
+    # both predate these columns; the row itself recorded neither who nor when, so a cancelled plan
+    # could not say who stopped it without reading the ledger. NULL on plans cancelled earlier.
+    CancelledAt: Mapped[datetime | None] = mapped_column(DateTime)
+    CancelledBy: Mapped[str | None] = mapped_column(Unicode(200))
     # TreatmentOutcomeReason — WHY a terminal row ended that way, so a client never parses
     # ErrorMessage. NULL on COMPLETE and on rows that failed before the column existed (read those
     # as generation_failed). Holds 5 of the enum's 6 values: 'timed_out' is projected at read time
@@ -367,15 +399,17 @@ class Risk_Treatment_Plan(Base):
     ErrorReason: Mapped[str | None] = mapped_column(UnicodeText)
 
 # ---------------------------------------------------------------------------
-# Threat library masters (seeded; imported, promoted on accept, or curated via
-# app/api/library_crud.py)
+# Threat library masters (seeded; grown ONLY via POST .../promote-to-library, or curated
+# directly in the database — the admin CRUD API for this was removed 2026-08 as unused
+# complexity; see git history for app/api/library_crud.py if it's ever needed again). The
+# threat LIST itself is Threat_Catalogue (below).
 #
 # All four carry the same audit quartet:
 #   CreatedAt/CreatedBy — every insert path. CreatedBy holds the caller's user id, or an
 #                         'auto:<source>' / 'cli:<user>' literal when there was no logged-in caller.
-#   UpdatedAt/UpdatedBy — CRUD update/delete ONLY. Importer and promote-on-accept upserts leave an
-#                         existing row untouched (provenance is first-writer — dal.upsert_threat_type),
-#                         so a re-import never restamps a row a curator has since edited.
+#   UpdatedAt/UpdatedBy — CRUD update/delete ONLY. The promote API's upserts leave an existing
+#                         row untouched (provenance is first-writer — dal.upsert_threat_type),
+#                         so a re-promotion never restamps a row a curator has since edited.
 # A soft delete IS an update (IsDeleted=1 plus the Updated* stamp) — hence no DeletedBy column.
 # ---------------------------------------------------------------------------
 class Threat_Category(Base):
@@ -400,7 +434,8 @@ class Threat_Type(Base):
     ThreatTypeID: Mapped[int] = mapped_column(Integer, primary_key=True)
     ThreatTypeName: Mapped[str] = mapped_column(Unicode(300))
     Description: Mapped[str | None] = mapped_column(UnicodeText)
-    SectorID: Mapped[int | None] = mapped_column(Integer)
+    # SectorID exists in the frozen table but is deliberately UNMAPPED: sector logic was removed
+    # 2026-08 per user instruction — the code ignores the column entirely.
     ThreatCategoryID: Mapped[int | None] = mapped_column(Integer)
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -410,23 +445,6 @@ class Threat_Type(Base):
     # lives there, moved from scripts/TSG_Core.sql 2026-08-04) — see test_schema_sync's
     # _COLUMN_DEPLOYED_SEPARATELY.
     Source: Mapped[str | None] = mapped_column(Unicode(50))
-    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
-    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
-    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
-    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
-
-
-class Threat_Catalogue(Base):
-    __tablename__ = "Threat_Catalogue"
-    ThreatCatalogueID: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ThreatTypeID: Mapped[int] = mapped_column(Integer)
-    ThreatName: Mapped[str] = mapped_column(Unicode(500))
-    Description: Mapped[str | None] = mapped_column(UnicodeText)
-    SectorID: Mapped[int | None] = mapped_column(Integer)
-    IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
-    IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
-    # See Threat_Type.Source above — same provenance tracking, same script adds it.
-    Source: Mapped[str | None] = mapped_column(Unicode(100))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
     UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -450,6 +468,24 @@ class Threat_Actor(Base):
     UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
 
 
+class Threat_Catalogue(Base):
+    __tablename__ = "Threat_Catalogue"
+    ThreatCatalogueID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ThreatTypeID: Mapped[int] = mapped_column(Integer)
+    ThreatName: Mapped[str] = mapped_column(Unicode(500))
+    Description: Mapped[str | None] = mapped_column(UnicodeText)
+    # SectorID exists in the frozen table but is deliberately UNMAPPED — same rule as
+    # Threat_Type.SectorID above (sector logic removed 2026-08, user instruction).
+    IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
+    IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    # See Threat_Type.Source above — same provenance tracking, same script adds it.
+    Source: Mapped[str | None] = mapped_column(Unicode(100))
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+    UpdatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
+
+
 class ThreatType_ThreatActor_Map(Base):
     __tablename__ = "ThreatType_ThreatActor_Map"
     ThreatTypeID: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -458,11 +494,24 @@ class ThreatType_ThreatActor_Map(Base):
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
+class Threat_Catalogue_Category_Map(Base):
+    __tablename__ = "Threat_Catalogue_Category_Map"
+    # Declared CATEGORY-first to match the DDL's PK_Threat_Catalogue_Category_Map
+    # (ThreatCategoryID, ThreatCatalogueID) — the order is load-bearing for
+    # get_possible_types' category seek, and SQLAlchemy derives composite-PK order
+    # from declaration order (the SQLite test schema must agree with MSSQL's).
+    ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ThreatCatalogueID: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
+    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 # ---------------------------------------------------------------------------
 # Control library masters (seeded from functional-team Control_Library.xlsx). Created by
-# scripts/Control_library.sql (run manually — see test_schema_sync's _DEPLOYED_SEPARATELY,
-# same pattern as Config_Threat_Rule). IDENTITY PKs — never inserted by app code. Same audit
-# quartet as the threat masters, stamped only by app/api/control_library_crud.py.
+# scripts/Control_library.sql (run manually — see test_schema_sync's
+# _DEPLOYED_SEPARATELY). IDENTITY PKs — never inserted by app code (the admin CRUD API that
+# used to stamp these was removed 2026-08 as unused complexity). Same audit quartet as the
+# threat masters.
 class Control_Standard(Base):
     __tablename__ = "Control_Standard"
     StandardID: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -502,41 +551,6 @@ class Control_Library_Standard_Map(Base):
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
-# The authoritative per-threat category source (see grounding.get_possible_types):
-# Threat_Type.ThreatCategoryID is only a rough default — 74 of 75 curated Threat_Catalogue rows
-# carry a different/additional STRIDE category than their Type's. Created by
-# scripts/Threat_library.sql (run manually — see test_schema_sync's _DEPLOYED_SEPARATELY).
-class Threat_Catalogue_Category_Map(Base):
-    __tablename__ = "Threat_Catalogue_Category_Map"
-    # Declared CATEGORY-first to match the DDL's PK_Threat_Catalogue_Category_Map
-    # (ThreatCategoryID, ThreatCatalogueID) — the order is load-bearing for
-    # get_possible_types' category seek, and SQLAlchemy derives composite-PK order
-    # from declaration order (the SQLite test schema must agree with MSSQL's).
-    ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True)
-    ThreatCatalogueID: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
-    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
-
-
-class Config_Threat_Rule(Base):
-    __tablename__ = "Config_Threat_Rule"
-    ThreatRuleID: Mapped[int] = mapped_column(Integer, primary_key=True)
-    RuleType: Mapped[str] = mapped_column(Unicode(100))       # enums.ThreatRuleType
-    ThreatTypeID: Mapped[int] = mapped_column(Integer)        # app-enforced FK → Threat_Type
-    # One of scoping._RULE_KEY_FIELDS — currently exactly: criticality, subsystem_name,
-    # asset_type, past_incidents. This example used to read "internet_facing", a key REMOVED on
-    # 2026-07-12 because gather_asset_details never produced it. An unknown key here is a silent
-    # no-op (scoping._apply_rules logs and continues), so a stale example invites dead rules.
-    RuleKey: Mapped[str] = mapped_column(Unicode(200))
-    RuleValue: Mapped[str | None] = mapped_column(Unicode(450))                    # optional expected value
-    Metadata: Mapped[str | None] = mapped_column(UnicodeText)                      # extra rule config (JSON), e.g. {"weight": 15}
-    CreateDate: Mapped[datetime | None] = mapped_column(DateTime)
-    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
-    UpdateDate: Mapped[datetime | None] = mapped_column(DateTime)
-    UpdatedBy: Mapped[str | None] = mapped_column(Unicode(200))
-    IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
-    IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
-
 
 class Config_Tuning(Base):
     """Business-calibration overrides, editable at runtime (admin/DBA insert; no restart).
@@ -562,34 +576,6 @@ class Config_Tuning(Base):
 # Context_Field_Config (the per-field AI-prompt allowlist) was removed: prompts.build_base_context
 # now sends every context field the context layer assembled, filtered only by redaction and the
 # no-value scrub in core.security.scrub_context. The SQL table and its seed are gone too.
-
-# TSG-owned (not seeded like the masters above): one row per AI-proposed threat NAME reaching
-# accept. Now genuinely a pending-review queue — accept.py writes `pending` and does NOT create a
-# Threat_Catalogue row from the name, because prompts.py requires that name to embed the asset's
-# own name and so it is never library-shaped. A curator generalizes it and creates the real entry.
-# The queue holds BOTH kinds of admin-gated proposals: threats (name+type) and actors
-# (name only) — CandidateKind tells them apart (NULL = legacy 'threat' rows).
-class Threat_Candidate_Review(Base):
-    __tablename__ = "Threat_Candidate_Review"
-    CandidateID: Mapped[str] = mapped_column(GUID, primary_key=True)
-    TenantID: Mapped[str] = mapped_column(Unicode(200))
-    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
-    SessionID: Mapped[str] = mapped_column(GUID)
-    ProposedCategory: Mapped[str | None] = mapped_column(Unicode(200))  # NULL on actor candidates
-    ProposedType: Mapped[str | None] = mapped_column(Unicode(300))      # on actor candidates: the
-    # threat type the actor was proposed FOR (approval's link target); NULL only on legacy rows
-    ProposedName: Mapped[str] = mapped_column(Unicode(500))  # threat name, or the actor name
-    # The candidate's library-shaped name — what the curator actually generalizes toward.
-    # NULL on rows queued before the column existed.
-    ProposedGenericName: Mapped[str | None] = mapped_column(Unicode(500))
-    Status: Mapped[str] = mapped_column(Unicode(100))
-    ThreatTypeID: Mapped[int | None] = mapped_column(Integer)
-    ThreatCatalogueID: Mapped[int | None] = mapped_column(Integer)
-    ReviewedBy: Mapped[str | None] = mapped_column(Unicode(200))
-    ReviewedAt: Mapped[datetime | None] = mapped_column(DateTime)
-    CreatedAt: Mapped[datetime] = mapped_column(DateTime)
-    CandidateKind: Mapped[str | None] = mapped_column(Unicode(100))  # CandidateKind enum; NULL = 'threat'
-    CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))     # ORIGINAL proposer, never the admin
 
 # One row per LLM call (exact prompt + raw response, success or failure). Raw model output is
 # NEVER put in ErrorMessage/audit/SSE (all client-visible) — only here.
@@ -640,7 +626,11 @@ class Scenario_Audit(Base):
     # (scenario_accepted / scenario_rejected), NULL on every session- or subsystem-scoped event.
     # A real column rather than a DetailJSON key: IX_ScenarioAudit_Output makes "the decision
     # history of this scenario" a seek, which is the query a GRC reviewer actually runs.
-    OutputID: Mapped[str | None] = mapped_column(GUID)
+    ScenarioID: Mapped[str | None] = mapped_column(GUID)
+    # The plan a treatment event concerns — a real column for the same reason as ScenarioID above:
+    # IX_ScenarioAudit_Plan makes "this plan's history" a seek, where a DetailJSON key forced the
+    # caller to fetch a whole session and filter in Python. NULL on every non-plan event.
+    PlanID: Mapped[str | None] = mapped_column(GUID)
     Decision: Mapped[str | None] = mapped_column(Unicode(100))  # accept only — AuditDecision; NULL elsewhere
     Granularity: Mapped[str | None] = mapped_column(Unicode(100))  # regeneration_completed only
     ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)  # library_promoted +
@@ -665,9 +655,10 @@ class user_table(Base):
     email: Mapped[str] = mapped_column(Unicode(255))
 
 # Read-only mirror of the platform's user->scope table (owned by Shield, we never write it).
-# ref_id is polymorphic across scope levels; scope_type decodes via option_value group 1010:
-# 1=Sector 2=Sub-Sector 3=Service 4=Entity 5=Asset. For entity membership we read scope_type=4,
-# where ref_id = group.id = the EntityID TSG uses as its tenant key. See dal.user_has_entity.
+# ref_id is polymorphic across scope levels; scope_type decodes via option_value group 1010
+# (Sector/Sub-Sector/Service/Entity/Asset). For entity membership, ref_id = group.id = the
+# EntityID TSG uses as its tenant key. Which scope_type value means "Entity" is resolved from
+# the DB at runtime, not hardcoded — see dal.resolve_scope_type_entity_id/user_has_entity.
 class user_scope_assignment(Base):
     __tablename__ = "user_scope_assignment"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -711,6 +702,9 @@ class ctm_scan_entity(Base):
     name: Mapped[str | None] = mapped_column(Unicode(300))
     description: Mapped[str | None] = mapped_column(UnicodeText)
     criticality: Mapped[int | None] = mapped_column(Integer)
+    # ctm_scan_category.id — the ASSET's own category (IT/OT/Physical/...). Unioned with each
+    # supporting system's asset_type into the session's asset_category_ids (context.py).
+    ctm_category_id: Mapped[int | None] = mapped_column(Integer)
     operating_system: Mapped[str | None] = mapped_column(Unicode(200))
     location: Mapped[str | None] = mapped_column(Unicode(200))
     owner_custodian: Mapped[str | None] = mapped_column(Unicode(200))
@@ -832,4 +826,3 @@ class ctm_scan_category(Base):
     parent_id: Mapped[int | None] = mapped_column(Integer)
     code: Mapped[str | None] = mapped_column(Unicode(100))
     name: Mapped[str | None] = mapped_column(Unicode(255))
-

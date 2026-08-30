@@ -47,7 +47,7 @@ def _seed(s, *, created_offset_days: int = 1, stage_status: str = StageStatus.AW
     """One session whose SCENARIOS stage is settled and whose single complete output was never
     control-mapped — i.e. exactly the state the old code stranded forever."""
     now = datetime.now(UTC)
-    sid, output_id = str(uuid.uuid4()), str(uuid.uuid4())
+    sid, scenario_id = str(uuid.uuid4()), str(uuid.uuid4())
     s.execute(m.Scenario_Session.__table__.insert().values(
         SessionID=sid, TenantID="t", EntityID="e", UserID="u",
         AssetName="a", AssetID="1", SessionStatus="completed", CurrentStage="SCENARIOS",
@@ -61,14 +61,14 @@ def _seed(s, *, created_offset_days: int = 1, stage_status: str = StageStatus.AW
             ActiveTaskID=task, AttemptCount=1,
             UpdatedAt=now - timedelta(seconds=settled_secs_ago)))
     s.execute(m.Threat_Scenario_Output.__table__.insert().values(
-        OutputID=output_id, SessionID=sid, TenantID="t", EntityID="e", UserID="u",
+        ScenarioID=scenario_id, SessionID=sid, TenantID="t", EntityID="e", UserID="u",
         SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
         ScenarioJSON=json.dumps({"scenario_title": "Setpoint manipulation on the HMI",
                                 "scenario_statement": "An attacker writes an unsafe setpoint."}),
         Accepted=accepted, Superseded=superseded, ScenarioNumber=1, GenerationEpoch=EPOCH,
         ControlsMappedAt=None, CreatedAt=now))
     s.commit()
-    return sid, output_id
+    return sid, scenario_id
 
 
 def _stub_grounding(monkeypatch, *, matches=((1, 91.0), (2, 77.0))):
@@ -88,11 +88,11 @@ class _FakeLLM:
         return [[0.0] for _ in texts]
 
 
-def _mapped(s, output_id) -> tuple[int, object]:
+def _mapped(s, scenario_id) -> tuple[int, object]:
     n = len(s.execute(select(m.Threat_Scenario_Control_Map.ControlLibraryID)
-                    .where(m.Threat_Scenario_Control_Map.OutputID == output_id)).all())
+                    .where(m.Threat_Scenario_Control_Map.ScenarioID == scenario_id)).all())
     stamp = s.execute(select(m.Threat_Scenario_Output.ControlsMappedAt)
-                    .where(m.Threat_Scenario_Output.OutputID == output_id)).scalar_one()
+                    .where(m.Threat_Scenario_Output.ScenarioID == scenario_id)).scalar_one()
     return n, stamp
 
 
@@ -105,10 +105,10 @@ def test_the_sweep_maps_an_output_the_pipeline_left_stranded(monkeypatch):
     Session = sessionmaker(bind=_engine(), future=True)
     _stub_grounding(monkeypatch)
     with Session() as s:
-        sid, output_id = _seed(s)
+        sid, scenario_id = _seed(s)
         assert control_mapping.sessions_awaiting_control_mapping(s) == [(sid, 0, EPOCH)]
         assert cascade.run_control_map_sweep(s, _FakeLLM()) == [sid]
-        n, stamp = _mapped(s, output_id)
+        n, stamp = _mapped(s, scenario_id)
         assert n == 2, "the sweep must actually write the control map rows"
         assert stamp is not None, "and stamp the output, so it leaves the queue"
         # Idempotent: a second tick finds nothing, so beat cannot re-rank the same output forever.
@@ -123,15 +123,15 @@ def test_sessions_created_before_ship_time_are_never_swept(monkeypatch):
     Session = sessionmaker(bind=_engine(), future=True)
     _stub_grounding(monkeypatch)
     with Session() as s:
-        _sid, output_id = _seed(s, created_offset_days=-1)   # one day BEFORE ship time
+        _sid, scenario_id = _seed(s, created_offset_days=-1)   # one day BEFORE ship time
         assert control_mapping.sessions_awaiting_control_mapping(s) == []
         assert cascade.run_control_map_sweep(s, _FakeLLM()) == []
-        assert _mapped(s, output_id) == (0, None)
+        assert _mapped(s, scenario_id) == (0, None)
 
 
 def test_a_running_scenarios_stage_is_never_swept(monkeypatch):
     """A live batch owns the session and maps at its own tail. Sweeping it would put two writers
-    on one subsystem: duplicate (OutputID, ControlLibraryID) inserts, an IntegrityError, and the
+    on one subsystem: duplicate (scenario_id, ControlLibraryID) inserts, an IntegrityError, and the
     real batch losing its ENTIRE mapping to one swallowed `controls.mapping_failed`."""
     Session = sessionmaker(bind=_engine(), future=True)
     _stub_grounding(monkeypatch)
@@ -160,10 +160,10 @@ def test_a_held_subsystem_lock_defers_the_sweep(monkeypatch):
     Session = sessionmaker(bind=_engine(), future=True)
     _stub_grounding(monkeypatch)
     with Session() as s:
-        sid, output_id = _seed(s, lock_status=StageStatus.RUNNING, lock_task=str(uuid.uuid4()))
+        sid, scenario_id = _seed(s, lock_status=StageStatus.RUNNING, lock_task=str(uuid.uuid4()))
         assert control_mapping.sessions_awaiting_control_mapping(s) == [(sid, 0, EPOCH)]
         assert cascade.run_control_map_sweep(s, _FakeLLM()) == []
-        assert _mapped(s, output_id) == (0, None), "deferred, NOT stamped — it must retry later"
+        assert _mapped(s, scenario_id) == (0, None), "deferred, NOT stamped — it must retry later"
 
 
 def test_an_accepted_but_superseded_output_is_still_swept(monkeypatch):
@@ -178,10 +178,10 @@ def test_an_accepted_but_superseded_output_is_still_swept(monkeypatch):
     Session = sessionmaker(bind=_engine(), future=True)
     _stub_grounding(monkeypatch)
     with Session() as s:
-        sid, output_id = _seed(s, accepted=1, superseded=1)
+        sid, scenario_id = _seed(s, accepted=1, superseded=1)
         assert control_mapping.sessions_awaiting_control_mapping(s) == [(sid, 0, EPOCH)]
         assert cascade.run_control_map_sweep(s, _FakeLLM()) == [sid]
-        n, stamp = _mapped(s, output_id)
+        n, stamp = _mapped(s, scenario_id)
         assert n == 2 and stamp is not None
 
 

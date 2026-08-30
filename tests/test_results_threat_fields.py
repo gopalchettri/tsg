@@ -4,7 +4,7 @@ Phase 4 added four columns to ThreatResult (ThreatCategory, ThreatTypeID, Librar
 LibraryThreatName) and updated sessions.get_results' ThreatResult(...) construction to read
 them off each threat dict -- but never updated the two SELECTs that BUILD that dict
 (sessions.py's `threats = get_current_rows(it, [...])` and the `missing_tids` backfill query).
-Both kept selecting only the pre-Phase-4 column set, so `t["ThreatCategory"]` raised KeyError
+Both kept selecting only the pre-Phase-4 column set, so `t["threat_category"]` raised KeyError
 the moment a session actually had an active, scenario-carrying threat.
 
 Every SQLite fixture in the suite that drives get_results happened to end up with an EMPTY
@@ -59,7 +59,7 @@ def _engine():
 
     for table in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario_Output,
                 m.Scenario_Audit, m.Identified_Threat, m.Scoped_Threat, m.Threat_Type,
-                m.Threat_Catalogue, m.Risk_Treatment_Plan, m.Threat_Scenario_Control_Map,
+                m.Risk_Treatment_Plan, m.Threat_Scenario_Control_Map,
                 m.Control_Library, m.Threat_Actor, m.Control_Standard,
                 m.Control_Library_Standard_Map):
         table.__table__.create(engine)
@@ -69,7 +69,7 @@ def _engine():
 def _seed(Session) -> tuple[str, str]:
     """One session, one threat, one ACTIVE complete scenario off it -- the exact shape a real
     session produces, which is the shape every prior SQLite fixture avoided by accident."""
-    threat_id, scoped_id, output_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    threat_id, scoped_id, scenario_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
     with Session() as s:
         s.execute(m.Scenario_Session.__table__.insert().values(
             SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
@@ -88,19 +88,22 @@ def _seed(Session) -> tuple[str, str]:
             ThreatID=threat_id, SessionID=SID, TenantID="t", EntityID=ENTITY, SubsystemID=0,
             ThreatCategory="Denial of Service", ThreatType="Ransomware on OT support systems",
             ThreatName="Ransomware on OT support systems",
-            ThreatTypeID=57, ThreatCatalogueID=418,
+            ThreatTypeID=57, ThreatCatalogueID=418, ThreatCategoryID=5,
+            Description="Ransomware encrypts OT support systems.", IsAIGenerated=False,
             LibraryThreatType="Malware/Ransomware", LibraryThreatName="OT ransomware",
             GroundingStatus="verified", GroundingScore=100.0, Superseded=0, CreatedAt=NOW,
             ThreatActorsJSON=json.dumps({"actors": ["Nation-state/APT"], "validated": True})))
+        # Actor keys resolve by name against Threat_Actor at read time (the seeded blob
+        # predates stored actor_ids, so the name-lookup fallback is what's exercised).
         s.execute(m.Threat_Actor.__table__.insert().values(
-            ThreatActorID=7, ThreatActorName="Nation-state/APT", IsCapable=1,
+            ThreatActorID=7, ThreatActorName="Nation-state/APT",
             IsActive=True, IsDeleted=False))
         s.execute(m.Scoped_Threat.__table__.insert().values(
             ScopedThreatID=scoped_id, SessionID=SID, TenantID="t", EntityID=ENTITY,
             SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=1, Selected=1,
             Superseded=0, CreatedAt=NOW))
         s.execute(m.Threat_Scenario_Output.__table__.insert().values(
-            OutputID=output_id, SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
+            ScenarioID=scenario_id, SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
             SubsystemID=0, ScopedThreatID=scoped_id, Status=ScenarioStatus.complete,
             ScenarioJSON=json.dumps({"scenario_title": "t", "scenario_statement": "s",
                                     "risk_statement": "r"}),
@@ -113,7 +116,7 @@ def _seed(Session) -> tuple[str, str]:
             Domain="Identification & Authentication", ControlName="Multi-Factor Authentication",
             ControlDescription="d", IsActive=True, IsDeleted=False))
         s.execute(m.Threat_Scenario_Control_Map.__table__.insert().values(
-            OutputID=output_id, ControlLibraryID=201, SessionID=SID, Score=93.0, MapRank=1,
+            ScenarioID=scenario_id, ControlLibraryID=201, SessionID=SID, Score=93.0, MapRank=1,
             CreatedAt=NOW))
         for std_id, std_name in ((3, "NIST SP 800-53 Rev. 5"), (7, "ISO 27001:2022")):
             s.execute(m.Control_Standard.__table__.insert().values(
@@ -121,7 +124,7 @@ def _seed(Session) -> tuple[str, str]:
             s.execute(m.Control_Library_Standard_Map.__table__.insert().values(
                 ControlLibraryID=201, StandardID=std_id))
         s.commit()
-    return threat_id, output_id
+    return threat_id, scenario_id
 
 
 def test_get_results_does_not_crash_on_a_real_active_threat(monkeypatch):
@@ -130,7 +133,7 @@ def test_get_results_does_not_crash_on_a_real_active_threat(monkeypatch):
 
     engine = _engine()
     Session = sessionmaker(bind=engine, future=True)
-    threat_id, output_id = _seed(Session)
+    threat_id, scenario_id = _seed(Session)
 
     @contextmanager
     def fake_db_session():
@@ -154,35 +157,38 @@ def test_get_results_does_not_crash_on_a_real_active_threat(monkeypatch):
     # card's own threat, so each card carries it instead (ScenarioResult.threat), read from the
     # SAME row and therefore unable to drift from the card it describes.
     assert not hasattr(results, "threats")
-    assert results.scenarios[0].OutputID == output_id
+    assert results.scenarios[0].scenario_id == scenario_id
 
     # THE threat block, on the ENVELOPE -- every database key, round-tripped with its REAL
     # seeded value. Declared here rather than inside `scenario` precisely so a failure card
     # (scenario=null) still reports which threat failed.
     t = results.scenarios[0].threat
     assert t is not None
-    assert t.ThreatID == threat_id
-    assert t.ThreatCategory == "Denial of Service"
-    assert t.ThreatTypeID == 57
-    assert t.ThreatCatalogueID == 418
-    assert t.GroundingStatus == "verified"
-    assert t.GroundingScore == 100.0
-    assert t.LibraryThreatType == "Malware/Ransomware"
-    assert t.LibraryThreatName == "OT ransomware"
+    assert t.threat_id == threat_id
+    assert t.threat_category == "Denial of Service"
+    assert t.threat_type_id == 57
+    assert t.threat_catalogue_id == 418
+    assert t.threat_category_id == 5
+    assert t.description == "Ransomware encrypts OT support systems."
+    assert t.is_ai_generated is False
+    assert t.grounding_status == "verified"
+    assert t.grounding_score == 100.0
+    assert t.library_threat_type == "Malware/Ransomware"
+    assert t.library_threat_name == "OT ransomware"
     # Score/ScopeRank come from THIS scenario's own Scoped_Threat row, via the same join.
-    assert t.Score == 90.0
-    assert t.ScopeRank == 1
+    assert t.score == 90.0
+    assert t.scope_rank == 1
     # Actors carry their DB keys. There is deliberately NO bare ThreatActors list beside them:
     # a second, un-keyed copy of the same names is what drifts.
     assert not hasattr(t, "ThreatActors")
-    assert [(a.ThreatActorID, a.ThreatActorName) for a in t.Actors] == [(7, "Nation-state/APT")]
+    assert [(a.actor_id, a.actor_name) for a in t.actors] == [(7, "Nation-state/APT")]
 
     # Standards carry their DB keys alongside the legacy name list — one control referring to
     # several standards is ambiguous as bare names, which is the gap StandardRef closes.
     control = results.scenarios[0].scenario.controls[0]
-    assert control.ControlLibraryID == 201
+    assert control.control_id == 201
     assert not hasattr(control, "StandardNames")   # keyed list only, no un-keyed duplicate
-    assert [(s.StandardID, s.StandardName) for s in control.Standards] == [
+    assert [(s.standard_id, s.standard_name) for s in control.standards] == [
         (7, "ISO 27001:2022"), (3, "NIST SP 800-53 Rev. 5")]
 
 
@@ -201,7 +207,7 @@ def test_failure_card_still_reports_which_threat_failed(monkeypatch):
 
     engine = _engine()
     Session = sessionmaker(bind=engine, future=True)
-    threat_id, _output_id = _seed(Session)
+    threat_id, _scenario_id = _seed(Session)
 
     failed_output, failed_scoped = str(uuid.uuid4()), str(uuid.uuid4())
     with Session() as s:
@@ -211,7 +217,7 @@ def test_failure_card_still_reports_which_threat_failed(monkeypatch):
             SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=2, Selected=1,
             Superseded=0, CreatedAt=NOW))
         s.execute(m.Threat_Scenario_Output.__table__.insert().values(
-            OutputID=failed_output, SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
+            ScenarioID=failed_output, SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
             SubsystemID=0, ScopedThreatID=failed_scoped, Status=ScenarioStatus.error,
             ScenarioJSON=None, ErrorMessage="LLM call failed",
             Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW))
@@ -233,13 +239,13 @@ def test_failure_card_still_reports_which_threat_failed(monkeypatch):
     principal = Principal(claims={"sub": "u1"}, entities={ENTITY}, client_id="c", tenant_id="t")
     results = sessions_mod.get_results(SID, include_replaced=False, principal=principal)
 
-    card = next(c for c in results.scenarios if c.OutputID == failed_output)
+    card = next(c for c in results.scenarios if c.scenario_id == failed_output)
     assert card.scenario is None                      # the failure card, as expected
     assert card.threat is not None, "a failure card must still say WHICH threat failed"
-    assert card.threat.ThreatID == threat_id
-    assert card.threat.ThreatName == "Ransomware on OT support systems"
-    assert card.threat.ThreatCatalogueID == 418       # database keys survive too
-    assert card.threat.ThreatTypeID == 57
+    assert card.threat.threat_id == threat_id
+    assert card.threat.threat_name == "Ransomware on OT support systems"
+    assert card.threat.threat_catalogue_id == 418       # database keys survive too
+    assert card.threat.threat_type_id == 57
 
 
 def test_a_failed_controls_read_is_not_published_as_a_library_gap(monkeypatch):
@@ -262,7 +268,7 @@ def test_a_failed_controls_read_is_not_published_as_a_library_gap(monkeypatch):
     from app.api.deps import Principal
 
     Session = sessionmaker(bind=_engine(), future=True)
-    _threat_id, output_id = _seed(Session)
+    _threat_id, scenario_id = _seed(Session)
 
     @contextmanager
     def fake_db_session():
@@ -285,14 +291,14 @@ def test_a_failed_controls_read_is_not_published_as_a_library_gap(monkeypatch):
     results = sessions_mod.get_results(SID, include_replaced=False, principal=principal)
 
     card = results.scenarios[0]
-    assert card.OutputID == output_id
+    assert card.scenario_id == scenario_id
     # The deliberate contract is intact: a failed secondary read still returns the page.
     assert card.scenario is not None, "a failed controls read must not take down the results view"
     assert card.scenario.controls == []
     # ControlsMapped is correct — it reads ControlsMappedAt off the row, and mapping DID run.
-    assert card.ControlsMapped is True
+    assert card.controls_mapped is True
     # ...which is precisely why the empty list beside it needed to stop being ambiguous.
-    assert card.ControlsUnavailable is True, (
+    assert card.controls_unavailable is True, (
         "an unreadable control list is being published as a genuine library gap")
 
 
@@ -303,7 +309,7 @@ def test_a_healthy_read_never_claims_controls_are_unavailable(monkeypatch):
     from app.api.deps import Principal
 
     Session = sessionmaker(bind=_engine(), future=True)
-    _threat_id, _output_id = _seed(Session)
+    _threat_id, _scenario_id = _seed(Session)
 
     @contextmanager
     def fake_db_session():
@@ -321,5 +327,5 @@ def test_a_healthy_read_never_claims_controls_are_unavailable(monkeypatch):
     principal = Principal(claims={"sub": "u1"}, entities={ENTITY}, client_id="c", tenant_id="t")
     card = sessions_mod.get_results(SID, include_replaced=False,
                                     principal=principal).scenarios[0]
-    assert card.ControlsUnavailable is False
-    assert [c.ControlLibraryID for c in card.scenario.controls] == [201]
+    assert card.controls_unavailable is False
+    assert [c.control_id for c in card.scenario.controls] == [201]

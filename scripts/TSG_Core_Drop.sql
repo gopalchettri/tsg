@@ -107,13 +107,13 @@ FROM    sys.indexes i
 JOIN    sys.tables  t ON t.object_id = i.object_id
 WHERE   t.name IN ('Threat_Category','Threat_Type','Threat_Catalogue','Threat_Actor',
                    'ThreatType_ThreatActor_Map','Threat_Catalogue_Category_Map',
-                   'Config_Threat_Rule','Control_Standard','Control_Library',
+                   'Control_Standard','Control_Library',
                    'Control_Library_Standard_Map','Threat_Scenario_Control_Map')
     AND i.name IS NOT NULL                 -- skip heaps
     AND i.is_primary_key = 0               -- PKs are structure, not tuning
     AND i.is_unique_constraint = 0
     AND i.name NOT IN (                    -- everything the current scripts create
-            'IX_ThreatType_Category_Active','UX_ConfigThreatRule_NaturalKey',
+            'IX_ThreatType_Category_Active',
             'UX_ThreatActor_NaturalKey','UX_ThreatCatalogue_NaturalKey',
             'UX_ThreatCategory_NaturalKey','UX_ThreatType_NaturalKey',
             'UX_Control_Library_Code','UX_Control_Standard_Name')

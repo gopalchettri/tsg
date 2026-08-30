@@ -34,11 +34,11 @@ docker compose -f docker/compose.yml up -d          # mssql, redis, mongo, litel
 
 # database-first: the schema comes from scripts/, not from a migration tool.
 # Run once against the target DB (safe to re-run — every CREATE TABLE is guarded):
-sqlcmd -S <server> -d <database> -i scripts/TSG_Core.sql
-sqlcmd -S <server> -d <database> -i scripts/Threat_library.sql
-sqlcmd -S <server> -d <database> -i scripts/Seed_to_Threat_library.sql
-sqlcmd -S <server> -d <database> -i scripts/Control_library.sql          # Step-4 control mapping
-sqlcmd -S <server> -d <database> -i scripts/Seed_to_Control_library.sql  # 30 standards, 1288 controls
+sqlcmd -S <server> -d <database> -i "scripts/eyshield_handoff/1. TSG_Core.sql"
+sqlcmd -S <server> -d <database> -i "scripts/eyshield_handoff/2. Threat_library.sql"
+sqlcmd -S <server> -d <database> -i "scripts/eyshield_handoff/3. Seed_to_Threat_library.sql"
+sqlcmd -S <server> -d <database> -i "scripts/eyshield_handoff/4. Control_library.sql"          # Step-4 control mapping
+sqlcmd -S <server> -d <database> -i "scripts/eyshield_handoff/5. Seed_to_Control_library.sql"  # 30 standards, 1288 controls
 
 uvicorn app.main:app                                 # API (runs INV checks at boot)
 celery -A app.pipeline.celery_worker.celery_app worker -P gevent -l info
@@ -58,8 +58,8 @@ tier is meant to cover once it's wired up.
 
 ## Config
 All settings are env vars prefixed `TSG_` (see `app/core/config.py`); copy
-`.env.example` to `.env`. Nothing is hardcoded — thresholds, timeouts, pool sizes,
-JWT issuer/JWKS all come from the environment.
+`.env.example` to `.env`. Nothing is hardcoded — thresholds, timeouts, pool sizes and
+credentials all come from the environment.
 
 **Swap models without code changes** via `.env` (three independent switches — see
 `.env.example` for a ready-to-use dev config, `.env.prod.example` for production):
@@ -87,3 +87,30 @@ Optional safety features (off/unset by default, litellm_proxy only): `LLM_MODERA
 
 Local models need the extra: `pip install -e ".[local]"` (sentence-transformers).
 The real `AZURE_OPENAI_API_KEY` goes in `.env` only — never committed.
+
+## Authentication — read this before issuing a key
+
+**`X-API-Key` is the credential. Everything else is input.** TSG authenticates the *calling
+service*, not the end user: `X-User-Id`, `X-Entity-Id` and `X-Tenant-Id` are request data that
+the caller is trusted to populate truthfully, having already authenticated the person behind the
+request. They are used for scoping and for the audit trail; they are not verified against a
+membership table (`TSG_VERIFY_MEMBERSHIP` is off by design).
+
+**A key is not scoped to a tenant.** Keys are scoped by `Module` and nothing else, so one valid
+key can address every entity in every tenant simply by varying `X-Entity-Id`. That is the intended
+contract for a trusted server-to-server caller — and it is why key handling *is* the security
+model:
+
+- **Server-side only.** Never ship a key to a browser, mobile app, or anything the end user can
+  inspect. A key in a client is a full cross-tenant compromise.
+- **One key per calling service**, so a rotation or a revocation has a known blast radius.
+- **Rotate by replacing, never by recovering.** The secret is `secrets.token_hex(32)`, returned
+  exactly once at creation and stored only as a SHA-256 hash — it cannot be read back. Lost or
+  suspected-leaked: `POST /v1/tsg/api-clients/{client_id}/revoke`, then mint a new one.
+- **`X-Admin-Key` is separate and stronger**: it gates the cross-tenant admin surface (libraries,
+  embeddings, intel feeds, key issuance) on its own, deliberately without needing a client key —
+  minting the first key must not require already having one.
+
+CORS is `["*"]` by design and is safe here: `allow_credentials` is never enabled, so a browser
+attaches no ambient credential and a hostile origin must already hold a key — at which point CORS
+is irrelevant.

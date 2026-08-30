@@ -1,8 +1,6 @@
 """Pins pipeline/coverage.py: the (subsystem x STRIDE) coverage matrix accounting, plus the
 rule that decides which subsystem rows a threat occupies (Phase 2b)."""
-from app.core.enums import ThreatRuleType
 from app.pipeline.coverage import coverage_gaps, coverage_report, covered_cells, required_cells
-from app.pipeline.scoping import _apply_rules, gate_matching_subsystems
 from app.pipeline.threat_retrieval import attribute_to_subsystems
 
 CATS = ["Spoofing", "Tampering", "Repudiation"]
@@ -48,50 +46,20 @@ def test_report_counts_and_zero_unexplained_definition():
 OT = {"id": 41, "name": "SCADA HMI", "asset_type": "OT"}
 IT = {"id": 42, "name": "Billing Portal", "asset_type": "IT"}
 BLANK = {"id": 43, "name": "Unclassified Link", "asset_type": None}
-_GATE = {"RuleType": ThreatRuleType.tech_gate, "RuleKey": "asset_type", "RuleValue": "OT"}
 
 
-def test_ungated_type_is_universal_not_unattributable():
-    # None means "no gate constrains this", NOT "reaches nothing". Collapsing the two would
-    # erase the seeded universal threats (phishing, ransomware) from every supporting system.
-    assert gate_matching_subsystems(7, [OT, IT], {}) is None
-    assert attribute_to_subsystems([OT, IT], [7], {}) == {7: [41, 42]}
+def test_every_threat_attributes_to_every_supporting_system():
+    """A threat reaches the asset AND every supporting system — fail-open, with no gate able
+    to silently shrink the grid. The Config_Threat_Rule tech_gate narrowing that used to carve
+    exceptions here left with that table (2026-08): its failure mode was a real exposure
+    silently missing from coverage cells, which the matrix exists to make impossible."""
+    assert attribute_to_subsystems([OT, IT], [7]) == {7: [41, 42]}
+    assert attribute_to_subsystems([OT, IT, BLANK], [7, 9]) == {7: [41, 42, 43],
+                                                                9: [41, 42, 43]}
 
 
-def test_gate_narrows_to_the_systems_it_actually_hits():
-    assert gate_matching_subsystems(7, [OT, IT], {7: [_GATE]}) == [41]
-    assert attribute_to_subsystems([OT, IT], [7], {7: [_GATE]}) == {7: [41]}
-
-
-def test_unresolved_field_everywhere_is_a_no_op_in_both_functions():
-    # Fixed 2026-08-24: this used to assert gate_matching_subsystems([BLANK]) == [] here, on
-    # the reasoning that "we don't know" must not become "yes". That reasoning is correct
-    # PER SUBSYSTEM when a rule is resolved elsewhere -- but when a rule is unresolved on
-    # EVERY subsystem, _apply_rules already treats it as a no-op at the asset level (the type
-    # is admitted, not rejected). Attribution disagreeing -- failing closed on every subsystem
-    # for the SAME rule the asset-level check ignored -- meant a threat could be recorded once
-    # at the asset level and attributed to ZERO supporting systems: a real exposure silently
-    # missing from every (subsystem, category) coverage cell it should have filled. Both
-    # functions must now agree: a wholly-unresolved rule contributes nothing to either verdict.
-    assert gate_matching_subsystems(7, [BLANK], {7: [_GATE]}) == [43]
-    _delta, selected, _fails, _factors = _apply_rules(
-        {"threat_type_id": 7}, [BLANK], {7: [_GATE]}, 0.0)
-    assert selected is True
-
-
-def test_unresolved_on_this_system_but_resolved_elsewhere_still_fails_closed():
-    # The case the fix above must NOT change: a rule with real evidence on ANOTHER subsystem
-    # still must not claim a system it has no evidence for. Two systems, one OT (matches the
-    # gate), one with asset_type unset -- the unset one must stay excluded.
-    unresolved = {"id": 44, "name": "Unclassified Link 2", "asset_type": None}
-    assert gate_matching_subsystems(7, [OT, unresolved], {7: [_GATE]}) == [41]
-
-
-def test_asset_verdict_and_per_system_union_cannot_disagree():
-    # Gates AND across rules and OR across systems. If the asset passed on a resolvable
-    # field, at least one system must be named — otherwise a threat would be recorded
-    # nowhere on the grid while still being live on the asset.
-    _delta, selected, _fails, _factors = _apply_rules(
-        {"threat_type_id": 7}, [OT, IT], {7: [_GATE]}, 0.0)
-    assert selected is True
-    assert gate_matching_subsystems(7, [OT, IT], {7: [_GATE]}) != []
+def test_attribution_with_no_subsystems_is_empty_lists_not_missing_keys():
+    # The asset row (ASSET_UNIT_ID = 0) is recorded separately; a subsystem-less asset still
+    # gets an entry per type so callers never KeyError.
+    assert attribute_to_subsystems([], [7]) == {7: []}
+    assert attribute_to_subsystems(None, [7]) == {7: []}

@@ -1,8 +1,7 @@
 """Live threat-intel admin API — feed status and on-demand refresh.
 
-TSG's two external-data channels. The threat-library import
-(app/api/threat_library_import.py) loads DURABLE catalogue knowledge into SQL; these
-routes drive the PERISHABLE side — CISA KEV, CISA ICS advisories, OTX, URLhaus and any
+TSG's PERISHABLE external-data channel (the durable side is curated directly in the
+threat-library tables; the bulk importer is retired). These routes drive — CISA KEV, CISA ICS advisories, OTX, URLhaus and any
 configured TAXII source — cached in Mongo with a TTL and injected into scenario prompts
 as citable reference material.
 
@@ -24,6 +23,7 @@ from app.api.admin_jobs import FAMILY_INTEL, intel_job_channel_key, mark_admin_j
 from app.api.admin_sse import admin_job_event_stream
 from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.schemas import (
+    UNAVAILABLE_RESPONSES,
     IntelFeedsResponse,
     IntelFeedStatus,
     IntelItem,
@@ -67,7 +67,7 @@ def list_feeds(_principal: Principal = Depends(get_admin_principal)) -> IntelFee
     return IntelFeedsResponse(feeds=[IntelFeedStatus(**f) for f in feed_status()])
 
 
-@router.get("/items", response_model=IntelItemsResponse)
+@router.get("/items", response_model=IntelItemsResponse, responses=UNAVAILABLE_RESPONSES)
 def list_items(source: str | None = None,
             limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
             _principal: Principal = Depends(get_admin_principal)) -> IntelItemsResponse:
@@ -128,7 +128,8 @@ def _extend_intel_terminal(result: AsyncResult) -> dict:
     return {"item_count": result.result} if isinstance(result.result, int) else {}
 
 
-@router.get("/feeds/events/{job_id}", responses={200: {"content": {"text/event-stream": {}}}})
+@router.get("/feeds/events/{job_id}",
+            responses={200: {"content": {"text/event-stream": {}}}} | UNAVAILABLE_RESPONSES)
 async def job_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE stream for one queued per-feed refresh job (one of the ids in
     IntelRefreshAccepted.jobs): a state snapshot on connect, then the worker's live

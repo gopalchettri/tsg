@@ -168,83 +168,6 @@ def check_litellm_proxy_health() -> str | None:
     return None
 
 
-def check_dead_threat_rules(sess: Session) -> str | None:
-    """Warn once an active Config_Threat_Rule.RuleKey falls outside scoping's fixed
-    _RULE_KEY_FIELDS allowlist. _apply_rules doesn't error on an unknown key — it logs
-    and no-ops the rule (scoping.py §5.4 step 1) — so a curator adding or renaming a
-    RuleKey the code doesn't actually resolve would otherwise stay invisible until
-    someone notices a rule that never fires. This already happened once (scoping.py's
-    own comment: keys removed 2026-07-12 when their backing columns went away)."""
-    from app.pipeline.scoping import _RULE_KEY_FIELDS
-
-    ct = m.Config_Threat_Rule
-    active_keys = sess.execute(
-        select(ct.RuleKey).where(ct.IsActive == True, ct.IsDeleted == False).distinct()
-    ).scalars().all()
-    dead = sorted(set(active_keys) - _RULE_KEY_FIELDS.keys())
-    if dead:
-        log.warning("selfcheck.dead_threat_rules", rule_keys=dead)
-        return "dead_threat_rules"
-    return None
-
-
-def check_ctm_scan_category_names(sess: Session) -> str | None:
-    """Warn if the real platform ctm_scan_category.name values don't cover every asset_type
-    value the seeded Config_Threat_Rule tech_gate rules expect. scoping._matches does a
-    case-insensitive, WHITESPACE-STRIPPED TEXT compare between a subsystem's resolved asset_type
-    (context.py's ctm_scan_category.name lookup) and each rule's RuleValue (e.g. "Operational
-    Technology (OT)") — a spelling drift on the platform side makes that rule permanently no-op
-    (it never excludes anything again) with no error anywhere, silently weakening threat
-    filtering. This check mirrors that same strip+lower comparison exactly, or it would flag
-    false-positive "mismatches" for rules that actually work fine at runtime (e.g. a stray
-    trailing space in a platform-table name).
-
-    check_dead_threat_rules (above) can't catch this: that checks RuleKey names, not RuleValue
-    content. Nothing here is hardcoded — both sides are read live, so this never needs updating
-    when new asset_type rules are added."""
-    ct = m.Config_Threat_Rule
-    # RuleValue is nullable at the type level (Mapped[str | None]) even though the WHERE clause
-    # below already excludes NULL rows at the SQL level — mypy can't see through that runtime
-    # filter, so narrow it here too, the same "belt and suspenders" a `None` in expected would
-    # otherwise crash .strip() on. A blank/whitespace-only RuleValue is excluded on purpose: per
-    # scoping.py's own _apply_rules comment, "" is a real curator sentinel meaning "match
-    # subsystems with a blank asset_type" — not a category name to look up here at all.
-    expected = [v.strip() for v in sess.execute(
-        select(ct.RuleValue).where(
-            ct.RuleKey == "asset_type", ct.IsActive == True, ct.IsDeleted == False,
-            ct.RuleValue.is_not(None),
-        ).distinct()
-    ).scalars().all() if v is not None and v.strip()]
-    if not expected:
-        return None
-    cat = m.ctm_scan_category
-    real_names = {n.strip().lower() for n in sess.execute(select(cat.name)).scalars().all() if n and n.strip()}
-    missing = sorted({v for v in expected if v.lower() not in real_names})
-    if missing:
-        log.warning("selfcheck.ctm_scan_category_asset_type_mismatch", missing_values=missing)
-        return "ctm_scan_category_asset_type_mismatch"
-    return None
-
-
-def check_ungated_threat_types(sess: Session) -> None:
-    """INFORMATIONAL, never fires: log which active threat families have no active tech_gate
-    rule. Deliberately not a warning — a genuinely cross-domain family (Malware/Ransomware,
-    Social Engineering) SHOULD be ungated, so a permanent warning would be noise. The log line
-    exists so coverage is a visible, periodically-restated fact a curator can diff, instead of
-    an assumption; 6 of the 27 seeded families shipped ungated and nothing surfaced it."""
-    tt, ct = m.Threat_Type, m.Config_Threat_Rule
-    has_gate = select(ct.ThreatRuleID).where(
-        ct.ThreatTypeID == tt.ThreatTypeID, ct.RuleType == "tech_gate",
-        ct.IsActive == True, ct.IsDeleted == False)
-    ungated = sess.execute(
-        select(tt.ThreatTypeName).where(
-            tt.IsActive == True, tt.IsDeleted == False,
-            ~has_gate.exists()).order_by(tt.ThreatTypeName)
-    ).scalars().all()
-    if ungated:
-        log.info("selfcheck.ungated_threat_types", count=len(ungated), names=ungated[:40])
-
-
 def check_orphaned_scenario_outputs(sess: Session) -> str | None:
     """Warn on any active Threat_Scenario_Output whose Scoped_Threat parent is superseded or gone.
 
@@ -263,11 +186,11 @@ def check_orphaned_scenario_outputs(sess: Session) -> str | None:
     has_active_parent = select(st.ScopedThreatID).where(
         st.ScopedThreatID == o.ScopedThreatID, st.Superseded == 0)
     orphans = sess.execute(
-        select(o.OutputID).where(o.Superseded == 0, ~has_active_parent.exists()).limit(20)
+        select(o.ScenarioID).where(o.Superseded == 0, ~has_active_parent.exists()).limit(20)
     ).scalars().all()
     if orphans:
         log.warning("selfcheck.orphaned_scenario_outputs",
-                    output_ids=[str(x) for x in orphans], sample_capped_at=20)
+                    scenario_ids=[str(x) for x in orphans], sample_capped_at=20)
         return "orphaned_scenario_outputs"
     return None
 
@@ -288,10 +211,7 @@ def run_self_checks(sess: Session) -> list[str]:
     s = get_settings()
     checks: list[tuple[str, object]] = [
         ("active_sessions", lambda: check_active_sessions(sess)),
-        ("dead_threat_rules", lambda: check_dead_threat_rules(sess)),
-        ("ctm_scan_category_names", lambda: check_ctm_scan_category_names(sess)),
         ("orphaned_scenario_outputs", lambda: check_orphaned_scenario_outputs(sess)),
-        ("ungated_threat_types", lambda: check_ungated_threat_types(sess)),
     ]
     if s.max_concurrent_llm_calls:
         checks.append(("llm_slots", lambda: check_llm_slots()))

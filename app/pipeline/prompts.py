@@ -23,11 +23,9 @@ from app.core.stride import STRIDE_ORDER
 log = get_logger(__name__)
 
 
-# NO LONGER JUST AN AUDIT STAMP. This is the scenario library's invalidation key
-# (dal.library_scenarios): a stored scenario is only served back to a session running the SAME
-# prompt version, so leaving this stale would serve text written by an older prompt as if the
-# current one had produced it. Bump it whenever a prompt's CONTRACT or content changes; the cost
-# of bumping unnecessarily is a regeneration, the cost of not bumping is a silently stale answer.
+# An audit-trail stamp: recorded on every generation (tasks.py) so a reviewer can tell which
+# prompt version produced a given scenario. Bump it whenever a prompt's CONTRACT or content
+# changes meaningfully enough to be worth distinguishing in that history.
 #
 # 2.0 — the library-first redesign: threats_prompt stopped asking for actors, scenario_prompt
 # stopped asking for controls, and threat_validation_prompt (new) judges library candidates.
@@ -108,18 +106,25 @@ _EXCLUDE_DB_KEY_TO_PROMPT = frozenset({
     "ctm_scan_entity_id", "onboarding_supporting_system_id",
     "sector_id", "service_id", "group_id", "tier1_critical_service_id",
     # --- treatment / control library ---
-    "control_library_id", "standard_id", "output_id", "plan_id",
+    "control_library_id", "standard_id", "scenario_id", "plan_id",
     # --- threat + session ---
-    "session_id", "threat_id", "scoped_threat_id", "threat_catalogue_id",
-    "threat_actor_id", "threat_type_id", "threat_category_id",
+    "session_id", "threat_id", "scoped_threat_id", "threat_risk_register_id",
+    "threat_actor_id", "threat_type_id", "threat_category_id", "asset_type_id", "theme_id",
+    # The spellings the pipeline's own candidate/summary dicts use (threat_retrieval,
+    # dal.active_threats) -- the raw shapes the cascade/next-set path hands around, so the
+    # net must catch them even though no hand-built payload carries them today. Register-era
+    # spellings stay as defence-in-depth.
+    "catalogue_id", "threat_catalogue_id", "register_id", "threat_code", "type_id",
+    "category_id",
     # --- fields that CARRY a pk value under a NON-pk name: derived from column names alone
     # these would be missed. _ground_entry_points stamps the first two onto the scenario dict;
     # the repair turn is safe today only because it runs BEFORE grounding — listing them here
     # removes that implicit-ordering dependency.
-    "entry_point_id", "plausible_entry_point_ids", "replaces_output_id",
+    "entry_point_id", "plausible_entry_point_ids", "replaces_scenario_id",
     # --- CamelCase forms, in case a raw DB row ever reaches a payload unmapped ---
-    "OutputID", "ControlLibraryID", "SessionID", "ThreatID", "ScopedThreatID", "PlanID",
-    "StandardID", "ThreatCatalogueID", "ThreatActorID", "ThreatTypeID", "ThreatCategoryID",
+    "ScenarioID", "ControlLibraryID", "SessionID", "ThreatID", "ScopedThreatID", "PlanID",
+    "StandardID", "ThreatCatalogueID", "ThreatRiskRegisterID", "ThreatActorID", "ThreatTypeID", "ThreatCategoryID",
+    "ThemeID", "AssetTypeID", "ThreatCode",
     "CreatedAt", "UpdatedAt", "DeletedAt", "CreatedBy", "UpdatedBy", "DeletedBy",
     "IsDeleted", "IsActive", "IsEnabled", "IsRequired", "IsOptional",
     "is_deleted", "created_at", "updated_at", "deleted_at", "created_by", "updated_by", "deleted_by",
@@ -308,6 +313,10 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         "removed — the library-shaped form, e.g. 'Unauthorized disclosure of sensitive "
         "information'. Same condition as name, generalized only — never placeholders like "
         "'N/A' or 'None'; omit nothing, generalize.\n"
+        "description: one sentence describing the condition named in generic_name — what the "
+        "condition is and why it matters. Use the SAME asset-free language as generic_name: no "
+        "asset, product, technology or organisation names, because this text is stored in a "
+        "threat library shared across customers. Under 200 characters.\n"
         "type: the generic condition in plain library terms, with no asset, product or "
         "technology names — " + "; ".join(
             f"{c} → {_STRIDE_TYPE_HINTS.get(c, 'condition on the asset')}" for c in cats) + "."
@@ -337,7 +346,8 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         "name or general reputation is not evidence of a specific relationship to this asset.\n"
         "3) Defensive, enterprise risk language only: no vulnerabilities, exploits, malware, "
         "CVEs, payloads or procedural attack steps. Keep every field a short phrase — name and "
-        "generic_name under 500 characters, type under 300, category under 200; if a value "
+        "generic_name under 500 characters, type under 300, category under 200, "
+        "description under 200; if a value "
         "would exceed its limit, rewrite it more concisely rather than truncating it.\n"
         "4) A different actor or a different supporting system changes the attack path, never "
         "the threat itself — never split one condition into several threats because the path "
@@ -346,7 +356,7 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         "selected, resolve the mismatch before output rather than submitting it inconsistent.\n"
         "5) These are candidates only, each independently checked against an approved threat "
         "library before use — you decide nothing." + coverage + "\n"
-        "\nOutput ONLY a JSON array of {category, type, name, generic_name} objects "
+        "\nOutput ONLY a JSON array of {category, type, name, generic_name, description} objects "
         "— no markdown code fences, no text before or after it."},
         # Redaction and no-value scrubbing happen inside build_base_context; _context_message
         # adds the db-key scrub and the framing.
@@ -362,9 +372,8 @@ def threat_validation_prompt(asset_name: str, asset_context: dict[str, Any],
     _EXCLUDE_DB_KEY_TO_PROMPT stays intact and the server maps indexes back to catalogue rows.
 
     The candidates carry evidence the retrieval ranking never saw the model's side of —
-    descriptions, categories, fired applicability rules, and the actors whose technique set
-    reaches the type — and the verdict must cite the asset's own context, which is what makes
-    this a validation rather than a re-rank.
+    the catalogue's description prose and the category memberships — and the verdict must
+    cite the asset's own context, which is what makes this a validation rather than a re-rank.
     NOT_RELEVANT is a HARD DROP server-side (GAP-B), so the contract stresses that a drop
     needs grounds in the context, not vibes."""
     payload = build_base_context(asset_name, asset_context, subsystems)
@@ -374,18 +383,6 @@ def threat_validation_prompt(asset_name: str, asset_context: dict[str, Any],
         "type": redact(cand.get("type_name")),
         "name": redact(cand.get("threat_name")),
         "description": redact((cand.get("description") or "")[:600]),
-        # Fired applicability rules plus the actor evidence, humanized — inputs the
-        # RANKING never saw, which is what makes this a validation rather than a re-rank
-        # (GAP-4). The actor line is the intelligence direction stated in words the model
-        # can reason about: this technique is here because a group operating in this sector
-        # uses it, not because a vector happened to be close.
-        "applicability_evidence": [
-            f"rule {f.get('key')} ({f.get('family')})"
-            + (f" gate {f.get('gate')}" if f.get("gate") else f" weight {f.get('delta')}")
-            for f in (cand.get("rule_factors") or [])]
-            + ([("threat actors known to operate against this sector and to use this "
-                "technique: " + ", ".join(redact(a) for a in cand["actor_evidence"]))]
-            if cand.get("actor_evidence") else []),
     } for i, cand in enumerate(candidates, start=1)]
     system_content = (
         "You are a critical-infrastructure threat analyst VALIDATING pre-selected library "
@@ -730,7 +727,10 @@ def treatment_prompt(snapshot: dict[str, Any]) -> list[dict]:
         "array.\n"
         "action_plan: one concise paragraph rolling up the remediation_action_plan, citing "
         "the action ids.\n"
-        "mitigation_timeline: one relative overall duration for the whole plan.\n"
+        "mitigation_timeline: one relative overall duration for the whole plan. When the "
+        "context carries risk_assessment.assessment_window, the ENTIRE plan must complete "
+        "inside it: keep mitigation_timeline and every action timeline within "
+        "assessment_window.total_days days - never schedule past timeline_end_date.\n"
         "mitigation_owner: the single role or team responsible for executing the whole plan "
         "— a role, never a person's name.\n"
         f"applicable_to_all_subsystems: exactly one of {yes_no}. 'Yes' only when every "
@@ -753,8 +753,6 @@ def treatment_prompt(snapshot: dict[str, Any]) -> list[dict]:
         "rating labels, or calendar dates; those come from the risk register.\n"
         "5) Never name a person or a specific entity/organization — owners are roles or "
         "teams.\n"
-        "6) If the context contains reviewer_note, it is steering from the human reviewer — "
-        "follow it wherever it does not conflict with the rules above.\n"
         "\nOutput ONLY the JSON object — no markdown code fences, no text before or after it."
     )
     user_content = _context_message(

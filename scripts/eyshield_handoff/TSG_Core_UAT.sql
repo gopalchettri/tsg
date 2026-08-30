@@ -9,7 +9,12 @@
 -- On a UAT database that already has the TSG tables, this run will:
 --   * widen Risk_Treatment_Plan Status / TreatmentStrategy / RiskLevel /
 --     ReviewStatus to nvarchar(100), and ErrorReason to nvarchar(max)
---   * create any table / column added since the last run (guarded CREATEs/ADDs)
+--   * create any table / column added since the last run (guarded CREATEs/ADDs) --
+--     currently Identified_Threat.Description/ThreatCategoryID plus the 2026-08 register
+--     migration columns ThreatCatalogueID / IsAIGenerated (all asserted by
+--     the app at startup). The retired Threat_Candidate_Review / Threat_Library_Import_Run
+--     tables and Scenario_Session Promotion* columns are no longer created; existing
+--     copies are left in place (drop snippets ship separately).
 --   * create index IX_TreatmentPlan_SessionHistory (superseded-plan history)
 --   * DROP the retired index IX_Session_CompletedByAsset if present
 --   * fix up data: backfill Risk_Treatment_Plan.ErrorReason on legacy ERROR
@@ -88,25 +93,17 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Session', 'ScoringRulesSnapshotJSON') IS NULL
     ALTER TABLE Scenario_Session ADD ScoringRulesSnapshotJSON nvarchar(max) NULL;
 
--- Library-promotion retry tracking (accept.py's isolated Phase 2). NULL PromotionFailedAt =
--- never failed, or already resolved by a successful attempt/retry.
+-- Cancellation attribution. POST /sessions/{id}/cancel and the session_cancelled audit event have
+-- always existed; the row recorded neither who nor when (CompletedAt covers the success path
+-- only). Independently guarded per column — see the RiskLevel block's warning about a shared
+-- guard skipping later columns silently.
 IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Scenario_Session', 'PromotionFailedAt') IS NULL
-    ALTER TABLE Scenario_Session ADD PromotionFailedAt datetime2 NULL;
+    AND COL_LENGTH('dbo.Scenario_Session', 'CancelledAt') IS NULL
+    ALTER TABLE Scenario_Session ADD CancelledAt datetime2 NULL;
 
 IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Scenario_Session', 'PromotionAttempts') IS NULL
-    ALTER TABLE Scenario_Session ADD PromotionAttempts int NOT NULL CONSTRAINT DF_Session_PromotionAttempts DEFAULT 0;
-
-IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Scenario_Session', 'PromotionError') IS NULL
-    ALTER TABLE Scenario_Session ADD PromotionError nvarchar(max) NULL;
-
--- The accepting user when promotion first failed, so a later retry (automatic or admin-
--- triggered) attributes promoted threats to that SAME person, never a system identity.
-IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Scenario_Session', 'PromotionUserID') IS NULL
-    ALTER TABLE Scenario_Session ADD PromotionUserID nvarchar(200) NULL;
+    AND COL_LENGTH('dbo.Scenario_Session', 'CancelledBy') IS NULL
+    ALTER TABLE Scenario_Session ADD CancelledBy nvarchar(200) NULL;
 
 GO
 
@@ -184,11 +181,14 @@ CREATE TABLE Identified_Threat (
     ThreatType         nvarchar(300) NOT NULL,
     ThreatName         nvarchar(500) NULL,
     GenericName        nvarchar(500) NULL,   -- library-shaped ThreatName (no asset/product names); NULL = legacy row
+    Description        nvarchar(200) NULL,   -- AI description OF THE THREAT; copied to crm_threat_risk_register.threat_scenario on promotion
+    ThreatCategoryID   int           NULL,   -- resolved category id (grounding already computes it); ThreatCategory text kept for display
     ThreatActorsJSON   nvarchar(max) NULL,
     LibraryThreatType  nvarchar(300) NULL,
     LibraryThreatName  nvarchar(500) NULL,
     ThreatTypeID       int           NULL,
-    ThreatCatalogueID  int           NULL,
+    ThreatCatalogueID  int           NULL,   -- Threat_Catalogue.ThreatCatalogueID; set <=> GroundingStatus verified
+    IsAIGenerated      bit           NOT NULL DEFAULT 0, -- immutable provenance: 1 = NOT in the catalogue at identification (invented by the AI); promotion never flips it
     GroundingStatus    nvarchar(100)  NOT NULL,
     GroundingScore     float         NULL,
     Superseded         int           NOT NULL,
@@ -262,14 +262,29 @@ IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Identified_Threat', 'GenericName') IS NULL
     ALTER TABLE Identified_Threat ADD GenericName nvarchar(500) NULL;
 
--- ProposedGenericName: library-shaped proposal shown to curators.
-IF OBJECT_ID('dbo.Threat_Candidate_Review', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Candidate_Review', 'ProposedGenericName') IS NULL
-    ALTER TABLE Threat_Candidate_Review ADD ProposedGenericName nvarchar(500) NULL;
+-- Added 2026-08 alongside the promote-to-library endpoint. Description carries the AI's own
+-- wording for the threat straight into crm_threat_risk_register.threat_scenario; ThreatCategoryID
+-- stops every downstream consumer re-deriving a category id from text grounding already resolved.
+IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'Description') IS NULL
+    ALTER TABLE Identified_Threat ADD Description nvarchar(200) NULL;
+
+IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'ThreatCategoryID') IS NULL
+    ALTER TABLE Identified_Threat ADD ThreatCategoryID int NULL;
+
+-- The library identity (Threat_Catalogue row matched at Stage 1).
+IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'ThreatCatalogueID') IS NULL
+    ALTER TABLE Identified_Threat ADD ThreatCatalogueID int NULL;
+
+IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Identified_Threat', 'IsAIGenerated') IS NULL
+    ALTER TABLE Identified_Threat ADD IsAIGenerated bit NOT NULL DEFAULT 0;
 
 IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NULL
 CREATE TABLE Threat_Scenario_Output (
-    OutputID             uniqueidentifier NOT NULL CONSTRAINT PK_Threat_Scenario_Output PRIMARY KEY,
+    ScenarioID           uniqueidentifier NOT NULL CONSTRAINT PK_Threat_Scenario_Output PRIMARY KEY,
     SessionID            uniqueidentifier NOT NULL,
     TenantID             nvarchar(200) NULL,
     EntityID             nvarchar(200) NULL,
@@ -284,7 +299,7 @@ CREATE TABLE Threat_Scenario_Output (
     Superseded           int           NOT NULL,
     IdentityHash         nvarchar(100)  NULL,
     ScenarioNumber       int           NOT NULL CONSTRAINT DF_ScenarioOutput_ScenarioNumber DEFAULT 1,  -- 1 = original, 2+ = "generate next set" alternates
-    ReplacesOutputID     uniqueidentifier NULL,   -- OutputID this row replaced; NULL for first-run/variant rows
+    ReplacesScenarioID   uniqueidentifier NULL,   -- ScenarioID this row replaced; NULL for first-run/variant rows
     GenerationEpoch      int           NOT NULL,
     ErrorMessage         nvarchar(max) NULL,
     CreatedAt            datetime2     NULL,
@@ -322,6 +337,23 @@ IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario_Output', 'RejectedBy') IS NULL
     ALTER TABLE Threat_Scenario_Output ADD RejectedBy nvarchar(200) NULL;
 
+-- Adds the ACCEPT half of the decision attribution. Reject has recorded who and when since
+-- 2026-08-23; accept recorded neither, so "who rejected this" was a column read while "who
+-- accepted this" was answerable only from the Scenario_Audit ledger — the same class of fact
+-- living in two different places. Legacy rows read NULL, which is honest: nobody recorded an
+-- acceptor for them, and no backfill runs here.
+-- Separately guarded per column, deliberately: a shared guard would let a re-run see the first
+-- column present and skip the second — the silent-miss failure the RiskLevel block warns about.
+-- CK_ScenarioOutput_DecisionExclusive needs no change: AcceptedAt is only ever set where
+-- Accepted = 1, and that constraint already forbids such a row from also carrying RejectedAt.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'AcceptedAt') IS NULL
+    ALTER TABLE Threat_Scenario_Output ADD AcceptedAt datetime2 NULL;
+
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'AcceptedBy') IS NULL
+    ALTER TABLE Threat_Scenario_Output ADD AcceptedBy nvarchar(200) NULL;
+
 -- Adds ScenarioSource for pre-scenario-library databases. NULL reads as "generated for this
 -- asset", which is what every legacy row is.
 IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
@@ -345,6 +377,14 @@ IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
 IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Audit', 'OutputID') IS NULL
     ALTER TABLE Scenario_Audit ADD OutputID uniqueidentifier NULL;
+
+-- The PLAN a treatment event concerns. Same argument that made ScenarioID a real column rather
+-- than a DetailJSON key: an indexed column can be SEEKED, a JSON blob cannot — which is why the
+-- per-scenario plan trail used to fetch a whole session and narrow in Python. Legacy rows read
+-- NULL, correctly: session- and scenario-scoped events belong to no plan.
+IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'PlanID') IS NULL
+    ALTER TABLE Scenario_Audit ADD PlanID uniqueidentifier NULL;
 
 -- MANDATORY one-time backfill for the scenario-lifecycle change.
 -- Generation now COMPLETES the session when it reaches its review barrier, which is what releases
@@ -404,20 +444,7 @@ IF OBJECT_ID('dbo.Scoped_Threat', 'U') IS NOT NULL
 IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario_Output', 'Status') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Scenario_Output'), 'Status', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Scenario_Output ALTER COLUMN Status nvarchar(100) NOT NULL;
-IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Library_Import_Run', 'Source') IS NOT NULL
-    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Library_Import_Run'), 'Source', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Library_Import_Run ALTER COLUMN Source nvarchar(100) NOT NULL;
-IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Library_Import_Run', 'SourceTag') IS NOT NULL
-    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Library_Import_Run'), 'SourceTag', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Library_Import_Run ALTER COLUMN SourceTag nvarchar(100) NULL;
-IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Library_Import_Run', 'Status') IS NOT NULL
-    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Library_Import_Run'), 'Status', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Library_Import_Run ALTER COLUMN Status nvarchar(100) NOT NULL;
-IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    ALTER TABLE Threat_Scenario_Output ALTER COLUMN Status nvarchar(100) NOT NULL;IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Audit', 'Stage') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Audit'), 'Stage', 'CharMaxLen') < 100
     ALTER TABLE Scenario_Audit ALTER COLUMN Stage nvarchar(100) NULL;
@@ -444,12 +471,7 @@ IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NOT NULL
 IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Prompt_Log', 'PromptVersion') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Prompt_Log'), 'PromptVersion', 'CharMaxLen') < 100
-    ALTER TABLE Prompt_Log ALTER COLUMN PromptVersion nvarchar(100) NOT NULL;
-IF OBJECT_ID('dbo.Threat_Candidate_Review', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Candidate_Review', 'CandidateKind') IS NOT NULL
-    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Candidate_Review'), 'CandidateKind', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Candidate_Review ALTER COLUMN CandidateKind nvarchar(100) NULL;
-IF OBJECT_ID('dbo.Config_Tuning', 'U') IS NOT NULL
+    ALTER TABLE Prompt_Log ALTER COLUMN PromptVersion nvarchar(100) NOT NULL;IF OBJECT_ID('dbo.Config_Tuning', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Config_Tuning', 'ValueType') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Config_Tuning'), 'ValueType', 'CharMaxLen') < 100
     ALTER TABLE Config_Tuning ALTER COLUMN ValueType nvarchar(100) NOT NULL;
@@ -475,25 +497,79 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Session', 'ScoringRulesSnapshotJSON') IS NULL
     EXEC sp_rename 'dbo.Scenario_Session.TuningSnapshotJSON', 'ScoringRulesSnapshotJSON', 'COLUMN';
 
+-- ---------------------------------------------------------------------------
+-- OutputID -> ScenarioID. The column identifies a SCENARIO; "output" named the table it happened
+-- to live in (Threat_Scenario_Output), not the thing itself, and the same id was spelled three
+-- different ways across the API. Renamed at the source so the database and the wire agree.
+--
+-- sp_rename, not add-and-copy: it preserves the data in place, and INDEXES FOLLOW AUTOMATICALLY —
+-- SQL Server stores index key references by column ID, so IX_ScenarioAudit_Output,
+-- UX_TreatmentPlan_ActiveOutput and IX_TreatmentPlan_SessionHistory keep working untouched and
+-- report the new name. Only their NAMES still read "Output", which is cosmetic and deliberately
+-- left alone: renaming an index is a second, riskier operation for zero behavioural gain.
+--
+-- Guarded BOTH ways on every table, exactly like the TuningJSON rename above: it runs once on an
+-- existing database and is a no-op afterwards, and on a fresh install the CREATE TABLEs already
+-- declare ScenarioID so the old name is never present. Order-independent for the same reason —
+-- each guard tests its own table, so a table that does not exist yet is skipped, not an error.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'OutputID') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ScenarioID') IS NULL
+    EXEC sp_rename 'dbo.Threat_Scenario_Output.OutputID', 'ScenarioID', 'COLUMN';
 
-IF OBJECT_ID('dbo.Threat_Library_Import_Run', 'U') IS NULL
-CREATE TABLE Threat_Library_Import_Run (
-    RunID            uniqueidentifier NOT NULL CONSTRAINT PK_Threat_Library_Import_Run PRIMARY KEY,
-    Source           nvarchar(100)  NOT NULL,   -- attack | attack_ics | capec | emb3d | pytm | threat_composer | misp_actors
-    SourceTag        nvarchar(100)  NULL,       -- provenance tag stamped on imported rows (Threat_Type.Source)
-    DryRun           bit           NOT NULL,
-    Status           nvarchar(100)  NOT NULL,   -- running | success | failed
-    JobID            nvarchar(100) NULL,       -- Celery task id
-    StartedBy        nvarchar(200) NULL,
-    StartedAt        datetime2     NULL,
-    FinishedAt       datetime2     NULL,
-    TypesImported    int           NULL,
-    ThreatsImported  int           NULL,
-    ActorsUpserted   int           NULL,
-    OtRules          int           NULL,
-    SkippedCount     int           NULL,
-    ErrorMessage     nvarchar(max) NULL
+-- The self-reference: which scenario this one replaced. Renamed for the same reason, or the table
+-- would carry ScenarioID beside ReplacesOutputID and reintroduce the inconsistency in one row.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ReplacesOutputID') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ReplacesScenarioID') IS NULL
+    EXEC sp_rename 'dbo.Threat_Scenario_Output.ReplacesOutputID', 'ReplacesScenarioID', 'COLUMN';
+
+IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'OutputID') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'ScenarioID') IS NULL
+    EXEC sp_rename 'dbo.Scenario_Audit.OutputID', 'ScenarioID', 'COLUMN';
+
+IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'OutputID') IS NOT NULL
+    AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'ScenarioID') IS NULL
+    EXEC sp_rename 'dbo.Risk_Treatment_Plan.OutputID', 'ScenarioID', 'COLUMN';
+
+
+-- One row per grounding-threshold calibration sweep. Doubles as the THRESHOLD STORE: MatchTh on
+-- the latest Status='success' row for a model pair is what the pipeline reads. There is no second
+-- store (the value used to live in Mongo, written by a best-effort call that swallowed failures,
+-- so a finished 15-minute sweep could lose its answer silently). Keyed by model pair because the
+-- cutoff is model-specific; a new pair has no successful row and falls back to the static default.
+IF OBJECT_ID('dbo.Grounding_Calibration_Run', 'U') IS NULL
+CREATE TABLE Grounding_Calibration_Run (
+    RunID              uniqueidentifier NOT NULL CONSTRAINT PK_Grounding_Calibration_Run PRIMARY KEY,
+    JobID              nvarchar(100) NULL,        -- Celery task id
+    Status             nvarchar(100) NOT NULL,    -- running | success | no_signal | failed
+    StartedBy          nvarchar(200) NULL,        -- X-User-Id: CLAIMED, never verified on admin routes
+    StartedByClient    nvarchar(200) NULL,        -- API_Client.ClientID: VERIFIED
+    StartedAt          datetime2     NULL,
+    FinishedAt         datetime2     NULL,
+    EmbeddingModel     nvarchar(500) NULL,
+    RerankerModel      nvarchar(500) NULL,
+    Forced             bit           NOT NULL CONSTRAINT DF_GroundingCalibration_Forced DEFAULT 0,
+    MatchTh            float         NULL,        -- the cutoff; NULL unless Status='success'
+    Quality            float         NULL,        -- Youden's J at MatchTh, 0-1
+    NegativesCount     int           NULL,
+    PositivesCount     int           NULL,
+    HighestNegative    float         NULL,
+    LowestPositive     float         NULL,
+    NearDuplicatesJSON nvarchar(max) NULL,        -- curation to-do list, not an error
+    ErrorMessage       nvarchar(max) NULL
 );
+GO
+
+-- WHICH cutoff judged each identified threat: 'calibrated' | 'static_default' | 'env_pinned'.
+-- The three collide numerically, so without this there is no way to find the threats graded on a
+-- default tuned for a DIFFERENT model pair once a deployment finally calibrates. Nullable so the
+-- seeds' explicit column lists stay valid; never backfilled (it was genuinely unknown before).
+IF COL_LENGTH('dbo.Identified_Threat', 'GroundingThresholdOrigin') IS NULL
+    ALTER TABLE Identified_Threat ADD GroundingThresholdOrigin nvarchar(100) NULL;
+GO
 
 -- Threat_Scenario_Control_Map (Step-4 mapping) lives in Control_library.sql.
 
@@ -510,7 +586,8 @@ CREATE TABLE Scenario_Audit (
     -- the per-scenario decision rows (scenario_accepted / scenario_rejected). A column, not a
     -- DetailJSON key, because "the decision history of this scenario" is the question a GRC
     -- reviewer actually asks, and JSON cannot be indexed for it.
-    OutputID         uniqueidentifier NULL,
+    ScenarioID       uniqueidentifier NULL,
+    PlanID           uniqueidentifier NULL,
     Decision         nvarchar(100)  NULL,
     Granularity      nvarchar(100)  NULL,
     ThreatTypeRefID  int           NULL,
@@ -551,74 +628,15 @@ IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Prompt_Log', 'Prompt') IS NULL
     ALTER TABLE Prompt_Log ADD Prompt nvarchar(max) NULL;
 
-IF OBJECT_ID('dbo.Threat_Candidate_Review', 'U') IS NULL
-CREATE TABLE Threat_Candidate_Review (
-    CandidateID       uniqueidentifier NOT NULL CONSTRAINT PK_Threat_Candidate_Review PRIMARY KEY,
-    TenantID          nvarchar(200) NOT NULL,
-    EntityID          nvarchar(200) NULL,
-    SessionID         uniqueidentifier NOT NULL,
-    ProposedCategory  nvarchar(200) NULL,     -- NULL on actor candidates (kind='actor')
-    ProposedType      nvarchar(300) NULL,     -- actor candidates: the threat type the actor was
-                                              -- proposed FOR (approval's link target); NULL only on legacy rows
-    ProposedName      nvarchar(500) NOT NULL, -- threat name, or the actor name for kind='actor'
-    ProposedGenericName nvarchar(500) NULL,  -- library-shaped name the curator generalizes toward
-    Status            nvarchar(100)  NOT NULL,
-    ThreatTypeID      int NULL,
-    ThreatCatalogueID int NULL,
-    ReviewedBy        nvarchar(200) NULL,
-    ReviewedAt        datetime2 NULL,
-    CreatedAt         datetime2 NOT NULL,
-    CandidateKind     nvarchar(100) NULL,      -- 'threat' | 'actor'; NULL = legacy 'threat'
-    CreatedBy         nvarchar(200) NULL      -- ORIGINAL proposer (accepting user), never the admin
-);
-
--- Admin-gated library growth (2026-08-18): the queue now also holds ACTOR candidates
--- (CandidateKind 'actor'; NULL = legacy 'threat' rows). On those, ProposedName is the actor and
--- ProposedType names the threat type it was proposed for (approval's link target) — category is
--- NULL, and both columns must become nullable (type is NULL on legacy actor rows queued before
--- the type text was stamped). CreatedBy = the ORIGINAL proposer (the user whose accept raised
--- the candidate); NULL reads honestly as "predates the column".
--- nvarchar(100), NOT 20: this ADD sits BELOW the blanket widen block, so on a database that
--- did not yet have the column the widen is a no-op (COL_LENGTH IS NULL) and this ADD is what
--- the column ends up as - permanently. At 20 an upgraded site would sit two widths below a
--- fresh install's CREATE TABLE, which is exactly the silent drift the widen block exists to
--- stop. Matches the CREATE TABLE above.
-IF COL_LENGTH('dbo.Threat_Candidate_Review', 'CandidateKind') IS NULL
-    ALTER TABLE dbo.Threat_Candidate_Review ADD CandidateKind nvarchar(100) NULL;
-IF COL_LENGTH('dbo.Threat_Candidate_Review', 'CreatedBy') IS NULL
-    ALTER TABLE dbo.Threat_Candidate_Review ADD CreatedBy nvarchar(200) NULL;
-IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Threat_Candidate_Review')
-           AND name = 'ProposedCategory' AND is_nullable = 0)
-    ALTER TABLE dbo.Threat_Candidate_Review ALTER COLUMN ProposedCategory nvarchar(200) NULL;
-IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Threat_Candidate_Review')
-           AND name = 'ProposedType' AND is_nullable = 0)
-    ALTER TABLE dbo.Threat_Candidate_Review ALTER COLUMN ProposedType nvarchar(300) NULL;
-
--- Speeds up the curator queue's "list pending" read. Non-unique: names can legitimately recur.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_Session_Status' AND object_id = OBJECT_ID('dbo.Threat_Candidate_Review'))
-    CREATE INDEX IX_ThreatCandidateReview_Session_Status
-        ON Threat_Candidate_Review (SessionID, Status);
-
--- The admin curator queue (GET /v1/tsg/threat-library/candidates) is deliberately CROSS-session
--- — Status alone, no SessionID filter, ordered oldest-first — so the index above can't serve it:
--- SessionID is its leading column, and a query with no SessionID predicate can't seek on it.
--- NOT filtered to Status='pending': SQLAlchemy sends Status as a bound parameter, not a literal,
--- and SQL Server can't match a filtered index against a parameterized predicate (same reasoning
--- IX_ScopedThreat_SessionActiveScores below documents) — Status leads as a plain key column
--- instead, with CreatedAt trailing so the ORDER BY is satisfied by the same seek, no extra sort.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatCandidateReview_Status_Created' AND object_id = OBJECT_ID('dbo.Threat_Candidate_Review'))
-    CREATE INDEX IX_ThreatCandidateReview_Status_Created
-        ON Threat_Candidate_Review (Status, CreatedAt);
-
 -- Risk Treatment Plan (docs/RISK_TREATMENT_PLAN_SDD.md). One row per generation attempt
--- on an accepted scenario; at most one active (Superseded=0) row per OutputID, enforced
+-- on an accepted scenario; at most one active (Superseded=0) row per ScenarioID, enforced
 -- by UX_TreatmentPlan_ActiveOutput below. Risk data (ratings, level, existing controls)
 -- arrives in the request body — TSG reads no external risk tables.
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NULL
 CREATE TABLE Risk_Treatment_Plan (
     PlanID                  uniqueidentifier NOT NULL CONSTRAINT PK_Risk_Treatment_Plan PRIMARY KEY,
     SessionID               uniqueidentifier NOT NULL,
-    OutputID                uniqueidentifier NOT NULL,  -- the accepted Threat_Scenario_Output
+    ScenarioID              uniqueidentifier NOT NULL,  -- the accepted Threat_Scenario_Output row
     TenantID                nvarchar(200) NULL,
     EntityID                nvarchar(200) NULL,         -- copied from the session (authz boundary)
     UserID                  nvarchar(200) NULL,         -- requesting principal (provenance)
@@ -662,6 +680,13 @@ IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Ris
     ALTER TABLE Risk_Treatment_Plan ADD ReviewedBy nvarchar(200) NULL;
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'ReviewedAt') IS NULL
     ALTER TABLE Risk_Treatment_Plan ADD ReviewedAt datetime2 NULL;
+-- Cancellation attribution. /treatment-plan/cancel and the treatment_plan_cancelled audit event
+-- have always existed; the row recorded neither who nor when. Same gap the accept columns close
+-- on Threat_Scenario_Output. Independently guarded per column for the reason stated above.
+IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'CancelledAt') IS NULL
+    ALTER TABLE Risk_Treatment_Plan ADD CancelledAt datetime2 NULL;
+IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'CancelledBy') IS NULL
+    ALTER TABLE Risk_Treatment_Plan ADD CancelledBy nvarchar(200) NULL;
 GO
 
 -- Widen ReviewStatus on PRE-EXISTING databases (fresh installs get nvarchar(100) from the
@@ -846,20 +871,35 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_SessionS
 CREATE INDEX IX_ScenarioAudit_SessionSubEvent ON Scenario_Audit(SessionID, SubsystemID, EventType, CreatedAt DESC);
 
 -- "Show me every decision on this scenario, newest first." Filtered so it costs nothing for the
--- session/subsystem rows that carry no OutputID, which is the overwhelming majority of the ledger.
+-- session/subsystem rows that carry no ScenarioID, which is the overwhelming majority of the ledger.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Output' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
-    AND COL_LENGTH('dbo.Scenario_Audit', 'OutputID') IS NOT NULL
-    EXEC('CREATE INDEX IX_ScenarioAudit_Output ON Scenario_Audit(OutputID, CreatedAt DESC) WHERE OutputID IS NOT NULL');
+    AND COL_LENGTH('dbo.Scenario_Audit', 'ScenarioID') IS NOT NULL
+    EXEC('CREATE INDEX IX_ScenarioAudit_Output ON Scenario_Audit(ScenarioID, CreatedAt DESC) WHERE ScenarioID IS NOT NULL');
+
+-- Same shape for the plan dimension, filtered for the same reason: session- and scenario-scoped
+-- rows carry no PlanID and are the overwhelming majority of the ledger.
+IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'PlanID') IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Plan')
+    EXEC('CREATE INDEX IX_ScenarioAudit_Plan ON Scenario_Audit(PlanID, CreatedAt DESC) WHERE PlanID IS NOT NULL');
 -- Speeds up dal.latest_next_set_outcome, polled on every status check. Not in
 -- invariants.REQUIRED_INDEXES: that list is for correctness, not performance.
+
+-- ONE in-flight calibration per model pair. This is a CORRECTNESS index, not a performance one:
+-- a calibration sweep costs 10-15 minutes and ~100 billed LLM calls, and the route cannot prevent
+-- a double-start on its own — two requests arriving together both read "nothing running" before
+-- either writes. The database refusing the second INSERT is the only thing that closes that gap,
+-- so this is registered in invariants.REQUIRED_INDEXES and a DB missing it fails the boot.
+-- An abandoned 'running' row would block every future run, so the route settles rows older than
+-- calibration_stale_after_seconds to 'failed' before inserting. Filtered on the literal that
+-- CalibrationStatus.running carries — invariants.FILTERED_INDEX_LITERALS pins the two together.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_GroundingCalibration_Running' AND object_id = OBJECT_ID('dbo.Grounding_Calibration_Run'))
+    EXEC('CREATE UNIQUE INDEX UX_GroundingCalibration_Running ON Grounding_Calibration_Run(EmbeddingModel, RerankerModel) WHERE Status = ''running''');
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Session_EntityUser' AND object_id = OBJECT_ID('dbo.Scenario_Session'))
 CREATE INDEX IX_Session_EntityUser ON Scenario_Session(EntityID, UserID) INCLUDE (SessionStatus);
 -- GET /v1/users/{user_id}/scenarios and /v1/entities/{entity_id}/scenarios hot path.
 -- Unfiltered: those routes query all three session statuses.
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Session_PromotionFailed' AND object_id = OBJECT_ID('dbo.Scenario_Session'))
-CREATE INDEX IX_Session_PromotionFailed ON Scenario_Session(PromotionFailedAt) WHERE PromotionFailedAt IS NOT NULL;
 -- Backs the promotion-retry sweep and the admin GET /v1/tsg/sessions/promotions list — the
 -- failed set is always a tiny fraction of all sessions, so this stays a narrow lookup, never a
 -- full table scan, regardless of how large Scenario_Session grows.
@@ -867,7 +907,7 @@ CREATE INDEX IX_Session_PromotionFailed ON Scenario_Session(PromotionFailedAt) W
 -- One active treatment plan per scenario — the concurrent-POST race arbiter (the losing
 -- INSERT hits this and surfaces as 409 generation_in_progress).
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_TreatmentPlan_ActiveOutput' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
-CREATE UNIQUE INDEX UX_TreatmentPlan_ActiveOutput ON Risk_Treatment_Plan(OutputID) WHERE Superseded = 0;
+CREATE UNIQUE INDEX UX_TreatmentPlan_ActiveOutput ON Risk_Treatment_Plan(ScenarioID) WHERE Superseded = 0;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_TreatmentPlan_SessionActive' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
 CREATE INDEX IX_TreatmentPlan_SessionActive ON Risk_Treatment_Plan(SessionID) WHERE Superseded = 0;
@@ -876,9 +916,9 @@ CREATE INDEX IX_TreatmentPlan_SessionActive ON Risk_Treatment_Plan(SessionID) WH
 -- board). The two indexes above are filtered Superseded = 0 and serve no Superseded = 1
 -- predicate, so without this every history read scans the whole plan table — a cost that grows
 -- with every plan ever generated, tenant-wide. Seeks by SessionID (board form) or
--- SessionID+OutputID (single-plan form); CreatedAt keyed for the newest-first ORDER BY.
+-- SessionID+ScenarioID (single-plan form); CreatedAt keyed for the newest-first ORDER BY.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_TreatmentPlan_SessionHistory' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
-CREATE INDEX IX_TreatmentPlan_SessionHistory ON Risk_Treatment_Plan(SessionID, OutputID, CreatedAt) WHERE Superseded = 1;
+CREATE INDEX IX_TreatmentPlan_SessionHistory ON Risk_Treatment_Plan(SessionID, ScenarioID, CreatedAt) WHERE Superseded = 1;
 
 -- ============================================================
 -- SECTION 4 — Threat-library guard indexes now live in Threat_library.sql.
@@ -951,8 +991,8 @@ UNION ALL
 SELECT TABLE_NAME, 1 FROM INFORMATION_SCHEMA.TABLES
 WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME IN (
     'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Identified_Duplicate_Threat',
-    'Scoped_Threat','Threat_Scenario_Output','Threat_Library_Import_Run','Scenario_Audit',
-    'Prompt_Log','Threat_Candidate_Review','Risk_Treatment_Plan','Config_Tuning','API_Client');
+    'Scoped_Threat','Threat_Scenario_Output','Scenario_Audit',
+    'Prompt_Log','Risk_Treatment_Plan','Config_Tuning','API_Client');
 
 
 -- ---------------------------------------------------------------------------
@@ -1018,12 +1058,7 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
 IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario_Output', 'IdentityHash') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Scenario_Output'), 'IdentityHash', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Scenario_Output ALTER COLUMN IdentityHash nvarchar(100) NULL;
-IF OBJECT_ID('dbo.Threat_Candidate_Review', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Candidate_Review', 'Status') IS NOT NULL
-    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Candidate_Review'), 'Status', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Candidate_Review ALTER COLUMN Status nvarchar(100) NOT NULL;
-IF OBJECT_ID('dbo.API_Client', 'U') IS NOT NULL
+    ALTER TABLE Threat_Scenario_Output ALTER COLUMN IdentityHash nvarchar(100) NULL;IF OBJECT_ID('dbo.API_Client', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.API_Client', 'KeyHash') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.API_Client'), 'KeyHash', 'CharMaxLen') < 100
     ALTER TABLE API_Client ALTER COLUMN KeyHash nvarchar(100) NOT NULL;

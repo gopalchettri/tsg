@@ -11,7 +11,9 @@ discipline — is what keeps `Settings` and the env files in step:
   2. DERIVED settings must never be a LIVE line in a template. Detection is
      `model_fields_set`: pydantic records whether a value was SUPPLIED, not whether it differs
      from the default — so pinning one at its own default still silently disables the
-     derivation (the live `TSG_GROUNDING_MATCH_THRESHOLD=90` pin was exactly this failure).
+     derivation. (grounding_match_threshold used to be the canonical example, until its
+     resolution order was flipped DB-first in 2026-08 — a live line there is now a harmless
+     pre-calibration bootstrap, so it left this list.)
      The operator's own `.env` is exempt from THIS rule only (a deliberate pin is their call);
      it still owes every field a documented entry.
 
@@ -31,8 +33,7 @@ from app.core.config import Settings
 #: Settings whose value DERIVES from other settings when left unset (model_fields_set
 #: detection) — a live line freezes the derivation. Documented COMMENTED with "LEAVE UNSET".
 DERIVED_SETTINGS: tuple[str, ...] = (
-    "stage_lease_seconds", "reaper_stale_grace_seconds",
-    "grounding_match_threshold", "control_map_min_score",
+    "stage_lease_seconds", "reaper_stale_grace_seconds", "control_map_min_score",
 )
 
 

@@ -102,7 +102,7 @@ Run the migrations using the image (so the exact app version applies them):
 ```bash
 # Database-first: the schema is stood up from scripts/*.sql, not a migration tool.
 # Run against the target DB from any machine with sqlcmd (safe to re-run):
-sqlcmd -S <server> -d <database> -i scripts/TSG_Core.sql
+sqlcmd -S <server> -d <database> -i "scripts/eyshield_handoff/1. TSG_Core.sql"
 ```
 
 Then, once, in SQL Server: `ALTER DATABASE TSG SET READ_COMMITTED_SNAPSHOT ON;`
@@ -231,7 +231,7 @@ tokens, real database, real models.
   `TSG_SELF_CHECK_INTERVAL_SECONDS` (default 300s) and logs a `selfcheck.*` WARNING event for anything
   worth attention — `active_sessions_high` (nearing `TSG_MAX_ACTIVE_SESSIONS`), `pool_saturated`
   (database connection pool nearly fully checked-out), `tempdb_version_store_high` and
-  `tempdb_long_running_txn` (the RCSI tempdb-growth risk called out in `scripts/TSG_Core.sql` —
+  `tempdb_long_running_txn` (the RCSI tempdb-growth risk called out in `scripts/eyshield_handoff/1. TSG_Core.sql` —
   the version store isn't just turned on and forgotten anymore). All five thresholds
   (`TSG_TEMPDB_VERSION_STORE_WARN_MB`, `TSG_TEMPDB_LONG_TXN_WARN_SECONDS`,
   `TSG_ACTIVE_SESSIONS_WARN_RATIO`, `TSG_POOL_UTILIZATION_WARN_RATIO`, and the interval itself) are
@@ -288,7 +288,7 @@ these hardening items (Milestones 2–4 in the plan):
 ```bash
 docker build -t tsg:latest .
 cp .env.prod.example .env.uat                                   # then fill in real values
-sqlcmd -S <server> -d <database> -i scripts/TSG_Core.sql          # schema, database-first
+sqlcmd -S <server> -d <database> -i "scripts/eyshield_handoff/1. TSG_Core.sql"          # schema, database-first
 docker compose -f docker/compose.prod.yml --env-file .env.uat up -d
 curl http://YOUR_HOST:8000/ready                                # ready?
 TOKEN=... (Section 7)                                            # real JWT with entities claim

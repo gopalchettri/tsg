@@ -29,13 +29,12 @@ dependencies = [
   "mypy>=2.3.0",
   "tenacity>=9.1.4",
   "taxii2-client>=2.3",     # generic TAXII 2.1 pull (app/intel/taxii_client.py)
-  "openpyxl>=3.1",          # .xlsx export (app/api/results_excel.py)
 ]
 
 [project.optional-dependencies]
 # httpx/ruff/mypy are already top-level dependencies above. The type stubs are dev-only: without
-# them mypy reports `import-untyped` for openpyxl/yaml, which CI enforces as an error.
-dev = ["pytest>=8.2", "types-openpyxl>=3.1", "types-PyYAML>=6.0"]
+# them mypy reports `import-untyped` for yaml, which CI enforces as an error.
+dev = ["pytest>=8.2", "types-PyYAML>=6.0"]
 # >=5.0, not >=3.0: local_models.py calls get_embedding_dimension(), which replaced
 # get_sentence_embedding_dimension() in 5.x (the old name still works but FutureWarns).
 local = ["sentence-transformers>=5.0"]   # local embedding + reranker (EMBEDDING/RERANKER_PROVIDER=local)

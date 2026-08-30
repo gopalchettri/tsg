@@ -93,9 +93,12 @@ def get_principal(
 
       1. `X-API-Key` authenticates the caller (Shield) — bad/absent -> 401.
       2. `X-User-Id` + `X-Entity-Id` carry the acting identity — absent -> 401.
-      3. If `verify_membership` is on, the (user, entity) pair is checked against
-         `user_scope_assignment` — not a real active Entity assignment -> 403. Default OFF:
-         the pair is taken on trust (Phase A), the API key is the security boundary.
+      3. `verify_membership` (OFF by design) would additionally check the (user, entity) pair
+         against `user_scope_assignment` -> 403. With it off — the permanent posture — the two
+         identity headers are request INPUT the calling service is trusted to populate, having
+         already authenticated the end user. X-API-Key is the credential and the whole security
+         boundary, so `require_entity` scopes a resource to the entity the CALLER NAMED: that is
+         the intended contract, not an unverified claim standing in for a verified one.
 
     downstream handlers still owe `require_entity`. AuthError/EntityForbidden propagate to
     the [R9] envelope handler in app/api/errors.py."""
@@ -110,7 +113,12 @@ def get_principal(
             with db_session() as sess:
                 allowed = dal.user_has_entity(sess, user_id, entity_id)
         except Exception:  # noqa: BLE001 — fail CLOSED: any lookup error is a deny, not an allow
-            _log.warning("auth.membership_check_failed", user_id=user_id, entity_id=entity_id)
+            # exc_info: the DENY is correct, but without the cause a DB outage, an exhausted
+            # pool, or a non-numeric X-User-Id (dal.user_has_entity casts with int()) denies
+            # EVERY request while logging a line indistinguishable from a genuine entitlement
+            # change — on-call reads a fleet-wide fault as "someone revoked all permissions".
+            _log.warning("auth.membership_check_failed", user_id=user_id, entity_id=entity_id,
+                        exc_info=True)
             allowed = False
         if not allowed:
             raise EntityForbidden(f"user {user_id} is not authorized for entity {entity_id}")

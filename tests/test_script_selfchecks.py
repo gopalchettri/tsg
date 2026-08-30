@@ -20,11 +20,8 @@ from pathlib import Path
 import pytest
 
 _SCRIPTS = [
-    "test_build_results_workbook.py",
-    "test_build_treatment_plans_workbook.py",
     "test_next_set_overfetch.py",
     "test_pipeline_guards.py",
-    "test_promotion_retry_flow.py",
     "test_prompt_no_db_keys.py",
     "test_scenario_flatten.py",
 ]

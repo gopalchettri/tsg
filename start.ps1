@@ -104,6 +104,14 @@ if (-not (Test-Path $envFile)) {
     Write-Warning "$envFile not found. Copy .env.example to .env and fill in real values first."
 }
 
+# Which env file the APP will actually read. config.py::_env_file() honours TSG_ENV_FILE and
+# falls back to '.env'; this script neither sets nor validates it. That is silent-failure
+# territory because '.env' (dev) ALSO carries APP_ENV=staging -- so a UAT launch from a shell
+# that forgot the variable looks identical to a correct one right up until Mongo
+# (localhost:27017) and the LLM provider (azure_openai) turn out to be the dev ones, at which
+# point the symptom reads as "calibration keeps failing", not "wrong config file". Print it.
+$effectiveEnvFile = if ($env:TSG_ENV_FILE) { $env:TSG_ENV_FILE } else { '.env  (TSG_ENV_FILE not set)' }
+
 # Refuse to double-launch. Two workers on one box race the same queue (and, before -n below,
 # under identical broker hostnames). NOTE: ONE healthy stack normally shows a celery.exe +
 # TWO python.exe chain per service (launcher parent + real process) -- matched python.exe
@@ -123,9 +131,13 @@ $logsDir = Join-Path $ProjectRoot 'logs'
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 
 Write-Host "Project root : $ProjectRoot" -ForegroundColor Cyan
+Write-Host "Env file     : $effectiveEnvFile" -ForegroundColor Cyan
 Write-Host "FastAPI port : $Port"        -ForegroundColor Cyan
 Write-Host "Concurrency  : $Concurrency" -ForegroundColor Cyan
 Write-Host "Auto-reload  : $($Reload.IsPresent)" -ForegroundColor Cyan
+if (-not $env:TSG_ENV_FILE) {
+    Write-Warning "TSG_ENV_FILE is not set -- the app will load .env (DEV config: azure_openai, mongodb://localhost:27017). For UAT/staging, stop and relaunch with:  `$env:TSG_ENV_FILE='.env.uat'"
+}
 Write-Host ""
 
 # ---------------------------------------------------------------------------
@@ -374,6 +386,14 @@ Stop-ProcessOnPort -Port $Port -Label 'uvicorn (pre-existing)'
 $uvicornCmd = "& '$venvPython' -m uvicorn app.main:app --host 0.0.0.0 --port $Port"
 if ($Reload.IsPresent) { $uvicornCmd += ' --reload' }
 
+# Same tee as the worker/beat windows above, and for the same reason: this window is where a
+# boot failure prints (unreachable DB, refused setting, wrong env file), and without a file it
+# dies with the window -- leaving "the API never came up" with no evidence at all. Appended
+# AFTER --reload so the pipe stays last.
+# ponytail: no rotation -- logs/ grows unbounded, same as celery.log/beat.log.
+$apiLog = Join-Path $logsDir 'api.log'
+$uvicornCmd += " 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$apiLog' -Append"
+
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
                   -InnerCommand $uvicornCmd -WindowTitle 'tsg-api'
 Write-Host "FastAPI server starting in a new window (title: tsg-api)..." -ForegroundColor Green
@@ -487,8 +507,15 @@ if (-not $NoFlower) {
     # operator started by hand on this port.
     Stop-ProcessOnPort -Port $FlowerPort -Label 'flower (pre-existing)'
 
+    # Tee'd like the other three windows. Flower is the one that most needs it: it can refuse to
+    # start (bad --basic-auth), die on bind, or fail its first broker connect, and every one of
+    # those messages used to vanish with the window -- which is exactly what makes a dead
+    # http://127.0.0.1:5555 undiagnosable after the fact.
+    # ponytail: no rotation -- logs/ grows unbounded, same as celery.log/beat.log.
+    $flowerLog = Join-Path $logsDir 'flower.log'
+    $flowerCmd = "& '$venvPython' -m celery $flowerArgs 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$flowerLog' -Append"
     Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
-                      -InnerCommand "& '$venvPython' -m celery $flowerArgs" -WindowTitle 'tsg-flower'
+                      -InnerCommand $flowerCmd -WindowTitle 'tsg-flower'
     Write-Host "Flower starting in a new window (title: tsg-flower) -- http://127.0.0.1:$FlowerPort" -ForegroundColor Green
 }
 

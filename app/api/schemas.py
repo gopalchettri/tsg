@@ -5,15 +5,45 @@ can be found in one place without wading through route logic.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 from pydantic.json_schema import JsonDict
 
 
+class ApiModel(BaseModel):
+    """Base for every request/response model. Its ONLY job is to stamp UTC on timestamps.
+
+    Every datetime in this schema is UTC by convention — `dal.now()` returns aware UTC and
+    `_utc_naive` strips tzinfo at the boundary because "pyodbc silently drops tzinfo binding into
+    datetime2". The values were therefore correct but UNLABELLED: a naive datetime serializes with
+    no offset, and every browser parses that as LOCAL time. For an IST client that is a 5.5-hour
+    error on `accepted_at`, `reviewed_at` and every audit timestamp — on endpoints already shipping.
+
+    A base class rather than a per-field annotated type, deliberately: an annotation is more
+    explicit at the declaration, but the NEXT datetime field somebody adds would silently miss it
+    and the bug would be back. Inheriting cannot be forgotten per-field, and
+    `test_every_timestamped_model_inherits_ApiModel` fails loudly if a model skips the base
+    entirely — which restores the explicitness the annotation would have bought.
+
+    NOT switching the columns to `datetimeoffset`: the driver already drops tzinfo on the way IN
+    (which is why `_utc_naive` exists), so storing offsets bets the fix on the exact behaviour this
+    codebase wrote defensive code to avoid, and it fails silently. Labelling on the way out cannot.
+
+    The `*` serializer is safe for non-datetime values — verified it leaves nested models,
+    lists and scalars untouched, returning them unchanged for pydantic's normal handling.
+    """
+
+    @field_serializer("*", when_used="unless-none")
+    def _stamp_utc(self, value):
+        if isinstance(value, datetime) and value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
+
+
 # --- API client key-management (admin) schemas ---
-class CreateApiClientBody(BaseModel):
+class CreateApiClientBody(ApiModel):
     """Provision a new API key. The secret is generated server-side; the caller supplies only
     metadata."""
     client_id: str = Field(min_length=1, max_length=100)
@@ -21,14 +51,14 @@ class CreateApiClientBody(BaseModel):
     module: str = Field(min_length=1, max_length=50)
 
 
-class ApiClientCreated(BaseModel):
+class ApiClientCreated(ApiModel):
     """Returned ONCE at creation. `secret` is never stored and never retrievable again."""
     client_id: str
     module: str
     secret: str
 
 
-class ApiClientInfo(BaseModel):
+class ApiClientInfo(ApiModel):
     """One API client as listed — metadata only, never the hash or secret."""
     client_id: str
     name: str
@@ -39,16 +69,20 @@ class ApiClientInfo(BaseModel):
     revoked_at: datetime | None = None
     revoked_by: str | None = None
 
+
+class ApiClientRevoked(ApiModel):
+    """Confirmation that a key was deactivated. Exists so the route is not typed `-> dict`, which
+    publishes an EMPTY object schema — a generated client then has no idea what comes back."""
+    client_id: str
+    status: str = "revoked"
+
 # Typing the wire with these is what puts them in /openapi.json — the UI generates its own
 # string-literal unions from the spec instead of hand-copying codes out of the API guide.
 from app.core.config import CONTROL_DESCRIPTION_MAX_CHARS, CONTROL_NAME_MAX_CHARS
 from app.core.enums import (
-    CandidateKind,
-    CandidateStatus,
     CeleryJobState,
     ClickOutcomeReason,
     NextSetOutcome,
-    RetryOutcome,
     ReviewGateReason,
     RiskLevel,
     SSEEventType,
@@ -66,8 +100,8 @@ from app.db.dal import canonical_guid
 _MAX_BATCH = 50
 
 
-def _canonical_output_ids(v: list[str] | None) -> list[str] | None:
-    """Normalize client-supplied OutputIDs to the one canonical spelling AT THE TRUST BOUNDARY,
+def _canonical_scenario_ids(v: list[str] | None) -> list[str] | None:
+    """Normalize client-supplied scenario_ids to the one canonical spelling AT THE TRUST BOUNDARY,
     so nothing downstream ever compares a raw client id against a DB-derived one.
 
     `uuid.UUID` accepts uppercase, dashless, braced and `urn:uuid:` forms and `models.GUID`
@@ -98,7 +132,7 @@ def _canonical_output_ids(v: list[str] | None) -> list[str] | None:
 
 
 def _canonical_guid_or_none(v: str | None) -> str | None:
-    """Scalar sibling of _canonical_output_ids — same trust-boundary rule for single-id fields
+    """Scalar sibling of _canonical_scenario_ids — same trust-boundary rule for single-id fields
     (TreatmentReviewBody.plan_id): MSSQL returns uppercase GUIDs, dal.guid() stores lowercase,
     Python compares case-sensitively — an un-canonicalized id would silently flip a branch
     decision (e.g. 'is this the active plan version?'). Malformed input dies here as a clean
@@ -111,7 +145,7 @@ def _canonical_guid_or_none(v: str | None) -> str | None:
         raise ValueError(f"not a valid GUID: {v!r}") from None
 
 
-class CreateSessionBody(BaseModel):
+class CreateSessionBody(ApiModel):
     """Ids only — asset/subsystem/sector descriptive context is resolved server-side,
     authoritatively, from the DB (`app.pipeline.context.gather_asset_details`), never
     accepted from the client. This is deliberate: the client can no longer inject
@@ -165,7 +199,7 @@ class CreateSessionBody(BaseModel):
         return v
 
 
-class AcceptBody(BaseModel):
+class AcceptBody(ApiModel):
     """Body for the "accept scenarios" endpoint. `mode` is REQUIRED (no default) so a
     caller can never silently accept-all by omitting a field — accept-all/none/subset
     are three separate, mutually-exclusive choices instead of shades of
@@ -175,7 +209,7 @@ class AcceptBody(BaseModel):
             "examples": [
                 {"mode": "all"},
                 {"mode": "none"},
-                {"mode": "subset", "output_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]},
+                {"mode": "subset", "scenario_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]},
             ]
         }
     )
@@ -184,10 +218,10 @@ class AcceptBody(BaseModel):
         description=(
             "Required. 'all' = accept every generated scenario; 'none' = accept nothing "
             "(the session still completes, terminally — [R8]); 'subset' = accept only the "
-            "scenarios named in output_ids."
+            "scenarios named in scenario_ids."
         )
     )
-    output_ids: list[str] | None = Field(
+    scenario_ids: list[str] | None = Field(
         default=None,
         description=(
             f"Output ids to accept. Required (non-empty, max {_MAX_BATCH}) when mode='subset'; "
@@ -198,50 +232,50 @@ class AcceptBody(BaseModel):
         ),
     )
 
-    _canonicalize_output_ids = field_validator("output_ids")(_canonical_output_ids)
+    _canonicalize_scenario_ids = field_validator("scenario_ids")(_canonical_scenario_ids)
 
     @model_validator(mode="after")
-    def _mode_and_output_ids_agree(self) -> AcceptBody:
+    def _mode_and_scenario_ids_agree(self) -> AcceptBody:
         # Length bounds live HERE, not as Field constraints: Pydantic runs field-level
         # min_length/max_length BEFORE any mode="after" validator, so a field failure would
-        # skip this validator entirely — {"mode": "all", "output_ids": []} would then be told
+        # skip this validator entirely — {"mode": "all", "scenario_ids": []} would then be told
         # to ADD items ("at least 1 item") when the actual fix is to REMOVE the field. One
-        # validation site keeps every mode/output_ids disagreement on one context-aware message.
+        # validation site keeps every mode/scenario_ids disagreement on one context-aware message.
         if self.mode == "subset":
-            if not self.output_ids:
-                raise ValueError("output_ids is required (non-empty) when mode='subset'")
-            if len(self.output_ids) > _MAX_BATCH:
-                raise ValueError(f"output_ids must have at most {_MAX_BATCH} items")
-        elif self.output_ids is not None:
-            raise ValueError(f"output_ids must not be provided when mode={self.mode!r}")
+            if not self.scenario_ids:
+                raise ValueError("scenario_ids is required (non-empty) when mode='subset'")
+            if len(self.scenario_ids) > _MAX_BATCH:
+                raise ValueError(f"scenario_ids must have at most {_MAX_BATCH} items")
+        elif self.scenario_ids is not None:
+            raise ValueError(f"scenario_ids must not be provided when mode={self.mode!r}")
         return self
 
 
-class RegenerateScenariosBody(BaseModel):
+class RegenerateScenariosBody(ApiModel):
     """Body for asking the pipeline to regenerate scenarios for the session's asset. No asset/
     subsystem id is needed here — `session_id` (already in the URL) is the sole identifier, since
     a session is always exactly one asset (`UX_Session_ActiveAsset`); the target scenarios are
-    identified by `output_ids` alone."""
+    identified by `scenario_ids` alone."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "output_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"],
+                "scenario_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"],
                 "user_note": "Please emphasize the insider-threat vector.",
             }
         }
     )
 
-    output_ids: list[str] = Field(
+    scenario_ids: list[str] = Field(
         min_length=1, max_length=_MAX_BATCH, description="Output ids of the scenarios to regenerate. 1-50 ids."
     )
     user_note: str | None = Field(
         default=None, description="Optional free-text note from the reviewer guiding the regeneration (e.g. what to change)."
     )
 
-    _canonicalize_output_ids = field_validator("output_ids")(_canonical_output_ids)
+    _canonicalize_scenario_ids = field_validator("scenario_ids")(_canonical_scenario_ids)
 
 
-class NextSetSummary(BaseModel):
+class NextSetSummary(ApiModel):
     """What the most recent "generate next set" click on this session achieved.
 
     THE DURABLE record, not a convenience copy. The `next_set_result` SSE event carries the same
@@ -288,7 +322,7 @@ class NextSetSummary(BaseModel):
     )
 
 
-class RegenSummary(BaseModel):
+class RegenSummary(ApiModel):
     """What the most recent scenario-regenerate request on this session did (plan item 3) — the
     DURABLE mirror of the SSE `regen_result` event, same rationale as `NextSetSummary` above:
     `regen_result` is best-effort behind a circuit breaker with no replay (app/sse/bus.py), so a
@@ -312,10 +346,10 @@ class RegenSummary(BaseModel):
         default=None, description="ThreatIDs this regeneration actually resolved to and redid; "
                                 "null if none resolved.")
     requested_ids: list[str] | None = Field(
-        default=None, description="OutputIDs the client asked to regenerate (the request body's "
-                                "`output_ids`); null for a request with no explicit targets.")
+        default=None, description="scenario_ids the client asked to regenerate (the request body's "
+                                "`scenario_ids`); null for a request with no explicit targets.")
     replacements: list[dict[str, str]] = Field(
-        default_factory=list, description="old->new OutputID pairs this regen actually committed.")
+        default_factory=list, description="old->new scenario_id pairs this regen actually committed.")
     failed_threat_ids: list[str] = Field(
         default_factory=list, description="Targets whose generation call itself failed — "
                                         "transient, still worth retrying via the same request.")
@@ -329,13 +363,13 @@ class RegenSummary(BaseModel):
         default=None, description="Free-text note the client supplied with the request, redacted.")
 
 
-class CoverageCell(BaseModel):
+class CoverageCell(ApiModel):
     """One unanswered (supporting system x STRIDE category) question."""
     subsystem_id: int = Field(description="0 = the asset itself, >= 1 = a specific supporting system.")
     category: str = Field(description="STRIDE category with no threat recorded against that unit.")
 
 
-class CoverageVerdict(BaseModel):
+class CoverageVerdict(ApiModel):
     """Did this assessment actually ANSWER every question it was supposed to ask?
 
     Threat modelling needs a set-level property that per-item relevance ranking is structurally
@@ -370,7 +404,7 @@ class CoverageVerdict(BaseModel):
     )
 
 
-class SessionProgress(BaseModel):
+class SessionProgress(ApiModel):
     """The session's asset-level progress: per-stage statuses plus a derived overall status. One
     flat object, not a list — the pipeline tracks the asset as a single unit of work (see
     sessions.py::build_board), so there is never more than one of these per session."""
@@ -443,7 +477,7 @@ class SessionProgress(BaseModel):
     )
 
 
-class SessionBoard(BaseModel):
+class SessionBoard(ApiModel):
     """Full status board for a session: session-level info plus the asset's progress."""
     model_config = ConfigDict(
         json_schema_extra={
@@ -478,7 +512,7 @@ class SessionBoard(BaseModel):
     progress: SessionProgress = Field(description="The session's asset-level progress.")
 
 
-class CreateSessionResponse(BaseModel):
+class CreateSessionResponse(ApiModel):
     """Response returned after a new session is created."""
     model_config = ConfigDict(
         json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user"}}
@@ -491,126 +525,143 @@ class CreateSessionResponse(BaseModel):
     )
 
 
-class ThreatActorRef(BaseModel):
+class ThreatActorRef(ApiModel):
     """One adversary WITH its database key. Actor names always come from the library (the model
     never invents one), so a name normally resolves to a real Threat_Actor row; ThreatActorID is
     null only when the stored name no longer matches an active row — visible, never silent."""
-    ThreatActorID: int | None = Field(
+    actor_id: int | None = Field(
         default=None,
         description="Threat_Actor primary key. Null when the stored name no longer resolves to "
                     "an active Threat_Actor row (renamed/deactivated since this threat was written).")
-    ThreatActorName: str = Field(description="The adversary's name (Threat_Actor.ThreatActorName).")
+    actor_name: str = Field(description="The adversary's name (Threat_Actor.ThreatActorName).")
 
 
-class ThreatResult(BaseModel):
+class ThreatResult(ApiModel):
     """One threat identified for the session's asset, as returned to the client."""
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "ThreatID": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
-                "ThreatCategory": "Tampering",
-                "ThreatType": "Spoofing",
-                "ThreatName": "Unauthorized RTU firmware update",
-                "ThreatTypeID": 3,
-                "ThreatCatalogueID": 42,
-                "LibraryThreatType": "Logic/Configuration Manipulation",
-                "LibraryThreatName": "Unauthorised firmware modification",
-                "GroundingStatus": "verified",
+                "threat_category": "Tampering",
+                "grounding_status": "verified",
             }
         }
     )
 
-    ThreatID: str = Field(description="Identified threat's unique id (GUID). Matches the ThreatID on the scenario(s) generated from it.")
-    ThreatCategory: str | None = Field(
+    threat_id: str = Field(description="Identified threat's unique id (GUID). Matches the ThreatID on the scenario(s) generated from it.")
+    threat_category: str | None = Field(
         default=None,
         description="STRIDE category this threat was placed in (Spoofing, Tampering, Repudiation, "
                     "Information Disclosure, Denial of Service, Elevation of Privilege) - the "
                     "coverage grid's column."
     )
-    ThreatType: str = Field(description="The threat's type AS PROPOSED. For a library-retrieved threat "
+    threat_category_id: int | None = Field(
+        default=None,
+        description="Threat_Category primary key for ThreatCategory, resolved at identification "
+                    "time and stored — so this joins without matching the category TEXT. Null "
+                    "when the proposed category matched no master row."
+    )
+    threat_type: str = Field(description="The threat's type AS PROPOSED. For a library-retrieved threat "
                                         "this equals LibraryThreatType; for a generated one it is the "
                                         "model's own wording, kept verbatim.")
-    ThreatName: str | None = Field(description="The threat's name AS PROPOSED - see ThreatType.")
-    ThreatTypeID: int | None = Field(
+    threat_name: str | None = Field(description="The threat's name AS PROPOSED - see ThreatType.")
+    description: str | None = Field(
+        default=None,
+        description="The AI's one-sentence description of this threat, written at identification "
+                    "time in asset-free language and copied into Threat_Catalogue.Description "
+                    "when the threat is promoted. For a library-retrieved threat this carries "
+                    "the catalogue's own description (clipped). Null when the model's wording "
+                    "named the asset (dropped rather than leaked into a shared library)."
+    )
+    threat_type_id: int | None = Field(
         default=None,
         description="Id of the matched Threat_Type master row. Null when the type came back unverified."
     )
-    LibraryThreatType: str | None = Field(
+    library_threat_type: str | None = Field(
         default=None,
         description="The MATCHED library type's own name, straight off Threat_Type. Null when nothing "
                     "matched. Reported ALONGSIDE ThreatType rather than replacing it: the two differ "
                     "exactly when the model's wording and the curator's differ, and that difference is "
                     "the reviewer's signal about match quality."
     )
-    LibraryThreatName: str | None = Field(
+    library_threat_name: str | None = Field(
         default=None,
         description="The MATCHED library threat's own name, straight off Threat_Catalogue. Same "
                     "alongside-not-instead-of rule as LibraryThreatType."
     )
-    GroundingStatus: str = Field(
+    grounding_status: str = Field(
         description=(
             "Whether this threat matched an approved threat-library entry: `verified` (it did) "
             "or `unverified` (no confident match — a novel candidate, still scenario-generated "
             "and eligible for library promotion on accept)."
         )
     )
-    ThreatCatalogueID: int | None = Field(
-        description="Id of the matched Threat_Catalogue master row, set only when the name match "
+    threat_catalogue_id: int | None = Field(
+        default=None,
+        description="Id of the matched Threat_Catalogue row, set only when the name match "
                     "itself cleared the cutoff. Null whenever it did not — a close-but-unconfirmed "
                     "candidate is deliberately not reported as a match."
+    )
+    is_ai_generated: bool | None = Field(
+        default=None,
+        description="True when the threat was NOT in the threat catalogue at identification "
+                    "time (invented by the AI); False for library threats -- retrieved, or "
+                    "AI-proposed but verified to match a catalogue row. Immutable provenance: "
+                    "promoting the threat later does NOT flip it. Null only for rows written "
+                    "before this field existed."
     )
     # No bare `ThreatActors: list[str]`. Actors below carries the same names WITH their
     # Threat_Actor keys, so a parallel un-keyed copy was pure duplication — and the kind that
     # silently drifts, since nothing forced the two to be built from the same list.
-    Actors: list[ThreatActorRef] = Field(
+    actors: list[ThreatActorRef] = Field(
         default_factory=list,
         description="Adversaries for this threat, each with its Threat_Actor database key. Taken "
-                    "from the LIBRARY only — the actors a curator linked to the matched "
-                    "Threat_Type, or the nearest active Threat_Actor rows when none are linked. "
+                    "from the LIBRARY only — the actors curated on the matched threat's TYPE "
+                    "(ThreatType_ThreatActor_Map), or the nearest active library "
+                    "actors when none are linked. "
                     "The model never names an adversary, so a name here always corresponds to a "
                     "real Threat_Actor row. Empty when the table holds none."
     )
-    GroundingScore: float | None = Field(
+    grounding_score: float | None = Field(
         default=None,
         description="Library-match confidence (reranker score, 0-100) against the threat "
                     "catalogue. Null for rows written before this field existed."
     )
-    Score: float | None = Field(
+    score: float | None = Field(
         default=None,
         description="Relevance score from scoping (base + confidence + rule boosts). Higher = "
                     "more relevant to this asset; rank best-first on this."
     )
-    ScopeRank: int | None = Field(
+    scope_rank: int | None = Field(
         default=None,
         description="1-based rank the scoping pass assigned within its round (1 = strongest)."
     )
 
 
-class StandardRef(BaseModel):
+class StandardRef(ApiModel):
     """One referred standard WITH its database key. A control can refer to several standards
     (Control_Library_Standard_Map is many-to-many), and a bare name list cannot say which
     Control_Standard row each came from — the same keys-alongside-names rule as
     ThreatCatalogueID/ControlLibraryID."""
-    StandardID: int = Field(description="Control_Standard primary key.")
-    StandardName: str = Field(description="The standard's name (Control_Standard.StandardName).")
+    standard_id: int = Field(description="Control_Standard primary key.")
+    standard_name: str = Field(description="The standard's name (Control_Standard.StandardName).")
 
 
 #: One `scenario.controls` entry, for the OpenAPI examples below.
 _MAPPED_CONTROL_EXAMPLE: JsonDict = {
-    "ControlLibraryID": 201,
-    "ControlCode": "CII-CID-201",
-    "Domain": "Identification & Authentication",
-    "ControlName": "Multi-Factor Authentication",
-    "MapRank": 1,
-    "Score": 93.0,
-    "Standards": [
-        {"StandardID": 3, "StandardName": "NIST SP 800-53 Rev. 5"},
-        {"StandardID": 7, "StandardName": "ISO 27001:2022"},
+    "control_id": 201,
+    "control_code": "CII-CID-201",
+    "domain": "Identification & Authentication",
+    "control_name": "Multi-Factor Authentication",
+    "map_rank": 1,
+    "score": 93.0,
+    "standards": [
+        {"standard_id": 3, "standard_name": "NIST SP 800-53 Rev. 5"},
+        {"standard_id": 7, "standard_name": "ISO 27001:2022"},
     ],
 }
 
 #: The scenario narrative exactly as the pipeline produces it (prompts.py::scenario_prompt): these
-#: are the LLM's own keys, passed through verbatim by sessions.py::_safe_scenario_json, with
+#: are the LLM's own keys, passed through verbatim by sessions.py (via dal.safe_json_dict), with
 #: `controls` swapped for the grounded library matches. ONE constant shared by every example that
 #: shows a scenario — the four hand-copied literals this replaces had all drifted to a
 #: `title`/`narrative` shape the API has never actually returned.
@@ -638,7 +689,7 @@ _SCENARIO_EXAMPLE: JsonDict = {
 }
 
 
-class MappedControl(BaseModel):
+class MappedControl(ApiModel):
     """One Control_Library row mapped to a scenario by Step-4 control mapping
     (control_mapping.map_controls): the scenario's own text was grounded against the control
     library and this real library control matched. Ordered by rank (1 = best). The LLM never
@@ -651,24 +702,24 @@ class MappedControl(BaseModel):
     ScenarioResult)."""
     model_config = ConfigDict(json_schema_extra={"example": _MAPPED_CONTROL_EXAMPLE})
 
-    ControlLibraryID: int = Field(description="Control_Library primary key.")
-    ControlCode: str = Field(description="Stable control code, e.g. 'CII-CID-201'.")
-    Domain: str = Field(description="The control's domain as recorded in the library (reported as-is).")
-    ControlName: str = Field(description="The library control's official name.")
-    MapRank: int = Field(description="1 = best match for this scenario. Spelled as the "
+    control_id: int = Field(description="Control_Library primary key.")
+    control_code: str = Field(description="Stable control code, e.g. 'CII-CID-201'.")
+    domain: str = Field(description="The control's domain as recorded in the library (reported as-is).")
+    control_name: str = Field(description="The library control's official name.")
+    map_rank: int = Field(description="1 = best match for this scenario. Spelled as the "
                                     "Threat_Scenario_Control_Map column it is read from.")
-    Score: float | None = Field(description="Raw match confidence 0-100 at mapping time.")
+    score: float | None = Field(description="Raw match confidence 0-100 at mapping time.")
     # No bare `StandardNames: list[str]`. Standards below carries the same names WITH their
     # Control_Standard keys; a control routinely refers to three or more standards, which is
     # exactly where an un-keyed name list stops being usable and starts being ambiguous.
-    Standards: list[StandardRef] = Field(
+    standards: list[StandardRef] = Field(
         default_factory=list,
         description="Referred standards for this control, each with its Control_Standard "
                     "database key (Control_Library_Standard_Map is many-to-many, so a control "
                     "commonly refers to several).")
 
 
-class SupportingSystemApplicability(BaseModel):
+class SupportingSystemApplicability(ApiModel):
     """The LLM's own judgment (prompts.py::scenario_prompt) of whether this scenario involves a
     given supporting system in the session's scope, one entry per system. Rides straight through
     from the LLM's own JSON, same treatment as entry_point: no DB enrichment, no separate
@@ -678,7 +729,7 @@ class SupportingSystemApplicability(BaseModel):
     justification: str = Field(description="One-sentence rationale for the applicable value.")
 
 
-class ScenarioNarrative(BaseModel):
+class ScenarioNarrative(ApiModel):
     """The LLM's scenario JSON passed through verbatim, with `controls` replaced by the Step-4
     grounded library matches (sessions.py::_scenario_with_controls).
 
@@ -727,53 +778,38 @@ class ScenarioNarrative(BaseModel):
 
 #: Shared by ScenarioResult and by the SessionResults example that embeds one.
 _SCENARIO_RESULT_EXAMPLE: JsonDict = {
-    "OutputID": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-    "ThreatID": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
+    "scenario_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
     "scenario": _SCENARIO_EXAMPLE,
     "threat": {
-        "ThreatID": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
-        "ThreatCategory": "Tampering",
-        "ThreatType": "unauthorized modification of firmware",
-        "ThreatName": "Unauthorized firmware update of Remote Terminal Unit (RTU)",
-        "ThreatTypeID": 3,
-        "LibraryThreatType": "Logic/Configuration Manipulation",
-        "LibraryThreatName": "Unauthorised firmware modification",
-        "GroundingStatus": "verified",
-        "ThreatCatalogueID": 42,
-        "Actors": [
-            {"ThreatActorID": 7, "ThreatActorName": "Nation-state/APT"},
-            {"ThreatActorID": 12, "ThreatActorName": "Malicious insider"},
+        "threat_category": "Tampering",
+        "grounding_status": "verified",
+        "actors": [
+            {"actor_id": 7, "actor_name": "Nation-state/APT"},
+            {"actor_id": 12, "actor_name": "Malicious insider"},
         ],
-        "GroundingScore": 100.0,
-        "Score": 70.0,
-        "ScopeRank": 3,
+        "grounding_score": 100.0,
+        "score": 70.0,
+        "scope_rank": 3,
     },
-    "Accepted": False,
+    "accepted": False,
     "moderation_checked": False,
     "moderation_flagged": None,
     "moderation_categories": [],
     "validation_status": "ok",
     "validation_errors": [],
-    "GenerationEpoch": 1,
-    "ScenarioNumber": 1,
-    "ControlsMapped": True,
-    "ScenarioSource": "generated",
+    "generation_epoch": 1,
+    "scenario_number": 1,
+    "controls_mapped": True,
+    "scenario_source": "generated",
     "replaced_scenarios": [],
 }
 
 
-class ScenarioResult(BaseModel):
+class ScenarioResult(ApiModel):
     """One generated scenario for the session's asset, plus whether it has been accepted."""
     model_config = ConfigDict(json_schema_extra={"example": _SCENARIO_RESULT_EXAMPLE})
 
-    OutputID: str = Field(description="Generated scenario's unique id (GUID). Used to accept/regenerate this scenario.")
-    ThreatID: str | None = Field(
-        description="Id of the threat this scenario was generated from. Matches the ThreatID on "
-                    "this card's own `threat` block — there is no session-level threats list to "
-                    "resolve it against. Null only if the underlying threat/scoping link is "
-                    "missing (this schema has no enforced foreign keys) — the scenario itself is "
-                    "still shown, never dropped, so it remains visible for review and accept."
-    )
+    scenario_id: str = Field(description="Generated scenario's unique id (GUID). Used to accept/regenerate this scenario.")
     scenario: ScenarioNarrative | None = Field(
         description=(
             "Generated scenario narrative — scenario_title, scenario_statement, risk_statement, "
@@ -793,7 +829,24 @@ class ScenarioResult(BaseModel):
             "sessions.py::_scenario_select)."
         )
     )
-    Accepted: bool = Field(description="Whether a human reviewer has accepted this scenario.")
+    accepted: bool = Field(description="Whether a human reviewer has accepted this scenario.")
+    # WHO decided, beside the flag that says a decision happened. `Accepted: true` with no
+    # accepted_by used to be the only thing this endpoint could say. Named snake_case because
+    # that is the convention the whole response surface is moving to — new fields land in the
+    # target spelling rather than being renamed a second time.
+    accepted_by: str | None = Field(
+        default=None,
+        description="User id of whoever accepted this scenario. Null if it has not been accepted, "
+                    "or was accepted before this was recorded.")
+    accepted_at: datetime | None = Field(
+        default=None, description="When it was accepted (naive UTC). Null if not accepted.")
+    rejected_by: str | None = Field(
+        default=None,
+        description="User id of whoever rejected this scenario. Null if it has not been rejected. "
+                    "A scenario can never carry both an acceptor and a rejecter — "
+                    "CK_ScenarioOutput_DecisionExclusive forbids it in the database.")
+    rejected_at: datetime | None = Field(
+        default=None, description="When it was rejected (naive UTC). Null if not rejected.")
     moderation_checked: bool = Field(
         description="Whether content moderation actually ran for this scenario. False means moderation_flagged is meaningless (never checked, not checked-and-clean) — off by default, or the moderation service was unavailable.",
     )
@@ -824,14 +877,14 @@ class ScenarioResult(BaseModel):
             "Empty unless validation_status is warning."
         ),
     )
-    GenerationEpoch: int = Field(
+    generation_epoch: int = Field(
         description=(
             "Generation round that produced this scenario: 1 = the initial run; each "
             "regenerate/next-set round increments it. The highest epoch is the newest batch — "
             "clients use this to spot fresh scenarios without diffing output ids."
         ),
     )
-    ScenarioNumber: int = Field(
+    scenario_number: int = Field(
         default=1,
         description=(
             "Which of its threat's coexisting scenarios this is: 1 = the original, 2+ = alternate "
@@ -852,7 +905,7 @@ class ScenarioResult(BaseModel):
     # Mirrors Threat_Scenario_Output.ControlsMappedAt, so false ALSO covers the unseeded-library
     # case: control_mapping bails at `controls.no_candidates` without stamping, deliberately, so
     # those outputs are picked up by a later run once Seed_to_Control_library.sql has been applied.
-    ScenarioSource: str = Field(
+    scenario_source: str = Field(
         default="generated",
         description=(
             "Where this scenario's TEXT came from. `generated` = written for this asset. "
@@ -866,7 +919,7 @@ class ScenarioResult(BaseModel):
             "POST /regenerate/scenarios, which never serves from the library."
         ),
     )
-    ControlsUnavailable: bool = Field(
+    controls_unavailable: bool = Field(
         default=False,
         description=(
             "true = this response could NOT read the control mapping (a transient database "
@@ -879,7 +932,7 @@ class ScenarioResult(BaseModel):
             "grounding.ControlMatches.answered was introduced to kill on the write side."
         ),
     )
-    ControlsMapped: bool = Field(
+    controls_mapped: bool = Field(
         description=(
             "Whether Step-4 control mapping has been attempted for this scenario. true with an "
             "empty `scenario.controls` = mapping ran and nothing in the library matched, a genuine "
@@ -907,13 +960,13 @@ class ScenarioResult(BaseModel):
             "times this scenario has been regenerated: 2 entries means it is version 3. "
             "NOT disjoint from the top-level cards: an accepted-but-superseded version appears "
             "BOTH as its own top-level card (flagged accepted) and inside its successor's "
-            "history — the history is complete, deliberately; dedupe by output_id if rendering "
+            "history — the history is complete, deliberately; dedupe by scenario_id if rendering "
             "both."
         ),
     )
 
 
-class SessionResults(BaseModel):
+class SessionResults(ApiModel):
     """The scenarios produced so far for a session, each carrying its own threat."""
     model_config = ConfigDict(
         json_schema_extra={
@@ -956,7 +1009,7 @@ class SessionResults(BaseModel):
     )
 
 
-class AcceptResponse(BaseModel):
+class AcceptResponse(ApiModel):
     """Response confirming an accept request was processed."""
     model_config = ConfigDict(
         json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "status": "completed", "accepted_count": 3}}
@@ -968,7 +1021,70 @@ class AcceptResponse(BaseModel):
     accepted_count: int = Field(description="Number of scenarios actually marked accepted by this request (0 for mode='none').")
 
 
-class RejectBody(BaseModel):
+class PromotedRef(ApiModel):
+    """One master-library row this promotion touched, with every key the UI needs to join on.
+
+    No bare names anywhere — same reasoning as MappedControl.Standards: an un-keyed name list
+    "stops being usable and starts being ambiguous". `status` is the field to branch on."""
+    id: int | None = Field(description="The master row's primary key. Null only when status is "
+                                       "'failed' and no row could be resolved.")
+    name: str = Field(description="Display name of the master row.")
+    status: Literal["inserted", "existing", "failed"] = Field(
+        description="'inserted' — a NEW master row exists because of this call. 'existing' — one "
+                    "was already there and was reused (the normal case; nothing was duplicated). "
+                    "'failed' — see `error`.")
+    error: str | None = Field(default=None, description="Why this item failed. Null otherwise.")
+    type_id: int | None = Field(default=None, description="Threat_Type key this row hangs off — "
+                                                          "set on the threat and on every actor.")
+    category_id: int | None = Field(default=None, description="Threat_Category key. Null when the "
+                                                              "AI's category text matched no master row.")
+    linked: bool | None = Field(default=None, description="Actors only: true when THIS call wrote "
+                                "a new ThreatType_ThreatActor_Map row (actors attach per TYPE in "
+                                "this model). Always false on an EXISTING catalogue threat — its "
+                                "curation belongs to the curators and is never touched.")
+
+
+class LibraryPromotionResponse(ApiModel):
+    """Result of promoting one accepted scenario's threat data into the shared master library.
+
+    Every entity carries its database id and the id of what it links to. Controls are REPORTED,
+    never written: they are selected from the curated Control_Library during generation, so a
+    mapped control is already master data and there is never a new one to create."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+        "scenario_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "success": True, "created_count": 1,
+        "threat_type": {"id": 42, "name": "Ransomware", "category_id": 2, "status": "existing"},
+        "threat": {"id": 187,
+                   "name": "Ransomware encrypts historian data at rest",
+                   "type_id": 42, "category_id": 2,
+                   "status": "inserted"},
+        "threat_actors": [{"id": 9, "name": "APT-Nova", "type_id": 42,
+                           "status": "existing", "linked": True}],
+        "controls": [{"control_id": 771, "control_code": "CII-CID-201", "domain": "Access Control",
+                      "control_name": "Privileged access review", "map_rank": 1, "score": 82.4}],
+        "controls_mapped": True}})
+
+    session_id: str = Field(description="Session's unique id (GUID).")
+    scenario_id: str = Field(description="The promoted scenario's unique id (GUID).")
+    success: bool = Field(description="False when any item reports status 'failed'. The rest of "
+                                      "the promotion still stands — check each item's status.")
+    created_count: int = Field(description="How many NEW master rows this call created. 0 on a "
+                                           "repeat call, which is the expected idempotent result.")
+    threat_type: PromotedRef = Field(description="The Threat_Type row.")
+    threat: PromotedRef = Field(description="The Threat_Catalogue row.")
+    threat_actors: list[PromotedRef] = Field(
+        default_factory=list,
+        description="Threat_Actor rows linked to the type. Always 'existing' in practice — the AI "
+                    "never invents an adversary, so this endpoint links but never creates actors.")
+    controls: list[MappedControl] = Field(
+        default_factory=list,
+        description="Controls already mapped to this scenario at generation time. Read-only.")
+    controls_mapped: bool = Field(description="False when Step-4 control mapping has not produced "
+                                              "rows for this scenario yet.")
+
+
+class RejectBody(ApiModel):
     """Body for the "reject scenarios" endpoint — an explicit, recorded decline.
 
     Always an explicit list. There is deliberately no `mode` and no reject-all: accept has three
@@ -976,10 +1092,10 @@ class RejectBody(BaseModel):
     click a reviewer should be one mis-tap away from. Leaving scenarios pending is already a valid
     resting state, so the destructive-looking shortcut buys nothing."""
     model_config = ConfigDict(
-        json_schema_extra={"examples": [{"output_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]}]}
+        json_schema_extra={"examples": [{"scenario_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]}]}
     )
 
-    output_ids: list[str] = Field(
+    scenario_ids: list[str] = Field(
         description=(
             f"Output ids to reject (non-empty, max {_MAX_BATCH}). Rejecting records WHO declined "
             "the scenario and WHEN; it does not delete it, and the scenario stays visible in "
@@ -989,20 +1105,20 @@ class RejectBody(BaseModel):
         ),
     )
 
-    _canonicalize_output_ids = field_validator("output_ids")(_canonical_output_ids)
+    _canonicalize_scenario_ids = field_validator("scenario_ids")(_canonical_scenario_ids)
 
     @model_validator(mode="after")
-    def _output_ids_within_bounds(self) -> RejectBody:
+    def _scenario_ids_within_bounds(self) -> RejectBody:
         # Same reasoning as AcceptBody: bounds live here, not as Field constraints, so the
         # message is written for the caller rather than by Pydantic's generic length check.
-        if not self.output_ids:
-            raise ValueError("output_ids is required (non-empty)")
-        if len(self.output_ids) > _MAX_BATCH:
-            raise ValueError(f"output_ids must have at most {_MAX_BATCH} items")
+        if not self.scenario_ids:
+            raise ValueError("scenario_ids is required (non-empty)")
+        if len(self.scenario_ids) > _MAX_BATCH:
+            raise ValueError(f"scenario_ids must have at most {_MAX_BATCH} items")
         return self
 
 
-class RejectResponse(BaseModel):
+class RejectResponse(ApiModel):
     """Response confirming a reject request was processed."""
     model_config = ConfigDict(
         json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "rejected_count": 2}}
@@ -1013,7 +1129,7 @@ class RejectResponse(BaseModel):
     rejected_count: int = Field(description="Number of scenarios actually marked rejected by this request.")
 
 
-class RegenerateResponse(BaseModel):
+class RegenerateResponse(ApiModel):
     """Response confirming a regenerate/next-set request was ACCEPTED — not that it finished.
 
     The work runs on a Celery worker and can take minutes; this returns in milliseconds. `epoch`
@@ -1046,7 +1162,7 @@ class RegenerateResponse(BaseModel):
     )
 
 
-class CancelResponse(BaseModel):
+class CancelResponse(ApiModel):
     """Response confirming a session was cancelled."""
     model_config = ConfigDict(
         json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "status": "cancelled"}}
@@ -1062,7 +1178,7 @@ class CancelResponse(BaseModel):
 # spec, not to construct it. Without them ReviewGateReason reaches no route and never appears in
 # /openapi.json — leaving the UI to hand-copy exactly the codes it most needs, since they decide
 # whether a blocked action shows a dead end or a spinner.
-class ErrorDetails(BaseModel):
+class ErrorDetails(ApiModel):
     """`details` on a 4xx envelope. Open-ended by design: handlers attach cause-specific keys
     (`existing_id`, `active_session_id`, …) alongside the common ones below."""
     model_config = ConfigDict(extra="allow")
@@ -1081,7 +1197,7 @@ class ErrorDetails(BaseModel):
     message: str | None = Field(default=None, description="End-user-safe sentence for this reason, when one is defined.")
 
 
-class ErrorResponse(BaseModel):
+class ErrorResponse(ApiModel):
     """The envelope every 4xx/5xx body uses (see errors.py::_env)."""
     model_config = ConfigDict(
         json_schema_extra={
@@ -1098,11 +1214,74 @@ class ErrorResponse(BaseModel):
     details: ErrorDetails | None = Field(default=None, description="Cause-specific extras; omitted when there are none.")
 
 
+class LivenessReport(ApiModel):
+    """`GET /health` — the liveness probe's body. Trivial, but untyped it published an EMPTY object,
+    so a generated client could not see even this one field."""
+    status: Literal["ok"] = Field(description="Always 'ok'; the route returns 200 unconditionally.")
+
+
+class ReadinessReport(ApiModel):
+    """`GET /ready` — per-dependency readiness.
+
+    `checks` is deliberately a mapping rather than named fields: the dependency set is
+    configuration-dependent (Mongo is skipped when unused), so a fixed shape would publish
+    dependencies a given deployment does not have. The VALUES are closed, which is the part worth
+    typing — 'skipped' is distinct from 'ok' and means the dependency is not in use here.
+
+    Note the route returns its 503 with a plain `JSONResponse` rather than raising, so that body is
+    THIS shape, not the ErrorResponse envelope — which is why /ready must NOT take the shared
+    UNAVAILABLE_RESPONSES fragment. Attaching it would publish a lie."""
+    status: Literal["ready", "not_ready"] = Field(
+        description="'not_ready' is returned with HTTP 503 so an orchestrator pulls the pod.")
+    checks: dict[str, Literal["ok", "error", "skipped"]] = Field(
+        description="Per-dependency outcome. 'skipped' = not used by this deployment.")
+
+
+class TreatmentPlanDocument(ApiModel):
+    """The AI-authored treatment plan, as served.
+
+    Every field Optional and `extra="allow"` — the SAME posture as ScenarioNarrative, and for the
+    same reason: this content is model-authored, it is read back from rows written by older builds,
+    and a strict declaration would turn one odd stored value into a 500 on the poll endpoint rather
+    than a slightly-wrong field. The model exists to NAME the shape on the wire, not to police it.
+
+    It is also the single source of `treatment._VISIBLE_PLAN_KEYS`: that projection used to restate
+    these ten names in a tuple beside the model that defines them, so a prompt change could add a
+    key the API silently dropped. Declaring them once and deriving the projection removes the copy.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    title: Any | None = None
+    treatment_plan: Any | None = None
+    action_plan: Any | None = None
+    applicable_to_all_subsystems: Any | None = None
+    controls_to_be_implemented: Any | None = None
+    remediation_action_plan: Any | None = None
+    mitigation_timeline: Any | None = None
+    mitigation_owner: Any | None = None
+    risk_owner: Any | None = None
+    impacted_business_division: Any | None = None
+
+
+#: Attach to any route that can answer 503 — `responses=UNAVAILABLE_RESPONSES` on its decorator.
+#:
+#: Same idea as treatment._CONFLICT_RESPONSES: the ROUTE declares what it can return, because the
+#: route is what knows. This replaced a central set of route PATHS in main.py, which had exactly
+#: the failure a central list invites — the {output_id} -> {scenario_id} rename silently orphaned
+#: two of its six entries, so those routes stopped declaring 503 with no boot error and no failing
+#: test. A path list nothing validates goes stale in silence; a decorator argument moves with the
+#: route it is attached to.
+UNAVAILABLE_RESPONSES: dict[int | str, dict] = {
+    503: {"model": ErrorResponse,
+        "description": "Temporarily unavailable — retry. Capacity and stream-ceiling responses "
+                        "also carry Retry-After."}}
+
+
 # --- SSE event payloads -------------------------------------------------------------------------
 # Same rationale: cascade.py publishes these dicts, and the /events route streams them, so nothing
 # would otherwise describe them in the spec. Publishing through these models keeps the wire and the
 # documented schema from drifting.
-class NextSetResultEvent(BaseModel):
+class NextSetResultEvent(ApiModel):
     """`next_set_result` — one "generate next set" click finished.
 
     ADVISORY. Best-effort, behind a circuit breaker, never replayed (app/sse/bus.py), so treat it
@@ -1130,7 +1309,7 @@ class NextSetResultEvent(BaseModel):
     ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
 
 
-class RegenResultEvent(BaseModel):
+class RegenResultEvent(ApiModel):
     """`regen_result` — one regenerate click finished.
 
     Deliberately carries NO outcome/requested fields: regenerate REPLACES rather than adds, so its
@@ -1138,8 +1317,8 @@ class RegenResultEvent(BaseModel):
     type: Literal[SSEEventType.regen_result] = Field(description="Always 'regen_result'.")  # see NextSetResultEvent.type
     session_id: str = Field(description="Session the click belonged to.")
     subsystem_id: int = Field(description="Unit of work; always 0 (the asset itself).")
-    requested_output_ids: list[str] = Field(description="OutputIDs the client asked to regenerate.")
-    new_output_ids: list[str] = Field(description="Replacement OutputIDs. Empty means the click was fruitless.")
+    requested_scenario_ids: list[str] = Field(description="scenario_ids the client asked to regenerate.")
+    new_scenario_ids: list[str] = Field(description="Replacement scenario_ids. Empty means the click was fruitless.")
     replacements: list[dict[str, str]] = Field(
         default_factory=list,
         description="old→new pairs. The two flat lists above cannot express the mapping when "
@@ -1161,7 +1340,7 @@ class RegenResultEvent(BaseModel):
     ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
 
 
-class TreatmentPlanResultEvent(BaseModel):
+class TreatmentPlanResultEvent(ApiModel):
     """`treatment_plan_result` — one treatment plan reached a committed COMPLETE or ERROR.
 
     ADVISORY, and weaker than the two above: it is a prompt to REFETCH, never a completion
@@ -1175,17 +1354,17 @@ class TreatmentPlanResultEvent(BaseModel):
     that worker process for a cooldown window. **A client MUST therefore keep a slow backstop poll**
     — this event only makes the common case feel instant.
 
-    Match on `output_id`: a regeneration mints a NEW plan_id, so a client keyed on plan_id would
+    Match on `scenario_id`: a regeneration mints a NEW plan_id, so a client keyed on plan_id would
     discard the very event it is waiting for."""
     type: Literal[SSEEventType.treatment_plan_result] = Field(
         description="Always 'treatment_plan_result'.")  # see NextSetResultEvent.type
     session_id: str = Field(description="Session the plan belongs to.")
-    output_id: str = Field(
+    scenario_id: str = Field(
         description="The accepted scenario this plan treats. MATCH ON THIS — it is stable across "
                     "regenerations, unlike plan_id.")
     plan_id: str = Field(
         description="Informational: the Risk_Treatment_Plan row that finished. A regeneration "
-                    "produces a different one for the same output_id.")
+                    "produces a different one for the same scenario_id.")
     status: Literal[StageStatus.COMPLETE, StageStatus.ERROR] = Field(
         description="The committed status. Refetch for the detail.")
     reason: TreatmentOutcomeReason | None = Field(
@@ -1199,7 +1378,7 @@ class TreatmentPlanResultEvent(BaseModel):
 # Field shapes are taken directly from their publish call sites — tasks.py::_send_live_update for
 # the two stage events, and the three bus.publish() calls below it for subsystem_started/
 # session_entered_review/error (app/pipeline/tasks.py).
-class StageStartedEvent(BaseModel):
+class StageStartedEvent(ApiModel):
     """`stage_started` — one (subsystem, level) work cell was just claimed and began running."""
     type: Literal[SSEEventType.stage_started] = Field(description="Always 'stage_started'.")  # see NextSetResultEvent.type
     session_id: str = Field(description="Session the stage belongs to.")
@@ -1212,7 +1391,7 @@ class StageStartedEvent(BaseModel):
     ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
 
 
-class StageCompletedEvent(BaseModel):
+class StageCompletedEvent(ApiModel):
     """`stage_completed` — one (subsystem, level) work cell finished successfully; a failure
     routes to `error` instead and never reaches this event.
 
@@ -1233,7 +1412,7 @@ class StageCompletedEvent(BaseModel):
     ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
 
 
-class SubsystemStartedEvent(BaseModel):
+class SubsystemStartedEvent(ApiModel):
     """`subsystem_started` — fires BEFORE this subsystem's stages run. Subsystem-scoped, no
     `stage` field: it precedes both THREATS and SCENARIOS for this subsystem."""
     type: Literal[SSEEventType.subsystem_started] = Field(description="Always 'subsystem_started'.")  # see NextSetResultEvent.type
@@ -1243,7 +1422,7 @@ class SubsystemStartedEvent(BaseModel):
     ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
 
 
-class SessionEnteredReviewEvent(BaseModel):
+class SessionEnteredReviewEvent(ApiModel):
     """`session_entered_review` — every subsystem hit its review barrier; the session is now
     parked at REVIEW waiting on a human decision. Session-wide: never carries subsystem_id."""
     type: Literal[SSEEventType.session_entered_review] = Field(
@@ -1255,7 +1434,7 @@ class SessionEnteredReviewEvent(BaseModel):
     ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
 
 
-class ErrorEvent(BaseModel):
+class ErrorEvent(ApiModel):
     """`error` — a stage failed, or the whole session failed. DUAL-scope by design (plan item
     27); `scope` says which instead of leaving a client to infer it from whether `subsystem_id`
     happens to be present:
@@ -1302,7 +1481,7 @@ class ErrorEvent(BaseModel):
     ts: datetime = Field(description="When the event was published (UTC, ISO-8601).")
 
 
-class HeartbeatEvent(BaseModel):
+class HeartbeatEvent(ApiModel):
     """`heartbeat` — keep-alive so proxies don't drop an idle SSE connection (sse_starlette's
     `ping`, on `sse_ping_seconds`). Carries no progress information; a client should ignore its
     content and only use its arrival to reset its own idle/liveness timer."""
@@ -1313,24 +1492,33 @@ class HeartbeatEvent(BaseModel):
 
 #: Shared by AcceptedScenario and by the AcceptedScenariosResponse example that embeds one.
 _ACCEPTED_SCENARIO_EXAMPLE: JsonDict = {
-    "OutputID": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-    "SubsystemID": 101,
-    "ThreatTypeID": 3,
-    "ThreatCatalogueID": 42,
-    "ThreatType": "Spoofing",
-    "ThreatName": "Unauthorized RTU firmware update",
-    "LibraryThreatType": "Logic/Configuration Manipulation",
-    "LibraryThreatName": "Unauthorised firmware modification",
+    "scenario_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+    "subsystem_id": 101,
     "scenario": _SCENARIO_EXAMPLE,
 }
 
 
-class AcceptedScenario(BaseModel):
+class AcceptedScenario(ApiModel):
     """One accepted scenario row — joinable on ids."""
     model_config = ConfigDict(json_schema_extra={"example": _ACCEPTED_SCENARIO_EXAMPLE})
 
-    OutputID: str = Field(description="Accepted scenario's unique id (GUID).")
-    ControlsUnavailable: bool = Field(
+    scenario_id: str = Field(description="Accepted scenario's unique id (GUID).")
+    # Same four as ScenarioResult. Declared on THIS base so ScenarioListItem and every route that
+    # returns it inherit them — one declaration, not one per response model, which is the drift
+    # that dal.scenario_threat_columns() exists to prevent one layer down.
+    accepted_by: str | None = Field(
+        default=None,
+        description="User id of whoever accepted this scenario. Null if accepted before this was "
+                    "recorded.")
+    accepted_at: datetime | None = Field(
+        default=None, description="When it was accepted (naive UTC).")
+    rejected_by: str | None = Field(
+        default=None,
+        description="User id of whoever rejected this scenario. Null unless rejected — mutually "
+                    "exclusive with accepted_by.")
+    rejected_at: datetime | None = Field(
+        default=None, description="When it was rejected (naive UTC).")
+    controls_unavailable: bool = Field(
         default=False,
         description=(
             "true = the control mapping could not be read for this response, so "
@@ -1338,40 +1526,18 @@ class AcceptedScenario(BaseModel):
             "ScenarioResult.ControlsUnavailable."
         ),
     )
-    SubsystemID: int = Field(
+    subsystem_id: int = Field(
         description="Unit of work this scenario belongs to: 0 = the asset itself, >= 1 = a specific "
                     "supporting system. Scenarios are written at the asset unit; a threat's reach "
                     "across supporting systems is reported per scenario in "
                     "`scenario.supporting_system_applicability`."
     )
-    ThreatTypeID: int | None = Field(
-        description="Id of the matched Threat_Type master row. Null when the type came back unverified."
-    )
-    ThreatCatalogueID: int | None = Field(
-        description="Id of the matched Threat_Catalogue master row. Null when no catalogue candidate matched."
-    )
-    ThreatType: str | None = Field(description="The type AS PROPOSED for the threat this scenario came from.")
-    ThreatName: str | None = Field(description="The name AS PROPOSED for the threat this scenario came from.")
-    LibraryThreatType: str | None = Field(
-        default=None,
-        description="The MATCHED library type's own name. Reported alongside ThreatType, never "
-                    "instead of it - the API no longer coalesces the two, so a caller can see "
-                    "exactly what was proposed and exactly what it matched."
-    )
-    LibraryThreatName: str | None = Field(
-        default=None, description="The MATCHED library threat's own name. See LibraryThreatType.")
     scenario: ScenarioNarrative | None = Field(
         description=(
             "Accepted scenario narrative — scenario_title, scenario_statement, risk_statement, plus "
             "the Step-4 `controls` mapped from the control library. Identical shape to "
             "ScenarioResult.scenario."
         )
-    )
-    ThreatActors: list[str] = Field(
-        default=[],
-        description="Library actors of the threat this scenario was generated from. Never "
-                    "model-invented - see ThreatResult.Actors, which carries the same names "
-                    "with their Threat_Actor database keys."
     )
     threat: ThreatResult | None = Field(
         default=None,
@@ -1382,7 +1548,7 @@ class AcceptedScenario(BaseModel):
     )
 
 
-class AcceptedScenariosResponse(BaseModel):
+class AcceptedScenariosResponse(ApiModel):
     """The accepted scenarios for one session (whichever version was accepted — possibly one
     a regeneration superseded), identified solely by the session_id in the URL path. asset_id
     and entity_id are read off that session (not separate inputs) and returned here so a
@@ -1419,17 +1585,17 @@ _SCENARIO_LIST_ITEM_EXAMPLE: JsonDict = {
     "entity_id": "ENT-001",
     "user_id": "qa-user",
     "session_status": "completed",
-    "ScenarioNumber": 1,
-    "Accepted": True,
-    "Superseded": False,
-    "CreatedAt": "2026-07-20T14:32:11.123Z",
+    "scenario_number": 1,
+    "accepted": True,
+    "superseded": False,
+    "created_at": "2026-07-20T14:32:11.123Z",
 }
 
 
 class ScenarioListItem(AcceptedScenario):
     """One scenario row with its session context — the cross-session reads
     (GET /v1/users/{user_id}/scenarios, GET /v1/entities/{entity_id}/scenarios,
-    GET /v1/sessions/{session_id}/scenarios/{output_id}) all return this shape."""
+    GET /v1/sessions/{session_id}/scenarios/{scenario_id}) all return this shape."""
     model_config = ConfigDict(json_schema_extra={"example": _SCENARIO_LIST_ITEM_EXAMPLE})
 
     # RENAME BOUNDARY (Phase 4): columns of the THREAT / SCENARIO / CONTROL tables carry their
@@ -1442,16 +1608,76 @@ class ScenarioListItem(AcceptedScenario):
         description="The session's owning user (who created it). Null only if the principal had no identity to record."
     )
     session_status: str = Field(description="Owning session's status: active | completed | cancelled.")
-    ScenarioNumber: int = Field(description="1 = original scenario, 2+ = coexisting 'next set' alternates.")
-    Accepted: bool = Field(description="True once the user accepted this scenario.")
-    Superseded: bool = Field(
+    scenario_number: int = Field(description="1 = original scenario, 2+ = coexisting 'next set' alternates.")
+    accepted: bool = Field(description="True once the user accepted this scenario.")
+    superseded: bool = Field(
         description="True if a regeneration replaced this row. Only reachable in lists with "
-                    "include_superseded=true, or on a direct fetch by output_id."
+                    "include_superseded=true, or on a direct fetch by scenario_id."
     )
-    CreatedAt: datetime | None = Field(description="UTC timestamp the scenario row was created.")
+    created_at: datetime | None = Field(description="UTC timestamp the scenario row was created.")
 
 
-class EmbeddingActionBody(BaseModel):
+class SessionAuditEvent(ApiModel):
+    """One step in a session's history.
+
+    EVERY row names what it acted on. Without that, the trail reads as an unexplained hop between
+    people — user1, then system, then user2 — because the SUBJECT is changing and nothing says so.
+    With it, the same sequence reads plainly: user1 started the session, the system generated
+    scenarios, user2 accepted scenario A, user2 approved the plan for scenario A.
+
+    `actor_user_id` is WHO ACTUALLY DID IT and is null for pipeline steps — that is information,
+    not missing data. It used to be back-filled with the session owner, which is what made the
+    timeline unreadable. `actor_type` states it outright so nothing has to be inferred."""
+    audit_id: str = Field(description="This entry's unique id (GUID).")
+    at: datetime | None = Field(description="When it happened (UTC).")
+    event: str = Field(
+        description="What happened — an AuditEventType value. Typed as a string ON PURPOSE: the "
+                    "column carries no database constraint, so one unrecognised historical value "
+                    "would otherwise fail the whole page rather than the single row.")
+    subject_type: Literal["session", "scenario", "plan"] = Field(
+        description="What this step acted on. Derived: a plan id means the plan, else a scenario "
+                    "id means that scenario, else the session as a whole.")
+    scenario_id: str | None = Field(
+        default=None, description="The scenario this step concerns, when it concerns one.")
+    plan_id: str | None = Field(
+        default=None, description="The treatment plan this step concerns, when it concerns one.")
+    actor_user_id: str | None = Field(
+        default=None,
+        description="Who performed it. NULL means the pipeline did — read with actor_type.")
+    actor_type: str | None = Field(
+        default=None, description="'user' or 'system'. NULL only on rows predating the column.")
+    stage: str | None = Field(default=None, description="Workflow stage, when the step has one.")
+    subsystem_id: int | None = Field(
+        default=None, description="0 = the asset itself; >= 1 = a specific supporting system.")
+    decision: str | None = Field(default=None, description="Set on accept/reject rows only.")
+    detail: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Event-specific payload; the keys differ per event type. Left open rather "
+                    "than modelled: a union across every event's shape would be more machinery "
+                    "than the dict it replaced.")
+
+
+class SessionAuditPage(ApiModel):
+    """A page of a session's step trail, oldest first — same envelope shape as the entity-wide
+    treatment audit feed, so both audit reads page identically."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "limit": 100, "offset": 0,
+        "events": [{
+            "audit_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
+            "at": "2026-08-30T09:00:00Z", "event": "session_started", "subject_type": "session",
+            "scenario_id": None, "plan_id": None, "actor_user_id": "u1", "actor_type": "user",
+            "stage": None, "subsystem_id": None, "decision": None, "detail": {},
+        }],
+    }})
+
+    session_id: str = Field(description="The session this trail belongs to.")
+    limit: int = Field(description="Page size that was applied.")
+    offset: int = Field(description="Rows skipped.")
+    events: list[SessionAuditEvent] = Field(
+        default_factory=list, description="The steps, oldest first.")
+
+
+class EmbeddingActionBody(ApiModel):
     """Shared request shape for all four admin embedding actions (app/api/admin.py).
     `group=None` means "every group"; `names`, when given, scopes to just those items and
     REQUIRES an explicit (non-null) `group` (a name alone doesn't say which table it's in)."""
@@ -1470,7 +1696,7 @@ class EmbeddingActionBody(BaseModel):
     )
 
 
-class EmbeddingActionResponse(BaseModel):
+class EmbeddingActionResponse(ApiModel):
     """[REVIEW-FIX] create/update/recreate report ROW-count semantics (active master rows
     processed); delete reports a DIFFERENT quantity (Mongo vectors actually deleted, which can
     include stale docs from a retired model) — distinct field names instead of one ambiguous
@@ -1500,89 +1726,7 @@ class EmbeddingActionResponse(BaseModel):
     )
 
 
-class ThreatLibraryImportBody(BaseModel):
-    """Request for POST /v1/tsg/threat-library/sources/{source}/import — trigger one
-    threat-library import (the same job scripts/import_threat_libraries.py runs). Plain
-    JSON body, deliberately not multipart: the uploaded "file" is itself JSON text, so
-    `file_content` carries it with no extra upload machinery.
-
-    EVERY field below is optional, and `{}` is a valid body — it means "really import the
-    source named in the path, downloading it from upstream". Two fields apply to SOME
-    SOURCES ONLY: `via_taxii` to attack/attack_ics, `max_actors` to misp_actors. Those
-    rules are enforced BEFORE dispatch, so a wrong combination returns 422 and never
-    reaches the queue."""
-    model_config = ConfigDict(
-        json_schema_extra={"example": {"dry_run": True}}
-    )
-
-    # `source` is NOT a body field: it is the addressed resource in the path
-    # (POST /v1/tsg/threat-library/sources/{source}/import), so an unknown library is a
-    # 404 on that resource rather than a 422 on a body value.
-    dry_run: bool = Field(default=False, description=(
-        "Preview only — parse and report what WOULD be imported; nothing is written."))
-    via_taxii: bool = Field(default=False, description=(
-        "Fetch ATT&CK live via TAXII instead of GitHub (attack/attack_ics only; "
-        "incompatible with file_content)."))
-    max_actors: int = Field(default=40, ge=1, description=(
-        "misp_actors only: cap on imported actors (they feed the threats-prompt hint)."))
-    file_content: str | None = Field(default=None, description=(
-        "ANY SOURCE. The library file's JSON text, supplied directly instead of downloading. "
-        "Size-capped by settings.threat_library_import_max_upload_mb (422 if over). Must be "
-        "valid JSON of the shape this source's adapter expects (422 otherwise). Mutually "
-        "exclusive with via_taxii."))
-
-
-class SourceInventoryItem(BaseModel):
-    """One threat-library source's current state — the per-source row of
-    GET /v1/tsg/threat-library/sources. `loaded=false` with a null `last_run` means the
-    source was never imported; `loaded=false` with a failed `last_run` means it was tried
-    and did not succeed. Those are different problems, so they read differently."""
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "source": "attack_ics", "source_tag": "mitre_attack_ics", "loaded": True,
-                "type_count": 12, "threat_count": 95, "actor_count": None,
-                "last_run": {"status": "success", "dry_run": False,
-                             "started_at": "2026-07-27T09:14:00Z",
-                             "finished_at": "2026-07-27T09:16:12Z", "error": None,
-                             "types_imported": 12, "threats_imported": 95, "actors_upserted": None,
-                             "started_by": "qa-tester"},
-            }
-        }
-    )
-
-    source: str = Field(description="API source name, e.g. 'attack_ics' — the value used in the import URL.")
-    source_tag: str | None = Field(description="Provenance tag stamped on this source's imported rows (Threat_Type.Source).")
-    loaded: bool = Field(description="True when this source has contributed rows to the library.")
-    type_count: int = Field(description="Threat_Type (family) rows attributed to this source.")
-    threat_count: int = Field(description="Threat_Catalogue (exact threat) rows attributed to this source.")
-    actor_count: int | None = Field(
-        default=None,
-        description=(
-            "Threat_Actor rows stamped with this source — misp_actors only; null for every other "
-            "source. Counts only actors whose Source matches: rows created before Threat_Actor "
-            "gained that column (seeded actors, anything promoted on accept) have Source=NULL and "
-            "are excluded. Until 2026-07-27 this was an unfiltered count of the whole table, so it "
-            "over-reported."
-        ),
-    )
-    last_run: dict[str, Any] | None = Field(
-        default=None,
-        description=(
-            "Most recent import attempt for this source, or null if never attempted. Keys: status, "
-            "dry_run, started_at, finished_at, error, types_imported, threats_imported, "
-            "actors_upserted, started_by (the user who triggered it — null for CLI-driven runs and "
-            "for any run recorded before the API forwarded its caller to the worker)."
-        ),
-    )
-
-
-class SourcesInventoryResponse(BaseModel):
-    """Every known source, imported or not — so 'pending' is visible rather than absent."""
-    sources: list[SourceInventoryItem]
-
-
-class IntelFeedStatus(BaseModel):
+class IntelFeedStatus(ApiModel):
     """One live-intel feed's operational state (GET /v1/tsg/threat-intel/feeds).
 
     Reports three distinguishable conditions that used to look identical: `enabled=false`
@@ -1612,12 +1756,12 @@ class IntelFeedStatus(BaseModel):
     last_error: str | None = Field(default=None, description="Error from the last attempt, or null if it succeeded.")
 
 
-class IntelFeedsResponse(BaseModel):
+class IntelFeedsResponse(ApiModel):
     """Every known feed, enabled or not."""
     feeds: list[IntelFeedStatus]
 
 
-class IntelRefreshAccepted(BaseModel):
+class IntelRefreshAccepted(ApiModel):
     """Queued refresh jobs. The all-feeds route fans out, so `jobs` carries one entry per
     feed dispatched — a single feed's refresh returns exactly one."""
     model_config = ConfigDict(
@@ -1627,7 +1771,7 @@ class IntelRefreshAccepted(BaseModel):
     jobs: dict[str, str] = Field(description="feed name -> Celery job id for the refresh queued for it.")
 
 
-class IntelItem(BaseModel):
+class IntelItem(ApiModel):
     """One cached intel item (GET /v1/tsg/threat-intel/items) — a KEV CVE, an ICS
     advisory, or an OTX pulse, in the store's normalized shape."""
     model_config = ConfigDict(
@@ -1659,7 +1803,7 @@ class IntelItem(BaseModel):
     published_at: datetime | None = Field(default=None, description="The item's own date at its source (an OTX pulse's last-modified time); falls back to sync time for feeds that publish none. This is the ordering key — newest threat first.")
 
 
-class IntelItemsResponse(BaseModel):
+class IntelItemsResponse(ApiModel):
     """One page of cached intel items, newest first."""
     items: list[IntelItem]
     total: int = Field(description="Total items matching the filter, across all pages.")
@@ -1667,44 +1811,7 @@ class IntelItemsResponse(BaseModel):
     offset: int = Field(description="Offset used for this response.")
 
 
-class ThreatLibraryImportAccepted(BaseModel):
-    """Returned immediately (202) when an import is queued — poll
-    GET /v1/tsg/threat-library/imports/{job_id} for the eventual outcome."""
-    model_config = ConfigDict(json_schema_extra={"example": {"job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}})
-
-    job_id: str = Field(description=(
-        "Celery task id for the queued import. Poll GET /v1/tsg/threat-library/imports/{job_id} — "
-        "NOT the embeddings status route, which is a different job family and 404s on this id."))
-
-
-class ImportJobStatus(BaseModel):
-    """Polled result of a queued threat-library import. `state` mirrors Celery's own
-    AsyncResult.state; `result` (populated once state == "SUCCESS") is run_import's
-    documented stats dict — including `ot_rules` (the auto-written boost-only scoring
-    rules, the one permanent side effect an admin must be able to see) and
-    `embeddings_job_id` (the follow-up refresh job, pollable on the embeddings status
-    route). `error` is populated only once state == "FAILURE". Deliberately NOT
-    EmbeddingJobStatus — an import result shares none of its fields."""
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "state": "SUCCESS",
-                "result": {"source": "attack_ics", "dry_run": False, "types": 11, "threats": 83,
-                        "new_category_links": 96, "before_count": 0, "after_count": 83,
-                        "ot_rules": [{"threat_type_id": 87, "threat_type_name": "ICS ATT&CK - Impact",
-                                        "rule_key": "asset_type", "threat_rule_id": 22}],
-                        "skipped_count": 4, "skipped": [], "embeddings_job_id": "6ba7b810-..."},
-                "error": None,
-            }
-        }
-    )
-
-    state: CeleryJobState = Field(description="Celery AsyncResult state — see CeleryJobState (app/core/enums.py).")
-    result: dict | None = Field(default=None, description="run_import's stats dict, once SUCCESS.")
-    error: str | None = Field(default=None, description="Bounded error message, once FAILURE.")
-
-
-class EmbeddingJobAccepted(BaseModel):
+class EmbeddingJobAccepted(ApiModel):
     """Returned immediately (202) when an admin embedding action is queued — poll
     GET .../status/{job_id} for the eventual outcome."""
     model_config = ConfigDict(json_schema_extra={"example": {"job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}})
@@ -1740,151 +1847,7 @@ class EmbeddingJobStatus(EmbeddingActionResponse):
 # Session-promotion admin (app/api/admin.py) — GET/retry/dismiss for sessions whose library
 # promotion (accept.py's isolated Phase 2) failed and is pending automatic or manual retry.
 # ---------------------------------------------------------------------------
-class PendingPromotion(BaseModel):
-    """One session currently stuck on a failed library promotion — a row of
-    GET /v1/tsg/sessions/promotions. The accept itself already succeeded for this session
-    (that's the whole point of the fix); only the "add novel threats to the shared library"
-    side-effect failed and is being tracked here."""
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-                "entity_id": "ENT-001", "asset_id": "AST-042", "asset_name": "Payment Gateway",
-                "failed_at": "2026-08-10T09:15:00Z", "attempts": 2, "max_attempts": 5,
-                "exhausted": False, "error": "litellm.APIConnectionError: ...",
-                "user_id": "qa-user", "completed_at": "2026-08-10T09:14:55Z",
-            }
-        }
-    )
-    session_id: str = Field(description="Session whose library promotion failed.")
-    entity_id: str = Field(description="Entity the session belongs to.")
-    asset_id: str = Field(description="Asset the session was for.")
-    asset_name: str = Field(description="Asset's display name, for a human-readable admin list.")
-    failed_at: str = Field(description="When the most recent promotion attempt failed (ISO 8601).")
-    attempts: int = Field(description="Failed attempts so far, automatic and manual combined.")
-    max_attempts: int = Field(description="Automatic-retry cap (promotion_max_attempts). Manual retries ignore this.")
-    exhausted: bool = Field(
-        description="True once attempts >= max_attempts: the automatic sweep has stopped retrying "
-                    "this session (manual retry via POST is still always available)."
-    )
-    error: str | None = Field(description="Most recent attempt's error message.")
-    user_id: str | None = Field(description="Accepting user, for retry attribution — null for a system-triggered accept.")
-    completed_at: str | None = Field(description="When the session itself completed (the accept succeeded before this).")
-
-
-class PendingPromotionsResponse(BaseModel):
-    """GET /v1/tsg/sessions/promotions — every session currently pending or exhausted-pending a
-    library-promotion retry."""
-    promotions: list[PendingPromotion]
-    total: int = Field(description="Row count returned (bounded by the request's `limit`).")
-    auto_retry_enabled: bool = Field(
-        description="Current global promotion_auto_retry_enabled setting — read this to know "
-                    "whether `exhausted` above is meaningful (the sweep is actively retrying) or "
-                    "moot (auto-retry is off, so nothing here is being auto-retried regardless)."
-    )
-
-
-class PromotionRetryResult(BaseModel):
-    """Response of POST /v1/tsg/sessions/promotions/{session_id}/retry — synchronous, since one
-    retry is a single bounded operation, not a long-running bulk job."""
-    model_config = ConfigDict(json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-                                                            "outcome": "succeeded"}})
-    session_id: str = Field(description="Session that was retried.")
-    outcome: RetryOutcome = Field(description="succeeded, failed (see the session's updated error via "
-                                    "GET .../promotions/{id}), or skipped (a live worker or another "
-                                    "retry currently holds this session's lock — try again shortly).")
-
-
-# ---------------------------------------------------------------------------
-# Threat-library candidate review (app/api/admin.py) — the curator workflow whose approve/reject
-# writes CandidateStatus.accepted/rejected: list/approve/reject
-# for Threat_Candidate_Review rows queued by accept.py when promotion_auto_approve_enabled is off
-# (or the triage verdict was genuinely ambiguous, which always queues regardless of that setting).
-# ---------------------------------------------------------------------------
-class PendingCandidate(BaseModel):
-    """One proposal awaiting curator review — a row of GET /v1/tsg/threat-library/candidates.
-    Two kinds share the shape: a THREAT card (type+name pair) and an ACTOR card (actor name,
-    with proposed_type naming the threat type the actor was proposed for)."""
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "candidate_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-                "session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "entity_id": "ENT-001",
-                "kind": "threat", "created_by": "sara",
-                "proposed_category": "Spoofing", "proposed_type": "Vendor Update Tampering",
-                "proposed_name": "Payment Gateway vendor software update tampering",
-                "proposed_generic_name": "Vendor software update tampering",
-                "threat_type_id": None,
-                "status": "pending", "created_at": "2026-08-10T09:15:00Z",
-            }
-        }
-    )
-    candidate_id: str = Field(description="Row's unique id — use it to approve or reject.")
-    session_id: str = Field(description="Session whose accept first proposed this threat.")
-    entity_id: str | None = Field(description="Entity the originating session belongs to.")
-    kind: CandidateKind = Field(
-        default=CandidateKind.threat,
-        description="'threat' (a proposed type+name pair) or 'actor' (a proposed actor name — "
-                    "proposed_type shows which threat type the actor was proposed for, and "
-                    "approval links the minted actor to that type; category is null).")
-    created_by: str | None = Field(
-        default=None,
-        description="The ORIGINAL proposer — the user whose accept raised this candidate. "
-                    "Null on rows queued before this column existed. On approval, the minted "
-                    "master row's CreatedBy credits this user, never the admin.")
-    proposed_category: str | None = Field(description="AI-proposed STRIDE-style category. Null on actor candidates.")
-    proposed_type: str | None = Field(description="AI-proposed threat type name. On actor candidates: the type "
-                                                "the actor was proposed FOR — approval resolves the actor→type "
-                                                "link from it. Null only on legacy actor rows.")
-    proposed_name: str = Field(description="AI-proposed name, asset-specific as originally written.")
-    proposed_generic_name: str | None = Field(description="Asset-agnostic form — what actually gets embedded/catalogued on approval.")
-    threat_type_id: int | None = Field(
-        default=None,
-        description="On a PENDING card: the queue-time grounding — the id approval uses FIRST "
-                    "(after a liveness check), else approval resolves by the proposed_type "
-                    "text. On a RESOLVED card (the detail route serves those too): the "
-                    "resolution outcome — the minted/linked type, null when an actor approval "
-                    "skipped the link; a rejected card keeps its queue-time value. Shown so "
-                    "the reviewer sees the actual target, not just its text.")
-    status: CandidateStatus = Field(description="pending, accepted, or rejected.")
-    created_at: str = Field(description="When this candidate was queued (ISO 8601).")
-
-
-class PendingCandidatesResponse(BaseModel):
-    """GET /v1/tsg/threat-library/candidates — every candidate awaiting curator review."""
-    candidates: list[PendingCandidate]
-    total: int = Field(description="Row count returned (bounded by the request's `limit`).")
-
-
-class CandidateResolutionResult(BaseModel):
-    """Response of POST .../candidates/{id}/approve or .../reject — both card kinds."""
-    model_config = ConfigDict(json_schema_extra={"example": {"candidate_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-                                                            "status": "accepted", "threat_type_id": 210,
-                                                            "threat_catalogue_id": 4021}})
-    candidate_id: str = Field(description="Candidate that was resolved.")
-    status: CandidateStatus = Field(description="accepted or rejected — the status this candidate now has.")
-    threat_type_id: int | None = Field(
-        description="Library Threat_Type id this candidate resolved to. Null on reject; on an "
-                    "actor approval it is the type the actor was LINKED to — null when the link "
-                    "was skipped (no unambiguous active type matched the card).")
-    threat_catalogue_id: int | None = Field(
-        description="Library Threat_Catalogue id this candidate resolved to. Null on reject, "
-                    "and always null on actor approvals (actors have no catalogue entry).")
-
-
-# ---------------------------------------------------------------------------
-# Threat-library master CRUD (app/api/library_crud.py)
-#
-# Three models per table — Create, Update (every field optional), Row (the response). They do
-# not collapse into one generic pair: the four tables genuinely differ (a category has a
-# SecurityObjective, an actor has IsCapable, a catalogue row has a parent type), and one loose
-# model would accept fields the target table has no column for.
-#
-# Update models: every field defaults to None and the handler sends only what was actually set,
-# so an omitted field keeps its current value instead of being nulled. An empty body is rejected
-# — far more likely a mistake than a request to stamp UpdatedBy and change nothing.
-# ---------------------------------------------------------------------------
-class LibraryRowAudit(BaseModel):
+class LibraryRowAudit(ApiModel):
     """Provenance every master row carries. `source` records WHERE the row came from
     ('functional_team_excel' seed, an import tag, 'ai_auto_promoted', 'manual' via this API);
     created_by/updated_by record WHO, as the caller's user id.
@@ -1914,7 +1877,7 @@ class LibraryRowAudit(BaseModel):
     )
 
 
-class ThreatCategoryCreate(BaseModel):
+class ThreatCategoryCreate(ApiModel):
     """New Threat_Category row. `threat_category_id` is REQUIRED and caller-supplied because
     this table's PK is a plain int, not IDENTITY (TSG_Core.sql section 2) — the STRIDE set is
     fixed and externally numbered. Deriving MAX+1 server-side would race two concurrent creates
@@ -1930,7 +1893,7 @@ class ThreatCategoryCreate(BaseModel):
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
 
-class ThreatCategoryUpdate(BaseModel):
+class ThreatCategoryUpdate(ApiModel):
     """Partial update — send only what changes. At least one field is required."""
     model_config = ConfigDict(json_schema_extra={"example": {"security_objective": "Authorization"}})
 
@@ -1948,28 +1911,20 @@ class ThreatCategoryRow(LibraryRowAudit):
     security_objective: str | None = Field(default=None, description="CIA objective.")
 
 
-class ThreatTypeCreate(BaseModel):
-    """New Threat_Type row (a threat FAMILY). Unique on (name, category, sector) among live
-    rows, so the same name under a different category or sector is allowed — and a name freed
-    by a soft delete can be reused."""
+class ThreatTypeCreate(ApiModel):
+    """New Threat_Type row (a threat FAMILY). Unique on NAME alone among live rows — a name
+    freed by a soft delete can be reused."""
     model_config = ConfigDict(json_schema_extra={"example": {
         "threat_type_name": "Credential Abuse", "description": "Attacks that misuse valid credentials.",
         "threat_category_id": 4}})
 
     threat_type_name: str = Field(min_length=1, max_length=300, description="Family name. Also the text the AI matches against — keep it descriptive.")
     description: str | None = Field(default=None, description="Free text. Not embedded; only the name is matched.")
-    sector_id: int | None = Field(default=None, ge=1, description="Scope to one sector, or null for every sector.")
     threat_category_id: int | None = Field(default=None, ge=1, description="Owning STRIDE category. Must reference a live Threat_Category row.")
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
-    actor_names: list[str] = Field(
-        default=[],
-        description="Adversary types for this family, linked on create. Existing names "
-                    "(case-insensitive) are reused; genuinely new ones are created — admin "
-                    "supply is the deliberate way the actor vocabulary grows."
-    )
 
 
-class ThreatTypeUpdate(BaseModel):
+class ThreatTypeUpdate(ApiModel):
     """Partial update — send only what changes. At least one field is required.
 
     Renaming re-embeds this row for AI matching — see the endpoint's `embeddings_job_id`."""
@@ -1977,15 +1932,8 @@ class ThreatTypeUpdate(BaseModel):
 
     threat_type_name: str | None = Field(default=None, min_length=1, max_length=300)
     description: str | None = Field(default=None)
-    sector_id: int | None = Field(default=None, ge=1)
     threat_category_id: int | None = Field(default=None, ge=1)
     is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a natural-key clash.")
-    actor_names: list[str] | None = Field(
-        default=None,
-        description="Adversary types to link to this family — ADDITIVE and idempotent "
-                    "(existing links are never removed). Also the repair path when a create's "
-                    "actor linking failed after the family was committed."
-    )
 
 
 class ThreatTypeRow(LibraryRowAudit):
@@ -1993,34 +1941,32 @@ class ThreatTypeRow(LibraryRowAudit):
     threat_type_id: int = Field(description="Primary key.")
     threat_type_name: str = Field(description="Family name.")
     description: str | None = Field(default=None)
-    sector_id: int | None = Field(default=None)
     threat_category_id: int | None = Field(default=None)
 
 
-class ThreatCatalogueCreate(BaseModel):
-    """New Threat_Catalogue row (one EXACT threat under a family). Unique on
-    (threat_type_id, name, sector) among live rows."""
+class ThreatCatalogueCreate(ApiModel):
+    """New Threat_Catalogue row (one EXACT threat under a family). Name-unique among live rows
+    (UX_ThreatCatalogue_NaturalKey); the app also dedups by normalized name."""
     model_config = ConfigDict(json_schema_extra={"example": {
         "threat_type_id": 12, "threat_name": "Credential phishing and MFA session theft",
         "description": "Adversary-in-the-middle phishing that replays the session cookie."}})
 
     threat_type_id: int = Field(ge=1, description="Owning family. Must reference a live Threat_Type row.")
     threat_name: str = Field(min_length=1, max_length=500, description="Exact threat name. Also the text the AI matches against.")
-    description: str | None = Field(default=None, description="Free text. Not embedded; only the name is matched.")
-    sector_id: int | None = Field(default=None, ge=1, description="Scope to one sector, or null for every sector.")
+    description: str | None = Field(default=None, description="Free text; embedded together with the name (catalogue_passage_text).")
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
 
-class ThreatCatalogueUpdate(BaseModel):
+class ThreatCatalogueUpdate(ApiModel):
     """Partial update — send only what changes. At least one field is required.
 
-    Renaming re-embeds this row for AI matching — see the endpoint's `embeddings_job_id`."""
+    Renaming OR re-describing re-embeds this row for AI matching — see the endpoint's
+    `embeddings_job_id`."""
     model_config = ConfigDict(json_schema_extra={"example": {"description": "Updated wording."}})
 
     threat_type_id: int | None = Field(default=None, ge=1)
     threat_name: str | None = Field(default=None, min_length=1, max_length=500)
     description: str | None = Field(default=None)
-    sector_id: int | None = Field(default=None, ge=1)
     is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a natural-key clash.")
 
 
@@ -2030,10 +1976,9 @@ class ThreatCatalogueRow(LibraryRowAudit):
     threat_type_id: int = Field(description="Owning family.")
     threat_name: str = Field(description="Exact threat name.")
     description: str | None = Field(default=None)
-    sector_id: int | None = Field(default=None)
 
 
-class ThreatActorCreate(BaseModel):
+class ThreatActorCreate(ApiModel):
     """New Threat_Actor row. Unique on name alone among live rows — actors are global, with no
     sector or category dimension."""
     model_config = ConfigDict(json_schema_extra={"example": {"threat_actor_name": "Hacktivist", "is_capable": 1}})
@@ -2043,7 +1988,7 @@ class ThreatActorCreate(BaseModel):
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
 
-class ThreatActorUpdate(BaseModel):
+class ThreatActorUpdate(ApiModel):
     """Partial update — send only what changes. At least one field is required."""
     model_config = ConfigDict(json_schema_extra={"example": {"is_capable": 0}})
 
@@ -2059,65 +2004,11 @@ class ThreatActorRow(LibraryRowAudit):
     is_capable: int = Field(description="Capability weight.")
 
 
-class ThreatRuleCreate(BaseModel):
-    """New Config_Threat_Rule row — a scoping rule (tech_gate hard include/exclude, or a
-    relevance_* score weight) keyed to one threat family. Unique on the live
-    (threat_type_id, rule_type, rule_key, rule_value) quadruple.
-
-    `weight` is stored server-side as Metadata {"weight": N} — callers never write raw Metadata
-    JSON, because a malformed blob makes scoping skip the rule silently (_rule_weight's contract).
-    tech_gate rules take NO weight (they are a hard door; scoping records delta 0.0)."""
-    model_config = ConfigDict(json_schema_extra={"example": {
-        "rule_type": "relevance_flag", "threat_type_id": 12, "rule_key": "asset_type",
-        "rule_value": "Operational Technology (OT)", "weight": 10.0}})
-
-    rule_type: str = Field(description="One of: tech_gate, relevance_flag, relevance_context_value.")
-    threat_type_id: int = Field(ge=1, description="The Threat_Type this rule scopes — must name a live family.")
-    rule_key: str = Field(min_length=1, max_length=200,
-                        description="Context field the rule reads. Must be in scoping's allowlist "
-                                    "(currently: criticality, subsystem_name, asset_type, past_incidents) "
-                                    "— an unknown key would create a rule that silently never fires.")
-    rule_value: str | None = Field(default=None, max_length=450,
-                                description="Expected value. Omit for the key's default/truthy check; "
-                                            "an explicit empty string means 'match a blank field'.")
-    weight: float | None = Field(default=None,
-                                description="relevance_* score delta. Omit to use the configured "
-                                            "default_rule_weight. Forbidden on tech_gate.")
-    is_active: bool = Field(default=True, description="Set false to create the rule already disabled.")
-
-
-class ThreatRuleUpdate(BaseModel):
-    """Partial update — send only what changes. `rule_type`/`rule_key`/`threat_type_id` are
-    deliberately immutable (retire the rule and create a new one; keeps the audit trail honest).
-    Sending `weight: null` explicitly CLEARS the override back to the configured default."""
-    model_config = ConfigDict(json_schema_extra={"example": {"weight": 15.0}})
-
-    rule_value: str | None = Field(default=None, max_length=450)
-    weight: float | None = Field(default=None)
-    is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a natural-key clash.")
-
-
-class ThreatRuleRow(BaseModel):
-    """One Config_Threat_Rule row as returned by the CRUD endpoints."""
-    threat_rule_id: int = Field(description="Primary key.")
-    rule_type: str = Field(description="tech_gate | relevance_flag | relevance_context_value.")
-    threat_type_id: int = Field(description="The Threat_Type this rule scopes.")
-    rule_key: str = Field(description="Context field the rule reads.")
-    rule_value: str | None = Field(description="Expected value; null = default/truthy check.")
-    weight: float | None = Field(description="Metadata weight override; null = configured default (or n/a for tech_gate).")
-    is_active: bool
-    is_deleted: bool
-    created_at: datetime | None = None
-    created_by: str | None = None
-    updated_at: datetime | None = None
-    updated_by: str | None = None
-
-
 # --- Control library (/v1/tsg/control-library) -------------------------------------------
 # Same three-model-per-table shape as the threat masters above. The one behavioural difference
 # worth knowing: a control's embedded text is `control_name + ": " + control_description`, so
 # editing EITHER re-embeds the row — unlike the threat tables, where only the name counts.
-class ControlStandardCreate(BaseModel):
+class ControlStandardCreate(ApiModel):
     """New Control_Standard row (a named standard, e.g. 'NIST SP 800-53 Rev. 5'). Unique on name
     among live rows."""
     model_config = ConfigDict(json_schema_extra={"example": {"standard_name": "NIST SP 800-53 Rev. 5"}})
@@ -2126,7 +2017,7 @@ class ControlStandardCreate(BaseModel):
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
 
-class ControlStandardUpdate(BaseModel):
+class ControlStandardUpdate(ApiModel):
     """Partial update — send only what changes. At least one field is required."""
     model_config = ConfigDict(json_schema_extra={"example": {"standard_name": "ISO 27001:2022", "is_active": True}})
 
@@ -2140,7 +2031,7 @@ class ControlStandardRow(LibraryRowAudit):
     standard_name: str = Field(description="Standard's full name.")
 
 
-class ControlCreate(BaseModel):
+class ControlCreate(ApiModel):
     """New Control_Library row. Unique on `control_code` among live rows — the code, not the
     name, is the natural key, because two controls can legitimately share a name across domains."""
     model_config = ConfigDict(json_schema_extra={"example": {
@@ -2166,7 +2057,7 @@ class ControlCreate(BaseModel):
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
 
-class ControlUpdate(BaseModel):
+class ControlUpdate(ApiModel):
     """Partial update — send only what changes. At least one field is required.
 
     Changing `control_name` OR `control_description` re-embeds the control (see the endpoint's
@@ -2197,7 +2088,7 @@ class ControlRow(LibraryRowAudit):
     sample_evidence: str | None = Field(default=None, description="Example evidence.")
 
 
-class ControlStandardsResponse(BaseModel):
+class ControlStandardsResponse(ApiModel):
     """The standards currently linked to one control — what fills `standards[]` on a scenario's
     mapped controls. Returned by the attach/detach endpoints so the caller sees the result of
     the change without a second call."""
@@ -2211,10 +2102,10 @@ class ControlStandardsResponse(BaseModel):
 
 
 # --- Risk Treatment Plan generation (app/api/treatment.py, docs/RISK_TREATMENT_PLAN_SDD.md §5) ---
-class TreatmentPlanBody(BaseModel):
-    """POST .../scenarios/{output_id}/treatment-plan — the register's risk data, sent by the
+class TreatmentPlanBody(ApiModel):
+    """POST .../scenarios/{scenario_id}/treatment-plan — the register's risk data, sent by the
     UI (TSG reads NO risk-module tables; the body is the single source). TSG extracts the
-    asset/threat/scenario/mapped-controls half itself via the path's session_id + output_id.
+    asset/threat/scenario/mapped-controls half itself via the path's session_id + scenario_id.
 
     The endpoint IS the Mitigate generator — there is no strategy field; TreatmentStrategy is
     stamped server-side (TreatmentStrategy.mitigate). Register facts the AI must never invent
@@ -2222,7 +2113,14 @@ class TreatmentPlanBody(BaseModel):
     the output shows null, the model is never asked to fill the gap. `user_id` is deliberately
     NOT a field — the acting user comes from the authenticated principal (see
     CreateSessionBody's rationale)."""
-    model_config = ConfigDict(json_schema_extra={"example": {
+    # extra="forbid": an unrecognised key is a 422 naming it, never a silent drop. This is the
+    # FIRST forbid model in this file (the rest take pydantic's ignore default, and ScenarioResult
+    # sets allow on purpose) — deliberate here, because silent-drop is exactly how the
+    # mitigation_*/timeline_* field-name mismatch stayed invisible while every request returned
+    # 200 and lost its assessment window. Keys accepted-and-dropped before this flag, which now
+    # 422: user_id, strategy, treatment_strategy, user_note, timeline_start_date/_end_date.
+    # Rejection renders as the standard 422 envelope with errors[].type == "extra_forbidden".
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"example": {
         "existing_controls": ["annual patching", "network firewall"],
         "likelihood_rating": 4, "impact_rating": 5,
         "final_risk_rating": 20, "risk_level": "Critical",
@@ -2230,7 +2128,8 @@ class TreatmentPlanBody(BaseModel):
         "risk_owner": "Head of OT Operations",
         "impacted_business_division": "Water Treatment Operations",
         "existing_controls_all_subsystems": "No",
-        "existing_controls_all_subsystems_justification": "Controls deployed on IT systems only."}})
+        "existing_controls_all_subsystems_justification": "Controls deployed on IT systems only.",
+        "mitigation_start_date": "2026-07-01", "mitigation_end_date": "2026-09-30"}})
 
     existing_controls: list[str] = Field(
         max_length=_MAX_BATCH,
@@ -2262,12 +2161,43 @@ class TreatmentPlanBody(BaseModel):
     existing_controls_all_subsystems_justification: str | None = Field(
         default=None, max_length=1000,
         description="Free-text justification for the Yes/No above (redacted before reaching the AI).")
-    user_note: str | None = Field(
-        default=None, max_length=1000,
-        description=("Optional steering for the first generation — e.g. 'vendor owns the "
-                     "network; prefer host-level controls'. Redacted, then shown to the AI as "
-                     "reviewer_note (prompt RULE 6). Later versions are steered via "
-                     "POST .../treatment-plan/regenerate's own user_note."))
+    mitigation_start_date: date | None = Field(
+        default=None,
+        description="Start of the window the ENTIRE risk assessment must complete within. "
+                    "Provide together with mitigation_end_date, or neither.")
+    mitigation_end_date: date | None = Field(
+        default=None,
+        description="End of that window — every mitigation action's schedule and the overall "
+                    "mitigation_timeline must fit inside [start, end].")
+
+    @field_validator("risk_identification_date", "risk_owner", "impacted_business_division",
+                     "existing_controls_all_subsystems",
+                     "existing_controls_all_subsystems_justification",
+                     "mitigation_start_date", "mitigation_end_date", mode="before")
+    @classmethod
+    def _blank_is_absent(cls, v):
+        """An empty string means "not provided" on every OPTIONAL field, not a validation failure.
+
+        The UI sends "" for an unfilled control. Without this, the TYPED ones (the two dates, the
+        datetime, and the YesNo enum) each 422 the ENTIRE request — the caller gets no plan at all
+        rather than a plan without that value, which contradicts this model's own "absent -> the
+        output shows null" contract. The two str fields are included deliberately: they ACCEPT ""
+        happily, and it then survives redact() into the snapshot and back out through
+        _VISIBLE_PLAN_KEYS as "" where that same contract promises null.
+
+        `risk_level` is deliberately NOT here — it is REQUIRED, so "" there is a genuinely
+        unfilled mandatory field and its 422 is the correct answer.
+        mode="before" so this runs ahead of both type coercion and _validate_mitigation_window.
+        """
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @model_validator(mode="after")
+    def _validate_mitigation_window(self):
+        if (self.mitigation_start_date is None) != (self.mitigation_end_date is None):
+            raise ValueError("mitigation_start_date and mitigation_end_date must be provided together")
+        if self.mitigation_start_date and self.mitigation_end_date < self.mitigation_start_date:
+            raise ValueError("mitigation_end_date must be on or after mitigation_start_date")
+        return self
 
     @field_validator("existing_controls")
     @classmethod
@@ -2287,33 +2217,37 @@ class TreatmentPlanBody(BaseModel):
         return v.astimezone(UTC).replace(tzinfo=None)
 
 
-class TreatmentPlanRegenerateBody(BaseModel):
-    """POST .../treatment-plan/regenerate — mint a new plan version. ONLY the note travels:
-    the register risk data was frozen into the active version's InputSnapshotJSON at first
+class TreatmentPlanRegenerateBody(ApiModel):
+    """POST .../treatment-plan/regenerate — mint a new plan version. NOTHING travels: send `{}`.
+
+    The register risk data was frozen into the active version's InputSnapshotJSON at first
     generation and is reused from there (the client never resends it; changed register data
     cannot be resubmitted after first generation — a documented limitation of this shape).
     The baseline is the ACTIVE version — the one a human last chose — never simply the
-    newest, so regenerating after a version switch builds on the switched-to plan."""
-    model_config = ConfigDict(json_schema_extra={"example": {
-        "user_note": "focus on database encryption; vendor owns the network"}})
-    user_note: str | None = Field(
-        default=None, max_length=1000,
-        description=("Optional steering for this regeneration — replaces the previous "
-                     "version's note entirely (omit for none). Redacted, then shown to the "
-                     "AI as reviewer_note."))
+    newest, so regenerating after a version switch builds on the switched-to plan.
+
+    The body is now EMPTY (the `user_note` steering field was removed 2026-08). What a
+    regeneration therefore does is REFRESH the plan against the CURRENT scenario and its mapped
+    controls: build_treatment_input rebuilds the TSG-derived half every time, so a scenario that
+    changed since the last version yields a different plan. With nothing changed and
+    TREATMENT_TEMPERATURE at 0.0 the model is deterministic, so the result is the previous plan
+    again — the call still costs an LLM round trip. The model is kept (rather than dropping the
+    body parameter) so a client still POSTing the removed field gets a loud 422 instead of having
+    its body silently ignored."""
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"example": {}})
 
 
-class TreatmentPlanAccepted(BaseModel):
+class TreatmentPlanAccepted(ApiModel):
     """202 body for the POST — the GET on the same path is the poll endpoint."""
     model_config = ConfigDict(json_schema_extra={"example": {
         "plan_id": "0f0e0d0c-0b0a-8988-8786-858483828180",
         "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
-        "output_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
+        "scenario_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
         "status": "RUNNING"}})
 
     plan_id: str = Field(description="The new Risk_Treatment_Plan row's id.")
     session_id: str = Field(description="Echo of the session in the path.")
-    output_id: str = Field(description="Echo of the scenario in the path.")
+    scenario_id: str = Field(description="Echo of the scenario in the path.")
     # Narrowed because the ROUTE constructs this from an enum member — safe. The GET/board/register
     # status fields are deliberately NOT narrowed: those come back from the database as free text,
     # and one out-of-vocabulary row would 500 the whole page rather than degrade.
@@ -2322,11 +2256,11 @@ class TreatmentPlanAccepted(BaseModel):
                     "COMPLETE or ERROR; that GET also serves the finished plan. For an instant "
                     "hand-off the worker additionally publishes an advisory `treatment_plan_result` "
                     "on GET /v1/sessions/{session_id}/events — listen with "
-                    "addEventListener('treatment_plan_result'), match on output_id (a regenerate "
+                    "addEventListener('treatment_plan_result'), match on scenario_id (a regenerate "
                     "mints a new plan_id), and KEEP the poll: several outcomes never publish.")
 
 
-class TreatmentPlanStatus(BaseModel):
+class TreatmentPlanStatus(ApiModel):
     """GET .../treatment-plan — the active plan row. `status` is the poll signal; `plan` is the
     parsed PlanJSON contract (null until COMPLETE, or when the stored blob is corrupt). A
     RUNNING row whose progress clock stopped for longer than treatment_stale_seconds is
@@ -2343,7 +2277,7 @@ class TreatmentPlanStatus(BaseModel):
     model_config = ConfigDict(json_schema_extra={"example": {
         "plan_id": "0f0e0d0c-0b0a-8988-8786-858483828180",
         "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
-        "output_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
+        "scenario_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
         "status": "COMPLETE", "treatment_strategy": "Mitigate",
         "scenario": {"threat_category": "Elevation of Privilege",
                      "threat_type": "Credential Abuse",
@@ -2376,7 +2310,7 @@ class TreatmentPlanStatus(BaseModel):
 
     plan_id: str = Field(description="Risk_Treatment_Plan row id.")
     session_id: str = Field(description="Owning session.")
-    output_id: str = Field(description="The accepted scenario this plan treats.")
+    scenario_id: str = Field(description="The accepted scenario this plan treats.")
     status: str = Field(description="RUNNING | COMPLETE | ERROR — the poll signal (stale RUNNING projects as ERROR).")
     treatment_strategy: str = Field(description="The strategy this plan was generated for — server-stamped 'Mitigate'.")
     scenario: dict[str, Any] | None = Field(
@@ -2392,8 +2326,21 @@ class TreatmentPlanStatus(BaseModel):
     review_status: str | None = Field(
         default=None, description="TreatmentReviewStatus (approved / rejected) — null until a human reviews.")
     review_comment: str | None = Field(default=None, exclude=True, description="The reviewer's comment, if any.")
-    reviewed_by: str | None = Field(default=None, exclude=True, description="Who recorded the decision (from their login token).")
-    reviewed_at: datetime | None = Field(default=None, exclude=True, description="When the decision was recorded.")
+    # UNHIDDEN (was exclude=True under the 06 Aug 2026 presentation trim): the requirement
+    # "user_id who created the remediation plan, user_id who accepted the plan — everything is
+    # required" supersedes that trim for the two ATTRIBUTION fields. review_comment stays hidden;
+    # it was not asked for and is not an attribution.
+    reviewed_by: str | None = Field(default=None, description="Who recorded the review decision (from their login token).")
+    reviewed_at: datetime | None = Field(default=None, description="When the review decision was recorded.")
+    created_by: str | None = Field(
+        default=None,
+        description="User id of whoever REQUESTED this plan. Distinct from reviewed_by: the "
+                    "generator and the reviewer are routinely different people, which is the "
+                    "point of the review step.")
+    cancelled_by: str | None = Field(
+        default=None, description="User id of whoever cancelled this plan. Null unless cancelled.")
+    cancelled_at: datetime | None = Field(
+        default=None, description="When it was cancelled (naive UTC). Null unless cancelled.")
     risk_identification_date: datetime | None = Field(
         default=None,
         description="Echo of the request's register date — record data, never AI-generated (spec). Null when not sent.")
@@ -2433,10 +2380,10 @@ class TreatmentPlanStatus(BaseModel):
     completed_at: datetime | None = Field(default=None, exclude=True, description="When it reached COMPLETE/ERROR.")
 
 
-class TreatmentBoardRow(BaseModel):
+class TreatmentBoardRow(ApiModel):
     """One accepted scenario's line on the session plan board. Null plan fields = no plan has
     ever been requested for it (the UI shows a Generate button)."""
-    output_id: str = Field(description="The accepted scenario.")
+    scenario_id: str = Field(description="The accepted scenario.")
     scenario_title: str | None = Field(default=None, description="From the scenario, for display.")
     plan_id: str | None = Field(default=None, description="Active plan id; null = never requested.")
     status: str | None = Field(default=None, description="RUNNING | COMPLETE | ERROR (stale RUNNING projects as ERROR).")
@@ -2463,22 +2410,22 @@ class TreatmentBoardRow(BaseModel):
     completed_at: datetime | None = Field(default=None)
 
 
-class TreatmentBoard(BaseModel):
+class TreatmentBoard(ApiModel):
     """GET /v1/sessions/{id}/treatment-plans — every accepted scenario's plan state in ONE
     call (the page the reviewer looks at daily; replaces N per-scenario polls)."""
     model_config = ConfigDict(json_schema_extra={"example": {
         "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e", "accepted_scenarios": 2,
-        "plans": [{"output_id": "1a2b…", "scenario_title": "Ransomware via exposed RDP",
+        "plans": [{"scenario_id": "1a2b…", "scenario_title": "Ransomware via exposed RDP",
                    "plan_id": "b9fe…", "status": "COMPLETE", "risk_level": "Critical",
                    "review_status": "approved"},
-                  {"output_id": "9f3c…", "scenario_title": "Insider tampering",
+                  {"scenario_id": "9f3c…", "scenario_title": "Insider tampering",
                    "plan_id": None, "status": None}]}})
     session_id: str
     accepted_scenarios: int = Field(description="How many accepted scenarios the session holds.")
     plans: list[TreatmentBoardRow]
 
 
-class TreatmentCancelResponse(BaseModel):
+class TreatmentCancelResponse(ApiModel):
     """POST .../treatment-plan/cancel — the stop button's receipt."""
     plan_id: str
     status: Literal[StageStatus.ERROR] = Field(  # route-constructed from the enum — safe to narrow
@@ -2486,7 +2433,7 @@ class TreatmentCancelResponse(BaseModel):
     error_message: str | None = Field(default=None, description="'cancelled by user'.")
 
 
-class TreatmentReviewBody(BaseModel):
+class TreatmentReviewBody(ApiModel):
     """POST .../treatment-plan/review — record the human adoption decision on a COMPLETE
     plan. The reviewer's identity comes from the login token, never from this body."""
     model_config = ConfigDict(json_schema_extra={"example": {
@@ -2512,18 +2459,18 @@ class TreatmentReviewBody(BaseModel):
     _canonicalize_plan_id = field_validator("plan_id")(_canonical_guid_or_none)
 
 
-class TreatmentReviewResponse(BaseModel):
+class TreatmentReviewResponse(ApiModel):
     plan_id: str
     review_status: TreatmentReviewStatus  # echoes the validated request body — safe to type
     reviewed_by: str | None = Field(default=None, description="From the reviewer's login token.")
     reviewed_at: datetime | None = None
 
 
-class TreatmentRegisterRow(BaseModel):
+class TreatmentRegisterRow(ApiModel):
     """One plan in the entity-wide remediation register."""
     plan_id: str
     session_id: str
-    output_id: str
+    scenario_id: str
     asset_name: str | None = None
     scenario_title: str | None = None
     status: str = Field(description="RUNNING | COMPLETE | ERROR (stale RUNNING projects as ERROR).")
@@ -2558,7 +2505,7 @@ class TreatmentRegisterRow(BaseModel):
     completed_at: datetime | None = None
 
 
-class TreatmentRegisterPage(BaseModel):
+class TreatmentRegisterPage(ApiModel):
     """GET /v1/entities/{id}/treatment-plans — every plan across the entity, newest first,
     filterable by status / review_status / risk_level. This list IS the remediation register."""
     entity_id: str
@@ -2567,7 +2514,7 @@ class TreatmentRegisterPage(BaseModel):
     plans: list[TreatmentRegisterRow]
 
 
-class TreatmentAuditEvent(BaseModel):
+class TreatmentAuditEvent(ApiModel):
     """One entry in a treatment-plan audit trail. `detail` is the event's DetailJSON verbatim
     (plan_id, status, decision, note… depending on the event type)."""
     at: datetime | None = Field(default=None, description="When it happened (UTC).")
@@ -2578,15 +2525,15 @@ class TreatmentAuditEvent(BaseModel):
     detail: dict[str, Any] = Field(default_factory=dict)
 
 
-class TreatmentAuditTrail(BaseModel):
+class TreatmentAuditTrail(ApiModel):
     """GET .../treatment-plan/audit — one scenario's plan life story across ALL versions:
     who requested, each attempt's outcome, cancels, reviews, and supersedes, oldest first."""
     session_id: str
-    output_id: str
+    scenario_id: str
     events: list[TreatmentAuditEvent]
 
 
-class TreatmentEntityAuditPage(BaseModel):
+class TreatmentEntityAuditPage(ApiModel):
     """GET /v1/entities/{id}/treatment-plans/audit — the compliance feed: every treatment-plan
     action across the entity, newest first, filterable by date range and person."""
     entity_id: str
@@ -2595,7 +2542,7 @@ class TreatmentEntityAuditPage(BaseModel):
     events: list[TreatmentAuditEvent]
 
 
-class TreatmentEvidenceAttempt(BaseModel):
+class TreatmentEvidenceAttempt(ApiModel):
     """One AI-call receipt (Prompt_Log row) for the plan version — the exact words exchanged."""
     at: datetime | None = None
     prompt: str | None = Field(default=None, description="The exact flattened prompt sent.")
@@ -2606,7 +2553,7 @@ class TreatmentEvidenceAttempt(BaseModel):
     parse_succeeded: bool | None = None
 
 
-class TreatmentEvidence(BaseModel):
+class TreatmentEvidence(ApiModel):
     """GET .../treatment-plan/evidence?version={plan_id} — the reproducibility bundle for ONE
     version (superseded versions included — that is what an auditor asks for): the frozen
     input snapshot, the validation/moderation record, and every AI-call receipt (linked by
@@ -2620,3 +2567,203 @@ class TreatmentEvidence(BaseModel):
     input_snapshot: dict[str, Any] | None = Field(default=None, description="Exactly what the AI was given.")
     validation: dict[str, Any] | None = Field(default=None, description="Warnings + moderation record.")
     attempts: list[TreatmentEvidenceAttempt]
+
+
+# ---------------------------------------------------------------------------
+# Grounding-threshold calibration (app/api/admin.py::grounding_router)
+# ---------------------------------------------------------------------------
+
+class GroundingCalibrationBody(ApiModel):
+    """POST body for /v1/tsg/grounding/calibrate."""
+    model_config = ConfigDict(json_schema_extra={"example": {"force": False}})
+
+    force: bool = Field(
+        default=False,
+        description="Re-measure and OVERWRITE an existing stored calibration for this "
+                    "embedding+reranker pair. Without it a pair that already has one is a no-op "
+                    "(the job returns skipped=already_calibrated), because a sweep costs minutes "
+                    "of wall-clock and real LLM spend. Set it after curating the threat library.",
+    )
+
+
+class GroundingCalibrationAccepted(ApiModel):
+    """Returned immediately (202) when a calibration sweep is started — poll
+    GET .../calibrate/status/{job_id} for the eventual outcome."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "run_id": "0f8fad5b-d9cb-469f-a165-70867728950e"}})
+
+    job_id: str = Field(description="Celery task id for the queued sweep. Poll GET "
+                                    "calibrate/status/{job_id} for the outcome.")
+    run_id: str = Field(description="Ledger row id (Grounding_Calibration_Run.RunID). Unlike "
+                                    "job_id, which expires with the Celery result after an hour, "
+                                    "this identifies the run permanently — it is what "
+                                    "GET /calibrations reports.")
+
+
+class GroundingCalibrationStatus(ApiModel):
+    """Polled result of a queued calibration sweep. `state` mirrors Celery's AsyncResult.state;
+    every measurement field is populated only once `state == "SUCCESS"`, `error` only on FAILURE.
+
+    NOTE `state == "SUCCESS"` with `match_th == null` is a real, meaningful outcome, not a bug:
+    the sweep ran and found that NO cutoff separates genuine matches from impostors better than
+    chance under this model pair. That is a finding about the models/library, so it is reported
+    as a successful measurement rather than a task failure — see `quality`."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "state": "SUCCESS",
+                "match_th": 86.25,
+                "quality": 0.94,
+                "negatives": 100,
+                "positives": 200,
+                "highest_negative": 99.5,
+                "lowest_positive": 71.2,
+                "near_duplicates": ["'Mobile, QR or collaboration-channel compromise' ~ "
+                                    "'Removable media or portable device compromise' @ 99.5"],
+                "embedding_model": "multilingual-e5-large",
+                "reranker_model": "bge-reranker-v2-m3",
+                "skipped": None,
+                "error": None,
+            }
+        }
+    )
+
+    state: CeleryJobState = Field(
+        description="Job's current state, mirrors Celery's AsyncResult.state — see CeleryJobState."
+    )
+    match_th: float | None = Field(
+        default=None,
+        description="The measured cutoff. null means no cutoff beat chance (see the class note).")
+    quality: float | None = Field(
+        default=None,
+        description="Youden's J at `match_th`: 1.0 separates the two classes perfectly, 0.0 is "
+                    "chance. THE FIELD THAT SAYS WHETHER TO TRUST `match_th` — a cutoff scraped "
+                    "out of heavy overlap and one measured on cleanly separated scores are the "
+                    "same float otherwise. null when the sweep was skipped.")
+    negatives: int | None = Field(
+        default=None, description="Impostor scores measured (library entries vs the library "
+                                "with themselves removed).")
+    positives: int | None = Field(
+        default=None, description="Genuine-match scores measured (LLM paraphrases vs the full library).")
+    highest_negative: float | None = Field(
+        default=None, description="Best score any impostor achieved — the ceiling the cutoff fights.")
+    lowest_positive: float | None = Field(
+        default=None, description="Worst score any genuine paraphrase achieved.")
+    near_duplicates: list[str] = Field(
+        default_factory=list,
+        description="Catalogue pairs naming the same threat (scored >= TSG_NEAR_DUPLICATE_SCORE "
+                    "against each other). Each is scored as an impostor against its own twin, so "
+                    "it drags the measured cutoff down. CURATION WORK, not an error — calibration "
+                    "no longer aborts on these; dedupe them and re-run with force=true for a "
+                    "tighter threshold.")
+    run_id: str | None = Field(
+        default=None,
+        description="Ledger row id. This route answers from the permanent row once the Celery "
+                    "result has expired, so a late poll still gets the real outcome.")
+    embedding_model: str | None = Field(default=None, description="Embedding model this calibration is for.")
+    reranker_model: str | None = Field(default=None, description="Reranker model this calibration is for.")
+    skipped: str | None = Field(
+        default=None,
+        description="Set when the sweep did not run: 'already_calibrated' means this pair had a "
+                    "successful run and force was not set.")
+    error: str | None = Field(default=None, description="Populated only when state is FAILURE.")
+
+
+class GroundingCalibrationRun(ApiModel):
+    """One row of calibration history — who ran it, when, and how it ended."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "run_id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+                "job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "status": "success",
+                "started_by": "gopal",
+                "started_by_client": "tsg-web",
+                "started_at": "2026-08-27T10:14:02Z",
+                "finished_at": "2026-08-27T10:29:41Z",
+                "embedding_model": "multilingual-e5-large",
+                "reranker_model": "bge-reranker-v2-m3",
+                "forced": False,
+                "match_th": 86.25,
+                "quality": 0.99,
+                "negatives": 100,
+                "positives": 200,
+                "highest_negative": 99.5,
+                "lowest_positive": 71.2,
+                "near_duplicates": [],
+                "error": None,
+            }
+        }
+    )
+
+    run_id: str = Field(description="Grounding_Calibration_Run.RunID — permanent.")
+    job_id: str | None = Field(default=None, description="Celery task id, for cross-referencing "
+                                                        "logs. Expires; run_id does not.")
+    status: str = Field(
+        description="running | success | no_signal | failed. `no_signal` is NOT a crash — the "
+                    "sweep ran and found no cutoff that beats chance under this model pair, which "
+                    "means curate the library or change models. `failed` means it raised. A "
+                    "`running` row past the stale window is reported here as `failed`, since it "
+                    "cannot still be running.")
+    started_by: str | None = Field(
+        default=None,
+        description="The X-User-Id that asked. CLAIMED, not proven: admin routes are gated by a "
+                    "shared X-Admin-Key and this header is trusted, never verified. See "
+                    "`started_by_client` for the half that is authenticated.")
+    started_by_client: str | None = Field(
+        default=None,
+        description="The API_Client the request authenticated as (X-API-Key). Verified.")
+    started_at: datetime | None = Field(default=None)
+    finished_at: datetime | None = Field(default=None)
+    embedding_model: str | None = Field(default=None)
+    reranker_model: str | None = Field(default=None)
+    forced: bool = Field(default=False, description="Re-measured over an existing successful run.")
+    match_th: float | None = Field(default=None, description="The measured cutoff. This value IS "
+                                                            "the threshold the pipeline reads.")
+    quality: float | None = Field(
+        default=None,
+        description="Youden's J at match_th: 1.0 separates the classes perfectly, 0.0 is chance. "
+                    "The field that says whether to trust match_th.")
+    negatives: int | None = Field(default=None)
+    positives: int | None = Field(default=None)
+    highest_negative: float | None = Field(default=None)
+    lowest_positive: float | None = Field(default=None)
+    near_duplicates: list[str] = Field(
+        default_factory=list,
+        description="Catalogue pairs naming the same threat. Curation work, not an error — each "
+                    "is scored as an impostor against its own twin and drags the cutoff down.")
+    error: str | None = Field(default=None, description="Why it failed, when it did.")
+
+
+class GroundingCalibrationHistory(ApiModel):
+    """Calibration runs, newest first.
+
+    Exists because Celery's result backend expires after an hour, so the per-job status route
+    cannot answer "did last Tuesday's calibration pass, and who ran it?" — and a failed sweep used
+    to write nothing anywhere. These rows are permanent."""
+    model_config = ConfigDict(json_schema_extra={"example": {"runs": []}})
+
+    runs: list[GroundingCalibrationRun]
+
+
+class GroundingThresholdResponse(ApiModel):
+    """The cutoff this deployment is CURRENTLY grounding with, and where it came from."""
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {"value": 86.25, "origin": "calibrated",
+                        "embedding_model": "multilingual-e5-large",
+                        "reranker_model": "bge-reranker-v2-m3"}
+        }
+    )
+
+    value: float = Field(description="The match cutoff in force right now.")
+    origin: str = Field(
+        description="Where it came from — the field that makes `value` interpretable: "
+                    "'calibrated' (measured for this exact model pair — always wins when one "
+                    "is stored), 'env_pinned' (TSG_GROUNDING_MATCH_THRESHOLD is bootstrapping "
+                    "because no calibration is stored for this pair yet), or "
+                    "'static_default' (the built-in default, tuned for a DIFFERENT model pair — "
+                    "provisional, and a calibration is worth running).")
+    embedding_model: str = Field(description="Embedding model the threshold applies to.")
+    reranker_model: str = Field(description="Reranker model the threshold applies to.")

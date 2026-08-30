@@ -169,10 +169,12 @@ run_treatment_generation                    pipeline/treatment.py
         ├─ regenerate -> supersede + new row / approve-swap restores a version
         ├─ cancel                            api/treatment.py:538-556
         ├─ SSE treatment_plan_result         (advisory hint only)
-        └─ Excel export                      api/treatment_plan_excel.py
+        └─ Excel export                      REMOVED (was api/treatment_plan_excel.py)
 ```
 
 ### 4.2 Gaps
+
+> **2026-08-28 note:** the library returned to `Threat_Catalogue` + its two junction maps (the crm_threat_risk_register interlude was reverted before shipping). Still RETIRED and not returning: `Threat_Candidate_Review`/auto-promotion (replaced by the explicit `promote-to-library` API), the bulk importer (`threat_library_import.py`), sector scoping, and `Config_Threat_Rule`. Rows citing those remain historical; rows citing the catalogue itself may be live findings again, though their line numbers predate the current code.
 
 | # | Gap | File : Line | Why / Benefit | Proposed solution | Sev | Eff |
 |---|---|---|---|---|---|---|
@@ -191,6 +193,8 @@ run_treatment_generation                    pipeline/treatment.py
 ---
 
 ## 5. Master library and candidate governance
+
+> **2026-08-28 note:** the library returned to `Threat_Catalogue` + its two junction maps (the crm_threat_risk_register interlude was reverted before shipping). Still RETIRED and not returning: `Threat_Candidate_Review`/auto-promotion (replaced by the explicit `promote-to-library` API), the bulk importer (`threat_library_import.py`), sector scoping, and `Config_Threat_Rule`. Rows citing those remain historical; rows citing the catalogue itself may be live findings again, though their line numbers predate the current code.
 
 | # | Gap | File : Line | Why / Benefit | Proposed solution | Sev | Eff |
 |---|---|---|---|---|---|---|
@@ -266,7 +270,7 @@ These are SDD requirements met by a **different, sound mechanism**. Do not "fix"
 | Durable mirrors for advisory outcomes (§33A.7 block 490) | `next_set_result` and `regen_result` each write an audit row **first** and are re-served on the board — an outbox by a different mechanism. Terminal transitions never depend on the publish | `pipeline/cascade.py:163-187`; `api/sessions.py:155-161`, `:897-913` |
 | Reproducibility manifest (§33A.6) | Rather than hashes, TSG stores the **artefacts**: the complete redacted input snapshot, plus the complete prompt messages, raw response, Model, ModelVersion and PromptVersion, served byte-for-byte by a dedicated evidence endpoint that works for versions replaced long ago. `Prompt_Log` is written **even on parse failure** via a rollback-and-insert | `api/treatment.py:772-798`; `db/dal.py:2365-2420`; `pipeline/tasks.py:316-318`, `:325-336` |
 | Poison isolation and per-operation timeouts (§22) | `AttemptCount < stage_max_attempts` makes an exhausted stage permanently unclaimable with its ERROR surfacing on the board; a 3300/3600 backstop pinned to `visibility_timeout` | `db/dal.py:560`; `core/config.py:423`; `pipeline/celery_app.py:88-89`, `:377-378` |
-| Excel formula-injection escaping | **A control the SDD never asks for** — leading formula-trigger characters are escaped, treating LLM prose as a real trust boundary for the spreadsheet consumer | `api/treatment_plan_excel.py:55-67`, `:152` |
+| Excel formula-injection escaping | **A control the SDD never asks for** — leading formula-trigger characters were escaped, treating LLM prose as a real trust boundary for the spreadsheet consumer. No longer applicable: the treatment-plan Excel export was removed | REMOVED (was `api/treatment_plan_excel.py:55-67`, `:152`) |
 | No secrets in configuration data (§19.2, §33Q.15) | API client secrets are never stored — only a SHA-256 of the 32-byte value, with several Active rows permitted for make-before-break rotation. The seeding instruction hashes in Python, explicitly not in SQL. `Config_Tuning` has no column that could hold one | `db/models.py:599-615`; `db/invariants.py:146-152` |
 | Expand/contract migrations (§30) | Met without a framework: additive guarded DDL, converge-to-target re-runnable scripts, read-only preflight/verify gates, and an ORM that types new columns `\| None` with comments explaining the intermediate state. `metadata.create_all()` is forbidden; platform-owned tables are mapped read-only | `scripts/TSG_Core.sql:71-93`, `:106-116`, `:140-142`; `db/models.py:74`, `129`, `182`, `212`; `db/engine.py:4-5` |
 | Structured logging and correlation (§27) | structlog emits JSON in API and worker with stdlib records bridged in; `X-Request-Id` is accepted or generated, bound into contextvars, echoed on the response and unconditionally cleared on unwind; Flower task events are set **in code**, so Flower works on every launch path | `core/logging.py:20-47`; `core/middleware.py:57-93`; `pipeline/celery_app.py:69-70` |

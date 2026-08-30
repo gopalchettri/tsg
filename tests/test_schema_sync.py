@@ -27,7 +27,10 @@ import pytest
 
 from app.db import models as m
 
-_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+# The DEPLOYED scripts are the single source of truth since the 2026-08 dedup of
+# scripts/ vs scripts/eyshield_handoff/ — the numbered handoff copies are what a DBA
+# actually runs, so they are what the code must stay in lockstep with.
+_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts" / "eyshield_handoff"
 
 #: Tables the PLATFORM owns and deploys — TSG maps them read-only for context (see the
 #: "Context (platform-owned, read-only)" banner in models.py) and its scripts must never
@@ -97,8 +100,9 @@ def test_parser_finds_known_landmark_columns() -> None:
     in a CREATE TABLE body, one added only by a guarded ALTER."""
     created, altered = _ddl_columns()
     assert "SessionID" in created.get("Scenario_Session", set())
-    assert "PromotionFailedAt" in altered.get("Scenario_Session", set()), (
-        "guarded-ALTER parsing broke: PromotionFailedAt is added by ALTER, not CREATE TABLE")
+    assert "ThreatCatalogueID" in altered.get("Identified_Threat", set()), (
+        "guarded-ALTER parsing broke: ThreatCatalogueID is added by ALTER too, not only "
+        "CREATE TABLE")
 
 
 def test_allowlist_has_no_stale_entries() -> None:
@@ -136,3 +140,201 @@ def test_alter_statements_target_tables_this_repo_creates() -> None:
     assert not orphans, (
         f"ALTER ... ADD targets tables with no CREATE TABLE in scripts/: {sorted(orphans)}. "
         f"The IF OBJECT_ID(...) guard makes a misspelled table name a silent no-op.")
+
+
+# ---------------------------------------------------------------------------
+# INDEX DEFINITIONS — the same lockstep guard, for indexes rather than columns.
+#
+# Written after a real incident: the natural-key indexes were narrowed to name-only in the DDL
+# while invariants.REQUIRED_INDEXES still declared the old three-column form. Nothing compared
+# them, so the first symptom would have been the APPLICATION REFUSING TO BOOT against a correctly
+# migrated database — invariants asserts ordered columns and fails startup on a mismatch.
+#
+# The same column list is declared in three places, and all three must agree:
+#   1. scripts/*.sql            CREATE UNIQUE INDEX ... (what actually gets built)
+#   2. app/db/invariants.py     REQUIRED_INDEXES       (asserted at boot; wrong => no boot)
+#   3. scripts/TSG_Verify.sql   @req_indexes           (wrong => a false PASS at sign-off)
+#
+# The FOURTH site — the IntegrityError recovery predicates in dal.upsert_threat_type /
+# upsert_threat_catalogue, which must select on exactly the index's columns or a duplicate
+# becomes a 500 — is covered behaviourally by
+# test_dal_upsert_threat_type_collision.test_integrity_error_recovery_returns_the_existing_winner
+# and test_promote_scenario_library.test_cross_type_name_collision_recovers_to_existing_row.
+# ---------------------------------------------------------------------------
+_CREATE_INDEX_RE = re.compile(
+    r"CREATE\s+UNIQUE\s+INDEX\s+(\w+)\s+ON\s+(\w+)\s*\(([^)]*)\)", re.IGNORECASE)
+_VERIFY_ROW_RE = re.compile(r"\(N'(UX_\w+)',\s*N'(\w+)',\s*N'([^']*)'\)")
+
+
+def _ddl_indexes() -> dict[str, tuple[str, tuple[str, ...]]]:
+    """{index name: (table, ordered columns)} from every CREATE UNIQUE INDEX in the scripts."""
+    found: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for sql in _SCRIPTS.glob("*.sql"):
+        for name, table, cols in _CREATE_INDEX_RE.findall(sql.read_text(encoding="utf-8", errors="replace")):
+            found[name] = (table, tuple(c.strip() for c in cols.split(",") if c.strip()))
+    return found
+
+
+def test_required_indexes_match_the_ddl_that_creates_them() -> None:
+    """Every index the app asserts at boot must exist in the DDL with the SAME ordered columns."""
+    from app.db import invariants
+
+    ddl = _ddl_indexes()
+    mismatched, missing = [], []
+    for name, table, cols in invariants.REQUIRED_INDEXES:
+        if name not in ddl:
+            # Some indexes are created by scripts deployed separately; only flag ones the
+            # repo's own scripts are supposed to build.
+            missing.append(name)
+            continue
+        if ddl[name] != (table, tuple(cols)):
+            mismatched.append(f"{name}: invariants={table}{tuple(cols)} ddl={ddl[name][0]}{ddl[name][1]}")
+    assert not mismatched, (
+        "REQUIRED_INDEXES disagrees with the CREATE INDEX statements — the app will refuse to "
+        "boot against a database built from these scripts:\n  " + "\n  ".join(mismatched))
+    assert not missing, (
+        "REQUIRED_INDEXES names indexes no script creates (a fresh install would never boot): "
+        + ", ".join(sorted(missing)))
+
+
+def test_verify_script_expects_the_same_index_columns() -> None:
+    """TSG_Verify.sql's expected column lists must match the DDL too, or it signs off an install
+    the application then rejects — the one failure mode its own section-3 comment calls
+    unacceptable."""
+    ddl = _ddl_indexes()
+    verify = (_SCRIPTS / "6. TSG_Verify.sql").read_text(encoding="utf-8", errors="replace")
+    wrong = []
+    for name, table, cols in _VERIFY_ROW_RE.findall(verify):
+        expected = tuple(c.strip() for c in cols.split(",") if c.strip())
+        if name in ddl and ddl[name] != (table, expected):
+            wrong.append(f"{name}: verify={table}{expected} ddl={ddl[name][0]}{ddl[name][1]}")
+    assert not wrong, "TSG_Verify.sql disagrees with the DDL:\n  " + "\n  ".join(wrong)
+
+
+# ---------------------------------------------------------------------------
+# FROZEN MASTER TABLES -- the operational constraint, enforced instead of remembered.
+#
+# The six curated master tables hold data that must survive every deployment and may not be
+# altered: the business said so, and until this test the rule lived only in conversation --
+# which is exactly how a future edit (or a merge from an older branch) ships an unguarded
+# ALTER and mutates a table nobody may touch. Every statement against a frozen table must be
+# IDEMPOTENT-GUARDED (IF OBJECT_ID / COL_LENGTH / COLUMNPROPERTY / sys.indexes), so on a
+# database that already has the schema it is a provable NO-OP; destructive statements are
+# forbidden outright.
+# ---------------------------------------------------------------------------
+_FROZEN_TABLES = ("Threat_Category", "Threat_Type", "Threat_Catalogue", "Threat_Actor",
+                "Control_Library", "Control_Standard")
+_GUARD_MARKERS = ("COL_LENGTH", "COLUMNPROPERTY", "OBJECT_ID", "sys.indexes", "IF NOT EXISTS",
+                "IF EXISTS")
+
+
+def test_no_destructive_statement_against_a_frozen_table() -> None:
+    for sql in sorted(_SCRIPTS.glob("*.sql")):
+        text = re.sub(r"--[^\n]*", "", sql.read_text(encoding="utf-8", errors="replace"))
+        for tbl in _FROZEN_TABLES:
+            for verb in (rf"DROP\s+TABLE\s+(?:dbo\.)?{tbl}\b",
+                        rf"TRUNCATE\s+TABLE\s+(?:dbo\.)?{tbl}\b",
+                        rf"DELETE\s+FROM\s+(?:dbo\.)?{tbl}\b",
+                        rf"ALTER\s+TABLE\s+(?:dbo\.)?{tbl}\s+DROP\s+COLUMN"):
+                assert not re.search(verb, text, re.IGNORECASE), (
+                    f"{sql.name}: destructive statement against frozen table {tbl} "
+                    f"(pattern {verb}) -- the six master tables hold curated data that must "
+                    "survive every deployment")
+
+
+def test_every_alter_against_a_frozen_table_is_guarded() -> None:
+    """Every ALTER TABLE <frozen> must be the body of an IF existence/width guard -- either
+    the single guarded statement (`IF COL_LENGTH(...) IS NULL` / `ALTER ...`) or inside a
+    guarded `IF ... BEGIN ... END` block -- so re-running the script against the live frozen
+    schema is a provable no-op, never a mutation.
+
+    Implemented as a tiny FORWARD parser tracking guard state and BEGIN/END nesting, because
+    both simpler heuristics failed their own bite-test: a lines-window check was satisfied by
+    an unrelated COL_LENGTH nearby (passed on a truly unguarded ALTER), and a backward walk
+    could not see that the second statement of a guarded BEGIN block is guarded too."""
+    offenders = []
+    for sql in sorted(_SCRIPTS.glob("*.sql")):
+        guard_pending = False   # an IF <marker> has been seen; its body statement is next
+        stack: list[bool] = []  # BEGIN/END nesting; True = block opened under a guarded IF
+        for i, raw in enumerate(sql.read_text(encoding="utf-8", errors="replace").splitlines()):
+            line = re.sub(r"--.*", "", raw).strip()
+            if not line:
+                continue
+            upper = line.upper()
+            if upper == "GO":
+                guard_pending, stack = False, []
+                continue
+            if upper == "BEGIN" or upper.endswith(" BEGIN"):
+                stack.append(guard_pending)
+                guard_pending = False
+                continue
+            if upper == "END" or upper.startswith("END;"):
+                if stack:
+                    stack.pop()
+                continue
+            if re.match(r"IF\b", line, re.IGNORECASE):
+                guard_pending = any(g in line for g in _GUARD_MARKERS)
+                continue
+            match = re.search(r"ALTER\s+TABLE\s+(?:dbo\.)?(\w+)", line, re.IGNORECASE)
+            if match and match.group(1) in _FROZEN_TABLES:
+                if not (guard_pending or True in stack):
+                    offenders.append(f"{sql.name}:{i + 1}: {line}")
+            # a completed statement consumes the pending single-statement guard
+            if line.rstrip().endswith(";"):
+                guard_pending = False
+    assert not offenders, (
+        "unguarded ALTER against a frozen master table -- make the ALTER the body of an "
+        "IF COL_LENGTH/COLUMNPROPERTY/OBJECT_ID guard so re-running is a no-op:\n  "
+        + "\n  ".join(offenders))
+
+REQ_IDX_RE = 'INSERT INTO @req_indexes \\(IndexName, TableName, Cols\\) VALUES\\n(.*?);'
+TRIPLE_RE = "\\(N'([^']+)', N'([^']+)', N'([^']+)'\\)"
+GUARDED_CREATE_RE = "IF OBJECT_ID\\('dbo\\.(\\w+)', 'U'\\) IS NULL\\s*\\nCREATE TABLE"
+TSG_TABLES_RE = 'INSERT INTO @tsg_tables \\(TableName\\) VALUES\\n(.*?);'
+SINGLE_RE = "\\(N'(\\w+)'\\)"
+
+
+def _verify_sql() -> str:
+    return (_SCRIPTS / "6. TSG_Verify.sql").read_text(encoding="utf-8", errors="replace")
+
+
+def test_verify_script_boot_index_list_matches_invariants_exactly() -> None:
+    """6. TSG_Verify.sql's @req_indexes must EQUAL db.invariants.REQUIRED_INDEXES — both
+    directions. The one-way column check below let the script verify only 12 of 13 boot
+    indexes for weeks: a database missing UX_Scenario_ActiveAccepted passed verification and
+    then refused to boot. Set equality makes that drift impossible."""
+    from app.db.invariants import REQUIRED_INDEXES
+    sql = _verify_sql()
+    # findall over the WHOLE file: the (N'..', N'..', N'..') triple shape exists only in the
+    # @req_indexes block, and slicing the block by regex was defeated by a semicolon inside one
+    # of its comments.
+    listed = set(re.findall(TRIPLE_RE, sql))
+    expected = {(name, table, ",".join(cols)) for name, table, cols in REQUIRED_INDEXES}
+    assert listed == expected, (
+        "verify script's boot-index list drifted from invariants.REQUIRED_INDEXES: "
+        f"only in script: {sorted(listed - expected)}; "
+        f"only in invariants: {sorted(expected - listed)}")
+    assert f"THE {len(expected)} INDEXES" in sql
+    assert f"All {len(expected)} boot-asserted indexes present" in sql
+
+
+def test_verify_script_table_list_matches_create_inventory() -> None:
+    """@tsg_tables must equal the CREATE TABLE inventory of the handoff DDL scripts — the list
+    claimed 24 while holding 23 names and missing two real tables (Scenario_Library,
+    Grounding_Calibration_Run): a database missing either passed verification and failed boot."""
+    created: set[str] = set()
+    for f in ("1. TSG_Core.sql", "2. Threat_library.sql", "4. Control_library.sql"):
+        text = (_SCRIPTS / f).read_text(encoding="utf-8", errors="replace")
+        # only REAL creates — the guarded form. Bare "CREATE TABLE" also appears in prose
+        # ("a new column needs a CREATE TABLE entry").
+        created |= set(re.findall(GUARDED_CREATE_RE, text))
+    sql = _verify_sql()
+    block = re.search(TSG_TABLES_RE, sql, re.DOTALL)
+    assert block, "@tsg_tables VALUES block not found"
+    listed = set(re.findall(SINGLE_RE, block.group(1)))
+    assert listed == created, (
+        "verify script's table list drifted from the CREATE TABLE inventory: "
+        f"only in script: {sorted(listed - created)}; "
+        f"only in DDL: {sorted(created - listed)}")
+    assert f"ALL {len(created)} TSG TABLES EXIST" in sql
+    assert f"All {len(created)} TSG tables present" in sql

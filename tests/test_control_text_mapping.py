@@ -35,7 +35,7 @@ def _engine():
 
 def _seed(s, session_id: str, task_id: str) -> str:
     now = datetime.now(UTC)
-    output_id = str(uuid.uuid4())
+    scenario_id = str(uuid.uuid4())
     s.execute(m.Scenario_Session.__table__.insert().values(
         SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
         AssetName="a", AssetID="1", SessionStatus="active", CurrentStage="SCENARIOS",
@@ -48,14 +48,14 @@ def _seed(s, session_id: str, task_id: str) -> str:
         LeaseExpiresAt=now + timedelta(minutes=10), HeartbeatAt=now, AttemptCount=1, UpdatedAt=now,
     ))
     s.execute(m.Threat_Scenario_Output.__table__.insert().values(
-        OutputID=output_id, SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
+        ScenarioID=scenario_id, SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
         SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
         ScenarioJSON=json.dumps({"scenario_title": "Credential theft against the HMI",
                                 "scenario_statement": "An attacker replays operator credentials."}),
         Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=now,
     ))
     s.commit()
-    return output_id
+    return scenario_id
 
 
 def test_collect_control_query_leads_with_the_threat_then_scenario_text():
@@ -106,11 +106,11 @@ def test_map_controls_actually_threads_the_threat_into_the_query(monkeypatch):
     scoped_id, threat_id = str(uuid.uuid4()), str(uuid.uuid4())
     now = datetime.now(UTC)
     with Session() as s:
-        output_id = _seed(s, sid, task_id)
+        scenario_id = _seed(s, sid, task_id)
         # Point the seeded output at a REAL scoped/threat chain — the piece every other
         # map_controls test leaves dangling.
         s.execute(m.Threat_Scenario_Output.__table__.update()
-                .where(m.Threat_Scenario_Output.OutputID == output_id)
+                .where(m.Threat_Scenario_Output.ScenarioID == scenario_id)
                 .values(ScopedThreatID=scoped_id))
         s.execute(m.Scoped_Threat.__table__.insert().values(
             ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="e",
@@ -161,7 +161,7 @@ def test_one_query_yields_top_k_distinct_ranked_controls(monkeypatch):
     Session = sessionmaker(bind=engine, future=True)
     sid, task_id = str(uuid.uuid4()), str(uuid.uuid4())
     with Session() as s:
-        output_id = _seed(s, sid, task_id)
+        scenario_id = _seed(s, sid, task_id)
 
     matches = [
         ({"ControlLibraryID": 1}, 95.0),
@@ -197,7 +197,7 @@ def test_one_query_yields_top_k_distinct_ranked_controls(monkeypatch):
     assert [r.MapRank for r in rows] == [1, 2, 3, 4, 5]               # strictly increasing
     assert [r.Score for r in rows] == [95.0, 90.0, 85.0, 80.0, 75.0]  # dedup kept the best
     assert all(r.SuggestedControl is None for r in rows)              # LLM suggestions are gone
-    assert all(r.OutputID == output_id for r in rows)
+    assert all(r.ScenarioID == scenario_id for r in rows)
 
 
 def test_empty_candidate_library_still_returns_control_matches_not_bare_lists():

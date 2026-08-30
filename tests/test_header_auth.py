@@ -15,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api import deps
 from app.core.security import AuthError
+from app.db import dal
 from app.db import models as m
 from app.db.dal import EntityForbidden
 
@@ -32,14 +33,18 @@ class _Settings:
 
 @pytest.fixture
 def db(monkeypatch):
-    """SQLite with the two auth tables, seeded, wired into deps via monkeypatch."""
+    """SQLite with the auth tables, seeded, wired into deps via monkeypatch."""
     engine = create_engine("sqlite://")
     m.API_Client.__table__.create(engine)
     m.user_scope_assignment.__table__.create(engine)
+    m.option_value.__table__.create(engine)
     Session = sessionmaker(bind=engine, future=True)
     with Session() as s:
         s.add(m.API_Client(ClientID="shield", KeyHash=KEY_HASH, Name="Shield",
                            Active=True, CreatedAt=datetime.now(UTC)))
+        # scope-type vocabulary (option group 1010) — dal.resolve_scope_type_entity_id reads
+        # this row instead of a hardcoded "4", so it must exist for user_has_entity to work.
+        s.add(m.option_value(id=1, name="Entity", value=4, option_id=1010))
         # user 1138 -> entity 86 (scope_type 4 = Entity), active
         s.add(m.user_scope_assignment(id=1, user_id=1138, scope_type=4, ref_id=86, is_active=True))
         # user 1152 -> ref 1720 but scope_type 2 = Sub-Sector (must NOT count as entity access)
@@ -316,18 +321,14 @@ def test_entity_header_requirement_is_admin_only():
     from app.api import (
         admin,
         api_clients,
-        control_library_crud,
         sessions,
         threat_intel,
-        threat_library_crud,
-        threat_library_import,
         treatment,
     )
     from app.api.route_audit import _all_dependency_calls
 
-    admin_routers = [admin.router, admin.promotions_router, admin.candidates_router,
-                     api_clients.router, threat_library_crud.router, control_library_crud.router,
-                     threat_intel.router, threat_library_import.router]
+    admin_routers = [admin.router, admin.grounding_router,
+                     api_clients.router, threat_intel.router]
     for router in admin_routers:
         for route in router.routes:
             calls = _all_dependency_calls(route.dependant)
@@ -339,3 +340,36 @@ def test_entity_header_requirement_is_admin_only():
             calls = _all_dependency_calls(route.dependant)
             assert deps.get_principal in calls, f"{route.path} lost its entity scoping"
             assert deps.get_admin_principal not in calls, f"{route.path} got the admin principal"
+
+
+# --- dal.resolve_scope_type_entity_id (found 2026-08-27: was a hardcoded "4") ---
+
+def test_resolve_scope_type_entity_id_reads_the_db_not_a_hardcoded_number(db):
+    """Seeded as value=4 in the `db` fixture, but the point is this comes from the row named
+    "Entity" — not a source-code literal. A different seeded value must resolve to THAT
+    number instead, proving there's no hardcoded fallback hiding underneath."""
+    with db() as s:
+        assert dal.resolve_scope_type_entity_id(s) == 4
+
+    engine = create_engine("sqlite://")
+    m.option_value.__table__.create(engine)
+    OtherSession = sessionmaker(bind=engine, future=True)
+    with OtherSession() as s:
+        s.add(m.option_value(id=1, name="Entity", value=99, option_id=1010))
+        s.commit()
+    dal._clear_scope_type_entity_cache()
+    with OtherSession() as s:
+        assert dal.resolve_scope_type_entity_id(s) == 99
+    dal._clear_scope_type_entity_cache()
+
+
+def test_resolve_scope_type_entity_id_fails_loudly_when_missing():
+    """No 'Entity' row in group 1010 at all — an authorization check must fail closed
+    (raise), never silently fall through to guessing a scope level."""
+    engine = create_engine("sqlite://")
+    m.option_value.__table__.create(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    dal._clear_scope_type_entity_cache()
+    with Session() as s, pytest.raises(RuntimeError):
+        dal.resolve_scope_type_entity_id(s)
+    dal._clear_scope_type_entity_cache()

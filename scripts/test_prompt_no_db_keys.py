@@ -105,7 +105,7 @@ def main() -> None:
     print("2 OK  nested ids gone at depth 2 and 3; sibling fields at those depths survive")
 
     # 3 — arbitrary depth, no cap
-    deep = prompts._scrub_db_keys({"a": {"b": [{"c": {"output_id": "x", "keep": "y"}}]}})
+    deep = prompts._scrub_db_keys({"a": {"b": [{"c": {"scenario_id": "x", "keep": "y"}}]}})
     assert deep == {"a": {"b": [{"c": {"keep": "y"}}]}}, deep
     print("3 OK  scrub reaches four levels down")
 

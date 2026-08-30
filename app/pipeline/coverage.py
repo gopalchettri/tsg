@@ -45,12 +45,12 @@ def covered_cells(threats: Iterable[Mapping[str, Any]]) -> set[Cell]:
 
 
 def coverage_gaps(subsystem_ids: Iterable[int], categories: Iterable[str],
-                  threats: Iterable[Mapping[str, Any]],
-                  justified_na: Iterable[Cell] = ()) -> list[Cell]:
+                threats: Iterable[Mapping[str, Any]],
+                justified_na: Iterable[Cell] = ()) -> list[Cell]:
     """The still-unanswered cells, deterministically ordered. A cell is answered by a threat
     OR by a justified not-applicable record — never by silence."""
     return sorted(required_cells(subsystem_ids, categories)
-                  - covered_cells(threats) - set(justified_na))
+                - covered_cells(threats) - set(justified_na))
 
 
 def coverage_report(subsystem_ids: Iterable[int], categories: Iterable[str],

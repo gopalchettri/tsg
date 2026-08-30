@@ -43,7 +43,6 @@ def _reject(Session, sid: str, ids, monkeypatch, actor: str = CREATOR) -> int:
 
 def _accept(Session, sid: str, subset, monkeypatch, actor: str = CREATOR) -> int:
     monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
-    monkeypatch.setattr(accept_mod, "run_promotion_phase", lambda *a, **k: True)
     with Session() as s:
         return accept_mod.accept_session(s, sid, "86", actor, subset=subset)
 
@@ -52,7 +51,7 @@ def _row(Session, oid: str):
     with Session() as s:
         return s.execute(
             m.Threat_Scenario_Output.__table__.select().where(
-                m.Threat_Scenario_Output.OutputID == oid)).mappings().one()
+                m.Threat_Scenario_Output.ScenarioID == oid)).mappings().one()
 
 
 def _audit(Session, sid: str, event_type=None) -> list:
@@ -82,7 +81,7 @@ def test_reject_then_accept_is_refused_with_the_right_reason(monkeypatch):
 
     with pytest.raises(dal.NotFoundError) as exc_info:
         _accept(Session, sid, [a], monkeypatch)
-    reasons = {u["output_id"]: u["reason"] for u in exc_info.value.details["unacceptable"]}
+    reasons = {u["scenario_id"]: u["reason"] for u in exc_info.value.details["unacceptable"]}
     assert reasons[a] == ScenarioDecisionReason.already_rejected
     assert _row(Session, a)["Accepted"] == 0          # never written
     assert _row(Session, a)["RejectedAt"] is not None  # the standing decision holds
@@ -97,7 +96,7 @@ def test_accept_then_reject_is_refused_with_the_right_reason(monkeypatch):
 
     with pytest.raises(dal.NotFoundError) as exc_info:
         _reject(Session, sid, [a], monkeypatch)
-    reasons = {u["output_id"]: u["reason"] for u in exc_info.value.details["unacceptable"]}
+    reasons = {u["scenario_id"]: u["reason"] for u in exc_info.value.details["unacceptable"]}
     assert reasons[a] == ScenarioDecisionReason.already_accepted
     assert _row(Session, a)["RejectedAt"] is None
     assert _row(Session, a)["Accepted"] == 1
@@ -143,7 +142,7 @@ def test_rejecting_a_failure_card_is_refused(monkeypatch):
 
     with pytest.raises(dal.NotFoundError) as exc_info:
         _reject(Session, sid, [card], monkeypatch)
-    reasons = {u["output_id"]: u["reason"] for u in exc_info.value.details["unacceptable"]}
+    reasons = {u["scenario_id"]: u["reason"] for u in exc_info.value.details["unacceptable"]}
     assert reasons[card] == ScenarioDecisionReason.failure_card
 
 
@@ -158,12 +157,12 @@ def test_each_decided_scenario_gets_its_own_ledger_row(monkeypatch):
     _reject(Session, sid, [c], monkeypatch)
 
     accepted = _audit(Session, sid, AuditEventType.scenario_accepted)
-    assert {r["OutputID"] for r in accepted} == {a, b}
+    assert {r["ScenarioID"] for r in accepted} == {a, b}
     assert all(r["Decision"] == AuditDecision.accept for r in accepted)
     assert all(r["ActorUserID"] == CREATOR for r in accepted)
 
     rejected = _audit(Session, sid, AuditEventType.scenario_rejected)
-    assert [r["OutputID"] for r in rejected] == [c]
+    assert [r["ScenarioID"] for r in rejected] == [c]
     assert rejected[0]["ActorUserID"] == CREATOR
 
 
@@ -173,7 +172,7 @@ def test_an_undecided_scenario_has_no_decision_row(monkeypatch):
 
     _accept(Session, sid, [a], monkeypatch)
 
-    decided = {r["OutputID"] for r in _audit(Session, sid)
+    decided = {r["ScenarioID"] for r in _audit(Session, sid)
             if r["EventType"] in (AuditEventType.scenario_accepted,
                                     AuditEventType.scenario_rejected)}
     assert c not in decided

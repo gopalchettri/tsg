@@ -1,26 +1,32 @@
-"""P2 gate for library-first threat identification (tasks.find_threats, Stage 1a/1b).
+"""P2 gate for library-first threat identification (tasks.find_threats) after the 2026-08-28
+catalogue reversal (Threat_Catalogue + the per-type actor / per-threat category maps).
 
-Asserts the whole redesigned flow on real SQLite tables with a deterministic fake LLM:
+What must hold, and why:
 
-  - retrieval fills from the library FIRST: validated candidates land as Identified_Threat
-    rows carrying MASTER ids (ThreatTypeID/ThreatCatalogueID), verified, GroundingScore 100,
-    the type's LINKED actors (validated=True)
-  - a tech_gate rule hard-excludes a non-applicable type (metadata filter)
-  - the LLM validator's NOT_RELEVANT is a HARD DROP with a recorded justification
-  - generation runs only for the SHORTFALL, and a generated proposal that matches a
-    retrieved library row is dropped as an identity duplicate attributed to that row
-  - a genuinely novel proposal survives as unverified (the promotion path input)
-  - the grounding_summary audit row carries retrieved/generated counts, the validator
-    outcome, and the coverage report
-  - the coverage gap reaches the BOARD (progress.coverage), not just an audit row
-  - Phase 2c: a threat type the SECTOR filter excludes still enters the pool when an actor
-    operating in this sector uses it (ThreatType_ThreatActor_Map read backwards), and the
-    audit records WHICH actor put it there
-  - Phase 2b: each threat is recorded against the asset AND every supporting system a
-    tech_gate does not rule out, so the coverage grid is 2D and an uncovered
-    (system x STRIDE) cell is reported instead of being invisible
+  - LIBRARY CANDIDATES ENTER FIRST: a validated catalogue candidate lands as an
+    Identified_Threat row with GroundingStatus verified / GroundingScore 100.0 and the
+    catalogue's own identity (a real ThreatCatalogueID, IsAIGenerated False) — grounding is
+    identity, not similarity, so a rerank score here would be a fiction and downstream
+    promote/scenario reads depend on the id being real.
+  - the validator's NOT_RELEVANT is a HARD DROP, enforced twice: the candidate is removed
+    AND a generated proposal that regrounds onto the same catalogue row is blocked as
+    validator_rejected (rejected_catalogue_ids) — otherwise Stage 1b silently reverses a
+    verdict a reviewer never sees questioned twice.
+  - an unrecognized verdict FAILS OPEN (kept as POTENTIALLY_RELEVANT): a flaky validator
+    must weaken ranking, never shrink coverage.
+  - generation fills only the SHORTFALL and is skipped entirely when the library fills
+    the cap — the whole point of library-first is that curated content is never displaced
+    by generated text.
+  - selection_sources tallies only "hybrid" and "generated": the actor-intel admission
+    leg retired with the sector filter, so any third key would mean dead provenance code
+    is running again.
+  - actor_ids are stored from the TYPE's junction (ThreatType_ThreatActor_Map — actors
+    attach per type in the catalogue model) so promotion links by key instead of
+    re-resolving a name that may since be renamed.
+  - the gap-generation exclusion list names retrieved threats by their BARE threat name —
+    the catalogue has no theme/precondition column left to qualify them with.
 
-House pattern: real SQLite, bus.publish stubbed, no Mongo/Redis/real models.
+House pattern: real SQLite, bus.publish stubbed, deterministic fake LLM, no Mongo/Redis.
 """
 from __future__ import annotations
 
@@ -34,16 +40,16 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.enums import GroundingStatus, StageStatus, SubsystemLevel
 from app.db import models as m
-from app.pipeline import embeddings, tasks
+from app.pipeline import embeddings, tasks, threat_retrieval
 from app.pipeline.tasks import find_threats, set_up_progress_tracking
 
 
 @pytest.fixture(autouse=True)
 def _isolated_embeddings(monkeypatch):
     """Force the in-memory embedding store and clear the process caches: a REAL local Mongo
-    (docker compose dev) would otherwise serve real 1024-dim vectors for library names that
-    exist in the real seed, colliding with the fake 256-dim test vectors — and the test would
-    WRITE fake vectors into the real store."""
+    would otherwise serve real 1024-dim vectors for library names that exist in the real
+    seed, colliding with the fake 256-dim test vectors — and the test would WRITE fake
+    vectors into the real store."""
     monkeypatch.setenv("TSG_EMBEDDING_STORE", "memory")
     embeddings._L1.clear()
     embeddings._MATRIX.clear()
@@ -51,24 +57,27 @@ def _isolated_embeddings(monkeypatch):
     embeddings._L1.clear()
     embeddings._MATRIX.clear()
 
-SID = str(uuid.uuid4())
+
 TASK_ID = str(uuid.uuid4())
 NOW = datetime.now(UTC)
 
-SUBSYSTEMS = [{"id": 41, "name": "SCADA HMI Server", "asset_type": "OT",
+# Subsystem/asset dicts still carry asset_type_id (the raw ctm_scan_category id) — stamped by
+# context.py at session creation. INERT for retrieval now (the catalogue has no asset-type
+# column); it feeds only the data-driven control ITOT filter downstream.
+SUBSYSTEMS = [{"id": 41, "name": "SCADA HMI Server", "asset_type": "OT", "asset_type_id": 3,
                "technology_used": ["Siemens SCADA"], "vendor_name": "Siemens",
                "criticality": "High"},
               {"id": 42, "name": "Customer Billing Portal", "asset_type": "IT",
-               "technology_used": ["Django"], "vendor_name": "In-house",
+               "asset_type_id": 2, "technology_used": ["Django"], "vendor_name": "In-house",
                "criticality": "Medium"}]
-ASSET_CONTEXT = {"name": "Water Pumping Station", "asset_type": "Pumping Station",
-                 "sector": "Energy & Water", "sub_sector": "Water Supply",
+ASSET_CONTEXT = {"name": "Water Pumping Station", "asset_type": "Operational Technology (OT)",
+                 "asset_type_id": 3, "sector": "Energy & Water", "sub_sector": "Water Supply",
                  "critical_service": ["Potable water supply"]}
 
 
 class FakeLLM:
-    """Deterministic: one-hot embeddings per unique text (no accidental cosine collisions),
-    exact-match reranking, and canned chat answers per stage recognized by system text."""
+    """Deterministic: one-hot embeddings per unique text (orthogonal — no accidental cosine
+    collisions), exact-match reranking, canned chat answers recognized by system text."""
 
     def __init__(self):
         self._slots: dict[str, int] = {}
@@ -86,25 +95,27 @@ class FakeLLM:
     def rerank(self, query, docs):
         return [95.0 if d.strip().lower() == query.strip().lower() else 5.0 for d in docs]
 
+    def validator_verdict(self, cand: dict) -> dict:
+        name = (cand.get("name") or "").lower()
+        bad = "skimming" in name
+        return {"index": cand["index"],
+                "verdict": "NOT_RELEVANT" if bad else "RELEVANT",
+                "justification": ("this threat does not apply to this asset" if bad
+                                  else "SCADA controls pump setpoints directly")}
+
     def chat(self, messages, temperature=None, expected_type=None):
         system, user = messages[0]["content"], messages[-1]["content"]
         self.chat_calls.append((system, user))
         if "VALIDATING pre-selected library threats" in system:
             payload = json.loads(user[user.index("{"):])
-            verdicts = []
-            for cand in payload["candidate_threats"]:
-                bad = "web application" in (cand.get("name") or "").lower()
-                verdicts.append({
-                    "index": cand["index"],
-                    "verdict": "NOT_RELEVANT" if bad else "RELEVANT",
-                    "justification": ("no web application exists on this asset" if bad
-                                      else "SCADA controls pump setpoints directly")})
-            return json.dumps(verdicts), None
-        # Stage-1b gap generation: one duplicate of a library row + one genuinely novel.
+            return json.dumps([self.validator_verdict(c)
+                               for c in payload["candidate_threats"]]), None
+        # Stage-1b gap generation: one proposal that regrounds onto the validator-rejected
+        # catalogue row (the reversal the hard drop must block) + one genuinely novel one.
         return json.dumps([
-            {"category": "Tampering", "type": "Logic/Configuration Manipulation",
-             "name": "Unauthorised setpoint modification",
-             "generic_name": "Unauthorised setpoint modification", "actors": []},
+            {"category": "Spoofing", "type": "Credential Abuse",
+             "name": "Payment card skimming at POS terminals",
+             "generic_name": "Payment card skimming at POS terminals", "actors": []},
             {"category": "Repudiation", "type": "Audit Evidence Loss",
              "name": "Loss of operator attribution from shared logins",
              "generic_name": "Loss of operator attribution", "actors": []},
@@ -115,271 +126,296 @@ def _engine():
     engine = create_engine("sqlite://")
     for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Identified_Threat,
                 m.Identified_Duplicate_Threat, m.Scenario_Audit, m.Prompt_Log,
-                m.Threat_Category, m.Threat_Type, m.Threat_Catalogue,
-                m.Threat_Catalogue_Category_Map, m.Threat_Actor,
-                m.ThreatType_ThreatActor_Map, m.Config_Threat_Rule):
+                m.Threat_Category, m.Threat_Type, m.Grounding_Calibration_Run,
+                m.Threat_Catalogue, m.Threat_Actor, m.ThreatType_ThreatActor_Map,
+                m.Threat_Catalogue_Category_Map):
         tbl.__table__.create(engine)
     return engine
 
 
-def _seed_library(s) -> None:
+def _seed_library(s, include_live: bool = True) -> None:
     for cid, name in ((4, "Repudiation"), (5, "Spoofing"), (6, "Tampering")):
         s.execute(m.Threat_Category.__table__.insert().values(
             ThreatCategoryID=cid, ThreatCategoryName=name, IsActive=True, IsDeleted=False))
-    for tid, name, cat in ((7, "Logic/Configuration Manipulation", 6),
-                           (9, "Credential Abuse", 5),
-                           (11, "Retail POS Skimming", 5)):
+    for tid, name, cat, active in ((7, "Logic/Configuration Manipulation", 6, True),
+                                   (9, "Credential Abuse", 5, True),
+                                   # INACTIVE type: its catalogue rows must never surface.
+                                   (11, "Physical Intrusion", 6, False)):
         s.execute(m.Threat_Type.__table__.insert().values(
             ThreatTypeID=tid, ThreatTypeName=name, ThreatCategoryID=cat,
-            IsActive=True, IsDeleted=False))
-    # Phase 2c: scoped to a sector this session CANNOT see, so the metadata filter alone
-    # drops it. It gets in only because APT33 - linked to type 7, which IS visible here -
-    # also uses it. This is the whole actor leg in one row.
-    s.execute(m.Threat_Type.__table__.insert().values(
-        ThreatTypeID=13, ThreatTypeName="Spear-phishing for Initial Access",
-        ThreatCategoryID=5, SectorID=999, IsActive=True, IsDeleted=False))
-    for cid, name, tid, desc in (
-            (418, "Unauthorised setpoint modification", 7,
-             "An actor alters pump setpoints so control logic integrity is lost."),
-            (522, "Web application parameter tampering", 7,
-             "Tampering with parameters of a public web application."),
-            (205, "Credential phishing and MFA session theft", 9,
-             "Phishing steals operator credentials and session tokens."),
-            (900, "Payment card skimming at POS terminals", 11,
-             "Skimming devices harvest card data at retail POS."),
-            (733, "Spear-phishing of control room engineers", 13,
-             "Tailored email lures an engineer into running attacker code.")):
+            IsActive=active, IsDeleted=False))
+    live = ((205, "Credential phishing and MFA session theft", 9),
+            (418, "Unauthorised setpoint modification", 7),
+            (900, "Payment card skimming at POS terminals", 9)) if include_live else ()
+    for cid, name, tid, deleted in (
+            *((c, n, t, False) for c, n, t in live),
+            # RETIRED: soft-deleted — eligibility is liveness alone, so never a candidate.
+            (555, "Perimeter fence cutting", 7, True),
+            # ORPHANED: live row under the INACTIVE type 11 — never a candidate either.
+            (777, "Orphaned manipulation threat", 11, False)):
         s.execute(m.Threat_Catalogue.__table__.insert().values(
-            ThreatCatalogueID=cid, ThreatName=name, ThreatTypeID=tid, Description=desc,
+            ThreatCatalogueID=cid, ThreatTypeID=tid, ThreatName=name,
+            Description=f"Scenario prose for {name}.",
+            IsActive=True, IsDeleted=deleted, Source="seed",
+            CreatedBy="seed", CreatedAt=NOW))
+    for aid, name in ((1, "APT33"), (2, "AquaViper")):
+        s.execute(m.Threat_Actor.__table__.insert().values(
+            ThreatActorID=aid, ThreatActorName=name, IsCapable=1,
             IsActive=True, IsDeleted=False))
-    # multi-category membership: phishing is Spoofing AND Repudiation (map is authoritative)
-    for cat_id, cid in ((6, 418), (6, 522), (5, 205), (4, 205), (5, 900), (5, 733)):
-        s.execute(m.Threat_Catalogue_Category_Map.__table__.insert().values(
-            ThreatCategoryID=cat_id, ThreatCatalogueID=cid))
-    s.execute(m.Threat_Actor.__table__.insert().values(
-        ThreatActorID=1, ThreatActorName="APT33", IsCapable=1, IsActive=True, IsDeleted=False))
-    s.execute(m.ThreatType_ThreatActor_Map.__table__.insert().values(
-        ThreatTypeID=7, ThreatActorID=1))
-    # the second hop: the same actor also uses the out-of-sector type
-    s.execute(m.ThreatType_ThreatActor_Map.__table__.insert().values(
-        ThreatTypeID=13, ThreatActorID=1))
-    # tech_gate: POS skimming applies only to RETAIL subsystems — none here, so type 11 is OUT
-    s.execute(m.Config_Threat_Rule.__table__.insert().values(
-        ThreatRuleID=1, RuleType="tech_gate", ThreatTypeID=11, RuleKey="asset_type",
-        RuleValue="RETAIL", IsActive=True, IsDeleted=False))
-    # tech_gate: setpoint manipulation is an OT concern. The ASSET still passes (system 41 is
-    # OT and the asset-level gate is an any()), but the per-system attribution must NOT put
-    # this threat on the IT billing portal — that narrowing is what Phase 2b buys.
-    s.execute(m.Config_Threat_Rule.__table__.insert().values(
-        ThreatRuleID=2, RuleType="tech_gate", ThreatTypeID=7, RuleKey="asset_type",
-        RuleValue="OT", IsActive=True, IsDeleted=False))
+    # PER-TYPE curated actors via the type junction — every catalogue threat under type 7
+    # shares them, and the pipeline must store these ids, not re-resolve names.
+    for tid, aid in ((7, 1), (7, 2)):
+        s.execute(m.ThreatType_ThreatActor_Map.__table__.insert().values(
+            ThreatTypeID=tid, ThreatActorID=aid))
 
 
-def _seed_session(s) -> dict:
-    row = {"SessionID": SID, "TenantID": "t", "EntityID": "e", "UserID": "u",
+def _seed_session(s, sid: str) -> dict:
+    row = {"SessionID": sid, "TenantID": "t", "EntityID": "e", "UserID": "u",
            "AssetName": "Water Pumping Station", "AssetID": "1", "SessionStatus": "active",
            "CurrentStage": "THREAT_IDENTIFICATION", "StageStatus": "IDLE", "Mode": "AUTO",
            "SubsystemsJSON": json.dumps(SUBSYSTEMS), "SectorIDsJSON": json.dumps([]),
            "CreatedAt": NOW, "UpdatedAt": NOW}
     s.execute(m.Scenario_Session.__table__.insert().values(**row))
-    set_up_progress_tracking(s, SID, "t", "e")
+    set_up_progress_tracking(s, sid, "t", "e")
     s.commit()
     return row
 
 
-def test_library_first_identification_end_to_end(monkeypatch):
+def _run(monkeypatch, llm, max_threats):
+    """One full find_threats run on a fresh engine; returns (threats, session factory, sid)."""
     monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
-    engine = _engine()
-    Session = sessionmaker(bind=engine, future=True)
-    llm = FakeLLM()
+    sid = str(uuid.uuid4())
+    Session = sessionmaker(bind=_engine(), future=True)
     with Session() as s:
         _seed_library(s)
-        scenario_session = _seed_session(s)
+        scenario_session = _seed_session(s, sid)
         threats, _prov = find_threats(s, scenario_session, SUBSYSTEMS, ASSET_CONTEXT, llm,
-                                      TASK_ID, max_threats=4)
+                                      TASK_ID, max_threats=max_threats)
+    return threats, Session, sid
 
-    # --- library rows first, master identity intact -----------------------------------
+
+def test_library_first_end_to_end(monkeypatch):
+    llm = FakeLLM()
+
+    # Capture the gap-generation ask so the exclusion-list contract is pinned on the SAME
+    # run (threats_prompt is only called for the gap in find_threats).
+    captured: dict = {}
+    real_prompt = tasks.prompts.threats_prompt
+
+    def _capture(*a, **kw):
+        if kw.get("quota") is not None:
+            captured.update(kw)
+        return real_prompt(*a, **kw)
+    monkeypatch.setattr(tasks.prompts, "threats_prompt", _capture)
+
+    threats, Session, _sid = _run(monkeypatch, llm, max_threats=4)
+
+    # --- eligibility: only LIVE rows under active types ever reached the validator --------
+    # The soft-deleted row (555) and the inactive-type row (777) must be filtered in SQL,
+    # BEFORE any LLM sees them — a validator justification for an ineligible threat would
+    # imply liveness is being enforced by a model instead of the query.
+    validator_users = [u for sys, u in llm.chat_calls
+                       if "VALIDATING pre-selected library threats" in sys]
+    assert len(validator_users) == 1
+    cands = json.loads(
+        validator_users[0][validator_users[0].index("{"):])["candidate_threats"]
+    assert {c["name"] for c in cands} == {"Unauthorised setpoint modification",
+                                         "Credential phishing and MFA session theft",
+                                         "Payment card skimming at POS terminals"}
+    # Payload shape: index/category/type/name/description only — the theme/risk_statement
+    # legs left with the register model.
+    assert all(set(c) == {"index", "category", "type", "name", "description"} for c in cands)
+
     with Session() as s:
-        all_rows = list(s.execute(select(m.Identified_Threat)).scalars())
-        # SubsystemID 0 only: Phase 2b also writes a copy of each threat on every supporting
-        # system it reaches, and those copies share the catalogue id (asserted separately
-        # below). Every consumer — scoping, scenarios, next-set, accept — reads unit 0.
-        rows = {r.ThreatCatalogueID: r for r in all_rows if r.SubsystemID == 0}
+        rows = {r.ThreatCatalogueID: r
+                for r in s.execute(select(m.Identified_Threat)).scalars()
+                if r.SubsystemID == 0}
+        # 900 validator-dropped (hard drop); 418 + 205 land; one novel generated row.
         retrieved = {cid: r for cid, r in rows.items() if cid is not None}
-        # 418 + 205 sector-visible, 733 admitted by the ACTOR leg;
-        # 522 validator-dropped; 900 gate-excluded
-        assert set(retrieved) == {418, 205, 733}
+        assert set(retrieved) == {418, 205}
+
+        # --- catalogue candidates enter FIRST with identity grounding -----------------
         for r in retrieved.values():
             assert str(r.GroundingStatus) == str(GroundingStatus.verified)
             assert r.GroundingScore == 100.0
-            assert r.ThreatTypeID in (7, 9, 13)
-            assert r.LibraryThreatName == r.ThreatName  # master name on every column
-        actors_418 = json.loads(retrieved[418].ThreatActorsJSON)
-        assert actors_418 == {"actors": ["APT33"], "validated": True}
+            # Identity, not similarity: no threshold was consulted, and the column must say
+            # so explicitly — NULL here means "pre-feature row", a different fact.
+            assert r.GroundingThresholdOrigin == "not_applicable"
+            assert r.LibraryThreatName == r.ThreatName
+            # Curated wording is the description — clipped to the column, no AI prose.
+            assert r.Description == f"Scenario prose for {r.ThreatName}."[:200]
+            # Immutable provenance: this threat came FROM the catalogue, so it is not
+            # AI-generated — the one column promotion must never rewrite.
+            assert r.IsAIGenerated is False
+        # Catalogue identity stored: the real type id — the promote API is a pure writer
+        # and reads these instead of guessing.
+        assert retrieved[418].ThreatTypeID == 7 and retrieved[205].ThreatTypeID == 9
 
-        # --- shortfall generation: duplicate dropped, novel survives -------------------
+        # --- actor ids from the TYPE junction, name-sorted, validated -----------------
+        # ids ride alongside names so promotion links by key: re-resolving a name at write
+        # time returns NULL the day an actor is renamed or retired.
+        assert json.loads(retrieved[418].ThreatActorsJSON) == {
+            "actors": ["APT33", "AquaViper"], "actor_ids": [1, 2], "validated": True}
+
+        # --- the validator's hard drop holds for the WHOLE round ----------------------
+        # The generated proposal that regrounds onto rejected row 900 is diverted, recorded
+        # as validator_rejected — never inserted, never silently skipped.
+        assert 900 not in rows
+        dups = list(s.execute(select(m.Identified_Duplicate_Threat)).scalars())
+        assert [d.DuplicateReason for d in dups] == ["validator_rejected"]
+        assert "skimming" in dups[0].ThreatName.lower()
+
+        # --- generation filled only the shortfall; the novel proposal survives --------
         novel = [r for cid, r in rows.items() if cid is None]
         assert len(novel) == 1
         assert "operator attribution" in novel[0].ThreatName
         assert str(novel[0].GroundingStatus) == str(GroundingStatus.unverified)
-        dups = list(s.execute(select(m.Identified_Duplicate_Threat)).scalars())
-        assert len(dups) == 1
-        assert dups[0].DuplicateReason == "identity"
-        assert dups[0].DuplicateOfThreatID == retrieved[418].ThreatID
+        # Provenance IS the id: no catalogue row -> AI-generated.
+        assert novel[0].IsAIGenerated is True
 
-        # --- stage completed + audit carries the full provenance -----------------------
+        # Ineligible catalogue rows never surface anywhere.
+        assert 555 not in rows and 777 not in rows
+
         stage = s.execute(select(m.Subsystem_Stage_State).where(
             m.Subsystem_Stage_State.Level == SubsystemLevel.THREATS)).scalar_one()
         assert str(stage.Status) == str(StageStatus.COMPLETE)
+
+        # --- audit: provenance tallies name only the two legs that exist now ----------
         audit = [json.loads(a.DetailJSON) for a in s.execute(
             select(m.Scenario_Audit)).scalars() if a.DetailJSON]
         summary = next(d for d in audit if "retrieved" in d)
-        assert summary["retrieved"] == 3 and summary["generated"] == 1
-        assert summary["validator"]["kept"] == 3
-        assert summary["validator"]["dropped"][0]["catalogue_id"] == 522
-        assert "no web application" in summary["validator"]["dropped"][0]["justification"]
-        cov = summary["coverage"]
-        # --- Phase 2b: the grid is 2D ---------------------------------------------------
-        # 3 units (asset + 2 supporting systems) x 3 STRIDE categories.
-        # --- Phase 2c: the actor leg, and the audit trail it leaves ----------------------
-        # Sources are the DISTINGUISHING reason each threat is in the pool.
-        assert summary["selection_sources"] == {
-            "hybrid": 1,        # 418, sector-visible and gated
-            "rules": 1,         # 205, sector-visible and ungated (universal tier)
-            "actor_intel": 1,   # 733, reachable ONLY through APT33
-            "generated": 1,
-        }
-        # The audit answers "why is this here?" with a group, not a similarity number.
-        # BOTH APT33 types appear: the evidence is a fact about the type, recorded wherever
-        # it is true. selection_source above is the separate question of whether that fact is
-        # what got the threat INTO the pool - for 418 it was not, for 733 it was.
-        assert sorted(d["threat_name"] for d in summary["actor_derived"]) == [
-            "Spear-phishing of control room engineers", "Unauthorised setpoint modification"]
-        assert all(d["actors"] == ["APT33"] for d in summary["actor_derived"])
+        assert summary["retrieved"] == 2 and summary["generated"] == 1
+        # The actor-intel leg retired with the sector filter: a third key here would mean
+        # dead admission code is running again.
+        assert summary["selection_sources"] == {"hybrid": 2, "generated": 1}
+        assert summary["validator"]["candidates"] == 3
+        assert summary["validator"]["kept"] == 2
+        dropped = {d["catalogue_id"]: d for d in summary["validator"]["dropped"]}
+        assert set(dropped) == {900}
+        assert "does not apply" in dropped[900]["justification"]
+        assert summary["validator_reversals_blocked"] == 1
 
-        assert cov["cells"] == 9
-        assert summary["units"] == [0, 41, 42]
-
-        # The asset's working set is untouched by the fan-out: 3 retrieved + 1 novel.
-        assert len([r for r in all_rows if r.SubsystemID == 0]) == 4
-        by_unit = {u: {r.ThreatCatalogueID for r in all_rows if r.SubsystemID == u}
-                for u in (0, 41, 42)}
-        # 418 is OT-gated: recorded on the SCADA server, NOT on the billing portal.
-        assert 418 in by_unit[41] and 418 not in by_unit[42]
-        # 205 (Credential Abuse) and 733 (spear-phishing) carry no gate — universal, so
-        # they reach both systems.
-        assert 205 in by_unit[41] and 205 in by_unit[42]
-        assert 733 in by_unit[41] and 733 in by_unit[42]
-
-        # ...and the grid now SEES what the flat version could not: no Tampering threat was
-        # identified for the IT subsystem. A reportable gap, not silence — this assertion is
-        # the whole point of the matrix.
-        assert cov["unexplained"] == 1
-        assert cov["gaps"] == [[42, "Tampering"]]
-
-        # ...and the gap REACHES THE CLIENT. Recording it in an audit blob nobody reads would
-        # leave the reviewer with a session that looks complete, which is the exact failure the
-        # matrix exists to prevent. This is the board's per-supporting-system dimension.
-        from app.api import sessions as sessions_mod
-        verdict = sessions_mod._coverage_verdict(s, SID)
-        assert verdict["complete"] is False
-        assert verdict["unexplained"] == 1
-        assert verdict["units"] == [0, 41, 42]
-        assert verdict["gaps"] == [{"subsystem_id": 42, "category": "Tampering"}]
-
-    # --- return value feeds write_scenarios: retrieved first, then novel ---------------
+    # --- return value: catalogue identity on every retrieved summary ------------------
     by_name = {t["threat_name"]: t for t in threats}
-    spear = by_name["Spear-phishing of control room engineers"]
-    assert spear["selection_source"] == "actor_intel"
-    assert spear["actor_evidence"] == ["APT33"]
-    # 418's type is ALSO used by APT33, so it carries the same evidence - but it was already
-    # in the pool on its own merits, which is exactly what selection_source distinguishes.
-    assert by_name["Unauthorised setpoint modification"]["selection_source"] == "hybrid"
-    assert by_name["Unauthorised setpoint modification"]["actor_evidence"] == ["APT33"]
-    # ...and a threat whose type no actor is linked to claims nothing it cannot support
-    assert by_name["Credential phishing and MFA session theft"]["actor_evidence"] == []
-    assert threats[0]["validator_verdict"] == "RELEVANT"
-    assert len(threats) == 4
+    setpoint = by_name["Unauthorised setpoint modification"]
+    assert setpoint["selection_source"] == "hybrid"
+    assert setpoint["catalogue_id"] == 418
+    assert setpoint["is_ai_generated"] is False
+    assert setpoint["threat_type_id"] == 7
+    # The STORED category is the assigned STRIDE slot; the full membership rides alongside.
+    assert setpoint["category"] == "Tampering" and setpoint["categories"] == ["Tampering"]
+    assert by_name["Credential phishing and MFA session theft"]["catalogue_id"] == 205
+    assert len(threats) == 3
+
+    # --- gap-generation exclusion list: bare threat names ------------------------------
+    # The catalogue has no theme/precondition column, so the label IS the substance the
+    # model judges overlap against.
+    assert set(captured["exclude"]) == {
+        "Unauthorised setpoint modification",
+        "Credential phishing and MFA session theft"}
 
 
-def test_empty_library_degrades_to_generation_only(monkeypatch):
-    """No library rows → the funnel returns [] loudly and the pre-redesign generation-only
-    path runs unchanged. The degraded-library ladder's 'genuinely empty' rung."""
-    monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
-    engine = _engine()
-    Session = sessionmaker(bind=engine, future=True)
+def test_retrieval_eligibility_and_candidate_shape():
+    """The deterministic half of Stage 1a on its own: eligibility is a SQL fact, provable
+    without any chat — liveness ALONE (IsActive/IsDeleted on the row AND an active parent
+    type); the sector and asset-type legs left with the register model, and the validator
+    now decides relevance. Candidates carry the catalogue identity and per-TYPE junction
+    actors the rest of the pipeline stores verbatim."""
+    Session = sessionmaker(bind=_engine(), future=True)
     llm = FakeLLM()
     with Session() as s:
-        scenario_session = _seed_session(s)  # library tables exist but are EMPTY
-        threats, _prov = find_threats(s, scenario_session, SUBSYSTEMS, ASSET_CONTEXT, llm,
-                                      TASK_ID, max_threats=4)
-    assert len(threats) == 2                      # both fake proposals, generation-only
-    assert all(t.get("selection_source") is None for t in threats)
-    # only the threats-stage chat ran — no validator call without candidates
-    assert all("VALIDATING pre-selected" not in sys for sys, _ in llm.chat_calls)
+        _seed_library(s)
+        s.commit()
+        out = threat_retrieval.retrieve_library_threats(s, llm, SUBSYSTEMS, ASSET_CONTEXT)
+    by_id = {c["catalogue_id"]: c for c in out}
+    # Liveness only: soft-deleted 555 and inactive-type 777 out, everything live in.
+    assert set(by_id) == {205, 418, 900}
+    for c in out:
+        # One provenance for every catalogue candidate now that actor-intel is gone.
+        assert c["selection_source"] == "hybrid"
+        # Healthy embeddings -> the keyword-only caveat must NOT be raised.
+        assert c["ranking_degraded"] is False
+    assert by_id[418]["type_id"] == 7
+    assert by_id[418]["type_name"] == "Logic/Configuration Manipulation"
+    # The catalogue row's own curated description rides on the candidate.
+    assert by_id[418]["description"] == "Scenario prose for Unauthorised setpoint modification."
+    # PER-TYPE junction actors, name-sorted, ids aligned; type 9 has none linked.
+    assert by_id[418]["actors"] == ["APT33", "AquaViper"]
+    assert by_id[418]["actor_ids"] == [1, 2]
+    assert by_id[205]["actors"] == [] and by_id[205]["actor_ids"] == []
+    # Empty category junction table -> the type's single category, canonical name.
+    assert by_id[418]["categories"] == ["Tampering"]
+    assert by_id[205]["categories"] == ["Spoofing"]
+    # ALL subsystems attributed — fail-open by design (no tech_gate can shrink the grid).
+    assert by_id[418]["subsystem_ids"] == [41, 42]
 
 
-def test_generation_asks_for_a_buffer_so_n_new_threats_actually_land(monkeypatch):
-    """find_threats(N) must return N whenever N obtainable threats exist.
-
-    THE BUG. Stage 1b asked the model for EXACTLY `shortfall`, then the consume loop dropped any
-    proposal duplicating what the session already holds — and nothing refilled them. So
-    find_threats(5) structurally returned fewer than 5 whenever the model repeated anything, and
-    next-set's "show more 5" delivered 4. cascade._buffered_ask tried to compensate from OUTSIDE
-    by over-asking, which is why it collided with max_threats_per_asset (a per-call identification
-    ceiling, unrelated to delivery) and forced operators to keep two settings in a 2x ratio.
-
-    The buffer now lives in Stage 1b, where the loss is measurable. This test pins that: the model
-    honours whatever count it is asked for and repeats itself half the time, so a bare-shortfall
-    ask cannot reach the target and a buffered one can.
-    """
-    monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
-
-    asked: list[int] = []
-    real_prompt = tasks.prompts.threats_prompt
-
-    def _capture(*a, **kw):
-        if kw.get("quota") is not None:          # the gap-generation call, not the threats prompt
-            asked.append(kw["max_threats"])
-        return real_prompt(*a, **kw)
-    monkeypatch.setattr(tasks.prompts, "threats_prompt", _capture)
-
-    class _RepeatingLLM(FakeLLM):
-        """Returns EXACTLY as many proposals as it was asked for, half of them the same threat.
-
-        Honouring the requested count is what makes this test load-bearing: a fake that always
-        returns a fixed surplus would pass on the old code too, because the consume loop already
-        takes survivors up to the target. The defect was never the loop — it was the ask.
-        """
-        def chat(self, messages, temperature=None, expected_type=None):
-            if "VALIDATING pre-selected library threats" in messages[0]["content"]:
-                return super().chat(messages, temperature, expected_type)
-            out = []
-            for i in range(asked[-1]):
-                if i % 2 == 0:      # a repeat — only the first copy survives identity dedup
-                    out.append({"category": "Tampering", "type": "Logic/Configuration Manipulation",
-                                "name": "Unauthorised setpoint modification",
-                                "generic_name": "Unauthorised setpoint modification", "actors": []})
-                else:
-                    out.append({"category": "Repudiation", "type": "Audit Evidence Loss",
-                                "name": f"Distinct novel threat {i}",
-                                "generic_name": f"Distinct novel threat {i}", "actors": []})
-            return json.dumps(out), None
-
-    want = 5
+def test_dead_library_returns_nothing():
+    """A library whose every row is retired (soft-deleted, or under an inactive type) must
+    return [] LOUDLY (find_threats then degrades to generation-only) rather than, say,
+    serving the dead rows anyway — silently widening eligibility is the failure mode the
+    liveness rule exists to prevent. (The category-union emptiness this test used to pin
+    left with the register model; liveness is the whole eligibility rule now.)"""
     Session = sessionmaker(bind=_engine(), future=True)
     with Session() as s:
-        _seed_library(s)
-        scenario_session = _seed_session(s)
-        threats, _prov = find_threats(s, scenario_session, SUBSYSTEMS, ASSET_CONTEXT,
-                                    _RepeatingLLM(), TASK_ID, max_threats=want)
+        _seed_library(s, include_live=False)
+        s.commit()
+        assert threat_retrieval.retrieve_library_threats(
+            s, FakeLLM(), SUBSYSTEMS, ASSET_CONTEXT) == []
 
-    assert asked, "gap generation never ran — the library filled everything, so this test is vacuous"
-    # THE assertion. Set TSG_GAP_GENERATION_BUFFER=1.0 (which makes _gap_ask return the bare
-    # shortfall, i.e. the old behaviour) and this fails: the model repeats itself, the repeats are
-    # dropped, and nothing refills them.
-    names = [t.get("threat_name") for t in threats]
-    assert len(threats) == want, (
-        f"asked for {want}, got {len(threats)} — generation under-delivered because its ask was "
-        f"not buffered against dedup loss (gap asks: {asked}, delivered: {names})")
-    assert len(set(names)) == len(names), f"delivered set is not unique: {names}"
+
+def test_unknown_verdict_kept_and_generation_skipped_when_library_fills(monkeypatch):
+    """Two fail-safe rules in one run. (1) An unrecognized validator verdict is KEPT as
+    POTENTIALLY_RELEVANT — only an explicit NOT_RELEVANT may shrink coverage, so a flaky
+    validator degrades ranking, never the threat set. (2) With the cap already filled from
+    the catalogue, Stage 1b never runs: exactly one chat call (the validator), no generated
+    rows, and no 'generated' key in the provenance tally — curated content is never
+    displaced by generated text."""
+
+    class _OddVerdictLLM(FakeLLM):
+        def validator_verdict(self, cand):
+            v = super().validator_verdict(cand)
+            if "skimming" in (cand.get("name") or "").lower():
+                v["verdict"] = "SOMEWHAT_RELEVANT"   # unrecognized — must be kept, not dropped
+            return v
+
+    llm = _OddVerdictLLM()
+    threats, Session, _sid = _run(monkeypatch, llm, max_threats=2)
+
+    assert len(llm.chat_calls) == 1, "generation must be skipped when the library fills the cap"
+    assert len(threats) == 2
+    assert all(t["selection_source"] == "hybrid" for t in threats)
+    with Session() as s:
+        rows = [r for r in s.execute(select(m.Identified_Threat)).scalars()
+                if r.SubsystemID == 0]
+        assert all(r.ThreatCatalogueID is not None for r in rows)
+        audit = [json.loads(a.DetailJSON) for a in s.execute(
+            select(m.Scenario_Audit)).scalars() if a.DetailJSON]
+        summary = next(d for d in audit if "retrieved" in d)
+        # All 3 candidates kept — the unrecognized verdict did NOT drop 900; the STRIDE
+        # quota (not the validator) is what narrowed 3 kept candidates to the cap of 2.
+        assert summary["validator"]["kept"] == 3
+        assert summary["validator"]["dropped"] == []
+        assert summary["selection_sources"] == {"hybrid": 2}
+        assert "generated" not in summary["selection_sources"]
+        assert summary["generated"] == 0
+
+
+def test_not_relevant_drop_is_recorded_with_justification(monkeypatch):
+    """The hard drop must leave a reviewable trail: the catalogue id and the model's own
+    justification land in the grounding_summary audit row. A drop with no recorded grounds
+    would be indistinguishable from the threat never having been considered — exactly the
+    silent omission GAP-B exists to prevent."""
+    llm = FakeLLM()
+    _threats, Session, _sid = _run(monkeypatch, llm, max_threats=2)
+    with Session() as s:
+        rows = {r.ThreatCatalogueID for r in
+                s.execute(select(m.Identified_Threat)).scalars() if r.SubsystemID == 0}
+        assert 900 not in rows
+        audit = [json.loads(a.DetailJSON) for a in s.execute(
+            select(m.Scenario_Audit)).scalars() if a.DetailJSON]
+        summary = next(d for d in audit if "retrieved" in d)
+        assert summary["validator"]["dropped"] == [{
+            "catalogue_id": 900,
+            "threat_name": "Payment card skimming at POS terminals",
+            "justification": "this threat does not apply to this asset"}]

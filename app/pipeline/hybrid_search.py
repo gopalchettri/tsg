@@ -98,14 +98,14 @@ def _ranked_indices(scores: Sequence[float]) -> list[int]:
 
 
 def hybrid_match(query_text: str, candidates: Sequence[dict[str, Any]],
-                 query_vec: Sequence[float] | None = None,
+                query_vec: Sequence[float] | None = None,
                  *, rrf_k: int = 60, top_n: int | None = None) -> list[tuple[int, float]]:
     """Rank `candidates` against one query. Returns [(candidate_index, fused_score)] best-first.
 
     Each candidate is a dict with:
-      "text"   - the document text BM25 scores against (required)
-      "vector" - its embedding, or None (vector leg skips it)
-      "name"   - optional exact-match key; a candidate whose normalized name equals the
+    "text"   - the document text BM25 scores against (required)
+    "vector" - its embedding, or None (vector leg skips it)
+    "name"   - optional exact-match key; a candidate whose normalized name equals the
                 normalized query is forced to the FRONT (score 1.0), before any fused result.
 
     `query_vec` None -> keyword-only. All-zero legs -> []. Deterministic for fixed inputs."""

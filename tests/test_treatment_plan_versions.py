@@ -1,6 +1,6 @@
 """Treatment-plan route split + accept-any-version (plan eager-swimming-acorn, phase 2).
 
-Create is first-generation-only, /regenerate takes just a user_note (register data carried from
+Create is first-generation-only, /regenerate takes an EMPTY body (register data carried from
 the ACTIVE version's frozen snapshot), and review's optional plan_id makes approving a historical
 COMPLETE version the atomic version switch. Real SQLite tables + the partial unique index
 UX_TreatmentPlan_ActiveOutput (the ORM declares no indexes — without creating it here the race
@@ -12,9 +12,10 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
@@ -28,7 +29,7 @@ from app.db import models as m
 from app.pipeline import treatment as treatment_mod
 from app.sse import bus
 
-OUTPUT_ID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+SCENARIO_ID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
 SESSION_ID = "5aa85f64-5717-4562-b3fc-2c963f66afa6"
 
 
@@ -43,7 +44,7 @@ def _engine():
         # models deliberately declare none (DB-first schema) — without this the insert-race
         # and swap tests could not fail even with the fences deleted.
         conn.execute(text("CREATE UNIQUE INDEX UX_TreatmentPlan_ActiveOutput "
-                          "ON Risk_Treatment_Plan(OutputID) WHERE Superseded = 0"))
+                          "ON Risk_Treatment_Plan(ScenarioID) WHERE Superseded = 0"))
     return engine
 
 
@@ -61,7 +62,7 @@ def _seed(Session) -> None:
             CurrentSubsystemIndex=0, SubsystemsJSON="[]", AssetContextJSON="{}",
             CreatedAt=_now(), UpdatedAt=_now()))
         s.execute(m.Threat_Scenario_Output.__table__.insert().values(
-            OutputID=OUTPUT_ID, SessionID=SESSION_ID, TenantID="t", EntityID="86",
+            ScenarioID=SCENARIO_ID, SessionID=SESSION_ID, TenantID="t", EntityID="86",
             UserID="u1", SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status="complete",
             ScenarioJSON=json.dumps({"scenario_title": "T", "scenario_statement": "s",
                                      "risk_statement": "r"}),
@@ -99,7 +100,14 @@ def _body(**over) -> TreatmentPlanBody:
                 risk_owner="Head of OT Operations", impacted_business_division="Water Ops",
                 existing_controls_all_subsystems="No",
                 existing_controls_all_subsystems_justification="IT systems only",
-                user_note="first note")
+                # The window is set HERE, in the shared body, on purpose: it makes
+                # test_regenerate_carries_register_data's `new_snap["risk_assessment"] ==
+                # old_snap["risk_assessment"]` a regression pin for BOTH window bugs at once
+                # (create must compute total_days; regenerate must carry the window forward).
+                # Without these two kwargs assessment_window is None on both sides and that
+                # assertion passes vacuously — which is exactly how both bugs survived.
+                mitigation_start_date=date(2026, 6, 14),
+                mitigation_end_date=date(2026, 9, 14))
     base.update(over)
     return TreatmentPlanBody(**base)
 
@@ -123,7 +131,7 @@ def _set_status(Session, plan_id: str, status: str, *, updated_at=None) -> None:
 def _create(Session, monkeypatch, **body_over):
     """Callers must have _wire()d already — re-wiring here would swap in a fresh published
     list and orphan the one the test asserts against."""
-    return treatment_api.post_treatment_plan(SESSION_ID, OUTPUT_ID, _body(**body_over),
+    return treatment_api.post_treatment_plan(SESSION_ID, SCENARIO_ID, _body(**body_over),
                                              _principal())
 
 
@@ -135,8 +143,80 @@ def test_create_then_create_conflicts(monkeypatch):
     resp = _create(Session, monkeypatch)
     assert resp.status == str(StageStatus.RUNNING)
     with pytest.raises(treatment_mod.TreatmentConflict) as exc_info:
-        treatment_api.post_treatment_plan(SESSION_ID, OUTPUT_ID, _body(), _principal())
+        treatment_api.post_treatment_plan(SESSION_ID, SCENARIO_ID, _body(), _principal())
     assert exc_info.value.reason == TreatmentGateReason.plan_already_exists
+
+
+def test_enqueue_failure_answers_503_not_500(monkeypatch):
+    """A broker that will not take the job is TRANSIENT and retryable. Re-raising bare made it the
+    catch-all 500 — "our code is broken, don't retry" — for a condition where retrying is exactly
+    right, and while the plan row's own message tells the caller to regenerate. The three sibling
+    sites for this identical failure (sessions.py's create, and _recover_from_enqueue_failure for
+    regenerate/next-set) already answer 503.
+
+    Also pins the two things the fix must NOT break: the row is still parked in ERROR so the
+    scenario_id is not wedged behind the staleness window, and the broker's own exception text does
+    not ride out on the wire."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+
+    def _broker_down(_plan_id):
+        raise RuntimeError("kombu.exceptions.OperationalError: [Errno 111] Connection refused")
+
+    monkeypatch.setattr(treatment_api, "enqueue_treatment_plan", _broker_down)
+
+    with pytest.raises(HTTPException) as exc_info:
+        treatment_api.post_treatment_plan(SESSION_ID, SCENARIO_ID, _body(), _principal())
+
+    assert exc_info.value.status_code == 503, "a transient broker failure must not report as 500"
+    for leaked in ("kombu", "Errno 111", "Connection refused"):
+        assert leaked not in str(exc_info.value.detail), exc_info.value.detail
+
+    rows = _plans(Session)
+    assert len(rows) == 1, rows
+    assert rows[0]["Status"] == str(StageStatus.ERROR), "row left RUNNING — scenario_id is wedged"
+
+
+def test_cancel_records_who_stopped_the_plan(monkeypatch):
+    """The cancel endpoint and its treatment_plan_cancelled audit event both predate the columns;
+    the row itself recorded neither who nor when, so a cancelled plan could not name the person who
+    stopped it without joining the ledger. FIRST test to exercise this route at all."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    _create(Session, monkeypatch)  # one RUNNING plan
+
+    treatment_api.post_cancel_treatment_plan(SESSION_ID, SCENARIO_ID, _principal())
+
+    row = _plans(Session)[0]
+    assert row["Status"] == str(StageStatus.ERROR)
+    assert row["CancelledBy"] == "u1", "the canceller was not recorded on the plan row"
+    assert row["CancelledAt"] is not None
+
+
+def test_a_normal_plan_completion_records_no_canceller(monkeypatch):
+    """finish_plan is ALSO the normal-completion and generic-failure writer. Stamping CancelledBy
+    there would claim a human stopped something that merely finished or failed — passing
+    `cancelled_by` is what makes a write a cancellation, and nothing else may set it."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    _create(Session, monkeypatch)
+    plan_id = _plans(Session)[0]["PlanID"]
+
+    with Session() as s:
+        assert dal.finish_plan(s, plan_id, status=StageStatus.COMPLETE, task_id=None,
+                               plan_json="{}") is True
+        s.commit()
+
+    row = _plans(Session)[0]
+    assert row["Status"] == str(StageStatus.COMPLETE)
+    assert row["CancelledBy"] is None and row["CancelledAt"] is None, (
+        "an ordinary completion was recorded as a cancellation")
 
 
 def test_regenerate_with_no_rows_is_404(monkeypatch):
@@ -146,13 +226,18 @@ def test_regenerate_with_no_rows_is_404(monkeypatch):
     _wire(Session, monkeypatch)
     with pytest.raises(dal.NotFoundError):
         treatment_api.post_regenerate_treatment_plan(
-            SESSION_ID, OUTPUT_ID, TreatmentPlanRegenerateBody(user_note="x"), _principal())
+            SESSION_ID, SCENARIO_ID, TreatmentPlanRegenerateBody(), _principal())
 
 
-def test_regenerate_carries_register_data_and_swaps_note(monkeypatch):
+def test_regenerate_carries_register_data(monkeypatch):
     """The register-sourced snapshot values survive byte-for-byte — including the two
-    all-subsystems keys a naive whole-block split would drop — while reviewer_note is
-    replaced (or removed) and the two row columns are copied."""
+    all-subsystems keys a naive whole-block split would drop, and the assessment window — and
+    the two row columns are copied.
+
+    The risk_assessment equality below is the regression pin for both window bugs: `_body()`
+    supplies a real mitigation window, so a create that fails to compute total_days, or a
+    regenerate that drops the window, makes the two blocks differ. (Formerly ...and_swaps_note;
+    the reviewer_note steering it also covered was removed with user_note.)"""
     engine = _engine()
     Session = sessionmaker(bind=engine, future=True)
     _seed(Session)
@@ -162,7 +247,7 @@ def test_regenerate_carries_register_data_and_swaps_note(monkeypatch):
     old_snap = json.loads(_plans(Session)[0]["InputSnapshotJSON"])
 
     resp = treatment_api.post_regenerate_treatment_plan(
-        SESSION_ID, OUTPUT_ID, TreatmentPlanRegenerateBody(user_note="second note"), _principal())
+        SESSION_ID, SCENARIO_ID, TreatmentPlanRegenerateBody(), _principal())
 
     rows = _plans(Session)
     assert [r["Superseded"] for r in rows] == [1, 0]
@@ -176,17 +261,19 @@ def test_regenerate_carries_register_data_and_swaps_note(monkeypatch):
             == old_snap["existing_controls"]["applied_to_all_subsystems_justification"])
     assert new_snap["risk_assessment"] == old_snap["risk_assessment"]
     assert new_snap["register"] == old_snap["register"]
-    assert new_snap["reviewer_note"] == "second note"
     assert new_row["RiskLevel"] == rows[0]["RiskLevel"]
     assert new_row["RiskIdentificationDate"] == rows[0]["RiskIdentificationDate"]
+    # Explicit, so a future change that makes the window None on BOTH sides cannot make the
+    # equality above pass vacuously again — the exact way both bugs hid.
+    assert old_snap["risk_assessment"]["assessment_window"]["total_days"] == 92
 
-    # Note removal: regenerate with no note -> key absent, register data still carried.
+    # Chained regenerate: the register data (and the window) survive a second hop too.
     _set_status(Session, resp.plan_id, str(StageStatus.COMPLETE))
     resp3 = treatment_api.post_regenerate_treatment_plan(
-        SESSION_ID, OUTPUT_ID, TreatmentPlanRegenerateBody(), _principal())
+        SESSION_ID, SCENARIO_ID, TreatmentPlanRegenerateBody(), _principal())
     snap3 = json.loads([r for r in _plans(Session)
                         if r["PlanID"] == resp3.plan_id][0]["InputSnapshotJSON"])
-    assert "reviewer_note" not in snap3
+    assert "reviewer_note" not in snap3   # the steering concept was removed entirely
     assert snap3["risk_assessment"] == old_snap["risk_assessment"]
 
 
@@ -198,7 +285,7 @@ def test_fresh_running_blocks_regenerate(monkeypatch):
     _create(Session, monkeypatch)  # fresh RUNNING row
     with pytest.raises(treatment_mod.TreatmentConflict) as exc_info:
         treatment_api.post_regenerate_treatment_plan(
-            SESSION_ID, OUTPUT_ID, TreatmentPlanRegenerateBody(), _principal())
+            SESSION_ID, SCENARIO_ID, TreatmentPlanRegenerateBody(), _principal())
     assert exc_info.value.reason == TreatmentGateReason.generation_in_progress
 
 
@@ -207,7 +294,7 @@ def _two_complete_versions(Session, monkeypatch) -> tuple[str, str]:
     p1 = _create(Session, monkeypatch).plan_id
     _set_status(Session, p1, str(StageStatus.COMPLETE))
     p2 = treatment_api.post_regenerate_treatment_plan(
-        SESSION_ID, OUTPUT_ID, TreatmentPlanRegenerateBody(user_note="v2"), _principal()).plan_id
+        SESSION_ID, SCENARIO_ID, TreatmentPlanRegenerateBody(), _principal()).plan_id
     _set_status(Session, p2, str(StageStatus.COMPLETE))
     return p1, p2
 
@@ -223,7 +310,7 @@ def test_approve_historical_complete_swaps_atomically(monkeypatch):
     published = _wire(Session, monkeypatch)
     p1, p2 = _two_complete_versions(Session, monkeypatch)
 
-    resp = treatment_api.post_review_treatment_plan(SESSION_ID, OUTPUT_ID,
+    resp = treatment_api.post_review_treatment_plan(SESSION_ID, SCENARIO_ID,
                                                     _review(plan_id=p1), _principal())
 
     assert resp.plan_id == p1
@@ -251,7 +338,7 @@ def test_reject_historical_is_version_not_active(monkeypatch):
     _wire(Session, monkeypatch)
     p1, p2 = _two_complete_versions(Session, monkeypatch)
     with pytest.raises(treatment_mod.TreatmentConflict) as exc_info:
-        treatment_api.post_review_treatment_plan(SESSION_ID, OUTPUT_ID,
+        treatment_api.post_review_treatment_plan(SESSION_ID, SCENARIO_ID,
                                                  _review(plan_id=p1, decision="rejected"),
                                                  _principal())
     assert exc_info.value.reason == TreatmentGateReason.version_not_active
@@ -266,7 +353,7 @@ def test_approve_historical_error_is_not_complete_and_never_claimable(monkeypatc
     p1, p2 = _two_complete_versions(Session, monkeypatch)
     _set_status(Session, p1, str(StageStatus.ERROR))
     with pytest.raises(treatment_mod.TreatmentConflict) as exc_info:
-        treatment_api.post_review_treatment_plan(SESSION_ID, OUTPUT_ID,
+        treatment_api.post_review_treatment_plan(SESSION_ID, SCENARIO_ID,
                                                  _review(plan_id=p1), _principal())
     assert exc_info.value.reason == TreatmentGateReason.not_complete
     rows = {r["PlanID"]: r for r in _plans(Session)}
@@ -282,7 +369,7 @@ def test_foreign_or_unknown_plan_id_is_404(monkeypatch):
     _wire(Session, monkeypatch)
     _two_complete_versions(Session, monkeypatch)
     with pytest.raises(dal.NotFoundError):
-        treatment_api.post_review_treatment_plan(SESSION_ID, OUTPUT_ID,
+        treatment_api.post_review_treatment_plan(SESSION_ID, SCENARIO_ID,
                                                  _review(plan_id=str(uuid.uuid4())), _principal())
 
 
@@ -295,7 +382,7 @@ def test_explicit_or_mixed_case_active_plan_id_takes_plain_path(monkeypatch):
     published = _wire(Session, monkeypatch)
     _p1, p2 = _two_complete_versions(Session, monkeypatch)
 
-    resp = treatment_api.post_review_treatment_plan(SESSION_ID, OUTPUT_ID,
+    resp = treatment_api.post_review_treatment_plan(SESSION_ID, SCENARIO_ID,
                                                     _review(plan_id=p2.upper()), _principal())
 
     assert resp.plan_id == p2
@@ -321,11 +408,11 @@ def test_regenerate_baselines_on_active_row_after_switch(monkeypatch):
         s.execute(update(m.Risk_Treatment_Plan).where(m.Risk_Treatment_Plan.PlanID == p2)
                   .values(InputSnapshotJSON=json.dumps(snap)))
         s.commit()
-    treatment_api.post_review_treatment_plan(SESSION_ID, OUTPUT_ID, _review(plan_id=p1),
+    treatment_api.post_review_treatment_plan(SESSION_ID, SCENARIO_ID, _review(plan_id=p1),
                                              _principal())
 
     resp = treatment_api.post_regenerate_treatment_plan(
-        SESSION_ID, OUTPUT_ID, TreatmentPlanRegenerateBody(), _principal())
+        SESSION_ID, SCENARIO_ID, TreatmentPlanRegenerateBody(), _principal())
 
     new_snap = json.loads([r for r in _plans(Session)
                            if r["PlanID"] == resp.plan_id][0]["InputSnapshotJSON"])
@@ -342,7 +429,7 @@ def test_reactivate_refuses_already_active_row(monkeypatch):
     _wire(Session, monkeypatch)
     _p1, p2 = _two_complete_versions(Session, monkeypatch)  # p2 is ACTIVE
     with Session() as s:
-        assert dal.reactivate_plan_version(s, SESSION_ID, OUTPUT_ID, p2) is False
+        assert dal.reactivate_plan_version(s, SESSION_ID, SCENARIO_ID, p2) is False
         s.rollback()
 
 
@@ -355,7 +442,7 @@ def test_toctou_fence_on_supersede(monkeypatch):
     _wire(Session, monkeypatch)
     p1, _p2 = _two_complete_versions(Session, monkeypatch)  # p1 is NOT the active row
     with Session() as s:
-        assert dal.supersede_active_plan(s, OUTPUT_ID, treatment_mod._stale_cutoff(),
+        assert dal.supersede_active_plan(s, SCENARIO_ID, treatment_mod._stale_cutoff(),
                                          plan_id=p1) == 0  # fence miss: stale read
         s.rollback()
     assert sum(1 for r in _plans(Session) if r["Superseded"] == 0) == 1
@@ -363,13 +450,13 @@ def test_toctou_fence_on_supersede(monkeypatch):
 
 def test_index_arbitrates_double_active_insert():
     """The recreated partial unique index has teeth: a second Superseded=0 row for one
-    OutputID is rejected by SQLite exactly as MSSQL's UX_TreatmentPlan_ActiveOutput would."""
+    scenario_id is rejected by SQLite exactly as MSSQL's UX_TreatmentPlan_ActiveOutput would."""
     engine = _engine()
     Session = sessionmaker(bind=engine, future=True)
     _seed(Session)
 
     def _plan_row(plan_id):
-        return dict(PlanID=plan_id, SessionID=SESSION_ID, OutputID=OUTPUT_ID, TenantID="t",
+        return dict(PlanID=plan_id, SessionID=SESSION_ID, ScenarioID=SCENARIO_ID, TenantID="t",
                     EntityID="86", Status=str(StageStatus.RUNNING),
                     TreatmentStrategy="Mitigate", InputSnapshotJSON="{}", Superseded=0,
                     CreatedAt=_now(), UpdatedAt=_now())

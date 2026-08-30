@@ -30,6 +30,15 @@ CREATE TABLE Control_Standard (
     IsDeleted      bit            NOT NULL CONSTRAINT DF_Control_Standard_IsDeleted DEFAULT (0)
 );
 
+-- OutputID -> ScenarioID (see the matching block in `1. TSG_Core.sql`). sp_rename preserves the
+-- data in place and the PRIMARY KEY follows automatically — SQL Server stores key columns by ID,
+-- not by name. Guarded both ways: runs once on an existing database, no-op on a fresh one where
+-- the CREATE TABLE above already declares ScenarioID.
+IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Control_Map', 'OutputID') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario_Control_Map', 'ScenarioID') IS NULL
+    EXEC sp_rename 'dbo.Threat_Scenario_Control_Map.OutputID', 'ScenarioID', 'COLUMN';
+
 IF OBJECT_ID('dbo.Control_Library', 'U') IS NULL
 CREATE TABLE Control_Library (
     ControlLibraryID    int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Control_Library PRIMARY KEY,
@@ -65,14 +74,14 @@ IF OBJECT_ID('dbo.Control_Library_Standard_Map', 'U') IS NOT NULL
 -- Threat_Scenario_Output already exists by the time this CREATE runs.
 IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NULL
 CREATE TABLE Threat_Scenario_Control_Map (
-    OutputID          uniqueidentifier NOT NULL,
+    ScenarioID        uniqueidentifier NOT NULL,
     ControlLibraryID  int           NOT NULL,
     SessionID         uniqueidentifier NOT NULL,
     MapRank           int           NOT NULL,   -- 1 = best match for this scenario
     Score             float         NULL,       -- raw rerank 0-100
     SuggestedControl  nvarchar(500) NULL,       -- the LLM's free-text suggestion this grounded from (NULL on scenario-text fallback)
     CreatedAt         datetime2     NULL,
-    CONSTRAINT PK_Threat_Scenario_Control_Map PRIMARY KEY (OutputID, ControlLibraryID)
+    CONSTRAINT PK_Threat_Scenario_Control_Map PRIMARY KEY (ScenarioID, ControlLibraryID)
 );
 
 -- ---------------------------------------------------------------------------

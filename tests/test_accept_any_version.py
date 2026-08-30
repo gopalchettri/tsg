@@ -28,8 +28,7 @@ from app.core.enums import (
 from app.db import dal
 from app.db import models as m
 from app.db.invariants import REQUIRED_INDEXES
-from app.pipeline import accept as accept_mod
-from app.pipeline.accept import _REASON_TEXT, AcceptConflict, accept_session
+from app.pipeline.accept import _REASON_TEXT, AcceptConflict, MasterInactive, accept_session
 from app.sse import bus
 
 HASH_10 = "a" * 64  # scenario #10's identity — shared by all its versions
@@ -118,12 +117,12 @@ def _scenario(Session, sid: str, *, identity: str, number: int = 1, superseded: 
     oid = str(uuid.uuid4())
     with Session() as s:
         s.execute(m.Threat_Scenario_Output.__table__.insert().values(
-            OutputID=oid, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=oid, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
             SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=status,
             ScenarioJSON=json.dumps({"scenario_title": title, "scenario_statement": "s",
                                      "risk_statement": "r"}),
             Accepted=accepted, Superseded=superseded, IdentityHash=identity,
-            ScenarioNumber=number, ReplacesOutputID=replaces, GenerationEpoch=1,
+            ScenarioNumber=number, ReplacesScenarioID=replaces, GenerationEpoch=1,
             CreatedAt=_now()))
         s.commit()
     return oid
@@ -142,7 +141,6 @@ def _accept(Session, sid: str, subset, monkeypatch) -> int:
     """Run the real accept_session with its two advisory tails stubbed (SSE + promotion —
     both out of scope here and both explicitly never-raise paths)."""
     monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
-    monkeypatch.setattr(accept_mod, "run_promotion_phase", lambda *a, **k: True)
     with Session() as s:
         return accept_session(s, sid, "86", "u1", subset=subset)
 
@@ -151,7 +149,7 @@ def _flags(Session, oid: str) -> tuple[int, int]:
     with Session() as s:
         row = s.execute(select(m.Threat_Scenario_Output.Accepted,
                                m.Threat_Scenario_Output.Superseded)
-                        .where(m.Threat_Scenario_Output.OutputID == oid)).one()
+                        .where(m.Threat_Scenario_Output.ScenarioID == oid)).one()
         return row[0], row[1]
 
 
@@ -290,50 +288,16 @@ def test_plan_board_and_history_see_accepted_superseded_row(monkeypatch):
 
     with Session() as s:
         board = dal.session_plan_board(s, sid)
-        assert [r["OutputID"] for r in board] == [b]
+        assert [r["ScenarioID"] for r in board] == [b]
         # board-form history: a retired plan row hanging off the ACCEPTED (superseded) scenario
         s.execute(m.Risk_Treatment_Plan.__table__.insert().values(
-            PlanID=str(uuid.uuid4()), SessionID=sid, OutputID=b, TenantID="t", EntityID="86",
+            PlanID=str(uuid.uuid4()), SessionID=sid, ScenarioID=b, TenantID="t", EntityID="86",
             Status=str(StageStatus.COMPLETE), TreatmentStrategy="Mitigate", Superseded=1,
             CreatedAt=_now(), UpdatedAt=_now()))
         s.commit()
         history = dal.superseded_plan_rows(s, sid)
-        assert [r["OutputID"] for r in history] == [b]
+        assert [r["ScenarioID"] for r in history] == [b]
 
-
-def test_promotion_candidates_not_starved_by_superseded_accepted(monkeypatch):
-    """_promotion_candidates must return a below-threshold threat whose ONLY accepted scenario
-    is a superseded version — seeded with the lineage regen ACTUALLY leaves behind: the
-    accepted old output hangs off a SUPERSEDED scoped row (regen supersedes the scoped row and
-    mints a new ScopedThreatID for the replacement), while the current unaccepted output owns
-    the active scoped row. An earlier draft seeded the accepted output on an active scoped row
-    — a state the pipeline never produces — and green-lit a query that still starved."""
-    engine = _engine()
-    Session = sessionmaker(bind=engine, future=True)
-    sid = _seed_session(Session)
-    threat_id = str(uuid.uuid4())
-    old_scoped, new_scoped = str(uuid.uuid4()), str(uuid.uuid4())
-    with Session() as s:
-        s.execute(m.Identified_Threat.__table__.insert().values(
-            ThreatID=threat_id, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
-            ThreatCategory="Information Disclosure", ThreatType="Data exposure",
-            ThreatName="Unauthorized disclosure of X", GroundingStatus="unverified",
-            GroundingScore=None, Superseded=0, CreatedAt=_now()))
-        for scoped_id, superseded in ((old_scoped, 1), (new_scoped, 0)):
-            s.execute(m.Scoped_Threat.__table__.insert().values(
-                ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="86",
-                SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=1, Selected=1,
-                Superseded=superseded, CreatedAt=_now()))
-        # accepted OLD version -> superseded scoped row; current version -> active scoped row
-        for scoped_id, accepted, superseded in ((old_scoped, 1, 1), (new_scoped, 0, 0)):
-            s.execute(m.Threat_Scenario_Output.__table__.insert().values(
-                OutputID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="86",
-                SubsystemID=0, ScopedThreatID=scoped_id, Status=str(ScenarioStatus.complete),
-                ScenarioJSON="{}", Accepted=accepted, Superseded=superseded,
-                IdentityHash=HASH_10, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=_now()))
-        s.commit()
-        rows = accept_mod._promotion_candidates(s, sid, [0])
-    assert [r["ThreatID"] for r in rows] == [threat_id]
 
 
 def test_results_default_view_shows_accepted_superseded_row(monkeypatch):
@@ -366,7 +330,7 @@ def test_results_default_view_shows_accepted_superseded_row(monkeypatch):
     principal = Principal(claims={"sub": "u1"}, entities={"86"}, client_id="c", tenant_id="t")
     results = sessions_mod.get_results(sid, include_replaced=False, principal=principal)
 
-    ids = {sc.OutputID for sc in results.scenarios}
+    ids = {sc.scenario_id for sc in results.scenarios}
     assert b in ids          # accepted, though superseded
     assert d in ids          # current version still visible (flagged not-accepted)
     assert a not in ids and c not in ids  # plain history stays hidden by default
@@ -375,9 +339,11 @@ def test_results_default_view_shows_accepted_superseded_row(monkeypatch):
     # describe. The old parallel threats[] list (and the backfill query that kept it in sync)
     # is gone precisely because this cannot drift.
     for sc in results.scenarios:
-        if sc.ThreatID is not None:
-            assert sc.threat is not None
-            assert sc.threat.ThreatID == sc.ThreatID
+        # The flat ThreatID that used to sit beside `threat` is gone: it was read from the SAME
+        # row, so `threat` being None and the flat id being None were the same condition. This
+        # assertion used to prove they agreed; now there is only one of them to read.
+        if sc.threat is not None:
+            assert sc.threat.ThreatID is not None
 
 
 def test_treatment_gate_accepts_superseded_accepted_scenario(monkeypatch):
@@ -405,7 +371,7 @@ def test_treatment_gate_accepts_superseded_accepted_scenario(monkeypatch):
     monkeypatch.setattr(treatment_mod, "build_treatment_input",
                         lambda *a, **k: (_ for _ in ()).throw(Sentinel()))
 
-    scn = {"OutputID": "o1", "Superseded": 1, "Accepted": 1}
+    scn = {"ScenarioID": "o1", "Superseded": 1, "Accepted": 1}
     monkeypatch.setattr(dal, "scenario_row", lambda *a, **k: dict(scn))
     body = treatment_api.TreatmentPlanBody(
         existing_controls=[], likelihood_rating=4, impact_rating=5,
@@ -486,3 +452,59 @@ def test_accept_all_is_guarded_against_an_earlier_accepted_version(monkeypatch):
         _accept(Session, sid, None, monkeypatch)
     assert exc_info.value.reason == ScenarioDecisionReason.duplicate_identity
     assert _flags(Session, d)[0] == 0
+
+
+# --- _ensure_threat_data_still_active: the last-line gate against a master row that was
+# deactivated/deleted between generation and accept. Previously untested in both branches. ---
+
+def _seed_threat(Session, sid: str, *, type_id: int | None = None,
+                catalogue_id: int | None = None) -> None:
+    """One live Identified_Threat row on subsystem 0 (the asset unit _seed_session's
+    SCENARIOS/AWAITING_DECISION stage covers), carrying the master ids under test."""
+    with Session() as s:
+        s.execute(m.Identified_Threat.__table__.insert().values(
+            ThreatID=str(uuid.uuid4()), SessionID=sid, SubsystemID=0,
+            ThreatCategory="Tampering", ThreatType="Setpoint manipulation",
+            ThreatTypeID=type_id, ThreatCatalogueID=catalogue_id,
+            GroundingStatus="verified", Superseded=0, CreatedAt=_now()))
+        s.commit()
+
+
+def test_accept_refused_when_threat_type_is_inactive(monkeypatch):
+    """A curator retired the type between generation and accept: the gate must 409, not let
+    the accept silently succeed against a master row that no longer exists in good standing."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, _d = _versions_abcd(Session, sid)
+    with Session() as s:
+        s.execute(m.Threat_Type.__table__.insert().values(
+            ThreatTypeID=7, ThreatTypeName="Setpoint manipulation",
+            IsActive=False, IsDeleted=False))
+        s.commit()
+    _seed_threat(Session, sid, type_id=7)
+
+    with pytest.raises(MasterInactive) as exc_info:
+        _accept(Session, sid, [b], monkeypatch)
+    assert "Threat_Type inactive" in str(exc_info.value)
+    assert _flags(Session, b)[0] == 0, "nothing is written when the gate refuses"
+
+
+def test_accept_refused_when_catalogue_row_is_deleted(monkeypatch):
+    """Same gate, the other master: a deleted Threat_Catalogue row must refuse accept too —
+    this is the property the whole catalogue reversal depends on staying enforced."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, _d = _versions_abcd(Session, sid)
+    with Session() as s:
+        s.execute(m.Threat_Catalogue.__table__.insert().values(
+            ThreatCatalogueID=418, ThreatTypeID=7, ThreatName="Setpoint modification",
+            IsActive=True, IsDeleted=True))
+        s.commit()
+    _seed_threat(Session, sid, catalogue_id=418)
+
+    with pytest.raises(MasterInactive) as exc_info:
+        _accept(Session, sid, [b], monkeypatch)
+    assert "Threat_Catalogue inactive" in str(exc_info.value)
+    assert _flags(Session, b)[0] == 0

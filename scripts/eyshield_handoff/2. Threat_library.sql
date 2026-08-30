@@ -1,7 +1,7 @@
 -- ============================================================================
 -- Threat_library — creates the threat-library MASTER tables (Category/Type/
--- Catalogue/Actor + type-actor map), Threat_Catalogue_Category_Map, Source
--- provenance columns, and Config_Threat_Rule. Schema only — row content
+-- Catalogue/Actor), the two junction maps (type-actor, catalogue-category), and the Source
+-- provenance columns. Schema only — row content
 -- lives in Seed_to_Threat_library.sql. Run after TSG_Core.sql.
 -- ============================================================================
 
@@ -99,6 +99,58 @@ IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat
 IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Actor', 'CreatedAt') IS NULL
     ALTER TABLE Threat_Actor ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
 
+-- Natural-key guard indexes. Makes concurrent promote-on-accept safe: two
+-- sessions accepting at once can't both create the same library master.
+-- Boot-asserted in app/db/invariants.REQUIRED_INDEXES.
+-- NAME-ONLY. These keys used to include ThreatCategoryID/SectorID, which let one name exist once
+-- per (category, sector): every curated row carries SectorID NULL while promotion stamped a real
+-- sector, so an AI-promoted threat forked a same-name twin every time.
+--
+-- These are a CONCURRENCY BACKSTOP, not the dedup mechanism. Dedup is owned by the application:
+-- dal.upsert_threat_type / upsert_threat_catalogue / upsert_threat_actor resolve an existing row
+-- through core.naming.normalize_name BEFORE inserting, so duplicates cannot be created even on a
+-- database where these indexes were never built. What the index adds is arbitration between two
+-- writers committing the same new name in the same instant.
+--
+-- Guarded CREATE, never DROP-then-CREATE: a DROP that succeeds followed by a CREATE UNIQUE that
+-- fails on pre-existing duplicates (Msg 1505) would leave the table with NO unique index at all
+-- -- strictly worse than the wrong one, and reached by running the install script. On a database
+-- still holding the old 3-column index, drop it by hand after confirming no duplicate names.
+--
+-- The IntegrityError recovery in dal selects on these exact columns (name alone); changing one
+-- without the other turns a duplicate into a 500. Boot-asserted in invariants.REQUIRED_INDEXES.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Type'))
+CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName) WHERE IsActive = 1 AND IsDeleted = 0;
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCatalogue_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Catalogue'))
+CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatName) WHERE IsActive = 1 AND IsDeleted = 0;
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
+CREATE UNIQUE INDEX UX_ThreatActor_NaturalKey ON Threat_Actor(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0;
+
+-- Threat_Category was the only CRUD-writable master without this guard
+-- (2026-07-30) — without it a duplicate category name was accepted silently,
+-- and grounding vs. the importer disagreed on which id it meant.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCategory_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Category'))
+CREATE UNIQUE INDEX UX_ThreatCategory_NaturalKey ON Threat_Category(ThreatCategoryName) WHERE IsActive = 1 AND IsDeleted = 0;
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatType_Category_Active' AND object_id = OBJECT_ID('dbo.Threat_Type'))
+CREATE INDEX IX_ThreatType_Category_Active ON Threat_Type(ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
+-- Supports grounding.get_possible_types()'s category filter. (SectorID stays in the key
+-- for already-deployed databases; sector logic was removed 2026-08, user instruction.)
+
+IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Threat_Type', 'Source') IS NULL
+        ALTER TABLE Threat_Type ADD Source nvarchar(50) NULL;
+END
+
+IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('dbo.Threat_Catalogue', 'Source') IS NULL
+        ALTER TABLE Threat_Catalogue ADD Source nvarchar(50) NULL;
+END
+
 IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NULL
 CREATE TABLE ThreatType_ThreatActor_Map (
     ThreatTypeID   int NOT NULL,
@@ -112,27 +164,6 @@ IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.ThreatType_ThreatActor_Map', 'CreatedAt') IS NULL
     ALTER TABLE ThreatType_ThreatActor_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_TypeActorMap_CreatedAt DEFAULT SYSUTCDATETIME();
 
--- Natural-key guard indexes. Makes concurrent promote-on-accept safe: two
--- sessions accepting at once can't both create the same library master.
--- Boot-asserted in app/db/invariants.REQUIRED_INDEXES.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Type'))
-CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName, ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCatalogue_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Catalogue'))
-CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatTypeID, ThreatName, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
-CREATE UNIQUE INDEX UX_ThreatActor_NaturalKey ON Threat_Actor(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0;
-
--- Threat_Category was the only CRUD-writable master without this guard
--- (2026-07-30) — without it a duplicate category name was accepted silently,
--- and grounding vs. the importer disagreed on which id it meant.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCategory_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Category'))
-CREATE UNIQUE INDEX UX_ThreatCategory_NaturalKey ON Threat_Category(ThreatCategoryName) WHERE IsActive = 1 AND IsDeleted = 0;
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatType_Category_Active' AND object_id = OBJECT_ID('dbo.Threat_Type'))
-CREATE INDEX IX_ThreatType_Category_Active ON Threat_Type(ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
--- Supports grounding.get_possible_types()'s category+sector filter.
 
 -- Threat_Catalogue <-> Threat_Category many-to-many: most real threats carry
 -- more than one STRIDE category, which a single FK can't represent. Source
@@ -155,44 +186,6 @@ IF OBJECT_ID('dbo.Threat_Catalogue_Category_Map', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Catalogue_Category_Map', 'CreatedAt') IS NULL
     ALTER TABLE Threat_Catalogue_Category_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_CatCategoryMap_CreatedAt DEFAULT SYSUTCDATETIME();
 
-IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.Threat_Type', 'Source') IS NULL
-        ALTER TABLE Threat_Type ADD Source nvarchar(50) NULL;
-END
-
-IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL
-BEGIN
-    IF COL_LENGTH('dbo.Threat_Catalogue', 'Source') IS NULL
-        ALTER TABLE Threat_Catalogue ADD Source nvarchar(50) NULL;
-END
-
--- Config_Threat_Rule (R12 scoping rules). IDENTITY starts at 22 so the
--- hand-seeded rows 1-21 in Seed_to_Threat_library.sql keep their ids.
--- UX_ConfigThreatRule_NaturalKey collapses duplicate auto-writes — without it
--- a duplicate relevance_flag row would silently double a threat's score boost.
-
-IF OBJECT_ID('dbo.Config_Threat_Rule', 'U') IS NULL
-CREATE TABLE Config_Threat_Rule (
-    ThreatRuleID  int            IDENTITY(22,1) NOT NULL CONSTRAINT PK_Config_Threat_Rule PRIMARY KEY,
-    RuleType      nvarchar(100)   NOT NULL,               -- tech_gate | relevance_flag | relevance_context_value
-    ThreatTypeID  int            NOT NULL,               -- app-enforced FK -> Threat_Type
-    RuleKey       nvarchar(200)  NOT NULL,               -- e.g. 'asset_type' (scoping.py allowlist)
-    RuleValue     nvarchar(450)  NULL,
-    Metadata      nvarchar(max)  NULL,                   -- JSON, e.g. {"weight": 15}
-    CreateDate    datetime2      NULL,
-    CreatedBy     nvarchar(200)  NULL,
-    UpdateDate    datetime2      NULL,
-    UpdatedBy     nvarchar(200)  NULL,
-    IsActive      bit            NOT NULL,
-    IsDeleted     bit            NOT NULL
-);
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ConfigThreatRule_NaturalKey'
-               AND object_id = OBJECT_ID('dbo.Config_Threat_Rule'))
-CREATE UNIQUE INDEX UX_ConfigThreatRule_NaturalKey
-    ON Config_Threat_Rule(ThreatTypeID, RuleType, RuleKey, RuleValue)
-    WHERE IsActive = 1 AND IsDeleted = 0;
 
 -- Context_Field_Config (the per-field AI-prompt allowlist) REMOVED. Nothing
 -- reads it anymore — context.py decides what fields are assembled,
@@ -210,15 +203,14 @@ SELECT 'Threat_Catalogue', OBJECT_ID('dbo.Threat_Catalogue', 'U')
 UNION ALL
 SELECT 'Threat_Actor', OBJECT_ID('dbo.Threat_Actor', 'U')
 UNION ALL
-SELECT 'ThreatType_ThreatActor_Map', OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U')
-UNION ALL
-SELECT 'Threat_Catalogue_Category_Map', OBJECT_ID('dbo.Threat_Catalogue_Category_Map', 'U')
-UNION ALL
 SELECT 'Threat_Type.Source', COL_LENGTH('dbo.Threat_Type', 'Source')
 UNION ALL
 SELECT 'Threat_Catalogue.Source', COL_LENGTH('dbo.Threat_Catalogue', 'Source')
 UNION ALL
-SELECT 'Config_Threat_Rule', OBJECT_ID('dbo.Config_Threat_Rule', 'U');
+SELECT 'ThreatType_ThreatActor_Map', OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U')
+UNION ALL
+SELECT 'Threat_Catalogue_Category_Map', OBJECT_ID('dbo.Threat_Catalogue_Category_Map', 'U')
+;
 
 
 -- ---------------------------------------------------------------------------
@@ -243,7 +235,3 @@ IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Actor', 'Source') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Actor'), 'Source', 'CharMaxLen') < 100
     ALTER TABLE Threat_Actor ALTER COLUMN Source nvarchar(100) NULL;
-IF OBJECT_ID('dbo.Config_Threat_Rule', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Config_Threat_Rule', 'RuleType') IS NOT NULL
-    AND COLUMNPROPERTY(OBJECT_ID('dbo.Config_Threat_Rule'), 'RuleType', 'CharMaxLen') < 100
-    ALTER TABLE Config_Threat_Rule ALTER COLUMN RuleType nvarchar(100) NOT NULL;

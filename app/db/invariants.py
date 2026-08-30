@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from app.core.config import get_settings
-from app.core.enums import SessionStatus
+from app.core.enums import CalibrationStatus, SessionStatus
 from app.core.logging import get_logger
 from app.core.stride import STRIDE_ORDER
 from app.db import models as m
@@ -36,8 +36,15 @@ REQUIRED_INDEXES = [
     ("UX_Scenario_ActiveAccepted", "Threat_Scenario_Output", ("SessionID", "IdentityHash", "ScenarioNumber")),
     # Master-library natural keys — makes concurrent promote-on-accept safe: two sessions
     # accepting at once can't both create the same library master.
-    ("UX_ThreatType_NaturalKey", "Threat_Type", ("ThreatTypeName", "ThreatCategoryID", "SectorID")),
-    ("UX_ThreatCatalogue_NaturalKey", "Threat_Catalogue", ("ThreatTypeID", "ThreatName", "SectorID")),
+    # NAME-ONLY since the 2026-08 duplicate-elimination change: SectorID/ThreatCategoryID used to
+    # be part of both keys, which let one name exist once per (category, sector) combination —
+    # curated rows carry SectorID NULL while promotion stamped a real sector, so every AI-promoted
+    # threat forked a same-name twin. The recovery lookup in dal.upsert_threat_type is
+    # narrowed to match; it MUST stay in step with this tuple. The same
+    # name-only rule applies to UX_ThreatCatalogue_NaturalKey (re-added 2026-08-28 with the
+    # catalogue's return — the promote API writes Threat_Catalogue again).
+    ("UX_ThreatType_NaturalKey", "Threat_Type", ("ThreatTypeName",)),
+    ("UX_ThreatCatalogue_NaturalKey", "Threat_Catalogue", ("ThreatName",)),
     ("UX_ThreatActor_NaturalKey", "Threat_Actor", ("ThreatActorName",)),
     ("UX_ThreatCategory_NaturalKey", "Threat_Category", ("ThreatCategoryName",)),
     # The row identity the whole lock/epoch-CAS design asserts in Python (rowcount == 1);
@@ -48,23 +55,25 @@ REQUIRED_INDEXES = [
     # (docs/RISK_TREATMENT_PLAN_SDD.md §4.1). The companion IX_TreatmentPlan_SessionActive is
     # a plain performance index and deliberately NOT listed: this check rejects non-unique
     # entries, and registering it would make every boot fail with the DDL correctly applied.
-    ("UX_TreatmentPlan_ActiveOutput", "Risk_Treatment_Plan", ("OutputID",)),
-    # Four more the code relies on for CORRECTNESS, not performance. Each is created by the
+    ("UX_TreatmentPlan_ActiveOutput", "Risk_Treatment_Plan", ("ScenarioID",)),
+    # One in-flight calibration per embedding+reranker pair. A sweep costs 10-15 minutes and ~100
+    # billed LLM calls, and the route CANNOT stop a double-start by itself: two requests arriving
+    # together both read "nothing running" before either writes. Only the DB refusing the second
+    # INSERT closes that window, so a database missing this index must not boot.
+    ("UX_GroundingCalibration_Running", "Grounding_Calibration_Run",
+    ("EmbeddingModel", "RerankerModel")),
+    # Three more the code relies on for CORRECTNESS, not performance. Each is created by the
     # deployment scripts, but until now none was asserted here — so a database missing one
     # booted cleanly and then corrupted data silently, the worst of both worlds.
     # Every one backs an IntegrityError-driven upsert or a 409 translation: without the index
     # there is no error to catch, so the duplicate is simply accepted.
-    #   * ConfigThreatRule — Threat_library.sql says it outright: "without it a duplicate
-    #     relevance_flag row would silently DOUBLE a threat's score boost" (scoping._apply_rules
-    #     sums fired weights additively). Silent mis-scoring of every future assessment.
     #   * Session_IdempotencyKey — dal.create_session branches on this index FIRST when a key was
     #     supplied; without it a retried POST /v1/sessions creates a second session for one asset.
-    #   * The two control-library keys — control_library_crud turns their IntegrityError into a
-    #     409; absent, a duplicate ControlCode is accepted and grounding gains a phantom control.
+    #   * The two control-library keys — a DB-level guarantee, independent of app code, that a
+    #     duplicate ControlCode/StandardName can never be inserted; absent, one would be silently
+    #     accepted and grounding would gain a phantom control.
     # Filtered/partial in the DDL, exactly like the entries above; the check compares name, table,
     # ordered columns and uniqueness, so a filter drift still surfaces as a boot failure.
-    ("UX_ConfigThreatRule_NaturalKey", "Config_Threat_Rule",
-    ("ThreatTypeID", "RuleType", "RuleKey", "RuleValue")),
     ("UX_Session_IdempotencyKey", "Scenario_Session", ("EntityID", "IdempotencyKey")),
     ("UX_Control_Standard_Name", "Control_Standard", ("StandardName",)),
     ("UX_Control_Library_Code", "Control_Library", ("ControlCode",)),
@@ -78,7 +87,6 @@ REQUIRED_INDEXES = [
 # bypass the entity-isolation filters that keep one customer's data away from another's.
 REQUIRED_NOT_NULL = [
     ("Scenario_Session", "EntityID"), ("Scenario_Session", "AssetID"),
-    ("Threat_Candidate_Review", "TenantID"),
 ]
 
 # CHECKLIST 3 — a LIVE data scan, not a schema check: supersede-instead-of-delete tables must
@@ -99,15 +107,18 @@ ACTIVE_UNIQUE = [
 # nothing crashes; readers and writers just start blocking each other under load, which is
 # near-undiagnosable after the fact.
 
-# CHECKLIST 5 — these filtered indexes bake a raw 'active' literal into their
-# WHERE clause against Scenario_Session.SessionStatus, and nothing in the DB ties that text to
-# the SessionStatus enum. Rename the enum without updating the DDL and the index silently stops
-# matching any row the app writes — the one-active-session lock degrades with no error anywhere.
+# CHECKLIST 5 — these filtered indexes bake a raw status literal into their WHERE clause, and
+# nothing in the DB ties that text to the Python enum it came from. Rename the enum without
+# updating the DDL and the index silently stops matching any row the app writes — the lock it
+# enforces degrades with NO error anywhere, which is the worst possible failure shape for a guard.
 #
-# Each entry is (index name, the SessionStatus member its filter must mention).
+# Each entry is (index name, the enum member its filter must mention).
 FILTERED_INDEX_LITERALS = [
     ("UX_Session_ActiveAsset", SessionStatus.active),
     ("IX_Session_Active", SessionStatus.active),
+    # The one-calibration-at-a-time guard. Same failure shape, higher cost: a silently-void
+    # filter here means concurrent sweeps, each 10-15 minutes of billed LLM calls.
+    ("UX_GroundingCalibration_Running", CalibrationStatus.running),
 ]
 
 
@@ -185,7 +196,7 @@ def _assert_api_client_configured(engine: Engine) -> None:
             "python -c \"import hashlib,secrets; s=secrets.token_hex(32); "
             "print(s, hashlib.sha256(s.encode()).hexdigest())\"  then  INSERT INTO API_Client "
             f"(ClientID, KeyHash, Name, Module) VALUES ('shield-<env>', '<keyhash>', 'Shield', "
-            f"'{API_MODULE}'). See scripts/TSG_Core.sql."
+            f"'{API_MODULE}'). See scripts/eyshield_handoff/'1. TSG_Core.sql'."
         )
 
 
@@ -216,7 +227,9 @@ def _assert_indexes(engine: Engine) -> None:
     missing = [ix for ix in by_name if ix not in present]
     if missing:
         raise StartupInvariantError(
-            f"missing required indexes (re-run scripts/TSG_Core.sql and scripts/Threat_library.sql): {missing}"
+            "missing required indexes (re-run scripts/eyshield_handoff/'1. TSG_Core.sql' and "
+            "'2. Threat_library.sql'; for UX_GroundingCalibration_Running alone, "
+            f"scripts/TSG_Migration_GroundingCalibration.sql): {missing}"
         )
     mismatched = [ix for ix, (table, cols) in by_name.items()
                 if present[ix]["table"] != table or present[ix]["columns"] != cols]
@@ -247,7 +260,10 @@ def _assert_filtered_index_literals(engine: Engine) -> None:
     present = {r[0]: (r[1] or "") for r in rows}
     missing = [name for name in names if name not in present]
     if missing:
-        raise StartupInvariantError(f"missing filtered indexes (re-run scripts/TSG_Core.sql): {missing}")
+        raise StartupInvariantError(
+            "missing filtered indexes (re-run scripts/eyshield_handoff/'1. TSG_Core.sql'; for "
+            f"UX_GroundingCalibration_Running alone, "
+            f"scripts/TSG_Migration_GroundingCalibration.sql): {missing}")
     stale = [name for name, status in FILTERED_INDEX_LITERALS if f"'{status.value}'" not in present[name]]
     if stale:
         raise StartupInvariantError(

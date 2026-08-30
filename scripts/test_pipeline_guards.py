@@ -21,10 +21,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import get_settings
 from app.core.enums import DuplicateReason
-from app.pipeline import accept, scoping, tasks
+from app.pipeline import scoping, tasks
 from app.pipeline.cascade import NextSetOutcome, _build_regen_audit_detail, _next_set_outcome
 from app.pipeline.tasks import (
-    _library_hits,
     _scrub_model_output,
     _semantic_duplicates,
     _usable_proposal,
@@ -248,29 +247,6 @@ def check_semantic_duplicates_compare_within_flag() -> None:
     print("ok  _semantic_duplicates compare_within=False exempts same-batch, keeps priors")
 
 
-def check_library_hits_canonicalizes_subsystem_order() -> None:
-    """The same real asset, submitted twice with its supporting systems in different order
-    (SubsystemsJSON preserves the request's own array order), must hash to the SAME
-    profile_key -- otherwise the scenario-library cache silently splits per request-order
-    instead of per real profile. work=[] takes the early-return branch before any DB call,
-    so this needs no session and no candidates."""
-    scenario_session = {"AssetName": "Water Pumping Station", "SectorIDsJSON": "[]"}
-    asset_context = {"asset_type": "Pumping Station", "sector": "Energy & Water",
-                    "sub_sector": "Water Supply"}
-    sub_a = {"id": 41, "name": "SCADA HMI", "asset_type": "OT", "technology_used": ["Siemens"]}
-    sub_b = {"id": 42, "name": "Billing Portal", "asset_type": "IT", "technology_used": ["Django"]}
-
-    _, key_forward, names_forward = _library_hits(
-        None, [], {}, scenario_session, [sub_a, sub_b], asset_context, {})
-    _, key_reversed, names_reversed = _library_hits(
-        None, [], {}, scenario_session, [sub_b, sub_a], asset_context, {})
-
-    assert key_forward == key_reversed, (key_forward, key_reversed)
-    # Canonicalized identically for both calls, so the position-matched substitution target
-    # list is unaffected by which order the caller happened to submit -- always id-sorted.
-    assert names_forward == names_reversed == ["Water Pumping Station", "SCADA HMI", "Billing Portal"]
-    print("ok  _library_hits canonicalizes subsystem order into the cache key")
-
 
 def check_semantic_scan_failure_is_not_fatal() -> None:
     """A failed scan must degrade to 'no duplicates', never lose the round's threats."""
@@ -294,21 +270,20 @@ def check_ranking_is_stable_and_meaningful() -> None:
     threats = [_threat("zzz-last-alphabetically", "alpha one"),
                _threat("aaa-first-alphabetically", "alpha two"),
                _threat("mmm-middle", "alpha three")]
-    scored = scoping.score_threats(threats, base_score=50.0, default_rule_weight=10.0,
-                                   score_threshold=None)
+    scored = scoping.score_threats(threats, base_score=50.0, score_threshold=None)
     assert [s.threat_id for s in scored] == [t["threat_id"] for t in threats], \
         [s.threat_id for s in scored]
-    assert all(s.selected for s in scored)  # no rules, no gate — nothing may be dropped
+    assert all(s.selected for s in scored)  # no gate exists any more — nothing may be dropped
     assert len({s.score for s in scored}) == 1  # identical grounding status => identical score
     print("ok  score_threats preserves input order within a score band")
 
 
 def check_score_floor_still_reachable() -> None:
-    """The floor is dormant under the shipped rulebook but must still WORK — it is what a
-    curator's negative-weight rule acts through."""
+    """The floor is dormant under the shipped defaults but must still WORK —
+    scoping_score_threshold is a real Config_Tuning knob, and an operator raising it above
+    base + the unverified confidence weight is choosing to require verified grounding."""
     threats = [_threat("t1", "alpha one")]
-    scored = scoping.score_threats(threats, base_score=50.0, default_rule_weight=10.0,
-                                   score_threshold=99.0)
+    scored = scoping.score_threats(threats, base_score=50.0, score_threshold=99.0)
     assert scored[0].selected is False
     assert str(scored[0].rejection) == "below_threshold", scored[0].rejection
     assert scored[0].selection is None  # selection is not None <=> selected
@@ -454,43 +429,57 @@ def check_scenario_receipts_carry_their_scenario_id() -> None:
     print("scenario receipts: correlation_id wired on both paths; variant id minted pre-call")
 
 
-def check_catalogued_threats_do_not_requeue_curation_cards() -> None:
-    """A threat already linked to a library entry must never queue a pending curation card.
-
-    The cause is a SPLIT decision. `_decide_candidate_fate` skips triage when the threat already
-    carries a ThreatCatalogueID, so `verdict` keeps its default `review` — and the card-insert
-    block then reads that verdict without re-checking why it holds. Any re-run of promotion (the
-    reaper's retry sweep today; per-accept promotion once scenarios decide independently) therefore
-    re-queued threats already in the library, giving curators duplicate work that approving cannot
-    resolve.
-
-    Pinned by source because reproducing it behaviourally needs a live catalogue, embeddings and a
-    full promotion run — same approach as scripts/test_promotion_retry_flow.py.
-
-    NOTE: weaker than a behavioural test. It proves the conjunct is still present, not that it
-    still has the intended effect. Replace it if seeding a real promotion run ever gets cheap."""
-    tree = ast.parse(inspect.getsource(accept._add_unverified_threats_to_library))
-
-    # Locate every `if` whose body inserts a candidate card, then assert its condition consults
-    # ThreatCatalogueID — i.e. a catalogued threat cannot reach the insert at all.
-    card_guards = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
-        if "CandidateKind" in body and "ProposedName" in body:
-            card_guards.append(ast.dump(node.test))
-    assert card_guards, "no candidate-card insert found in _add_unverified_threats_to_library"
-    for cond in card_guards:
-        assert "ThreatCatalogueID" in cond, (
-            "the candidate-card insert no longer checks ThreatCatalogueID — a threat already in "
-            "the library will be re-queued for curation on every promotion re-run")
-    print("promotion: catalogued threats cannot re-queue a curation card")
-
 
 #: The only function allowed to write a scenario's decision columns.
 _DECISION_WRITER = "decide_scenarios"
-_DECISION_COLUMNS = ("Accepted", "RejectedAt", "RejectedBy")
+_DECISION_COLUMNS = ("Accepted", "AcceptedAt", "AcceptedBy", "RejectedAt", "RejectedBy")
+
+
+def _dict_str_keys(node: ast.AST) -> set[str]:
+    """String keys of a dict literal. Computed keys are ignored — unresolvable, and no writer
+    in this repo builds a column name at runtime."""
+    if not isinstance(node, ast.Dict):
+        return set()
+    return {k.value for k in node.keys
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+
+
+def _decision_columns_written(call: ast.Call, fn) -> set[str]:
+    """Decision columns a `.values(...)` call writes — in ALL the spellings SQLAlchemy accepts.
+
+    This exists because the original check read `kw.arg` only. A `**dict` splat sets `kw.arg` to
+    None, so it matched nothing — and `.values(**values)` is exactly the spelling
+    `dal.decide_scenarios` itself uses. The guard therefore inspected every `.values()` call in
+    `app/` and reported an empty set for each, meaning `offenders` was unconditionally empty and
+    the assertion below could never fire. It protected nothing while reading as if it did.
+
+    Three spellings are covered:
+      .values(Accepted=1)            -> a literal keyword
+      .values(**{"Accepted": 1})     -> an inline dict literal
+      .values(**values)              -> a NAME, resolved against dict literals bound to it in the
+                                        same function, including `values |= {...}` augmentation
+    Only UPDATE `.values()` is inspected on purpose: an INSERT payload carrying `"Accepted": 0`
+    (tasks.py's new-scenario row) is initialisation, not a decision, and must not be flagged.
+    """
+    written: set[str] = set()
+    for kw in call.keywords:
+        if kw.arg is not None:
+            written.add(kw.arg)
+        elif isinstance(kw.value, ast.Dict):
+            written |= _dict_str_keys(kw.value)
+        elif isinstance(kw.value, ast.Name) and fn is not None:
+            name = kw.value.id
+            for stmt in ast.walk(fn):
+                if isinstance(stmt, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == name for t in stmt.targets):
+                    written |= _dict_str_keys(stmt.value)
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) \
+                        and stmt.target.id == name and stmt.value is not None:
+                    written |= _dict_str_keys(stmt.value)
+                elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name) \
+                        and stmt.target.id == name:
+                    written |= _dict_str_keys(stmt.value)
+    return written & set(_DECISION_COLUMNS)
 
 
 def check_only_one_function_writes_a_scenario_decision() -> None:
@@ -513,17 +502,20 @@ def check_only_one_function_writes_a_scenario_decision() -> None:
     offenders: list[str] = []
     for path in sorted(app_dir.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        # Map every node to the function enclosing it, so a hit can name its writer.
+        # Map every node to the function enclosing it, so a hit can name its writer — and to the
+        # function NODE too, since resolving a `**values` splat needs that function's assignments.
         enclosing: dict[ast.AST, str] = {}
+        enclosing_fn: dict[ast.AST, ast.FunctionDef | ast.AsyncFunctionDef] = {}
         for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]:
             for child in ast.walk(fn):
                 enclosing.setdefault(child, fn.name)
+                enclosing_fn.setdefault(child, fn)
         for node in ast.walk(tree):
-            # `.values(Accepted=1, ...)` — the SQLAlchemy UPDATE spelling
+            # `.values(...)` — the SQLAlchemy UPDATE spelling
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "values"):
                 continue
-            named = {kw.arg for kw in node.keywords if kw.arg in _DECISION_COLUMNS}
+            named = _decision_columns_written(node, enclosing_fn.get(node))
             if named and enclosing.get(node) != _DECISION_WRITER:
                 offenders.append(
                     f"{path.relative_to(app_dir.parent)}: {sorted(named)} written in "
@@ -587,7 +579,6 @@ def demo() -> None:
     check_only_one_function_writes_a_scenario_decision()
     check_every_decision_route_passes_the_review_gate()
     check_scenario_receipts_carry_their_scenario_id()
-    check_catalogued_threats_do_not_requeue_curation_cards()
     check_usable_proposal()
     check_semantic_duplicates_same_category()
     check_semantic_duplicates_identical_labels()
@@ -599,7 +590,6 @@ def demo() -> None:
     check_semantic_duplicates_no_chain_drop()
     check_semantic_duplicates_against_priors()
     check_semantic_duplicates_compare_within_flag()
-    check_library_hits_canonicalizes_subsystem_order()
     check_semantic_scan_failure_is_not_fatal()
     check_ranking_is_stable_and_meaningful()
     check_score_floor_still_reachable()

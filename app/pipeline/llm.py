@@ -878,8 +878,9 @@ def _verify_embedding_dimensions(s: Settings) -> None:
     """`local_models.validate_local_models` only dimension-checks the LOCAL path; a proxy-routed
     model can return a different width than EMBEDDING_DIMENSIONS (qwen3-embedding-8b-mig returns
     4096 against the 1024 default) and nothing downstream enforces it — vectors are stored as a
-    schema-less Mongo array, and `grounding.how_similar`'s `zip(a, b)` silently truncates to the
-    shorter vector, producing a plausible but meaningless cosine score.
+    schema-less Mongo array, and a stale mismatched vector wouldn't crash: `hybrid_search.cosine`
+    returns a flat 0.0 for any length mismatch rather than raising, so it would just silently
+    score as an ordinary no-match, masking a real dimension drift instead of surfacing an error.
 
     Costs one real embedding call at boot — same cadence validate_local_models already pays.
 
@@ -932,8 +933,8 @@ def _verify_embedding_dimensions(s: Settings) -> None:
             f"EMBEDDING_DIMENSIONS={s.embedding_dimensions} but litellm proxy model "
             f"'{s.embedding_model}' actually returns {dim}-dimensional vectors — fix "
             f"EMBEDDING_DIMENSIONS in .env before starting; a stale mismatch here would "
-            f"otherwise corrupt threat-grounding similarity scores silently (see "
-            f"grounding.how_similar)")
+            f"otherwise silently mask as an ordinary threat-grounding no-match instead of "
+            f"surfacing an error (see hybrid_search.cosine)")
 
 
 def log_litellm_key_info(settings: Settings | None = None) -> None:

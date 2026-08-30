@@ -7,7 +7,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -17,7 +17,6 @@ from sqlalchemy import (
     and_,
     bindparam,
     case,
-    exists,
     func,
     insert,
     or_,
@@ -34,8 +33,6 @@ from app.core.enums import (
     ActorType,
     AuditDecision,
     AuditEventType,
-    CandidateKind,
-    CandidateStatus,
     ScenarioDecisionReason,
     ScenarioStatus,
     SessionStatus,
@@ -45,6 +42,7 @@ from app.core.enums import (
     WorkflowStage,
 )
 from app.core.logging import get_logger
+from app.core.naming import normalize_name
 from app.core.stride import in_stride_order
 from app.core.tracing import trace_step
 from app.db import models as m
@@ -53,10 +51,70 @@ log = get_logger(__name__)
 #: 48-bit millisecond clock, in the LAST 6 bytes of every generated GUID. See guid().
 _COMB_TS_MASK = (1 << 48) - 1
 
+
+def safe_json_dict(blob: str | None, *, warn_event: str | None = None, **warn_fields) -> dict | None:
+    """One stored JSON blob -> dict, else None. THE defensive read for every nvarchar JSON column
+    (ScenarioJSON, PlanJSON, ValidationJSON, InputSnapshotJSON, DetailJSON): a single corrupt row
+    must degrade to None, never 500 a whole view and hide every other row with it.
+
+    Valid JSON that is not an object ("[1,2]", "null", a bare string) parses fine and would then
+    die in response validation as a 500 — the exact whole-view failure this prevents — so it is
+    treated the same as unparseable by the RETURN value.
+
+    `warn_event` (with **warn_fields) is emitted ONLY on a genuine parse failure, deliberately NOT
+    on that valid-but-wrong-shape case: the two are indistinguishable from the return value alone,
+    so folding the log into a caller-side `is None` check would start warning where the callers
+    are silent today. Callers wanting silence simply omit warn_event.
+
+    Note `pipeline/treatment.py::_loads` is a DIFFERENT contract (caller-supplied default, list
+    support) and is deliberately not folded in here.
+    """
+    if not blob:
+        return None
+    try:
+        parsed = json.loads(blob)
+    except (TypeError, ValueError):   # json.JSONDecodeError subclasses ValueError
+        if warn_event:
+            log.warning(warn_event, **warn_fields)
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
 # --- API authentication (header model, see app/api/deps.get_principal) ---
-#: user_scope_assignment.scope_type value that means "Entity" — option_value group 1010
-#: (1=Sector 2=Sub-Sector 3=Service 4=Entity 5=Asset). ref_id is then a group.id = EntityID.
-SCOPE_TYPE_ENTITY = 4
+#: option.id for the platform's "scope type" vocabulary group (values: Sector/Sub-Sector/
+#: Service/Entity/Asset). Only the group id is fixed in code — which value means "Entity" is
+#: resolved from option_value.name at runtime (resolve_scope_type_entity_id), not hardcoded,
+#: so a platform-side renumbering can't silently mis-authorize [R2].
+_SCOPE_TYPE_OPTION_ID = 1010
+_scope_type_entity_id_cache: int | None = None
+
+
+def resolve_scope_type_entity_id(sess: Session) -> int:
+    """The user_scope_assignment.scope_type value that means "Entity" — the row in
+    option_value (group _SCOPE_TYPE_OPTION_ID) whose name is "Entity", read from `.value`
+    (the small in-group code column; option_value.id is a table-wide PK and NOT what
+    scope_type stores). Cached at process level after the first resolution — one query per
+    process, not per call. Fails LOUDLY if the row is missing/renamed rather than guessing a
+    scope level: this feeds an authorization check, so failing closed beats failing quiet."""
+    global _scope_type_entity_id_cache
+    if _scope_type_entity_id_cache is None:
+        value = sess.execute(
+            select(m.option_value.value).where(
+                m.option_value.option_id == _SCOPE_TYPE_OPTION_ID,
+                m.option_value.name == "Entity")
+        ).scalar()
+        if value is None:
+            raise RuntimeError(
+                "user_scope_assignment authorization is unusable: no 'Entity' row found in "
+                f"option_value for option_id={_SCOPE_TYPE_OPTION_ID} — the platform's scope-"
+                "type vocabulary is missing or was renamed.")
+        _scope_type_entity_id_cache = value
+    return _scope_type_entity_id_cache
+
+
+def _clear_scope_type_entity_cache() -> None:
+    """Test-isolation hook — see tests/conftest.py's autouse cache-clear fixture."""
+    global _scope_type_entity_id_cache
+    _scope_type_entity_id_cache = None
 
 #: This deployment's module name (config: TSG_API_MODULE, default 'tsg'). An API_Client key is
 #: valid ONLY for its own Module, so a leaked key is contained to one module (a 'chatbot' key can't
@@ -71,7 +129,7 @@ def user_has_entity(sess: Session, user_id: str | int, entity_id: str | int) -> 
     The (user, entity) pair arrives self-declared in request headers; this is the check that
     makes it real. Fails CLOSED — the caller treats any exception as a deny.
 
-    scope_type is pinned to Entity (4), not optional: the same table holds Sub-Sector/Service/
+    scope_type is pinned to Entity, not optional: the same table holds Sub-Sector/Service/
     Asset rows for the same user, and a non-entity ref_id could otherwise collide with an
     entity id. We verify the supplied pair (never derive the entity from the user), so a user
     with more than one entity assignment is handled correctly.
@@ -80,7 +138,7 @@ def user_has_entity(sess: Session, user_id: str | int, entity_id: str | int) -> 
         select(1).where(
             m.user_scope_assignment.user_id == int(user_id),
             m.user_scope_assignment.ref_id == int(entity_id),
-            m.user_scope_assignment.scope_type == SCOPE_TYPE_ENTITY,
+            m.user_scope_assignment.scope_type == resolve_scope_type_entity_id(sess),
             m.user_scope_assignment.is_active == True,  # Core bit compare (renders `= 1`); MSSQL rejects `IS 1`
         ).limit(1)
     ).first() is not None
@@ -312,7 +370,7 @@ def active(col) -> Any:
     columns), so the bound form silently scans the whole table. The literal is a constant, so
     statements still cache and reuse plans. Sibling of superseded_plan_rows' `hist` literal — same
     fix, opposite constant. NOT needed where the row is already located by a PK/unfiltered seek
-    (PlanID/OutputID fences, threat_scores via IX_ScopedThreat_SessionActiveScores) — there
+    (PlanID/ScenarioID fences, threat_scores via IX_ScopedThreat_SessionActiveScores) — there
     Superseded is a residual predicate and a plain bind is fine."""
     return col == bindparam("act", 0, literal_execute=True)
 
@@ -407,13 +465,13 @@ def reserve_session(sess: Session, session_id: str) -> bool:
 
 def active_accept_candidates(sess: Session, session_id: str,
                              subsystem_ids: list[int]) -> dict[str, tuple[str | None, int]]:
-    """{OutputID: (IdentityHash, ScenarioNumber)} for exactly the rows an ACCEPT-ALL would flip.
+    """{ScenarioID: (IdentityHash, ScenarioNumber)} for exactly the rows an ACCEPT-ALL would flip.
 
     Mirrors mark_scenarios_accepted's subset=None predicates (active + complete + these
     subsystems) so the pre-flight and the write can never disagree about the candidate set."""
     out = m.Threat_Scenario_Output
-    return {str(r["OutputID"]): (r["IdentityHash"], r["ScenarioNumber"]) for r in sess.execute(
-        select(out.OutputID, out.IdentityHash, out.ScenarioNumber)
+    return {str(r["ScenarioID"]): (r["IdentityHash"], r["ScenarioNumber"]) for r in sess.execute(
+        select(out.ScenarioID, out.IdentityHash, out.ScenarioNumber)
         .where(out.SessionID == session_id,
             out.SubsystemID.in_(subsystem_ids),
             out.Status == ScenarioStatus.complete,
@@ -422,7 +480,7 @@ def active_accept_candidates(sess: Session, session_id: str,
 
 
 def accepted_identity_pairs(sess: Session, session_id: str) -> dict[tuple[str, int], str]:
-    """{(IdentityHash, ScenarioNumber): OutputID} for scenarios this session has ALREADY accepted.
+    """{(IdentityHash, ScenarioNumber): ScenarioID} for scenarios this session has ALREADY accepted.
 
     Seeds accept.py's duplicate-identity guard. Before per-scenario decisions this was dead code —
     accept completed the session, so a session could never hold an accepted row at accept time.
@@ -430,84 +488,36 @@ def accepted_identity_pairs(sess: Session, session_id: str) -> dict[tuple[str, i
     an earlier one, and UX_Scenario_ActiveAccepted would raise IntegrityError instead of a 409
     naming the version already accepted."""
     out = m.Threat_Scenario_Output
-    return {(r["IdentityHash"], r["ScenarioNumber"]): str(r["OutputID"]) for r in sess.execute(
-        select(out.OutputID, out.IdentityHash, out.ScenarioNumber)
+    return {(r["IdentityHash"], r["ScenarioNumber"]): str(r["ScenarioID"]) for r in sess.execute(
+        select(out.ScenarioID, out.IdentityHash, out.ScenarioNumber)
         .where(out.SessionID == session_id,
             accepted(out.Accepted),
             out.IdentityHash.is_not(None))
     ).mappings()}
 
 
-def cancel_session(sess: Session, session_id: str) -> bool:
+def cancel_session(sess: Session, session_id: str, user_id: str | None = None) -> bool:
     """Cancel/reaper path → cancelled/CANCELLED, releasing the M4 lock. CurrentStage/StageStatus
     move too, or the board shows the stale pre-cancel stage forever. Same CAS fence as
-    `reserve_session`: False means already terminal — a conflict."""
+    `reserve_session`: False means already terminal — a conflict.
+
+    `user_id` is WHO CHOSE to cancel, and is deliberately optional: the explicit cancel route
+    passes the acting principal, while a system-initiated recovery cancel (create_session's
+    failed-enqueue path) passes nothing, because no human decided it. A NULL CancelledBy on a
+    cancelled row therefore means "cancelled by the system", which is a fact worth being able to
+    read — attributing a recovery to whoever happened to make the request would be a lie.
+    CompletedAt covers the success path only, so before these columns a cancelled session had no
+    row-level record of who or when."""
     res = execute_dml(
         sess,
         update(m.Scenario_Session)
         .where(m.Scenario_Session.SessionID == session_id,
             m.Scenario_Session.SessionStatus == SessionStatus.active)
         .values(SessionStatus=SessionStatus.cancelled, CurrentStage=WorkflowStage.CANCELLED,
-                StageStatus=StageStatus.CANCELLED, UpdatedAt=now())
+                StageStatus=StageStatus.CANCELLED, UpdatedAt=now(),
+                CancelledAt=now(), CancelledBy=user_id)
     )
     return res.rowcount == 1
-
-# ---------------------------------------------------------------------------
-# Library-promotion retry tracking (accept.py's run_promotion_phase / reaper.py's
-# retry_one_promotion) — 4 columns on Scenario_Session, written only while the caller holds that
-# session's `_LOCK` subsystem lock, so a plain by-PK UPDATE is all the safety these need.
-# ---------------------------------------------------------------------------
-def stamp_promotion_failure(sess: Session, session_id: str, *, error_message: str,
-                            user_id: str | None) -> None:
-    """Record a failed promotion attempt: sets PromotionFailedAt=now, increments the attempt
-    counter, stores the error, and stamps the accepting user so a LATER retry (automatic or
-    admin-triggered) attributes any resulting promotion to that same person."""
-    execute_dml(sess, update(m.Scenario_Session)
-                .where(m.Scenario_Session.SessionID == session_id)
-                .values(PromotionFailedAt=now(),
-                        PromotionAttempts=m.Scenario_Session.PromotionAttempts + 1,
-                        PromotionError=error_message, PromotionUserID=user_id))
-
-
-def clear_promotion_failure(sess: Session, session_id: str) -> None:
-    """A promotion attempt just succeeded: clear the 4 tracking columns back to their fresh-
-    session state. Leaves no PromotionAttempts history — this column tracks "does this session
-    currently need attention", not a permanent attempt log."""
-    execute_dml(sess, update(m.Scenario_Session)
-                .where(m.Scenario_Session.SessionID == session_id)
-                .values(PromotionFailedAt=None, PromotionAttempts=0,
-                        PromotionError=None, PromotionUserID=None))
-
-
-def list_pending_promotions(sess: Session, *, limit: int, include_exhausted: bool,
-                            max_attempts: int) -> list[RowMapping]:
-    """Sessions currently stuck on a failed promotion, oldest failure first — the admin API's
-    GET /v1/tsg/sessions/promotions. Uses IX_Session_PromotionFailed (filtered on
-    PromotionFailedAt IS NOT NULL), so this is a narrow lookup even at large table sizes, never a
-    full scan. `include_exhausted=False` hides sessions the sweep has already given up on
-    (PromotionAttempts >= max_attempts), showing only what the sweep is still actively retrying."""
-    ss = m.Scenario_Session
-    where: list[Any] = [ss.PromotionFailedAt.isnot(None)]
-    if not include_exhausted:
-        where.append(ss.PromotionAttempts < max_attempts)
-    return list(sess.execute(
-        select(ss.SessionID, ss.EntityID, ss.AssetID, ss.AssetName, ss.PromotionFailedAt,
-            ss.PromotionAttempts, ss.PromotionError, ss.PromotionUserID, ss.CompletedAt)
-        .where(*where)
-        .order_by(ss.PromotionFailedAt.asc())
-        .limit(limit)
-    ).mappings().all())
-
-
-def get_pending_promotion(sess: Session, session_id: str) -> RowMapping | None:
-    """One session's promotion-failure detail, or None if it isn't currently in a failed state —
-    the admin API's GET /v1/tsg/sessions/promotions/{session_id} and the 404 gate for retry/dismiss."""
-    ss = m.Scenario_Session
-    return sess.execute(
-        select(ss.SessionID, ss.EntityID, ss.AssetID, ss.AssetName, ss.PromotionFailedAt,
-            ss.PromotionAttempts, ss.PromotionError, ss.PromotionUserID, ss.CompletedAt)
-        .where(ss.SessionID == session_id, ss.PromotionFailedAt.isnot(None))
-    ).mappings().first()
 
 # ---------------------------------------------------------------------------
 # Admission control — backpressure + idempotent create
@@ -967,11 +977,10 @@ def active_threat_grid_categories(sess: Session, session_id: str,
     impossible: there is no "prior vs new" distinction left to forget, only "what is active
     right now", which is what the coverage grid is supposed to describe.
 
-    Multi-category membership is resolved the same way threat_retrieval._load_candidates does:
-    Threat_Catalogue_Category_Map when the row has a ThreatCatalogueID (the map is
-    authoritative and can name several categories), falling back to the single ThreatCategory
-    column for a threat that never grounded to a catalogue row (a generated-and-ungrounded
-    threat has no map entry to look up)."""
+    Multi-category membership is resolved the same way threat_retrieval does: the catalogue's
+    category map (Threat_Catalogue_Category_Map ⋈ Threat_Category, by id — one numbering
+    system) when the row has a ThreatCatalogueID with map rows, falling back to the single
+    ThreatCategory column otherwise. Behaviour follows the data, per threat."""
     if not unit_ids:
         return []
     it = m.Identified_Threat
@@ -982,15 +991,7 @@ def active_threat_grid_categories(sess: Session, session_id: str,
     if not rows:
         return []
     cat_ids = {r["ThreatCatalogueID"] for r in rows if r["ThreatCatalogueID"] is not None}
-    mapped: dict[int, list[str]] = {}
-    if cat_ids:
-        mp, tc = m.Threat_Catalogue_Category_Map, m.Threat_Category
-        for cid, cat_name in sess.execute(
-                select(mp.ThreatCatalogueID, tc.ThreatCategoryName)
-                .join(tc, tc.ThreatCategoryID == mp.ThreatCategoryID)
-                .where(mp.ThreatCatalogueID.in_(cat_ids),
-                    tc.IsActive == True, tc.IsDeleted == False)):
-            mapped.setdefault(cid, []).append(cat_name)
+    mapped = categories_for_catalogue_threats(sess, cat_ids)
     out: list[dict] = []
     for r in rows:
         cats = mapped.get(r["ThreatCatalogueID"]) if r["ThreatCatalogueID"] is not None else None
@@ -1167,26 +1168,6 @@ def active_identified_threat_identities(sess: Session, session_id: str, subsyste
     return identities
 
 
-def active_threat_rules(sess: Session, threat_type_ids: list[int]) -> list[dict]:
-    """Active scoping rules for the given grounded master types ([R12], SDD §5.4) — one query,
-    ordered by ThreatRuleID so evaluation and the FactorsJSON it records are deterministic.
-
-    The rule's OWN IsActive/IsDeleted is not sufficient: with no foreign keys, soft-deleting a
-    Threat_Type leaves its Config_Threat_Rule children live and still gating real generations. The
-    EXISTS re-asserts the parent, as ON DELETE cascade would. Enforced here because this is the
-    single choke point every rule read passes through."""
-    if not threat_type_ids:
-        return []
-    ct, tt = m.Config_Threat_Rule, m.Threat_Type
-    return [dict(r) for r in sess.execute(
-        select(ct.RuleType, ct.ThreatTypeID, ct.RuleKey, ct.RuleValue, ct.Metadata)
-        .where(ct.ThreatTypeID.in_(threat_type_ids),
-            ct.IsActive == True, ct.IsDeleted == False,
-            exists().where(tt.ThreatTypeID == ct.ThreatTypeID,
-                        tt.IsActive == True, tt.IsDeleted == False))
-        .order_by(ct.ThreatRuleID)
-    ).mappings()]
-
 
 def active_category_names(sess: Session) -> list[str]:
     """Real STRIDE category names, read live so prompts.threats_prompt never drifts from
@@ -1209,18 +1190,34 @@ def active_category_names(sess: Session) -> list[str]:
     ))
 
 
+def scenario_threat_columns():
+    """The canonical Identified_Threat column set every scenario threat block reads
+    (sessions._threat_block and the treatment presenters pick what they need by name; extra
+    keys are inert -- every consumer maps by explicit name or .get). ONE list, unpacked by
+    _scenario_read_select, accepted_scenarios and sessions._scenario_select: the drift class
+    (one endpoint answering null where another carried the value) came from each select
+    hand-maintaining its own subset. dal.active_threats' summary dict is a different,
+    pipeline-internal contract and stays separate."""
+    it = m.Identified_Threat
+    return (it.ThreatID, it.ThreatTypeID, it.ThreatCatalogueID,
+            it.ThreatCategory, it.ThreatCategoryID, it.ThreatType, it.ThreatName,
+            it.Description, it.ThreatActorsJSON, it.LibraryThreatType, it.LibraryThreatName,
+            it.GroundingStatus, it.GroundingScore, it.IsAIGenerated)
+
+
 def _scenario_read_select():
     out, ss, st, it = m.Threat_Scenario_Output, m.Scenario_Session, m.Scoped_Threat, m.Identified_Threat
     return (
-        select(out.OutputID, out.SessionID, out.SubsystemID, out.ScenarioJSON,
+        select(out.ScenarioID, out.SessionID, out.SubsystemID, out.ScenarioJSON,
             out.Accepted, out.Superseded, out.ScenarioNumber, out.CreatedAt, out.ControlsMappedAt,
+            # WHO decided, and when. Rides this SELECT — no extra round trip at any page size.
+            # RejectedAt/RejectedBy have been stored since 2026-08 and were never read back by any
+            # route; the Accepted pair is new. Both are surfaced together so the two halves of one
+            # fact cannot drift apart again.
+            out.AcceptedAt, out.AcceptedBy, out.RejectedAt, out.RejectedBy,
             ss.EntityID, ss.UserID, ss.SessionStatus,
-            it.ThreatID, it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
-            it.LibraryThreatType, it.LibraryThreatName, it.GroundingStatus, it.GroundingScore,
-            st.Score, st.ScopeRank,
-            # treatment.build_treatment_input reads these two; every other consumer maps
-            # fields by name through explicit Pydantic models, so the extra keys are inert.
-            it.ThreatCategory, it.ThreatActorsJSON)
+            *scenario_threat_columns(),
+            st.Score, st.ScopeRank)
         .select_from(out.__table__
             .join(ss, out.SessionID == ss.SessionID)
             .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
@@ -1244,7 +1241,7 @@ def scenario_rows(sess: Session, *, entity_ids: set[str], user_id: str | None = 
     deliberately not adopted.
 
     `status`: 'accepted' filters the scenario flag, the others filter the parent session. Failure
-    cards never appear — they have no narrative. Newest first, OutputID tiebreak."""
+    cards never appear — they have no narrative. Newest first, ScenarioID tiebreak."""
     out, ss = m.Threat_Scenario_Output, m.Scenario_Session
     stmt = _scenario_read_select().where(
         ss.EntityID.in_({str(e) for e in entity_ids}),
@@ -1261,22 +1258,25 @@ def scenario_rows(sess: Session, *, entity_ids: set[str], user_id: str | None = 
         stmt = stmt.where(accepted(out.Accepted))
     elif status is not None:
         stmt = stmt.where(ss.SessionStatus == status)
+    # Newest-first, DELIBERATELY different from /results and /accepted-scenarios: those two show
+    # one session's scenarios, where grouping by threat is what a reviewer wants. This is a browse
+    # feed ACROSS sessions, where recency is the question being asked. Different semantic, not drift.
     # ponytail: OFFSET paging is O(offset) on deep pages — fine at limit<=500 over per-entity
-    # volumes; switch to keyset (WHERE (CreatedAt, OutputID) < last-seen) if offsets grow.
+    # volumes; switch to keyset (WHERE (CreatedAt, ScenarioID) < last-seen) if offsets grow.
     return [dict(r) for r in sess.execute(
-        stmt.order_by(out.CreatedAt.desc(), out.OutputID).limit(limit).offset(offset)
+        stmt.order_by(out.CreatedAt.desc(), out.ScenarioID).limit(limit).offset(offset)
     ).mappings()]
 
 
 def scenario_row(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
-    """One output row by id. The SessionID predicate makes an OutputID from another session 404
+    """One output row by id. The SessionID predicate makes an ScenarioID from another session 404
     rather than leak. No Superseded/Status filter — an explicit-id fetch returns the row with its
     flags visible. None on a malformed GUID (→ 404, not a MSSQL 500 — see _valid_guid)."""
     if not _valid_guid(output_id):
         return None
     out = m.Threat_Scenario_Output
     return sess.execute(
-        _scenario_read_select().where(out.OutputID == output_id, out.SessionID == session_id)
+        _scenario_read_select().where(out.ScenarioID == output_id, out.SessionID == session_id)
     ).mappings().first()
 
 
@@ -1313,7 +1313,7 @@ def _decidable_where(session_id: str, subsystem_ids: list[int], decision: AuditD
             out.Status == ScenarioStatus.complete,
             out.RejectedAt.is_(None) if decision is AuditDecision.accept else out.Accepted == 0]
     if subset is not None:
-        where.append(out.OutputID.in_(subset))
+        where.append(out.ScenarioID.in_(subset))
     else:
         # Decide-all means "the current version of everything".
         where.append(active(out.Superseded))
@@ -1358,33 +1358,41 @@ def decide_scenarios(
     # holds this session's `_LOCK` (acquire_execution_lock) for the whole decision, so nothing else
     # can add or remove a matching row between this SELECT and the UPDATE below.
     rows = sess.execute(
-        select(out.OutputID, out.Accepted, out.RejectedAt).where(*where)).mappings().all()
+        select(out.ScenarioID, out.Accepted, out.RejectedAt).where(*where)).mappings().all()
     if not rows:
         return 0
     # The ledger records TRANSITIONS, not matches. A row already carrying this decision still
     # matches (deciding twice is idempotent, not a 404), but writing a second audit row for it
     # would put two decisions in the trail where the reviewer made one — a double-click, or a
     # retried request, silently corrupting the very evidence this per-scenario trail exists to be.
-    changed = [str(r["OutputID"]) for r in rows
+    changed = [str(r["ScenarioID"]) for r in rows
             if not (r["Accepted"] if decision is AuditDecision.accept else r["RejectedAt"])]
 
+    _now = now()
     if decision is AuditDecision.accept:
+        # AcceptedAt/AcceptedBy use the SAME coalesce idiom as the reject pair below: first
+        # decider wins, so a re-accept (idempotent, not a 404) never rewrites who decided first.
+        # user_id may be None; coalesce then leaves the column NULL rather than inventing an
+        # actor — deliberately identical to RejectedBy's behaviour. The audit row's own
+        # session-owner fallback below is a DIFFERENT question and stays as it was.
         values: dict = {"Accepted": 1,
-                        "AcceptedSubsetJSON": json.dumps(subset) if subset is not None else None}
+                        "AcceptedSubsetJSON": json.dumps(subset) if subset is not None else None,
+                        "AcceptedAt": func.coalesce(out.AcceptedAt, _now),
+                        "AcceptedBy": func.coalesce(out.AcceptedBy, user_id)}
     else:
-        _now = now()
         values = {"RejectedAt": func.coalesce(out.RejectedAt, _now),
                 "RejectedBy": func.coalesce(out.RejectedBy, user_id)}
     res = execute_dml(sess, update(out).where(*where).values(**values))
 
     if changed:
         # Resolve the actor ONCE; audit_row's own back-fill would do a PK lookup per row.
-        actor = user_id if user_id is not None else sess.execute(
-            select(m.Scenario_Session.UserID)
-            .where(m.Scenario_Session.SessionID == session_id)).scalar()
+        # No session-owner fallback: a decision with no acting user is a SYSTEM decision, and
+        # naming the session owner would put a person's name on something they did not do — the
+        # same lie audit_row used to tell. NULL here is the honest answer, and ActorType says so.
+        actor = user_id
         sess.execute(insert(m.Scenario_Audit), [
             audit_row(sess, AuditID=guid(), SessionID=session_id, TenantID=tenant_id,
-                    EntityID=entity_id, OutputID=oid, EventType=event_type, Decision=decision,
+                    EntityID=entity_id, ScenarioID=oid, EventType=event_type, Decision=decision,
                     ActorUserID=actor)
             for oid in changed])
     return res.rowcount
@@ -1394,7 +1402,7 @@ def undecidable_subset_reasons(
     sess: Session, session_id: str, subset: list[str], subsystem_ids: list[int],
     *, decision: AuditDecision,
 ) -> dict[str, ScenarioDecisionReason]:
-    """Why each requested OutputID could not be decided — one ScenarioDecisionReason per id
+    """Why each requested ScenarioID could not be decided — one ScenarioDecisionReason per id
     `decide_scenarios` would skip. Decidable ids are absent.
 
     Asks `_decidable_where` which ids the write will actually touch rather than re-deriving the
@@ -1408,12 +1416,12 @@ def undecidable_subset_reasons(
     come back `unknown`, because "exists, wrong session" would confirm another tenant's row from an
     unauthenticated guess."""
     out = m.Threat_Scenario_Output
-    rows = {str(r["OutputID"]): r for r in sess.execute(
-        select(out.OutputID, out.SubsystemID, out.Status, out.Accepted, out.RejectedAt)
-        .where(out.SessionID == session_id, out.OutputID.in_(subset))
+    rows = {str(r["ScenarioID"]): r for r in sess.execute(
+        select(out.ScenarioID, out.SubsystemID, out.Status, out.Accepted, out.RejectedAt)
+        .where(out.SessionID == session_id, out.ScenarioID.in_(subset))
     ).mappings()}
     decidable = {str(r[0]) for r in sess.execute(
-        select(out.OutputID).where(*_decidable_where(session_id, subsystem_ids, decision, subset)))}
+        select(out.ScenarioID).where(*_decidable_where(session_id, subsystem_ids, decision, subset)))}
     reasons: dict[str, ScenarioDecisionReason] = {}
     for oid in subset:
         if oid in decidable:
@@ -1434,7 +1442,7 @@ def undecidable_subset_reasons(
 
 def scenario_identity_pairs(sess: Session, session_id: str, output_ids: list[str],
                             subsystem_ids: list[int]) -> dict[str, tuple[str | None, int]]:
-    """OutputID -> (IdentityHash, ScenarioNumber) for accept.py's pre-flight duplicate-identity
+    """ScenarioID -> (IdentityHash, ScenarioNumber) for accept.py's pre-flight duplicate-identity
     guard: a subset naming two versions of ONE scenario must be rejected BEFORE any write —
     after mark_scenarios_accepted, the only thing left to catch it would be the
     UX_Scenario_ActiveAccepted unique index surfacing as a raw IntegrityError.
@@ -1452,8 +1460,8 @@ def scenario_identity_pairs(sess: Session, session_id: str, output_ids: list[str
     if not output_ids:
         return {}
     out = m.Threat_Scenario_Output
-    return {str(r["OutputID"]): (r["IdentityHash"], r["ScenarioNumber"]) for r in sess.execute(
-        select(out.OutputID, out.IdentityHash, out.ScenarioNumber)
+    return {str(r["ScenarioID"]): (r["IdentityHash"], r["ScenarioNumber"]) for r in sess.execute(
+        select(out.ScenarioID, out.IdentityHash, out.ScenarioNumber)
         .where(*_decidable_where(session_id, subsystem_ids, AuditDecision.accept, output_ids))
     ).mappings()}
 
@@ -1463,60 +1471,9 @@ def scenario_identity_pairs(sess: Session, session_id: str, output_ids: list[str
 # ---------------------------------------------------------------------------
 # A superseded output KEEPS its control-map rows: GET /results?include_replaced=true can still
 # reach them. Costs ~control_map_top_k (5) rows per regeneration; nothing re-maps them
-# (map_controls filters Superseded=0, per OutputID).
+# (map_controls filters Superseded=0, per ScenarioID).
 # ponytail: if the table ever grows enough to matter, prune by session age, not on the write path.
 
-
-def library_scenarios(sess: Session, profile_key: str, catalogue_ids: list[int],
-                    prompt_version: str | None, model_id: str | None) -> dict[int, RowMapping]:
-    """ThreatCatalogueID -> the stored scenario for this PROFILE, or {} when nothing matches.
-
-    ScenarioNumber 1 only: alternates are per-session "next set" takes, and serving one as if
-    it were the primary would silently change what a reviewer sees first.
-
-    prompt_version/model_id are the invalidation key rather than a purge job — a prompt or model
-    change simply stops matching, so stale text ages out on its own and a rollback re-matches
-    the rows it produced. NULLs on either side never match, so a row written before the columns
-    existed is never served."""
-    if not catalogue_ids or not prompt_version or not model_id:
-        return {}
-    sl = m.Scenario_Library
-    return {r["ThreatCatalogueID"]: r for r in sess.execute(
-        select(sl.ThreatCatalogueID, sl.ScenarioJSON, sl.SourceNamesJSON)
-        .where(sl.ProfileKey == profile_key,
-            sl.ThreatCatalogueID.in_(sorted(set(catalogue_ids))),
-            sl.ScenarioNumber == 1,
-            sl.PromptVersion == prompt_version,
-            sl.ModelID == model_id)
-    ).mappings()}
-
-
-def remember_scenario(sess: Session, profile_key: str, catalogue_id: int, scenario_json: str,
-                    source_names_json: str, prompt_version: str | None,
-                    model_id: str | None) -> bool:
-    """Store one freshly generated scenario for reuse by the next asset of this profile.
-
-    BEST EFFORT BY CONSTRUCTION. Two sessions of the same profile can generate the same threat
-    at once; UX_ScenarioLibrary_Natural makes the loser's INSERT fail, and that is the correct
-    outcome — either text was valid, and the session keeps its own copy either way. Runs in a
-    SAVEPOINT so the collision cannot poison the caller's transaction, which is holding a
-    scenario that was already generated and already billed."""
-    if not profile_key or catalogue_id is None or not prompt_version or not model_id:
-        return False
-    try:
-        with sess.begin_nested():
-            sess.execute(insert(m.Scenario_Library).values(
-                ScenarioLibraryID=guid(), ProfileKey=profile_key, ThreatCatalogueID=catalogue_id,
-                ScenarioNumber=1, ScenarioJSON=scenario_json, SourceNamesJSON=source_names_json,
-                PromptVersion=prompt_version, ModelID=model_id, CreatedAt=now()))
-        return True
-    except IntegrityError:
-        log.info("scenario_library.race_lost", profile_key=profile_key, catalogue_id=catalogue_id)
-        return False
-    except Exception:
-        log.warning("scenario_library.write_failed", profile_key=profile_key,
-                    catalogue_id=catalogue_id, exc_info=True)
-        return False
 
 
 def supersede(sess: Session, table, session_id: str, subsystem_id: int) -> None:
@@ -1655,7 +1612,7 @@ def supersede_by_identity_hashes(sess: Session, session_id: str, subsystem_id: i
     `UX_Scenario_ActiveIdentity` from colliding. `scenario_number` is REQUIRED: an identity-wide
     supersede would retire a sibling while regenerating another.
 
-    RETURNS `{IdentityHash: retired OutputID}` so the caller stamps ReplacesOutputID from what was
+    RETURNS `{IdentityHash: retired ScenarioID}` so the caller stamps ReplacesScenarioID from what was
     ACTUALLY retired, not the requested id — a collapsed duplicate target would otherwise be retired
     with nothing pointing at it.
 
@@ -1673,7 +1630,7 @@ def supersede_by_identity_hashes(sess: Session, session_id: str, subsystem_id: i
             active(m.Threat_Scenario_Output.Superseded),
         )
         .values(Superseded=1)
-        .returning(m.Threat_Scenario_Output.OutputID, m.Threat_Scenario_Output.IdentityHash)
+        .returning(m.Threat_Scenario_Output.ScenarioID, m.Threat_Scenario_Output.IdentityHash)
     ).all()}
     return retired
 
@@ -1772,7 +1729,7 @@ def active_scenario_rows(sess: Session, session_id: str, subsystem_id: int) -> l
     cross-threat comparison want the same rows, so fetch once and fold in tasks._fold_scenario_rows."""
     out = m.Threat_Scenario_Output
     return list(sess.execute(
-        select(out.OutputID, out.IdentityHash, out.ScenarioNumber, out.Status,
+        select(out.ScenarioID, out.IdentityHash, out.ScenarioNumber, out.Status,
             out.ScopedThreatID, out.ScenarioJSON)
         .where(out.SessionID == session_id, out.SubsystemID == subsystem_id,
             active(out.Superseded), out.IdentityHash.is_not(None))
@@ -1785,20 +1742,23 @@ def insert_row(sess: Session, table, values: Mapping[str, Any]) -> None:
 
 
 def audit_row(sess: Session, **cols: Any) -> dict[str, Any]:
-    """One Scenario_Audit row with CreatedAt, ActorUserID and ActorType defaulted.
+    """One Scenario_Audit row with CreatedAt and ActorType defaulted.
 
-    `ActorUserID` = WHO IS ACCOUNTABLE: a background row back-fills the session's UserID, so a NULL
-    never reads as missing data. `ActorType` is decided from whether the CALLER named a human,
-    BEFORE that back-fill destroys the signal. Defaulting here means a future write cannot forget.
-    # ponytail: per-write PK lookup; pass ActorUserID explicitly if audit volume ever matters."""
+    `ActorUserID` = WHO ACTUALLY DID IT. NULL means the pipeline did it, and that is INFORMATION,
+    not missing data — read `ActorType` beside it to say so explicitly.
+
+    This used to back-fill `ActorUserID` with `Scenario_Session.UserID` whenever the caller named
+    no human, on the theory that a NULL "reads as missing". The cost was worse than the cure: every
+    worker-written step was stamped with the session OWNER's name, so a timeline read
+    user1 / user1 / user2 / user1 and nobody could tell which of those people had actually done
+    anything. `ActorType` existed ONLY to recover the signal the back-fill destroyed — a column
+    whose job was compensating for another column being deliberately filled with the wrong answer.
+
+    Removing the back-fill fixes the attribution AND deletes a per-write PK SELECT that the old
+    docstring already flagged as a shortcut. `ActorType` stays, now as an explicit label rather
+    than a repair: a consumer never has to infer that NULL means system."""
     cols.setdefault("CreatedAt", now())
-    # setdefault so an explicit caller value still wins; must run BEFORE the back-fill below.
     cols.setdefault("ActorType", ActorType.user if cols.get("ActorUserID") else ActorType.system)
-    if cols.get("ActorUserID") is None and cols.get("SessionID"):
-        cols["ActorUserID"] = sess.execute(
-            select(m.Scenario_Session.UserID)
-            .where(m.Scenario_Session.SessionID == cols["SessionID"])
-        ).scalar()
     return cols
 
 
@@ -1881,41 +1841,105 @@ def latest_regen_outcome(sess: Session, session_id: str, subsystem_id: int) -> d
 
 
 # ---------------------------------------------------------------------------
-# Threat-library promotion — race-safe insert-if-not-exists guarded by the M2 natural-key UNIQUE
-# indexes. Same savepoint + catch-IntegrityError + select idiom as `create_session`: the loser of
-# a concurrent promotion gets the winner's id back instead of a crash.
+# Threat-library promotion — insert-if-not-exists.
+#
+# Dedup is the APPLICATION's guarantee, not the database's: each upsert resolves an existing row
+# through core.naming.normalize_name FIRST, so a duplicate cannot be created even on a database
+# whose unique indexes were never built. The filtered natural-key indexes remain as the
+# concurrency backstop only — the savepoint + catch-IntegrityError + select idiom below (same as
+# `create_session`) is what makes the loser of a SIMULTANEOUS insert get the winner's id back
+# instead of a crash. Recovery selects on the index's exact columns (name alone); changing one
+# without the other turns a duplicate into a 500.
 # ---------------------------------------------------------------------------
-def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector_id: int | None,
+
+
+def _find_active_id_by_norm_name(sess: Session, model, pk_col, name_col, name: str) -> int | None:
+    """The single implementation behind the three by-normalized-name lookups.
+
+    The comparison runs in PYTHON, not SQL: MSSQL has no equivalent of the NFKD fold or the
+    letter/digit split, so this reads the active rows and folds them in memory. Affordable
+    because these tables are curated and small (27 types, 9 actors seeded)
+    and because it runs only on the path that is about to CREATE a master row — a threat whose
+    id generation already resolved never reaches here.
+
+    Returns an id ONLY on an unambiguous single match — same contract as
+    find_active_type_id_by_name: if two active rows already share a normalized name (possible on
+    a database whose unique index was never built, or from the documented concurrent-insert
+    window), return None and let the caller insert rather than silently binding to whichever row
+    the engine happened to return first. Never guesses.
+    """
+    key = normalize_name(name)
+    if not key:
+        return None
+    hits = [rid for rid, rname in sess.execute(
+        select(pk_col, name_col).where(model.IsActive == True, model.IsDeleted == False))
+        if normalize_name(rname or "") == key]
+    return hits[0] if len(hits) == 1 else None
+
+
+def find_type_id_by_norm_name(sess: Session, name: str) -> int | None:
+    """Active Threat_Type whose name normalizes to `name`'s key, ignoring category and sector —
+    those used to be part of the natural key and are exactly what let one name fork into several
+    rows."""
+    return _find_active_id_by_norm_name(
+        sess, m.Threat_Type, m.Threat_Type.ThreatTypeID, m.Threat_Type.ThreatTypeName, name)
+
+
+def find_catalogue_id_by_norm_name(sess: Session, type_id: int, name: str) -> int | None:
+    """Live Threat_Catalogue row UNDER `type_id` whose ThreatName normalizes to `name`'s key —
+    the promote API's duplicate guard, scoped to the already-matched type so one generic name
+    under two types stays two threats. ANY live match means the threat exists; several matches
+    (legacy duplicates) resolve to the lowest id deterministically — returning None on
+    ambiguity would make the promote API mint another copy."""
+    key = normalize_name(name)
+    if not key:
+        return None
+    tc = m.Threat_Catalogue
+    hits = [cid for cid, cname in sess.execute(
+        select(tc.ThreatCatalogueID, tc.ThreatName).where(
+            tc.ThreatTypeID == type_id, tc.IsActive == True, tc.IsDeleted == False))
+        if normalize_name(cname or "") == key]
+    return min(hits) if hits else None
+
+
+def find_actor_id_by_norm_name(sess: Session, name: str) -> int | None:
+    """Active Threat_Actor whose name normalizes to `name`'s key."""
+    return _find_active_id_by_norm_name(
+        sess, m.Threat_Actor, m.Threat_Actor.ThreatActorID, m.Threat_Actor.ThreatActorName, name)
+def upsert_threat_type(sess: Session, name: str, category_id: int | None,
                     description: str | None = None, source: str = "ai_auto_promoted",
                     created_by: str | None = None) -> tuple[int, bool]:
     """Insert-if-not-exists on `UX_ThreatType_NaturalKey`; returns (winning ThreatTypeID, created).
 
-    `created` is True only when THIS call inserted — accept.py gates actor linking on it, so links
-    may seed a type minted in the same accept but never extend a curated type's actors.
     `source`/`created_by` are FIRST-WRITER provenance: the collision branch never writes Updated*,
-    because re-asserting a row is not an edit."""
+    because re-asserting a row is not an edit. No sector: SectorID is unmapped (sector logic
+    removed 2026-08, user instruction)."""
     # Bound to ThreatTypeName's real column width (Unicode(300)) before the INSERT: an over-long
     # name raises DataError, NOT the IntegrityError caught here, so it would abort the whole
     # accept-session transaction.
     name = name[:300]
+    # APPLICATION-OWNED DEDUP, before any insert is attempted: a normalized-name match wins
+    # outright, ignoring category and sector (which is exactly what used to fork one name into
+    # several rows). This holds even where the unique index does not exist; the IntegrityError
+    # branch below is only the simultaneous-writer backstop.
+    existing = find_type_id_by_norm_name(sess, name)
+    if existing is not None:
+        return existing, False
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Type).values(
-                ThreatTypeName=name, ThreatCategoryID=category_id, SectorID=sector_id,
+                ThreatTypeName=name, ThreatCategoryID=category_id,
                 Description=description, IsActive=True, IsDeleted=False, Source=source,
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res), True
     except IntegrityError:
-        # BOTH predicates must be NULL-safe: SQL Server's unique index treats NULLs as equal, so
-        # a second promotion with an unresolved category IS a natural-key collision — but
-        # `== NULL` matches nothing, and the recovery lookup would re-raise and abort the accept.
-        cat_pred = (m.Threat_Type.ThreatCategoryID.is_(None) if category_id is None
-                    else m.Threat_Type.ThreatCategoryID == category_id)
-        sector_pred = m.Threat_Type.SectorID.is_(None) if sector_id is None else m.Threat_Type.SectorID == sector_id
+        # Recovery MUST select on exactly the index's columns — name ALONE since the key became
+        # UX_ThreatType_NaturalKey(ThreatTypeName). It previously also filtered category+sector;
+        # left that way, a collision against a same-name row under a DIFFERENT category or sector
+        # finds nothing here and re-raises, turning every such promotion into a 500.
         winner = sess.execute(
             select(m.Threat_Type.ThreatTypeID).where(
                 m.Threat_Type.ThreatTypeName == name,
-                cat_pred, sector_pred,
                 m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
         ).scalar()
         if winner is None:  # not a natural-key duplicate — fail loud, never return a NULL id
@@ -1923,32 +1947,135 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None, sector
         return winner, False
 
 
-def upsert_threat_catalogue(sess: Session, name: str, type_id: int, sector_id: int | None,
-                            description: str | None = None, source: str = "ai_auto_promoted",
-                            created_by: str | None = None) -> int:
-    """Insert-if-not-exists on `UX_ThreatCatalogue_NaturalKey`; returns the winning id either way.
-    Same first-writer provenance as upsert_threat_type. Does NOT link into
-    Threat_Catalogue_Category_Map — call link_catalogue_category once you have a category id."""
-    # See upsert_threat_type — ThreatName's real column width is Unicode(500).
+
+
+
+def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
+                            description: str | None = None, source: str = "promote-api",
+                            created_by: str | None = None) -> tuple[int, bool]:
+    """Insert-if-not-exists on Threat_Catalogue; returns (winning ThreatCatalogueID, created).
+
+    NAME-ONLY collision recovery, mirroring upsert_threat_type exactly: the recovery predicate
+    keys on ThreatName ALONE, matching UX_ThreatCatalogue_NaturalKey(ThreatName). The old
+    type+name+sector predicate would find nothing on a cross-type name collision and turn every
+    such promotion into a 500. The caller runs the app-owned normalized-name dedup first
+    (find_catalogue_id_by_norm_name, type-scoped); this function only mints. No sector —
+    SectorID stays unmapped and NULL (sector logic removed 2026-08, user instruction)."""
     name = name[:500]
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Catalogue).values(
-                ThreatTypeID=type_id, ThreatName=name, SectorID=sector_id,
-                Description=description, IsActive=True, IsDeleted=False, Source=source,
+                ThreatTypeID=type_id, ThreatName=name, Description=description,
+                IsActive=True, IsDeleted=False, Source=source,
                 CreatedAt=now(), CreatedBy=created_by))
-        return inserted_pk(res)
+        return inserted_pk(res), True
     except IntegrityError:
-        sector_pred = (m.Threat_Catalogue.SectorID.is_(None) if sector_id is None
-                    else m.Threat_Catalogue.SectorID == sector_id)
         winner = sess.execute(
             select(m.Threat_Catalogue.ThreatCatalogueID).where(
-                m.Threat_Catalogue.ThreatTypeID == type_id, m.Threat_Catalogue.ThreatName == name,
-                sector_pred, m.Threat_Catalogue.IsActive == True, m.Threat_Catalogue.IsDeleted == False)
+                m.Threat_Catalogue.ThreatName == name,
+                m.Threat_Catalogue.IsActive == True, m.Threat_Catalogue.IsDeleted == False)
         ).scalar()
-        if winner is None:  # see upsert_threat_type — only a real duplicate may resolve here
+        if winner is None:  # not a natural-key duplicate — fail loud, never return a NULL id
             raise
-        return winner
+        return winner, False
+
+
+def catalogue_active(sess: Session, catalogue_id: int) -> bool:
+    """Liveness check for a stored ThreatCatalogueID — the catalogue sibling of
+    threat_type_active. A threat grounded weeks ago can point at a catalogue row a curator has
+    since retired; callers treat False the same way they treat a dead type id."""
+    tc = m.Threat_Catalogue
+    return sess.execute(
+        select(tc.ThreatCatalogueID).where(tc.ThreatCatalogueID == catalogue_id,
+                                           tc.IsActive == True, tc.IsDeleted == False)
+    ).first() is not None
+
+
+def catalogue_rows_active(sess: Session, catalogue_ids: Sequence[int]) -> set[int]:
+    """Which of these catalogue ids are still live — one query, not one per id (the accept
+    liveness gate checks a whole session's threats at once)."""
+    if not catalogue_ids:
+        return set()
+    tc = m.Threat_Catalogue
+    return {row[0] for row in sess.execute(
+        select(tc.ThreatCatalogueID).where(tc.ThreatCatalogueID.in_(list(catalogue_ids)),
+                                           tc.IsActive == True, tc.IsDeleted == False))}
+
+
+def categories_for_catalogue_threats(sess: Session, catalogue_ids) -> dict[int, list[str]]:
+    """catalogue id -> its category names from Threat_Catalogue_Category_Map ⋈ Threat_Category
+    (joined by ID — one numbering system, unlike the retired crm junction that needed name
+    matching). Threats with no map rows are simply absent — callers fall back to the type's
+    single category, so multi-category coverage follows the data per threat."""
+    ids = sorted({int(i) for i in catalogue_ids or ()})
+    if not ids:
+        return {}
+    mp, tcat = m.Threat_Catalogue_Category_Map, m.Threat_Category
+    out: dict[int, list[str]] = {}
+    for cid, cname in sess.execute(
+            select(mp.ThreatCatalogueID, tcat.ThreatCategoryName)
+            .join(tcat, tcat.ThreatCategoryID == mp.ThreatCategoryID)
+            .where(mp.ThreatCatalogueID.in_(ids),
+                   tcat.IsActive == True, tcat.IsDeleted == False)
+            .order_by(mp.ThreatCatalogueID, mp.ThreatCategoryID)):
+        if cname not in out.setdefault(int(cid), []):
+            out[int(cid)].append(cname)
+    return out
+
+
+def type_actor_pairs(sess: Session, type_ids) -> dict[int, list[tuple[int, str]]]:
+    """type id -> its curated (actor id, actor name) pairs from ThreatType_ThreatActor_Map,
+    name-sorted for stable display. ONE batched read — never per-type queries. Actors are
+    linked per TYPE in this model: every catalogue threat under one type shares the list
+    (stated regression vs the retired per-threat register junction)."""
+    ids = sorted({int(i) for i in type_ids or ()})
+    if not ids:
+        return {}
+    mp, ta = m.ThreatType_ThreatActor_Map, m.Threat_Actor
+    out: dict[int, list[tuple[int, str]]] = {}
+    for tid, aid, aname in sess.execute(
+            select(mp.ThreatTypeID, ta.ThreatActorID, ta.ThreatActorName)
+            .join(ta, ta.ThreatActorID == mp.ThreatActorID)
+            .where(mp.ThreatTypeID.in_(ids),
+                   ta.IsActive == True, ta.IsDeleted == False)
+            .order_by(mp.ThreatTypeID, ta.ThreatActorID)):   # deterministic
+        out.setdefault(int(tid), []).append((int(aid), aname))
+    for tid in out:
+        out[tid].sort(key=lambda pair: pair[1])
+    return out
+
+
+def link_type_actor(sess: Session, type_id: int, actor_id: int) -> bool:
+    """Idempotent link into ThreatType_ThreatActor_Map; True iff a NEW row landed. SAVEPOINT
+    insert with the composite PK as the backstop; on IntegrityError the row's presence is
+    CONFIRMED before absorbing — a bad FK must never read as "already linked"."""
+    mp = m.ThreatType_ThreatActor_Map
+    try:
+        with sess.begin_nested():
+            execute_dml(sess, insert(mp).values(
+                ThreatTypeID=type_id, ThreatActorID=actor_id, CreatedAt=now()))
+        return True
+    except IntegrityError:
+        if sess.execute(select(mp.ThreatTypeID).where(
+                mp.ThreatTypeID == type_id, mp.ThreatActorID == actor_id)).first() is None:
+            raise
+        return False
+
+
+def link_catalogue_category(sess: Session, catalogue_id: int, category_id: int) -> bool:
+    """Idempotent link into Threat_Catalogue_Category_Map — same contract as link_type_actor."""
+    mp = m.Threat_Catalogue_Category_Map
+    try:
+        with sess.begin_nested():
+            execute_dml(sess, insert(mp).values(
+                ThreatCatalogueID=catalogue_id, ThreatCategoryID=category_id, CreatedAt=now()))
+        return True
+    except IntegrityError:
+        if sess.execute(select(mp.ThreatCatalogueID).where(
+                mp.ThreatCatalogueID == catalogue_id,
+                mp.ThreatCategoryID == category_id)).first() is None:
+            raise
+        return False
 
 
 def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promoted",
@@ -1963,6 +2090,12 @@ def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promote
     # bound -> rstrip, EXACTLY that boundary's shape: a slice ending on a space would store a
     # name the accept memo's exact/casefold keys can never match (casefold doesn't strip).
     name = name.strip()[:200].rstrip()
+    # See upsert_threat_type. Callers that already resolved by identity (accept_actors.
+    # resolve_actor_id_by_identity) skip this by never reaching here; the check makes the
+    # guarantee hold for the ones that do NOT — admin CRUD and the bulk importer.
+    existing = find_actor_id_by_norm_name(sess, name)
+    if existing is not None:
+        return existing
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Actor).values(
@@ -1980,39 +2113,12 @@ def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promote
         return winner
 
 
-# ---------------------------------------------------------------------------
-# Threat_Candidate_Review — the curator queue. accept.py writes `pending` rows; these functions
-# are the workflow CandidateStatus's accepted/rejected comments name as their writer
-# (close_candidate_review, driven by accept.resolve_candidate).
-# ---------------------------------------------------------------------------
-def candidate_identity_rows(sess: Session) -> list:
-    """RAW (CandidateKind, ProposedGenericName, ProposedName) of every PENDING and REJECTED
-    curation card, in ONE query — the input for accept_actors.pending_card_identities, which
-    owns the identity-folding rules (both fold conventions live beside their accept-side
-    writers, not down here). Rejected rows are included deliberately: an admin's "no" must
-    stick, so accepts suppress those identities too; accepted rows are excluded (their
-    identity lives in the master tables). Served by IX_ThreatCandidateReview_Status_Created
-    (Status leading); reject history grows monotonically but each row is three short columns —
-    revisit with a time bound or a covering INCLUDE only if it ever measurably bites.
-
-    Known, accepted window (NEW with the batched preload — the old memo-only guard had no
-    cross-session check at all): two accepts in the same instant can each read before either
-    inserts, so BOTH may queue one card for the same novelty (the table deliberately has no
-    unique index over free text). Cost: one duplicate admin card; close_candidate_review's
-    CAS makes resolving both safe."""
-    cr = m.Threat_Candidate_Review
-    return list(sess.execute(
-        select(cr.CandidateKind, cr.ProposedGenericName, cr.ProposedName)
-        .where(cr.Status.in_((CandidateStatus.pending, CandidateStatus.rejected)))
-    ).all())
-
-
 def threat_type_active(sess: Session, type_id: int) -> bool:
-    """Liveness check for a queue-time grounded type id (resolve_candidate): is this
-    Threat_Type still active and not soft-deleted? A curator can retire a type between an
-    actor/threat card being queued and its approval; trusting the stale id would link an
-    actor to (or mint a catalogue entry under) a retired type while the audit reports
-    success. Same predicate as find_active_type_id_by_name, keyed by PK."""
+    """Liveness check for a grounded type id, keyed by PK: is this Threat_Type still active
+    and not soft-deleted? Called from promote_scenario_to_library (app/pipeline/promote.py) —
+    a curator can retire a type between a scenario being generated and being promoted;
+    trusting the stale id would mint a catalogue row under a retired type while the response
+    reports success. Same predicate as find_active_type_id_by_name, keyed by PK instead of name."""
     return sess.execute(
         select(m.Threat_Type.ThreatTypeID).where(
             m.Threat_Type.ThreatTypeID == type_id,
@@ -2020,95 +2126,24 @@ def threat_type_active(sess: Session, type_id: int) -> bool:
     ).first() is not None
 
 
-def find_active_type_id_by_name(sess: Session, name: str | None) -> int | None:
-    """Find-only Threat_Type lookup by name, for actor-card approval (resolve_candidate): the
-    card stores the proposing threat's TYPE TEXT, and approval links only to a type that
-    actually exists by then. Returns an id ONLY on an unambiguous single active match: the
-    natural key is (name, category, sector), so one name can legally belong to several types —
-    master-data links are never guessed, so >1 match (or a NULL/blank name, e.g. a legacy card
-    predating the ProposedType stamp) returns None and the caller skips the link. Never mints."""
-    name = (name or "").strip()
-    if not name:
-        return None
-    ids = sess.execute(
-        select(m.Threat_Type.ThreatTypeID).where(
-            # [:300] mirrors upsert_threat_type's width-bound mint, so an over-long card text
-            # still matches the (truncated) name the approval actually stored.
-            m.Threat_Type.ThreatTypeName == name[:300],
-            m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
-        .limit(2)
-    ).scalars().all()
-    return ids[0] if len(ids) == 1 else None
+
+def active_actor_ids(sess: Session, actor_ids: Sequence[int]) -> set[int]:
+    """Which of these Threat_Actor ids are still live — one query, not one per id. Ids stored
+    at identification time can outlive the rows they name; the promote API must never link a
+    retired actor."""
+    if not actor_ids:
+        return set()
+    ta = m.Threat_Actor
+    rows = sess.execute(
+        select(ta.ThreatActorID).where(ta.ThreatActorID.in_(list(actor_ids)),
+                                       ta.IsActive == True, ta.IsDeleted == False))
+    return {r[0] for r in rows}
 
 
-def list_pending_candidates(sess: Session, *, limit: int, kind: str | None = None,
-                            status: str = CandidateStatus.pending) -> list[RowMapping]:
-    """Every candidate in one review state (default: awaiting curator review), oldest first —
-    the admin API's GET /v1/tsg/threat-library/candidates. `status='rejected'` enumerates the
-    standing identity blacklist (rejected cards permanently suppress re-queuing of their
-    identity, so without this the blacklist is invisible). Both `kind` and `status` filter IN
-    SQL, before the LIMIT — filtering after it would let one matching card hide forever behind
-    a page of older non-matching cards. NULL
-    CandidateKind counts as 'threat' (legacy rows). No filtered index needed: unlike promotion
-    failures, `Status='pending'` is this table's own overwhelmingly common value while a row is
-    unresolved, so a plain index on Status already keeps this narrow."""
-    cr = m.Threat_Candidate_Review
-    stmt = select(cr.CandidateID, cr.TenantID, cr.EntityID, cr.SessionID, cr.ProposedCategory,
-            cr.ProposedType, cr.ProposedName, cr.ProposedGenericName, cr.Status,
-            cr.ThreatTypeID, cr.ThreatCatalogueID, cr.CreatedAt, cr.CandidateKind, cr.CreatedBy
-        ).where(cr.Status == status)
-    if kind is not None:
-        if str(kind) == CandidateKind.actor:
-            stmt = stmt.where(cr.CandidateKind == CandidateKind.actor)
-        else:
-            stmt = stmt.where(or_(cr.CandidateKind == CandidateKind.threat, cr.CandidateKind.is_(None)))
-    return list(sess.execute(
-        stmt.order_by(cr.CreatedAt.asc()).limit(limit)
-    ).mappings().all())
-
-
-def get_candidate(sess: Session, candidate_id: str) -> RowMapping | None:
-    """One candidate's full detail, or None if the id doesn't exist — the admin API's
-    GET .../candidates/{id} and the 404 gate for approve/reject."""
-    cr = m.Threat_Candidate_Review
-    return sess.execute(
-        select(cr.CandidateID, cr.TenantID, cr.EntityID, cr.SessionID, cr.ProposedCategory,
-            cr.ProposedType, cr.ProposedName, cr.ProposedGenericName, cr.Status,
-            cr.ThreatTypeID, cr.ThreatCatalogueID, cr.ReviewedBy, cr.ReviewedAt, cr.CreatedAt,
-            cr.CandidateKind, cr.CreatedBy)
-        .where(cr.CandidateID == candidate_id)
-    ).mappings().first()
-
-
-def close_candidate_review(sess: Session, candidate_id: str, *, status: str,
-                            reviewer_user_id: str | None, type_id: int | None = None,
-                            catalogue_id: int | None = None,
-                            clear_type_id: bool = False) -> bool:
-    """CAS-guarded resolution of one candidate: matches only a row still `pending`, so a second
-    concurrent approve/reject (two admins, or a double-click) matches 0 rows and returns False —
-    the caller reports 409 instead of re-running (or silently re-reporting) a mint that already
-    happened. `type_id`/`catalogue_id` are the library ids this candidate resolved to; left
-    unset (None → column untouched) on a reject, since nothing was minted. `clear_type_id`
-    (actor approve only): a resolved card's ThreatTypeID must record the LINK OUTCOME, and
-    None-means-untouched would leave a stale queue-time grounding (possibly a soft-deleted
-    type) on an accepted-but-unlinked card — set True to write NULL explicitly when type_id
-    is None, so the card, the audit, and the API response all agree."""
-    cr = m.Threat_Candidate_Review
-    values: dict[str, Any] = {"Status": status, "ReviewedBy": reviewer_user_id, "ReviewedAt": now()}
-    if type_id is not None:
-        values["ThreatTypeID"] = type_id
-    elif clear_type_id:
-        values["ThreatTypeID"] = None
-    if catalogue_id is not None:
-        values["ThreatCatalogueID"] = catalogue_id
-    res = execute_dml(sess, update(cr)
-                    .where(cr.CandidateID == candidate_id, cr.Status == CandidateStatus.pending)
-                    .values(**values))
-    return res.rowcount == 1
 
 
 # ---------------------------------------------------------------------------
-# Threat-library master CRUD (app/api/library_crud.py) — generic over the four masters because
+# Threat-library master CRUD — generic over the four masters because
 # the steps are identical and only column names differ; four copies would be four places to
 # forget the Updated* stamp. These are the ONLY functions that write UpdatedAt/UpdatedBy.
 # ---------------------------------------------------------------------------
@@ -2160,71 +2195,7 @@ def soft_delete_library_row(sess: Session, model, pk_col, pk_value: int, user_id
         raise NotFoundError(f"{model.__tablename__} {pk_value} not found")
 
 
-def upsert_threat_rule(sess: Session, threat_type_id: int, rule_type: str, rule_key: str,
-                    rule_value: str, weight: float, source: str) -> int:
-    """Insert-if-not-exists on `UX_ConfigThreatRule_NaturalKey`; returns the winning id either way.
-    IDENTITY assigns it (never MAX+1 in app code), and a re-import collapses onto the existing row
-    instead of double-counting its weight (scoping._apply_rules sums fired weights). `source` lands
-    in CreatedBy, marking auto-written rules."""
-    try:
-        with sess.begin_nested():
-            res = execute_dml(sess, insert(m.Config_Threat_Rule).values(
-                RuleType=rule_type, ThreatTypeID=threat_type_id, RuleKey=rule_key,
-                RuleValue=rule_value, Metadata=json.dumps({"weight": weight}),
-                CreateDate=now(), CreatedBy=source, IsActive=True, IsDeleted=False))
-        return inserted_pk(res)
-    except IntegrityError:
-        winner = sess.execute(
-            select(m.Config_Threat_Rule.ThreatRuleID).where(
-                m.Config_Threat_Rule.ThreatTypeID == threat_type_id,
-                m.Config_Threat_Rule.RuleType == rule_type,
-                m.Config_Threat_Rule.RuleKey == rule_key,
-                m.Config_Threat_Rule.RuleValue == rule_value,
-                m.Config_Threat_Rule.IsActive == True, 
-                m.Config_Threat_Rule.IsDeleted == False)
-        ).scalar()
-        if winner is None:  # see upsert_threat_type — only a real duplicate may resolve here
-            raise
-        return winner
 
-
-def link_type_actor(sess: Session, type_id: int, actor_id: int) -> bool:
-    """Idempotent link into `ThreatType_ThreatActor_Map`; True iff a NEW row was inserted, so
-    callers can audit real library growth. The IntegrityError is absorbed only once the link is
-    CONFIRMED present — a bad id raises through the same branch, and answering False would report
-    "already linked" for a link that does not exist."""
-    try:
-        with sess.begin_nested():
-            sess.execute(insert(m.ThreatType_ThreatActor_Map).values(
-                ThreatTypeID=type_id, ThreatActorID=actor_id, CreatedAt=now()))
-        return True
-    except IntegrityError:
-        exists = sess.execute(
-            select(1).where(m.ThreatType_ThreatActor_Map.ThreatTypeID == type_id,
-                            m.ThreatType_ThreatActor_Map.ThreatActorID == actor_id)
-        ).first()
-        if exists is None:  # not a duplicate link — FK/NOT NULL/other violation
-            raise
-        return False
-
-
-def link_catalogue_category(sess: Session, catalogue_id: int, category_id: int) -> bool:
-    """Idempotent link into `Threat_Catalogue_Category_Map` — same composite-PK, race-safe-no-op,
-    fail-loud contract as `link_type_actor`; True iff a NEW row was inserted. The map is
-    multi-valued, so a second category is just a second call."""
-    try:
-        with sess.begin_nested():
-            sess.execute(insert(m.Threat_Catalogue_Category_Map).values(
-                ThreatCatalogueID=catalogue_id, ThreatCategoryID=category_id, CreatedAt=now()))
-        return True
-    except IntegrityError:
-        exists = sess.execute(
-            select(1).where(m.Threat_Catalogue_Category_Map.ThreatCatalogueID == catalogue_id,
-                            m.Threat_Catalogue_Category_Map.ThreatCategoryID == category_id)
-        ).first()
-        if exists is None:  # not a duplicate link — FK/NOT NULL/other violation
-            raise
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -2244,7 +2215,7 @@ def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime,
     read — a racing swap/regenerate that changed the active row in between misses the CAS
     (rowcount 0 → the caller 409s) instead of retiring, and acting on, the wrong version."""
     p = m.Risk_Treatment_Plan
-    where = [p.OutputID == output_id, active(p.Superseded),
+    where = [p.ScenarioID == output_id, active(p.Superseded),
              or_(p.Status.in_([StageStatus.COMPLETE, StageStatus.ERROR]),
                  and_(p.Status == StageStatus.RUNNING, p.UpdatedAt < stale_cutoff))]
     if plan_id is not None:
@@ -2263,7 +2234,7 @@ def active_plan_baseline(sess: Session, session_id: str, output_id: str) -> RowM
     p = m.Risk_Treatment_Plan
     return sess.execute(
         select(p.PlanID, p.RiskLevel, p.RiskIdentificationDate, p.InputSnapshotJSON)
-        .where(p.SessionID == session_id, p.OutputID == output_id, active(p.Superseded))
+        .where(p.SessionID == session_id, p.ScenarioID == output_id, active(p.Superseded))
     ).mappings().first()
 
 
@@ -2274,7 +2245,7 @@ def plan_version_exists(sess: Session, session_id: str, output_id: str, plan_id:
         return False
     p = m.Risk_Treatment_Plan
     return sess.execute(select(p.PlanID).where(
-        p.PlanID == plan_id, p.SessionID == session_id, p.OutputID == output_id)).first() is not None
+        p.PlanID == plan_id, p.SessionID == session_id, p.ScenarioID == output_id)).first() is not None
 
 
 def reactivate_plan_version(sess: Session, session_id: str, output_id: str, plan_id: str) -> bool:
@@ -2287,7 +2258,7 @@ def reactivate_plan_version(sess: Session, session_id: str, output_id: str, plan
     is the only writer that could otherwise leave a scenario with zero active plan rows."""
     p = m.Risk_Treatment_Plan
     return execute_dml(sess, update(p).where(
-        p.PlanID == plan_id, p.SessionID == session_id, p.OutputID == output_id,
+        p.PlanID == plan_id, p.SessionID == session_id, p.ScenarioID == output_id,
         p.Superseded == 1, p.Status == StageStatus.COMPLETE,
     ).values(Superseded=0, UpdatedAt=now())).rowcount == 1
 
@@ -2317,7 +2288,8 @@ def touch_plan(sess: Session, plan_id: str) -> None:
 def finish_plan(sess: Session, plan_id: str, *, status: StageStatus, task_id: str | None,
                 plan_json: str | None = None, validation_json: str | None = None,
                 error_message: str | None = None,
-                error_reason: TreatmentOutcomeReason | None = None) -> bool:
+                error_reason: TreatmentOutcomeReason | None = None,
+                cancelled_by: str | None = None) -> bool:
     """Terminal CAS to COMPLETE or ERROR. Fenced on (RUNNING, not superseded), so a superseded or
     already-finished row matches 0 rows and the caller drops its result instead of resurrecting a
     retired plan. ALSO fenced on ActiveTaskID — a zombie worker's late result must not clobber a
@@ -2331,66 +2303,56 @@ def finish_plan(sess: Session, plan_id: str, *, status: StageStatus, task_id: st
     `error_reason` is the machine-readable half of an ERROR (TreatmentOutcomeReason) so no client
     ever parses `error_message`. Pass it on EVERY ERROR path; leave it None for COMPLETE, where the
     column is meaningless. It is deliberately not defaulted per-status — a silent NULL on a failure
-    is exactly the ambiguity this column exists to remove."""
+    is exactly the ambiguity this column exists to remove.
+
+    `cancelled_by` is set ONLY by the cancel route. This function is also the normal-completion and
+    generic-failure writer, so the cancellation columns must not be touched on those paths — a
+    CancelledBy stamped on an ordinary ERROR would claim a human stopped something that simply
+    failed. Passing it is what makes the write a cancellation."""
     p = m.Risk_Treatment_Plan
+    _now = now()
+    values: dict = {"Status": status, "PlanJSON": plan_json, "ValidationJSON": validation_json,
+                    "ErrorMessage": error_message, "ErrorReason": error_reason,
+                    "UpdatedAt": _now, "CompletedAt": _now}
+    if cancelled_by is not None:
+        values |= {"CancelledAt": _now, "CancelledBy": cancelled_by}
     return execute_dml(sess, update(p).where(
         p.PlanID == plan_id, p.Superseded == 0, p.Status == StageStatus.RUNNING,
         p.ActiveTaskID.is_(None) if task_id is None else p.ActiveTaskID == task_id,
-    ).values(Status=status, PlanJSON=plan_json, ValidationJSON=validation_json,
-            ErrorMessage=error_message, ErrorReason=error_reason,
-            UpdatedAt=now(), CompletedAt=now())).rowcount == 1
+    ).values(**values)).rowcount == 1
 
 
 def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
     """The scenario's one active plan row for the GET poll, with its scenario JSON alongside. The
-    SessionID predicate keeps a foreign OutputID a 404, not a leak; None on a malformed GUID.
+    SessionID predicate keeps a foreign ScenarioID a 404, not a leak; None on a malformed GUID.
     Explicit columns, NOT the whole table — InputSnapshotJSON is tens of KB this poll never returns."""
     if not _valid_guid(output_id):
         return None
     p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
     st, it = m.Scoped_Threat, m.Identified_Threat
     return sess.execute(
-        select(p.PlanID, p.SessionID, p.OutputID, p.TenantID, p.EntityID, p.Status,
+        select(p.PlanID, p.SessionID, p.ScenarioID, p.TenantID, p.EntityID, p.Status,
             p.ActiveTaskID, p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
             p.ValidationJSON, p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment,
             p.ReviewedBy, p.ReviewedAt, p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt,
+            # UserID is the plan's GENERATOR — stored since the table existed and never selected,
+            # so no plan response could say who requested it. Cancelled* are today's new pair.
+            # All three ride this SELECT: no extra round trip.
+            p.UserID, p.CancelledAt, p.CancelledBy,
                out.ScenarioJSON,
             # The threat's own identity — NOT part of the LLM's scenario JSON (same split as
             # sessions._build_scenario). OUTER for the same reason as _scenario_read_select:
             # no enforced FKs, so a broken linkage must null these, never drop the plan row.
-            it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON)
-        .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID)
+            it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON,
+            # Curator's register wording, so naming.display_threat_names shows the SAME name
+            # here as /results does -- without these the treatment plan rendered the model's
+            # wording for a scenario the register shows under the curator's.
+            it.LibraryThreatType, it.LibraryThreatName)
+        .select_from(p.__table__.outerjoin(out, out.ScenarioID == p.ScenarioID)
                     .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
-        .where(p.SessionID == session_id, p.OutputID == output_id, active(p.Superseded))
+        .where(p.SessionID == session_id, p.ScenarioID == output_id, active(p.Superseded))
     ).mappings().first()
-
-
-def active_plan_rows(sess: Session, session_id: str) -> list[RowMapping]:
-    """Set-based sibling of active_plan_row: every active plan row of the session in ONE round
-    trip — same PK-hop outer joins (no fan-out possible, see active_plan_row). Serves the Excel
-    export's batch read; presentation order is the caller's concern (the board query drives it).
-    Batch-read column rule (shared with entity_plan_rows/superseded_plan_rows): no blobs that
-    feed only wire-hidden fields — ValidationJSON/ReviewComment are omitted (the Excel columns
-    render neither, and the presenter reads them with .get), as are TenantID/EntityID/
-    ActiveTaskID, which this function's one consumer never touches. Only the single-row
-    active_plan_row still hauls them, for the poll GET's one-flag-unhide contract."""
-    if not _valid_guid(session_id):
-        return []
-    p, out = m.Risk_Treatment_Plan, m.Threat_Scenario_Output
-    st, it = m.Scoped_Threat, m.Identified_Threat
-    return list(sess.execute(
-        select(p.PlanID, p.SessionID, p.OutputID, p.Status,
-            p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
-            p.ErrorMessage, p.RiskLevel, p.ReviewStatus,
-            p.ReviewedBy, p.ReviewedAt, p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt,
-               out.ScenarioJSON,
-            it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON)
-        .select_from(p.__table__.outerjoin(out, out.OutputID == p.OutputID)
-                    .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
-                    .outerjoin(it, st.ThreatID == it.ThreatID))
-        .where(p.SessionID == session_id, active(p.Superseded))
-    ).mappings().all())
 
 
 def review_plan(sess: Session, plan_id: str, *, status: str, comment: str | None,
@@ -2415,7 +2377,7 @@ def session_plan_board(sess: Session, session_id: str, *,
     precedent) — the board is polled, and hauling every multi-KB ScenarioJSON per cycle to keep
     one short string was the query's whole IO cost."""
     out, p = m.Threat_Scenario_Output, m.Risk_Treatment_Plan
-    cols = [out.OutputID,
+    cols = [out.ScenarioID,
             func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle"),
             p.PlanID, p.Status, p.RiskLevel, p.ReviewStatus, p.ErrorMessage, p.ErrorReason,
             p.CreatedAt.label("PlanCreatedAt"), p.UpdatedAt.label("PlanUpdatedAt"),
@@ -2425,10 +2387,10 @@ def session_plan_board(sess: Session, session_id: str, *,
     return list(sess.execute(
         select(*cols)
         .select_from(out.__table__.outerjoin(
-            p, and_(p.OutputID == out.OutputID, active(p.Superseded))))
+            p, and_(p.ScenarioID == out.ScenarioID, active(p.Superseded))))
         # Accepted alone — the accepted version may be superseded (decoupled flags).
         .where(out.SessionID == session_id, accepted(out.Accepted))
-        .order_by(out.CreatedAt, out.OutputID)
+        .order_by(out.CreatedAt, out.ScenarioID)
     ).mappings().all())
 
 
@@ -2449,20 +2411,21 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
     (?include_plan=true), bounded by the page limit, and NOT redundant here: every register row
     is a different scenario. Off keeps today's byte-stable SQL."""
     p, ss, out = m.Risk_Treatment_Plan, m.Scenario_Session, m.Threat_Scenario_Output
-    cols = [p.PlanID, p.SessionID, p.OutputID, p.Status, p.RiskLevel, p.ReviewStatus,
+    cols = [p.PlanID, p.SessionID, p.ScenarioID, p.Status, p.RiskLevel, p.ReviewStatus,
             p.ReviewedBy, p.ReviewedAt, p.ErrorMessage, p.ErrorReason, p.CreatedAt, p.UpdatedAt,
             p.CompletedAt, ss.AssetName,
             func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle")]
     joined = (p.__table__
               .join(ss, ss.SessionID == p.SessionID)
-              .outerjoin(out, out.OutputID == p.OutputID))
+              .outerjoin(out, out.ScenarioID == p.ScenarioID))
     if include_plan:
         st, it = m.Scoped_Threat, m.Identified_Threat
         # No ValidationJSON/ReviewComment: they feed only wire-hidden (exclude=True) fields —
         # a blob per row for bytes nobody can see. The presenter reads them with .get.
         cols += [p.PlanJSON, p.TreatmentStrategy, p.RiskIdentificationDate,
                  out.ScenarioJSON,
-                 it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON]
+                 it.ThreatCategory, it.ThreatType, it.ThreatName, it.ThreatActorsJSON,
+                 it.LibraryThreatType, it.LibraryThreatName]
         joined = (joined
                   .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                   .outerjoin(it, st.ThreatID == it.ThreatID))
@@ -2496,7 +2459,7 @@ def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[Ro
     return list(sess.execute(
         select(p.PlanID, p.Status, p.Superseded, p.ErrorMessage, p.RiskLevel, p.ReviewStatus,
             p.ReviewedBy, p.ReviewedAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
-        .where(p.SessionID == session_id, p.OutputID == output_id)
+        .where(p.SessionID == session_id, p.ScenarioID == output_id)
         .order_by(p.CreatedAt)
     ).mappings().all())
 
@@ -2506,10 +2469,10 @@ def superseded_plan_rows(sess: Session, session_id: str,
     """The regeneration history behind the poll GET's ?include_superseded=true: every RETIRED
     version of one scenario's plan — or, with output_id=None, of the WHOLE session in one round
     trip (the board's ?include_superseded=true; global newest-first order keeps each scenario's
-    group newest-first after the caller buckets by OutputID). Both forms seek
+    group newest-first after the caller buckets by ScenarioID). Both forms seek
     IX_TreatmentPlan_SessionHistory — the table's other two indexes are filtered Superseded = 0
     and serve no history predicate (the sessions._ancestry trap). Plan-table columns only — deliberately no
-    scenario/threat joins: those hang off the OutputID and are identical for every version, the
+    scenario/threat joins: those hang off the ScenarioID and are identical for every version, the
     caller already serves them once on the top-level (active) object, and re-hauling the same
     multi-KB ScenarioJSON per history row would multiply the DB read and the response for zero
     information (history rows therefore present scenario=null). InputSnapshotJSON stays excluded
@@ -2520,7 +2483,7 @@ def superseded_plan_rows(sess: Session, session_id: str,
         return []
     p = m.Risk_Treatment_Plan
     stmt = (
-        select(p.PlanID, p.SessionID, p.OutputID, p.Status, p.TreatmentStrategy,
+        select(p.PlanID, p.SessionID, p.ScenarioID, p.Status, p.TreatmentStrategy,
             p.RiskIdentificationDate, p.PlanJSON, p.ErrorMessage,
             p.RiskLevel, p.ReviewStatus, p.ReviewedBy, p.ReviewedAt,
             p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
@@ -2533,14 +2496,14 @@ def superseded_plan_rows(sess: Session, session_id: str,
                p.Superseded == bindparam("hist", 1, literal_execute=True))
         .order_by(p.CreatedAt.desc(), p.PlanID))
     if output_id is not None:
-        stmt = stmt.where(p.OutputID == output_id)
+        stmt = stmt.where(p.ScenarioID == output_id)
     else:
         # Board form: gate on board-visible scenarios. A scenario superseded AFTER its plan was
         # generated leaves retired plan rows no board row can attach to — without this PK-hop
         # join their PlanJSON blobs would be hauled and rendered only to be thrown away.
         out = m.Threat_Scenario_Output
         # Accepted alone — board visibility follows acceptance, not generation recency.
-        stmt = (stmt.join(out, out.OutputID == p.OutputID)
+        stmt = (stmt.join(out, out.ScenarioID == p.ScenarioID)
                     .where(accepted(out.Accepted)))
     return list(sess.execute(stmt).mappings().all())
 
@@ -2554,24 +2517,39 @@ def plan_row_by_id(sess: Session, session_id: str, output_id: str, plan_id: str)
     p = m.Risk_Treatment_Plan
     return sess.execute(
         select(p.PlanID, p.Status, p.InputSnapshotJSON, p.ValidationJSON).where(
-            p.PlanID == plan_id, p.SessionID == session_id, p.OutputID == output_id)
+            p.PlanID == plan_id, p.SessionID == session_id, p.ScenarioID == output_id)
     ).mappings().first()
 
 
 #: The treatment-plan lifecycle events. A tuple, not a set — byte-stable SQL for the plan cache.
-_TREATMENT_EVENTS = (
-    AuditEventType.treatment_plan_requested, AuditEventType.treatment_plan_outcome,
-    AuditEventType.treatment_plan_cancelled, AuditEventType.treatment_plan_reviewed,
-    AuditEventType.treatment_plan_version_restored)
+#: Derived from the enum, not restated beside it. A hand-maintained copy of a vocabulary that
+#: lives somewhere else is the drift this codebase keeps paying for — a new treatment_plan_* event
+#: would join the enum and silently miss the audit feed. The prefix IS the membership rule, and
+#: `test_treatment_events_match_the_enum_prefix` pins that the derivation still yields exactly the
+#: five members this tuple used to list by hand.
+_TREATMENT_EVENTS = tuple(e for e in AuditEventType if e.name.startswith("treatment_plan_"))
 
 
-def treatment_audit_rows(sess: Session, session_id: str) -> list[RowMapping]:
-    """All treatment-plan audit events of one session, oldest first; the trail endpoint narrows
-    them to one scenario in Python, since DetailJSON is opaque to SQL here."""
+def treatment_audit_rows(sess: Session, session_id: str,
+                        output_id: str | None = None) -> list[RowMapping]:
+    """Treatment-plan audit events, oldest first. `output_id` narrows to ONE scenario IN SQL.
+
+    It used to be impossible to narrow here: these events left the indexed `ScenarioID` column NULL
+    and buried the id in DetailJSON, which is opaque to SQL — so the endpoint fetched EVERY plan
+    event for the whole session and discarded the other scenarios' rows in Python, unbounded. The
+    writers now set the column, so the predicate is a seek on IX_ScenarioAudit_Output
+    (ScenarioID, CreatedAt DESC) WHERE ScenarioID IS NOT NULL.
+
+    Rows written before that change keep ScenarioID NULL and are therefore invisible to the filtered
+    form — correct for a filtered read, and harmless here because the un-narrowed call (no
+    output_id) still returns them."""
     a = m.Scenario_Audit
+    where = [a.SessionID == session_id, a.EventType.in_(_TREATMENT_EVENTS)]
+    if output_id is not None:
+        where.append(a.ScenarioID == output_id)
     return list(sess.execute(
         select(a.EventType, a.ActorUserID, a.ActorType, a.DetailJSON, a.CreatedAt)
-        .where(a.SessionID == session_id, a.EventType.in_(_TREATMENT_EVENTS))
+        .where(*where)
         .order_by(a.CreatedAt, a.AuditID)
     ).mappings().all())
 
@@ -2596,6 +2574,48 @@ def entity_treatment_audit_rows(sess: Session, entity_id: str, *, since=None, un
     ).mappings().all())
 
 
+def session_audit_rows(sess: Session, session_id: str, *, scenario_id: str | None = None,
+                    events: list[str] | None = None, actor: str | None = None,
+                    since: datetime | None = None, until: datetime | None = None,
+                    limit: int = 100, offset: int = 0) -> list[RowMapping]:
+    """One session's WHOLE step trail, oldest first — every event type, not just the plan ones.
+
+    Every step of every session has been written to Scenario_Audit since the beginning and NO
+    endpoint ever read it back: the two existing audit readers cover treatment plans only. This is
+    the missing read path, and it needs no new instrumentation — the data is already there.
+
+    Oldest-first (unlike the entity feed's newest-first) because this is read as a TIMELINE: the
+    question is "what happened, in order", not "what happened lately". `AuditID` breaks CreatedAt
+    ties so paging is stable — several rows share a timestamp when a batch decision writes one row
+    per scenario.
+
+    `limit`/`offset` are NOT optional. A session's trail is O(scenarios x subsystems x
+    regenerations); `treatment_audit_rows` is unbounded and that is a wart, not a precedent.
+
+    Seeks `IX_ScenarioAudit_SessionSubEvent(SessionID, SubsystemID, EventType, CreatedAt DESC)` on
+    its leading column. Honest limitation: with no predicate on SubsystemID (key 2), an `events`
+    filter is a RESIDUAL predicate, not a seek — it narrows rows after the SessionID seek rather
+    than before. That is fine at one session's volume and worth knowing before anyone "optimises"
+    it. `scenario_id` seeks the separate filtered IX_ScenarioAudit_Output instead."""
+    a = m.Scenario_Audit
+    stmt = select(a.AuditID, a.SessionID, a.EventType, a.Stage, a.SubsystemID, a.ScenarioID,
+                a.PlanID, a.Decision, a.Granularity, a.ActorUserID, a.ActorType,
+                a.DetailJSON, a.CreatedAt).where(a.SessionID == session_id)
+    if scenario_id is not None:
+        stmt = stmt.where(a.ScenarioID == scenario_id)
+    if events:
+        stmt = stmt.where(a.EventType.in_(events))
+    if actor is not None:
+        stmt = stmt.where(a.ActorUserID == actor)
+    if since is not None:
+        stmt = stmt.where(a.CreatedAt >= since)
+    if until is not None:
+        stmt = stmt.where(a.CreatedAt <= until)
+    return list(sess.execute(
+        stmt.order_by(a.CreatedAt, a.AuditID).limit(limit).offset(offset)
+    ).mappings().all())
+
+
 def prompt_logs_for_plan(sess: Session, plan_id: str) -> list[RowMapping]:
     """Every AI-call receipt for one plan version, oldest first, joined on Prompt_Log.CorrelationID
     (stamped by the worker), never by time-window guessing. Rows predating that column do not
@@ -2611,17 +2631,6 @@ def prompt_logs_for_plan(sess: Session, plan_id: str) -> list[RowMapping]:
     ).mappings().all())
 
 
-def active_actors(sess: Session) -> list[tuple[int, str]]:
-    """(id, name) of every active Threat_Actor — the full-table comparison set for accept's
-    banded actor-name triage AND the seed for its in-accept memo (active_actor_names above
-    covers the prompt, which needs names only). One bounded read of a small table."""
-    ta = m.Threat_Actor
-    return [(r[0], r[1]) for r in sess.execute(
-        select(ta.ThreatActorID, ta.ThreatActorName)
-        .where(ta.IsActive == True, ta.IsDeleted == False)
-        .order_by(ta.ThreatActorID)
-    )]
-
 def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
     """Accepted scenarios for one session, joined to their grounded threat so every row carries
     the [R13] join ids. Accepted==1 alone — no Superseded filter: the accepted version may be an
@@ -2635,13 +2644,21 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
     columns, never a vanished row."""
     out, st, it = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
     return [dict(r) for r in sess.execute(
-        select(out.OutputID, out.SubsystemID, out.ScopedThreatID, out.ScenarioJSON,
-            it.ThreatTypeID, it.ThreatCatalogueID, it.ThreatType, it.ThreatName,
-            it.LibraryThreatType, it.LibraryThreatName, it.GroundingStatus, it.GroundingScore,
-            it.ThreatCategory, it.ThreatActorsJSON, it.ThreatID,
+        select(out.ScenarioID, out.SubsystemID, out.ScopedThreatID, out.ScenarioJSON,
+            # `Accepted` was FILTERED on below but never SELECTED, so the accepted register could
+            # not report the flag it is defined by — nor, now, who set it. All three ride this
+            # same SELECT; no extra query.
+            out.Accepted, out.AcceptedAt, out.AcceptedBy,
+            *scenario_threat_columns(),
             st.Score, st.ScopeRank)
         .select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
         .where(out.SessionID == session_id, accepted(out.Accepted))
-        .order_by(out.SubsystemID, out.OutputID)
+        # SAME key as /results (sessions._scenario_select): these two endpoints describe the SAME
+        # rows, so returning them in different sequences was accidental, not a design. Grouping by
+        # threat is the meaningful order; ScenarioNumber is the human-facing sequence within a
+        # threat, and ScenarioID makes it TOTAL. The old (SubsystemID, ScenarioID) degenerated to
+        # id order anyway — accepted scenarios are written at the asset unit, so SubsystemID is
+        # effectively constant here.
+        .order_by(it.ThreatID, out.ScenarioNumber, out.ScenarioID)
     ).mappings()]

@@ -24,41 +24,69 @@ from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
 from app.db.dal import guid, now
-from app.pipeline import grounding
+from app.pipeline import grounding, threat_retrieval
 from app.pipeline.llm import LLMClient
 
 log = get_logger(__name__)
 
+def session_is_ot(sess: Session, subsystems: list[dict] | None, asset_context: dict) -> bool:
+    """Is any of this session's asset/subsystem categories Operational Technology? Same
+    code-first, then "(OT)"-in-name matching as _resolve_control_labels below — word-boundary-
+    safe, unlike substring matching on free text ("OT" inside "PROTOTYPE"). A category with
+    neither a matching code nor a recognizable name simply doesn't count; there is no free-text
+    fallback (found 2026-08-27: the prior version of this check pattern-matched the asset's own
+    free-text type instead of its already-available, DB-resolved ctm_scan_category)."""
+    ids = threat_retrieval.session_category_ids(subsystems, asset_context)
+    if not ids:
+        return False
+    for _cat_id, code, name in sess.execute(
+            select(m.ctm_scan_category.id, m.ctm_scan_category.code, m.ctm_scan_category.name)
+            .where(m.ctm_scan_category.id.in_(sorted(ids)))):
+        if (code or "").strip().casefold() == "ot":
+            return True
+        if "(ot)" in (name or "").casefold():
+            return True
+    return False
 
-def itot_family(value: object) -> str | None:
-    """Return ``IT`` or ``OT`` for a recognized technology label, otherwise ``None``.
 
-    Accepts the bare labels and the platform labels ``Information Technology (IT)`` and
-    ``Operational Technology (OT)``.
-    """
-    v = grounding.ensure_text(value).strip().upper()
-    if not v:
+def _resolve_control_labels(sess: Session, asset_context: dict,
+                            subsystems: list[dict] | None) -> list[str] | None:
+    """The DATA-DRIVEN control-pool filter (G5): the ITOT labels matching ANY of the session's
+    asset categories — the same union rule the threat filter uses. None = no filter.
+
+    Nothing is hardcoded to IT/OT. Each session category (ctm_scan_category rows behind the
+    asset's and every subsystem's asset_type_id) is matched against the labels the control
+    library ACTUALLY carries (grounding.control_itot_vocabulary): by code equality first, then
+    by the "(CODE)" parenthetical in the category name — word-boundary-safe, unlike substring
+    matching ("IT" appears inside "FACILITIES").
+
+    Vocabulary-aware fail-open: if ANY session category matches no label — today that is every
+    category except IT/OT, because the library carries only those two — the filter is not
+    applied at all. Part of the asset's nature cannot be represented, and a silently narrowed
+    pool is exactly the audited {Physical, IT}->IT-only defect this replaces. When eyshield
+    labels controls for the other ctm_scan_category kinds, the same rule narrows to their
+    union with no code change."""
+    ids = threat_retrieval.session_category_ids(subsystems, asset_context)
+    if not ids:
         return None
-    if v in ("IT", "OT"):
-        return v
-    if "(IT)" in v or "INFORMATION TECHNOLOGY" in v:
-        return "IT"
-    if "(OT)" in v or "OPERATIONAL TECHNOLOGY" in v:
-        return "OT"
-    return None
-
-
-def _resolve_itot(asset_context: dict, subsystems: list[dict] | None) -> str | None:
-    """Return one shared IT/OT family from the asset and its supporting subsystems.
-
-    Returns ``IT`` or ``OT`` only when all recognized values agree. Returns ``None`` when
-    no value is recognized or when both families are present, so mixed assets are not filtered.
-    """
-    families = {itot_family(asset_context.get("asset_type"))}
-    for sub in subsystems or []:
-        families.add(itot_family(sub.get("asset_type")))
-    families.discard(None)
-    return families.pop() if len(families) == 1 else None
+    vocab = grounding.control_itot_vocabulary(sess)
+    if not vocab:
+        return None
+    by_fold = {v.casefold(): v for v in vocab}
+    labels: set[str] = set()
+    for cat_id, code, name in sess.execute(
+            select(m.ctm_scan_category.id, m.ctm_scan_category.code, m.ctm_scan_category.name)
+            .where(m.ctm_scan_category.id.in_(sorted(ids)))):
+        matched = by_fold.get((code or "").strip().casefold())
+        if matched is None:
+            folded_name = (name or "").casefold()
+            matched = next((v for f, v in by_fold.items() if f"({f})" in folded_name), None)
+        if matched is None:
+            log.info("controls.category_without_vocabulary_no_filter",
+                    category_id=cat_id, code=code)
+            return None
+        labels.add(matched)
+    return sorted(labels)
 
 
 def _min_score(sess: Session, llm: LLMClient, s) -> grounding.Threshold:
@@ -139,11 +167,11 @@ def eligible_outputs(sess: Session, session_id: str) -> list:
     output whose scoped/threat chain is missing still maps on its narrative alone rather than
     being silently skipped.
     """
-    already_mapped = select(m.Threat_Scenario_Control_Map.OutputID).where(
-        m.Threat_Scenario_Control_Map.OutputID == m.Threat_Scenario_Output.OutputID)
+    already_mapped = select(m.Threat_Scenario_Control_Map.ScenarioID).where(
+        m.Threat_Scenario_Control_Map.ScenarioID == m.Threat_Scenario_Output.ScenarioID)
     out_t, st_t, it_t = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
     return sess.execute(
-        select(out_t.OutputID, out_t.ScenarioJSON,
+        select(out_t.ScenarioID, out_t.ScenarioJSON,
             it_t.ThreatName, it_t.ThreatType,
             it_t.LibraryThreatName, it_t.LibraryThreatType)
         .select_from(out_t.__table__
@@ -169,20 +197,20 @@ def build_output_queries(outputs) -> list[tuple[str, str]]:
     "there was nothing to ask" is a definitive answer, not a retryable one.
     """
     per_output: list[tuple[str, str]] = []
-    for output_id, scenario_json, tname, ttype, ltname, lttype in outputs:
+    for scenario_id, scenario_json, tname, ttype, ltname, lttype in outputs:
         # Library spelling first, same preference the API uses for display: the curator's
         # wording is the one the control library was written against.
         query = collect_control_query(scenario_json, ltname or tname, lttype or ttype)
         if query:
-            per_output.append((output_id, query))
+            per_output.append((scenario_id, query))
     return per_output
 
 
-def select_matching_controls(output_id: str, session_id: str, matches, min_score: float,
+def select_matching_controls(scenario_id: str, session_id: str, matches, min_score: float,
                             top_k: int) -> tuple[list[dict], int]:
     """Map rows for ONE answered output, best-first and rank-stamped, plus the dropped count.
 
-    KEEP the best[cid] dedup: the PK (OutputID, ControlLibraryID) turns any duplicate into an
+    KEEP the best[cid] dedup: the PK (ScenarioID, ControlLibraryID) turns any duplicate into an
     IntegrityError the caller's except would swallow into controls.mapping_failed — losing the
     whole output's mapping on one WARNING. One guard here is cheaper than trusting every
     upstream path.
@@ -197,7 +225,7 @@ def select_matching_controls(output_id: str, session_id: str, matches, min_score
         if cid not in best or score > best[cid]["Score"]:
             # SuggestedControl deliberately not written (column stays, legacy rows keep theirs):
             # the LLM no longer suggests controls.
-            best[cid] = {"OutputID": output_id, "ControlLibraryID": cid, "SessionID": session_id,
+            best[cid] = {"ScenarioID": scenario_id, "ControlLibraryID": cid, "SessionID": session_id,
                         "Score": score, "CreatedAt": now()}
     keep = sorted(best.values(), key=lambda r: r["Score"], reverse=True)[:top_k]
     for rank, rec in enumerate(keep, start=1):
@@ -222,13 +250,13 @@ def _stamp_mapped_outputs(sess: Session, outputs, per_output, answered: list[str
     to_stamp = answered + [row[0] for row in outputs if row[0] not in groundable]
     if to_stamp:
         sess.execute(update(m.Threat_Scenario_Output)
-                    .where(m.Threat_Scenario_Output.OutputID.in_(to_stamp))
+                    .where(m.Threat_Scenario_Output.ScenarioID.in_(to_stamp))
                     .values(ControlsMappedAt=now()))
 
 
 def _record_control_mapping(sess: Session, scenario_session: dict, subsystem_id: int,
                             queried: int, tally: MappingTally, threshold: grounding.Threshold,
-                            itot: str | None) -> None:
+                            itot_labels: list[str] | None) -> None:
     """Persist what this pass did, then log it. The audit row is the only durable record."""
     dal.append_audit(sess, AuditID=guid(), SessionID=scenario_session["SessionID"],
                     TenantID=scenario_session["TenantID"], EntityID=scenario_session["EntityID"],
@@ -243,8 +271,9 @@ def _record_control_mapping(sess: Session, scenario_session: dict, subsystem_id:
                                             # it degraded, or afterwards a degraded run is
                                             # indistinguishable from a clean one.
                                             "unanswered": tally.unanswered,
-                                            "skipped": tally.skipped, "itot": itot or "",
-                                            "itot_filter_applied": itot is not None,
+                                            "skipped": tally.skipped,
+                                            "itot_labels": itot_labels or [],
+                                            "itot_filter_applied": bool(itot_labels),
                                             "min_score": threshold.value,
                                             # WHERE the cutoff came from. Without it a stored
                                             # 75.0 cannot be told apart from a measured one, and
@@ -253,8 +282,8 @@ def _record_control_mapping(sess: Session, scenario_session: dict, subsystem_id:
                                             "min_score_origin": threshold.origin}))
     log.info("controls.mapped", session_id=scenario_session["SessionID"], outputs=queried,
             mapped=tally.inserted, dropped=tally.dropped, unanswered=tally.unanswered,
-            skipped=tally.skipped, itot=itot, min_score=threshold.value,
-            min_score_origin=threshold.origin)
+            skipped=tally.skipped, itot_labels=itot_labels,
+            min_score=threshold.value, min_score_origin=threshold.origin)
 
 
 def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
@@ -275,13 +304,13 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
     try:
         s = get_settings()
         sid, ss = scenario_session["SessionID"], subsystem_id
-        itot = _resolve_itot(asset_context, subsystems)
-        candidates = grounding.get_control_candidates(sess, itot)
-        if not candidates:
-            log.warning("controls.no_candidates", session_id=sid, itot=itot)
-            return
         outputs = eligible_outputs(sess, sid)
         if not outputs:
+            return
+        labels = _resolve_control_labels(sess, asset_context, subsystems)
+        candidates = grounding.get_control_candidates(sess, labels) if outputs else []
+        if outputs and not candidates:
+            log.warning("controls.no_candidates", session_id=sid, itot_labels=labels)
             return
         # ONE query per output — the threat identity plus the scenario's own text. Built before
         # calling the embedding service once per batch.
@@ -308,7 +337,7 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
             sess.commit()  # End the lease transaction before the slow grounding call.
             flat = [(q, qv_map.get(q)) for _, q in per_output]
             match_lists = grounding.ground_control_queries(llm, flat, candidates, s)
-            for (output_id, _query), result in zip(per_output, match_lists):
+            for (scenario_id, _query), result in zip(per_output, match_lists):
                 if not result.answered:
                     # NO ANSWER for this output (its rerank item failed) — as opposed to an
                     # answer of "nothing matched". Leave it completely alone: no map rows, and
@@ -316,9 +345,9 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                     # mapping run picks it straight back up.
                     unanswered += 1
                     continue
-                answered.append(output_id)
+                answered.append(scenario_id)
                 keep, fell_short = select_matching_controls(
-                    output_id, sid, result.matches, min_score, s.control_map_top_k)
+                    scenario_id, sid, result.matches, min_score, s.control_map_top_k)
                 dropped += fell_short
                 if keep:
                     sess.execute(insert(m.Threat_Scenario_Control_Map), keep)
@@ -336,7 +365,7 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
             return
         _record_control_mapping(sess, scenario_session, ss, len(per_output),
                                 MappingTally(inserted, dropped, unanswered, skipped),
-                                threshold, itot)
+                                threshold, labels)
         if durable:
             sess.commit()
     except Exception:

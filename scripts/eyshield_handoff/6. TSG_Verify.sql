@@ -34,34 +34,33 @@ CREATE TABLE #tsg_verify (
 );
 
 -- ---------------------------------------------------------------------------
--- 1. ALL 24 TSG TABLES EXIST
+-- 1. ALL 23 TSG TABLES EXIST
 -- ---------------------------------------------------------------------------
 DECLARE @tsg_tables TABLE (TableName sysname);
 INSERT INTO @tsg_tables (TableName) VALUES
     (N'API_Client'),
-    (N'Config_Threat_Rule'),
     (N'Config_Tuning'),
     (N'Control_Library'),
     (N'Control_Library_Standard_Map'),
     (N'Control_Standard'),
+    (N'Grounding_Calibration_Run'),
     (N'Identified_Duplicate_Threat'),
     (N'Identified_Threat'),
     (N'Prompt_Log'),
     (N'Risk_Treatment_Plan'),
     (N'Scenario_Audit'),
+    (N'Scenario_Library'),
     (N'Scenario_Session'),
     (N'Scoped_Threat'),
     (N'Subsystem_Stage_State'),
-    (N'ThreatType_ThreatActor_Map'),
     (N'Threat_Actor'),
-    (N'Threat_Candidate_Review'),
     (N'Threat_Catalogue'),
     (N'Threat_Catalogue_Category_Map'),
     (N'Threat_Category'),
-    (N'Threat_Library_Import_Run'),
     (N'Threat_Scenario_Control_Map'),
     (N'Threat_Scenario_Output'),
-    (N'Threat_Type');
+    (N'Threat_Type'),
+    (N'ThreatType_ThreatActor_Map');
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Tables', 'FAIL', N'Table missing: ' + t.TableName,
@@ -71,31 +70,34 @@ FROM @tsg_tables t
 WHERE NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES i WHERE i.TABLE_NAME = t.TableName);
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Tables', 'PASS', N'All 24 TSG tables present', N'Nothing missing.'
+SELECT 'Tables', 'PASS', N'All 23 TSG tables present', N'Nothing missing.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Tables');
 
 -- ---------------------------------------------------------------------------
--- 2. THE 12 INDEXES THE APPLICATION ASSERTS AT BOOT
+-- 2. THE 13 INDEXES THE APPLICATION ASSERTS AT BOOT
 -- ---------------------------------------------------------------------------
 -- These are not performance indexes. Each one enforces a correctness rule the
 -- code relies on — one active session per asset, one active scenario per
--- identity, unique library natural keys, and so on. The application checks all
--- twelve at every start and REFUSES TO BOOT if one is missing, on the wrong
--- table, or missing a column.
+-- identity, unique library natural keys, one in-flight grounding calibration per
+-- model pair, and so on. The application checks all twelve at every start and
+-- REFUSES TO BOOT if one is missing, on the wrong table, or missing a column.
 DECLARE @req_indexes TABLE (IndexName sysname, TableName sysname, Cols nvarchar(400));
 INSERT INTO @req_indexes (IndexName, TableName, Cols) VALUES
     (N'UX_Session_ActiveAsset', N'Scenario_Session', N'EntityID,AssetID'),
     (N'UX_Scenario_ActiveIdentity', N'Threat_Scenario_Output', N'SessionID,IdentityHash,ScenarioNumber'),
-    (N'UX_ThreatType_NaturalKey', N'Threat_Type', N'ThreatTypeName,ThreatCategoryID,SectorID'),
-    (N'UX_ThreatCatalogue_NaturalKey', N'Threat_Catalogue', N'ThreatTypeID,ThreatName,SectorID'),
+    (N'UX_Scenario_ActiveAccepted', N'Threat_Scenario_Output', N'SessionID,IdentityHash,ScenarioNumber'),
+    (N'UX_ThreatType_NaturalKey', N'Threat_Type', N'ThreatTypeName'),
+    (N'UX_ThreatCatalogue_NaturalKey', N'Threat_Catalogue', N'ThreatName'),
     (N'UX_ThreatActor_NaturalKey', N'Threat_Actor', N'ThreatActorName'),
     (N'UX_ThreatCategory_NaturalKey', N'Threat_Category', N'ThreatCategoryName'),
     (N'UX_SubsystemStageState_SessionSubLevel', N'Subsystem_Stage_State', N'SessionID,SubsystemID,Level'),
-    (N'UX_TreatmentPlan_ActiveOutput', N'Risk_Treatment_Plan', N'OutputID'),
-    (N'UX_ConfigThreatRule_NaturalKey', N'Config_Threat_Rule', N'ThreatTypeID,RuleType,RuleKey,RuleValue'),
+    (N'UX_TreatmentPlan_ActiveOutput', N'Risk_Treatment_Plan', N'ScenarioID'),
     (N'UX_Session_IdempotencyKey', N'Scenario_Session', N'EntityID,IdempotencyKey'),
     (N'UX_Control_Standard_Name', N'Control_Standard', N'StandardName'),
-    (N'UX_Control_Library_Code', N'Control_Library', N'ControlCode');
+    (N'UX_Control_Library_Code', N'Control_Library', N'ControlCode'),
+    -- One in-flight grounding calibration per embedding+reranker pair. Filtered on
+    -- Status='running'; the route cannot stop two concurrent 15-minute billed sweeps on its own.
+    (N'UX_GroundingCalibration_Running', N'Grounding_Calibration_Run', N'EmbeddingModel,RerankerModel');
 
 -- Missing entirely, or on the wrong table.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
@@ -140,7 +142,7 @@ CROSS APPLY (
 WHERE actual.ColList <> r.Cols;
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Indexes', 'PASS', N'All 12 boot-asserted indexes present, unique and correct',
+SELECT 'Indexes', 'PASS', N'All 13 boot-asserted indexes present, unique and correct',
        N'The application''s startup index check will pass.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Indexes');
 
@@ -159,8 +161,31 @@ FROM (VALUES (N'Threat_Type'), (N'Threat_Catalogue')) AS x(T)
 WHERE OBJECT_ID(N'dbo.' + x.T) IS NOT NULL
   AND COL_LENGTH(N'dbo.' + x.T, N'Source') IS NULL;
 
+-- Identified_Threat.Description / .ThreatCategoryID are added by ALTER in TSG_Core.sql, and the
+-- APPLICATION ASSERTS BOTH AT STARTUP (app/db/invariants._assert_mapped_columns_exist reads them
+-- straight off the ORM model). Unchecked, a part-way script 1 passes verification, gets signed
+-- off, and only then does the app refuse to boot -- the exact failure mode section 3b exists to
+-- prevent. Description carries the AI's threat wording into crm_threat_risk_register.
+-- threat_scenario on promotion; ThreatCategoryID is the resolved category key every later
+-- consumer reads instead of re-deriving it from ThreatCategory text; ThreatRiskRegisterID /
+-- ThreatCatalogueID is the library identity the promote API and dedup rely on. IsAIGenerated
+-- is the immutable provenance flag (1 = invented by the AI, i.e. not in the catalogue at
+-- identification; promotion never flips it).
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Columns', 'PASS', N'Late-ALTER columns present (Threat_Type.Source, Threat_Catalogue.Source)',
+SELECT 'Columns', 'FAIL', N'Column missing: Identified_Threat.' + x.C,
+       N'Added by an ALTER in TSG_Core.sql, and asserted by the application at startup -- the app '
+     + N'will refuse to boot without it. Re-run TSG_Core.sql; it is guarded and idempotent.'
+-- GroundingThresholdOrigin records WHICH cutoff judged each threat ('calibrated' |
+-- 'static_default' | 'env_pinned' | 'not_applicable'). Without it there is no way to find the
+-- threats graded on a default tuned for a DIFFERENT model pair once a deployment calibrates.
+FROM (VALUES (N'Description'), (N'ThreatCategoryID'), (N'GroundingThresholdOrigin'),
+             (N'ThreatCatalogueID'), (N'IsAIGenerated')) AS x(C)
+WHERE OBJECT_ID(N'dbo.Identified_Threat') IS NOT NULL
+  AND COL_LENGTH(N'dbo.Identified_Threat', x.C) IS NULL;
+
+
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Columns', 'PASS', N'Late-ALTER columns present (Threat_Type.Source, Threat_Catalogue.Source, Identified_Threat.Description/ThreatCategoryID/GroundingThresholdOrigin/ThreatCatalogueID/IsAIGenerated)',
        N'Confirms Threat_library.sql ran to completion.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Columns');
 
@@ -187,11 +212,11 @@ WHERE OBJECT_ID(N'dbo.Threat_Scenario_Output') IS NOT NULL
   AND COL_LENGTH(N'dbo.Threat_Scenario_Output', x.C) IS NULL;
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Scenario lifecycle', 'FAIL', N'Column missing: Scenario_Audit.OutputID',
+SELECT 'Scenario lifecycle', 'FAIL', N'Column missing: Scenario_Audit.ScenarioID',
        N'Names WHICH scenario a decision event is about. Without it the audit trail cannot answer '
      + N'"who accepted this scenario, and when" — the question the per-scenario trail exists for.'
 WHERE OBJECT_ID(N'dbo.Scenario_Audit') IS NOT NULL
-  AND COL_LENGTH(N'dbo.Scenario_Audit', N'OutputID') IS NULL;
+  AND COL_LENGTH(N'dbo.Scenario_Audit', N'ScenarioID') IS NULL;
 
 -- Accept and reject are mutually exclusive. Enforced in the DATABASE because they are independent
 -- routes reachable at any time, so the row itself is the only place both orderings meet.
@@ -209,10 +234,10 @@ WHERE OBJECT_ID(N'dbo.Threat_Scenario_Output') IS NOT NULL
 -- installed database. app/db/invariants.py leaves it out for exactly the same reason.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Scenario lifecycle', 'FAIL', N'Index missing: IX_ScenarioAudit_Output',
-       N'Filtered index on Scenario_Audit(OutputID, CreatedAt DESC). The application asserts it at '
+       N'Filtered index on Scenario_Audit(ScenarioID, CreatedAt DESC). The application asserts it at '
      + N'startup and will NOT BOOT without it. Re-run TSG_Core.sql.'
 WHERE OBJECT_ID(N'dbo.Scenario_Audit') IS NOT NULL
-  AND COL_LENGTH(N'dbo.Scenario_Audit', N'OutputID') IS NOT NULL
+  AND COL_LENGTH(N'dbo.Scenario_Audit', N'ScenarioID') IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM sys.indexes i
                   JOIN sys.tables t ON t.object_id = i.object_id
                   WHERE i.name = 'IX_ScenarioAudit_Output' AND t.name = 'Scenario_Audit');
@@ -232,7 +257,7 @@ HAVING COUNT(*) > 0;
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Scenario lifecycle', 'PASS', N'Scenario-lifecycle schema complete and backfill applied',
-       N'RejectedAt/RejectedBy, CK_ScenarioOutput_DecisionExclusive, Scenario_Audit.OutputID and '
+       N'RejectedAt/RejectedBy, CK_ScenarioOutput_DecisionExclusive, Scenario_Audit.ScenarioID and '
      + N'IX_ScenarioAudit_Output all present; no session stranded at active+REVIEW.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Scenario lifecycle');
 
@@ -267,9 +292,6 @@ INSERT INTO @enum_cols (TableName, ColumnName, NeedChars, EnumName, LongestValue
     (N'Identified_Threat',           N'GroundingStatus',   10, N'GroundingStatus',        N'unverified'),
     (N'Identified_Duplicate_Threat', N'DuplicateReason',   23, N'DuplicateReason',        N'semantic_cross_category'),
     (N'Threat_Scenario_Output',      N'Status',             8, N'ScenarioStatus',         N'complete'),
-    (N'Threat_Candidate_Review',     N'Status',             8, N'CandidateStatus',        N'accepted'),
-    (N'Threat_Library_Import_Run',   N'Status',             7, N'import run status',      N'running'),
-    (N'Config_Threat_Rule',          N'RuleType',          23, N'ThreatRuleType',         N'relevance_context_value'),
     (N'Risk_Treatment_Plan',         N'Status',             8, N'StageStatus subset',     N'COMPLETE'),
     (N'Risk_Treatment_Plan',         N'TreatmentStrategy',  8, N'TreatmentStrategy',      N'Mitigate'),
     (N'Risk_Treatment_Plan',         N'RiskLevel',          8, N'RiskLevel',              N'Critical'),
@@ -325,7 +347,8 @@ INSERT INTO @expected VALUES
     (N'Threat_Category',    6,    N'STRIDE categories'),
     (N'Threat_Type',        27,   N'threat families'),
     (N'Threat_Catalogue',   75,   N'curated named threats'),
-    (N'Config_Threat_Rule', 21,   N'scoping rules'),
+    (N'Threat_Catalogue_Category_Map', 346, N'threat-category STRIDE links'),
+    (N'ThreatType_ThreatActor_Map',    140, N'type-actor links'),
     (N'Control_Standard',   30,   N'control standards'),
     (N'Control_Library',    1288, N'controls');
 
@@ -384,18 +407,6 @@ SELECT 'Database',
                + N'TSG_Core.sql should have enabled it — check its output for a blocked '
                + N'ALTER DATABASE.' END
 FROM sys.databases d WHERE d.database_id = DB_ID();
-
-INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Database',
-       CASE WHEN COLUMNPROPERTY(OBJECT_ID('dbo.Config_Threat_Rule'), 'ThreatRuleID', 'IsIdentity') = 1
-            THEN 'PASS' ELSE 'FAIL' END,
-       N'Config_Threat_Rule.ThreatRuleID is an IDENTITY column',
-       CASE WHEN COLUMNPROPERTY(OBJECT_ID('dbo.Config_Threat_Rule'), 'ThreatRuleID', 'IsIdentity') = 1
-            THEN N'IDENTITY confirmed.'
-            ELSE N'NOT an IDENTITY column — pre-existing table the scripts cannot convert. The '
-               + N'threat-library import will fail on every auto-written rule. Report to the '
-               + N'application team; a one-off conversion is required.' END
-WHERE OBJECT_ID('dbo.Config_Threat_Rule') IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- RESULT

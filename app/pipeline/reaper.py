@@ -5,8 +5,8 @@ asset returns 409 forever. This is the safety net for every abandonment point:
 - a work stage RUNNING with an expired lease (died mid-stage) -> ERROR
 - a `_LOCK` RUNNING with an expired lease -> reclaimed to IDLE
 - any session left with no live lease, proven dead or stale-and-never-started, is finalized
-  through the SAME decide_session_outcome the pipeline uses (partial -> REVIEW, total ->
-  cancelled) under the `_LOCK` mutex, so it can never race a live worker or an in-flight accept.
+through the SAME decide_session_outcome the pipeline uses (partial -> REVIEW, total ->
+cancelled) under the `_LOCK` mutex, so it can never race a live worker or an in-flight accept.
 
 Steps 1/2 SELECT candidates before UPDATEing them, on purpose: a blind
 `UPDATE ... WHERE Status='RUNNING' AND expired` takes a locking read on EVERY running row,
@@ -23,7 +23,6 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.enums import (
-    RetryOutcome,
     SSEEventType,
     StageStatus,
     SubsystemLevel,
@@ -33,7 +32,6 @@ from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
 from app.db.dal import execute_dml, now
-from app.pipeline.accept import run_promotion_phase
 from app.sse import bus
 
 log = get_logger(__name__)
@@ -198,115 +196,3 @@ def _close_out_one_abandoned_session(sess: Session, scenario_session: dict) -> s
                 log.warning("reaper.lock_release_failed", session_id=sid, subsystem=ssid, exc_info=True)
         sess.commit()
 
-
-def retry_one_promotion(sess: Session, session_id: str, entity_id: str,
-                        promotion_user_id: str | None) -> RetryOutcome:
-    """Retry exactly one session's previously-failed library promotion. Used by both the periodic
-    sweep below and the admin API's manual retry-now action, so there is exactly one place that
-    acquires the session's locks and decides the RetryOutcome — not two copies that could drift.
-
-    No concept of promotion_max_attempts here — that cap is applied only by the sweep's candidate
-    query below, so a human-triggered retry can never be blocked by a limit meant for the sweep.
-
-    Returns .skipped if the session's locks are already held (a live worker, or another retry in
-    flight) — without touching PromotionAttempts/PromotionError, since lock contention isn't a
-    functional failure and must not burn one of the sweep's limited attempts. Otherwise returns
-    .succeeded/.failed per accept.run_promotion_phase's outcome; never raises."""
-    scenario_session = dal.get_session(sess, session_id, entity_id)
-    if scenario_session is None:
-        return RetryOutcome.skipped  # session vanished/reassigned between the candidate scan and this call
-
-    lock_subsystem_ids = dal.subsystem_ids_at_level(sess, session_id, SubsystemLevel.LOCK)
-    acquired: list[int] = []
-    try:
-        for subsystem_id in lock_subsystem_ids:
-            # acquire_execution_lock, not acquire_lock: a promotion retry always runs after
-            # the session is already completed, and acquire_lock's CAS requires an active
-            # session, so it would never succeed here.
-            if not dal.acquire_execution_lock(sess, session_id, subsystem_id, task_id=session_id):
-                return RetryOutcome.skipped  # a concurrent retry/dismiss owns this session right now
-            acquired.append(subsystem_id)
-            sess.commit()  # durable before other work — same reasoning as accept_session's own lock loop
-        good_subsystem_ids = dal.subsystem_ids_at_level(
-            sess, session_id, SubsystemLevel.SCENARIOS, status=StageStatus.AWAITING_DECISION)
-        succeeded = run_promotion_phase(sess, scenario_session, good_subsystem_ids, promotion_user_id, acquired)
-        return RetryOutcome.succeeded if succeeded else RetryOutcome.failed
-    finally:
-        # Isolate each release: one raising must not skip the rest or the commit below — same
-        # discipline as _close_out_one_abandoned_session above.
-        for subsystem_id in acquired:
-            try:
-                dal.release_lock(sess, session_id, subsystem_id, task_id=session_id)
-            except Exception:
-                log.warning("reaper.promotion_retry_lock_release_failed", session_id=session_id,
-                            subsystem_id=subsystem_id, exc_info=True)
-        sess.commit()
-
-
-def dismiss_promotion(sess: Session, session_id: str, entity_id: str,
-                    dismissed_by: str | None) -> RetryOutcome:
-    """Admin "dismiss" — stop tracking/retrying this session's failed promotion, without
-    retrying it. Acquires the SAME per-session lock retry_one_promotion uses before clearing the
-    4 columns, so a dismiss can never be silently undone by a retry that was already mid-flight
-    (or vice versa) — the two are fully serialized.
-
-    Returns .skipped (nothing changed) if the lock is already held — a live worker or in-flight
-    retry owns this session; ask the admin to try again shortly. Returns .succeeded otherwise;
-    never .failed — once the lock is acquired, dismissing is a single unconditional column clear
-    that cannot fail."""
-    lock_subsystem_ids = dal.subsystem_ids_at_level(sess, session_id, SubsystemLevel.LOCK)
-    acquired: list[int] = []
-    try:
-        for subsystem_id in lock_subsystem_ids:
-            # acquire_execution_lock, not acquire_lock — same reason as retry_one_promotion
-            # above: this session is always already completed, so acquire_lock's active-session
-            # CAS would never succeed.
-            if not dal.acquire_execution_lock(sess, session_id, subsystem_id, task_id=session_id):
-                return RetryOutcome.skipped
-            acquired.append(subsystem_id)
-            sess.commit()
-        dal.clear_promotion_failure(sess, session_id)
-        sess.commit()
-        log.info("session.promotion_dismissed", session_id=session_id, entity_id=entity_id,
-                dismissed_by=dismissed_by)
-        return RetryOutcome.succeeded
-    finally:
-        for subsystem_id in acquired:
-            try:
-                dal.release_lock(sess, session_id, subsystem_id, task_id=session_id)
-            except Exception:
-                log.warning("reaper.promotion_dismiss_lock_release_failed", session_id=session_id,
-                            subsystem_id=subsystem_id, exc_info=True)
-        sess.commit()
-
-
-def retry_failed_promotions(sess: Session) -> list[str]:
-    """Periodic sweep: retries every session whose library promotion previously failed and
-    hasn't exhausted `promotion_max_attempts`, if `promotion_auto_retry_enabled` is on. Returns
-    the session ids that succeeded this pass.
-
-    Re-reads `promotion_auto_retry_enabled` on every call instead of caching it at process
-    start, so an admin flipping the setting takes effect on the next scheduled tick — no restart
-    needed."""
-    settings = get_settings()
-    if not settings.promotion_auto_retry_enabled:
-        log.info("reaper.promotion_auto_retry_disabled")
-        return []
-
-    candidates = dal.list_pending_promotions(
-        sess, limit=settings.promotion_sweep_batch_limit, include_exhausted=False,
-        max_attempts=settings.promotion_max_attempts)
-    succeeded: list[str] = []
-    for candidate in candidates:
-        session_id = candidate["SessionID"]
-        try:
-            outcome = retry_one_promotion(
-                sess, session_id, candidate["EntityID"], candidate["PromotionUserID"])
-            if outcome == RetryOutcome.succeeded:
-                succeeded.append(session_id)
-        except Exception:  # one broken session must never stop the pass ([R8], same as clean_up_abandoned_sessions)
-            log.warning("reaper.promotion_retry_failed", session_id=session_id, exc_info=True)
-            sess.rollback()
-    if succeeded:
-        log.info("reaper.promotions_retried", sessions=succeeded)
-    return succeeded

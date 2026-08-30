@@ -2,6 +2,11 @@
 DBA RUNBOOK — hand this section to whoever runs the deployment
 ============================================================================
 
+THE SQL LIVES IN scripts/eyshield_handoff/ — the numbered files there are the ONE
+and only copy since the 2026-08 dedup (the unnumbered duplicates that used to sit
+beside this readme were deleted; tests/test_eyshield_mirrors.py fails if one ever
+reappears). File names below refer to those numbered copies.
+
 Run these SEVEN files, in this order, against the target database. The first
 and last are READ-ONLY checks; the middle five do the work. All are idempotent
 and safe to re-run.
@@ -47,17 +52,11 @@ NOT PART OF THE INSTALL — do not run:
     Control_library.sql — dropping the scenario tables without it leaves orphan rows keyed
     to OutputIDs that no longer exist. Recreates NOTHING: run TSG_Core.sql afterwards, then
     re-insert an API_Client row or the app will not boot.
-  * TSG_Migration_ScenarioLifecycle.sql -- copy-paste extract of the scenario-lifecycle
-    changes, for applying that one release without running the full ~800-line TSG_Core.sql.
-    Every statement in it is verbatim from TSG_Core.sql, so running either, or both, in any
-    order is safe. TSG_Core.sql stays canonical.
-  * backfill_null_platform_fields_for_testing.sql -- developer fixture. Writes FABRICATED
-    values into PLATFORM tables. It now refuses to run unless the database name looks like
-    dev/test, but do not run it regardless.
-  * backfill_rejection_kind.sql -- one-off repair for databases created before 2026-08-03.
-    Not needed for a fresh install; it self-guards and reports if it is not applicable.
+  (2026-08 cleanup: TSG_Migration_ScenarioLifecycle.sql, backfill_rejection_kind.sql and a
+  dozen unreferenced helper scripts were DELETED — every statement that mattered lives in the
+  canonical numbered scripts, which git history still holds for the deleted copies.)
 
-scripts/eyshield_handoff/ is the numbered copy of these seven files for handing
+scripts/eyshield_handoff/ is the SINGLE home of these seven files, for handing
 to someone without repo access (e.g. the EyShield DBA team). Unlike the old
 scripts/share/ (deleted 2026-08-09), it IS tracked in git, so it shows up in
 diffs and reviews when the canonical files below change — update it in the
@@ -140,9 +139,8 @@ database is recreated).
     rowcount == 1. Now boot-asserted in invariants.REQUIRED_INDEXES.
   * Threat_Catalogue_Category_Map: composite PK reordered to (ThreatCategoryID,
     ThreatCatalogueID) so grounding's filter on the category can seek the clustered index.
-  * Config_Threat_Rule rows are now also gated on their PARENT Threat_Type being live
-    (dal.active_threat_rules). No FKs exist, so soft-deleting a type previously left its scoping
-    rules steering real generations.
+  * Config_Threat_Rule rows were also gated on their PARENT Threat_Type being live.
+    (2026-08: the table and its engine were REMOVED entirely -- see the note at the top.)
 
 2026-07-30: CreatedAt datetime2 added to Subsystem_Stage_State, ThreatType_ThreatActor_Map,
 Threat_Catalogue_Category_Map, Context_Field_Config (since removed) and
@@ -151,8 +149,7 @@ tables that had no creation stamp at all. Nullable WITH a DEFAULT SYSUTCDATETIME
 the seeds' explicit column lists keep working, defaulted so seeded rows still get a real UTC
 value rather than NULL. Every app write site stamps dal.now() explicitly, so the DB default only
 ever fires for SQL-seeded rows. NOT added to Threat_Library_Import_Run (StartedAt already IS its
-creation time) or Config_Threat_Rule (has CreateDate/UpdateDate -- the last holdout of the older
-naming; renaming it is a separate decision, not a second column meaning the same thing).
+creation time) or Config_Threat_Rule (since removed, 2026-08).
 
 2026-07-30: dal.guid() now mints SEQUENTIAL (COMB) GUIDs instead of uuid4. Nine tables have a
 uniqueidentifier PRIMARY KEY, which SQL Server makes CLUSTERED by default, so a random key means

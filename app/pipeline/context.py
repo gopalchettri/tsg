@@ -58,6 +58,7 @@ def _load_asset(sess: Session, asset_id: int) -> tuple[dict[str, Any], list[str]
     asset_row = sess.execute(
         select(m.ctm_scan_entity.id, m.ctm_scan_entity.name, m.ctm_scan_entity.criticality,
             m.ctm_scan_entity.description, m.ctm_scan_entity.data_handled, m.ctm_scan_entity.type,
+            m.ctm_scan_entity.ctm_category_id,
             m.ctm_scan_entity.operating_system, m.ctm_scan_entity.location,
             m.ctm_scan_entity.target_rto_hours, m.ctm_scan_entity.target_rpo_hours)
         .where(m.ctm_scan_entity.id == asset_id)
@@ -215,7 +216,9 @@ def _load_multiselect_lookup(
     }
     codes_by_col: dict[str, set[int]] = {}
     for col in needed_cols:
-        if _fold_code(_MULTISELECT_OPTION_CODES[col]) not in option_ids:  # option group not seeded — leave unresolved
+        if _fold_code(_MULTISELECT_OPTION_CODES[col]) not in option_ids:
+            log.warning("context.option_group_not_seeded",
+                        column=col, code=_MULTISELECT_OPTION_CODES[col])
             continue
         codes = {code for row in ss_rows.values() for code in _decode_codes(row.get(col))}
         if codes:
@@ -254,7 +257,11 @@ def _load_singleselect_lookup(
             .where(m.option.code.in_([_SINGLESELECT_OPTION_CODES[c] for c in needed_cols]))
         ).mappings()
     }
-    resolvable_cols = [c for c in needed_cols if _fold_code(_SINGLESELECT_OPTION_CODES[c]) in option_ids]  # option group not seeded — leave unresolved
+    resolvable_cols = [c for c in needed_cols if _fold_code(_SINGLESELECT_OPTION_CODES[c]) in option_ids]
+    missing_cols = [c for c in needed_cols if c not in resolvable_cols]
+    if missing_cols:
+        log.warning("context.option_group_not_seeded",
+                    columns=missing_cols, codes=[_SINGLESELECT_OPTION_CODES[c] for c in missing_cols])
     if not resolvable_cols:
         return {}
     relevant_option_ids = {option_ids[_fold_code(_SINGLESELECT_OPTION_CODES[c])] for c in resolvable_cols}
@@ -301,6 +308,12 @@ def _build_subsystems(
             "name": ss_row.get("name"),
             "criticality": criticality,  # scoping input — stays even though it's dropped from the AI-prompt allowlist
             "asset_type": (category_lookup.get(ss_row["asset_type"]) if ss_row.get("asset_type") is not None else None),
+            # RAW ctm_scan_category id — one member of the session's asset-category union
+            # (threat_retrieval.session_category_ids), which now feeds ONLY the data-driven
+            # control ITOT filter (threat retrieval reads the whole active catalogue — the
+            # catalogue has no asset-type column). The resolved name above stays for display
+            # + ranking text.
+            "asset_type_id": ss_row.get("asset_type"),
             "past_incidents": ss_row.get("incident_description"),
             "technology_used": _resolve_multiselect(ss_row.get("technology_used"), multiselect_lookup.get("technology_used", {})),
             "vendor_name": ss_row.get("vendor_name"),
@@ -375,6 +388,10 @@ def gather_asset_details(
         "sub_sector": resolved_sub_sector,
         "data_handled": asset.get("data_handled"),
         "asset_type": asset.get("type"),  # the ASSET's own declared type — distinct from each subsystem's own asset_type below
+        # RAW ctm_scan_category id of the asset itself — unioned with the subsystems' ids into
+        # the session's asset-category set (threat_retrieval.session_category_ids), which the
+        # control ITOT filter consumes. Stripped from the AI prompt by the redaction list.
+        "asset_type_id": asset.get("ctm_category_id"),
         "operating_system": asset.get("operating_system"),
         "location": asset.get("location"),
         "target_rto_hours": asset.get("target_rto_hours"),

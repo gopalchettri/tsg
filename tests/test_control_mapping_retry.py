@@ -58,7 +58,7 @@ def _seed(s, session_id: str, task_id: str, n_outputs: int = 3) -> list[str]:
         oid = str(uuid.uuid4())
         ids.append(oid)
         s.execute(m.Threat_Scenario_Output.__table__.insert().values(
-            OutputID=oid, SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
+            ScenarioID=oid, SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
             SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
             ScenarioJSON=json.dumps({"scenario_title": f"title {i}",
                                     "scenario_statement": f"statement {i}"}),
@@ -92,7 +92,7 @@ def _run(Session, sid, task_id):
 
 def _state(Session):
     with Session() as s:
-        outputs = {r.OutputID: r for r in s.execute(
+        outputs = {r.ScenarioID: r for r in s.execute(
             m.Threat_Scenario_Output.__table__.select()).all()}
         maps = s.execute(m.Threat_Scenario_Control_Map.__table__.select()).all()
         audits = [json.loads(a.DetailJSON) for a in s.execute(
@@ -121,7 +121,7 @@ def test_unanswered_output_is_not_stamped_and_is_retried(monkeypatch):
     stamped = {oid for oid, r in outputs.items() if r.ControlsMappedAt is not None}
     assert ids[1] not in stamped, "an output we never got an answer for must stay in the queue"
     assert stamped == {ids[0], ids[2]}
-    assert {r.OutputID for r in maps} == {ids[0], ids[2]}
+    assert {r.ScenarioID for r in maps} == {ids[0], ids[2]}
     # ...and the degradation is PERSISTED, not just logged, so a later reader can tell this
     # run apart from a clean one (the tasks._validate_candidates `degraded` discipline).
     assert audits[0]["unanswered"] == 1
@@ -133,7 +133,7 @@ def test_unanswered_output_is_not_stamped_and_is_retried(monkeypatch):
 
     outputs, maps, _ = _state(Session)
     assert all(r.ControlsMappedAt is not None for r in outputs.values())
-    assert {r.OutputID for r in maps} == set(ids), "the retried output finally got its controls"
+    assert {r.ScenarioID for r in maps} == set(ids), "the retried output finally got its controls"
 
 
 def test_a_real_empty_result_is_still_stamped(monkeypatch):

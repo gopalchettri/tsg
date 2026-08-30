@@ -6,18 +6,20 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.admin import candidates_router, promotions_router
+from app.api.admin import grounding_router
 from app.api.admin import router as admin_router
 from app.api.api_clients import router as api_clients_router
-from app.api.control_library_crud import router as control_library_crud_router
+from app.api.deps import require_admin
 from app.api.errors import register_error_handlers
 from app.api.health import router as health_router
-from app.api.route_audit import assert_routes_authenticated
+from app.api.route_audit import (
+    _ENTITY_SCOPED_ROUTES,
+    _EXEMPT_ROUTES,
+    assert_routes_authenticated,
+)
 from app.api.sessions import router as sessions_router
 from app.api.sessions import scenarios_router
 from app.api.threat_intel import router as threat_intel_router
-from app.api.threat_library_crud import router as threat_library_crud_router
-from app.api.threat_library_import import router as threat_library_import_router
 from app.api.treatment import router as treatment_router
 from app.core.config import get_settings
 from app.core.middleware import BodySizeLimitMiddleware, RequestIDMiddleware
@@ -71,62 +73,17 @@ def create_app() -> FastAPI:
                     "AI-generated Risk Treatment (Mitigate) plans for accepted scenarios. "
                     "The register's risk data (ratings, level, existing controls) is sent in "
                     "the request body. Present only when RISK_MODULE_ENABLED is on. POST to "
-                    "generate/regenerate, poll the GET on the same path."
-                ),
-            },
-            {
-                "name": "Controls Admin",
-                "description": (
-                    "Curate the 1,288-control library: create/update/delete controls, and link/"
-                    "unlink them to the standards they satisfy (which is what fills "
-                    "`standards[]` on a scenario's mapped controls). Requires the admin key. "
-                    "Deletes are soft, except unlinking a control from a standard."
-                ),
-            },
-            {
-                "name": "Standards Admin",
-                "description": (
-                    "Curate the named standards controls are linked to (ISO, NIST, DESC ISR, "
-                    "...). Requires the admin key. Deletes are soft."
-                ),
-            },
-            {
-                "name": "Threat Categories Admin",
-                "description": (
-                    "Curate the STRIDE threat categories. This table's PK is caller-supplied, "
-                    "not auto-generated. Requires the admin key. Deletes are soft — library ids "
-                    "are referenced by completed sessions."
-                ),
-            },
-            {
-                "name": "Threat Types Admin",
-                "description": (
-                    "Curate threat families (types). Renaming re-embeds the row for AI "
-                    "matching. Requires the admin key. Deletes are soft."
-                ),
-            },
-            {
-                "name": "Threat Catalogue Admin",
-                "description": (
-                    "Curate exact threats under a threat-type family — creating one 404s if the "
-                    "parent family doesn't exist. Renaming re-embeds the row. Requires the admin "
-                    "key. Deletes are soft."
-                ),
-            },
-            {
-                "name": "Threat Actors Admin",
-                "description": (
-                    "Curate threat actors. Actors are not embedded, so no refresh job is ever "
-                    "returned for them. Requires the admin key. Deletes are soft."
-                ),
-            },
-            {
-                "name": "Threat Rules Admin",
-                "description": (
-                    "Curate the scoping rules that decide which threat types apply to which "
-                    "asset contexts during Stage 1 identification — tech_gate rules hard "
-                    "include/exclude, relevance rules weight the score. Requires the admin key. "
-                    "Deletes are soft."
+                    "generate/regenerate, poll the GET on the same path.\n\n"
+                    "**Breaking change — the request body is now closed.** Unknown keys are "
+                    "rejected with 422 `extra_forbidden` instead of being silently dropped, and "
+                    "the two window fields were renamed `timeline_start_date`/`timeline_end_date` "
+                    "-> `mitigation_start_date`/`mitigation_end_date`. Generate accepts exactly "
+                    "these 12 keys: `existing_controls`, `likelihood_rating`, `impact_rating`, "
+                    "`final_risk_rating`, `risk_level`, `risk_identification_date`, `risk_owner`, "
+                    "`impacted_business_division`, `existing_controls_all_subsystems`, "
+                    "`existing_controls_all_subsystems_justification`, `mitigation_start_date`, "
+                    "`mitigation_end_date`. Regenerate accepts `{}` — `user_note` was removed. "
+                    "Send `\"\"` for an unset optional value; it is read as absent."
                 ),
             },
             {
@@ -138,32 +95,14 @@ def create_app() -> FastAPI:
                 ),
             },
             {
-                "name": "Session Admin",
+                "name": "Grounding Admin",
                 "description": (
-                    "Visibility and control over sessions whose library-promotion side-effect "
-                    "failed after an otherwise-successful accept: list/inspect pending "
-                    "failures, force an immediate retry, or dismiss one from tracking. Requires "
-                    "the admin key."
-                ),
-            },
-            {
-                "name": "Threat Library Candidates",
-                "description": (
-                    "Admin review queue for EVERYTHING new the AI pipeline proposes — threat "
-                    "types, threat names, and actors (kind='threat' | 'actor'). With "
-                    "promotion_auto_approve_enabled off (the default), nothing enters the "
-                    "shared library without an approval here; approve mints the entry "
-                    "(crediting the ORIGINAL proposer as CreatedBy) or reject closes the card. "
-                    "Requires the admin key."
-                ),
-            },
-            {
-                "name": "Threat Library Admin",
-                "description": (
-                    "Bulk-import open-source threat libraries (MITRE ATT&CK/ATT&CK ICS, MISP "
-                    "actors, ...): list known sources, trigger an import, and poll its job "
-                    "status. Requires the admin key. For editing individual rows by hand, see "
-                    "the Threat Categories/Types/Catalogue/Actors Admin groups instead."
+                    "Measure the grounding match threshold — the score at or above which an "
+                    "AI-proposed threat is treated as an existing library entry rather than a "
+                    "new one. The right value is specific to the configured embedding+reranker "
+                    "pair, so it is measured per pair and stored, not hand-tuned: read the "
+                    "current one (with its provenance) and queue a re-calibration after "
+                    "changing models or curating the library. Requires the admin key."
                 ),
             },
             {
@@ -205,11 +144,7 @@ def create_app() -> FastAPI:
     app.include_router(scenarios_router)
     app.include_router(admin_router)
     app.include_router(api_clients_router)
-    app.include_router(promotions_router)
-    app.include_router(candidates_router)
-    app.include_router(threat_library_import_router)
-    app.include_router(threat_library_crud_router)
-    app.include_router(control_library_crud_router)
+    app.include_router(grounding_router)
     app.include_router(threat_intel_router)
     # Feature-flagged: routes only mount, and only 404-by-absence otherwise
     if get_settings().risk_module_enabled:
@@ -226,9 +161,100 @@ def create_app() -> FastAPI:
         def _dev_sse_test() -> FileResponse:  # pragma: no cover - dev tooling
             return FileResponse(_sse_page, media_type="text/html")
 
+    _finalize_openapi(app)
     # Fail-closed: refuse to boot if any route is missing entity-scoping or was never audited
     assert_routes_authenticated(app)
     return app
+
+
+_API_KEY_SCHEME = "ApiKeyAuth"
+_ADMIN_KEY_SCHEME = "AdminKeyAuth"
+
+def _finalize_openapi(app: FastAPI) -> None:
+    """Make the PUBLISHED spec match what the app actually does: one error envelope, declared
+    authentication, and the error statuses each route can really return.
+
+    Three defects this closes, all of the same kind — the document promised something untrue:
+
+    1. FastAPI auto-adds a 422 documented as `HTTPValidationError` (`{"detail": [...]}`), but this
+       app registers its own RequestValidationError handler, so the real body is the
+       `{error_code, message, details}` envelope. Every such route published a shape it does not
+       honour, and a client generated from the spec parses the wrong one.
+    2. No `securitySchemes` and no `security` anywhere, with all five auth headers published
+       `required: false` — so the spec described the whole API, admin routes included, as
+       unauthenticated, and a generated client simply omitted the key.
+    3. 401/403/404 were returned but never declared. (503 is declared by the ROUTES
+       themselves via schemas.UNAVAILABLE_RESPONSES — a central path list here went
+       stale the moment a route was renamed, silently.)
+
+    Done HERE, over the finished schema, rather than as `responses=`/`dependencies=` on each of
+    the 8 routers: a per-router kwarg is one more thing a NEW router can forget, and forgetting is
+    invisible. Rewriting the generated document covers every route that exists now and every route
+    added later, with nothing to remember.
+
+    The auth classification is READ FROM route_audit's registries rather than restated here.
+    Those registries already map every (method, path) to its auth model and `create_app()` refuses
+    to boot when a route is missing from both, so sourcing the spec from them means the document
+    cannot drift from what is enforced. A second hand-maintained list in this file would
+    reintroduce exactly the drift this function exists to remove.
+
+    NOT done here: marking the auth headers `required`. `deps.py` declares them `Header(default="")`
+    on purpose so the dependency runs and raises AuthError -> a clean 401; making FastAPI enforce
+    them instead would turn every missing-key 401 into a 422.
+    """
+    schema = app.openapi()
+    ref = {"$ref": "#/components/schemas/ErrorResponse"}
+
+    def envelope(description: str) -> dict:
+        return {"description": description, "content": {"application/json": {"schema": ref}}}
+
+    schema.setdefault("components", {})["securitySchemes"] = {
+        _API_KEY_SCHEME: {
+            "type": "apiKey", "in": "header", "name": "X-API-Key",
+            "description": "Client key. Entity-scoped routes additionally require X-User-Id and "
+                        "X-Entity-Id (and X-Tenant-Id where multi-tenant).",
+        },
+        _ADMIN_KEY_SCHEME: {
+            "type": "apiKey", "in": "header", "name": "X-Admin-Key",
+            "description": "Admin key. Gates the cross-tenant admin surface on its own — minting "
+                        "the first client key must not itself require a client key.",
+        },
+    }
+
+    for path, methods in schema.get("paths", {}).items():
+        for method, op in methods.items():
+            if not isinstance(op, dict):
+                continue  # "parameters"/"summary" siblings of the verb keys, not operations
+            key = (method.upper(), path)
+            responses = op.setdefault("responses", {})
+
+            r422 = responses.get("422")
+            if r422 and "content" in r422:
+                r422["description"] = "Validation error — the standard error envelope."
+                for media in r422["content"].values():
+                    media["schema"] = ref
+
+            # setdefault throughout: a route that already declares a status (accept/reject's own
+            # 409, the SSE routes' 200) keeps its more specific text.
+            if key in _ENTITY_SCOPED_ROUTES:
+                op["security"] = [{_API_KEY_SCHEME: []}]
+                responses.setdefault("401", envelope("Missing or invalid credentials."))
+                responses.setdefault("403", envelope(
+                    "Authenticated, but not entitled to the target entity."))
+            elif key in _EXEMPT_ROUTES and _EXEMPT_ROUTES[key] is require_admin:
+                op["security"] = [{_ADMIN_KEY_SCHEME: []}]
+                responses.setdefault("401", envelope("Missing or invalid admin key."))
+
+            if "{" in path:  # every route that names a resource in its path can miss it
+                responses.setdefault("404", envelope(
+                    "Not found, or not visible to this caller. `details` may carry a "
+                    "machine-readable reason per item — accept/reject name each unusable "
+                    "scenario id and why."))
+
+    # HTTPValidationError/ValidationError become unreferenced once every 422 points at
+    # ErrorResponse; leave them in components rather than deleting — a stale $ref elsewhere would
+    # break the whole document, and an unused schema costs nothing.
+    app.openapi_schema = schema
 
 
 app = create_app()

@@ -58,7 +58,7 @@ def _engine(tmp_path):
 def _create_all(engine):
     for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Identified_Threat,
                 m.Scoped_Threat, m.Threat_Scenario_Output, m.Threat_Scenario_Control_Map,
-                m.Scenario_Audit, m.Prompt_Log, m.Config_Threat_Rule):
+                m.Scenario_Audit, m.Prompt_Log):
         tbl.__table__.create(engine)
     return engine
 

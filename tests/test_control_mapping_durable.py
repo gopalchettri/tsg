@@ -53,7 +53,7 @@ def _seed(s, session_id: str, task_id: str, epoch: int = 1) -> None:
         LeaseExpiresAt=now + timedelta(minutes=10), HeartbeatAt=now, AttemptCount=1, UpdatedAt=now,
     ))
     s.execute(m.Threat_Scenario_Output.__table__.insert().values(
-        OutputID=str(uuid.uuid4()), SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
+        ScenarioID=str(uuid.uuid4()), SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
         SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
         ScenarioJSON=json.dumps({"controls": [{"name": "MFA", "why": "reduces credential abuse"}],
                                 "scenario_title": "t", "scenario_statement": "s"}),

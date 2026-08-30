@@ -35,11 +35,10 @@ log = get_logger(__name__)
 #: in .env: they are needed before a DB connection exists, or a wrong value yields stuck jobs
 #: rather than a worse report.
 TUNABLE_KEYS: tuple[str, ...] = (
-    "scoping_score_threshold", "base_score", "default_rule_weight", "max_threats_per_asset",
+    "scoping_score_threshold", "base_score", "max_threats_per_asset",
     "next_set_size", "coverage_attempt_slack",
     "variant_sibling_prompt_k", "prompt_intel_limit", "sibling_similarity_ratio",
-    "semantic_near_duplicate_threshold", "triage_auto_reject_cosine",
-    "triage_auto_approve_cosine",
+    "semantic_near_duplicate_threshold",
 )
 
 #: Keys whose value is EMBEDDING-MODEL-SPECIFIC: an override row should name the model it was
@@ -47,8 +46,7 @@ TUNABLE_KEYS: tuple[str, ...] = (
 #: skipped with a warning and the config default applies — a number derived on another model
 #: is noise, and a model swap must never brick session creation.
 EMBEDDING_COUPLED_KEYS: frozenset[str] = frozenset({
-    "semantic_near_duplicate_threshold", "triage_auto_reject_cosine",
-    "triage_auto_approve_cosine",
+    "semantic_near_duplicate_threshold",
 })
 
 #: The tunable keys whose canonical type is int. NOT derived from ResolvedTuning annotations
@@ -87,7 +85,6 @@ class ResolvedTuning:
     prevent)."""
     scoping_score_threshold: float | None
     base_score: float
-    default_rule_weight: float
     max_threats_per_asset: int
     next_set_size: int
     coverage_attempt_slack: int
@@ -95,8 +92,6 @@ class ResolvedTuning:
     prompt_intel_limit: int
     sibling_similarity_ratio: float
     semantic_near_duplicate_threshold: float
-    triage_auto_reject_cosine: float
-    triage_auto_approve_cosine: float
 
 
 def _from_config(s: Settings) -> dict[str, Any]:
@@ -185,5 +180,8 @@ def from_session(scenario_session: Mapping[str, Any] | None) -> ResolvedTuning:
             log.warning("tuning.snapshot_unreadable",
                         session_id=(scenario_session or {}).get("SessionID"))
         else:
-            base.update(dict(parsed))
+            # Filter to the CURRENT key set: a legacy snapshot may carry keys that have since
+            # been retired (default_rule_weight left with Config_Threat_Rule, 2026-08), and an
+            # unknown kwarg would crash ResolvedTuning on every pre-change session.
+            base.update({k: v for k, v in dict(parsed).items() if k in base})
     return ResolvedTuning(**base)

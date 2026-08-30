@@ -6,35 +6,49 @@ streams the worker's live embedding_job_update hints over SSE.
 """
 from __future__ import annotations
 
-from typing import Literal
+import json
 
 from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, Query, Request
+from sqlalchemy import select
+from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError
 
-from app.api.admin_jobs import FAMILY_EMBEDDINGS, admin_job_exists, emb_job_channel_key, mark_admin_job
+from app.api.admin_jobs import (
+    FAMILY_EMBEDDINGS,
+    FAMILY_GROUNDING,
+    admin_job_exists,
+    emb_job_channel_key,
+    grounding_job_channel_key,
+    mark_admin_job,
+)
 from app.api.admin_sse import admin_job_event_stream
 from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.schemas import (
-    CandidateResolutionResult,
+    UNAVAILABLE_RESPONSES,
     EmbeddingActionBody,
     EmbeddingJobAccepted,
     EmbeddingJobStatus,
-    PendingCandidate,
-    PendingCandidatesResponse,
-    PendingPromotion,
-    PendingPromotionsResponse,
-    PromotionRetryResult,
+    GroundingCalibrationAccepted,
+    GroundingCalibrationBody,
+    GroundingCalibrationHistory,
+    GroundingCalibrationRun,
+    GroundingCalibrationStatus,
+    GroundingThresholdResponse,
 )
 from app.core.config import get_settings
-from app.core.enums import CandidateKind, CandidateStatus, CeleryJobState, SSEEventType
+from app.core.enums import (
+    CalibrationStatus,
+    CeleryJobState,
+    SSEEventType,
+)
 from app.core.logging import get_logger
-from app.db import dal
+from app.db import models as m
 from app.db.dal import NotFoundError
 from app.db.engine import db_session
-from app.pipeline.accept import AcceptConflict, eager_embed_promoted, resolve_candidate
-from app.pipeline.celery_app import admin_embedding_action_task, celery_app
+from app.pipeline import grounding
+from app.pipeline.celery_app import admin_embedding_action_task, calibrate_grounding_task, celery_app
 from app.pipeline.llm import get_llm
-from app.pipeline.reaper import dismiss_promotion, retry_one_promotion
 
 router = APIRouter(
     prefix="/v1/tsg/threat-library/embeddings",
@@ -149,7 +163,8 @@ def get_status(job_id: str, _principal: Principal = Depends(get_admin_principal)
     return EmbeddingJobStatus(state=state)
 
 
-@router.get("/events/{job_id}", responses={200: {"content": {"text/event-stream": {}}}})
+@router.get("/events/{job_id}",
+            responses={200: {"content": {"text/event-stream": {}}}} | UNAVAILABLE_RESPONSES)
 async def job_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE stream for one queued embedding action: a state snapshot on connect (a late
     subscriber to a finished job gets the terminal state immediately and the stream closes),
@@ -166,196 +181,226 @@ async def job_events(job_id: str, _principal: Principal = Depends(get_admin_prin
 
 
 # ---------------------------------------------------------------------------
-# Session-promotion admin — visibility and control over sessions whose library promotion
-# (accept.py's isolated Phase 2) failed. The accept itself already succeeded for every session
-# listed here; only the "add novel threats to the shared library" side-effect is pending.
+# Grounding-threshold calibration — measure the match cutoff for the CURRENTLY configured
+# embedding+reranker pair instead of pinning it by hand.
+#
+# Own prefix (not the embeddings one) because this is not a cache operation: it is a property of
+# the MODEL PAIR, stored per pair in Mongo and reused by every worker and every later boot.
+#
+# Asynchronous for the same reason as the embedding routes, only more so — a sweep is
+# `TSG_CALIBRATION_SAMPLE_SIZE` local rerank passes plus that many BILLED paraphrase calls, which
+# runs into minutes. It is deliberately NOT on the worker boot path: worker_init runs before the
+# worker registers on the broker, so a sweep there made every cold start miss its readiness
+# window. Worker boot now queues this job and comes up immediately.
 # ---------------------------------------------------------------------------
-promotions_router = APIRouter(
-    prefix="/v1/tsg/sessions",
-    tags=["Session Admin"],
+grounding_router = APIRouter(
+    prefix="/v1/tsg/grounding",
+    tags=["Grounding Admin"],
     dependencies=[Depends(require_admin)],
 )
 
 
-def _to_pending_promotion(row, max_attempts: int) -> PendingPromotion:
-    """Shared row -> response mapping for the list and detail promotion routes, so the two
-    routes can never disagree about what a field means."""
-    return PendingPromotion(
-        session_id=row["SessionID"], entity_id=row["EntityID"], asset_id=row["AssetID"],
-        asset_name=row["AssetName"], failed_at=row["PromotionFailedAt"].isoformat(),
-        attempts=row["PromotionAttempts"], max_attempts=max_attempts,
-        exhausted=row["PromotionAttempts"] >= max_attempts,
-        error=row["PromotionError"], user_id=row["PromotionUserID"],
-        completed_at=row["CompletedAt"].isoformat() if row["CompletedAt"] else None,
-    )
+@grounding_router.get("/threshold", response_model=GroundingThresholdResponse)
+def get_threshold(_principal: Principal = Depends(get_admin_principal)) -> GroundingThresholdResponse:
+    """The match cutoff in force RIGHT NOW, with its provenance.
 
-
-@promotions_router.get("/promotions", response_model=PendingPromotionsResponse)
-def list_promotions(
-    limit: int = Query(default=100, ge=1, description="Max rows to return."),
-    include_exhausted: bool = Query(
-        default=True,
-        description="Include sessions the automatic sweep has already given up on (still manually retryable)."),
-    _principal: Principal = Depends(get_admin_principal),
-) -> PendingPromotionsResponse:
-    """Every session currently stuck on a failed library promotion, oldest failure first."""
-    settings = get_settings()
-    bounded_limit = min(limit, settings.promotion_list_max_limit)
+    Read-only and cheap — never calibrates (no allow_calibration), so this route is safe to poll.
+    `origin` is the field that matters: 'static_default' means the number was tuned for a
+    DIFFERENT model pair and every grounding decision made on it is provisional, which is the
+    cue to POST /calibrate."""
+    s = get_settings()
     with db_session() as sess:
-        rows = dal.list_pending_promotions(
-            sess, limit=bounded_limit, include_exhausted=include_exhausted,
-            max_attempts=settings.promotion_max_attempts)
-    promotions = [_to_pending_promotion(row, settings.promotion_max_attempts) for row in rows]
-    return PendingPromotionsResponse(promotions=promotions, total=len(promotions),
-                                    auto_retry_enabled=settings.promotion_auto_retry_enabled)
+        th = grounding.resolve_thresholds(sess, get_llm(), s)
+    return GroundingThresholdResponse(
+        value=th.value, origin=th.origin,
+        embedding_model=s.embedding_model, reranker_model=s.reranker_model)
 
 
-@promotions_router.get("/promotions/{session_id}", response_model=PendingPromotion)
-def get_promotion(session_id: str, _principal: Principal = Depends(get_admin_principal)) -> PendingPromotion:
-    """One session's promotion-failure detail. 404 if it isn't currently in a failed state."""
-    settings = get_settings()
-    with db_session() as sess:
-        row = dal.get_pending_promotion(sess, session_id)
-    if row is None:
-        raise NotFoundError(f"session {session_id!r} has no pending promotion failure")
-    return _to_pending_promotion(row, settings.promotion_max_attempts)
+class CalibrationConflict(Exception):
+    """A calibration for this model pair is already running -> 409 (see app/api/errors.py).
+
+    Carries the in-flight RunID so the caller can poll that one instead of retrying blind — the
+    same courtesy SessionConflict extends with its active_session_id."""
+
+    def __init__(self, message: str, run_id: str | None = None) -> None:
+        super().__init__(message)
+        self.run_id = run_id
 
 
-@promotions_router.post("/promotions/{session_id}/retry", response_model=PromotionRetryResult)
-def retry_promotion(session_id: str, principal: Principal = Depends(get_admin_principal)) -> PromotionRetryResult:
-    """Force a retry now, instead of waiting for the next scheduled sweep. Synchronous: one
-    retry is a single bounded operation (unlike the embeddings actions above, which can re-embed
-    a whole group), so there is no need for the async job/poll pattern those use. Always
-    available regardless of promotion_max_attempts — that cap only throttles the unattended
-    sweep, never a human explicitly asking to retry."""
-    with db_session() as sess:
-        row = dal.get_pending_promotion(sess, session_id)
-        if row is None:
-            raise NotFoundError(f"session {session_id!r} has no pending promotion failure")
-        outcome = retry_one_promotion(sess, session_id, row["EntityID"], row["PromotionUserID"])
-    log.warning("admin.promotion_retry", session_id=session_id, outcome=outcome, user_id=principal.user_id)
-    return PromotionRetryResult(session_id=session_id, outcome=outcome)
+@grounding_router.post("/calibrate", response_model=GroundingCalibrationAccepted, status_code=202)
+def calibrate(request: Request, body: GroundingCalibrationBody | None = None,
+            principal: Principal = Depends(get_admin_principal)) -> GroundingCalibrationAccepted:
+    """Start a calibration sweep for the current embedding+reranker pair; returns 202 + a job_id.
 
+    THE ONLY WAY A CALIBRATION EVER STARTS. Nothing queues one automatically — a sweep is 10-15
+    minutes and ~100 billed LLM calls, so it is a deliberate act with an accountable caller.
 
-@promotions_router.delete("/promotions/{session_id}", response_model=PromotionRetryResult)
-def dismiss_promotion_route(session_id: str, principal: Principal = Depends(get_admin_principal)) -> PromotionRetryResult:
-    """Dismiss — stop tracking/retrying this session's failed promotion, without attempting it
-    again. Serialized against any in-flight retry via the same per-session lock, so a dismiss can
-    never be silently undone by a retry that was already mid-flight."""
-    with db_session() as sess:
-        row = dal.get_pending_promotion(sess, session_id)
-        if row is None:
-            raise NotFoundError(f"session {session_id!r} has no pending promotion failure")
-        outcome = dismiss_promotion(sess, session_id, row["EntityID"], principal.user_id)
-    log.warning("admin.promotion_dismissed", session_id=session_id, outcome=outcome, user_id=principal.user_id)
-    return PromotionRetryResult(session_id=session_id, outcome=outcome)
+    The ledger row is opened HERE, before the task is queued, and that ordering IS the concurrency
+    guard. `UX_GroundingCalibration_Running` is a unique index filtered on Status='running', so a
+    second concurrent request's INSERT is refused by the database and becomes a 409. Checking "is
+    one running?" in Python instead leaves a window where two requests both read "no" and both
+    queue a sweep; the database has no such window. Queueing first would move the guard behind the
+    broker, where the duplicate has already been promised a 202.
 
-
-# ---------------------------------------------------------------------------
-# Threat-library candidate review — the curator workflow whose approve/reject writes
-# CandidateStatus.accepted/rejected (via resolve_candidate). Lists and resolves
-# Threat_Candidate_Review rows accept.py queues (always for an ambiguous triage verdict; also for
-# a "genuinely novel" one when promotion_auto_approve_enabled is off).
-# ---------------------------------------------------------------------------
-candidates_router = APIRouter(
-    prefix="/v1/tsg/threat-library/candidates",
-    tags=["Threat Library Candidates"],
-    dependencies=[Depends(require_admin)],
-)
-
-
-def _to_pending_candidate(row) -> PendingCandidate:
-    """Shared row -> response mapping for the list and detail candidate routes. On actor
-    candidates category is None and proposed_type names the type the actor was proposed for
-    (None only on legacy rows); a NULL CandidateKind is a legacy 'threat' row."""
-    return PendingCandidate(
-        candidate_id=row["CandidateID"], session_id=row["SessionID"], entity_id=row["EntityID"],
-        kind=row.get("CandidateKind") or CandidateKind.threat,
-        created_by=row.get("CreatedBy"),
-        proposed_category=row["ProposedCategory"], proposed_type=row["ProposedType"],
-        proposed_name=row["ProposedName"], proposed_generic_name=row["ProposedGenericName"],
-        threat_type_id=row.get("ThreatTypeID"),
-        status=row["Status"], created_at=row["CreatedAt"].isoformat(),
-    )
-
-
-@candidates_router.get("", response_model=PendingCandidatesResponse)
-def list_candidates(
-    limit: int = Query(default=100, ge=1, description="Max rows to return."),
-    kind: CandidateKind | None = Query(
-        default=None, description="Filter to one candidate kind ('threat' or 'actor'); "
-                                  "omit for both."),
-    status: Literal["pending", "rejected"] = Query(
-        default="pending", description="'pending' (default) lists cards awaiting review; "
-                                       "'rejected' lists the standing identity blacklist "
-                                       "(rejected cards permanently suppress re-queuing)."),
-    _principal: Principal = Depends(get_admin_principal),
-) -> PendingCandidatesResponse:
-    """Every proposal in one review state (threats AND actors), oldest first — by default the
-    cards awaiting curator review; `status=rejected` enumerates the otherwise-invisible
-    identity blacklist. Approve/reject stay pending-only — listing a rejected card does not
-    reopen it."""
-    settings = get_settings()
-    bounded_limit = min(limit, settings.promotion_list_max_limit)
-    with db_session() as sess:
-        # kind and status filter IN SQL, before the LIMIT — a Python filter here would let one
-        # matching card hide forever behind a page of older cards (and misreport `total`).
-        rows = dal.list_pending_candidates(sess, limit=bounded_limit, kind=kind, status=status)
-    candidates = [_to_pending_candidate(row) for row in rows]
-    return PendingCandidatesResponse(candidates=candidates, total=len(candidates))
-
-
-@candidates_router.get("/{candidate_id}", response_model=PendingCandidate)
-def get_candidate_route(candidate_id: str, _principal: Principal = Depends(get_admin_principal)) -> PendingCandidate:
-    """One candidate's full detail. 404 if the id doesn't exist."""
-    with db_session() as sess:
-        row = dal.get_candidate(sess, candidate_id)
-    if row is None:
-        raise NotFoundError(f"candidate {candidate_id!r} not found")
-    return _to_pending_candidate(row)
-
-
-def _resolve_and_respond(candidate_id: str, principal: Principal, *, approve: bool) -> CandidateResolutionResult:
-    """Shared body for approve/reject: fetch, resolve, audit-log the admin action, respond —
-    the only difference between the two routes below is the `approve` flag they pass in."""
-    with db_session() as sess:
-        candidate = dal.get_candidate(sess, candidate_id)
-        if candidate is None:
-            raise NotFoundError(f"candidate {candidate_id!r} not found")
-        resolution = resolve_candidate(sess, candidate, principal.user_id, approve=approve)
-        if not resolution.won:
-            # INSIDE the block on purpose: raising here makes db_session() roll back, so a
-            # losing approve leaves NO trace — its mints/links are ERASED, never committed
-            # alongside the other request's verdict. Checking after commit (the old shape)
-            # let a lost approve durably add master rows while the card read "rejected".
-            raise AcceptConflict(f"candidate {candidate_id!r} was already reviewed")
-    # db_session()'s `with` block has now committed (or raised) — the mint above, if any, is
-    # durable. Eager-embed AFTER that, in a FRESH session, never inside the same block: doing it
-    # before commit risks writing to Mongo for a name whose SQL row could still be rolled back by
-    # a later failure in the same block (same orphan-vector trap run_promotion_phase avoids).
-    if resolution.promoted_names:
+    Without `force`, a pair that already has a successful run is a no-op the job reports as
+    skipped=already_calibrated. Send force=true after curating the library."""
+    force = bool(body.force) if body else False
+    s = get_settings()
+    key = (s.embedding_model, s.reranker_model)
+    try:
+        run_id = grounding.record_calibration_started(
+            key, job_id=None, started_by=principal.user_id,
+            started_by_client=principal.client_id, forced=force)
+    except IntegrityError as exc:
+        # The unique index refused it: another sweep for this pair is in flight. Abandoned rows
+        # were already settled inside record_calibration_started, so this one is genuinely LIVE.
         with db_session() as sess:
-            eager_embed_promoted(sess, get_llm(), resolution.promoted_names)
-    status = CandidateStatus.accepted if approve else CandidateStatus.rejected
-    log.warning("admin.candidate_resolved", candidate_id=candidate_id, status=status,
-                user_id=principal.user_id)
-    # resolve_candidate already computed these ids — no second read needed to report them.
-    return CandidateResolutionResult(
-        candidate_id=candidate_id, status=status,
-        threat_type_id=resolution.type_id, threat_catalogue_id=resolution.catalogue_id)
+            live = grounding.running_run(sess, key)
+        raise CalibrationConflict(
+            "a calibration for this embedding+reranker pair is already running — poll it rather "
+            "than starting a second 10-15 minute sweep",
+            run_id=str(live.RunID) if live is not None else None) from exc
+
+    try:
+        task = calibrate_grounding_task.delay(force, principal.user_id, principal.client_id, run_id)
+    except BaseException as exc:
+        # The row is the lock, and it is opened BEFORE the queue on purpose. If the broker refuses
+        # the publish there is no worker to close it, so close it here — otherwise every calibrate
+        # request for the next calibration_stale_after_seconds gets a 409 pointing at a sweep that
+        # never started. Scope is exactly this call: once .delay() returns the task owns the row,
+        # and settling it from here would race a live sweep.
+        grounding.record_calibration_finished(run_id, error=f"queueing failed: {exc!r}")
+        raise
+    mark_admin_job(task.id, FAMILY_GROUNDING)  # best-effort — see admin_jobs.mark_admin_job
+    _attach_job_id(run_id, task.id)
+    # AFTER .delay() for the same reason _audit fires after _enqueue: logging first would leave a
+    # permanent record of a sweep that never ran when the broker was unreachable. The ledger row
+    # is deliberately written BEFORE — it is the lock, not the log.
+    log.warning("admin.grounding_calibration", force=force, job_id=task.id, run_id=run_id,
+                user_id=principal.user_id, client_id=principal.client_id,
+                source_ip=request.client.host if request.client else None)
+    return GroundingCalibrationAccepted(job_id=task.id, run_id=run_id)
 
 
-@candidates_router.post("/{candidate_id}/approve", response_model=CandidateResolutionResult)
-def approve_candidate(candidate_id: str, principal: Principal = Depends(get_admin_principal)) -> CandidateResolutionResult:
-    """Approve — mint this card's proposal into the shared library now (threat card: its
-    Threat_Type + Threat_Catalogue entry; actor card: the Threat_Actor plus its link to the
-    type the card names, when one live unambiguous match exists). CAS-guarded: a candidate
-    already reviewed by someone else returns 409 with every write rolled back."""
-    return _resolve_and_respond(candidate_id, principal, approve=True)
+def _attach_job_id(run_id: str, job_id: str) -> None:
+    """Stamp the Celery task id onto the ledger row now that the broker has accepted it.
+
+    Two steps because the row must exist BEFORE the task is queued (it is the concurrency guard),
+    and the task id only exists after. Best-effort: JobID only cross-references the Celery result,
+    and the row is already complete and correct without it."""
+    try:
+        with db_session() as sess:
+            sess.execute(
+                sa_update(m.Grounding_Calibration_Run)
+                .where(m.Grounding_Calibration_Run.RunID == run_id)
+                .values(JobID=job_id))
+    except Exception:
+        log.warning("admin.grounding_calibration_jobid_failed", run_id=run_id, job_id=job_id,
+                    exc_info=True)
 
 
-@candidates_router.post("/{candidate_id}/reject", response_model=CandidateResolutionResult)
-def reject_candidate(candidate_id: str, principal: Principal = Depends(get_admin_principal)) -> CandidateResolutionResult:
-    """Reject — close this candidate without adding anything to the shared library. Same
-    CAS guard as approve."""
-    return _resolve_and_respond(candidate_id, principal, approve=False)
+@grounding_router.get("/calibrations", response_model=GroundingCalibrationHistory)
+def list_calibrations(limit: int = Query(default=50, ge=1, le=200),
+                    _principal: Principal = Depends(get_admin_principal)) -> GroundingCalibrationHistory:
+    """Calibration history, newest first — who ran it, when, and whether it passed.
+
+    THE REASON THE LEDGER TABLE EXISTS. Celery's own result expires after
+    TSG_RESULT_EXPIRES_SECONDS (1h by default), so `/calibrate/status/{job_id}` cannot answer
+    "did last Tuesday's calibration succeed?" — and before this table a FAILED sweep wrote nothing
+    at all. These rows are permanent.
+
+    `status` is settled, not raw: a `running` row older than the stale window reads as `failed`
+    with a synthesized cause, because it cannot still be running and saying otherwise misleads
+    every consumer."""
+    with db_session() as sess:
+        rows = grounding.recent_runs(sess, limit)
+        return GroundingCalibrationHistory(runs=[_to_calibration_run(r) for r in rows])
+
+
+def _to_calibration_run(row) -> GroundingCalibrationRun:
+    """Ledger row -> response. `status`/`error` go through the settling helpers so an abandoned
+    run is reported as the failure it is."""
+    return GroundingCalibrationRun(
+        run_id=str(row.RunID), job_id=row.JobID,
+        status=grounding.settled_status(row), started_by=row.StartedBy,
+        started_by_client=row.StartedByClient,
+        started_at=row.StartedAt, finished_at=row.FinishedAt,
+        embedding_model=row.EmbeddingModel, reranker_model=row.RerankerModel,
+        forced=bool(row.Forced), match_th=row.MatchTh, quality=row.Quality,
+        negatives=row.NegativesCount, positives=row.PositivesCount,
+        highest_negative=row.HighestNegative, lowest_positive=row.LowestPositive,
+        near_duplicates=json.loads(row.NearDuplicatesJSON) if row.NearDuplicatesJSON else [],
+        error=grounding.settled_error(row))
+
+
+@grounding_router.get("/calibrate/status/{job_id}", response_model=GroundingCalibrationStatus)
+def get_calibration_status(job_id: str,
+                        _principal: Principal = Depends(get_admin_principal)) -> GroundingCalibrationStatus:
+    """Polls one sweep's outcome — Celery's AsyncResult while it lives, the LEDGER after it dies.
+
+    The provenance marker is checked FIRST, and is NOT fail-open on a Redis error — identical
+    reasoning to get_status above: this route never calls require_entity, so without the marker
+    any caller who learned another task's id could read ITS result here.
+
+    The ledger fallback is what makes this route survivable. Celery's result and the marker share
+    one TTL (an hour by default), so beyond that this used to 404 a sweep that had genuinely
+    succeeded — the exact question an operator asks late. The ledger row is permanent, so a miss
+    on the marker is now "look it up properly", not "never happened"."""
+    if not admin_job_exists(job_id, FAMILY_GROUNDING):
+        row = _calibration_row_by_job(job_id)
+        if row is None:
+            raise NotFoundError(f"unknown or expired job_id: {job_id!r}")
+        return _status_from_row(row)
+    result = AsyncResult(job_id, app=celery_app)
+    state = CeleryJobState(result.state)
+    if state is CeleryJobState.FAILURE:
+        return GroundingCalibrationStatus(state=state, error=str(result.result))
+    if state is CeleryJobState.SUCCESS:
+        return GroundingCalibrationStatus(state=state, **(result.result or {}))
+    return GroundingCalibrationStatus(state=state)
+
+
+def _calibration_row_by_job(job_id: str):
+    """The ledger row for a Celery task id, or None. Doubles as the authorization check the
+    expired marker can no longer make: a job_id this router never queued has no row here."""
+    with db_session() as sess:
+        return sess.execute(
+            select(m.Grounding_Calibration_Run)
+            .where(m.Grounding_Calibration_Run.JobID == job_id)).scalars().first()
+
+
+def _status_from_row(row) -> GroundingCalibrationStatus:
+    """Ledger row -> the same shape the live Celery path returns, so a caller polling across the
+    TTL boundary sees one contract rather than two. `no_signal` and `success` both map to a
+    SUCCESS job state — the sweep ran; `match_th` being null is the finding."""
+    settled = grounding.settled_status(row)
+    # success / no_signal / skipped are all SUCCESSFUL JOBS — the task ran and returned. What
+    # differs is what it found, which `match_th` and `skipped` below carry. Only `failed` means
+    # the job itself raised; anything else is still in flight.
+    state = (CeleryJobState.FAILURE if settled == CalibrationStatus.failed
+            else CeleryJobState.SUCCESS if settled in (CalibrationStatus.success,
+                                                        CalibrationStatus.no_signal,
+                                                        CalibrationStatus.skipped)
+            else CeleryJobState.STARTED)
+    return GroundingCalibrationStatus(
+        state=state, run_id=str(row.RunID), match_th=row.MatchTh, quality=row.Quality,
+        skipped="already_calibrated" if settled == CalibrationStatus.skipped else None,
+        negatives=row.NegativesCount, positives=row.PositivesCount,
+        highest_negative=row.HighestNegative, lowest_positive=row.LowestPositive,
+        near_duplicates=json.loads(row.NearDuplicatesJSON) if row.NearDuplicatesJSON else [],
+        embedding_model=row.EmbeddingModel, reranker_model=row.RerankerModel,
+        error=grounding.settled_error(row))
+
+
+@grounding_router.get("/calibrate/events/{job_id}",
+            responses={200: {"content": {"text/event-stream": {}}}} | UNAVAILABLE_RESPONSES)
+async def calibration_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
+    """SSE stream for one calibration sweep: a state snapshot on connect, then the worker's live
+    `grounding_job_update` hints — STARTED, then phase/done/total ticks as the negatives and
+    positives passes progress, then the terminal result.
+
+    Worth streaming rather than polling precisely because a sweep runs for MINUTES: the progress
+    ticks are the only way to tell "still measuring" from "wedged". Same hint-layer contract as
+    every other admin job stream — get_calibration_status stays the durable truth."""
+    return await admin_job_event_stream(
+        job_id, FAMILY_GROUNDING, grounding_job_channel_key, str(SSEEventType.grounding_job_update))

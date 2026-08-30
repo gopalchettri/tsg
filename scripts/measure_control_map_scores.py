@@ -116,7 +116,7 @@ def _queries_from_db(sess, limit: int) -> list[tuple[str, str]]:
     # mismatch this script exists to catch.
     out_t, st_t, it_t = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
     rows = sess.execute(
-        select(out_t.OutputID, out_t.ScenarioJSON,
+        select(out_t.ScenarioID, out_t.ScenarioJSON,
             it_t.ThreatName, it_t.ThreatType, it_t.LibraryThreatName, it_t.LibraryThreatType)
         .select_from(out_t.__table__
                     .outerjoin(st_t, out_t.ScopedThreatID == st_t.ScopedThreatID)
@@ -128,11 +128,11 @@ def _queries_from_db(sess, limit: int) -> list[tuple[str, str]]:
         .limit(limit)
     ).all()
     out = []
-    for output_id, scenario_json, tname, ttype, ltname, lttype in rows:
+    for scenario_id, scenario_json, tname, ttype, ltname, lttype in rows:
         query = control_mapping.collect_control_query(scenario_json, ltname or tname,
                                                     lttype or ttype)
         if query:
-            out.append((str(output_id)[:8], query))
+            out.append((str(scenario_id)[:8], query))
     return out
 
 
@@ -148,7 +148,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=50,
                     help="scenarios/paragraphs to measure (default 50)")
     ap.add_argument("--text-file", help="one scenario paragraph per line, instead of DB scenarios")
-    ap.add_argument("--itot", choices=["IT", "OT"], help="narrow the library, as a real session would")
+    ap.add_argument("--itot", help="narrow the library to one ITOT label, as a real session "
+                    "would (checked against the live Control_Library vocabulary after connecting)")
     args = ap.parse_args()
 
     configure_logging()
@@ -156,7 +157,15 @@ def main() -> int:
     llm = get_llm()
 
     with db_session() as sess:
-        candidates = grounding.get_control_candidates(sess, args.itot)
+        itot_labels = None
+        if args.itot:
+            live_vocab = grounding.control_itot_vocabulary(sess)
+            if args.itot not in live_vocab:
+                print(f"FAIL  --itot {args.itot!r} is not a label the active Control_Library "
+                    f"carries today (live values: {sorted(live_vocab) or '(none)'}).")
+                return 2
+            itot_labels = [args.itot]
+        candidates = grounding.get_control_candidates(sess, itot_labels)
         if not candidates:
             print("FAIL  Control_Library returned no active rows — run Seed_to_Control_library.sql "
                 "first. Measuring against an empty library would 'prove' any threshold.")
@@ -175,7 +184,7 @@ def main() -> int:
         # Read the provenance rather than inferring it. The three origins collide numerically,
         # so "75.0" alone cannot tell a measurement from a default meant for another model pair.
         origin = "TSG_CONTROL_MAP_MIN_SCORE, operator-pinned" if explicit else {
-            "env_pinned": "TSG_GROUNDING_MATCH_THRESHOLD, operator-pinned",
+            "env_pinned": "TSG_GROUNDING_MATCH_THRESHOLD bootstrap (no calibration stored yet)",
             "calibrated": "auto-calibrated for THIS embedding+reranker pair",
             "static_default": ("the static Settings default - tuned for a DIFFERENT model pair, "
                             "and never measured for paragraph-vs-label. NOT evidence"),

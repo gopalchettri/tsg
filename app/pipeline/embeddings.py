@@ -16,13 +16,14 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-import uuid
 from collections.abc import Sequence
 from contextlib import contextmanager
 from functools import lru_cache
 from types import ModuleType
 from typing import Any
 
+from redis.exceptions import LockNotOwnedError
+from redis.lock import Lock
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -52,16 +53,54 @@ process_role = "api"
 _CONTROL_TEXT = m.Control_Library.ControlName + ": " + func.coalesce(m.Control_Library.ControlDescription, "")
 
 # group name -> (table, name column). Single source of truth — the admin API and
-# scripts/refresh_embeddings.py both use this instead of re-deriving it.
+# scripts/refresh_embeddings.py both use this instead of re-deriving it. Groups whose text is
+# COMPOSED across joins (threat_catalogue) carry a None column and are gathered by
+# _group_texts' special case instead — the composition function is shared with the query path
+# (catalogue_passage_text), so warm-cache text and query text can never drift apart (G10: the
+# pre-2026-08 catalogue group warmed bare names while retrieval embedded name+description, so
+# retrieval vectors were never pre-warmed; the shared composer removes that class).
 _GROUPS = {
     "threat_type": (m.Threat_Type, m.Threat_Type.ThreatTypeName),
-    "threat_catalogue": (m.Threat_Catalogue, m.Threat_Catalogue.ThreatName),
+    "threat_catalogue": (m.Threat_Catalogue, None),
     "control_library": (m.Control_Library, _CONTROL_TEXT),
     # Actor names for the nearest-match fallback (library-first actors): bare labels — the
     # table has no description column. Name-only vectors are weak alone, so the consumer
     # pairs them with the BM25 keyword leg via hybrid_search.hybrid_match.
     "threat_actor": (m.Threat_Actor, m.Threat_Actor.ThreatActorName),
 }
+
+
+def catalogue_passage_text(name, description, limit: int) -> str:
+    """THE passage text for one catalogue threat — name + description, truncated to the embed
+    limit. Single source shared by retrieval's corpus build, the admin CRUD's embed hook and
+    this module's warm/refresh path, BY CONSTRUCTION the same bytes (G10)."""
+    head = str(name or "").strip()
+    tail = str(description or "").strip()
+    text = head + (": " + tail if tail else "")
+    return text[:limit]
+
+
+def _catalogue_texts(sess: Session) -> list[str]:
+    """Composed passage texts for every RETRIEVABLE catalogue threat (live row, active type —
+    the same eligibility retrieval applies, so the warm set is exactly the query set)."""
+    limit = get_settings().max_embed_chars
+    tc, tt = m.Threat_Catalogue, m.Threat_Type
+    return [catalogue_passage_text(name, desc, limit)
+            for name, desc in sess.execute(
+                select(tc.ThreatName, tc.Description)
+                .select_from(tc.__table__.join(tt.__table__, tt.ThreatTypeID == tc.ThreatTypeID))
+                .where(tc.IsActive == True, tc.IsDeleted == False,
+                    tt.IsActive == True, tt.IsDeleted == False)
+                .order_by(tc.ThreatCatalogueID)).all()]
+
+
+def _group_texts(sess: Session, group: str) -> list[str]:
+    """The authoritative embeddable texts for one group — composed for threat_catalogue,
+    single-column via _active_names for everything else."""
+    if group == "threat_catalogue":
+        return _catalogue_texts(sess)
+    table, name_col = _GROUPS[group]
+    return _active_names(sess, table, name_col)
 
 
 class EmbeddingBusy(Exception):
@@ -303,7 +342,7 @@ def get_matrix(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: st
         return None
     mat = _np.asarray(rows, dtype=_np.float32)
     norms = _np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0  # zero-magnitude rows stay all-zero -> cosine 0, how_similar's convention
+    norms[norms == 0] = 1.0  # zero-magnitude rows stay all-zero -> cosine 0, hybrid_search.cosine's convention
     mat = mat / norms
     _MATRIX[key] = (digest, mat, row_indexes)
     return mat, row_indexes
@@ -369,49 +408,18 @@ def delete_cached(group: str, names: list[str] | None = None, *, strict: bool = 
     return col.delete_many(query).deleted_count
 
 
-def _thresholds_col():
-    """Sibling collection holding the per-model-pair grounding threshold. None when Mongo is
-    unavailable — callers degrade to the static default."""
-    col = _store_if_healthy()
-    if col is None:
-        return None
-    return col.database["grounding_thresholds"]
-
-
-def load_thresholds(model_pair: tuple[str, str]) -> float | None:
-    """Stored match_th for this (embedding_model, reranker_model) pair, or None if not
-    calibrated yet / Mongo unreachable.
-
-    An old doc (pre-migration) may carry `grounded_th`/`confirm_th` instead of `match_th` —
-    that reads as "not calibrated" and triggers one free re-calibration, never a KeyError.
-    """
-    try:
-        col = _thresholds_col()
-        if col is None:
-            return None
-        doc = col.find_one({"embedding_model": model_pair[0], "reranker_model": model_pair[1]})
-        raw = doc.get("match_th") if doc else None
-        return float(raw) if raw is not None else None
-    except Exception:
-        log.warning("embeddings.load_thresholds_failed", exc_info=True)
-        return None
-
-
-def store_thresholds(model_pair: tuple[str, str], match_th: float) -> None:
-    """Persist a calibration so every other worker (and every later boot) reuses it instead of
-    re-running the paraphrase+scoring pass. Upserts keyed on the model pair — two workers racing
-    the same calibration just write the same answer twice (cheap, no lock needed)."""
-    try:
-        col = _thresholds_col()
-        if col is None:
-            return
-        col.update_one(
-            {"embedding_model": model_pair[0], "reranker_model": model_pair[1]},
-            {"$set": {"match_th": match_th, "computed_at": now().isoformat()},
-            "$unset": {"grounded_th": "", "confirm_th": ""}},
-            upsert=True)
-    except Exception:
-        log.warning("embeddings.store_thresholds_failed", exc_info=True)
+# The grounding threshold NO LONGER LIVES HERE. `_thresholds_col`/`load_thresholds`/
+# `store_thresholds` used to keep it in a sibling `grounding_thresholds` collection; they are gone
+# and the collection is retired (see scripts/TSG_Migration_GroundingCalibration.sql). It is now a
+# column on Grounding_Calibration_Run, read by grounding.latest_successful_run.
+#
+# Not a preference — three real defects went with them. (1) store_thresholds was best-effort and
+# swallowed its own failures, so a finished 15-minute sweep could lose its answer to a Mongo blip
+# and leave only a log line. (2) The upsert filter had no unique index, so concurrent writes could
+# create duplicate docs and find_one would then return an arbitrary one. (3) _thresholds_col
+# reached Mongo VIA the embeddings handle, so a failure ensuring the `embeddings` index made the
+# threshold unreachable too — an unrelated cache problem silently downgrading every grounding
+# decision. The `embeddings` collection above is unaffected; only the threshold left Mongo.
 
 
 def _known_master_names(sess: Session | None, group: str, names: list[str]) -> set[str]:
@@ -421,8 +429,7 @@ def _known_master_names(sess: Session | None, group: str, names: list[str]) -> s
     """
     if sess is None or not names:
         return set()
-    table, name_col = _GROUPS[group]
-    resolved_pairs = _resolve_names(_active_names(sess, table, name_col), names)
+    resolved_pairs = _resolve_names(_group_texts(sess, group), names)
     # _resolve_names returns master spellings; fold to find which INPUT names matched
     unmatched_folded = {str(u).strip().lower() for u in resolved_pairs[1]}
     return {n for n in names if str(n).strip().lower() not in unmatched_folded}
@@ -493,7 +500,7 @@ def _active_names(sess: Session, table, name_col) -> list[str]:
     there, but scripts/Seed_to_Control_library.sql writes rows with direct INSERT and bypasses
     Pydantic entirely. This is the guard that covers every writer, whatever route it took.
 
-    Deliberately generic rather than control-specific: an over-long threat-catalogue name fails the
+    Deliberately generic rather than control-specific: an over-long threat-type name fails the
     same way, and this is the one gatherer every group already shares. Skipping costs that ONE row
     its vector (it drops out of the semantic leg; the keyword leg still finds it); NOT skipping
     costs the entire group.
@@ -515,16 +522,19 @@ def _active_names(sess: Session, table, name_col) -> list[str]:
                 limit=limit, skipped=len(oversized), samples=oversized[:3])
     return names
 
-def _renew_group_lock_loop(r, key: str, token: str, interval: float, ttl: int,
-                            stop_event: threading.Event) -> None:
+def _renew_group_lock_loop(lock: Lock, interval: float, stop_event: threading.Event) -> None:
     """Refreshes the group lock's TTL every `interval` seconds, so a slow embed call doesn't
     outlive the lock's fixed TTL and have it expire mid-operation. Same idea as llm.py's
     _heartbeat_loop.
+
+    Runs on a separate thread from the one that called lock.acquire() — thread_local=False on
+    the Lock (see _group_lock) is what lets this thread see the same ownership token.
     """
     while not stop_event.wait(interval):
         try:
-            if r.get(key) == token:  # only renew OUR OWN lock — never extend one a stale timeout
-                r.expire(key, ttl)  # already let a different caller acquire
+            lock.extend(lock.timeout, replace_ttl=True)  # reset to the full TTL, not additive
+        except LockNotOwnedError:  # a stale timeout already let a different caller acquire
+            pass
         except Exception:
             log.warning("embeddings.group_lock_renewal_failed", exc_info=True)
 
@@ -540,10 +550,11 @@ def _group_lock(group: str):
     """
     ttl = get_settings().embedding_group_lock_ttl_seconds  # must stay int — redis-py rejects a float for ex=/EXPIRE
     key = f"tsg:embed-lock:{group}"
-    token = str(uuid.uuid4())
     try:
-        r = _slot_redis()
-        acquired = r.set(key, token, nx=True, ex=ttl)
+        # thread_local=False: the heartbeat thread below must see the same ownership token the
+        # acquiring thread set, or every renewal tick raises LockNotOwnedError.
+        lock = Lock(_slot_redis(), key, timeout=ttl, thread_local=False)
+        acquired = lock.acquire(blocking=False)
     except Exception:
         log.warning("embeddings.group_lock_redis_unavailable_fail_open", group=group, exc_info=True)
         yield
@@ -553,19 +564,20 @@ def _group_lock(group: str):
     stop_event = threading.Event()
     # plain threading.Thread, not gevent.spawn — same portability reasoning as llm.py's _llm_slot
     hb_thread = threading.Thread(
-        target=_renew_group_lock_loop, args=(r, key, token, ttl / 3, ttl, stop_event),
+        target=_renew_group_lock_loop, args=(lock, ttl / 3, stop_event),
         daemon=True)
     hb_thread.start()
     try:
         yield
     finally:
         # stop the renewal thread before releasing — otherwise an in-flight renewal tick
-        # could re-extend a lock we just deleted
+        # could re-extend a lock we just released
         stop_event.set()
         hb_thread.join(timeout=ttl)
         try:
-            if r.get(key) == token:  # only release OUR OWN lock, never one a retry-after-TTL-expiry took
-                r.delete(key)
+            lock.release()
+        except LockNotOwnedError:  # already lost ownership to a stale-timeout retry
+            pass
         except Exception:  # best-effort release; the TTL is the backstop
             log.warning("embeddings.group_lock_release_failed", group=group, exc_info=True)
 
@@ -645,8 +657,7 @@ def create_items(sess: Session, llm: LLMClient, group: str, names: list[str]) ->
     embedding the operator's raw spelling would cache an orphan under a key grounding never
     looks up — a paid embed that reports SUCCESS for an item that's still effectively un-embedded.
     """
-    table, name_col = _GROUPS[group]
-    resolved, unmatched = _resolve_names(_active_names(sess, table, name_col), names)
+    resolved, unmatched = _resolve_names(_group_texts(sess, group), names)
     if unmatched:
         raise UnknownEmbeddingNames(
             f"no active {group} row matches name(s): {sorted(unmatched)} — nothing was embedded")
@@ -658,8 +669,7 @@ def create_items(sess: Session, llm: LLMClient, group: str, names: list[str]) ->
 def update_group(sess: Session, llm: LLMClient, group: str) -> int:
     """Whole-group sync: embed whatever's missing across every active row. Rows already
     cached (same model + text) are skipped by get_vectors itself — cheap, always safe."""
-    table, name_col = _GROUPS[group]
-    names = _active_names(sess, table, name_col)
+    names = _group_texts(sess, group)
     if names:
         get_vectors(llm, names, model_id=get_settings().embedding_model, group=group, kind="passage")
     return len(names)
@@ -669,8 +679,7 @@ def recreate_group(sess: Session, llm: LLMClient, group: str, names: list[str] |
     """Force a full re-embed — deletes cached vectors first (scoped to `names` if given, else
     the whole group), then re-embeds. Serialized per group (see _group_lock)."""
     with _group_lock(group):
-        table, name_col = _GROUPS[group]
-        active = _active_names(sess, table, name_col)
+        active = _group_texts(sess, group)
         if names is None:
             target_names = active
         else:
@@ -695,10 +704,10 @@ def delete_group(sess: Session, group: str, names: list[str] | None = None, *,
     row). A name with no vector is then checked against active master rows: already-clean
     succeeds with 0 deleted; a name matching nothing anywhere is a typo and fails loudly.
 
-    strict=False is for machine-derived names, where that typo check is wrong: library_crud.py
-    retires a vector when a row is renamed or soft-deleted, and by then the old text is no
-    longer an active master row — indistinguishable from a typo. A caller reading the name
-    straight off the row it just changed can't have mistyped it.
+    strict=False is for machine-derived names, where that typo check is wrong: a caller retiring
+    a vector for a row it just renamed or soft-deleted reads the old text straight off the row it
+    just changed, so it can't have mistyped it — even though that old text is no longer an active
+    master row by the time the delete runs, indistinguishable from a typo without this escape hatch.
     """
     with _group_lock(group):
         # delete_cached already resolves once against the collection it holds — a pre-check

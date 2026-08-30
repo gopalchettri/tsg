@@ -1,20 +1,18 @@
 -- ============================================================================
 -- TSG -- seed the ThreatLibrary from the functional team's ThreatLibrary.xlsx
--- (75 curated threats). Idempotent (guarded IF NOT EXISTS), safe to re-run.
+-- (75 curated threats + 346 category-map links + 140 type-actor links).
+-- Idempotent (guarded IF NOT EXISTS), safe to re-run.
 --
 -- Run order (all prerequisites, in sequence):
 --   1. TSG_Core.sql -- creates Threat_Category/
---      Threat_Type/Threat_Catalogue/Threat_Actor/ThreatType_ThreatActor_Map.
---   2. Threat_library.sql -- creates the Config_Threat_Rule table
+--   2. Threat_library.sql -- creates the master tables this script fills
 --      itself (TSG_Core.sql deliberately does not).
---   3. Threat_library.sql -- creates Threat_Catalogue_Category_Map
 --      and the Threat_Type/Threat_Catalogue.Source columns this script writes to.
 --   4. This script.
 --
 -- KNOWN GAP: 6 of 27 Threat Types mix IT and OT at the
--- individual-threat level (Config_Threat_Rule only scopes by ThreatTypeID, not
--- ThreatCatalogueID) -- no asset_type rule is emitted for these, to avoid wrongly
--- gating all their threats to one asset type: AI Abuse, Credential Abuse, Malware/Ransomware, Service Disruption, Social Engineering, Supply Chain Compromise
+-- individual-threat level -- these six families are instead DECLARED universal
+-- (validated per-asset by the Stage-1a LLM validator): AI Abuse, Credential Abuse, Malware/Ransomware, Service Disruption, Social Engineering, Supply Chain Compromise
 -- ============================================================================
 
 -- Threat_Type/Threat_Catalogue/Threat_Actor all have filtered UNIQUE indexes
@@ -29,7 +27,7 @@ SET QUOTED_IDENTIFIER ON;
 SET ANSI_NULLS ON;
 
 -- 1. Threat_Category (STRIDE, 6) -- ThreatCategoryID is NOT IDENTITY (TSG_Core.sql),
--- every INSERT must supply it explicitly, same convention as Config_Threat_Rule below.
+-- every INSERT must supply it explicitly.
 --
 -- ThreatCategoryID ORDER IS NOT MEANINGFUL. These ids were assigned ALPHABETICALLY, so
 -- Denial of Service holds 1 and Spoofing/Tampering hold 5/6 -- nothing to do with STRIDE
@@ -41,7 +39,6 @@ SET ANSI_NULLS ON;
 -- The application no longer depends on this order at all: app/core/stride.py owns the
 -- canonical sequence, dal.active_category_names sorts by it, and the category a threat is
 -- STORED with is the coverage slot it was selected to fill. The ids are left exactly as they
--- are on purpose -- they are FK targets in Threat_Type and Threat_Catalogue_Category_Map in
 -- already-deployed databases, and renumbering a primary key to encode an ordering the code
 -- must not read anyway would be risk without benefit. Every reference below resolves a
 -- category BY NAME for the same reason.
@@ -380,6 +377,7 @@ IF NOT EXISTS (SELECT 1 FROM Threat_Catalogue tc JOIN Threat_Type tt ON tc.Threa
 IF NOT EXISTS (SELECT 1 FROM Threat_Catalogue tc JOIN Threat_Type tt ON tc.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'AI Abuse' AND tc.ThreatName = N'AI-assisted OT decision or data manipulation' AND tc.SectorID IS NULL)
     INSERT INTO Threat_Catalogue (ThreatTypeID, ThreatName, Description, SectorID, IsActive, IsDeleted, Source)
     VALUES ((SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'AI Abuse' AND SectorID IS NULL), N'AI-assisted OT decision or data manipulation', N'Threat actors manipulate AI prompts, OT data pipelines, model inputs, AI assistant outputs or analytics recommendations used by operators, SOC teams or engineers. The attacker uses the AI workflow to hide signals, reveal sensitive OT data or influence operational decisions. [Precondition/Theme: Asset uses AI/analytics for OT decisions]', NULL, 1, 0, N'functional_team_excel');
+
 
 -- 4. Threat_Catalogue_Category_Map (per-threat STRIDE links)
 IF NOT EXISTS (SELECT 1 FROM Threat_Catalogue_Category_Map m JOIN Threat_Catalogue tc ON m.ThreatCatalogueID = tc.ThreatCatalogueID JOIN Threat_Type tt ON tc.ThreatTypeID = tt.ThreatTypeID JOIN Threat_Category cat ON m.ThreatCategoryID = cat.ThreatCategoryID WHERE tt.ThreatTypeName = N'Credential Abuse' AND tc.ThreatName = N'Credential phishing and MFA session theft' AND cat.ThreatCategoryName = N'Spoofing')
@@ -1795,6 +1793,7 @@ IF NOT EXISTS (SELECT 1 FROM Threat_Actor WHERE ThreatActorName = N'Supply Chain
 IF NOT EXISTS (SELECT 1 FROM Threat_Actor WHERE ThreatActorName = N'Physical Intruder/Saboteur')
     INSERT INTO Threat_Actor (ThreatActorName, IsCapable, IsActive, IsDeleted) VALUES (N'Physical Intruder/Saboteur', 1, 1, 0);
 
+
 -- 6. ThreatType_ThreatActor_Map (deduped type/actor pairs)
 IF NOT EXISTS (SELECT 1 FROM ThreatType_ThreatActor_Map m JOIN Threat_Type tt ON m.ThreatTypeID = tt.ThreatTypeID JOIN Threat_Actor ta ON m.ThreatActorID = ta.ThreatActorID WHERE tt.ThreatTypeName = N'Credential Abuse' AND tt.SectorID IS NULL AND ta.ThreatActorName = N'External attacker')
     INSERT INTO ThreatType_ThreatActor_Map (ThreatTypeID, ThreatActorID) VALUES (
@@ -2357,83 +2356,12 @@ IF NOT EXISTS (SELECT 1 FROM ThreatType_ThreatActor_Map m JOIN Threat_Type tt ON
         (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Engineering Workstation Compromise' AND SectorID IS NULL),
         (SELECT ThreatActorID FROM Threat_Actor WHERE ThreatActorName = N'Physical Intruder/Saboteur'));
 
--- 7. Config_Threat_Rule (asset_type gate) -- only for the 21 asset-type-PURE Threat Types
--- Skipped (mixed IT/OT, see header): AI Abuse, Credential Abuse, Malware/Ransomware, Service Disruption, Social Engineering, Supply Chain Compromise
--- ThreatRuleID is IDENTITY(22,1) since the auto-import feature (Threat_library.sql's
--- CREATE TABLE / migration 0027) -- these hand-curated rows keep their historical
--- explicit ids 1-21, which now requires IDENTITY_INSERT for the duration of this
--- section. Threat_library.sql is a hard prerequisite for this table's existence
--- (nothing else creates it) but is schema-only (its own former 12-row legacy seed
--- was removed -- see that script's header for why), so this section is the table's
--- only hand-seeded data; auto-written rows (CreatedBy LIKE 'auto:%') start at 22.
-SET IDENTITY_INSERT Config_Threat_Rule ON;
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Cloud/IIoT Abuse' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (1, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Cloud/IIoT Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Cloud/SaaS Abuse' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (2, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Cloud/SaaS Abuse' AND SectorID IS NULL), N'asset_type', N'Information Technology (IT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Data Theft/Tampering' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (3, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Data Theft/Tampering' AND SectorID IS NULL), N'asset_type', N'Information Technology (IT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Data/Telemetry Abuse' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (4, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Data/Telemetry Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Detection Evasion' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (5, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Detection Evasion' AND SectorID IS NULL), N'asset_type', N'Information Technology (IT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Engineering Access Abuse' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (6, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Engineering Access Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Engineering Workstation Compromise' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (7, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Engineering Workstation Compromise' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Field Asset Manipulation' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (8, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Field Asset Manipulation' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'HMI/SCADA Manipulation' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (9, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'HMI/SCADA Manipulation' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Logic/Configuration Manipulation' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (10, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Logic/Configuration Manipulation' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Monitoring Evasion' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (11, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Monitoring Evasion' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'OT Network Intrusion' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (12, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'OT Network Intrusion' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'OT Service Exploitation' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (13, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'OT Service Exploitation' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Physical/Portable Media Compromise' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (14, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Physical/Portable Media Compromise' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Protocol/Command Abuse' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (15, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Protocol/Command Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Recovery Disruption' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (16, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Recovery Disruption' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Remote Access Abuse' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (17, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Remote Access Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Safety System Abuse' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (18, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Safety System Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Trust/Crypto Abuse' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (19, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Trust/Crypto Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Web/API Exploitation' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (20, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Web/API Exploitation' AND SectorID IS NULL), N'asset_type', N'Information Technology (IT)', 1, 0);
-IF NOT EXISTS (SELECT 1 FROM Config_Threat_Rule r JOIN Threat_Type tt ON r.ThreatTypeID = tt.ThreatTypeID WHERE tt.ThreatTypeName = N'Wireless/Comms Abuse' AND r.RuleKey = N'asset_type')
-    INSERT INTO Config_Threat_Rule (ThreatRuleID, RuleType, ThreatTypeID, RuleKey, RuleValue, IsActive, IsDeleted)
-    VALUES (21, N'tech_gate', (SELECT ThreatTypeID FROM Threat_Type WHERE ThreatTypeName = N'Wireless/Comms Abuse' AND SectorID IS NULL), N'asset_type', N'Operational Technology (OT)', 1, 0);
-SET IDENTITY_INSERT Config_Threat_Rule OFF;
+-- 7. (Removed 2026-08.) The universal-families concept left with the retrieval cap
+-- (threat_retrieval_top_k): no deployment ever enabled the cap, so no exemption tier is
+-- needed -- EVERY sector-visible candidate reaches the LLM validator, which decides
+-- relevance. Cost control when the library outgrows validate-everything is a reranker.
 
 -- Verify
 SELECT (SELECT COUNT(*) FROM Threat_Category) AS categories, (SELECT COUNT(*) FROM Threat_Type WHERE Source = N'functional_team_excel') AS types,
        (SELECT COUNT(*) FROM Threat_Catalogue WHERE Source = N'functional_team_excel') AS catalogue_entries, (SELECT COUNT(*) FROM Threat_Actor) AS actors,
-       (SELECT COUNT(*) FROM Threat_Catalogue_Category_Map) AS category_links, (SELECT COUNT(*) FROM ThreatType_ThreatActor_Map) AS actor_links,
-       (SELECT COUNT(*) FROM Config_Threat_Rule WHERE RuleKey = N'asset_type') AS asset_type_rules;
+       (SELECT COUNT(*) FROM Threat_Catalogue_Category_Map) AS category_links, (SELECT COUNT(*) FROM ThreatType_ThreatActor_Map) AS actor_links;

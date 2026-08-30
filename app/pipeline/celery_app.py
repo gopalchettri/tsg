@@ -17,7 +17,7 @@ import sys
 import time
 
 import structlog
-from celery import Celery, current_task  # type: ignore[import-untyped]
+from celery import Celery  # type: ignore[import-untyped]
 from celery.signals import (  # type: ignore[import-untyped]
     task_postrun,
     task_prerun,
@@ -25,16 +25,26 @@ from celery.signals import (  # type: ignore[import-untyped]
     worker_process_init,
 )
 
-from app.api.admin_jobs import emb_job_channel_key, import_job_channel_key, intel_job_channel_key
+from app.api.admin_jobs import (
+    emb_job_channel_key,
+    grounding_job_channel_key,
+    intel_job_channel_key,
+)
 from app.core.config import get_settings
-from app.core.enums import CeleryJobState, RegenGranularity, SSEEventType
+from app.core.enums import (
+    CeleryJobState,
+    RegenGranularity,
+    SSEEventType,
+    StageStatus,
+    TreatmentOutcomeReason,
+)
 from app.core.logging import configure_logging
 from app.db import dal
 from app.db.dal import guid
 from app.db.engine import db_session
-from app.pipeline import cascade, embeddings, treatment
+from app.pipeline import cascade, embeddings, grounding, treatment
 from app.pipeline.llm import LLMSlotUnavailable, get_llm
-from app.pipeline.reaper import clean_up_abandoned_sessions, retry_failed_promotions
+from app.pipeline.reaper import clean_up_abandoned_sessions
 from app.pipeline.selfcheck import run_self_checks
 from app.pipeline.tasks import _process_all_supporting_systems
 from app.sse import bus
@@ -97,8 +107,6 @@ celery_app.conf.update(
     task_time_limit=3600,
     beat_schedule={                    # the reaper must run on a schedule in production
         "reap-stuck-sessions": {"task": "tsg.reap", "schedule": _s.reaper_interval_seconds},
-        "retry-failed-promotions": {"task": "tsg.retry_promotions",
-                                    "schedule": _s.promotion_retry_interval_seconds},
         # THE consumer of the control-mapping retry queue — without it, map_controls' three
         # "leave it for the next run" paths have no next run. See cascade.run_control_map_sweep.
         "map-controls-sweep": {"task": "tsg.map_controls_sweep",
@@ -192,27 +200,160 @@ def _init_worker(sender=None, **_):
                 pass
         os._exit(1)
     log_litellm_key_info()             # observability only, never raises
-    # Warm the per-model-pair grounding thresholds OUTSIDE any stage lease: the first resolution
-    # for a new embedding+reranker pair auto-calibrates (a bounded paraphrase+scoring pass), which
-    # at boot is a one-time deploy cost but inside find_threats would burn lease time.
-    # allow_calibration=True ONLY here, so the expensive pass can never run in a leased stage.
-    # Best-effort: on failure workers resolve lazily later, at worst on the static defaults.
+    # Report the grounding threshold — READ-ONLY, and it queues NOTHING.
+    #
+    # This used to CALIBRATE here, and it was the single worst thing on the boot path. Every
+    # receiver of `worker_init` runs BEFORE the consumer blueprint connects, so the worker is
+    # invisible to `inspect ping` for the whole of it. Measured on this checkout: the sweep took
+    # a rock-steady ~106s on top of a 9-94s model load, against start.ps1's 180s readiness
+    # budget — a warm boot squeaked in at ~115s, a cold one missed at ~213s. Worse, the sweep
+    # ABORTED every time (one near-duplicate library pair vetoed the old hard margin) and stored
+    # nothing, so the next boot paid the same ~106s for the same nothing, forever.
+    #
+    # Boot cannot re-acquire that behaviour by accident: resolve_thresholds has no calibrate
+    # switch left to set. Calibration is an explicit admin action
+    # (POST /v1/tsg/grounding/calibrate) — a sweep costs 10-15 minutes and ~100 billed LLM calls,
+    # which is not something a process restart should be able to trigger on its own.
+    #
+    # An uncalibrated pair is announced, loudly, and then served on the static default:
+    # resolve_thresholds deliberately does not memoize that fallback, so the moment an admin
+    # calibrates, this worker picks the real value up on its next resolve with no restart.
+    from app.core.logging import get_logger
     from app.pipeline.grounding import resolve_thresholds
-    for attempt in range(verify_max_attempts):
-        try:
-            with db_session() as sess:
-                resolve_thresholds(sess, get_llm(), allow_calibration=True)
-            break
-        except LLMSlotUnavailable:
-            if attempt == verify_max_attempts - 1:
-                from app.core.logging import get_logger
-                get_logger(__name__).warning("grounding.threshold_warmup_slots_exhausted")
-                break
-            time.sleep(verify_backoff * (attempt + 1))
-        except Exception:  # noqa: BLE001 — warm-up only; never blocks worker boot
-            from app.core.logging import get_logger
-            get_logger(__name__).warning("grounding.threshold_warmup_failed", exc_info=True)
-            break
+    try:
+        with db_session() as sess:
+            th = resolve_thresholds(sess, get_llm())
+        if th.origin == "static_default":
+            get_logger(__name__).warning(
+                "grounding.threshold_uncalibrated", match_th=th.value,
+                embedding_model=_s.embedding_model, reranker_model=_s.reranker_model,
+                note="NO calibration stored for this embedding+reranker pair. Grounding will use "
+                    "the static default, which was tuned for a DIFFERENT pair and may "
+                    "misclassify. Run POST /v1/tsg/grounding/calibrate when ready — this worker "
+                    "picks the result up automatically, no restart needed.")
+        else:
+            get_logger(__name__).info("grounding.threshold_resolved", match_th=th.value,
+                                    origin=th.origin)
+    except Exception:  # noqa: BLE001 — advisory only; the pipeline resolves lazily either way
+        get_logger(__name__).warning("grounding.threshold_read_failed", exc_info=True)
+
+
+def _publish_grounding_job_event(job_id: str | None, state: CeleryJobState, **fields) -> None:
+    """Best-effort SSE hint for admin.py::calibration_events subscribers — same contract as
+    _publish_emb_job_event: bus.publish's breaker applies, the endpoint's AsyncResult backstop
+    covers a lost publish, and no job id (a synchronous call in tests) is a no-op."""
+    if not job_id:
+        return
+    bus.publish(grounding_job_channel_key(job_id),
+                {"type": str(SSEEventType.grounding_job_update), "job_id": job_id,
+                "state": str(state), **fields})
+
+
+# max_retries bounded for the same reason as admin_embedding_action_task: a permanent slot
+# exhaustion must not retry a MULTI-MINUTE sweep forever. Reuses that cap rather than inventing
+# a second knob for the identical failure mode.
+@celery_app.task(bind=True, name="tsg.calibrate_grounding",
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True,
+                max_retries=_s.admin_embedding_max_retries)
+def calibrate_grounding_task(self, force: bool = False, started_by: str | None = None,
+                            client_id: str | None = None, run_id: str | None = None) -> dict:
+    """Measure the grounding match threshold for the CURRENT embedding+reranker pair and record
+    the run. NEVER queued automatically — the only trigger is POST /v1/tsg/grounding/calibrate.
+
+    `run_id` is the ledger row the ROUTE already opened. The route opens it, not this task,
+    because that INSERT is what the filtered unique index arbitrates: opening it here would put
+    the guard behind the broker, where a duplicate request has already been accepted with a 202
+    and there is nobody left to answer 409. Called without one (a direct `.delay()`, or a test),
+    the task opens its own.
+
+    `started_by`/`client_id` are the acting identity carried over the broker — the only reason
+    the caller survives the hop into the worker. `started_by` is claimed (an unverified header);
+    `client_id` is the authenticated API client. Both are recorded, neither is conflated.
+
+    `force=True` re-measures even though this pair already has a successful run — the way to
+    refresh a calibration after curating the library. Without it an already-calibrated pair is a
+    no-op, because a sweep costs 10-15 minutes and ~100 billed LLM calls.
+
+    A run that finds no signal is a task SUCCESS with match_th=null, recorded as `no_signal`: it
+    measured correctly and the answer is "this model pair cannot separate them". That is a
+    finding about the models, not a task failure, and conflating the two would send whoever reads
+    it to the wrong place."""
+    job_id = self.request.id
+    _publish_grounding_job_event(job_id, CeleryJobState.STARTED, force=force, run_id=run_id)
+    s = get_settings()
+    key = (s.embedding_model, s.reranker_model)
+
+    if not force:
+        with db_session() as sess:
+            existing = grounding.latest_successful_run(sess, key)
+        if existing is not None:
+            out = {"match_th": existing, "quality": None, "run_id": run_id,
+                "embedding_model": key[0], "reranker_model": key[1],
+                "skipped": "already_calibrated"}
+            # Close the row the route opened — otherwise a skipped run sits `running` until the
+            # stale window expires and blocks the next real calibration behind the unique index.
+            # Recorded as `skipped`, NOT success: nothing was measured here. Writing a success row
+            # (with a fabricated quality=0.0 and zero counts, as this once did) would put a
+            # calibration that never happened into the audit trail — the exact falsehood the
+            # ledger exists to prevent — and would read as a sweep that separated nothing.
+            if run_id:
+                grounding.record_calibration_finished(run_id, skipped=existing)
+            _publish_grounding_job_event(job_id, CeleryJobState.SUCCESS, **out)
+            return out
+
+    if run_id is None:  # direct .delay() or a test — see the docstring
+        run_id = grounding.record_calibration_started(
+            key, job_id=job_id, started_by=started_by, started_by_client=client_id, forced=force)
+
+    def _tick(phase: str, done: int, total: int) -> None:
+        # One publish per sample would be hundreds of events on a multi-minute job; ~5% steps
+        # keep the stream readable. The terminal event below is the load-bearing one.
+        if total and (done == total or done % max(1, total // 20) == 0):
+            _publish_grounding_job_event(job_id, CeleryJobState.STARTED,
+                                        phase=phase, done=done, total=total, run_id=run_id)
+
+    try:
+        with db_session() as sess:
+            result = grounding.calibrate(sess, get_llm(), s, progress=_tick)
+    except BaseException as exc:
+        # DO NOT close the row while a retry is still coming. Celery's autoretry wrapper sits
+        # OUTSIDE this function and re-runs the SAME task id with the SAME argv — so `run_id` is
+        # already set on the next attempt, `if run_id is None` above is False, and NO new
+        # `running` row is opened. Closing here would therefore leave
+        # UX_GroundingCalibration_Running with nothing to arbitrate for the whole retry: a
+        # concurrent POST /calibrate would INSERT cleanly, answer 202 instead of 409, and a second
+        # 10-15 minute ~100-billed-call sweep would run beside this one. Worse, this run's
+        # eventual success UPDATEs by RunID with no status predicate and would flip the recorded
+        # `failed` back to `success`, erasing the failure from the audit trail.
+        #
+        # LLMSlotUnavailable is an ORDINARY outcome here (a sweep issues ~100 billed chat calls),
+        # so this is the common path, not a corner. Leave the row `running` while attempts remain
+        # — settle_abandoned_runs' stale window still covers a genuinely killed worker — and
+        # report RETRY, not a terminal FAILURE that would tear down SSE subscribers early. Only
+        # the exhausted attempt closes the row. Same discrimination intel_refresh_feed_task uses.
+        if isinstance(exc, LLMSlotUnavailable) and self.request.retries < self.max_retries:
+            _publish_grounding_job_event(job_id, CeleryJobState.RETRY, run_id=run_id)
+            raise
+        grounding.record_calibration_finished(run_id, error=repr(exc))
+        _publish_grounding_job_event(job_id, CeleryJobState.FAILURE, run_id=run_id,
+                                    error=repr(exc))
+        raise
+
+    # ONE write: the measured value is a column of the record of the measurement, so there is no
+    # "measured but not saved" window — and record_calibration_finished RAISES rather than
+    # swallowing when the status is success, so a lost write fails the task instead of reporting
+    # a number nobody stored. Storing the value separately is what previously let a finished
+    # 15-minute sweep lose its answer to a Mongo blip and leave only a log line.
+    grounding.record_calibration_finished(run_id, result=result)
+    # No memo to invalidate: resolve_thresholds reads the ledger on every resolve, precisely so a
+    # re-calibration reaches OTHER worker processes too — which popping a local dict never could.
+
+    out = {**result._asdict(), "run_id": run_id,
+        "embedding_model": key[0], "reranker_model": key[1]}
+    from app.core.logging import get_logger
+    get_logger(__name__).warning("grounding.calibration_complete", job_id=job_id, **out)
+    _publish_grounding_job_event(job_id, CeleryJobState.SUCCESS, **out)
+    return out
 
 
 @task_prerun.connect
@@ -286,15 +427,40 @@ def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_
                             get_llm(), self.request.id or guid())
 
 
+# max_retries BOUNDED (and shared with the other slot-shortage tasks, same as
+# calibrate_grounding_task): unlike run_pipeline/next_set/regenerate above, a plan row has NO
+# AttemptCount column, so `max_retries=None` here had no ceiling at all — PlanID fences DUPLICATES,
+# it does not count attempts. A sustained provider 429 retried forever and pinned the row RUNNING.
 @celery_app.task(bind=True, name="tsg.generate_treatment_plan",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
+                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True,
+                max_retries=_s.admin_embedding_max_retries)
 def generate_treatment_plan_task(self, plan_id: str) -> None:
     """One Risk Treatment Plan attempt (docs/RISK_TREATMENT_PLAN_SDD.md §6.2); queued after the
     RUNNING row is committed. A retry (same task id) resumes via claim_plan's own-task branch, so
     a slot-exhausted attempt never wedges the row. No epoch — plan rows are never reused
-    (regenerate = supersede + new row), so PlanID itself is the fence."""
-    with db_session() as sess:
-        treatment.run_treatment_generation(sess, plan_id, get_llm(), self.request.id or guid())
+    (regenerate = supersede + new row), so PlanID itself is the fence.
+
+    The EXHAUSTED attempt parks the row terminally. Bounding the retries alone would only trade
+    "retries forever" for "stuck in RUNNING forever, silently" — worse, because the retry traffic
+    that would make someone look disappears. Same discrimination as calibrate_grounding_task:
+    re-raise while attempts remain, close the row on the last one."""
+    task_id = self.request.id or guid()  # ONE value: finish_plan's CAS is fenced on ActiveTaskID,
+    #                                      which claim_plan committed under this exact id
+    try:
+        with db_session() as sess:
+            treatment.run_treatment_generation(sess, plan_id, get_llm(), task_id)
+    except LLMSlotUnavailable:
+        if self.request.retries < self.max_retries:
+            raise  # attempts remain — autoretry_for backs off and re-runs
+        with db_session() as sess:
+            dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=task_id,
+                            error_message="the AI service stayed busy for every attempt — "
+                                        "regenerate the plan (POST .../treatment-plan/regenerate)",
+                            error_reason=TreatmentOutcomeReason.timed_out)
+        from app.core.logging import get_logger  # module idiom: no module-level logger here
+        get_logger(__name__).error("treatment.slot_retries_exhausted", plan_id=plan_id,
+                                retries=self.request.retries, exc_info=True)
+        raise
 
 
 def _publish_emb_job_event(job_id: str | None, state: CeleryJobState, **fields) -> None:
@@ -346,9 +512,12 @@ def admin_embedding_action_task(self, action: str, group: str | None, names: lis
 
     try:
         if action == "delete":
-            # `strict` stays ON for the admin route (a typed name CAN be a typo) and is turned OFF by
-            # library_crud.py, whose names come from a row it just renamed or soft-deleted — no longer
-            # ACTIVE, so strict made every such edit report FAILURE for a delete with nothing to do.
+            # `strict` ON means "a name that matched nothing is an error" — right for the admin
+            # route, where a typed name CAN be a typo. It is now always ON in practice: the one
+            # caller that passed it OFF was the library CRUD API (deleted), which fed in names
+            # from a row it had just renamed or soft-deleted, so strict reported FAILURE for a
+            # delete that had nothing left to do. Kept as a parameter because this task is
+            # reachable outside the route (Flower, tests) — see the create branch below.
             with db_session() as sess:
                 out = {"vectors_deleted": embeddings._for_each_group(
                     group, lambda g: _done(g, embeddings.delete_group(sess, g, names, strict=strict)))}
@@ -391,14 +560,6 @@ def reap_task() -> list[str]:
     with db_session() as sess:
         return clean_up_abandoned_sessions(sess)
 
-
-@celery_app.task(name="tsg.retry_promotions")
-def retry_promotions_task() -> list[str]:
-    """Periodic library-promotion retry sweep; scheduled by `beat_schedule` above.
-    retry_failed_promotions() already logs what it retried (and no-ops, logging why, when
-    promotion_auto_retry_enabled is off)."""
-    with db_session() as sess:
-        return retry_failed_promotions(sess)
 
 
 @celery_app.task(name="tsg.map_controls_sweep")
@@ -490,77 +651,3 @@ def self_check_task() -> list[str]:
     scheduled by `beat_schedule` above. run_self_checks() already logs every check that fires."""
     with db_session() as sess:
         return run_self_checks(sess)
-
-
-def _publish_import_job_event(job_id: str | None, state: CeleryJobState, **fields) -> None:
-    """Best-effort SSE hint for threat_library_import.py::job_events subscribers — same
-    hint-layer contract as _publish_emb_job_event above (bus.publish's breaker applies, the
-    endpoint's own AsyncResult backstop covers a lost publish). No-op without a job id: the
-    task body is callable synchronously (tests) where no Celery request id exists."""
-    if not job_id:
-        return
-    bus.publish(import_job_channel_key(job_id),
-                {"type": str(SSEEventType.import_job_update), "job_id": job_id,
-                "state": str(state), **fields})
-
-
-@celery_app.task(name="tsg.import_threat_library")
-def import_threat_library_task(source: str, file_content: str | None, via_taxii: bool,
-                            max_actors: int, dry_run: bool, started_by: str | None = None) -> dict:
-    """Background counterpart to app/api/threat_library_import.py: runs the same run_import the
-    CLI script drives, then (real runs only) dispatches the embeddings refresh.
-
-    ORDERING IS LOAD-BEARING: the import commits inside its OWN db_session block first, and the
-    embeddings dispatch happens strictly after that block exits — otherwise the embeddings task's
-    fresh session reads a snapshot without the new rows. A SEPARATE job, so a late embeddings
-    failure can never roll back a successful import. No autoretry_for (no LLM calls); a
-    crash-redelivery is safe because every write path is a natural-key upsert.
-
-    ponytail: file_content rides the Redis broker as a plain (size-capped) string — move to a
-    shared blob store + a reference argument if much larger bundles are ever needed."""
-    from app.api.admin_jobs import FAMILY_EMBEDDINGS, mark_admin_job  # local import, mirrors admin-task style
-    from app.pipeline import threat_library_import
-
-    # ties the history row to the job the status route polls; None when called directly
-    job_id = getattr(getattr(current_task, "request", None), "id", None)
-    _publish_import_job_event(job_id, CeleryJobState.STARTED, source=source)
-    # started_by lands in Threat_Library_Import_Run.StartedBy AND CreatedBy on every row this run
-    # creates; run_import falls back to 'auto:<tag>' when there is no caller.
-    run_id = threat_library_import.record_import_started(source, dry_run=dry_run, job_id=job_id,
-                                                        started_by=started_by)
-    try:
-        with db_session() as sess:
-            stats = threat_library_import.run_import(
-                sess, source, file_content=file_content, via_taxii=via_taxii,
-                max_actors=max_actors, dry_run=dry_run, started_by=started_by)
-    except Exception as exc:
-        # Own transaction, outside the rolled-back import session: a failed import that left no
-        # trace is the case an operator most needs to see.
-        threat_library_import.record_import_finished(run_id, error=f"{type(exc).__name__}: {exc}")
-        _publish_import_job_event(job_id, CeleryJobState.FAILURE, source=source,
-                                error=f"{type(exc).__name__}: {exc}"[:500])
-        raise
-    threat_library_import.record_import_finished(run_id, stats=stats)
-    if not dry_run and source != "misp_actors":
-        # The import is ALREADY COMMITTED here, so a failed dispatch must not mark the job
-        # FAILURE — that reports an applied import as failed and invites a redundant re-run over
-        # a transient broker blip. Degrade instead: say the refresh still needs running.
-        try:
-            embed_job = admin_embedding_action_task.delay("update", None, None)
-            # Without the marker the returned id 404s on /embeddings/status — the marker is that
-            # route's authorization check.
-            mark_admin_job(embed_job.id, FAMILY_EMBEDDINGS)
-            stats["embeddings_job_id"] = embed_job.id
-        except Exception:  # noqa: BLE001 — the committed import is the job's real outcome
-            from app.core.logging import get_logger
-            get_logger(__name__).warning("threat_library_import.embeddings_dispatch_failed",
-                                        source=source, exc_info=True)
-            stats["embeddings_job_id"] = None
-            stats["warning"] = ((stats.get("warning", "") + " ") if stats.get("warning") else "") + (
-                "import committed, but the follow-up embeddings refresh could not be queued — "
-                "run POST /v1/tsg/threat-library/embeddings/update, or the new rows stay "
-                "unmatchable by grounding")
-    # stats already carries "source" (run_import sets it) — no source= kwarg here, or this
-    # collides as a duplicate keyword argument.
-    _publish_import_job_event(job_id, CeleryJobState.SUCCESS, **stats)
-    return stats

@@ -22,6 +22,7 @@ completion contract; see that function's docstring for the three outcomes that n
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -107,12 +108,12 @@ def _stale_cutoff(at: datetime | None = None) -> datetime:
 # the bug class that once shipped here as an accidental self-join. New statements MUST
 # follow this pattern and be added to the self-check list.
 # ---------------------------------------------------------------------------
-def _library_map_stmt(output_id: str):
+def _library_map_stmt(scenario_id: str):
     cmap, lib = m.Threat_Scenario_Control_Map, m.Control_Library
     return (
         select(cmap.MapRank, lib.ControlLibraryID, lib.ControlCode, lib.Domain, lib.ControlName)
         .join(lib, lib.ControlLibraryID == cmap.ControlLibraryID)
-        .where(cmap.OutputID == output_id,
+        .where(cmap.ScenarioID == scenario_id,
             lib.IsActive == True, lib.IsDeleted == False)
         .order_by(cmap.MapRank)
     )
@@ -129,12 +130,12 @@ def _standards_stmt(control_library_ids: list[int]):
     )
 
 
-def _library_controls(sess: Session, output_id: str) -> list[dict[str, Any]]:
+def _library_controls(sess: Session, scenario_id: str) -> list[dict[str, Any]]:
     """The scenario's Step-4 grounded Control_Library rows, as plain dicts. Same join shape as
     sessions._query_controls, deliberately re-issued here rather than imported — API→pipeline
     is the only allowed import direction, and pulling the session router in would drag the
     whole API layer into every worker."""
-    rows = sess.execute(_library_map_stmt(output_id)).mappings().all()
+    rows = sess.execute(_library_map_stmt(scenario_id)).mappings().all()
     std_names: dict[int, list[str]] = {}
     if rows:
         for cid, name in sess.execute(
@@ -160,9 +161,9 @@ def _loads(blob: str | None, default):
     return parsed if isinstance(parsed, type(default)) else default
 
 
-def regen_risk_input_from_snapshot(snapshot: dict[str, Any], user_note: str | None) -> dict[str, Any]:
+def regen_risk_input_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     """The regenerate route's register half: rebuild the `risk_input` dict from the ACTIVE plan's
-    frozen InputSnapshotJSON, so `/regenerate` needs only a user_note and build_treatment_input
+    frozen InputSnapshotJSON, so `/regenerate` needs no body at all and build_treatment_input
     stays the ONE snapshot recipe (fresh TSG-derived half every time — honors a restored scenario
     version).
 
@@ -170,13 +171,18 @@ def regen_risk_input_from_snapshot(snapshot: dict[str, Any], user_note: str | No
     `existing_controls` block MIXES register data with TSG-derived data (library_mapped/
     _count must be rebuilt fresh, never carried): `register_controls`,
     `applied_to_all_subsystems`, `applied_to_all_subsystems_justification`, the whole
-    `risk_assessment` block, and the echo-only `register` block. Carried values are already
-    clipped/redacted; build_treatment_input re-applies both, which is idempotent, so the stored
-    bytes survive the round trip. `reviewer_note` is NOT carried — the new note replaces it
-    (None → key absent → no note), which is the whole point of a steered regenerate."""
+    `risk_assessment` block INCLUDING its assessment window, and the echo-only `register` block.
+    Carried values are already clipped/redacted; build_treatment_input re-applies both, which is
+    idempotent, so the stored bytes survive the round trip."""
     controls = snapshot.get("existing_controls") or {}
     assessment = snapshot.get("risk_assessment") or {}
     register = snapshot.get("register") or {}
+    # [Fix] The window used to be dropped here entirely, so every regenerate silently discarded
+    # the deadline the original plan was written against. The STORED keys are timeline_* (a frozen
+    # record format, unchanged by the mitigation_* request rename — see _assessment_window), and
+    # what _assessment_window READS is mitigation_*, so this is a deliberate translation: it
+    # rebuilds the window for every row ever written, not just post-rename ones.
+    window = assessment.get("assessment_window") or {}
     return {
         "existing_controls": controls.get("register_controls") or [],
         "existing_controls_all_subsystems": controls.get("applied_to_all_subsystems"),
@@ -187,9 +193,10 @@ def regen_risk_input_from_snapshot(snapshot: dict[str, Any], user_note: str | No
         "final_risk_rating": assessment.get("final_risk_rating"),
         "risk_level": assessment.get("risk_level"),
         "impacted_business_division": assessment.get("impacted_business_division"),
+        "mitigation_start_date": window.get("timeline_start_date"),
+        "mitigation_end_date": window.get("timeline_end_date"),
         "risk_identification_date": register.get("risk_identification_date"),
         "risk_owner": register.get("risk_owner"),
-        "user_note": user_note,
     }
 
 
@@ -246,7 +253,7 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
     # deliberately DISTINCT — a hard lookup failure must never masquerade as an empty map.
     lookup_failed = False
     try:
-        library_mapped = _library_controls(sess, scenario_row["OutputID"])
+        library_mapped = _library_controls(sess, scenario_row["ScenarioID"])
     except Exception:
         sess.rollback()  # no uncommitted writes exist at this point in the POST
         log.warning("treatment.library_controls_read_failed", exc_info=True)
@@ -290,6 +297,10 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
             "final_risk_rating": risk_input.get("final_risk_rating"),
             "risk_level": risk_input.get("risk_level"),
             "impacted_business_division": redact(risk_input.get("impacted_business_division")),
+            # The window the ENTIRE assessment must complete within (request pair, validated
+            # both-or-neither). PROMPT-VISIBLE on purpose: the model must schedule inside it;
+            # _validate_plan then cross-checks the answer against total_days.
+            "assessment_window": _assessment_window(risk_input),
         },
         "treatment_strategy": str(TreatmentStrategy.mitigate),
         # Echo-only block — stripped from the prompt, injected into PlanJSON at finish.
@@ -300,17 +311,95 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
         },
         "warnings": warnings,
     }
-    # Regenerate-with-steering: the reviewer's note rides the PROMPT-VISIBLE snapshot (that is
-    # the whole point — the model must read it), redacted + capped like all body free text.
-    note = _clip(risk_input.get("user_note"))
-    if note:
-        snap["reviewer_note"] = note
     return snap
 
 
 # ---------------------------------------------------------------------------
 # Output validation + server-owned keys (worker)
 # ---------------------------------------------------------------------------
+def _as_date(v: Any):
+    """A `date` from a date, a datetime, or an ISO string — None if it is none of those.
+
+    [Fix] The request path hands ISO STRINGS here: api/treatment.py dumps the body with
+    mode="json", which serializes pydantic's `date` fields to "YYYY-MM-DD". The old code only
+    handled real date objects, so on the ONLY path that actually runs it computed no day count at
+    all (see _assessment_window). Normalizing every accepted shape HERE — rather than changing the
+    one caller's dump mode — is what stops a future caller reintroducing it by choosing a
+    different mode. datetime.fromisoformat (not date.fromisoformat) so a full ISO timestamp
+    parses too, and so no module-level `date` import shadows build_treatment_input's own local.
+    """
+    if isinstance(v, datetime):
+        return v.date()
+    if hasattr(v, "toordinal"):   # a real date; datetime is already handled above
+        return v
+    if isinstance(v, str):
+        try:
+            return datetime.fromisoformat(v).date()
+        except ValueError:
+            return None
+    return None
+
+
+def _assessment_window(risk_input: dict[str, Any]) -> dict[str, Any] | None:
+    """{timeline_start_date, timeline_end_date, total_days} from the request pair, or None.
+    total_days is computed server-side so the model reasons over one unambiguous number and
+    the post-generation check compares against the same one.
+
+    STORED KEY NAMES STAY timeline_* while the REQUEST fields are mitigation_*, deliberately: the
+    snapshot is a persisted record format — read back by regenerate and served verbatim by the
+    evidence endpoint — so renaming the request contract must not rewrite the shape of every row
+    already in the table. regen_risk_input_from_snapshot translates between the two.
+    """
+    raw_start = risk_input.get("mitigation_start_date")
+    raw_end = risk_input.get("mitigation_end_date")
+    if not raw_start or not raw_end:   # both-or-neither is enforced by the request model
+        return None
+    start, end = _as_date(raw_start), _as_date(raw_end)
+    if start is None or end is None:
+        # Both values were supplied but at least one will not parse — a corrupted snapshot, or a
+        # caller passing a shape _as_date does not know. Say so out loud: returning a silent None
+        # is precisely what hid the original bug, and it disables _window_violations for the whole
+        # plan rather than for one field.
+        log.warning("treatment.assessment_window_unparseable",
+                    start=repr(raw_start), end=repr(raw_end))
+        return None
+    return {"timeline_start_date": start.isoformat(), "timeline_end_date": end.isoformat(),
+            "total_days": (end - start).days}
+
+
+_DURATION_DAYS = re.compile(r"(\d+)\s*(day|week|month)", re.IGNORECASE)
+_DURATION_UNIT_DAYS = {"day": 1, "week": 7, "month": 30}
+
+
+def _window_violations(parsed: dict[str, Any], window: dict[str, Any] | None) -> list[str]:
+    """Advisory check that the plan fits the assessment window (Part 3 of the register spec):
+    every parsable relative duration — the overall mitigation_timeline and each action's
+    timeline — must fit within total_days. Flags, never blocks, same posture as the
+    vocabulary clamps: the reviewer sees exactly which line overran and by what."""
+    if not window or not window.get("total_days"):
+        return []
+    budget = int(window["total_days"])
+
+    def worst_days(text: str | None) -> int | None:
+        hits = [_DURATION_UNIT_DAYS[u.lower()] * int(n)
+                for n, u in _DURATION_DAYS.findall(str(text or ""))]
+        return max(hits) if hits else None
+
+    out: list[str] = []
+    overall = worst_days(parsed.get("mitigation_timeline"))
+    if overall is not None and overall > budget:
+        out.append(f"mitigation_timeline ({parsed.get('mitigation_timeline')!r}) exceeds the "
+                f"assessment window of {budget} days")
+    for i, act in enumerate(parsed.get("remediation_action_plan") or []):
+        if not isinstance(act, dict):
+            continue
+        d = worst_days(act.get("timeline"))
+        if d is not None and d > budget:
+            out.append(f"remediation_action_plan[{i}].timeline ({act.get('timeline')!r}) "
+                    f"exceeds the assessment window of {budget} days")
+    return out
+
+
 def _validate_plan(parsed: dict[str, Any]) -> list[str]:
     """Structural requirement + advisory vocabulary clamps (SDD §6.2 step 4). Both tables MUST
     be present — controls_to_be_implemented.controls (nested under the coverage verdict) and
@@ -379,8 +468,8 @@ def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any
     written back too, so the human-visible half is repaired as well.
     """
     by_code = {str(c["control_code"]).strip().casefold(): c
-               for c in ((snapshot.get("existing_controls") or {}).get("library_mapped") or [])
-               if isinstance(c, dict) and c.get("control_code") and c.get("control_library_id")}
+            for c in ((snapshot.get("existing_controls") or {}).get("library_mapped") or [])
+            if isinstance(c, dict) and c.get("control_code") and c.get("control_library_id")}
     cti = parsed.get("controls_to_be_implemented") or {}
     kept: list[dict] = []
     dropped: list[str] = []
@@ -401,7 +490,7 @@ def _resolve_control_library_ids(parsed: dict[str, Any], snapshot: dict[str, Any
     # occasional invented code is expected, but one that SHOULD have matched is a join-key loss.
     if dropped:
         log.info("treatment.control_code_unresolved_dropped", codes=dropped,
-                 known=sorted(c["control_code"] for c in by_code.values()))
+                known=sorted(c["control_code"] for c in by_code.values()))
 
 
 def _inject_reserved(parsed: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -429,7 +518,7 @@ def _narrative_text(parsed: dict[str, Any]) -> str:
     controls = (parsed.get("controls_to_be_implemented") or {}).get("controls") or []
     parts += [str(c.get("description") or "") for c in controls if isinstance(c, dict)]
     parts += [str(a.get("action") or "") for a in parsed.get("remediation_action_plan") or []
-              if isinstance(a, dict)]
+            if isinstance(a, dict)]
     return "\n".join(p for p in parts if p)
 
 
@@ -455,20 +544,20 @@ def _classify_failure(exc: Exception) -> tuple[TreatmentOutcomeReason, str]:
 
 
 def _plan_result_event(row, plan_id: str, status: StageStatus,
-                       reason: TreatmentOutcomeReason | None = None) -> dict:
+                    reason: TreatmentOutcomeReason | None = None) -> dict:
     """The advisory SSE payload for one finished plan. Split from the publish so the self-check
     can assert it against TreatmentPlanResultEvent without a bus or a DB. StrEnum members serialize
     as their value, so no str() conversion is needed here."""
     event = {"type": SSEEventType.treatment_plan_result,
-             "session_id": row["SessionID"], "output_id": row["OutputID"],
-             "plan_id": plan_id, "status": status, "ts": dal.now().isoformat()}
+            "session_id": row["SessionID"], "ScenarioID": row["ScenarioID"],
+            "plan_id": plan_id, "status": status, "ts": dal.now().isoformat()}
     if reason is not None:
         event["reason"] = reason
     return event
 
 
 def _publish_plan_result(row, plan_id: str, status: StageStatus,
-                         reason: TreatmentOutcomeReason | None = None) -> None:
+                        reason: TreatmentOutcomeReason | None = None) -> None:
     """Tell any open SSE stream this plan finished, so the UI refetches now instead of on its next
     poll. Three rules, each with a failure mode that is invisible until it bites:
 
@@ -523,8 +612,15 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
     # row at insert, so no Scenario_Session re-read is needed here. Scenario_Audit has no
     # UserID column (only ActorUserID, back-filled by audit_row), hence the narrower dict.
     audit_ident = {"SessionID": row["SessionID"], "TenantID": row["TenantID"],
-                   "EntityID": row["EntityID"], "UserID": row["UserID"]}
+                "EntityID": row["EntityID"], "UserID": row["UserID"]}
+    # ScenarioID included: without it these worker-written treatment_plan_outcome rows leave the
+    # indexed column NULL, stay OUTSIDE the filtered IX_ScenarioAudit_Output, and cannot say WHICH
+    # scenario they belong to — so the per-scenario trail had to fetch a whole session and discard
+    # the rest in Python. It is not an optimisation: a row that cannot name its subject is unusable
+    # in a timeline. The API-side writes were stamped already; these two were the gap.
     audit_cols = {k: audit_ident[k] for k in ("SessionID", "TenantID", "EntityID")}
+    audit_cols["ScenarioID"] = row["ScenarioID"]
+    audit_cols["PlanID"] = plan_id   # the plan dimension, same reason as ScenarioID
     try:
         snapshot = _loads(row["InputSnapshotJSON"], {})
         messages = prompts.treatment_prompt(snapshot)
@@ -539,25 +635,27 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
             subsystem_id=ASSET_UNIT_ID, stage="treatment_plan",
             correlation_id=plan_id,  # stamps the Prompt_Log receipt for the evidence API
             expected_type=dict, temperature=settings.treatment_temperature)
-        warnings = list(snapshot.get("warnings") or []) + _validate_plan(parsed)
+        warnings = (list(snapshot.get("warnings") or []) + _validate_plan(parsed)
+                    + _window_violations(parsed,
+                                        (snapshot.get("risk_assessment") or {}).get("assessment_window")))
         parsed = _inject_reserved(parsed, snapshot)
         moderation = llm_mod.moderate(_narrative_text(parsed))  # free function, NOT a client method
         validation_json = json.dumps({
             "warnings": warnings,
             "moderation": {"checked": moderation.checked, "flagged": moderation.flagged,
-                           "categories": moderation.categories, "error": moderation.error},
+                        "categories": moderation.categories, "error": moderation.error},
         })
         if not dal.finish_plan(sess, plan_id, status=StageStatus.COMPLETE, task_id=task_id,
-                               plan_json=json.dumps(parsed), validation_json=validation_json):
+                            plan_json=json.dumps(parsed), validation_json=validation_json):
             # Superseded mid-flight (a regenerate/version-switch took over) — drop the result; the new row owns
             # the scenario now. Prompt_Log still records the spend (committed in _ask_ai).
             sess.rollback()
             log.info("treatment.finish_dropped", plan_id=plan_id)
             return
         dal.append_audit(sess, AuditID=dal.guid(), **audit_cols,
-                         SubsystemID=ASSET_UNIT_ID,
-                         EventType=AuditEventType.treatment_plan_outcome,
-                         DetailJSON=json.dumps({"plan_id": plan_id,
+                        SubsystemID=ASSET_UNIT_ID,
+                        EventType=AuditEventType.treatment_plan_outcome,
+                        DetailJSON=json.dumps({"plan_id": plan_id,
                                                 "status": str(StageStatus.COMPLETE),
                                                 "warnings": len(warnings)}))
         sess.commit()
@@ -573,11 +671,11 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
         # finished the row, or a regenerate superseded it), writing an ERROR audit row would
         # contradict the plan's real state — drop it instead.
         if dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=task_id,
-                           error_message=client_msg, error_reason=reason):
+                        error_message=client_msg, error_reason=reason):
             dal.append_audit(sess, AuditID=dal.guid(), **audit_cols,
-                             SubsystemID=ASSET_UNIT_ID,
-                             EventType=AuditEventType.treatment_plan_outcome,
-                             DetailJSON=json.dumps({"plan_id": plan_id,
+                            SubsystemID=ASSET_UNIT_ID,
+                            EventType=AuditEventType.treatment_plan_outcome,
+                            DetailJSON=json.dumps({"plan_id": plan_id,
                                                     "status": str(StageStatus.ERROR),
                                                     "reason": str(reason),  # switchable in the audit feed too
                                                     "error": client_msg}))
@@ -594,7 +692,7 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     # and bad columns (CompileError) with no database — exactly the class of bug that once
     # shipped here as an accidental self-join. Every new statement builder MUST be added.
     for _stmt in (_library_map_stmt("00000000-0000-0000-0000-000000000000"),
-                  _standards_stmt([1])):
+                _standards_stmt([1])):
         _stmt.compile()
 
     # The advisory SSE payload must satisfy the model the API publishes to /openapi.json — the one
@@ -602,14 +700,14 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     from app.api.schemas import TreatmentPlanResultEvent
     _ev = _plan_result_event(
         {"SessionID": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
-         "OutputID": "1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90"},
+        "ScenarioID": "1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90"},
         "b9fe2c07-4d3a-4a51-8e2f-6c1d90a7e4b3", StageStatus.COMPLETE)
     assert TreatmentPlanResultEvent(**_ev).status == "COMPLETE"
     assert _ev["type"] == "treatment_plan_result"
     assert "reason" not in _ev, "COMPLETE carries no reason"
     _err = _plan_result_event(
         {"SessionID": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
-         "OutputID": "1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90"},
+        "ScenarioID": "1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90"},
         "b9fe2c07-4d3a-4a51-8e2f-6c1d90a7e4b3", StageStatus.ERROR,
         TreatmentOutcomeReason.cancelled)
     assert TreatmentPlanResultEvent(**_err).reason == "cancelled"
@@ -645,7 +743,7 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
         "controls_to_be_implemented": {
             "control_coverage": "covered",
             "controls": [{"control_type": "quantum", "control_name": "X", "description": "d",
-                         "priority": "Urgent"}]},
+                        "priority": "Urgent"}]},
         "remediation_action_plan": [
             {"action_id": "A1", "action": "a", "owner": "SOC", "priority": "High"}],
         "applicable_to_all_subsystems": "Maybe",
@@ -671,7 +769,7 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
         "title": "T", "action_plan": "AP", "mitigation_timeline": "90 days",
         "mitigation_owner": "SOC",
         "controls_to_be_implemented": {"control_coverage": "gaps",
-                                       "controls": [{"description": "install MFA"}]},
+                                    "controls": [{"description": "install MFA"}]},
         "remediation_action_plan": [{"action": "rotate keys"}]})
     assert {"T", "AP", "90 days", "install MFA", "rotate keys"} <= set(narrative.split("\n"))
     assert "SOC" not in narrative
@@ -682,15 +780,15 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     # is dropped, "MFA" resolves and gets its control_library_id stamped on. The drift-pin
     # assert makes adding a key to _RESERVED_PLAN_KEYS without teaching the injector fail here.
     ai_controls = [{"control_name": "MFA", "control_code": "CII-CID-028"},
-                   {"control_name": "Made-up control", "control_code": "NOT-REAL"}]
+                {"control_name": "Made-up control", "control_code": "NOT-REAL"}]
     injected = _inject_reserved(
         {"treatment_plan": "Avoid", "risk_owner": "Dr. Evil",
-         "controls_to_be_implemented": {"control_coverage": "gaps", "controls": ai_controls}},
+        "controls_to_be_implemented": {"control_coverage": "gaps", "controls": ai_controls}},
         {"register": {"risk_identification_date": "2026-06-14T08:31:00",
-                      "risk_owner": "Head of OT Operations",
-                      "impacted_business_division": "Water Treatment Operations"},
-         "existing_controls": {"library_mapped": [
-             {"control_library_id": 28, "control_code": "CII-CID-028"}]}})
+                    "risk_owner": "Head of OT Operations",
+                    "impacted_business_division": "Water Treatment Operations"},
+        "existing_controls": {"library_mapped": [
+            {"control_library_id": 28, "control_code": "CII-CID-028"}]}})
     assert injected["treatment_plan"] == "Mitigate"
     kept = injected["controls_to_be_implemented"]["controls"]
     assert [c["control_name"] for c in kept] == ["MFA"]  # unresolved control dropped

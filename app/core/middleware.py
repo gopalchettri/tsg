@@ -31,20 +31,22 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
     ponytail: Content-Length only — a chunked upload declares no length, so it still reaches the
     handler's own cap. Add a streaming byte-counter if chunked uploads ever become a real path."""
 
-    async def dispatch(self, request: Request, call_next):
-        from app.core.config import get_settings
+    # ponytail: fixed 16 MB. The configurable cap existed for the bulk importer's uploads;
+    # with the importer retired (2026-08) no route accepts large bodies, so this is a plain
+    # abuse ceiling — raise the constant if a legitimately large route ever appears.
+    MAX_BODY_BYTES = 16 * 1024 * 1024
 
+    async def dispatch(self, request: Request, call_next):
         declared = request.headers.get("content-length")
         if declared and declared.isdigit():
-            cap_bytes = get_settings().threat_library_import_max_upload_mb * 1024 * 1024
+            cap_bytes = self.MAX_BODY_BYTES
             if int(declared) > cap_bytes:
                 log.warning("http.body_too_large", path=request.url.path, declared=int(declared),
                             cap_bytes=cap_bytes)
                 return JSONResponse(
                     status_code=413,
                     content={"error_code": "payload_too_large",
-                            "message": f"request body exceeds the {cap_bytes} byte limit "
-                                        "(threat_library_import_max_upload_mb)"})
+                            "message": f"request body exceeds the {cap_bytes} byte limit"})
         return await call_next(request)
 
 
