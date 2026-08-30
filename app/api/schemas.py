@@ -2406,10 +2406,14 @@ class TreatmentPlanStatus(ApiModel):
         "scenario": {"threat_category": "Elevation of Privilege",
                      "threat_type": "Credential Abuse",
                      "threat_name": "Stolen RDP credentials",
-                     "threat_actors": ["Nation-state/APT", "Malicious insider"],
                      "scenario_title": "Ransomware via exposed RDP",
                      "scenario_statement": "A ransomware operator gains access through…",
                      "risk_statement": "Loss of treatment-plant availability…"},
+        # Adversaries are a SIBLING of `scenario`, never inside it — this example must keep
+        # showing that, since json_schema_extra is a separate expression that survives a field
+        # change and is exactly how a published example ends up contradicting its own schema.
+        "actors": [{"actor_id": 12, "actor_name": "Nation-state/APT"},
+                   {"actor_id": 31, "actor_name": "Malicious insider"}],
         "risk_level": "Critical", "review_status": None,
         # No 'Z' suffix on purpose: values round-trip as NAIVE datetimes (UTC by convention —
         # the body validator normalizes, datetime2 stores naive), so the wire has no offset.

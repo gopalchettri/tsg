@@ -112,7 +112,7 @@ footer{color:var(--ink-faint); font-size:12px; margin-top:40px; padding-top:16px
   <main>
     <h1>TSG API Testing Guidebook</h1>
     <p class="sub">Every route in the app: exact request body, complete response, tables touched, and a copy-pasteable
-    SQL query to verify the result yourself. Traced against the live source on 2026-08-30 — not recalled.</p>
+    SQL query to verify the result yourself. Request and response blocks are DERIVED from the running app's own OpenAPI spec (regenerated 2026-08-30), so a field rename in schemas.py reaches this page on the next run. Purpose, auth, SQL and notes are hand-written and carried forward.</p>
     <div class="vars">
       <div class="lbl2">Set once, reuse everywhere below</div>
       <pre>API_KEY="&lt;X-API-Key&gt;"   ADMIN_KEY="&lt;X-Admin-Key&gt;"
@@ -158,12 +158,17 @@ USER_ID="&lt;user id&gt;"     ENTITY_ID="78"      HOST="http://localhost:8000"</
   <div class="blk">
     <h3>Request</h3>
     <pre>{
-  &quot;entity_id&quot;: &quot;78&quot;,
-  &quot;service_id&quot;: 335,
-  &quot;sector_id&quot;: 95,
-  &quot;subsector_id&quot;: 111,
   &quot;asset_id&quot;: 103,
-  &quot;supporting_system_id&quot;: [321, 322, 323, 324]
+  &quot;entity_id&quot;: &quot;78&quot;,
+  &quot;sector_id&quot;: 95,
+  &quot;service_id&quot;: 335,
+  &quot;subsector_id&quot;: 111,
+  &quot;supporting_system_id&quot;: [
+    321,
+    322,
+    323,
+    324
+  ]
 }</pre>
   </div>
   <div class="blk">
@@ -198,23 +203,20 @@ USER_ID="&lt;user id&gt;"     ENTITY_ID="78"      HOST="http://localhost:8000"</
   <div class="blk">
     <h3>Response <span class="status">200 (404 if not found)</span></h3>
     <pre>{
-  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-  &quot;entity_id&quot;: &quot;78&quot;,
-  &quot;asset_id&quot;: 103,
+  &quot;asset_id&quot;: 12345,
   &quot;asset_name&quot;: &quot;SCADA Historian&quot;,
-  &quot;user_id&quot;: &quot;qa-user&quot;,
-  &quot;session_status&quot;: &quot;active&quot;,
   &quot;current_stage&quot;: &quot;SCENARIO_GENERATION&quot;,
-  &quot;stage_status&quot;: &quot;SCENARIOS_AWAITING_DECISION&quot;,
+  &quot;entity_id&quot;: &quot;ENT-001&quot;,
   &quot;progress&quot;: {
-    &quot;threats&quot;: &quot;COMPLETE&quot;,
-    &quot;scenarios&quot;: &quot;SCENARIOS_AWAITING_DECISION&quot;,
-    &quot;overall&quot;: &quot;awaiting_review&quot;,
     &quot;error_message&quot;: {},
-    &quot;last_next_set&quot;: {&quot;outcome&quot;: &quot;partial_retryable&quot;, &quot;requested&quot;: 5, &quot;delivered&quot;: 3, &quot;variants&quot;: 0, &quot;reason&quot;: null, &quot;epoch&quot;: 4},
-    &quot;last_regen&quot;: null,
-    &quot;coverage&quot;: {&quot;cells&quot;: 18, &quot;covered&quot;: 17, &quot;justified_na&quot;: 0, &quot;unexplained&quot;: 1, &quot;complete&quot;: false, &quot;units&quot;: [0, 41, 42], &quot;gaps&quot;: [{&quot;subsystem_id&quot;: 42, &quot;category&quot;: &quot;Tampering&quot;}]}
-  }
+    &quot;overall&quot;: &quot;awaiting_review&quot;,
+    &quot;scenarios&quot;: &quot;AWAITING_DECISION&quot;,
+    &quot;threats&quot;: &quot;COMPLETE&quot;
+  },
+  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
+  &quot;session_status&quot;: &quot;active&quot;,
+  &quot;stage_status&quot;: &quot;AWAITING_DECISION&quot;,
+  &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -269,31 +271,79 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   <div class="blk">
     <h3>Response <span class="status">200 (404 if not found)</span></h3>
     <pre>{
-  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-  &quot;entity_id&quot;: &quot;78&quot;,
-  &quot;asset_id&quot;: 103,
+  &quot;asset_id&quot;: 12345,
   &quot;asset_name&quot;: &quot;SCADA Historian&quot;,
-  &quot;user_id&quot;: &quot;qa-user&quot;,
-  &quot;progress&quot;: {&quot;threats&quot;: &quot;COMPLETE&quot;, &quot;scenarios&quot;: &quot;SCENARIOS_AWAITING_DECISION&quot;, &quot;overall&quot;: &quot;awaiting_review&quot;, &quot;error_message&quot;: {}, &quot;last_next_set&quot;: null, &quot;last_regen&quot;: null, &quot;coverage&quot;: {&quot;cells&quot;: 6, &quot;covered&quot;: 6, &quot;justified_na&quot;: 0, &quot;unexplained&quot;: 0, &quot;complete&quot;: true, &quot;units&quot;: [0], &quot;gaps&quot;: []}},
-  &quot;scenarios&quot;: [{
-    &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
-    &quot;scenario&quot;: {
-      &quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;,
-      &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;,
-      &quot;threat_actors&quot;: [&quot;Nation-state/APT&quot;, &quot;Malicious insider&quot;],
-      &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;,
-      &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
-      &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
-      &quot;controls&quot;: [{&quot;control_id&quot;: 201, &quot;control_code&quot;: &quot;CII-CID-201&quot;, &quot;domain&quot;: &quot;Identification &amp; Authentication&quot;, &quot;control_name&quot;: &quot;Multi-Factor Authentication&quot;, &quot;map_rank&quot;: 1, &quot;score&quot;: 93.0, &quot;standards&quot;: [{&quot;standard_id&quot;: 3, &quot;standard_name&quot;: &quot;NIST SP 800-53 Rev. 5&quot;}]}],
-      &quot;supporting_system_applicability&quot;: [{&quot;supporting_system&quot;: &quot;OT Telecom Network&quot;, &quot;applicable&quot;: true, &quot;justification&quot;: &quot;The firmware push travels over this network to reach the RTU.&quot;}]
-    },
-    &quot;threat&quot;: {&quot;threat_id&quot;: &quot;9c858901-8a57-4791-81fe-4c455b099bc9&quot;, &quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_category_id&quot;: 2, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;, &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;, &quot;description&quot;: &quot;Firmware integrity may be compromised via unsigned updates.&quot;, &quot;threat_type_id&quot;: 42, &quot;library_threat_type&quot;: &quot;Firmware Tampering&quot;, &quot;library_threat_name&quot;: null, &quot;grounding_status&quot;: &quot;verified&quot;, &quot;threat_catalogue_id&quot;: 187, &quot;is_ai_generated&quot;: false, &quot;actors&quot;: [{&quot;actor_id&quot;: 7, &quot;actor_name&quot;: &quot;Nation-state/APT&quot;}, {&quot;actor_id&quot;: 12, &quot;actor_name&quot;: &quot;Malicious insider&quot;}], &quot;grounding_score&quot;: 100.0, &quot;score&quot;: 70.0, &quot;scope_rank&quot;: 3},
-    &quot;accepted&quot;: false, &quot;accepted_by&quot;: null, &quot;accepted_at&quot;: null, &quot;rejected_by&quot;: null, &quot;rejected_at&quot;: null,
-    &quot;moderation_checked&quot;: false, &quot;moderation_flagged&quot;: null, &quot;moderation_categories&quot;: [],
-    &quot;validation_status&quot;: &quot;ok&quot;, &quot;validation_errors&quot;: [],
-    &quot;generation_epoch&quot;: 1, &quot;scenario_number&quot;: 1, &quot;scenario_source&quot;: &quot;generated&quot;,
-    &quot;controls_mapped&quot;: true, &quot;controls_unavailable&quot;: false, &quot;replaced_scenarios&quot;: []
-  }]
+  &quot;entity_id&quot;: &quot;ENT-001&quot;,
+  &quot;scenarios&quot;: [
+    {
+      &quot;accepted&quot;: false,
+      &quot;actors&quot;: [
+        {
+          &quot;actor_id&quot;: 12,
+          &quot;actor_name&quot;: &quot;Nation-state/APT&quot;
+        },
+        {
+          &quot;actor_id&quot;: 31,
+          &quot;actor_name&quot;: &quot;Malicious insider&quot;
+        }
+      ],
+      &quot;controls&quot;: [
+        {
+          &quot;control_code&quot;: &quot;CII-CID-201&quot;,
+          &quot;control_id&quot;: 201,
+          &quot;control_name&quot;: &quot;Multi-Factor Authentication&quot;,
+          &quot;domain&quot;: &quot;Identification &amp; Authentication&quot;,
+          &quot;map_rank&quot;: 1,
+          &quot;score&quot;: 93.0,
+          &quot;standards&quot;: [
+            {
+              &quot;standard_id&quot;: 3,
+              &quot;standard_name&quot;: &quot;NIST SP 800-53 Rev. 5&quot;
+            },
+            {
+              &quot;standard_id&quot;: 7,
+              &quot;standard_name&quot;: &quot;ISO 27001:2022&quot;
+            }
+          ]
+        }
+      ],
+      &quot;controls_mapped&quot;: true,
+      &quot;generation_epoch&quot;: 1,
+      &quot;moderation_categories&quot;: [],
+      &quot;moderation_checked&quot;: false,
+      &quot;replaced_scenarios&quot;: [],
+      &quot;scenario&quot;: {
+        &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
+        &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
+        &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;,
+        &quot;supporting_systems_involved&quot;: [
+          {
+            &quot;is_entry_point&quot;: true,
+            &quot;justification&quot;: &quot;The firmware push travels over this network to reach the RTU.&quot;,
+            &quot;supporting_system&quot;: &quot;OT Telecom Network&quot;,
+            &quot;supporting_system_id&quot;: 306
+          }
+        ],
+        &quot;threat_category&quot;: &quot;Tampering&quot;,
+        &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;,
+        &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;
+      },
+      &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
+      &quot;scenario_number&quot;: 1,
+      &quot;scenario_source&quot;: &quot;generated&quot;,
+      &quot;threat&quot;: {
+        &quot;grounding_score&quot;: 100.0,
+        &quot;grounding_status&quot;: &quot;verified&quot;,
+        &quot;scope_rank&quot;: 3,
+        &quot;score&quot;: 70.0,
+        &quot;threat_category&quot;: &quot;Tampering&quot;
+      },
+      &quot;validation_errors&quot;: [],
+      &quot;validation_status&quot;: &quot;ok&quot;
+    }
+  ],
+  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
+  &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -303,7 +353,7 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   <div class="tables"><span class="tbl">Threat_Scenario</span><span class="tbl">Scoped_Threat</span><span class="tbl">Identified_Threat</span><span class="tbl">Threat_Scenario_Control_Map</span><span class="tbl">Control_Library</span><span class="tbl">Control_Library_Standard_Map</span><span class="tbl">Control_Standard</span><span class="tbl">Threat_Actor</span><span class="tbl">Subsystem_Stage_State</span><span class="tbl">Scenario_Audit</span></div>
   <details class="notes">
     <summary>Implementation notes &amp; error cases</summary>
-    <p>scenario can be null (generation failed — a failure card) while threat is still populated, so a reviewer can see WHICH threat failed. controls_mapped=false with empty scenario.controls means Step-4 mapping hasn&#x27;t run yet or the control library was unseeded — NOT a library gap; controls_mapped=true with empty controls IS a genuine library-gap signal. controls_unavailable=true means the control-mapping read itself failed transiently (treat controls as unknown, retry) — a different fact from a genuine gap. include_replaced=true nests superseded versions newest-first inside replaced_scenarios; the ancestry walk is capped at 100 regeneration hops (truncates + logs beyond that, essentially never reached).</p>
+    <p>scenario can be null (generation failed — a failure card) while threat is still populated, so a reviewer can see WHICH threat failed. controls_mapped=false with empty controls means Step-4 mapping hasn&#x27;t run yet or the control library was unseeded — NOT a library gap; controls_mapped=true with empty controls IS a genuine library-gap signal. controls_unavailable=true means the control-mapping read itself failed transiently (treat controls as unknown, retry) — a different fact from a genuine gap. include_replaced=true nests superseded versions newest-first inside replaced_scenarios; the ancestry walk is capped at 100 regeneration hops (truncates + logs beyond that, essentially never reached).</p>
     <p class="errs"><span class="lbl">Errors</span> 404 if session_id unknown or wrong entity. No 409/422 — it&#x27;s a read-only poll endpoint; a mid-run call simply returns whatever scenarios exist so far (check progress.overall, not scenario count, for completeness).</p>
   </details>
 </article>
@@ -321,19 +371,63 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   <div class="blk">
     <h3>Response <span class="status">200 (404 if not found)</span></h3>
     <pre>{
-  &quot;asset_id&quot;: 103,
-  &quot;entity_id&quot;: &quot;78&quot;,
-  &quot;user_id&quot;: &quot;qa-user&quot;,
-  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
+  &quot;asset_id&quot;: 12345,
   &quot;completed_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;,
-  &quot;scenarios&quot;: [{
-    &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
-    &quot;accepted_by&quot;: &quot;qa-user&quot;, &quot;accepted_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;,
-    &quot;rejected_by&quot;: null, &quot;rejected_at&quot;: null, &quot;controls_unavailable&quot;: false,
-    &quot;subsystem_id&quot;: 0,
-    &quot;scenario&quot;: {&quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;, &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;, &quot;threat_actors&quot;: [&quot;Nation-state/APT&quot;], &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;, &quot;scenario_statement&quot;: &quot;An attacker pushes unsigned firmware to the RTU.&quot;, &quot;risk_statement&quot;: &quot;Corrupted firmware could cause a sustained outage.&quot;, &quot;controls&quot;: [], &quot;supporting_system_applicability&quot;: []},
-    &quot;threat&quot;: {&quot;threat_id&quot;: &quot;9c858901-8a57-4791-81fe-4c455b099bc9&quot;, &quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_category_id&quot;: 2, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;, &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;, &quot;description&quot;: null, &quot;threat_type_id&quot;: 42, &quot;library_threat_type&quot;: &quot;Firmware Tampering&quot;, &quot;library_threat_name&quot;: null, &quot;grounding_status&quot;: &quot;verified&quot;, &quot;threat_catalogue_id&quot;: 187, &quot;is_ai_generated&quot;: false, &quot;actors&quot;: [{&quot;actor_id&quot;: 7, &quot;actor_name&quot;: &quot;Nation-state/APT&quot;}], &quot;grounding_score&quot;: 100.0, &quot;score&quot;: 70.0, &quot;scope_rank&quot;: 1}
-  }]
+  &quot;entity_id&quot;: &quot;ENT-001&quot;,
+  &quot;scenarios&quot;: [
+    {
+      &quot;actors&quot;: [
+        {
+          &quot;actor_id&quot;: 12,
+          &quot;actor_name&quot;: &quot;Nation-state/APT&quot;
+        },
+        {
+          &quot;actor_id&quot;: 31,
+          &quot;actor_name&quot;: &quot;Malicious insider&quot;
+        }
+      ],
+      &quot;controls&quot;: [
+        {
+          &quot;control_code&quot;: &quot;CII-CID-201&quot;,
+          &quot;control_id&quot;: 201,
+          &quot;control_name&quot;: &quot;Multi-Factor Authentication&quot;,
+          &quot;domain&quot;: &quot;Identification &amp; Authentication&quot;,
+          &quot;map_rank&quot;: 1,
+          &quot;score&quot;: 93.0,
+          &quot;standards&quot;: [
+            {
+              &quot;standard_id&quot;: 3,
+              &quot;standard_name&quot;: &quot;NIST SP 800-53 Rev. 5&quot;
+            },
+            {
+              &quot;standard_id&quot;: 7,
+              &quot;standard_name&quot;: &quot;ISO 27001:2022&quot;
+            }
+          ]
+        }
+      ],
+      &quot;scenario&quot;: {
+        &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
+        &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
+        &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;,
+        &quot;supporting_systems_involved&quot;: [
+          {
+            &quot;is_entry_point&quot;: true,
+            &quot;justification&quot;: &quot;The firmware push travels over this network to reach the RTU.&quot;,
+            &quot;supporting_system&quot;: &quot;OT Telecom Network&quot;,
+            &quot;supporting_system_id&quot;: 306
+          }
+        ],
+        &quot;threat_category&quot;: &quot;Tampering&quot;,
+        &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;,
+        &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;
+      },
+      &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
+      &quot;subsystem_id&quot;: 101
+    }
+  ],
+  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
+  &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -361,13 +455,20 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   <div class="blk">
     <h3>Response <span class="status">200 (404 if not found)</span></h3>
     <pre>{
-  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
+  &quot;events&quot;: [
+    {
+      &quot;actor_type&quot;: &quot;user&quot;,
+      &quot;actor_user_id&quot;: &quot;u1&quot;,
+      &quot;at&quot;: &quot;2026-08-30T09:00:00Z&quot;,
+      &quot;audit_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
+      &quot;detail&quot;: {},
+      &quot;event&quot;: &quot;session_started&quot;,
+      &quot;subject_type&quot;: &quot;session&quot;
+    }
+  ],
   &quot;limit&quot;: 100,
   &quot;offset&quot;: 0,
-  &quot;events&quot;: [
-    {&quot;audit_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;, &quot;at&quot;: &quot;2026-08-30T09:00:00Z&quot;, &quot;event&quot;: &quot;session_started&quot;, &quot;subject_type&quot;: &quot;session&quot;, &quot;scenario_id&quot;: null, &quot;plan_id&quot;: null, &quot;actor_user_id&quot;: &quot;qa-user&quot;, &quot;actor_type&quot;: &quot;user&quot;, &quot;stage&quot;: null, &quot;subsystem_id&quot;: null, &quot;decision&quot;: null, &quot;detail&quot;: {}},
-    {&quot;audit_id&quot;: &quot;2b3c4d5e-6f78-4980-98a1-9b8c8d8e8fa0&quot;, &quot;at&quot;: &quot;2026-08-30T09:05:00Z&quot;, &quot;event&quot;: &quot;scenario_accepted&quot;, &quot;subject_type&quot;: &quot;scenario&quot;, &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;, &quot;plan_id&quot;: null, &quot;actor_user_id&quot;: &quot;qa-user&quot;, &quot;actor_type&quot;: &quot;user&quot;, &quot;stage&quot;: null, &quot;subsystem_id&quot;: 0, &quot;decision&quot;: &quot;accept&quot;, &quot;detail&quot;: {}}
-  ]
+  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -391,18 +492,16 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   <div class="blk">
     <h3>Request</h3>
     <pre>{
-  &quot;mode&quot;: &quot;subset&quot;,
-  &quot;scenario_ids&quot;: [&quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;]
-}
-// or {&quot;mode&quot;: &quot;all&quot;}  or  {&quot;mode&quot;: &quot;none&quot;}</pre>
+  &quot;mode&quot;: &quot;all&quot;
+}</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">200 (409 Conflict — see error_cases)</span></h3>
     <pre>{
+  &quot;accepted_count&quot;: 3,
   &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-  &quot;user_id&quot;: &quot;qa-user&quot;,
   &quot;status&quot;: &quot;completed&quot;,
-  &quot;accepted_count&quot;: 3
+  &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -426,15 +525,17 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   <div class="blk">
     <h3>Request</h3>
     <pre>{
-  &quot;scenario_ids&quot;: [&quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;]
+  &quot;scenario_ids&quot;: [
+    &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;
+  ]
 }</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">200 (409 Conflict — see error_cases)</span></h3>
     <pre>{
+  &quot;rejected_count&quot;: 2,
   &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-  &quot;user_id&quot;: &quot;qa-user&quot;,
-  &quot;rejected_count&quot;: 2
+  &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -462,10 +563,10 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
     <pre>{
+  &quot;epoch&quot;: 4,
   &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-  &quot;user_id&quot;: &quot;qa-user&quot;,
-  &quot;status&quot;: &quot;generating&quot;,
-  &quot;epoch&quot;: 4
+  &quot;status&quot;: &quot;regenerating&quot;,
+  &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -490,17 +591,19 @@ SELECT ScenarioID, ScenarioNumber, GenerationEpoch FROM Threat_Scenario WHERE Se
   <div class="blk">
     <h3>Request</h3>
     <pre>{
-  &quot;scenario_ids&quot;: [&quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;],
+  &quot;scenario_ids&quot;: [
+    &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;
+  ],
   &quot;user_note&quot;: &quot;Please emphasize the insider-threat vector.&quot;
 }</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
     <pre>{
+  &quot;epoch&quot;: 4,
   &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-  &quot;user_id&quot;: &quot;qa-user&quot;,
   &quot;status&quot;: &quot;regenerating&quot;,
-  &quot;epoch&quot;: 4
+  &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -529,15 +632,43 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   <div class="blk">
     <h3>Response <span class="status">200 (409 Conflict — see error_cases)</span></h3>
     <pre>{
-  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-  &quot;scenario_id&quot;: &quot;7c9e6679-7425-40de-944b-e07fc1f90ae7&quot;,
-  &quot;success&quot;: true,
+  &quot;controls&quot;: [
+    {
+      &quot;control_code&quot;: &quot;CII-CID-201&quot;,
+      &quot;control_id&quot;: 771,
+      &quot;control_name&quot;: &quot;Privileged access review&quot;,
+      &quot;domain&quot;: &quot;Access Control&quot;,
+      &quot;map_rank&quot;: 1,
+      &quot;score&quot;: 82.4
+    }
+  ],
+  &quot;controls_mapped&quot;: true,
   &quot;created_count&quot;: 1,
-  &quot;threat_type&quot;: {&quot;id&quot;: 42, &quot;name&quot;: &quot;Ransomware&quot;, &quot;status&quot;: &quot;existing&quot;, &quot;error&quot;: null, &quot;type_id&quot;: null, &quot;category_id&quot;: 2, &quot;linked&quot;: null},
-  &quot;threat&quot;: {&quot;id&quot;: 187, &quot;name&quot;: &quot;Ransomware encrypts historian data at rest&quot;, &quot;status&quot;: &quot;inserted&quot;, &quot;error&quot;: null, &quot;type_id&quot;: 42, &quot;category_id&quot;: 2, &quot;linked&quot;: null},
-  &quot;threat_actors&quot;: [{&quot;id&quot;: 9, &quot;name&quot;: &quot;APT-Nova&quot;, &quot;status&quot;: &quot;existing&quot;, &quot;error&quot;: null, &quot;type_id&quot;: 42, &quot;category_id&quot;: null, &quot;linked&quot;: true}],
-  &quot;controls&quot;: [{&quot;control_id&quot;: 771, &quot;control_code&quot;: &quot;CII-CID-201&quot;, &quot;domain&quot;: &quot;Access Control&quot;, &quot;control_name&quot;: &quot;Privileged access review&quot;, &quot;map_rank&quot;: 1, &quot;score&quot;: 82.4, &quot;standards&quot;: []}],
-  &quot;controls_mapped&quot;: true
+  &quot;scenario_id&quot;: &quot;7c9e6679-7425-40de-944b-e07fc1f90ae7&quot;,
+  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
+  &quot;success&quot;: true,
+  &quot;threat&quot;: {
+    &quot;category_id&quot;: 2,
+    &quot;id&quot;: 187,
+    &quot;name&quot;: &quot;Ransomware encrypts historian data at rest&quot;,
+    &quot;status&quot;: &quot;inserted&quot;,
+    &quot;type_id&quot;: 42
+  },
+  &quot;threat_actors&quot;: [
+    {
+      &quot;id&quot;: 9,
+      &quot;linked&quot;: true,
+      &quot;name&quot;: &quot;APT-Nova&quot;,
+      &quot;status&quot;: &quot;existing&quot;,
+      &quot;type_id&quot;: 42
+    }
+  ],
+  &quot;threat_type&quot;: {
+    &quot;category_id&quot;: 2,
+    &quot;id&quot;: 42,
+    &quot;name&quot;: &quot;Ransomware&quot;,
+    &quot;status&quot;: &quot;existing&quot;
+  }
 }</pre>
   </div>
   <div class="blk verify">
@@ -566,8 +697,8 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     <h3>Response <span class="status">200 (409 if already terminal)</span></h3>
     <pre>{
   &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
-  &quot;user_id&quot;: &quot;qa-user&quot;,
-  &quot;status&quot;: &quot;cancelled&quot;
+  &quot;status&quot;: &quot;cancelled&quot;,
+  &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -595,14 +726,62 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   <div class="blk">
     <h3>Response <span class="status">200 (404 if not found)</span></h3>
     <pre>{
+  &quot;accepted&quot;: true,
+  &quot;actors&quot;: [
+    {
+      &quot;actor_id&quot;: 12,
+      &quot;actor_name&quot;: &quot;Nation-state/APT&quot;
+    },
+    {
+      &quot;actor_id&quot;: 31,
+      &quot;actor_name&quot;: &quot;Malicious insider&quot;
+    }
+  ],
+  &quot;controls&quot;: [
+    {
+      &quot;control_code&quot;: &quot;CII-CID-201&quot;,
+      &quot;control_id&quot;: 201,
+      &quot;control_name&quot;: &quot;Multi-Factor Authentication&quot;,
+      &quot;domain&quot;: &quot;Identification &amp; Authentication&quot;,
+      &quot;map_rank&quot;: 1,
+      &quot;score&quot;: 93.0,
+      &quot;standards&quot;: [
+        {
+          &quot;standard_id&quot;: 3,
+          &quot;standard_name&quot;: &quot;NIST SP 800-53 Rev. 5&quot;
+        },
+        {
+          &quot;standard_id&quot;: 7,
+          &quot;standard_name&quot;: &quot;ISO 27001:2022&quot;
+        }
+      ]
+    }
+  ],
+  &quot;created_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;,
+  &quot;entity_id&quot;: &quot;ENT-001&quot;,
+  &quot;scenario&quot;: {
+    &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
+    &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
+    &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;,
+    &quot;supporting_systems_involved&quot;: [
+      {
+        &quot;is_entry_point&quot;: true,
+        &quot;justification&quot;: &quot;The firmware push travels over this network to reach the RTU.&quot;,
+        &quot;supporting_system&quot;: &quot;OT Telecom Network&quot;,
+        &quot;supporting_system_id&quot;: 306
+      }
+    ],
+    &quot;threat_category&quot;: &quot;Tampering&quot;,
+    &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;,
+    &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;
+  },
   &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
-  &quot;accepted_by&quot;: null, &quot;accepted_at&quot;: null, &quot;rejected_by&quot;: null, &quot;rejected_at&quot;: null, &quot;controls_unavailable&quot;: false,
+  &quot;scenario_number&quot;: 1,
+  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
+  &quot;session_status&quot;: &quot;completed&quot;,
   &quot;subsystem_id&quot;: 101,
-  &quot;scenario&quot;: {&quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;, &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;, &quot;threat_actors&quot;: [&quot;Nation-state/APT&quot;], &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;, &quot;scenario_statement&quot;: &quot;An attacker pushes unsigned firmware to the RTU.&quot;, &quot;risk_statement&quot;: &quot;Corrupted firmware could cause a sustained outage.&quot;, &quot;controls&quot;: [], &quot;supporting_system_applicability&quot;: []},
-  &quot;threat&quot;: {&quot;threat_id&quot;: &quot;9c858901-8a57-4791-81fe-4c455b099bc9&quot;, &quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_category_id&quot;: 2, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;, &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;, &quot;description&quot;: null, &quot;threat_type_id&quot;: 42, &quot;library_threat_type&quot;: &quot;Firmware Tampering&quot;, &quot;library_threat_name&quot;: null, &quot;grounding_status&quot;: &quot;verified&quot;, &quot;threat_catalogue_id&quot;: 187, &quot;is_ai_generated&quot;: false, &quot;actors&quot;: [{&quot;actor_id&quot;: 7, &quot;actor_name&quot;: &quot;Nation-state/APT&quot;}], &quot;grounding_score&quot;: 100.0, &quot;score&quot;: 70.0, &quot;scope_rank&quot;: 1},
-  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;, &quot;entity_id&quot;: &quot;78&quot;, &quot;user_id&quot;: &quot;qa-user&quot;,
-  &quot;session_status&quot;: &quot;completed&quot;, &quot;scenario_number&quot;: 1, &quot;accepted&quot;: false, &quot;superseded&quot;: false,
-  &quot;created_at&quot;: &quot;2026-07-20T14:30:00.000Z&quot;
+  &quot;superseded&quot;: false,
+  &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -629,16 +808,66 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">200 (403 if entity_id not authorized)</span></h3>
-    <pre>[{
-  &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
-  &quot;accepted_by&quot;: &quot;qa-user&quot;, &quot;accepted_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;, &quot;rejected_by&quot;: null, &quot;rejected_at&quot;: null, &quot;controls_unavailable&quot;: false,
-  &quot;subsystem_id&quot;: 101,
-  &quot;scenario&quot;: {&quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;, &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;, &quot;threat_actors&quot;: [&quot;Nation-state/APT&quot;], &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;, &quot;scenario_statement&quot;: &quot;An attacker pushes unsigned firmware to the RTU.&quot;, &quot;risk_statement&quot;: &quot;Corrupted firmware could cause a sustained outage.&quot;, &quot;controls&quot;: [], &quot;supporting_system_applicability&quot;: []},
-  &quot;threat&quot;: {&quot;threat_id&quot;: &quot;9c858901-8a57-4791-81fe-4c455b099bc9&quot;, &quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_category_id&quot;: 2, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;, &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;, &quot;description&quot;: null, &quot;threat_type_id&quot;: 42, &quot;library_threat_type&quot;: &quot;Firmware Tampering&quot;, &quot;library_threat_name&quot;: null, &quot;grounding_status&quot;: &quot;verified&quot;, &quot;threat_catalogue_id&quot;: 187, &quot;is_ai_generated&quot;: false, &quot;actors&quot;: [], &quot;grounding_score&quot;: 100.0, &quot;score&quot;: 70.0, &quot;scope_rank&quot;: 1},
-  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;, &quot;entity_id&quot;: &quot;78&quot;, &quot;user_id&quot;: &quot;qa-user&quot;,
-  &quot;session_status&quot;: &quot;completed&quot;, &quot;scenario_number&quot;: 1, &quot;accepted&quot;: true, &quot;superseded&quot;: false,
-  &quot;created_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;
-}]</pre>
+    <pre>[
+  {
+    &quot;accepted&quot;: true,
+    &quot;actors&quot;: [
+      {
+        &quot;actor_id&quot;: 12,
+        &quot;actor_name&quot;: &quot;Nation-state/APT&quot;
+      },
+      {
+        &quot;actor_id&quot;: 31,
+        &quot;actor_name&quot;: &quot;Malicious insider&quot;
+      }
+    ],
+    &quot;controls&quot;: [
+      {
+        &quot;control_code&quot;: &quot;CII-CID-201&quot;,
+        &quot;control_id&quot;: 201,
+        &quot;control_name&quot;: &quot;Multi-Factor Authentication&quot;,
+        &quot;domain&quot;: &quot;Identification &amp; Authentication&quot;,
+        &quot;map_rank&quot;: 1,
+        &quot;score&quot;: 93.0,
+        &quot;standards&quot;: [
+          {
+            &quot;standard_id&quot;: 3,
+            &quot;standard_name&quot;: &quot;NIST SP 800-53 Rev. 5&quot;
+          },
+          {
+            &quot;standard_id&quot;: 7,
+            &quot;standard_name&quot;: &quot;ISO 27001:2022&quot;
+          }
+        ]
+      }
+    ],
+    &quot;created_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;,
+    &quot;entity_id&quot;: &quot;ENT-001&quot;,
+    &quot;scenario&quot;: {
+      &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
+      &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
+      &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;,
+      &quot;supporting_systems_involved&quot;: [
+        {
+          &quot;is_entry_point&quot;: true,
+          &quot;justification&quot;: &quot;The firmware push travels over this network to reach the RTU.&quot;,
+          &quot;supporting_system&quot;: &quot;OT Telecom Network&quot;,
+          &quot;supporting_system_id&quot;: 306
+        }
+      ],
+      &quot;threat_category&quot;: &quot;Tampering&quot;,
+      &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;,
+      &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;
+    },
+    &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
+    &quot;scenario_number&quot;: 1,
+    &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
+    &quot;session_status&quot;: &quot;completed&quot;,
+    &quot;subsystem_id&quot;: 101,
+    &quot;superseded&quot;: false,
+    &quot;user_id&quot;: &quot;qa-user&quot;
+  }
+]</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -664,16 +893,66 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">200</span></h3>
-    <pre>[{
-  &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
-  &quot;accepted_by&quot;: null, &quot;accepted_at&quot;: null, &quot;rejected_by&quot;: null, &quot;rejected_at&quot;: null, &quot;controls_unavailable&quot;: false,
-  &quot;subsystem_id&quot;: 101,
-  &quot;scenario&quot;: {&quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;, &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;, &quot;threat_actors&quot;: [&quot;Nation-state/APT&quot;], &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;, &quot;scenario_statement&quot;: &quot;An attacker pushes unsigned firmware to the RTU.&quot;, &quot;risk_statement&quot;: &quot;Corrupted firmware could cause a sustained outage.&quot;, &quot;controls&quot;: [], &quot;supporting_system_applicability&quot;: []},
-  &quot;threat&quot;: {&quot;threat_id&quot;: &quot;9c858901-8a57-4791-81fe-4c455b099bc9&quot;, &quot;threat_category&quot;: &quot;Tampering&quot;, &quot;threat_category_id&quot;: 2, &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;, &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;, &quot;description&quot;: null, &quot;threat_type_id&quot;: 42, &quot;library_threat_type&quot;: &quot;Firmware Tampering&quot;, &quot;library_threat_name&quot;: null, &quot;grounding_status&quot;: &quot;verified&quot;, &quot;threat_catalogue_id&quot;: 187, &quot;is_ai_generated&quot;: false, &quot;actors&quot;: [], &quot;grounding_score&quot;: 100.0, &quot;score&quot;: 70.0, &quot;scope_rank&quot;: 1},
-  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;, &quot;entity_id&quot;: &quot;78&quot;, &quot;user_id&quot;: &quot;qa-user&quot;,
-  &quot;session_status&quot;: &quot;active&quot;, &quot;scenario_number&quot;: 1, &quot;accepted&quot;: false, &quot;superseded&quot;: false,
-  &quot;created_at&quot;: &quot;2026-08-29T10:00:00.000Z&quot;
-}]</pre>
+    <pre>[
+  {
+    &quot;accepted&quot;: true,
+    &quot;actors&quot;: [
+      {
+        &quot;actor_id&quot;: 12,
+        &quot;actor_name&quot;: &quot;Nation-state/APT&quot;
+      },
+      {
+        &quot;actor_id&quot;: 31,
+        &quot;actor_name&quot;: &quot;Malicious insider&quot;
+      }
+    ],
+    &quot;controls&quot;: [
+      {
+        &quot;control_code&quot;: &quot;CII-CID-201&quot;,
+        &quot;control_id&quot;: 201,
+        &quot;control_name&quot;: &quot;Multi-Factor Authentication&quot;,
+        &quot;domain&quot;: &quot;Identification &amp; Authentication&quot;,
+        &quot;map_rank&quot;: 1,
+        &quot;score&quot;: 93.0,
+        &quot;standards&quot;: [
+          {
+            &quot;standard_id&quot;: 3,
+            &quot;standard_name&quot;: &quot;NIST SP 800-53 Rev. 5&quot;
+          },
+          {
+            &quot;standard_id&quot;: 7,
+            &quot;standard_name&quot;: &quot;ISO 27001:2022&quot;
+          }
+        ]
+      }
+    ],
+    &quot;created_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;,
+    &quot;entity_id&quot;: &quot;ENT-001&quot;,
+    &quot;scenario&quot;: {
+      &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
+      &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
+      &quot;scenario_title&quot;: &quot;Remote Terminal Unit (RTU) — Unauthorized firmware push&quot;,
+      &quot;supporting_systems_involved&quot;: [
+        {
+          &quot;is_entry_point&quot;: true,
+          &quot;justification&quot;: &quot;The firmware push travels over this network to reach the RTU.&quot;,
+          &quot;supporting_system&quot;: &quot;OT Telecom Network&quot;,
+          &quot;supporting_system_id&quot;: 306
+        }
+      ],
+      &quot;threat_category&quot;: &quot;Tampering&quot;,
+      &quot;threat_name&quot;: &quot;Unauthorized firmware update of Remote Terminal Unit (RTU)&quot;,
+      &quot;threat_type&quot;: &quot;unauthorized modification of firmware&quot;
+    },
+    &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
+    &quot;scenario_number&quot;: 1,
+    &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
+    &quot;session_status&quot;: &quot;completed&quot;,
+    &quot;subsystem_id&quot;: 101,
+    &quot;superseded&quot;: false,
+    &quot;user_id&quot;: &quot;qa-user&quot;
+  }
+]</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -698,11 +977,32 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   <p class="auth"><span class="lbl">Auth</span> get_principal: X-API-Key (valid, active API_Client secret), X-User-Id (non-blank), X-Entity-Id (non-blank; must equal the session&#x27;s own EntityID or 403 EntityForbidden from get_authorized_session), X-Tenant-Id (non-blank; required for auth but not checked against the session).</p>
   <div class="blk">
     <h3>Request</h3>
-    <pre>{&quot;existing_controls&quot;: [&quot;annual patching&quot;, &quot;network firewall&quot;], &quot;likelihood_rating&quot;: 4, &quot;impact_rating&quot;: 5, &quot;final_risk_rating&quot;: 20, &quot;risk_level&quot;: &quot;Critical&quot;, &quot;risk_identification_date&quot;: &quot;2026-06-14T08:31:00Z&quot;, &quot;risk_owner&quot;: &quot;Head of OT Operations&quot;, &quot;impacted_business_division&quot;: &quot;Water Treatment Operations&quot;, &quot;existing_controls_all_subsystems&quot;: &quot;No&quot;, &quot;existing_controls_all_subsystems_justification&quot;: &quot;Controls deployed on IT systems only.&quot;, &quot;mitigation_start_date&quot;: &quot;2026-07-01&quot;, &quot;mitigation_end_date&quot;: &quot;2026-09-30&quot;}</pre>
+    <pre>{
+  &quot;existing_controls&quot;: [
+    &quot;annual patching&quot;,
+    &quot;network firewall&quot;
+  ],
+  &quot;existing_controls_all_subsystems&quot;: &quot;No&quot;,
+  &quot;existing_controls_all_subsystems_justification&quot;: &quot;Controls deployed on IT systems only.&quot;,
+  &quot;final_risk_rating&quot;: 20,
+  &quot;impact_rating&quot;: 5,
+  &quot;impacted_business_division&quot;: &quot;Water Treatment Operations&quot;,
+  &quot;likelihood_rating&quot;: 4,
+  &quot;mitigation_end_date&quot;: &quot;2026-09-30&quot;,
+  &quot;mitigation_start_date&quot;: &quot;2026-07-01&quot;,
+  &quot;risk_identification_date&quot;: &quot;2026-06-14T08:31:00Z&quot;,
+  &quot;risk_level&quot;: &quot;Critical&quot;,
+  &quot;risk_owner&quot;: &quot;Head of OT Operations&quot;
+}</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
-    <pre>{&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;, &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90&quot;, &quot;status&quot;: &quot;RUNNING&quot;}</pre>
+    <pre>{
+  &quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-8988-8786-858483828180&quot;,
+  &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
+  &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;,
+  &quot;status&quot;: &quot;RUNNING&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -728,7 +1028,56 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">200 (404 if no plan has ever been requested for this scenario)</span></h3>
-    <pre>{&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;, &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90&quot;, &quot;status&quot;: &quot;COMPLETE&quot;, &quot;treatment_strategy&quot;: &quot;Mitigate&quot;, &quot;scenario&quot;: {&quot;scenario_title&quot;: &quot;Ransomware via exposed RDP&quot;, &quot;scenario_statement&quot;: &quot;A ransomware operator gains access through an internet-exposed RDP endpoint.&quot;, &quot;risk_statement&quot;: &quot;Loss of treatment-plant availability during an active ransomware incident.&quot;, &quot;threat_category&quot;: &quot;Elevation of Privilege&quot;, &quot;threat_type&quot;: &quot;Credential Abuse&quot;, &quot;threat_name&quot;: &quot;Stolen RDP credentials&quot;, &quot;threat_actors&quot;: [&quot;Nation-state/APT&quot;, &quot;Malicious insider&quot;]}, &quot;risk_level&quot;: &quot;Critical&quot;, &quot;review_status&quot;: &quot;approved&quot;, &quot;reviewed_by&quot;: &quot;bob.reviewer&quot;, &quot;reviewed_at&quot;: &quot;2026-08-20T10:15:00&quot;, &quot;created_by&quot;: &quot;alice.chen&quot;, &quot;cancelled_by&quot;: null, &quot;cancelled_at&quot;: null, &quot;risk_identification_date&quot;: &quot;2026-06-14T08:31:00&quot;, &quot;plan&quot;: {&quot;title&quot;: &quot;Remote Access Hardening&quot;, &quot;treatment_plan&quot;: &quot;Mitigate&quot;, &quot;action_plan&quot;: &quot;Harden remote access in three phases over the mitigation window.&quot;, &quot;applicable_to_all_subsystems&quot;: &quot;No&quot;, &quot;controls_to_be_implemented&quot;: {&quot;control_coverage&quot;: &quot;gaps&quot;, &quot;controls&quot;: [{&quot;control_type&quot;: &quot;preventive&quot;, &quot;control_name&quot;: &quot;Access Restriction For Change&quot;, &quot;description&quot;: &quot;Enforce role-based access control and least-privilege for remote sessions.&quot;, &quot;priority&quot;: &quot;Critical&quot;, &quot;control_code&quot;: &quot;CII-CID-070&quot;, &quot;control_library_id&quot;: 70}]}, &quot;remediation_action_plan&quot;: [&quot;Phase 1: MFA on all remote endpoints (30 days)&quot;, &quot;Phase 2: Network segmentation (60 days)&quot;, &quot;Phase 3: Continuous monitoring rollout (90 days)&quot;], &quot;mitigation_timeline&quot;: &quot;90 days overall; critical actions within 30 days&quot;, &quot;mitigation_owner&quot;: &quot;OT Security Team&quot;, &quot;risk_owner&quot;: &quot;Head of OT Operations&quot;, &quot;impacted_business_division&quot;: &quot;Water Treatment Operations&quot;}, &quot;warnings&quot;: [], &quot;moderation_flagged&quot;: false, &quot;error_message&quot;: null, &quot;reason&quot;: null, &quot;superseded&quot;: null}</pre>
+    <pre>{
+  &quot;actors&quot;: [
+    {
+      &quot;actor_id&quot;: 12,
+      &quot;actor_name&quot;: &quot;Nation-state/APT&quot;
+    },
+    {
+      &quot;actor_id&quot;: 31,
+      &quot;actor_name&quot;: &quot;Malicious insider&quot;
+    }
+  ],
+  &quot;plan&quot;: {
+    &quot;action_plan&quot;: &quot;Harden remote access in three phases…&quot;,
+    &quot;applicable_to_all_subsystems&quot;: &quot;No&quot;,
+    &quot;controls_to_be_implemented&quot;: {
+      &quot;control_coverage&quot;: &quot;gaps&quot;,
+      &quot;controls&quot;: [
+        {
+          &quot;control_code&quot;: &quot;CII-CID-070&quot;,
+          &quot;control_library_id&quot;: 70,
+          &quot;control_name&quot;: &quot;Access Restriction For Change&quot;,
+          &quot;control_type&quot;: &quot;preventive&quot;,
+          &quot;description&quot;: &quot;Enforce role-based access control and least-privilege…&quot;,
+          &quot;priority&quot;: &quot;Critical&quot;
+        }
+      ]
+    },
+    &quot;impacted_business_division&quot;: &quot;Water Treatment Operations&quot;,
+    &quot;mitigation_owner&quot;: &quot;OT Security Team&quot;,
+    &quot;mitigation_timeline&quot;: &quot;90 days overall; critical actions within 30 days&quot;,
+    &quot;risk_owner&quot;: &quot;Head of OT Operations&quot;,
+    &quot;title&quot;: &quot;Remote Access Hardening&quot;,
+    &quot;treatment_plan&quot;: &quot;Mitigate&quot;
+  },
+  &quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-8988-8786-858483828180&quot;,
+  &quot;risk_identification_date&quot;: &quot;2026-06-14T08:31:00&quot;,
+  &quot;risk_level&quot;: &quot;Critical&quot;,
+  &quot;scenario&quot;: {
+    &quot;risk_statement&quot;: &quot;Loss of treatment-plant availability…&quot;,
+    &quot;scenario_statement&quot;: &quot;A ransomware operator gains access through…&quot;,
+    &quot;scenario_title&quot;: &quot;Ransomware via exposed RDP&quot;,
+    &quot;threat_category&quot;: &quot;Elevation of Privilege&quot;,
+    &quot;threat_name&quot;: &quot;Stolen RDP credentials&quot;,
+    &quot;threat_type&quot;: &quot;Credential Abuse&quot;
+  },
+  &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
+  &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;,
+  &quot;status&quot;: &quot;COMPLETE&quot;,
+  &quot;treatment_strategy&quot;: &quot;Mitigate&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -754,7 +1103,12 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
-    <pre>{&quot;plan_id&quot;: &quot;aa11bb22-cc33-4d44-8e55-9f6607182934&quot;, &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;, &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90&quot;, &quot;status&quot;: &quot;RUNNING&quot;}</pre>
+    <pre>{
+  &quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-8988-8786-858483828180&quot;,
+  &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
+  &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;,
+  &quot;status&quot;: &quot;RUNNING&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -776,11 +1130,19 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   <p class="auth"><span class="lbl">Auth</span> get_principal: X-API-Key, X-User-Id (this becomes reviewed_by — never taken from the body), X-Entity-Id (must equal the session&#x27;s EntityID or 403), X-Tenant-Id.</p>
   <div class="blk">
     <h3>Request</h3>
-    <pre>{&quot;decision&quot;: &quot;approved&quot;, &quot;comment&quot;: &quot;Access restriction controls implemented and verified; residual risk reduced to Low.&quot;}</pre>
+    <pre>{
+  &quot;comment&quot;: &quot;A3 timeline extended per operations.&quot;,
+  &quot;decision&quot;: &quot;approved&quot;
+}</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">200</span></h3>
-    <pre>{&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;review_status&quot;: &quot;approved&quot;, &quot;reviewed_by&quot;: &quot;bob.reviewer&quot;, &quot;reviewed_at&quot;: &quot;2026-08-30T09:42:11&quot;}</pre>
+    <pre>{
+  &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+  &quot;review_status&quot;: &quot;approved&quot;,
+  &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
+  &quot;reviewed_at&quot;: &quot;2026-08-30T12:00:00&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -806,7 +1168,11 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">200</span></h3>
-    <pre>{&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;status&quot;: &quot;ERROR&quot;, &quot;error_message&quot;: &quot;cancelled by user&quot;}</pre>
+    <pre>{
+  &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+  &quot;status&quot;: &quot;ERROR&quot;,
+  &quot;error_message&quot;: &quot;&lt;error_message&gt;&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -832,7 +1198,20 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">200 (404 if no plan has ever been requested for this scenario)</span></h3>
-    <pre>{&quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;, &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90&quot;, &quot;events&quot;: [{&quot;at&quot;: &quot;2026-08-14T09:02:11&quot;, &quot;event&quot;: &quot;requested&quot;, &quot;actor&quot;: &quot;alice.chen&quot;, &quot;actor_type&quot;: &quot;user&quot;, &quot;session_id&quot;: null, &quot;detail&quot;: {&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90&quot;}}, {&quot;at&quot;: &quot;2026-08-14T09:04:47&quot;, &quot;event&quot;: &quot;outcome&quot;, &quot;actor&quot;: null, &quot;actor_type&quot;: &quot;system&quot;, &quot;session_id&quot;: null, &quot;detail&quot;: {&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;status&quot;: &quot;COMPLETE&quot;, &quot;warnings&quot;: 0}}, {&quot;at&quot;: &quot;2026-08-20T10:15:00&quot;, &quot;event&quot;: &quot;reviewed&quot;, &quot;actor&quot;: &quot;bob.reviewer&quot;, &quot;actor_type&quot;: &quot;user&quot;, &quot;session_id&quot;: null, &quot;detail&quot;: {&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;decision&quot;: &quot;approved&quot;}}]}</pre>
+    <pre>{
+  &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
+  &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+  &quot;events&quot;: [
+    {
+      &quot;at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;event&quot;: &quot;&lt;event&gt;&quot;,
+      &quot;actor&quot;: &quot;&lt;actor&gt;&quot;,
+      &quot;actor_type&quot;: &quot;&lt;actor_type&gt;&quot;,
+      &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
+      &quot;detail&quot;: {}
+    }
+  ]
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -858,7 +1237,23 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">200 (404 if no such plan version exists for this scenario)</span></h3>
-    <pre>{&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;status&quot;: &quot;COMPLETE&quot;, &quot;input_snapshot&quot;: {&quot;risk_assessment&quot;: {&quot;risk_level&quot;: &quot;Critical&quot;, &quot;likelihood_rating&quot;: 4, &quot;impact_rating&quot;: 5, &quot;final_risk_rating&quot;: 20}, &quot;threat&quot;: {&quot;category&quot;: &quot;Elevation of Privilege&quot;, &quot;type&quot;: &quot;Credential Abuse&quot;, &quot;name&quot;: &quot;Stolen RDP credentials&quot;, &quot;actors&quot;: [&quot;Nation-state/APT&quot;]}, &quot;library_mapped&quot;: [{&quot;control_library_id&quot;: 70, &quot;control_code&quot;: &quot;CII-CID-070&quot;, &quot;control_name&quot;: &quot;Access Restriction For Change&quot;, &quot;standards&quot;: [&quot;ISA/IEC 62443&quot;]}]}, &quot;validation&quot;: {&quot;warnings&quot;: [], &quot;moderation&quot;: {&quot;checked&quot;: true, &quot;flagged&quot;: false, &quot;categories&quot;: [], &quot;error&quot;: null}}, &quot;attempts&quot;: [{&quot;at&quot;: &quot;2026-08-14T09:04:20&quot;, &quot;prompt&quot;: &quot;[system+context prompt text]&quot;, &quot;response&quot;: &quot;{\&quot;title\&quot;: \&quot;Remote Access Hardening\&quot;, ...}&quot;, &quot;model_name&quot;: &quot;gpt-4o&quot;, &quot;model_version&quot;: &quot;2024-08-06&quot;, &quot;prompt_version&quot;: &quot;treatment-v3&quot;, &quot;parse_succeeded&quot;: true}]}</pre>
+    <pre>{
+  &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+  &quot;status&quot;: &quot;&lt;status&gt;&quot;,
+  &quot;input_snapshot&quot;: {},
+  &quot;validation&quot;: {},
+  &quot;attempts&quot;: [
+    {
+      &quot;at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;prompt&quot;: &quot;&lt;prompt&gt;&quot;,
+      &quot;response&quot;: &quot;&lt;response&gt;&quot;,
+      &quot;model_name&quot;: &quot;&lt;model_name&gt;&quot;,
+      &quot;model_version&quot;: &quot;&lt;model_version&gt;&quot;,
+      &quot;prompt_version&quot;: &quot;&lt;prompt_version&gt;&quot;,
+      &quot;parse_succeeded&quot;: false
+    }
+  ]
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -884,7 +1279,24 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">200</span></h3>
-    <pre>{&quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;, &quot;accepted_scenarios&quot;: 2, &quot;plans&quot;: [{&quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90&quot;, &quot;scenario_title&quot;: &quot;Ransomware via exposed RDP&quot;, &quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;status&quot;: &quot;COMPLETE&quot;, &quot;risk_level&quot;: &quot;Critical&quot;, &quot;review_status&quot;: &quot;approved&quot;, &quot;error_message&quot;: null, &quot;reason&quot;: null, &quot;plan&quot;: null, &quot;superseded&quot;: null, &quot;created_at&quot;: &quot;2026-08-14T09:02:11&quot;, &quot;completed_at&quot;: &quot;2026-08-14T09:04:47&quot;}, {&quot;scenario_id&quot;: &quot;9f3c2b1a-7d6e-4f5c-8b4a-3c2d1e0f9a8b&quot;, &quot;scenario_title&quot;: &quot;Insider tampering with SCADA setpoints&quot;, &quot;plan_id&quot;: null, &quot;status&quot;: null, &quot;risk_level&quot;: null, &quot;review_status&quot;: null, &quot;error_message&quot;: null, &quot;reason&quot;: null, &quot;plan&quot;: null, &quot;superseded&quot;: null, &quot;created_at&quot;: null, &quot;completed_at&quot;: null}]}</pre>
+    <pre>{
+  &quot;accepted_scenarios&quot;: 2,
+  &quot;plans&quot;: [
+    {
+      &quot;plan_id&quot;: &quot;b9fe…&quot;,
+      &quot;review_status&quot;: &quot;approved&quot;,
+      &quot;risk_level&quot;: &quot;Critical&quot;,
+      &quot;scenario_id&quot;: &quot;1a2b…&quot;,
+      &quot;scenario_title&quot;: &quot;Ransomware via exposed RDP&quot;,
+      &quot;status&quot;: &quot;COMPLETE&quot;
+    },
+    {
+      &quot;scenario_id&quot;: &quot;9f3c…&quot;,
+      &quot;scenario_title&quot;: &quot;Insider tampering&quot;
+    }
+  ],
+  &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -910,7 +1322,38 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">200</span></h3>
-    <pre>{&quot;entity_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;, &quot;limit&quot;: 100, &quot;offset&quot;: 0, &quot;plans&quot;: [{&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;, &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-4788-898a-8b8c8d8e8f90&quot;, &quot;asset_name&quot;: &quot;Riverside WTP SCADA&quot;, &quot;scenario_title&quot;: &quot;Ransomware via exposed RDP&quot;, &quot;status&quot;: &quot;COMPLETE&quot;, &quot;risk_level&quot;: &quot;Critical&quot;, &quot;review_status&quot;: &quot;approved&quot;, &quot;reviewed_by&quot;: &quot;bob.reviewer&quot;, &quot;error_message&quot;: null, &quot;reason&quot;: null, &quot;scenario&quot;: null, &quot;treatment_strategy&quot;: null, &quot;risk_identification_date&quot;: null, &quot;plan&quot;: null, &quot;created_at&quot;: &quot;2026-08-14T09:02:11&quot;, &quot;completed_at&quot;: &quot;2026-08-14T09:04:47&quot;}]}</pre>
+    <pre>{
+  &quot;entity_id&quot;: &quot;&lt;entity_id&gt;&quot;,
+  &quot;limit&quot;: 0,
+  &quot;offset&quot;: 0,
+  &quot;plans&quot;: [
+    {
+      &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+      &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
+      &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+      &quot;asset_name&quot;: &quot;&lt;asset_name&gt;&quot;,
+      &quot;scenario_title&quot;: &quot;&lt;scenario_title&gt;&quot;,
+      &quot;status&quot;: &quot;&lt;status&gt;&quot;,
+      &quot;risk_level&quot;: &quot;&lt;risk_level&gt;&quot;,
+      &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
+      &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
+      &quot;error_message&quot;: &quot;&lt;error_message&gt;&quot;,
+      &quot;reason&quot;: &quot;generation_failed&quot;,
+      &quot;scenario&quot;: {},
+      &quot;actors&quot;: [
+        {
+          &quot;actor_id&quot;: 0,
+          &quot;actor_name&quot;: &quot;&lt;actor_name&gt;&quot;
+        }
+      ],
+      &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
+      &quot;risk_identification_date&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;plan&quot;: {},
+      &quot;created_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;completed_at&quot;: &quot;2026-08-30T12:00:00&quot;
+    }
+  ]
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -936,7 +1379,21 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   </div>
   <div class="blk">
     <h3>Response <span class="status">200</span></h3>
-    <pre>{&quot;entity_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;, &quot;limit&quot;: 200, &quot;offset&quot;: 0, &quot;events&quot;: [{&quot;at&quot;: &quot;2026-08-20T10:15:00&quot;, &quot;event&quot;: &quot;reviewed&quot;, &quot;actor&quot;: &quot;bob.reviewer&quot;, &quot;actor_type&quot;: &quot;user&quot;, &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;, &quot;detail&quot;: {&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;decision&quot;: &quot;approved&quot;}}, {&quot;at&quot;: &quot;2026-08-14T09:04:47&quot;, &quot;event&quot;: &quot;outcome&quot;, &quot;actor&quot;: null, &quot;actor_type&quot;: &quot;system&quot;, &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;, &quot;detail&quot;: {&quot;plan_id&quot;: &quot;0f0e0d0c-0b0a-4988-8786-858483828180&quot;, &quot;status&quot;: &quot;COMPLETE&quot;, &quot;warnings&quot;: 0}}]}</pre>
+    <pre>{
+  &quot;entity_id&quot;: &quot;&lt;entity_id&gt;&quot;,
+  &quot;limit&quot;: 0,
+  &quot;offset&quot;: 0,
+  &quot;events&quot;: [
+    {
+      &quot;at&quot;: &quot;2026-08-30T12:00:00&quot;,
+      &quot;event&quot;: &quot;&lt;event&gt;&quot;,
+      &quot;actor&quot;: &quot;&lt;actor&gt;&quot;,
+      &quot;actor_type&quot;: &quot;&lt;actor_type&gt;&quot;,
+      &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
+      &quot;detail&quot;: {}
+    }
+  ]
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -968,40 +1425,16 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     <pre>{
   &quot;feeds&quot;: [
     {
-      &quot;feed&quot;: &quot;cisa_kev&quot;, &quot;enabled&quot;: true, &quot;item_count&quot;: 1287,
-      &quot;kinds&quot;: {&quot;cve&quot;: 1287}, &quot;prompted&quot;: true,
-      &quot;last_fetched_at&quot;: &quot;2026-08-30T03:00:07Z&quot;,
-      &quot;last_attempt_at&quot;: &quot;2026-08-30T03:00:07Z&quot;,
-      &quot;last_success_at&quot;: &quot;2026-08-30T03:00:07Z&quot;,
-      &quot;last_error&quot;: null
-    },
-    {
-      &quot;feed&quot;: &quot;cisa_ics&quot;, &quot;enabled&quot;: true, &quot;item_count&quot;: 356,
-      &quot;kinds&quot;: {&quot;ics_advisory&quot;: 356}, &quot;prompted&quot;: true,
-      &quot;last_fetched_at&quot;: &quot;2026-08-30T03:01:42Z&quot;,
-      &quot;last_attempt_at&quot;: &quot;2026-08-30T03:01:42Z&quot;,
-      &quot;last_success_at&quot;: &quot;2026-08-30T03:01:42Z&quot;,
-      &quot;last_error&quot;: null
-    },
-    {
-      &quot;feed&quot;: &quot;otx&quot;, &quot;enabled&quot;: false, &quot;item_count&quot;: 0,
-      &quot;kinds&quot;: {}, &quot;prompted&quot;: true,
-      &quot;last_fetched_at&quot;: null, &quot;last_attempt_at&quot;: null,
-      &quot;last_success_at&quot;: null, &quot;last_error&quot;: null
-    },
-    {
-      &quot;feed&quot;: &quot;urlhaus&quot;, &quot;enabled&quot;: false, &quot;item_count&quot;: 0,
-      &quot;kinds&quot;: {}, &quot;prompted&quot;: false,
-      &quot;last_fetched_at&quot;: null, &quot;last_attempt_at&quot;: null,
-      &quot;last_success_at&quot;: null, &quot;last_error&quot;: null
-    },
-    {
-      &quot;feed&quot;: &quot;taxii&quot;, &quot;enabled&quot;: false, &quot;item_count&quot;: 0,
-      &quot;kinds&quot;: {}, &quot;prompted&quot;: false,
-      &quot;last_fetched_at&quot;: &quot;2026-08-14T09:12:03Z&quot;,
-      &quot;last_attempt_at&quot;: &quot;2026-08-15T03:02:11Z&quot;,
-      &quot;last_success_at&quot;: null,
-      &quot;last_error&quot;: &quot;URLError: &lt;urlopen error [Errno 111] Connection refused&gt;: https://taxii.example.org/collections/&quot;
+      &quot;enabled&quot;: true,
+      &quot;feed&quot;: &quot;cisa_kev&quot;,
+      &quot;item_count&quot;: 1653,
+      &quot;kinds&quot;: {
+        &quot;cve&quot;: 1653
+      },
+      &quot;last_attempt_at&quot;: &quot;2026-07-27T03:00:00Z&quot;,
+      &quot;last_fetched_at&quot;: &quot;2026-07-27T03:00:00Z&quot;,
+      &quot;last_success_at&quot;: &quot;2026-07-27T03:00:00Z&quot;,
+      &quot;prompted&quot;: true
     }
   ]
 }</pre>
@@ -1035,28 +1468,22 @@ db.intel_feed_status.findOne({ feed: &quot;cisa_kev&quot; });</pre>
     <pre>{
   &quot;items&quot;: [
     {
-      &quot;source&quot;: &quot;cisa_kev&quot;, &quot;kind&quot;: &quot;cve&quot;, &quot;external_id&quot;: &quot;CVE-2026-30154&quot;,
-      &quot;title&quot;: &quot;Apache Struts2 OGNL Injection Vulnerability&quot;,
-      &quot;adversary&quot;: null,
-      &quot;description&quot;: &quot;Apache Struts2 before 6.5.2 allows remote code execution via a crafted OGNL expression in the Content-Type header...&quot;,
-      &quot;url&quot;: &quot;https://nvd.nist.gov/vuln/detail/CVE-2026-30154&quot;,
-      &quot;tags&quot;: [],
-      &quot;fetched_at&quot;: &quot;2026-08-30T03:00:07Z&quot;,
-      &quot;published_at&quot;: &quot;2026-08-28T00:00:00Z&quot;
-    },
-    {
-      &quot;source&quot;: &quot;otx&quot;, &quot;kind&quot;: &quot;pulse&quot;, &quot;external_id&quot;: &quot;6a6c1a2b3c4d5e6f7a8b9c0d&quot;,
-      &quot;title&quot;: &quot;[Armored Likho] Armored Likho&#x27;s new weapon: BusySnake Stealer&quot;,
       &quot;adversary&quot;: &quot;Armored Likho&quot;,
-      &quot;description&quot;: &quot;BusySnake is a new stealer attributed to the Armored Likho group, delivered via spear-phishing attachments...&quot;,
-      &quot;url&quot;: &quot;https://otx.alienvault.com/pulse/6a6c1a2b3c4d5e6f7a8b9c0d&quot;,
-      &quot;tags&quot;: [&quot;armored likho&quot;, &quot;stealer&quot;],
-      &quot;fetched_at&quot;: &quot;2026-08-29T14:22:10Z&quot;,
-      &quot;published_at&quot;: &quot;2026-08-29T11:05:00Z&quot;
+      &quot;description&quot;: &quot;BusySnake is a new stealer attributed to ...&quot;,
+      &quot;external_id&quot;: &quot;6a6c1a2b3c4d5e6f7a8b9c0d&quot;,
+      &quot;fetched_at&quot;: &quot;2026-08-03T07:44:27Z&quot;,
+      &quot;kind&quot;: &quot;pulse&quot;,
+      &quot;source&quot;: &quot;otx&quot;,
+      &quot;tags&quot;: [
+        &quot;armored likho&quot;,
+        &quot;stealer&quot;
+      ],
+      &quot;title&quot;: &quot;[Armored Likho] Armored Likho&#x27;s new weapon: BusySnake Stealer&quot;,
+      &quot;url&quot;: &quot;https://otx.alienvault.com/pulse/6a6c1a2b3c4d5e6f7a8b9c0d&quot;
     }
   ],
-  &quot;total&quot;: 1643,
-  &quot;limit&quot;: 50,
+  &quot;total&quot;: 0,
+  &quot;limit&quot;: 0,
   &quot;offset&quot;: 0
 }</pre>
   </div>
@@ -1085,7 +1512,11 @@ db.threat_intel.find({ source: &quot;cisa_kev&quot; }, { raw: 0 }).sort({ publis
   </div>
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
-    <pre>{&quot;jobs&quot;: {&quot;cisa_kev&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;, &quot;cisa_ics&quot;: &quot;7c9e6679-7425-40de-944b-e07fc1f90ae7&quot;}}</pre>
+    <pre>{
+  &quot;jobs&quot;: {
+    &quot;cisa_kev&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;
+  }
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1112,7 +1543,11 @@ db.intel_feed_status.findOne({ feed: &quot;cisa_kev&quot; });  // repeat for eve
   </div>
   <div class="blk">
     <h3>Response <span class="status">202 (404 if {feed} is unknown or currently disabled)</span></h3>
-    <pre>{&quot;jobs&quot;: {&quot;cisa_kev&quot;: &quot;9c858901-8a57-4791-81fe-4c455b099bc9&quot;}}</pre>
+    <pre>{
+  &quot;jobs&quot;: {
+    &quot;cisa_kev&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;
+  }
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1168,11 +1603,19 @@ db.intel_feed_status.findOne({ feed: &quot;{feed_from_the_event_payload}&quot; }
   <p class="auth"><span class="lbl">Auth</span> Router-level require_admin: X-Admin-Key must exactly match the server&#x27;s configured admin key. Plus get_admin_principal: X-API-Key (valid, hashed client key) and X-User-Id (required, non-blank — becomes the audited actor). X-Entity-Id and X-Tenant-Id are NOT required for admin routes.</p>
   <div class="blk">
     <h3>Request</h3>
-    <pre>{&quot;group&quot;: &quot;threat_type&quot;, &quot;names&quot;: [&quot;Spoofing&quot;, &quot;Denial of Service&quot;]}</pre>
+    <pre>{
+  &quot;group&quot;: &quot;threat_type&quot;,
+  &quot;names&quot;: [
+    &quot;Spoofing&quot;,
+    &quot;Denial of Service&quot;
+  ]
+}</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
-    <pre>{&quot;job_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;}</pre>
+    <pre>{
+  &quot;job_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1194,11 +1637,19 @@ db.intel_feed_status.findOne({ feed: &quot;{feed_from_the_event_payload}&quot; }
   <p class="auth"><span class="lbl">Auth</span> Same as /create: X-Admin-Key (router-level require_admin) + X-API-Key + X-User-Id (required). X-Entity-Id/X-Tenant-Id not required.</p>
   <div class="blk">
     <h3>Request</h3>
-    <pre>{&quot;group&quot;: &quot;control_library&quot;}</pre>
+    <pre>{
+  &quot;group&quot;: &quot;threat_type&quot;,
+  &quot;names&quot;: [
+    &quot;Spoofing&quot;,
+    &quot;Denial of Service&quot;
+  ]
+}</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
-    <pre>{&quot;job_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;}</pre>
+    <pre>{
+  &quot;job_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1220,11 +1671,19 @@ db.intel_feed_status.findOne({ feed: &quot;{feed_from_the_event_payload}&quot; }
   <p class="auth"><span class="lbl">Auth</span> Same as /create: X-Admin-Key (router-level require_admin) + X-API-Key + X-User-Id (required). X-Entity-Id/X-Tenant-Id not required.</p>
   <div class="blk">
     <h3>Request</h3>
-    <pre>{&quot;group&quot;: &quot;threat_catalogue&quot;, &quot;names&quot;: [&quot;Removable media or portable device compromise&quot;]}</pre>
+    <pre>{
+  &quot;group&quot;: &quot;threat_type&quot;,
+  &quot;names&quot;: [
+    &quot;Spoofing&quot;,
+    &quot;Denial of Service&quot;
+  ]
+}</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
-    <pre>{&quot;job_id&quot;: &quot;0f8fad5b-d9cb-469f-a165-70867728950e&quot;}</pre>
+    <pre>{
+  &quot;job_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1246,11 +1705,19 @@ db.intel_feed_status.findOne({ feed: &quot;{feed_from_the_event_payload}&quot; }
   <p class="auth"><span class="lbl">Auth</span> Same as /create: X-Admin-Key (router-level require_admin) + X-API-Key + X-User-Id (required). X-Entity-Id/X-Tenant-Id not required.</p>
   <div class="blk">
     <h3>Request</h3>
-    <pre>{&quot;group&quot;: &quot;threat_actor&quot;, &quot;names&quot;: [&quot;APT33&quot;]}</pre>
+    <pre>{
+  &quot;group&quot;: &quot;threat_type&quot;,
+  &quot;names&quot;: [
+    &quot;Spoofing&quot;,
+    &quot;Denial of Service&quot;
+  ]
+}</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
-    <pre>{&quot;job_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;}</pre>
+    <pre>{
+  &quot;job_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1276,7 +1743,13 @@ db.intel_feed_status.findOne({ feed: &quot;{feed_from_the_event_payload}&quot; }
   </div>
   <div class="blk">
     <h3>Response <span class="status">200 (404 if job_id unknown/expired)</span></h3>
-    <pre>{&quot;state&quot;: &quot;SUCCESS&quot;, &quot;rows_processed&quot;: {&quot;threat_type&quot;: 12, &quot;threat_catalogue&quot;: 8}, &quot;vectors_deleted&quot;: null, &quot;error&quot;: null}</pre>
+    <pre>{
+  &quot;rows_processed&quot;: {
+    &quot;threat_catalogue&quot;: 8,
+    &quot;threat_type&quot;: 12
+  },
+  &quot;state&quot;: &quot;SUCCESS&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1325,11 +1798,16 @@ data: {&quot;type&quot;: &quot;embedding_job_update&quot;, &quot;job_id&quot;: &
   <p class="auth"><span class="lbl">Auth</span> X-Admin-Key (router-level require_admin) + X-API-Key + X-User-Id (required). X-Entity-Id/X-Tenant-Id not required. Body is optional.</p>
   <div class="blk">
     <h3>Request</h3>
-    <pre>{&quot;force&quot;: false}  -- or omit the body entirely; force defaults to false</pre>
+    <pre>{
+  &quot;force&quot;: false
+}</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">202</span></h3>
-    <pre>{&quot;job_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;, &quot;run_id&quot;: &quot;0f8fad5b-d9cb-469f-a165-70867728950e&quot;}</pre>
+    <pre>{
+  &quot;job_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
+  &quot;run_id&quot;: &quot;0f8fad5b-d9cb-469f-a165-70867728950e&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1355,7 +1833,20 @@ data: {&quot;type&quot;: &quot;embedding_job_update&quot;, &quot;job_id&quot;: &
   </div>
   <div class="blk">
     <h3>Response <span class="status">200 (404 if job_id unknown and no matching ledger row exists)</span></h3>
-    <pre>{&quot;state&quot;: &quot;SUCCESS&quot;, &quot;match_th&quot;: 86.25, &quot;quality&quot;: 0.94, &quot;negatives&quot;: 100, &quot;positives&quot;: 200, &quot;highest_negative&quot;: 99.5, &quot;lowest_positive&quot;: 71.2, &quot;near_duplicates&quot;: [&quot;&#x27;Mobile, QR or collaboration-channel compromise&#x27; ~ &#x27;Removable media or portable device compromise&#x27; @ 99.5&quot;], &quot;run_id&quot;: &quot;0f8fad5b-d9cb-469f-a165-70867728950e&quot;, &quot;embedding_model&quot;: &quot;multilingual-e5-large&quot;, &quot;reranker_model&quot;: &quot;bge-reranker-v2-m3&quot;, &quot;skipped&quot;: null, &quot;error&quot;: null}</pre>
+    <pre>{
+  &quot;embedding_model&quot;: &quot;multilingual-e5-large&quot;,
+  &quot;highest_negative&quot;: 99.5,
+  &quot;lowest_positive&quot;: 71.2,
+  &quot;match_th&quot;: 86.25,
+  &quot;near_duplicates&quot;: [
+    &quot;&#x27;Mobile, QR or collaboration-channel compromise&#x27; ~ &#x27;Removable media or portable device compromise&#x27; @ 99.5&quot;
+  ],
+  &quot;negatives&quot;: 100,
+  &quot;positives&quot;: 200,
+  &quot;quality&quot;: 0.94,
+  &quot;reranker_model&quot;: &quot;bge-reranker-v2-m3&quot;,
+  &quot;state&quot;: &quot;SUCCESS&quot;
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1408,7 +1899,9 @@ data: {&quot;type&quot;: &quot;grounding_job_update&quot;, &quot;job_id&quot;: &
   </div>
   <div class="blk">
     <h3>Response <span class="status">200</span></h3>
-    <pre>{&quot;runs&quot;: [{&quot;run_id&quot;: &quot;0f8fad5b-d9cb-469f-a165-70867728950e&quot;, &quot;job_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;, &quot;status&quot;: &quot;success&quot;, &quot;started_by&quot;: &quot;gopal&quot;, &quot;started_by_client&quot;: &quot;tsg-web&quot;, &quot;started_at&quot;: &quot;2026-08-27T10:14:02Z&quot;, &quot;finished_at&quot;: &quot;2026-08-27T10:29:41Z&quot;, &quot;embedding_model&quot;: &quot;multilingual-e5-large&quot;, &quot;reranker_model&quot;: &quot;bge-reranker-v2-m3&quot;, &quot;forced&quot;: false, &quot;match_th&quot;: 86.25, &quot;quality&quot;: 0.99, &quot;negatives&quot;: 100, &quot;positives&quot;: 200, &quot;highest_negative&quot;: 99.5, &quot;lowest_positive&quot;: 71.2, &quot;near_duplicates&quot;: [], &quot;error&quot;: null}]}</pre>
+    <pre>{
+  &quot;runs&quot;: []
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1434,7 +1927,12 @@ data: {&quot;type&quot;: &quot;grounding_job_update&quot;, &quot;job_id&quot;: &
   </div>
   <div class="blk">
     <h3>Response <span class="status">200</span></h3>
-    <pre>{&quot;value&quot;: 86.25, &quot;origin&quot;: &quot;calibrated&quot;, &quot;embedding_model&quot;: &quot;multilingual-e5-large&quot;, &quot;reranker_model&quot;: &quot;bge-reranker-v2-m3&quot;}</pre>
+    <pre>{
+  &quot;embedding_model&quot;: &quot;multilingual-e5-large&quot;,
+  &quot;origin&quot;: &quot;calibrated&quot;,
+  &quot;reranker_model&quot;: &quot;bge-reranker-v2-m3&quot;,
+  &quot;value&quot;: 86.25
+}</pre>
   </div>
   <div class="blk verify">
     <h3>Verify in the database</h3>
@@ -1465,24 +1963,14 @@ data: {&quot;type&quot;: &quot;grounding_job_update&quot;, &quot;job_id&quot;: &
     <h3>Response <span class="status">200</span></h3>
     <pre>[
   {
-    &quot;client_id&quot;: &quot;svc-chatbot-prod&quot;,
-    &quot;name&quot;: &quot;Chatbot Production Key&quot;,
-    &quot;module&quot;: &quot;chatbot&quot;,
-    &quot;active&quot;: true,
-    &quot;created_at&quot;: &quot;2026-08-15T09:12:44+00:00&quot;,
-    &quot;created_by&quot;: &quot;gopal.chettri&quot;,
-    &quot;revoked_at&quot;: null,
-    &quot;revoked_by&quot;: null
-  },
-  {
-    &quot;client_id&quot;: &quot;svc-legacy-import&quot;,
-    &quot;name&quot;: &quot;Legacy Import Job (decommissioned)&quot;,
-    &quot;module&quot;: &quot;tsg&quot;,
+    &quot;client_id&quot;: &quot;&lt;client_id&gt;&quot;,
+    &quot;name&quot;: &quot;&lt;name&gt;&quot;,
+    &quot;module&quot;: &quot;&lt;module&gt;&quot;,
     &quot;active&quot;: false,
-    &quot;created_at&quot;: &quot;2025-11-02T14:00:00+00:00&quot;,
-    &quot;created_by&quot;: &quot;gopal.chettri&quot;,
-    &quot;revoked_at&quot;: &quot;2026-06-01T08:30:12+00:00&quot;,
-    &quot;revoked_by&quot;: &quot;gopal.chettri&quot;
+    &quot;created_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+    &quot;created_by&quot;: &quot;&lt;created_by&gt;&quot;,
+    &quot;revoked_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+    &quot;revoked_by&quot;: &quot;&lt;revoked_by&gt;&quot;
   }
 ]</pre>
   </div>
@@ -1507,17 +1995,17 @@ data: {&quot;type&quot;: &quot;grounding_job_update&quot;, &quot;job_id&quot;: &
   <div class="blk">
     <h3>Request</h3>
     <pre>{
-  &quot;client_id&quot;: &quot;svc-chatbot-prod&quot;,
-  &quot;name&quot;: &quot;Chatbot Production Key&quot;,
-  &quot;module&quot;: &quot;chatbot&quot;
+  &quot;client_id&quot;: &quot;&lt;client_id&gt;&quot;,
+  &quot;name&quot;: &quot;&lt;name&gt;&quot;,
+  &quot;module&quot;: &quot;&lt;module&gt;&quot;
 }</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">201</span></h3>
     <pre>{
-  &quot;client_id&quot;: &quot;svc-chatbot-prod&quot;,
-  &quot;module&quot;: &quot;chatbot&quot;,
-  &quot;secret&quot;: &quot;5de88d819b2fac4abab5a55f1be42793652fe81c8ebc72fe8c980f1b2582df10&quot;
+  &quot;client_id&quot;: &quot;&lt;client_id&gt;&quot;,
+  &quot;module&quot;: &quot;&lt;module&gt;&quot;,
+  &quot;secret&quot;: &quot;&lt;secret&gt;&quot;
 }</pre>
   </div>
   <div class="blk verify">
@@ -1545,7 +2033,7 @@ data: {&quot;type&quot;: &quot;grounding_job_update&quot;, &quot;job_id&quot;: &
   <div class="blk">
     <h3>Response <span class="status">200 (404 if client_id is not an active client)</span></h3>
     <pre>{
-  &quot;client_id&quot;: &quot;svc-chatbot-prod&quot;,
+  &quot;client_id&quot;: &quot;&lt;client_id&gt;&quot;,
   &quot;status&quot;: &quot;revoked&quot;
 }</pre>
   </div>
@@ -1603,12 +2091,7 @@ data: {&quot;type&quot;: &quot;grounding_job_update&quot;, &quot;job_id&quot;: &
     <h3>Response <span class="status">200 (&quot;ready&quot;) normally; 503 (&quot;not_ready&quot;) if database, redis, or an in-use Mongo check fails -- workers is advisory-only and never causes the 503 by itself</span></h3>
     <pre>{
   &quot;status&quot;: &quot;ready&quot;,
-  &quot;checks&quot;: {
-    &quot;database&quot;: &quot;ok&quot;,
-    &quot;redis&quot;: &quot;ok&quot;,
-    &quot;mongo&quot;: &quot;skipped&quot;,
-    &quot;workers&quot;: &quot;ok&quot;
-  }
+  &quot;checks&quot;: {}
 }</pre>
   </div>
   <div class="blk verify">
