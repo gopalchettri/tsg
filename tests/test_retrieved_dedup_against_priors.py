@@ -105,7 +105,11 @@ class FakeLLM:
             verdicts = [{"index": c["index"], "verdict": "RELEVANT",
                          "justification": "SCADA setpoints are remotely modifiable here"}
                         for c in payload["candidate_threats"]]
-            return json.dumps(verdicts), None
+            # OBJECT-shaped, per the threat_validation contract (prompts.py). Leaving this
+            # as a bare array would NOT fail this file loudly: every verdict here is
+            # RELEVANT, and the fail-open path also yields "kept", so the test would keep
+            # passing while silently exercising none of the validator.
+            return json.dumps({"verdicts": verdicts}), None
         return json.dumps([]), None  # Stage-1b: no gap-fill proposals in these tests
 
 
