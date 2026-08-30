@@ -1267,7 +1267,8 @@ def _ground_entry_points(scenario: dict, vocab: dict[str, int],
         if is_primary:
             entry_id = sid
         involved.append({"supporting_system_id": sid, "supporting_system": label,
-                        "is_entry_point": is_primary, "justification": row.get("justification")})
+                        "is_entry_point": is_primary,
+                        "justification": row.get("justification") or ""})
     scenario["supporting_systems_involved"] = involved
 
     plausible_ids: list[int] = [entry_id] if entry_id is not None else []

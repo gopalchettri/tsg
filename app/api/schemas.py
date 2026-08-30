@@ -744,7 +744,20 @@ class SupportingSystemInvolved(ApiModel):
         description="True for the ONE system through which this scenario's threat reaches the "
                     "asset (at most one true per scenario). False means affected but not the "
                     "entry path.")
-    justification: str = Field(description="One-sentence rationale, grounded in the context.")
+    # default="", not required: a missing justification must degrade, never crash the whole
+    # results page for every OTHER scenario in the session — same fail-open posture as every
+    # other model-authored prose field in this file. Verified: without this default, a single
+    # scenario whose repair turn omitted the field 500s every read of the session's results.
+    justification: str = Field(default="", description="One-sentence rationale, grounded in the context.")
+
+    @field_validator("justification", mode="before")
+    @classmethod
+    def _null_is_absent(cls, v):
+        """default="" alone only covers a MISSING key — a stored row carrying an explicit
+        `null` (any row written before tasks.py's write-time normalization, or any future
+        write path that misses it) still needs to degrade rather than 500. Verified: without
+        this, ScenarioNarrative(justification=None) still raises."""
+        return "" if v is None else v
 
 
 class ScenarioNarrative(ApiModel):

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+from app.api.schemas import ScenarioNarrative
 from app.core.enums import ScenarioStatus
 from app.db.dal import _entry_point_id, variant_eligible_primaries
 
@@ -65,3 +66,18 @@ def test_no_plausible_entry_points_fails_closed():
     primary = _row(ScenarioJSON=_scenario_json(306))  # no plausible_ids key
     result = variant_eligible_primaries(None, "sess-1", 5, rows=[primary], attempt_slack=2)
     assert result == []
+
+
+def test_missing_justification_degrades_instead_of_crashing_the_whole_response():
+    """Cross-check finding: a stored row with justification=None (a partial repair turn, or
+    any row written before tasks.py's write-time `or ""` normalization) used to raise a
+    pydantic ValidationError with no per-item isolation anywhere in its callers — one bad
+    scenario 500'd the ENTIRE session's results page. Both the missing-key and explicit-null
+    shapes must degrade to an empty string, never crash."""
+    involved = [{"supporting_system_id": 306, "supporting_system": "x", "is_entry_point": True,
+                "justification": None}]
+    assert ScenarioNarrative(
+        supporting_systems_involved=involved).supporting_systems_involved[0].justification == ""
+    del involved[0]["justification"]
+    assert ScenarioNarrative(
+        supporting_systems_involved=involved).supporting_systems_involved[0].justification == ""
