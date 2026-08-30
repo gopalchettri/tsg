@@ -432,9 +432,8 @@ class Threat_Type(Base):
     __tablename__ = "Threat_Type"
     ThreatTypeID: Mapped[int] = mapped_column(Integer, primary_key=True)
     ThreatTypeName: Mapped[str] = mapped_column(Unicode(300))
-    # SectorID exists in the frozen table but is deliberately UNMAPPED: sector logic was removed
-    # 2026-08 per user instruction — the code ignores the column entirely. Description was
-    # DROPPED 2026-08-30 as unused (nothing read it).
+    # SectorID and Description were both DROPPED 2026-08-30 as unused (sector logic was removed
+    # 2026-08 per user instruction; nothing read Description either).
     ThreatCategoryID: Mapped[int | None] = mapped_column(Integer)
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -474,8 +473,8 @@ class Threat_Catalogue(Base):
     ThreatName: Mapped[str] = mapped_column(Unicode(500))
     # Description was DROPPED 2026-08-30. It had fed the embedded passage
     # (embeddings.catalogue_passage_text) and the validator prompt; both are now name-only.
-    # SectorID exists in the frozen table but is deliberately UNMAPPED — same rule as
-    # Threat_Type.SectorID above (sector logic removed 2026-08, user instruction).
+    # SectorID was DROPPED the same day — same rule as Threat_Type.SectorID above
+    # (sector logic removed 2026-08, user instruction).
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
     # See Threat_Type.Source above — same provenance tracking, same script adds it.

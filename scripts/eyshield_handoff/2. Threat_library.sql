@@ -1,28 +1,24 @@
 -- ============================================================================
--- Threat_library — creates the threat-library MASTER tables (Category/Type/
--- Catalogue/Actor), the two junction maps (type-actor, catalogue-category), and the Source
--- provenance columns. Schema only — row content
--- lives in Seed_to_Threat_library.sql. Run after TSG_Core.sql.
+-- Threat_library — the threat-library MASTER tables (Category/Type/Catalogue/
+-- Actor), their two junction maps, and the Source provenance columns. Schema
+-- only; rows live in Seed_to_Threat_library.sql. Run after TSG_Core.sql.
 -- ============================================================================
 
--- REQUIRED: this script creates FILTERED indexes (WHERE IsActive=1 AND
--- IsDeleted=0), which SQL Server refuses unless QUOTED_IDENTIFIER is ON.
--- sqlcmd defaults it OFF (SSMS defaults ON) — without this line the script
--- aborts partway, and Seed_to_Threat_library.sql then fails on every INSERT.
+-- REQUIRED: the filtered indexes below need QUOTED_IDENTIFIER ON, and sqlcmd
+-- defaults it OFF. Without this the script aborts partway (Msg 1934) and the
+-- seed then fails on every INSERT.
 SET QUOTED_IDENTIFIER ON;
 SET ANSI_NULLS ON;
 GO
 
 -- ============================================================
--- Threat-library MASTER tables. Type/Catalogue/Actor use IDENTITY PKs
--- (promote-on-accept inserts and reads back the key); Category stays a
--- plain int PK (fixed STRIDE set).
+-- MASTER tables. Type/Catalogue/Actor use IDENTITY PKs (promote-on-accept
+-- reads the key back); Category is a plain int PK (fixed STRIDE set).
 -- ============================================================
 
--- Audit columns (CreatedAt/By, UpdatedAt/By) are nullable with no DEFAULT:
--- Seed_to_Threat_library.sql inserts explicit column lists, so a NOT NULL
--- column would break every statement. Updated* is written only by the CRUD
--- API — importer/promote-on-accept leave existing rows untouched (first-writer wins).
+-- Audit columns are nullable with no DEFAULT: the seed inserts explicit column
+-- lists, so NOT NULL would break every statement. Updated* is written by the
+-- CRUD API only.
 IF OBJECT_ID('dbo.Threat_Category', 'U') IS NULL
 CREATE TABLE Threat_Category (
     ThreatCategoryID    int            NOT NULL CONSTRAINT PK_Threat_Category PRIMARY KEY,
@@ -40,7 +36,6 @@ IF OBJECT_ID('dbo.Threat_Type', 'U') IS NULL
 CREATE TABLE Threat_Type (
     ThreatTypeID             int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Type PRIMARY KEY,
     ThreatTypeName           nvarchar(300)  NOT NULL,
-    SectorID                 int            NULL,
     ThreatCategoryID  int            NULL,
     IsActive                 bit            NOT NULL,
     IsDeleted                bit            NOT NULL,
@@ -55,7 +50,6 @@ CREATE TABLE Threat_Catalogue (
     ThreatCatalogueID  int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Catalogue PRIMARY KEY,
     ThreatTypeID       int            NOT NULL,
     ThreatName         nvarchar(500)  NOT NULL,
-    SectorID           int            NULL,
     IsActive           bit            NOT NULL,
     IsDeleted          bit            NOT NULL,
     CreatedAt          datetime2      NULL,
@@ -64,8 +58,7 @@ CREATE TABLE Threat_Catalogue (
     UpdatedBy          nvarchar(200)  NULL
 );
 
--- Source declared directly here (Type/Catalogue get it via the guarded ALTERs
--- below) since the column was new when this table was created.
+-- Source is declared inline here; Type/Catalogue get it from the ALTERs below.
 IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NULL
 CREATE TABLE Threat_Actor (
     ThreatActorID    int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Actor PRIMARY KEY,
@@ -97,23 +90,21 @@ IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Act
     ALTER TABLE Threat_Actor ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
 
 -- ---------------------------------------------------------------------------
--- REMOVED COLUMNS (2026-08-30): Threat_Category.SecurityObjective,
--- Threat_Type.Description, Threat_Catalogue.Description
+-- REMOVED COLUMNS: Threat_Category.SecurityObjective, Threat_Type.Description,
+-- Threat_Catalogue.Description, Threat_Type.SectorID, Threat_Catalogue.SectorID
 -- ---------------------------------------------------------------------------
--- Nothing read SecurityObjective, and Threat_Type.Description was never embedded or shown.
--- Threat_Catalogue.Description WAS load-bearing until this change: it was the second half of
--- the embedded passage (embeddings.catalogue_passage_text) and was shown to the validator LLM.
--- Both are name-only now, so catalogue matching scores against the NAME ALONE.
--- RE-RUN POST /v1/tsg/grounding/calibrate after this upgrade, or the stored threshold is being
--- applied to text it was never measured against.
+-- SecurityObjective was never read. Threat_Type.Description was never embedded or shown.
+-- Threat_Catalogue.Description WAS load-bearing until 2026-08-30: it fed the embedded passage
+-- (embeddings.catalogue_passage_text) and the validator prompt. Catalogue matching is name-only
+-- from here — RE-RUN POST /v1/tsg/grounding/calibrate after this upgrade, or the stored
+-- threshold judges text it was never measured against.
+-- SectorID was already unmapped and unread (sector logic removed 2026-08, per user instruction)
+-- before this drop, so removing it has NO functional impact — unlike Description above.
 --
--- THIS IS THE ONLY DROP IN ANY OF THESE SCRIPTS, and it is a sanctioned exception to the
--- frozen-master-table rule enforced by tests/test_schema_sync.py. It DESTROYS the 75 curated
--- catalogue descriptions that shipped in 3. Seed_to_Threat_library.sql (recoverable only from
--- git history). Everything else in these scripts is additive and re-runnable; a DROP COLUMN is
--- not reversible without a restore. Guarded on the column still existing, so it fires once and
--- no-ops afterwards, and placed AFTER every CREATE/ADD above so an earlier failure stops the
--- script before it can reach here.
+-- THE ONLY DROPS IN ANY OF THESE SCRIPTS, and a sanctioned exception to the frozen-master-table
+-- rule enforced by tests/test_schema_sync.py. Each guarded on the column still existing, so it
+-- fires once and no-ops afterwards; placed AFTER every CREATE/ADD above so an earlier failure
+-- stops the script before it can reach here.
 IF OBJECT_ID('dbo.Threat_Category', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Category', 'SecurityObjective') IS NOT NULL
     ALTER TABLE Threat_Category DROP COLUMN SecurityObjective;
@@ -125,29 +116,26 @@ IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL
 IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Catalogue', 'Description') IS NOT NULL
     ALTER TABLE Threat_Catalogue DROP COLUMN Description;
+
+IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Type', 'SectorID') IS NOT NULL
+    ALTER TABLE Threat_Type DROP COLUMN SectorID;
+
+IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Catalogue', 'SectorID') IS NOT NULL
+    ALTER TABLE Threat_Catalogue DROP COLUMN SectorID;
 GO
 
 
--- Natural-key guard indexes. Makes concurrent promote-on-accept safe: two
--- sessions accepting at once can't both create the same library master.
--- Boot-asserted in app/db/invariants.REQUIRED_INDEXES.
--- NAME-ONLY. These keys used to include ThreatCategoryID/SectorID, which let one name exist once
--- per (category, sector): every curated row carries SectorID NULL while promotion stamped a real
--- sector, so an AI-promoted threat forked a same-name twin every time.
---
--- These are a CONCURRENCY BACKSTOP, not the dedup mechanism. Dedup is owned by the application:
--- dal.upsert_threat_type / upsert_threat_catalogue / upsert_threat_actor resolve an existing row
--- through core.naming.normalize_name BEFORE inserting, so duplicates cannot be created even on a
--- database where these indexes were never built. What the index adds is arbitration between two
--- writers committing the same new name in the same instant.
---
--- Guarded CREATE, never DROP-then-CREATE: a DROP that succeeds followed by a CREATE UNIQUE that
--- fails on pre-existing duplicates (Msg 1505) would leave the table with NO unique index at all
--- -- strictly worse than the wrong one, and reached by running the install script. On a database
--- still holding the old 3-column index, drop it by hand after confirming no duplicate names.
---
--- The IntegrityError recovery in dal selects on these exact columns (name alone); changing one
--- without the other turns a duplicate into a 500. Boot-asserted in invariants.REQUIRED_INDEXES.
+-- Natural-key guard indexes, NAME-ONLY. A concurrency backstop, not the dedup
+-- mechanism: dedup is app-side (dal.upsert_threat_* via normalize_name), and
+-- this only arbitrates two writers committing the same new name at once.
+-- Boot-asserted in app/db/invariants.REQUIRED_INDEXES, and dal's IntegrityError
+-- recovery selects on these exact columns — change both together, or a duplicate
+-- turns into a 500.
+-- Guarded CREATE, never DROP-then-CREATE: a DROP followed by a CREATE UNIQUE
+-- that fails on existing duplicates (Msg 1505) would leave NO unique index at
+-- all. On a database still holding the old 3-column index, drop it by hand.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Type'))
 CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName) WHERE IsActive = 1 AND IsDeleted = 0;
 
@@ -157,16 +145,15 @@ CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatName
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
 CREATE UNIQUE INDEX UX_ThreatActor_NaturalKey ON Threat_Actor(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0;
 
--- Threat_Category was the only CRUD-writable master without this guard
--- (2026-07-30) — without it a duplicate category name was accepted silently,
--- and grounding vs. the importer disagreed on which id it meant.
+-- Without this a duplicate category name is accepted silently, and grounding
+-- and the importer disagree on which id it means.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCategory_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Category'))
 CREATE UNIQUE INDEX UX_ThreatCategory_NaturalKey ON Threat_Category(ThreatCategoryName) WHERE IsActive = 1 AND IsDeleted = 0;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatType_Category_Active' AND object_id = OBJECT_ID('dbo.Threat_Type'))
-CREATE INDEX IX_ThreatType_Category_Active ON Threat_Type(ThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;
--- Supports grounding.get_possible_types()'s category filter. (SectorID stays in the key
--- for already-deployed databases; sector logic was removed 2026-08, user instruction.)
+CREATE INDEX IX_ThreatType_Category_Active ON Threat_Type(ThreatCategoryID) WHERE IsActive = 1 AND IsDeleted = 0;
+-- Supports grounding.get_possible_types()'s category filter. SectorID was removed from this
+-- index's key (and from the table, above) 2026-08-30 — it was already unused.
 
 IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL
 BEGIN
@@ -194,18 +181,15 @@ IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NOT NULL
     ALTER TABLE ThreatType_ThreatActor_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_TypeActorMap_CreatedAt DEFAULT SYSUTCDATETIME();
 
 
--- Threat_Catalogue <-> Threat_Category many-to-many: most real threats carry
--- more than one STRIDE category, which a single FK can't represent. Source
--- tracks provenance (curated / AI-promoted / imported).
+-- Threat_Catalogue <-> Threat_Category many-to-many: most threats carry more
+-- than one STRIDE category, which a single FK cannot represent.
 
 IF OBJECT_ID('dbo.Threat_Catalogue_Category_Map', 'U') IS NULL
 CREATE TABLE Threat_Catalogue_Category_Map (
     ThreatCatalogueID INT NOT NULL,
     ThreatCategoryID  INT NOT NULL,
-    -- PK leads on ThreatCategoryID (not ThreatCatalogueID): the composite PK is
-    -- also the clustered index, and the one query that filters this table
-    -- (grounding.get_possible_types) filters on category, so it needs to seek
-    -- on that column first.
+    -- PK leads on ThreatCategoryID: it is also the clustered index, and the one
+    -- query that filters this table (grounding.get_possible_types) seeks on category.
     CreatedAt datetime2 NULL CONSTRAINT DF_CatCategoryMap_CreatedAt DEFAULT SYSUTCDATETIME(),
     CONSTRAINT PK_Threat_Catalogue_Category_Map PRIMARY KEY (ThreatCategoryID, ThreatCatalogueID)
 );
@@ -216,11 +200,8 @@ IF OBJECT_ID('dbo.Threat_Catalogue_Category_Map', 'U') IS NOT NULL
     ALTER TABLE Threat_Catalogue_Category_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_CatCategoryMap_CreatedAt DEFAULT SYSUTCDATETIME();
 
 
--- Context_Field_Config (the per-field AI-prompt allowlist) REMOVED. Nothing
--- reads it anymore — context.py decides what fields are assembled,
--- security.redact()/scrub_context() strip secrets/PII, and
--- prompts._EXCLUDE_DB_KEY_TO_PROMPT drops primary keys. If the table still
--- exists in a deployed database it's inert; drop it when convenient.
+-- Context_Field_Config REMOVED — nothing reads it. If a deployed database still
+-- has the table it is inert; drop it when convenient.
 
 
 -- Verify
@@ -245,16 +226,10 @@ SELECT 'Threat_Catalogue_Category_Map', OBJECT_ID('dbo.Threat_Catalogue_Category
 -- ---------------------------------------------------------------------------
 -- Widen every remaining short nvarchar column to nvarchar(100)
 -- ---------------------------------------------------------------------------
--- A blanket floor, not a per-column judgement. Narrow columns sized to today's longest value are
--- a standing trap: the value that outgrows one is usually a one-line enum or vocabulary change,
--- and the failure is invisible because every SHORTER value still inserts - the application looks
--- healthy until the first write of the new value fails, mid-workflow, with no obvious cause.
---
--- nvarchar is variable-length, so this costs nothing: a 12-character value occupies 12 characters
--- whatever the declared maximum. Index keys are unaffected in practice - the widest key here
--- reaches 220 bytes against a 1700-byte limit.
---
--- Each is guarded on the CURRENT width, so re-running is a no-op and a site already at 100 skips.
+-- A blanket floor. A value that outgrows its column fails only on that one value,
+-- so the application looks healthy until the first write of it. nvarchar is
+-- variable-length, so the headroom costs nothing. Each guarded on the CURRENT
+-- width, so re-running is a no-op.
 
 IF OBJECT_ID('dbo.Threat_Category', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Category', 'ThreatCategoryCode') IS NOT NULL

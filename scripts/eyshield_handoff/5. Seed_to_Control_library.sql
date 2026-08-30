@@ -1,24 +1,17 @@
 -- ============================================================================
--- Seed_to_Control_library — real data from the functional team's
--- Control_Library.xlsx (generated 2026-07-19). 30 standards, 1288 controls,
--- 6105 control-to-standard links.
+-- Seed_to_Control_library — 30 standards, 1288 controls and 6105 control-standard
+-- links, from the functional team's Control_Library.xlsx.
 --
--- Idempotency is TABLE-LEVEL, not per-row: a one-time bulk load, so each
--- block only inserts if its target table is currently empty. Safe to
--- re-run, but NOT a way to add a few new controls later without re-running
--- the whole file — that needs a separate, per-row-guarded script.
+-- Idempotency is TABLE-LEVEL, not per-row: each block inserts only if its target
+-- table is empty. Safe to re-run, but NOT a way to add a few controls later.
 --
--- Run with SSMS or sqlcmd, after Control_library.sql.
+-- Run after Control_library.sql.
 -- ============================================================================
 
--- REQUIRED, and this one fails SILENTLY at the application layer. Control_library.sql (which
--- runs before this) creates the FILTERED unique indexes UX_Control_Standard_Name and
--- UX_Control_Library_Code, and SQL Server requires QUOTED_IDENTIFIER ON for ANY insert/update
--- against a table carrying a filtered index. sqlcmd defaults it OFF (SSMS defaults it ON), so
--- under the install README.md prescribes this aborts on the very first INSERT with Msg 1934.
--- Nothing downstream errors: the app boots fine, and Step-4 control mapping simply finds an
--- empty library and attaches zero controls to every scenario, forever, with no signal.
--- Same guard, same reason, as Seed_to_Threat_library.sql.
+-- REQUIRED, and this one fails SILENTLY. Inserts against the filtered unique
+-- indexes created by Control_library.sql need QUOTED_IDENTIFIER ON; sqlcmd
+-- defaults it OFF and the first INSERT aborts with Msg 1934. Nothing downstream
+-- errors: the app boots and Step-4 attaches zero controls to every scenario.
 SET QUOTED_IDENTIFIER ON;
 SET ANSI_NULLS ON;
 GO

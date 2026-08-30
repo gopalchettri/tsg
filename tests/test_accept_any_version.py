@@ -58,8 +58,9 @@ def _engine():
         table.__table__.create(engine)
 
     # The two filtered unique indexes that arbitrate scenario identity in production
-    # (TSG_Core.sql:628, :637). SQLite supports partial indexes with the same semantics, so
-    # mirroring them here is what lets a test in this file DETECT a double-accept at all.
+    # (UX_Scenario_ActiveIdentity / UX_Scenario_ActiveAccepted in TSG_Core.sql). SQLite
+    # supports partial indexes with the same semantics, so mirroring them here is what
+    # lets a test in this file DETECT a double-accept at all.
     #
     # Without them the shim silently accepts rows the real database would reject, so a test can
     # assert a guard "prevents" a collision that the shim was never going to raise — passing for

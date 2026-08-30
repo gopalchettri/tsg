@@ -1,23 +1,12 @@
 -- ============================================================================
--- TSG_Preflight — RUN THIS FIRST, BEFORE ANY OTHER SCRIPT.
+-- TSG_Preflight — RUN FIRST, before any other script. READ-ONLY: creates
+-- nothing, changes nothing, writes no row.
 --
--- READ-ONLY. Creates no permanent object, changes no setting, writes no row.
--- Safe to run on production at any time, as many times as you like.
+-- Every row is one check. Send the whole result set to the application team
+-- before running anything else. FAIL must be resolved first; WARN rows are
+-- judgement calls, explained in the Detail column.
 --
--- It answers the four questions that decide whether the install will succeed:
---   1. Is this client session configured so the install can even run?
---   2. Is the database configured the way the application requires?
---   3. Do the pre-existing platform tables the application READS actually exist,
---      with every column it expects?
---   4. Is this a fresh install or an upgrade — and if an upgrade, is there a
---      known conversion the scripts cannot perform automatically?
---
--- Every row it returns is one check. Send the whole result set back to the
--- application team before running anything else. Any row with Status = 'FAIL'
--- must be resolved first; 'WARN' rows are judgement calls, explained inline.
---
--- The table and column lists below are GENERATED from app/db/models.py — they
--- are the exact set the application asserts at boot, not a hand-written copy.
+-- Table and column lists are generated from app/db/models.py.
 -- ============================================================================
 
 SET NOCOUNT ON;
@@ -32,13 +21,11 @@ CREATE TABLE #tsg_preflight (
 );
 
 -- ---------------------------------------------------------------------------
--- 1. CLIENT SESSION — the single most common cause of a failed install.
+-- 1. CLIENT SESSION — the most common cause of a failed install.
 -- ---------------------------------------------------------------------------
--- The install scripts create FILTERED indexes (WHERE IsActive = 1 AND
--- IsDeleted = 0) and then INSERT into those tables. SQL Server refuses both
--- unless QUOTED_IDENTIFIER is ON. SSMS defaults it ON; sqlcmd defaults it OFF.
--- The scripts now set it themselves, but if your tooling forces it OFF this
--- tells you before you find out from a half-created schema.
+-- Filtered indexes, and inserts against them, need QUOTED_IDENTIFIER ON (SSMS
+-- defaults ON, sqlcmd OFF). The scripts set it themselves; this warns if your
+-- tooling forces it back OFF.
 INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
 SELECT 'Session',
        CASE WHEN SESSIONPROPERTY('QUOTED_IDENTIFIER') = 1 THEN 'PASS' ELSE 'WARN' END,
@@ -52,12 +39,9 @@ SELECT 'Session',
 -- ---------------------------------------------------------------------------
 -- 2. DATABASE CONFIGURATION
 -- ---------------------------------------------------------------------------
--- Read Committed Snapshot Isolation. The application's concurrency design
--- (compare-and-swap stage claims, per-asset locks) requires readers not to
--- block behind writers. The API and every background worker REFUSE TO START
--- without it. TSG_Core.sql will enable it, but doing so forces every other
--- session off the database and rolls back their work — so if this says OFF,
--- schedule a maintenance window rather than running the install ad hoc.
+-- RCSI: the API and every worker REFUSE TO START without it. TSG_Core.sql
+-- enables it, but that forces every other session off the database — if this
+-- says OFF, schedule a maintenance window.
 INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
 SELECT 'Database',
        CASE WHEN d.is_read_committed_snapshot_on = 1 THEN 'PASS' ELSE 'WARN' END,
@@ -79,18 +63,16 @@ SELECT 'Database', 'INFO', 'Target database / server',
 -- ---------------------------------------------------------------------------
 -- 3. PLATFORM DEPENDENCIES — tables TSG READS but never creates.
 -- ---------------------------------------------------------------------------
--- These belong to the onboarding/CTM platform. The install scripts do NOT
--- create them; the application only reads them (ctm_scan_category feeds the
--- data-driven control ITOT filter and the session context). If one is missing, or exists
--- but is missing a column, the API refuses to start — it checks every column
--- listed here at boot. Resolve with the platform team, not by editing TSG.
+-- Owned by the onboarding/CTM platform; TSG only reads them. A missing table,
+-- or one missing a column, stops the API at boot. Resolve with the platform
+-- team, not by editing TSG.
 DECLARE @platform_cols TABLE (TableName sysname, ColumnName sysname);
 INSERT INTO @platform_cols (TableName, ColumnName) VALUES
     (N'ctm_scan_category', N'id'),
     (N'ctm_scan_category', N'parent_id'),
     (N'ctm_scan_category', N'code'),
     (N'ctm_scan_category', N'name'),
-        (N'ctm_scan_entity', N'id'),
+    (N'ctm_scan_entity', N'id'),
     (N'ctm_scan_entity', N'type'),
     (N'ctm_scan_entity', N'name'),
     (N'ctm_scan_entity', N'description'),
@@ -178,8 +160,8 @@ FROM (SELECT DISTINCT TableName FROM @platform_cols) t
 WHERE NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES i
                   WHERE i.TABLE_NAME = t.TableName);
 
--- 3b. Missing COLUMNS on platform tables that DO exist. This is the boot blocker:
---     a table present but short one column stops the application dead.
+-- 3b. Missing COLUMNS on tables that DO exist — one missing column stops the
+--     application dead at boot.
 INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
 SELECT 'Platform dependency', 'FAIL',
        N'Platform column missing: ' + p.TableName + N'.' + p.ColumnName,
@@ -212,11 +194,9 @@ DECLARE @tsg_existing int = (
         N'Threat_Category', N'ThreatType_ThreatActor_Map',
         N'Threat_Scenario_Control_Map', N'Threat_Scenario', N'Threat_Scenario_Output',
         N'Threat_Type'));
--- 22 names, but at most 21 can be present at once: a database carries EITHER the pre-rename
--- Threat_Scenario_Output OR the renamed Threat_Scenario, never both. Both are listed because this
--- script runs BEFORE 1. TSG_Core.sql performs the rename, so a healthy legacy database must still
--- count 21 and report UPGRADE rather than a false PARTIAL. The three "21" literals below are
--- therefore still correct and deliberately unchanged.
+-- 22 names, at most 21 present at once: a database carries EITHER
+-- Threat_Scenario_Output OR the renamed Threat_Scenario, never both. This runs
+-- before TSG_Core.sql renames it, so 21 is the correct expected count.
 
 INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
 SELECT 'Install type', 'INFO',

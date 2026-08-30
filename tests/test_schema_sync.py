@@ -240,6 +240,10 @@ _APPROVED_COLUMN_DROPS = {
     # deletes the 75 seeded scenario descriptions. Catalogue matching is name-only from here, so
     # the stored grounding calibration has to be re-run.
     ("Threat_Catalogue", "Description"),
+    # Already unmapped (deliberately, since sector logic was removed 2026-08) before this drop —
+    # unlike Description above, dropping it has no functional impact; nothing ever read it.
+    ("Threat_Type", "SectorID"),
+    ("Threat_Catalogue", "SectorID"),
 }
 
 

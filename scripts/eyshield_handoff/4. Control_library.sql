@@ -1,22 +1,17 @@
 -- ============================================================================
--- Control Library — Standard + Control + many-to-many map (1,288 controls,
--- 30 standards; most controls reference 2+ standards at once). IDENTITY PKs,
--- no physical FOREIGN KEYs (this DB's convention, enforced app-side).
--- Idempotent, safe to re-run. Run with SSMS or sqlcmd against the TSG database.
+-- Control Library — Standard + Control + their many-to-many map (1,288 controls,
+-- 30 standards). IDENTITY PKs, no physical FOREIGN KEYs (this DB's convention,
+-- enforced app-side). Idempotent, safe to re-run. Run after TSG_Core.sql.
 -- ============================================================================
 
--- REQUIRED for the filtered unique indexes below — sqlcmd defaults this OFF
--- (SSMS defaults ON), which is why the failure only shows up from the command line.
+-- REQUIRED for the filtered unique indexes below; sqlcmd defaults it OFF, so
+-- this failure only shows up from the command line.
 SET QUOTED_IDENTIFIER ON;
 GO
 
--- 2026-07-27: renamed CreateDate/UpdateDate -> CreatedAt/UpdatedAt to match the
--- threat masters; added Source (provenance); switched the two natural keys to
--- FILTERED unique indexes so a soft-deleted control frees its code for reuse.
--- 2026-07-30: CreatedAt now defaults SYSUTCDATETIME() (was local getdate()).
--- CreatedBy/UpdatedBy widened 55->200 to match every other identity column —
--- they hold the JWT `sub`, and an over-long one used to raise an unhandled 500.
--- Existing databases: migrated in place by the guarded block below the CREATEs.
+-- Natural keys are FILTERED unique indexes so a soft-deleted control frees its
+-- code for reuse. Existing databases are migrated in place by the guarded block
+-- below the CREATEs.
 IF OBJECT_ID('dbo.Control_Standard', 'U') IS NULL
 CREATE TABLE Control_Standard (
     StandardID     int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Control_Standard PRIMARY KEY,
@@ -30,10 +25,9 @@ CREATE TABLE Control_Standard (
     IsDeleted      bit            NOT NULL CONSTRAINT DF_Control_Standard_IsDeleted DEFAULT (0)
 );
 
--- OutputID -> ScenarioID (see the matching block in `1. TSG_Core.sql`). sp_rename preserves the
--- data in place and the PRIMARY KEY follows automatically — SQL Server stores key columns by ID,
--- not by name. Guarded both ways: runs once on an existing database, no-op on a fresh one where
--- the CREATE TABLE above already declares ScenarioID.
+-- OutputID -> ScenarioID (matching block in `1. TSG_Core.sql`). sp_rename keeps
+-- the data in place and the PK follows automatically. Guarded both ways: runs
+-- once on an existing database, no-op on a fresh one.
 IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario_Control_Map', 'OutputID') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario_Control_Map', 'ScenarioID') IS NULL
@@ -71,7 +65,7 @@ IF OBJECT_ID('dbo.Control_Library_Standard_Map', 'U') IS NOT NULL
     ALTER TABLE Control_Library_Standard_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_ControlStdMap_CreatedAt DEFAULT SYSUTCDATETIME();
 
 -- Threat_Scenario_Control_Map (Step-4 mapping). Runs after TSG_Core.sql, so
--- Threat_Scenario already exists by the time this CREATE runs.
+-- Threat_Scenario already exists.
 IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NULL
 CREATE TABLE Threat_Scenario_Control_Map (
     ScenarioID        uniqueidentifier NOT NULL,
@@ -85,12 +79,11 @@ CREATE TABLE Threat_Scenario_Control_Map (
 );
 
 -- ---------------------------------------------------------------------------
--- In-place migration for pre-existing databases. Every step guarded — no-op
--- on a fresh database, safe to re-run on an old one.
+-- In-place migration for pre-existing databases. Every step guarded.
 -- ---------------------------------------------------------------------------
 
--- 1. Column renames (metadata only — does not rewrite rows). Also renames the
---    DEFAULT constraint so its name still matches the column.
+-- 1. Column renames (metadata only). Also renames the DEFAULT constraint so its
+--    name still matches the column.
 IF COL_LENGTH('dbo.Control_Standard', 'CreateDate') IS NOT NULL
 BEGIN
     EXEC sp_rename 'dbo.Control_Standard.CreateDate', 'CreatedAt', 'COLUMN';
@@ -115,9 +108,9 @@ IF OBJECT_ID('dbo.Control_Standard', 'U') IS NOT NULL AND COL_LENGTH('dbo.Contro
 IF OBJECT_ID('dbo.Control_Library', 'U') IS NOT NULL AND COL_LENGTH('dbo.Control_Library', 'Source') IS NULL
     ALTER TABLE Control_Library ADD Source nvarchar(50) NULL;
 
--- 3. UNIQUE constraint -> FILTERED unique index (a constraint can't carry a
---    WHERE clause). Without the filter, a soft-deleted control would reserve
---    its ControlCode forever.
+-- 3. UNIQUE constraint -> FILTERED unique index (a constraint cannot carry a
+--    WHERE clause). Without the filter a soft-deleted control would reserve its
+--    ControlCode forever.
 IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'UX_Control_Standard_Name')
     ALTER TABLE Control_Standard DROP CONSTRAINT UX_Control_Standard_Name;
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Control_Standard_Name' AND object_id = OBJECT_ID('dbo.Control_Standard'))
@@ -138,16 +131,13 @@ UNION ALL
 SELECT 'Threat_Scenario_Control_Map', OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U');
 
 -- ============================================================================
--- In-place migration for pre-fix databases. Both steps safe to re-run.
+-- More in-place migration. Both steps safe to re-run.
 -- ============================================================================
 
--- Identity columns: 55 -> 200, matching every other CreatedBy/UpdatedBy in the
--- schema (unbounded JWT `sub`).
---
--- COL_LENGTH counts BYTES, not characters: nvarchar(55)=110, nvarchar(200)=400.
--- Compare against 110, not 55 — a bare "= 55" is unsatisfiable and the widen
--- silently never runs. Not `< 400` either: COL_LENGTH returns -1 for
--- nvarchar(max), which would narrow a max column to 200.
+-- Identity columns 55 -> 200, matching every other CreatedBy/UpdatedBy.
+-- COL_LENGTH counts BYTES: nvarchar(55)=110. Compare against 110, not 55 — a
+-- bare "= 55" never matches and the widen silently never runs. Not `< 400`
+-- either: COL_LENGTH returns -1 for nvarchar(max), which would narrow it.
 IF COL_LENGTH('dbo.Control_Standard', 'CreatedBy') = 110
     ALTER TABLE Control_Standard ALTER COLUMN CreatedBy nvarchar(200) NULL;
 IF COL_LENGTH('dbo.Control_Standard', 'UpdatedBy') = 110
@@ -183,16 +173,10 @@ END
 -- ---------------------------------------------------------------------------
 -- Widen every remaining short nvarchar column to nvarchar(100)
 -- ---------------------------------------------------------------------------
--- A blanket floor, not a per-column judgement. Narrow columns sized to today's longest value are
--- a standing trap: the value that outgrows one is usually a one-line enum or vocabulary change,
--- and the failure is invisible because every SHORTER value still inserts - the application looks
--- healthy until the first write of the new value fails, mid-workflow, with no obvious cause.
---
--- nvarchar is variable-length, so this costs nothing: a 12-character value occupies 12 characters
--- whatever the declared maximum. Index keys are unaffected in practice - the widest key here
--- reaches 220 bytes against a 1700-byte limit.
---
--- Each is guarded on the CURRENT width, so re-running is a no-op and a site already at 100 skips.
+-- A blanket floor. A value that outgrows its column fails only on that one value,
+-- so the application looks healthy until the first write of it. nvarchar is
+-- variable-length, so the headroom costs nothing. Each guarded on the CURRENT
+-- width, so re-running is a no-op.
 
 IF OBJECT_ID('dbo.Control_Standard', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Control_Standard', 'Source') IS NOT NULL

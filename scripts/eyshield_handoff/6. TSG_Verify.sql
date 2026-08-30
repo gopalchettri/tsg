@@ -1,26 +1,18 @@
 -- ============================================================================
--- TSG_Verify — RUN THIS LAST, AFTER ALL FIVE INSTALL SCRIPTS.
+-- TSG_Verify — RUN LAST, after all five install scripts. READ-ONLY: creates
+-- nothing, changes nothing, writes no row.
 --
--- READ-ONLY. Creates no permanent object, changes no setting, writes no row.
--- Safe to run on production at any time, as many times as you like.
+-- The sign-off. Every row is one check; send the whole result set back to the
+-- application team. It catches the two SILENT failures: a script that aborted
+-- half way still leaves a database that looks populated, and a seed that
+-- inserted nothing leaves an app that starts and returns empty results forever.
 --
--- This is the sign-off. It proves the install actually worked, rather than
--- assuming it did because no error scrolled past. Every row is one check.
--- Send the whole result set back to the application team.
---
--- WHY THIS EXISTS: two of the ways this install can fail are SILENT. A script
--- that aborts half way still leaves a database that looks populated, and a
--- seed script that inserts nothing leaves an application that starts normally
--- and then produces empty results forever. Neither shows up as an error at
--- deploy time. This script catches both.
---
--- The expected tables and indexes below are GENERATED from app/db/models.py
--- and the application's own boot-time assertion list — not a hand-written copy.
+-- Expected tables and indexes are generated from app/db/models.py and the
+-- application's boot-time assertion list.
 -- ============================================================================
 
--- QI ON is required by the FOR XML column-list checks below (XML data type methods err
--- Msg 1934 under QI OFF) — set here so the script runs identically from SSMS (QI defaults
--- ON) and from `sqlcmd` (defaults OFF unless -I), same posture as TSG_Core.sql.
+-- Required by the FOR XML column-list checks below (Msg 1934 under QI OFF), so
+-- the script runs identically from SSMS and from sqlcmd.
 SET QUOTED_IDENTIFIER ON;
 SET NOCOUNT ON;
 
@@ -76,11 +68,9 @@ WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Tables');
 -- ---------------------------------------------------------------------------
 -- 2. THE 13 INDEXES THE APPLICATION ASSERTS AT BOOT
 -- ---------------------------------------------------------------------------
--- These are not performance indexes. Each one enforces a correctness rule the
--- code relies on — one active session per asset, one active scenario per
--- identity, unique library natural keys, one in-flight grounding calibration per
--- model pair, and so on. The application checks all thirteen at every start and
--- REFUSES TO BOOT if one is missing, on the wrong table, or missing a column.
+-- Not performance indexes: each enforces a correctness rule. The application
+-- checks all thirteen at every start and REFUSES TO BOOT if one is missing, on
+-- the wrong table, or built on the wrong columns.
 DECLARE @req_indexes TABLE (IndexName sysname, TableName sysname, Cols nvarchar(400));
 INSERT INTO @req_indexes (IndexName, TableName, Cols) VALUES
     (N'UX_Session_ActiveAsset', N'Scenario_Session', N'EntityID,AssetID'),
@@ -95,8 +85,8 @@ INSERT INTO @req_indexes (IndexName, TableName, Cols) VALUES
     (N'UX_Session_IdempotencyKey', N'Scenario_Session', N'EntityID,IdempotencyKey'),
     (N'UX_Control_Standard_Name', N'Control_Standard', N'StandardName'),
     (N'UX_Control_Library_Code', N'Control_Library', N'ControlCode'),
-    -- One in-flight grounding calibration per embedding+reranker pair. Filtered on
-    -- Status='running'; the route cannot stop two concurrent 15-minute billed sweeps on its own.
+    -- One in-flight calibration per embedding+reranker pair. The route cannot stop
+    -- two concurrent billed sweeps on its own.
     (N'UX_GroundingCalibration_Running', N'Grounding_Calibration_Run', N'EmbeddingModel,RerankerModel');
 
 -- Missing entirely, or on the wrong table.
@@ -149,10 +139,9 @@ WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Indexes');
 -- ---------------------------------------------------------------------------
 -- 3. COLUMNS ADDED BY ALTER — the silent casualty of a part-way abort
 -- ---------------------------------------------------------------------------
--- Threat_Type.Source and Threat_Catalogue.Source are added by ALTER statements
--- near the END of Threat_library.sql. If that script aborted at its first
--- filtered index, the tables exist but these two columns do not — and the seed
--- script then fails on every row, because it names Source explicitly.
+-- Threat_Type.Source and Threat_Catalogue.Source are added by ALTERs near the
+-- END of Threat_library.sql. If that script aborted early the tables exist but
+-- these columns do not, and the seed then fails on every row.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Columns', 'FAIL', N'Column missing: ' + x.T + N'.Source',
        N'Added by an ALTER near the end of Threat_library.sql. Its absence means that script '
@@ -161,23 +150,16 @@ FROM (VALUES (N'Threat_Type'), (N'Threat_Catalogue')) AS x(T)
 WHERE OBJECT_ID(N'dbo.' + x.T) IS NOT NULL
   AND COL_LENGTH(N'dbo.' + x.T, N'Source') IS NULL;
 
--- Identified_Threat.Description / .ThreatCategoryID are added by ALTER in TSG_Core.sql, and the
--- APPLICATION ASSERTS BOTH AT STARTUP (app/db/invariants._assert_mapped_columns_exist reads them
--- straight off the ORM model). Unchecked, a part-way script 1 passes verification, gets signed
--- off, and only then does the app refuse to boot -- the exact failure mode section 3b exists to
--- prevent. Description carries the AI's threat wording into crm_threat_risk_register.
--- threat_scenario on promotion; ThreatCategoryID is the resolved category key every later
--- consumer reads instead of re-deriving it from ThreatCategory text; ThreatRiskRegisterID /
--- ThreatCatalogueID is the library identity the promote API and dedup rely on. IsAIGenerated
--- is the immutable provenance flag (1 = invented by the AI, i.e. not in the catalogue at
--- identification; promotion never flips it).
+-- Added by ALTER in TSG_Core.sql, and the APPLICATION ASSERTS THEM AT STARTUP
+-- (app/db/invariants._assert_mapped_columns_exist). Unchecked, a part-way
+-- script 1 passes verification, gets signed off, and only then does the app
+-- refuse to boot.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Columns', 'FAIL', N'Column missing: Identified_Threat.' + x.C,
        N'Added by an ALTER in TSG_Core.sql, and asserted by the application at startup -- the app '
      + N'will refuse to boot without it. Re-run TSG_Core.sql; it is guarded and idempotent.'
--- GroundingThresholdOrigin records WHICH cutoff judged each threat ('calibrated' |
--- 'static_default' | 'env_pinned' | 'not_applicable'). Without it there is no way to find the
--- threats graded on a default tuned for a DIFFERENT model pair once a deployment calibrates.
+-- GroundingThresholdOrigin records WHICH cutoff judged each threat, so threats
+-- graded on a default tuned for a different model pair stay findable.
 FROM (VALUES (N'Description'), (N'ThreatCategoryID'), (N'GroundingThresholdOrigin'),
              (N'ThreatCatalogueID'), (N'IsAIGenerated')) AS x(C)
 WHERE OBJECT_ID(N'dbo.Identified_Threat') IS NOT NULL
@@ -192,17 +174,10 @@ WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Columns');
 -- ---------------------------------------------------------------------------
 -- 3b. THE SCENARIO-LIFECYCLE RELEASE
 -- ---------------------------------------------------------------------------
--- Everything below is added by TSG_Core.sql for the release that made scenarios
--- individually decidable (accept one today, the rest next week) and gave each
--- decision its own audit row.
---
--- Its own category because the application ASSERTS these at startup
--- (app/db/invariants.py) and refuses to boot without them. Before this block
--- existed, the 0-6 sequence could run against a database that never received
--- them, report a clean PASS, and get signed off — and only then would the app
--- fail to start. A verification that green-lights an install the application
--- will reject is worse than no verification: it turns a loud failure into an
--- approved one.
+-- Added by TSG_Core.sql for the release that made scenarios individually
+-- decidable. Its own category because the application ASSERTS these at startup
+-- (app/db/invariants.py) and refuses to boot without them — a verification that
+-- green-lights an install the app will reject is worse than no verification.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Scenario lifecycle', 'FAIL', N'Column missing: Threat_Scenario.' + x.C,
        N'Records who declined a scenario and when. Added by TSG_Core.sql; its absence means that '
@@ -229,9 +204,8 @@ WHERE OBJECT_ID(N'dbo.Threat_Scenario') IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM sys.check_constraints
                   WHERE name = 'CK_Scenario_DecisionExclusive');
 
--- Checked HERE and not via @req_indexes: that block FAILs any index with is_unique = 0, and this
--- one is deliberately non-unique AND filtered. Registering it there would fail every correctly
--- installed database. app/db/invariants.py leaves it out for exactly the same reason.
+-- Checked here, not via @req_indexes: that block FAILs any non-unique index and
+-- this one is deliberately non-unique. invariants.py omits it for the same reason.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Scenario lifecycle', 'FAIL', N'Index missing: IX_ScenarioAudit_Scenario',
        N'Filtered index on Scenario_Audit(ScenarioID, CreatedAt DESC). NOT boot-asserted, for the '
@@ -243,10 +217,9 @@ WHERE OBJECT_ID(N'dbo.Scenario_Audit') IS NOT NULL
                   JOIN sys.tables t ON t.object_id = i.object_id
                   WHERE i.name = 'IX_ScenarioAudit_Scenario' AND t.name = 'Scenario_Audit');
 
--- The backfill. Schema presence does not prove the migration finished: generation now completes a
--- session at its review barrier, and the accept path that used to close pre-release sessions no
--- longer completes anything. Any session left at active+REVIEW is stranded PERMANENTLY and holds
--- its asset open, blocking every new assessment for it. Silent, until someone tries that asset.
+-- Schema presence does not prove the backfill ran. A session left at
+-- active+REVIEW is stranded PERMANENTLY and holds its asset open, blocking every
+-- new assessment for it — silently, until someone tries that asset.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Scenario lifecycle', 'FAIL',
        N'Stranded sessions: ' + CAST(COUNT(*) AS nvarchar(20)) + N' left at active+REVIEW',
@@ -265,21 +238,15 @@ WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Scenario lifecycle
 -- ---------------------------------------------------------------------------
 -- 4. ENUM COLUMNS ARE WIDE ENOUGH FOR THE VALUES THE APPLICATION WRITES
 -- ---------------------------------------------------------------------------
--- The third silent failure mode. A column narrower than the longest value its
--- enum can hold breaks ONLY when that one value is first written — every other
--- value inserts fine, so the install looks clean, the application starts, and
--- sessions run normally until they reach that one state.
---
--- This has shipped: Scenario_Session.StageStatus was nvarchar(20) and could not
--- hold 'SCENARIOS_AWAITING_DECISION' (27 chars), the value that marks the review
--- barrier. Threat and scenario generation completed correctly, then the session
--- froze forever at the hand-off to review, and the truncation error was swallowed
--- by the reaper's own per-session error handling. Nothing in this script would
--- have caught it — tables and indexes were all present and correct.
+-- The third silent failure mode. A column narrower than its enum's longest value
+-- breaks ONLY when that one value is first written; every other value inserts
+-- fine, so the install looks clean and sessions run until they reach that state.
+-- This has shipped: StageStatus was nvarchar(20) and could not hold the 27-char
+-- 'SCENARIOS_AWAITING_DECISION', freezing sessions at the review barrier.
 --
 -- NeedChars is the longest member of each enum in app/core/enums.py.
--- CHARACTER_MAXIMUM_LENGTH is in CHARACTERS; COL_LENGTH would report bytes
--- (2x for nvarchar) and is deliberately not used here.
+-- CHARACTER_MAXIMUM_LENGTH is in CHARACTERS; COL_LENGTH reports bytes (2x for
+-- nvarchar) and is deliberately not used here.
 DECLARE @enum_cols TABLE (
     TableName sysname, ColumnName sysname, NeedChars int,
     EnumName nvarchar(40), LongestValue nvarchar(100));
@@ -339,10 +306,8 @@ WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Column width');
 -- ---------------------------------------------------------------------------
 -- 5. SEED DATA ACTUALLY LANDED
 -- ---------------------------------------------------------------------------
--- The failure this catches is entirely silent: if a seed script aborted, the
--- application still starts normally and simply produces empty results forever.
--- No error, no warning — scenarios generate with zero controls attached and
--- nobody can tell why.
+-- Entirely silent when it fails: if a seed aborted, the application still starts
+-- and produces empty results forever — scenarios with zero controls attached.
 DECLARE @expected TABLE (TableName sysname, Expected int, Meaning nvarchar(200));
 INSERT INTO @expected VALUES
     (N'Threat_Category',    6,    N'STRIDE categories'),
