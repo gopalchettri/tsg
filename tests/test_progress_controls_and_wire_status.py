@@ -45,20 +45,26 @@ def test_overall_now_reports_complete_at_the_review_barrier():
     assert sessions_mod._wire_stage_status(StageStatus.AWAITING_DECISION) == "COMPLETE"
 
 
-def test_awaiting_decision_is_the_surviving_review_queue_signal():
-    """THE regression the change above could cause, and the field that now prevents it.
+def test_awaiting_decision_reads_the_raw_status_not_the_published_one():
+    """With `overall` and `scenarios` BOTH reporting COMPLETE at the review barrier, this
+    boolean is the only thing left that can tell "generated and undecided" from "reviewed and
+    finished". Reading the PUBLISHED value would make it False for exactly the sessions it
+    exists to find."""
+    assert sessions_mod._wire_stage_status(StageStatus.AWAITING_DECISION) == "COMPLETE"
+    assert StageStatus.AWAITING_DECISION != StageStatus.COMPLETE, (
+        "the flag distinguishes these two; if the enum ever collapses them it is unbuildable")
 
-    With `overall` and `scenarios` BOTH reporting COMPLETE at the review barrier, neither can
-    tell "generated and undecided" from "reviewed and finished". A review queue built on either
-    would come back EMPTY — the failure get_overall_status's old ordering existed to avoid. The
-    boolean is the whole safety net, so it must be derived from the RAW status: reading the
-    published value would make it False for exactly the sessions it needs to find.
+
+def test_undecided_predicate_turns_off_once_everything_is_decided():
+    """THE bug this predicate exists for, and it is NOT hypothetical.
+
+    Subsystem_Stage_State.SCENARIOS is parked at AWAITING_DECISION when generation hits the
+    review barrier and is NEVER moved off it — accept_session() does not rewrite that row. A
+    flag keyed on the stage alone therefore reads true FOREVER, and a review queue fed by it
+    never empties. The scenarios themselves are the honest source.
     """
-    raw_at_barrier = StageStatus.AWAITING_DECISION
-    assert sessions_mod._wire_stage_status(raw_at_barrier) == "COMPLETE"   # published
-    assert (raw_at_barrier == StageStatus.AWAITING_DECISION) is True       # what the flag reads
-    # A finished session must NOT set it, or every session looks like it needs review.
-    assert (StageStatus.COMPLETE == StageStatus.AWAITING_DECISION) is False
+    assert dal.has_undecided_scenarios(_CountSession(3), "s") is True   # 3 still undecided
+    assert dal.has_undecided_scenarios(_CountSession(0), "s") is False  # all decided -> queue empties
 
 
 def test_the_stored_value_is_untouched():
@@ -75,6 +81,19 @@ class _FakeResult:
 
     def one(self):
         return self._row
+
+    def scalar_one(self):
+        return self._row
+
+
+class _CountSession:
+    """Returns one scalar count — the shape has_undecided_scenarios selects."""
+
+    def __init__(self, undecided):
+        self._n = undecided
+
+    def execute(self, *_a, **_k):
+        return _FakeResult(self._n)
 
 
 class _FakeSession:

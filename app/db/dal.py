@@ -1868,6 +1868,30 @@ def latest_coverage_verdict(sess: Session, session_id: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def has_undecided_scenarios(sess: Session, session_id: str) -> bool:
+    """Does any ACTIVE scenario still lack an accept/reject decision?
+
+    This is the review-queue predicate, and it is deliberately NOT derived from the stage
+    status. `Subsystem_Stage_State.SCENARIOS` is parked at SCENARIOS_AWAITING_DECISION when
+    generation reaches the review barrier and is NEVER moved off it again — accept_session()
+    does not rewrite that row (see SubsystemProgress.complete). So a flag keyed on the stage
+    alone would read "awaiting a decision" forever, and the queue it feeds would never empty.
+
+    The honest source is the scenarios themselves: a decision has been made when the row is
+    Accepted or carries a RejectedAt. Superseded rows are excluded — a replaced scenario is not
+    something a reviewer owes an answer on — but an ACCEPTED superseded row cannot be undecided
+    anyway, so the two predicates never disagree.
+    """
+    return sess.execute(
+        select(func.count())
+        .where(m.Threat_Scenario.SessionID == session_id,
+               m.Threat_Scenario.Status == ScenarioStatus.complete,
+               active(m.Threat_Scenario.Superseded),
+               m.Threat_Scenario.Accepted == 0,
+               m.Threat_Scenario.RejectedAt.is_(None))
+    ).scalar_one() > 0
+
+
 def control_mapping_progress(sess: Session, session_id: str) -> str:
     """Session-level roll-up of Step-4 control mapping — see ControlMappingStatus.
 

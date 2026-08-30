@@ -233,10 +233,14 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
     t = stages.get("threats", StageStatus.IDLE)
     sc = stages.get("scenarios", StageStatus.IDLE)
     overall = str(get_overall_status(t, sc, scenario_session["SessionStatus"]))
-    # Computed from the RAW status, never the wire value: _wire_stage_status maps
-    # AWAITING_DECISION to COMPLETE, so reading the mapped value here would report False for
-    # every session actually awaiting a decision — the exact signal this field exists to carry.
-    awaiting_decision = sc == StageStatus.AWAITING_DECISION
+    # TWO conditions, and the second is the one that makes this field usable. The RAW status
+    # (never the wire value — _wire_stage_status maps AWAITING_DECISION to COMPLETE) says
+    # generation reached the review barrier. But that stage row is NEVER moved off
+    # AWAITING_DECISION again: accept_session() does not rewrite it, so on its own this flag
+    # would read true forever and the review queue would never empty. The scenarios themselves
+    # are the honest source of "is anything still undecided".
+    awaiting_decision = (sc == StageStatus.AWAITING_DECISION
+                         and dal.has_undecided_scenarios(sess, scenario_session["SessionID"]))
     return {
         "session_id": scenario_session["SessionID"], "entity_id": scenario_session["EntityID"],
         "asset_id": int(scenario_session["AssetID"]), "asset_name": scenario_session["AssetName"],
