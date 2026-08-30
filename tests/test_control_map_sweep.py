@@ -33,7 +33,7 @@ STALE = get_settings().stage_lease_seconds + 60   # older than one lease => the 
 
 def _engine():
     engine = create_engine("sqlite://")
-    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario_Output,
+    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Threat_Scenario_Control_Map, m.Scenario_Audit,
                 m.Scoped_Threat, m.Identified_Threat):
         tbl.__table__.create(engine)
@@ -60,7 +60,7 @@ def _seed(s, *, created_offset_days: int = 1, stage_status: str = StageStatus.AW
             SubsystemID=0, Level=level, Status=status, GenerationEpoch=EPOCH,
             ActiveTaskID=task, AttemptCount=1,
             UpdatedAt=now - timedelta(seconds=settled_secs_ago)))
-    s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+    s.execute(m.Threat_Scenario.__table__.insert().values(
         ScenarioID=scenario_id, SessionID=sid, TenantID="t", EntityID="e", UserID="u",
         SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
         ScenarioJSON=json.dumps({"scenario_title": "Setpoint manipulation on the HMI",
@@ -91,8 +91,8 @@ class _FakeLLM:
 def _mapped(s, scenario_id) -> tuple[int, object]:
     n = len(s.execute(select(m.Threat_Scenario_Control_Map.ControlLibraryID)
                     .where(m.Threat_Scenario_Control_Map.ScenarioID == scenario_id)).all())
-    stamp = s.execute(select(m.Threat_Scenario_Output.ControlsMappedAt)
-                    .where(m.Threat_Scenario_Output.ScenarioID == scenario_id)).scalar_one()
+    stamp = s.execute(select(m.Threat_Scenario.ControlsMappedAt)
+                    .where(m.Threat_Scenario.ScenarioID == scenario_id)).scalar_one()
     return n, stamp
 
 

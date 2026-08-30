@@ -114,7 +114,7 @@ def _queries_from_db(sess, limit: int) -> list[tuple[str, str]]:
     # The threat joins in because collect_control_query takes it — measuring the narrative
     # alone would measure a query shape production no longer sends, which is exactly the
     # mismatch this script exists to catch.
-    out_t, st_t, it_t = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
+    out_t, st_t, it_t = m.Threat_Scenario, m.Scoped_Threat, m.Identified_Threat
     rows = sess.execute(
         select(out_t.ScenarioID, out_t.ScenarioJSON,
             it_t.ThreatName, it_t.ThreatType, it_t.LibraryThreatName, it_t.LibraryThreatType)

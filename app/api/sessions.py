@@ -363,7 +363,7 @@ def _scenario_select():
     watches rows reshuffle between refreshes. Ordering
     once at the shared source fixes every reader and every reader added later; ordering per-caller
     is three chances to forget."""
-    out, st, it = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
+    out, st, it = m.Threat_Scenario, m.Scoped_Threat, m.Identified_Threat
     return select(
         out.ScenarioID, out.ScenarioJSON, out.Accepted, out.ValidationJSON, out.GenerationEpoch,
         out.ScenarioNumber, out.ReplacesScenarioID, out.ControlsMappedAt, out.ScenarioSource,
@@ -397,7 +397,7 @@ def _ancestry(sess: Session, sid: str, scenarios: list[dict]) -> dict[str, list[
     (the cycle guard below exists for the same reason), so an unscoped walk would hand another
     entity's scenario to this caller. Scoping here is sufficient for everything downstream,
     because the returned chains are the sole source of the ids /results goes on to fetch."""
-    out = m.Threat_Scenario_Output
+    out = m.Threat_Scenario
     predecessor: dict[str, str | None] = {}
     frontier = {str(s["ReplacesScenarioID"]) for s in scenarios if s["ReplacesScenarioID"]}
     hops = 0
@@ -466,7 +466,7 @@ def get_results(
                 select(*cols).where(table.SessionID == sid, dal.active(table.Superseded), *extra)
             ).mappings()]
 
-        out = m.Threat_Scenario_Output
+        out = m.Threat_Scenario
         # No separate threats query. Every threat it could return was, by its own EXISTS
         # predicate, one already backing an active scenario row — so each card now carries its
         # own threat (ScenarioResult.threat, read from the SAME row via _scenario_select's

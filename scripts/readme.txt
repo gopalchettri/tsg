@@ -50,7 +50,7 @@ NOT PART OF THE INSTALL — do not run:
     @I_UNDERSTAND = 'YES' inside it to arm it; it does nothing otherwise. Also empties
     Threat_Scenario_Control_Map, which holds per-scenario data but is created by
     Control_library.sql — dropping the scenario tables without it leaves orphan rows keyed
-    to OutputIDs that no longer exist. Recreates NOTHING: run TSG_Core.sql afterwards, then
+    to ScenarioIDs that no longer exist. Recreates NOTHING: run TSG_Core.sql afterwards, then
     re-insert an API_Client row or the app will not boot.
   (2026-08 cleanup: TSG_Migration_ScenarioLifecycle.sql, backfill_rejection_kind.sql and a
   dozen unreferenced helper scripts were DELETED — every statement that mattered lives in the
@@ -70,6 +70,11 @@ violating the read-only rule below.
 NOTES FOR DEVELOPERS
 ============================================================================
 
+DATED ENTRIES NAME OBJECTS AS THEY WERE ON THEIR DATE. Threat_Scenario_Output and six of its
+constraints/indexes were renamed on 2026-08-30 (see the last entry). Earlier entries deliberately
+keep the old names: a DBA matching this log against a database they upgraded in July needs the
+names that were actually there, not the ones in use today.
+
 1. once the database is created. run the following command-
 ALTER DATABASE <database_name> SET READ_COMMITTED_SNAPSHOT ON;
 
@@ -86,13 +91,16 @@ metadata.create_all() -- the app only ever reads a schema these scripts built.
 
 
 WHEN YOU CHANGE THE SCHEMA: edit TSG_Core.sql and models.py together, in the same
-change. THERE IS NO LONGER AN AUTOMATED GUARD FOR THIS. tests/test_schema_sync.py used
-to fail when a column existed in models.py but not in the script; the tests/ directory
-was removed, so nothing catches that drift now -- a column added to models.py and
-missed in TSG_Core.sql will not surface until a production query fails at runtime with
-"Invalid column name". Re-read both files side by side before committing.
-(app/db/invariants.py still asserts the UNIQUE indexes at boot; that check is alive and
-unrelated -- it does not look at columns.)
+change. tests/test_schema_sync.py IS the automated guard -- it fails when a column exists
+in models.py but not in the script, and it also set-compares TSG_Verify.sql's index list
+against app/db/invariants.py REQUIRED_INDEXES and its table list against the guarded
+CREATE TABLE inventory. (An earlier note here claimed the tests/ directory had been
+removed and nothing caught this drift. That is no longer true; the suite is alive and this
+is the check that catches it.)
+(app/db/invariants.py additionally asserts the UNIQUE indexes at boot. Note what it does
+NOT do: _assert_mapped_columns_exist SKIPS a table that is absent from the database, so a
+TABLE rename applied in models.py but not in the SQL is not caught there -- it surfaces as
+a raw driver "Invalid object name" instead. test_schema_sync.py is the real gate.)
 
 2026-07-25: Alembic was REMOVED. It was a second, parallel owner of the same schema, and on a
 hand-scripted database it could only ever be wrong. These .sql scripts are the ONE source of
@@ -240,8 +248,8 @@ ScenarioJSON now carries entry_point (label), entry_point_id (the supporting sys
 plausible_entry_point_ids (that threat's coverage target, declared by its FIRST scenario and
 inherited by every later one). They are additive JSON keys inside the existing nvarchar(max)
 column -- no DDL, and rows written before this simply lack them, which every reader treats as
-"no coverage signal". IX_ScenarioOutput_SessionSubActive is what serves the single
-dal.active_scenario_rows read that folds those out.
+"no coverage signal". IX_Scenario_SessionSubActive (named IX_ScenarioOutput_SessionSubActive
+until 2026-08-30) is what serves the single dal.active_scenario_rows read that folds those out.
 
 2026-08-14: Scenario_Session.StageStatus and Subsystem_Stage_State.Status widened
 nvarchar(20) -> nvarchar(100) IN PLACE by new schema-qualified, width-guarded ALTER blocks in
@@ -291,3 +299,33 @@ RiskLevel at 100. ErrorReason goes further: nvarchar(max) (guard fires on ANY bo
 nothing at rest, and the column is in no index. Verify width rows unchanged — the width check
 skips nvarchar(max) columns and re-arms if one is ever re-narrowed; the bounded columns'
 longest stored values still fit ('Mitigate' 8, 'Critical' 8).
+
+2026-08-30: Threat_Scenario_Output renamed to Threat_Scenario, with five of its objects
+
+The table holds SCENARIOS; "Output" named the pipeline step that produced them, not the thing
+stored. The earlier OutputID -> ScenarioID column rename had already moved the row's own identity
+to the new vocabulary, which left the object names pointing at a word no longer in the schema.
+Seven guarded sp_rename statements, at the TOP of 1. TSG_Core.sql:
+
+  Threat_Scenario_Output              -> Threat_Scenario                 (the table)
+  PK_Threat_Scenario_Output           -> PK_Threat_Scenario              (renames its index too)
+  CK_ScenarioOutput_DecisionExclusive -> CK_Scenario_DecisionExclusive
+  DF_ScenarioOutput_ScenarioNumber    -> DF_Scenario_ScenarioNumber
+  IX_ScenarioOutput_SessionSubActive  -> IX_Scenario_SessionSubActive
+  IX_ScenarioAudit_Output             -> IX_ScenarioAudit_Scenario       (on Scenario_Audit)
+  UX_TreatmentPlan_ActiveOutput       -> UX_TreatmentPlan_ActiveScenario (on Risk_Treatment_Plan)
+
+UX_Scenario_ActiveIdentity and UX_Scenario_ActiveAccepted already fitted and were left alone.
+Threat_Scenario_Control_Map is a DIFFERENT table, created by Control_library.sql, and is NOT
+touched -- it now reads correctly as a map between Threat_Scenario and Control_Library.
+
+This REVERSES the earlier call to leave the index names alone as "a second, riskier operation for
+zero behavioural gain". That held while the table was still Threat_Scenario_Output; renaming the
+table ended it, because the names then pointed at a word absent from the schema.
+
+HARD CUTOVER. The rename block sits above every CREATE in the file because each CREATE is guarded
+on the NEW name -- run them first against a pre-rename database and every guard creates a
+duplicate, after which the rename fails Msg 15335. An old and a new application build cannot both
+run against one database: app/db/invariants.py asserts index names AND their tables at startup.
+Stop the API and the Celery workers, run 1. TSG_Core.sql (or TSG_Core_UAT.sql), run
+6. TSG_Verify.sql, deploy the matching code, then start.

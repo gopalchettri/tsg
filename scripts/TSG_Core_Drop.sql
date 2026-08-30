@@ -8,14 +8,14 @@
    plan and API client in this database is destroyed. Intended for DEVELOPMENT, where recreating
    from a clean schema is faster than migrating.
 
-   DO NOT RUN THIS AGAINST UAT OR PRODUCTION. For those, run scripts/TSG_Core.sql (or
+   DO NOT RUN THIS AGAINST UAT OR PRODUCTION. For those, run scripts/eyshield_handoff/1. TSG_Core.sql (or
    scripts/TSG_Migration_ScenarioLifecycle.sql) instead — both are additive and preserve data.
 
    -------------------------------------------------------------------------------------------
    HOW TO USE
      1. Change @I_UNDERSTAND below from 'NO' to 'YES'. Nothing happens until you do.
      2. Run this file.
-     3. Run scripts/TSG_Core.sql  -> recreates all 13 tables at the current schema, with the
+     3. Run scripts/eyshield_handoff/1. TSG_Core.sql  -> recreates all 13 tables at the current schema, with the
         scenario-lifecycle columns already present. Nothing left to migrate.
      4. Re-insert an API_Client row, then restart the application.
 
@@ -45,6 +45,10 @@ BEGIN
     /* No FOREIGN KEYs exist between these tables, so any order works. */
     IF OBJECT_ID('dbo.Scenario_Audit', 'U')              IS NOT NULL DROP TABLE dbo.Scenario_Audit;
     IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U')         IS NOT NULL DROP TABLE dbo.Risk_Treatment_Plan;
+    IF OBJECT_ID('dbo.Threat_Scenario', 'U')             IS NOT NULL DROP TABLE dbo.Threat_Scenario;
+    /* The pre-rename name, kept deliberately: a database that has not yet had 1. TSG_Core.sql's
+       object-rename applied still carries this table. Dropping only the new name would leave it
+       POPULATED, and the next 1. TSG_Core.sql run would rename it straight back into place. */
     IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U')      IS NOT NULL DROP TABLE dbo.Threat_Scenario_Output;
     IF OBJECT_ID('dbo.Scoped_Threat', 'U')               IS NOT NULL DROP TABLE dbo.Scoped_Threat;
     IF OBJECT_ID('dbo.Identified_Duplicate_Threat', 'U') IS NOT NULL DROP TABLE dbo.Identified_Duplicate_Threat;
@@ -58,14 +62,14 @@ BEGIN
     IF OBJECT_ID('dbo.API_Client', 'U')                  IS NOT NULL DROP TABLE dbo.API_Client;
 
     /* Threat_Scenario_Control_Map is per-SCENARIO data but is created by Control_library.sql,
-       not TSG_Core.sql — so dropping the tables above leaves it holding rows keyed to OutputIDs
+       not TSG_Core.sql — so dropping the tables above leaves it holding rows keyed to ScenarioIDs
        that no longer exist. Emptied rather than dropped: the table would then need
        Control_library.sql re-run to come back, and its rows are session data, not library data. */
     IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NOT NULL
         DELETE FROM dbo.Threat_Scenario_Control_Map;
 
     PRINT '';
-    PRINT '  Dropped. Now run scripts/TSG_Core.sql to recreate all 13 tables.';
+    PRINT '  Dropped. Now run scripts/eyshield_handoff/1. TSG_Core.sql to recreate all 13 tables.';
     PRINT '  (Every index on those tables went with them — DROP TABLE removes its own indexes,';
     PRINT '   so the recreate leaves exactly the 22 indexes TSG_Core.sql defines and no strays.)';
     PRINT '';
@@ -80,12 +84,13 @@ GO
 SELECT name AS RemainingTable
 FROM sys.tables
 WHERE name IN ('Scenario_Session','Subsystem_Stage_State','Identified_Threat',
-               'Identified_Duplicate_Threat','Scoped_Threat','Threat_Scenario_Output',
+               'Identified_Duplicate_Threat','Scoped_Threat','Threat_Scenario',
+               'Threat_Scenario_Output',
                'Threat_Library_Import_Run','Scenario_Audit','Prompt_Log',
                'Threat_Candidate_Review','Risk_Treatment_Plan','Config_Tuning','API_Client')
 ORDER BY name;
 GO
-/* An EMPTY result set means the drop is complete — run scripts/TSG_Core.sql next.
+/* An EMPTY result set means the drop is complete — run scripts/eyshield_handoff/1. TSG_Core.sql next.
    Rows still listed mean @I_UNDERSTAND was left at 'NO' and nothing was dropped. */
 
 /* -- Stale indexes on the tables that SURVIVED ----------------------------------------------

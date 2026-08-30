@@ -338,3 +338,34 @@ def test_verify_script_table_list_matches_create_inventory() -> None:
         f"only in DDL: {sorted(created - listed)}")
     assert f"ALL {len(created)} TSG TABLES EXIST" in sql
     assert f"All {len(created)} TSG tables present" in sql
+
+
+def test_every_sp_rename_actually_renames_something() -> None:
+    """A rename block must stay ASYMMETRIC, or it silently stops renaming anything.
+
+    The object rename of 2026-08-30 was applied by a bulk find-and-replace over the tree. That
+    script's glob EXCLUDES the handoff SQL for exactly one reason: `1. TSG_Core.sql` is the one
+    file that must KEEP the old names, because they are the sources of its sp_rename statements
+    and the left half of every guard.
+
+    Re-run that sweep over this file and nothing errors. Every statement becomes
+    `sp_rename 'dbo.X', 'X'` and every guard becomes `X IS NOT NULL AND X IS NULL` -- permanently
+    false. The rename never runs on any database again, the script still reports success, and the
+    whole suite still passes, because nothing else here compares the two halves.
+
+    This is that comparison. It is deliberately structural rather than a list of the seven current
+    names, so a future rename block inherits the guard without anyone remembering to extend it."""
+    for script in sorted(_SCRIPTS.glob("*.sql")):
+        text = script.read_text(encoding="utf-8-sig", errors="replace")
+        for src, dst in re.findall(
+                r"sp_rename\s+'([^']+)'\s*,\s*'([^']+)'", text, re.I | re.S):
+            leaf = src.split(".")[-1]
+            assert leaf.lower() != dst.lower(), (
+                f"{script.name}: sp_rename '{src}' -> '{dst}' renames a name to ITSELF. "
+                f"A find-and-replace has almost certainly been run over this file; the rename "
+                f"is now a permanent no-op that fails silently on every database.")
+            assert not dst.startswith("dbo."), (
+                f"{script.name}: sp_rename target '{dst}' is schema-qualified. SQL Server does "
+                f"NOT reject this -- it creates an object literally named '{dst}', reachable "
+                f"only as [dbo].[{dst}]. The new name must be bare.")
+

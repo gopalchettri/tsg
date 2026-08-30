@@ -63,9 +63,9 @@ def _load_scenario_and_threat(sess: Session, session_id: str, scenario_id: str) 
     promote a scenario the caller never named.
     """
     out = sess.execute(
-        select(m.Threat_Scenario_Output).where(
-            m.Threat_Scenario_Output.ScenarioID == dal.canonical_guid(scenario_id),
-            m.Threat_Scenario_Output.SessionID == session_id)
+        select(m.Threat_Scenario).where(
+            m.Threat_Scenario.ScenarioID == dal.canonical_guid(scenario_id),
+            m.Threat_Scenario.SessionID == session_id)
     ).scalars().first()
     if out is None:
         raise NotFoundError(f"scenario {scenario_id} not found in session {session_id}")

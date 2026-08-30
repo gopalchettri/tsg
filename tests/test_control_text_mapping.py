@@ -23,7 +23,7 @@ from app.pipeline.control_mapping import collect_control_query
 
 def _engine():
     engine = create_engine("sqlite://")
-    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario_Output,
+    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Threat_Scenario_Control_Map, m.Scenario_Audit,
                 # map_controls joins these to put the THREAT in the control query
                 # (control_mapping.collect_control_query) — without them the join
@@ -47,7 +47,7 @@ def _seed(s, session_id: str, task_id: str) -> str:
         GenerationEpoch=1, ActiveTaskID=task_id,
         LeaseExpiresAt=now + timedelta(minutes=10), HeartbeatAt=now, AttemptCount=1, UpdatedAt=now,
     ))
-    s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+    s.execute(m.Threat_Scenario.__table__.insert().values(
         ScenarioID=scenario_id, SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
         SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
         ScenarioJSON=json.dumps({"scenario_title": "Credential theft against the HMI",
@@ -109,8 +109,8 @@ def test_map_controls_actually_threads_the_threat_into_the_query(monkeypatch):
         scenario_id = _seed(s, sid, task_id)
         # Point the seeded output at a REAL scoped/threat chain — the piece every other
         # map_controls test leaves dangling.
-        s.execute(m.Threat_Scenario_Output.__table__.update()
-                .where(m.Threat_Scenario_Output.ScenarioID == scenario_id)
+        s.execute(m.Threat_Scenario.__table__.update()
+                .where(m.Threat_Scenario.ScenarioID == scenario_id)
                 .values(ScopedThreatID=scoped_id))
         s.execute(m.Scoped_Threat.__table__.insert().values(
             ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="e",

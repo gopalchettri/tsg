@@ -71,7 +71,7 @@ IF OBJECT_ID('dbo.Control_Library_Standard_Map', 'U') IS NOT NULL
     ALTER TABLE Control_Library_Standard_Map ADD CreatedAt datetime2 NULL CONSTRAINT DF_ControlStdMap_CreatedAt DEFAULT SYSUTCDATETIME();
 
 -- Threat_Scenario_Control_Map (Step-4 mapping). Runs after TSG_Core.sql, so
--- Threat_Scenario_Output already exists by the time this CREATE runs.
+-- Threat_Scenario already exists by the time this CREATE runs.
 IF OBJECT_ID('dbo.Threat_Scenario_Control_Map', 'U') IS NULL
 CREATE TABLE Threat_Scenario_Control_Map (
     ScenarioID        uniqueidentifier NOT NULL,

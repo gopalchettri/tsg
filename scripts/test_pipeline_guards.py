@@ -489,7 +489,7 @@ def check_only_one_function_writes_a_scenario_decision() -> None:
     does three things together — applies the opposite decision's exclusion predicate, writes the
     row, and writes one Scenario_Audit ledger entry per scenario. A second writer anywhere gets
     none of them, and the failure is silent: the decision lands, the audit trail quietly does not,
-    and accept/reject stop being mutually exclusive until CK_ScenarioOutput_DecisionExclusive
+    and accept/reject stop being mutually exclusive until CK_Scenario_DecisionExclusive
     surfaces as a 500 somewhere unrelated.
 
     Both are regressions this repo has already had in other forms, which is why the rule is

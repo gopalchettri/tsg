@@ -168,8 +168,8 @@ def eligible_outputs(sess: Session, session_id: str) -> list:
     being silently skipped.
     """
     already_mapped = select(m.Threat_Scenario_Control_Map.ScenarioID).where(
-        m.Threat_Scenario_Control_Map.ScenarioID == m.Threat_Scenario_Output.ScenarioID)
-    out_t, st_t, it_t = m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat
+        m.Threat_Scenario_Control_Map.ScenarioID == m.Threat_Scenario.ScenarioID)
+    out_t, st_t, it_t = m.Threat_Scenario, m.Scoped_Threat, m.Identified_Threat
     return sess.execute(
         select(out_t.ScenarioID, out_t.ScenarioJSON,
             it_t.ThreatName, it_t.ThreatType,
@@ -249,8 +249,8 @@ def _stamp_mapped_outputs(sess: Session, outputs, per_output, answered: list[str
     # into "controls.mapping_failed", i.e. every output left unstamped and unmapped.
     to_stamp = answered + [row[0] for row in outputs if row[0] not in groundable]
     if to_stamp:
-        sess.execute(update(m.Threat_Scenario_Output)
-                    .where(m.Threat_Scenario_Output.ScenarioID.in_(to_stamp))
+        sess.execute(update(m.Threat_Scenario)
+                    .where(m.Threat_Scenario.ScenarioID.in_(to_stamp))
                     .values(ControlsMappedAt=now()))
 
 
@@ -415,7 +415,7 @@ def sessions_awaiting_control_mapping(sess: Session, limit: int = SWEEP_LIMIT) -
     its own `stage_settled_at_epoch` fallback: the sweep holds no stage claim, so `renew_lease`
     correctly fails and the settled check is what authorises it.
     """
-    out, ses, st = m.Threat_Scenario_Output, m.Scenario_Session, m.Subsystem_Stage_State
+    out, ses, st = m.Threat_Scenario, m.Scenario_Session, m.Subsystem_Stage_State
     cutoff = now() - timedelta(seconds=get_settings().stage_lease_seconds)
     rows = sess.execute(
         select(out.SessionID, out.SubsystemID, st.GenerationEpoch)

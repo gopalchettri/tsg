@@ -57,7 +57,7 @@ def _engine(tmp_path):
 
 def _create_all(engine):
     for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Identified_Threat,
-                m.Scoped_Threat, m.Threat_Scenario_Output, m.Threat_Scenario_Control_Map,
+                m.Scoped_Threat, m.Threat_Scenario, m.Threat_Scenario_Control_Map,
                 m.Scenario_Audit, m.Prompt_Log):
         tbl.__table__.create(engine)
     return engine
@@ -136,7 +136,7 @@ def _run(monkeypatch, engine, llm, *, concurrency=3):
 
 def _outputs(Session):
     with Session() as s:
-        rows = s.execute(m.Threat_Scenario_Output.__table__.select()).mappings().all()
+        rows = s.execute(m.Threat_Scenario.__table__.select()).mappings().all()
         scoped = {r["ScopedThreatID"]: r["ThreatID"] for r in s.execute(
             m.Scoped_Threat.__table__.select()).mappings()}
     return {scoped.get(r["ScopedThreatID"]): r for r in rows}

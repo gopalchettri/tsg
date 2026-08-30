@@ -51,7 +51,7 @@ def _engine():
                 return None      # which is what MSSQL's JSON_VALUE does for a bad path/blob
         dbapi_conn.create_function("json_value", 2, json_value)
 
-    for table in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario_Output,
+    for table in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Scenario_Audit, m.Identified_Threat, m.Scoped_Threat, m.Threat_Type,
                 m.Threat_Catalogue, m.Risk_Treatment_Plan, m.Threat_Scenario_Control_Map,
                 m.Control_Library):
@@ -68,10 +68,10 @@ def _engine():
     # present and future test in this file, rather than fixing the one test that got it wrong.
     with engine.begin() as conn:
         conn.exec_driver_sql(
-            "CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output"
+            "CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario"
             "(SessionID, IdentityHash, ScenarioNumber) WHERE Superseded = 0")
         conn.exec_driver_sql(
-            "CREATE UNIQUE INDEX UX_Scenario_ActiveAccepted ON Threat_Scenario_Output"
+            "CREATE UNIQUE INDEX UX_Scenario_ActiveAccepted ON Threat_Scenario"
             "(SessionID, IdentityHash, ScenarioNumber) WHERE Accepted = 1 AND IdentityHash IS NOT NULL")
     return engine
 
@@ -116,7 +116,7 @@ def _scenario(Session, sid: str, *, identity: str, number: int = 1, superseded: 
               replaces: str | None = None, title: str = "T") -> str:
     oid = str(uuid.uuid4())
     with Session() as s:
-        s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+        s.execute(m.Threat_Scenario.__table__.insert().values(
             ScenarioID=oid, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
             SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=status,
             ScenarioJSON=json.dumps({"scenario_title": title, "scenario_statement": "s",
@@ -147,9 +147,9 @@ def _accept(Session, sid: str, subset, monkeypatch) -> int:
 
 def _flags(Session, oid: str) -> tuple[int, int]:
     with Session() as s:
-        row = s.execute(select(m.Threat_Scenario_Output.Accepted,
-                               m.Threat_Scenario_Output.Superseded)
-                        .where(m.Threat_Scenario_Output.ScenarioID == oid)).one()
+        row = s.execute(select(m.Threat_Scenario.Accepted,
+                               m.Threat_Scenario.Superseded)
+                        .where(m.Threat_Scenario.ScenarioID == oid)).one()
         return row[0], row[1]
 
 
@@ -273,7 +273,7 @@ def test_unacceptable_reasons_no_longer_flag_superseded():
 
 
 def test_new_index_registered_in_boot_invariants():
-    assert ("UX_Scenario_ActiveAccepted", "Threat_Scenario_Output",
+    assert ("UX_Scenario_ActiveAccepted", "Threat_Scenario",
             ("SessionID", "IdentityHash", "ScenarioNumber")) in REQUIRED_INDEXES
 
 

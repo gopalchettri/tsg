@@ -1510,7 +1510,7 @@ def _begin_full_run_attempt(sess: Session, sid: str, ss: int, tenant: str,
     attempt = dal.stage_attempt_count(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch)
     if attempt == 1:
         dal.supersede(sess, m.Scoped_Threat, sid, ss)
-        dal.supersede(sess, m.Threat_Scenario_Output, sid, ss)
+        dal.supersede(sess, m.Threat_Scenario, sid, ss)
         not_selected = [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)
                         for sc, scoped_id, _t in pairs if not sc.selected]
         if not_selected:
@@ -1619,7 +1619,7 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
         for r in output_rows:
             r["ReplacesScenarioID"] = retired.get((r["IdentityHash"], r["ScenarioNumber"]))
     if output_rows:
-        sess.execute(insert(m.Threat_Scenario_Output), output_rows)
+        sess.execute(insert(m.Threat_Scenario), output_rows)
     return True
 
 
@@ -1697,7 +1697,7 @@ def _persist_full_run_failure(sess: Session, sid: str, ss: int, tenant: str, ent
     dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, {sc.threat_id})
     sess.execute(insert(m.Scoped_Threat),
                 [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
-    sess.execute(insert(m.Threat_Scenario_Output),
+    sess.execute(insert(m.Threat_Scenario),
                 [_build_error_output_row(scoped_id, sid, tenant, ss, client_msg, epoch,
                                         entity_id, user_id, info, replaces_scenario_id=retired_card)])
     sess.commit()
@@ -1715,7 +1715,7 @@ def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, en
     dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, {sc.threat_id})
     sess.execute(insert(m.Scoped_Threat),
                 [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
-    sess.execute(insert(m.Threat_Scenario_Output),
+    sess.execute(insert(m.Threat_Scenario),
                 [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
                                             entity_id, user_id, info, replaces_scenario_id=retired_card,
                                             source=source)])
@@ -2052,7 +2052,7 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
         try:
             sess.execute(insert(m.Scoped_Threat),
                         [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
-            sess.execute(insert(m.Threat_Scenario_Output),
+            sess.execute(insert(m.Threat_Scenario),
                         [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
                                                     entity_id, user_id, info,
                                                     scenario_number=item["next_number"])])

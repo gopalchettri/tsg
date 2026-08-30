@@ -109,7 +109,7 @@ class SelectionReason(StrEnum):
 
 
 class ScenarioStatus(StrEnum):
-    """`Threat_Scenario_Output.Status` — one generated scenario row's outcome. Not StageStatus."""
+    """`Threat_Scenario.Status` — one generated scenario row's outcome. Not StageStatus."""
     complete = "complete"
     error = "error"        # FAILURE CARD: a failed generation keeps a row (null scenario +
                         # ErrorMessage) so /regenerate/scenarios can retry it individually.

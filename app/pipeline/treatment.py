@@ -615,7 +615,7 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
     audit_ident = {"SessionID": row["SessionID"], "TenantID": row["TenantID"],
                 "EntityID": row["EntityID"], "UserID": row["UserID"]}
     # ScenarioID included: without it these worker-written treatment_plan_outcome rows leave the
-    # indexed column NULL, stay OUTSIDE the filtered IX_ScenarioAudit_Output, and cannot say WHICH
+    # indexed column NULL, stay OUTSIDE the filtered IX_ScenarioAudit_Scenario, and cannot say WHICH
     # scenario they belong to — so the per-scenario trail had to fetch a whole session and discard
     # the rest in Python. It is not an optimisation: a row that cannot name its subject is unusable
     # in a timeline. The API-side writes were stamped already; these two were the gap.

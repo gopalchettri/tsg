@@ -57,8 +57,8 @@ INSERT INTO @tsg_tables (TableName) VALUES
     (N'Threat_Catalogue'),
     (N'Threat_Catalogue_Category_Map'),
     (N'Threat_Category'),
+    (N'Threat_Scenario'),
     (N'Threat_Scenario_Control_Map'),
-    (N'Threat_Scenario_Output'),
     (N'Threat_Type'),
     (N'ThreatType_ThreatActor_Map');
 
@@ -79,19 +79,19 @@ WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Tables');
 -- These are not performance indexes. Each one enforces a correctness rule the
 -- code relies on — one active session per asset, one active scenario per
 -- identity, unique library natural keys, one in-flight grounding calibration per
--- model pair, and so on. The application checks all twelve at every start and
+-- model pair, and so on. The application checks all thirteen at every start and
 -- REFUSES TO BOOT if one is missing, on the wrong table, or missing a column.
 DECLARE @req_indexes TABLE (IndexName sysname, TableName sysname, Cols nvarchar(400));
 INSERT INTO @req_indexes (IndexName, TableName, Cols) VALUES
     (N'UX_Session_ActiveAsset', N'Scenario_Session', N'EntityID,AssetID'),
-    (N'UX_Scenario_ActiveIdentity', N'Threat_Scenario_Output', N'SessionID,IdentityHash,ScenarioNumber'),
-    (N'UX_Scenario_ActiveAccepted', N'Threat_Scenario_Output', N'SessionID,IdentityHash,ScenarioNumber'),
+    (N'UX_Scenario_ActiveIdentity', N'Threat_Scenario', N'SessionID,IdentityHash,ScenarioNumber'),
+    (N'UX_Scenario_ActiveAccepted', N'Threat_Scenario', N'SessionID,IdentityHash,ScenarioNumber'),
     (N'UX_ThreatType_NaturalKey', N'Threat_Type', N'ThreatTypeName'),
     (N'UX_ThreatCatalogue_NaturalKey', N'Threat_Catalogue', N'ThreatName'),
     (N'UX_ThreatActor_NaturalKey', N'Threat_Actor', N'ThreatActorName'),
     (N'UX_ThreatCategory_NaturalKey', N'Threat_Category', N'ThreatCategoryName'),
     (N'UX_SubsystemStageState_SessionSubLevel', N'Subsystem_Stage_State', N'SessionID,SubsystemID,Level'),
-    (N'UX_TreatmentPlan_ActiveOutput', N'Risk_Treatment_Plan', N'ScenarioID'),
+    (N'UX_TreatmentPlan_ActiveScenario', N'Risk_Treatment_Plan', N'ScenarioID'),
     (N'UX_Session_IdempotencyKey', N'Scenario_Session', N'EntityID,IdempotencyKey'),
     (N'UX_Control_Standard_Name', N'Control_Standard', N'StandardName'),
     (N'UX_Control_Library_Code', N'Control_Library', N'ControlCode'),
@@ -204,12 +204,12 @@ WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Columns');
 -- will reject is worse than no verification: it turns a loud failure into an
 -- approved one.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Scenario lifecycle', 'FAIL', N'Column missing: Threat_Scenario_Output.' + x.C,
+SELECT 'Scenario lifecycle', 'FAIL', N'Column missing: Threat_Scenario.' + x.C,
        N'Records who declined a scenario and when. Added by TSG_Core.sql; its absence means that '
      + N'script did not run to completion. Re-run it — it is guarded and idempotent.'
 FROM (VALUES (N'RejectedAt'), (N'RejectedBy')) AS x(C)
-WHERE OBJECT_ID(N'dbo.Threat_Scenario_Output') IS NOT NULL
-  AND COL_LENGTH(N'dbo.Threat_Scenario_Output', x.C) IS NULL;
+WHERE OBJECT_ID(N'dbo.Threat_Scenario') IS NOT NULL
+  AND COL_LENGTH(N'dbo.Threat_Scenario', x.C) IS NULL;
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Scenario lifecycle', 'FAIL', N'Column missing: Scenario_Audit.ScenarioID',
@@ -221,26 +221,27 @@ WHERE OBJECT_ID(N'dbo.Scenario_Audit') IS NOT NULL
 -- Accept and reject are mutually exclusive. Enforced in the DATABASE because they are independent
 -- routes reachable at any time, so the row itself is the only place both orderings meet.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Scenario lifecycle', 'FAIL', N'Constraint missing: CK_ScenarioOutput_DecisionExclusive',
+SELECT 'Scenario lifecycle', 'FAIL', N'Constraint missing: CK_Scenario_DecisionExclusive',
        N'Without it a scenario can be recorded as BOTH accepted and rejected. The service layer '
      + N'also checks, but this constraint is the arbiter when two decisions race.'
-WHERE OBJECT_ID(N'dbo.Threat_Scenario_Output') IS NOT NULL
-  AND COL_LENGTH(N'dbo.Threat_Scenario_Output', N'RejectedAt') IS NOT NULL
+WHERE OBJECT_ID(N'dbo.Threat_Scenario') IS NOT NULL
+  AND COL_LENGTH(N'dbo.Threat_Scenario', N'RejectedAt') IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM sys.check_constraints
-                  WHERE name = 'CK_ScenarioOutput_DecisionExclusive');
+                  WHERE name = 'CK_Scenario_DecisionExclusive');
 
 -- Checked HERE and not via @req_indexes: that block FAILs any index with is_unique = 0, and this
 -- one is deliberately non-unique AND filtered. Registering it there would fail every correctly
 -- installed database. app/db/invariants.py leaves it out for exactly the same reason.
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Scenario lifecycle', 'FAIL', N'Index missing: IX_ScenarioAudit_Output',
-       N'Filtered index on Scenario_Audit(ScenarioID, CreatedAt DESC). The application asserts it at '
-     + N'startup and will NOT BOOT without it. Re-run TSG_Core.sql.'
+SELECT 'Scenario lifecycle', 'FAIL', N'Index missing: IX_ScenarioAudit_Scenario',
+       N'Filtered index on Scenario_Audit(ScenarioID, CreatedAt DESC). NOT boot-asserted, for the '
+     + N'reason in the note above; without it the per-scenario audit read scans the whole ledger. '
+     + N'Re-run TSG_Core.sql.'
 WHERE OBJECT_ID(N'dbo.Scenario_Audit') IS NOT NULL
   AND COL_LENGTH(N'dbo.Scenario_Audit', N'ScenarioID') IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM sys.indexes i
                   JOIN sys.tables t ON t.object_id = i.object_id
-                  WHERE i.name = 'IX_ScenarioAudit_Output' AND t.name = 'Scenario_Audit');
+                  WHERE i.name = 'IX_ScenarioAudit_Scenario' AND t.name = 'Scenario_Audit');
 
 -- The backfill. Schema presence does not prove the migration finished: generation now completes a
 -- session at its review barrier, and the accept path that used to close pre-release sessions no
@@ -257,8 +258,8 @@ HAVING COUNT(*) > 0;
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
 SELECT 'Scenario lifecycle', 'PASS', N'Scenario-lifecycle schema complete and backfill applied',
-       N'RejectedAt/RejectedBy, CK_ScenarioOutput_DecisionExclusive, Scenario_Audit.ScenarioID and '
-     + N'IX_ScenarioAudit_Output all present; no session stranded at active+REVIEW.'
+       N'RejectedAt/RejectedBy, CK_Scenario_DecisionExclusive, Scenario_Audit.ScenarioID and '
+     + N'IX_ScenarioAudit_Scenario all present; no session stranded at active+REVIEW.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Scenario lifecycle');
 
 -- ---------------------------------------------------------------------------
@@ -291,7 +292,7 @@ INSERT INTO @enum_cols (TableName, ColumnName, NeedChars, EnumName, LongestValue
     (N'Subsystem_Stage_State',       N'Status',            27, N'StageStatus',            N'SCENARIOS_AWAITING_DECISION'),
     (N'Identified_Threat',           N'GroundingStatus',   10, N'GroundingStatus',        N'unverified'),
     (N'Identified_Duplicate_Threat', N'DuplicateReason',   23, N'DuplicateReason',        N'semantic_cross_category'),
-    (N'Threat_Scenario_Output',      N'Status',             8, N'ScenarioStatus',         N'complete'),
+    (N'Threat_Scenario',      N'Status',             8, N'ScenarioStatus',         N'complete'),
     (N'Risk_Treatment_Plan',         N'Status',             8, N'StageStatus subset',     N'COMPLETE'),
     (N'Risk_Treatment_Plan',         N'TreatmentStrategy',  8, N'TreatmentStrategy',      N'Mitigate'),
     (N'Risk_Treatment_Plan',         N'RiskLevel',          8, N'RiskLevel',              N'Critical'),

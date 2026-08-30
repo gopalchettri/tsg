@@ -33,7 +33,7 @@ NOW = datetime.now(UTC)
 
 def _engine():
     engine = create_engine("sqlite://")
-    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario_Output,
+    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Threat_Scenario_Control_Map, m.Scenario_Audit,
                 # map_controls joins these to put the THREAT in the control query
                 # (control_mapping.collect_control_query) — without them the join
@@ -57,7 +57,7 @@ def _seed(s, session_id: str, task_id: str, n_outputs: int = 3) -> list[str]:
     for i in range(n_outputs):
         oid = str(uuid.uuid4())
         ids.append(oid)
-        s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+        s.execute(m.Threat_Scenario.__table__.insert().values(
             ScenarioID=oid, SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
             SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
             ScenarioJSON=json.dumps({"scenario_title": f"title {i}",
@@ -93,7 +93,7 @@ def _run(Session, sid, task_id):
 def _state(Session):
     with Session() as s:
         outputs = {r.ScenarioID: r for r in s.execute(
-            m.Threat_Scenario_Output.__table__.select()).all()}
+            m.Threat_Scenario.__table__.select()).all()}
         maps = s.execute(m.Threat_Scenario_Control_Map.__table__.select()).all()
         audits = [json.loads(a.DetailJSON) for a in s.execute(
             m.Scenario_Audit.__table__.select()).all() if a.DetailJSON]

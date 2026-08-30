@@ -230,8 +230,8 @@ class Scoped_Threat(Base):
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 
-class Threat_Scenario_Output(Base):
-    __tablename__ = "Threat_Scenario_Output"
+class Threat_Scenario(Base):
+    __tablename__ = "Threat_Scenario"
     # Declared here as well as in TSG_Core.sql, and NOT redundantly: the app never runs
     # create_all (db/engine.py forbids it), so this materialises only where tables are built
     # FROM the models — the SQLite test engines. Without it a test can assert that accept and
@@ -241,7 +241,7 @@ class Threat_Scenario_Output(Base):
     # instead of each one remembering.
     __table_args__ = (
         CheckConstraint("RejectedAt IS NULL OR Accepted = 0",
-                        name="CK_ScenarioOutput_DecisionExclusive"),
+                        name="CK_Scenario_DecisionExclusive"),
     )
     ScenarioID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
@@ -281,7 +281,7 @@ class Threat_Scenario_Output(Base):
     # load-bearing in the accept and promotion predicates (dal.mark_scenarios_accepted,
     # accept._promotion_candidates), so overloading it would couple a human decision to them.
     # Mutually exclusive with Accepted=1, enforced in the DATABASE by
-    # CK_ScenarioOutput_DecisionExclusive — accept and reject are independent routes reachable in
+    # CK_Scenario_DecisionExclusive — accept and reject are independent routes reachable in
     # either order, so the row itself is the one place both orderings must meet.
     # WHERE THE TEXT CAME FROM. Always "generated" now — the cross-tenant scenario-reuse
     # feature (Scenario_Library, "library" values) was removed 2026-08-29. Column kept, not
@@ -343,7 +343,7 @@ class Grounding_Calibration_Run(Base):
 
 class Threat_Scenario_Control_Map(Base):
     """Step 4: which Control_Library rows mitigate one generated scenario (control_mapping.map_controls).
-    No Superseded/epoch columns — visibility follows the parent Threat_Scenario_Output row,
+    No Superseded/epoch columns — visibility follows the parent Threat_Scenario row,
     same posture as Scoped_Threat. Composite PK doubles as the dedup guard."""
     __tablename__ = "Threat_Scenario_Control_Map"
     ScenarioID: Mapped[str] = mapped_column(GUID, primary_key=True)
@@ -358,14 +358,14 @@ class Threat_Scenario_Control_Map(Base):
 class Risk_Treatment_Plan(Base):
     """One LLM-generated Risk Treatment Plan attempt for an ACCEPTED scenario
     (docs/RISK_TREATMENT_PLAN_SDD.md). At most one active (Superseded=0) row per ScenarioID —
-    UX_TreatmentPlan_ActiveOutput is the concurrent-POST race arbiter. Deliberately OUTSIDE the
+    UX_TreatmentPlan_ActiveScenario is the concurrent-POST race arbiter. Deliberately OUTSIDE the
     Subsystem_Stage_State machinery: accepted scenarios live on completed sessions, where
     acquire_lock/claim_stage refuse to run, so this row's own Status column is the state.
     Regenerate = supersede + new row; rows are never reused, so no GenerationEpoch."""
     __tablename__ = "Risk_Treatment_Plan"
     PlanID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
-    ScenarioID: Mapped[str] = mapped_column(GUID)               # the accepted Threat_Scenario_Output
+    ScenarioID: Mapped[str] = mapped_column(GUID)               # the accepted Threat_Scenario
     TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))  # copied from the session (authz boundary)
     UserID: Mapped[str | None] = mapped_column(Unicode(200))    # requesting principal (provenance)
@@ -624,7 +624,7 @@ class Scenario_Audit(Base):
     EventType: Mapped[str] = mapped_column(Unicode(100))
     # The scenario this event is ABOUT — set only on the per-scenario decision rows
     # (scenario_accepted / scenario_rejected), NULL on every session- or subsystem-scoped event.
-    # A real column rather than a DetailJSON key: IX_ScenarioAudit_Output makes "the decision
+    # A real column rather than a DetailJSON key: IX_ScenarioAudit_Scenario makes "the decision
     # history of this scenario" a seek, which is the query a GRC reviewer actually runs.
     ScenarioID: Mapped[str | None] = mapped_column(GUID)
     # The plan a treatment event concerns — a real column for the same reason as ScenarioID above:

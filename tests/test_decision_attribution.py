@@ -31,8 +31,8 @@ OTHER = "u2"
 
 def _row(Session, oid: str):
     with Session() as s:
-        return s.execute(m.Threat_Scenario_Output.__table__.select().where(
-            m.Threat_Scenario_Output.ScenarioID == oid)).mappings().one()
+        return s.execute(m.Threat_Scenario.__table__.select().where(
+            m.Threat_Scenario.ScenarioID == oid)).mappings().one()
 
 
 def _session_row(Session, sid: str):
@@ -90,7 +90,7 @@ def test_a_second_accept_keeps_the_first_acceptor(monkeypatch):
 
 
 def test_an_accepted_row_carries_no_rejection_attribution(monkeypatch):
-    """The two decisions are mutually exclusive (CK_ScenarioOutput_DecisionExclusive); their
+    """The two decisions are mutually exclusive (CK_Scenario_DecisionExclusive); their
     attribution must be too, or a row could name a rejecter it never had."""
     monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
     Session = sessionmaker(bind=_engine(), future=True)

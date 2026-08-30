@@ -29,11 +29,11 @@ REQUIRED_INDEXES = [
     # One active session per asset / one active scenario per scoped threat. Stops
     # duplicate "current" rows from a retried or racing request.
     ("UX_Session_ActiveAsset", "Scenario_Session", ("EntityID", "AssetID")),
-    ("UX_Scenario_ActiveIdentity", "Threat_Scenario_Output", ("SessionID", "IdentityHash", "ScenarioNumber")),
+    ("UX_Scenario_ActiveIdentity", "Threat_Scenario", ("SessionID", "IdentityHash", "ScenarioNumber")),
     # One ACCEPTED version per scenario identity. Accepted is decoupled from Superseded (an
     # older, superseded version may be the accepted one), so the active-identity index above
     # no longer implies this — filtered WHERE Accepted = 1.
-    ("UX_Scenario_ActiveAccepted", "Threat_Scenario_Output", ("SessionID", "IdentityHash", "ScenarioNumber")),
+    ("UX_Scenario_ActiveAccepted", "Threat_Scenario", ("SessionID", "IdentityHash", "ScenarioNumber")),
     # Master-library natural keys — makes concurrent promote-on-accept safe: two sessions
     # accepting at once can't both create the same library master.
     # NAME-ONLY since the 2026-08 duplicate-elimination change: SectorID/ThreatCategoryID used to
@@ -55,7 +55,7 @@ REQUIRED_INDEXES = [
     # (docs/RISK_TREATMENT_PLAN_SDD.md §4.1). The companion IX_TreatmentPlan_SessionActive is
     # a plain performance index and deliberately NOT listed: this check rejects non-unique
     # entries, and registering it would make every boot fail with the DDL correctly applied.
-    ("UX_TreatmentPlan_ActiveOutput", "Risk_Treatment_Plan", ("ScenarioID",)),
+    ("UX_TreatmentPlan_ActiveScenario", "Risk_Treatment_Plan", ("ScenarioID",)),
     # One in-flight calibration per embedding+reranker pair. A sweep costs 10-15 minutes and ~100
     # billed LLM calls, and the route CANNOT stop a double-start by itself: two requests arriving
     # together both read "nothing running" before either writes. Only the DB refusing the second
@@ -98,7 +98,7 @@ REQUIRED_NOT_NULL = [
 # deliberately absent — they are MEANT to hold many active rows per subsystem; their guard
 # against duplicate/retried writes is the epoch CAS, not uniqueness.
 ACTIVE_UNIQUE = [
-    (m.Threat_Scenario_Output, ["SessionID", "ScopedThreatID"]),
+    (m.Threat_Scenario, ["SessionID", "ScopedThreatID"]),
 ]
 
 

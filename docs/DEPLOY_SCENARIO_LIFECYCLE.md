@@ -20,21 +20,21 @@ accepted, or rejected — for as long as the reviewer needs, across days and acr
 ## 1. Run the schema script — BEFORE deploying the code
 
 ```
-scripts/TSG_Core.sql
+scripts/eyshield_handoff/1. TSG_Core.sql
 ```
 
 Guarded and idempotent; safe to re-run. It applies:
 
 | Object | Purpose |
 |---|---|
-| `Threat_Scenario_Output.RejectedAt` / `RejectedBy` | Records who declined a scenario and when |
-| `CK_ScenarioOutput_DecisionExclusive` | A scenario cannot be both accepted and rejected |
+| `Threat_Scenario.RejectedAt` / `RejectedBy` | Records who declined a scenario and when |
+| `CK_Scenario_DecisionExclusive` | A scenario cannot be both accepted and rejected |
 | `Scenario_Audit.ScenarioID` | Which scenario a decision event is about |
-| `IX_ScenarioAudit_Output` | Makes "the decision history of this scenario" a seek, not a scan |
+| `IX_ScenarioAudit_Scenario` | Makes "the decision history of this scenario" a seek, not a scan |
 
-**Customer/UAT sites provision from the mirrors instead** — `scripts/eyshield_handoff/1. TSG_Core.sql`
-(install) and `TSG_Core_UAT.sql` (upgrade). Both are byte-identical to the canonical script and a
-test enforces that; do not hand-edit them.
+**Customer/UAT sites run `TSG_Core_UAT.sql` instead** — the upgrade variant of the same script.
+A test enforces that its body matches `1. TSG_Core.sql` below the `SET QUOTED_IDENTIFIER ON;`
+marker, so do not hand-edit it; regenerate it from core.
 
 ## 2. The backfill — mandatory wherever the existing data matters
 

@@ -99,7 +99,7 @@ def test_retrieved_style_grounding_is_library_provenance():
 def _seeded_session(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'parity.db'}")
     for tbl in (m.Scenario_Session, m.Identified_Threat, m.Scoped_Threat,
-                m.Threat_Scenario_Output):
+                m.Threat_Scenario):
         tbl.__table__.create(engine)
     Session = sessionmaker(bind=engine, future=True)
     sid = str(uuid.uuid4())
@@ -117,7 +117,7 @@ def _seeded_session(tmp_path):
             ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="e",
             SubsystemID=0, ThreatID=row["ThreatID"], Score=77.0, ScopeRank=1, Selected=1,
             Superseded=0, CreatedAt=NOW))
-        s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+        s.execute(m.Threat_Scenario.__table__.insert().values(
             ScenarioID=scenario_id, SessionID=sid, TenantID="t", EntityID="e", SubsystemID=0,
             ScopedThreatID=scoped_id, Status="complete", ScenarioJSON="{}",
             Accepted=1, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW,
@@ -137,7 +137,7 @@ def test_both_read_paths_serve_the_identical_threat_block(tmp_path):
         accepted_row = dal.accepted_scenarios(s, sid)[0]
         results_row = dict(s.execute(
             sessions_mod._scenario_select().where(
-                m.Threat_Scenario_Output.SessionID == sid)).mappings().one())
+                m.Threat_Scenario.SessionID == sid)).mappings().one())
     block_a = sessions_mod._threat_block(accepted_row, {"APT33": 3})
     block_r = sessions_mod._threat_block(results_row, {"APT33": 3})
     assert block_a == block_r

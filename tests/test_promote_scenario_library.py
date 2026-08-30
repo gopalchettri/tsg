@@ -55,7 +55,7 @@ ACTORS_JSON = json.dumps({"actors": ["APT-Nova", "Insider"], "actor_ids": [9, 31
 _TABLES = (m.Threat_Category, m.Threat_Type, m.Threat_Actor, m.Threat_Catalogue,
            m.ThreatType_ThreatActor_Map, m.Threat_Catalogue_Category_Map,
            m.Control_Library, m.Threat_Scenario_Control_Map,
-           m.Identified_Threat, m.Scoped_Threat, m.Threat_Scenario_Output, m.Scenario_Audit)
+           m.Identified_Threat, m.Scoped_Threat, m.Threat_Scenario, m.Scenario_Audit)
 
 
 @pytest.fixture
@@ -122,7 +122,7 @@ def _seed(sf, *, accepted=1, rejected_at=None, superseded_out=0, superseded_thre
         s.add(m.Scoped_Threat(ScopedThreatID=stid, SessionID=sid, TenantID="t", EntityID="e",
                               UserID="u", SubsystemID=0, ThreatID=tid, Score=1.0, ScopeRank=1,
                               Selected=1))
-        s.add(m.Threat_Scenario_Output(
+        s.add(m.Threat_Scenario(
             ScenarioID=oid, SessionID=sid, TenantID="t", EntityID="e", UserID="u", SubsystemID=0,
             ScopedThreatID=stid, Status=status, ScenarioJSON="{}", Accepted=accepted,
             RejectedAt=rejected_at, IdentityHash="h", ScenarioNumber=1,

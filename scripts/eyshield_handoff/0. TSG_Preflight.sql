@@ -210,7 +210,13 @@ DECLARE @tsg_existing int = (
         N'Scoped_Threat', N'Subsystem_Stage_State',
         N'Threat_Actor', N'Threat_Catalogue', N'Threat_Catalogue_Category_Map',
         N'Threat_Category', N'ThreatType_ThreatActor_Map',
-        N'Threat_Scenario_Control_Map', N'Threat_Scenario_Output', N'Threat_Type'));
+        N'Threat_Scenario_Control_Map', N'Threat_Scenario', N'Threat_Scenario_Output',
+        N'Threat_Type'));
+-- 22 names, but at most 21 can be present at once: a database carries EITHER the pre-rename
+-- Threat_Scenario_Output OR the renamed Threat_Scenario, never both. Both are listed because this
+-- script runs BEFORE 1. TSG_Core.sql performs the rename, so a healthy legacy database must still
+-- count 21 and report UPGRADE rather than a false PARTIAL. The three "21" literals below are
+-- therefore still correct and deliberately unchanged.
 
 INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
 SELECT 'Install type', 'INFO',

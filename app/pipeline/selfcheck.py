@@ -169,7 +169,7 @@ def check_litellm_proxy_health() -> str | None:
 
 
 def check_orphaned_scenario_outputs(sess: Session) -> str | None:
-    """Warn on any active Threat_Scenario_Output whose Scoped_Threat parent is superseded or gone.
+    """Warn on any active Threat_Scenario whose Scoped_Threat parent is superseded or gone.
 
     This shape renders INCONSISTENTLY and silently: /results returns the row in `scenarios[]`
     (dal's scenario read select outer-joins with no Superseded predicate on the parent) while
@@ -182,7 +182,7 @@ def check_orphaned_scenario_outputs(sess: Session) -> str | None:
     dal.supersede_outputs_for_threats now closes it; this is the regression guard, and it catches
     any FUTURE one-sided supersede too, because it asserts the invariant rather than the fix.
     Cheap: one NOT EXISTS, no session scoping, nothing session-specific to iterate."""
-    o, st = m.Threat_Scenario_Output, m.Scoped_Threat
+    o, st = m.Threat_Scenario, m.Scoped_Threat
     has_active_parent = select(st.ScopedThreatID).where(
         st.ScopedThreatID == o.ScopedThreatID, st.Superseded == 0)
     orphans = sess.execute(

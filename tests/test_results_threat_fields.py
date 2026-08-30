@@ -57,7 +57,7 @@ def _engine():
                 return None
         dbapi_conn.create_function("json_value", 2, json_value)
 
-    for table in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario_Output,
+    for table in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Scenario_Audit, m.Identified_Threat, m.Scoped_Threat, m.Threat_Type,
                 m.Risk_Treatment_Plan, m.Threat_Scenario_Control_Map,
                 m.Control_Library, m.Threat_Actor, m.Control_Standard,
@@ -102,7 +102,7 @@ def _seed(Session) -> tuple[str, str]:
             ScopedThreatID=scoped_id, SessionID=SID, TenantID="t", EntityID=ENTITY,
             SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=1, Selected=1,
             Superseded=0, CreatedAt=NOW))
-        s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+        s.execute(m.Threat_Scenario.__table__.insert().values(
             ScenarioID=scenario_id, SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
             SubsystemID=0, ScopedThreatID=scoped_id, Status=ScenarioStatus.complete,
             ScenarioJSON=json.dumps({"scenario_title": "t", "scenario_statement": "s",
@@ -216,7 +216,7 @@ def test_failure_card_still_reports_which_threat_failed(monkeypatch):
             ScopedThreatID=failed_scoped, SessionID=SID, TenantID="t", EntityID=ENTITY,
             SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=2, Selected=1,
             Superseded=0, CreatedAt=NOW))
-        s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+        s.execute(m.Threat_Scenario.__table__.insert().values(
             ScenarioID=failed_output, SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
             SubsystemID=0, ScopedThreatID=failed_scoped, Status=ScenarioStatus.error,
             ScenarioJSON=None, ErrorMessage="LLM call failed",

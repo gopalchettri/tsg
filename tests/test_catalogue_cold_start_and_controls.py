@@ -214,7 +214,7 @@ def _control_engine(controls, categories=()):
 
 def _outputs_engine():
     engine = create_engine("sqlite://")
-    for tbl in (m.Threat_Scenario_Output, m.Scoped_Threat, m.Identified_Threat,
+    for tbl in (m.Threat_Scenario, m.Scoped_Threat, m.Identified_Threat,
                 m.Threat_Scenario_Control_Map):
         tbl.__table__.create(engine)
     return engine
@@ -234,7 +234,7 @@ def _seed_output(s, sid: str, out_id: str, *, catalogue_id=None, library_name=No
     s.execute(m.Scoped_Threat.__table__.insert().values(
         ScopedThreatID=st_id, SessionID=sid, SubsystemID=0, ThreatID=tid,
         Score=1.0, ScopeRank=1, Selected=1))
-    s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+    s.execute(m.Threat_Scenario.__table__.insert().values(
         ScenarioID=out_id, SessionID=sid, SubsystemID=0, ScopedThreatID=st_id,
         Status=ScenarioStatus.complete, ScenarioJSON=json.dumps({"title": out_id}),
         Accepted=0, Superseded=0, ControlsMappedAt=mapped_at))

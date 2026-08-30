@@ -19,6 +19,13 @@
 --   sqlcmd -b -S <server> -d <database> -E -i TSG_Core.sql
 -- (-b: exit non-zero on any SQL error instead of burying it mid-output and reporting
 -- success. -E = Windows auth; use -U/-P where those environments use SQL logins.)
+--
+-- HARD CUTOVER, 2026-08-30: this run renames Threat_Scenario_Output -> Threat_Scenario along
+-- with its PK, CHECK, DEFAULT and three indexes. An old and a new application build CANNOT both
+-- run against one database -- the old build refuses to boot once the rename lands, and the new
+-- build hits "Invalid object name 'Threat_Scenario'" until it does. There is no safe ordering
+-- and no rolling deploy. Stop the API and the Celery workers, run this script, run
+-- 6. TSG_Verify.sql, deploy the matching code, then start.
 -- ============================================================================
 
 SET QUOTED_IDENTIFIER ON;
@@ -36,6 +43,82 @@ BEGIN
     ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON;
     ALTER DATABASE CURRENT SET MULTI_USER;
 END
+
+GO
+
+-- ---------------------------------------------------------------------------
+-- Threat_Scenario_Output -> Threat_Scenario, plus the six object names reading "Output"
+-- ---------------------------------------------------------------------------
+-- The table holds SCENARIOS. "Output" named the pipeline step that produced them, not the thing
+-- stored, and the OutputID -> ScenarioID column rename further down this file already moved the
+-- row's own identity to the new vocabulary. This finishes the job on the object names.
+--
+-- POSITION IS LOAD-BEARING: this block MUST run before every CREATE TABLE, ADD CONSTRAINT and
+-- CREATE INDEX in this file. Those are all guarded on the NEW names; run them first against a
+-- pre-rename database and each guard sees its object missing and CREATES A SECOND ONE -- an empty
+-- Threat_Scenario beside the populated old table, a second CHECK, second copies of three indexes
+-- -- after which the rename below fails Msg 15335 and the app binds the empty table.
+--
+-- Guarded BOTH ways per object, exactly like the column renames further down: fires once on an
+-- existing database, no-op on a re-run, no-op on a fresh install (where nothing exists yet).
+--
+-- sp_rename is metadata only: no row is rewritten and no index rebuilt. It prints "Caution:
+-- Changing any part of an object name..." which is informational, not an error; sqlcmd -b does
+-- not trip on it. The NEW name is always BARE -- passing 'dbo.Threat_Scenario' as the second
+-- argument does not fail, it succeeds and produces an object literally called
+-- "dbo.Threat_Scenario", reachable only as [dbo].[dbo.Threat_Scenario].
+
+-- 1. The table FIRST, so every guard after it has one address to test.
+IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
+    AND OBJECT_ID('dbo.Threat_Scenario', 'U') IS NULL
+    EXEC sp_rename 'dbo.Threat_Scenario_Output', 'Threat_Scenario', 'OBJECT';
+
+-- 2. Constraints. OBJECT_ID DOES find these -- PK ('PK'), CHECK ('C') and DEFAULT ('D') are
+--    schema-scoped rows in sys.objects. Renaming the PK constraint renames its backing index with
+--    it, so there is deliberately NO separate INDEX rename for the primary key: seven statements,
+--    not eight.
+IF OBJECT_ID('dbo.PK_Threat_Scenario_Output', 'PK') IS NOT NULL
+    AND OBJECT_ID('dbo.PK_Threat_Scenario', 'PK') IS NULL
+    EXEC sp_rename 'dbo.PK_Threat_Scenario_Output', 'PK_Threat_Scenario', 'OBJECT';
+
+IF OBJECT_ID('dbo.CK_ScenarioOutput_DecisionExclusive', 'C') IS NOT NULL
+    AND OBJECT_ID('dbo.CK_Scenario_DecisionExclusive', 'C') IS NULL
+    EXEC sp_rename 'dbo.CK_ScenarioOutput_DecisionExclusive', 'CK_Scenario_DecisionExclusive', 'OBJECT';
+
+IF OBJECT_ID('dbo.DF_ScenarioOutput_ScenarioNumber', 'D') IS NOT NULL
+    AND OBJECT_ID('dbo.DF_Scenario_ScenarioNumber', 'D') IS NULL
+    EXEC sp_rename 'dbo.DF_ScenarioOutput_ScenarioNumber', 'DF_Scenario_ScenarioNumber', 'OBJECT';
+
+-- 3. Indexes. OBJECT_ID CANNOT guard these: an index is not a row in sys.objects, so
+--    OBJECT_ID('dbo.IX_Anything') is unconditionally NULL and the guard would be dead code that
+--    silently never fires. sys.indexes.name is unique per TABLE, not per schema, so the
+--    object_id predicate is load-bearing, not decoration. @objname is the three-part
+--    'schema.table.index'; the new name stays bare.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioOutput_SessionSubActive'
+           AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+    AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Scenario_SessionSubActive'
+                    AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+    EXEC sp_rename 'dbo.Threat_Scenario.IX_ScenarioOutput_SessionSubActive',
+                   'IX_Scenario_SessionSubActive', 'INDEX';
+
+-- On Scenario_Audit, not on the renamed table: "Output" here named the id it indexes, which the
+-- column rename further down this file already turned into ScenarioID.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Output'
+           AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+    AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Scenario'
+                    AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+    EXEC sp_rename 'dbo.Scenario_Audit.IX_ScenarioAudit_Output',
+                   'IX_ScenarioAudit_Scenario', 'INDEX';
+
+-- On Risk_Treatment_Plan. This one is ALSO registered in app/db/invariants.py REQUIRED_INDEXES
+-- and in TSG_Verify.sql section 2 -- all three must carry the new name together, or the app
+-- refuses to boot with StartupInvariantError.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_TreatmentPlan_ActiveOutput'
+           AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
+    AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_TreatmentPlan_ActiveScenario'
+                    AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
+    EXEC sp_rename 'dbo.Risk_Treatment_Plan.UX_TreatmentPlan_ActiveOutput',
+                   'UX_TreatmentPlan_ActiveScenario', 'INDEX';
 
 GO
 
@@ -261,9 +344,9 @@ IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Identified_Threat', 'IsAIGenerated') IS NULL
     ALTER TABLE Identified_Threat ADD IsAIGenerated bit NOT NULL DEFAULT 0;
 
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NULL
-CREATE TABLE Threat_Scenario_Output (
-    ScenarioID           uniqueidentifier NOT NULL CONSTRAINT PK_Threat_Scenario_Output PRIMARY KEY,
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NULL
+CREATE TABLE Threat_Scenario (
+    ScenarioID           uniqueidentifier NOT NULL CONSTRAINT PK_Threat_Scenario PRIMARY KEY,
     SessionID            uniqueidentifier NOT NULL,
     TenantID             nvarchar(200) NULL,
     EntityID             nvarchar(200) NULL,
@@ -277,7 +360,7 @@ CREATE TABLE Threat_Scenario_Output (
     Accepted             int           NOT NULL,
     Superseded           int           NOT NULL,
     IdentityHash         nvarchar(100)  NULL,
-    ScenarioNumber       int           NOT NULL CONSTRAINT DF_ScenarioOutput_ScenarioNumber DEFAULT 1,  -- 1 = original, 2+ = "generate next set" alternates
+    ScenarioNumber       int           NOT NULL CONSTRAINT DF_Scenario_ScenarioNumber DEFAULT 1,  -- 1 = original, 2+ = "generate next set" alternates
     ReplacesScenarioID   uniqueidentifier NULL,   -- ScenarioID this row replaced; NULL for first-run/variant rows
     GenerationEpoch      int           NOT NULL,
     ErrorMessage         nvarchar(max) NULL,
@@ -292,29 +375,29 @@ CREATE TABLE Threat_Scenario_Output (
 );
 
 -- Adds ControlsMappedAt for pre-Step-4 databases.
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ControlsMappedAt') IS NULL
-    ALTER TABLE Threat_Scenario_Output ADD ControlsMappedAt datetime2 NULL;
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'ControlsMappedAt') IS NULL
+    ALTER TABLE Threat_Scenario ADD ControlsMappedAt datetime2 NULL;
 
 -- Adds ScenarioNumber for pre-2026-07-29 databases.
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ScenarioNumber') IS NULL
-    ALTER TABLE Threat_Scenario_Output ADD ScenarioNumber int NOT NULL CONSTRAINT DF_ScenarioOutput_ScenarioNumber DEFAULT 1;
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'ScenarioNumber') IS NULL
+    ALTER TABLE Threat_Scenario ADD ScenarioNumber int NOT NULL CONSTRAINT DF_Scenario_ScenarioNumber DEFAULT 1;
 
 -- Adds ReplacesOutputID for pre-2026-07-30 databases. Legacy rows simply read as originals.
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ReplacesOutputID') IS NULL
-    ALTER TABLE Threat_Scenario_Output ADD ReplacesOutputID uniqueidentifier NULL;
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'ReplacesOutputID') IS NULL
+    ALTER TABLE Threat_Scenario ADD ReplacesOutputID uniqueidentifier NULL;
 
 -- Adds the per-scenario review decision for pre-2026-08-23 databases. Legacy rows read as
 -- pending, which is correct: nobody recorded a rejection for them.
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'RejectedAt') IS NULL
-    ALTER TABLE Threat_Scenario_Output ADD RejectedAt datetime2 NULL;
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'RejectedAt') IS NULL
+    ALTER TABLE Threat_Scenario ADD RejectedAt datetime2 NULL;
 
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'RejectedBy') IS NULL
-    ALTER TABLE Threat_Scenario_Output ADD RejectedBy nvarchar(200) NULL;
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'RejectedBy') IS NULL
+    ALTER TABLE Threat_Scenario ADD RejectedBy nvarchar(200) NULL;
 
 -- Adds the ACCEPT half of the decision attribution. Reject has recorded who and when since
 -- 2026-08-23; accept recorded neither, so "who rejected this" was a column read while "who
@@ -323,32 +406,32 @@ IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
 -- acceptor for them, and no backfill runs here.
 -- Separately guarded per column, deliberately: a shared guard would let a re-run see the first
 -- column present and skip the second — the silent-miss failure the RiskLevel block warns about.
--- CK_ScenarioOutput_DecisionExclusive needs no change: AcceptedAt is only ever set where
+-- CK_Scenario_DecisionExclusive needs no change: AcceptedAt is only ever set where
 -- Accepted = 1, and that constraint already forbids such a row from also carrying RejectedAt.
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'AcceptedAt') IS NULL
-    ALTER TABLE Threat_Scenario_Output ADD AcceptedAt datetime2 NULL;
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'AcceptedAt') IS NULL
+    ALTER TABLE Threat_Scenario ADD AcceptedAt datetime2 NULL;
 
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'AcceptedBy') IS NULL
-    ALTER TABLE Threat_Scenario_Output ADD AcceptedBy nvarchar(200) NULL;
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'AcceptedBy') IS NULL
+    ALTER TABLE Threat_Scenario ADD AcceptedBy nvarchar(200) NULL;
 
 -- Adds ScenarioSource for pre-scenario-library databases. NULL reads as "generated for this
 -- asset", which is what every legacy row is.
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ScenarioSource') IS NULL
-    ALTER TABLE Threat_Scenario_Output ADD ScenarioSource nvarchar(100) NULL;
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'ScenarioSource') IS NULL
+    ALTER TABLE Threat_Scenario ADD ScenarioSource nvarchar(100) NULL;
 
 -- A scenario cannot be both accepted and rejected. Enforced in the DATABASE, not only in the
 -- service layer: accept and reject will be independent routes reachable at any time after the
 -- session completes, so the one place both orderings must meet is the row itself. Guarded so a
 -- re-run is a no-op, and NOT trusted to WITH CHECK on legacy data — existing rows all read
 -- pending (RejectedAt NULL), so the constraint holds for them by construction.
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'RejectedAt') IS NOT NULL
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'RejectedAt') IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM sys.check_constraints
-                    WHERE name = 'CK_ScenarioOutput_DecisionExclusive')
-    ALTER TABLE Threat_Scenario_Output ADD CONSTRAINT CK_ScenarioOutput_DecisionExclusive
+                    WHERE name = 'CK_Scenario_DecisionExclusive')
+    ALTER TABLE Threat_Scenario ADD CONSTRAINT CK_Scenario_DecisionExclusive
         CHECK (RejectedAt IS NULL OR Accepted = 0);
 
 -- Per-scenario decision trail for pre-2026-08-23 databases. Legacy rows read as NULL, which is
@@ -420,10 +503,10 @@ IF OBJECT_ID('dbo.Scoped_Threat', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scoped_Threat', 'SelectionKind') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Scoped_Threat'), 'SelectionKind', 'CharMaxLen') < 100
     ALTER TABLE Scoped_Threat ALTER COLUMN SelectionKind nvarchar(100) NULL;
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'Status') IS NOT NULL
-    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Scenario_Output'), 'Status', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Scenario_Output ALTER COLUMN Status nvarchar(100) NOT NULL;IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'Status') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Scenario'), 'Status', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Scenario ALTER COLUMN Status nvarchar(100) NOT NULL;IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Audit', 'Stage') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Audit'), 'Stage', 'CharMaxLen') < 100
     ALTER TABLE Scenario_Audit ALTER COLUMN Stage nvarchar(100) NULL;
@@ -478,30 +561,34 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
 
 -- ---------------------------------------------------------------------------
 -- OutputID -> ScenarioID. The column identifies a SCENARIO; "output" named the table it happened
--- to live in (Threat_Scenario_Output), not the thing itself, and the same id was spelled three
--- different ways across the API. Renamed at the source so the database and the wire agree.
+-- to live in (Threat_Scenario_Output, itself since renamed to Threat_Scenario), not the thing
+-- itself, and the same id was spelled three different ways across the API. Renamed at the source
+-- so the database and the wire agree.
 --
 -- sp_rename, not add-and-copy: it preserves the data in place, and INDEXES FOLLOW AUTOMATICALLY —
--- SQL Server stores index key references by column ID, so IX_ScenarioAudit_Output,
--- UX_TreatmentPlan_ActiveOutput and IX_TreatmentPlan_SessionHistory keep working untouched and
--- report the new name. Only their NAMES still read "Output", which is cosmetic and deliberately
--- left alone: renaming an index is a second, riskier operation for zero behavioural gain.
+-- SQL Server stores index key references by column ID, so IX_ScenarioAudit_Scenario,
+-- UX_TreatmentPlan_ActiveScenario and IX_TreatmentPlan_SessionHistory keep working untouched and
+-- report the new name. Their NAMES were a separate call, and it has been REVERSED. This block used
+-- to leave them reading "Output" as cosmetic -- "a second, riskier operation for zero behavioural
+-- gain" -- which held while the table was still called Threat_Scenario_Output. Renaming the TABLE
+-- to Threat_Scenario ended that: the names then pointed at a word absent from the schema, so the
+-- gain stopped being zero. All of them are renamed by the guarded block at the top of this file.
 --
 -- Guarded BOTH ways on every table, exactly like the TuningJSON rename above: it runs once on an
 -- existing database and is a no-op afterwards, and on a fresh install the CREATE TABLEs already
 -- declare ScenarioID so the old name is never present. Order-independent for the same reason —
 -- each guard tests its own table, so a table that does not exist yet is skipped, not an error.
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'OutputID') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ScenarioID') IS NULL
-    EXEC sp_rename 'dbo.Threat_Scenario_Output.OutputID', 'ScenarioID', 'COLUMN';
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'OutputID') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'ScenarioID') IS NULL
+    EXEC sp_rename 'dbo.Threat_Scenario.OutputID', 'ScenarioID', 'COLUMN';
 
 -- The self-reference: which scenario this one replaced. Renamed for the same reason, or the table
 -- would carry ScenarioID beside ReplacesOutputID and reintroduce the inconsistency in one row.
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ReplacesOutputID') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'ReplacesScenarioID') IS NULL
-    EXEC sp_rename 'dbo.Threat_Scenario_Output.ReplacesOutputID', 'ReplacesScenarioID', 'COLUMN';
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'ReplacesOutputID') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'ReplacesScenarioID') IS NULL
+    EXEC sp_rename 'dbo.Threat_Scenario.ReplacesOutputID', 'ReplacesScenarioID', 'COLUMN';
 
 IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Audit', 'OutputID') IS NOT NULL
@@ -609,13 +696,13 @@ IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NOT NULL
 
 -- Risk Treatment Plan (docs/RISK_TREATMENT_PLAN_SDD.md). One row per generation attempt
 -- on an accepted scenario; at most one active (Superseded=0) row per ScenarioID, enforced
--- by UX_TreatmentPlan_ActiveOutput below. Risk data (ratings, level, existing controls)
+-- by UX_TreatmentPlan_ActiveScenario below. Risk data (ratings, level, existing controls)
 -- arrives in the request body — TSG reads no external risk tables.
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NULL
 CREATE TABLE Risk_Treatment_Plan (
     PlanID                  uniqueidentifier NOT NULL CONSTRAINT PK_Risk_Treatment_Plan PRIMARY KEY,
     SessionID               uniqueidentifier NOT NULL,
-    ScenarioID              uniqueidentifier NOT NULL,  -- the accepted Threat_Scenario_Output row
+    ScenarioID              uniqueidentifier NOT NULL,  -- the accepted Threat_Scenario row
     TenantID                nvarchar(200) NULL,
     EntityID                nvarchar(200) NULL,         -- copied from the session (authz boundary)
     UserID                  nvarchar(200) NULL,         -- requesting principal (provenance)
@@ -661,7 +748,7 @@ IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Ris
     ALTER TABLE Risk_Treatment_Plan ADD ReviewedAt datetime2 NULL;
 -- Cancellation attribution. /treatment-plan/cancel and the treatment_plan_cancelled audit event
 -- have always existed; the row recorded neither who nor when. Same gap the accept columns close
--- on Threat_Scenario_Output. Independently guarded per column for the reason stated above.
+-- on Threat_Scenario. Independently guarded per column for the reason stated above.
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'CancelledAt') IS NULL
     ALTER TABLE Risk_Treatment_Plan ADD CancelledAt datetime2 NULL;
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NOT NULL AND COL_LENGTH('dbo.Risk_Treatment_Plan', 'CancelledBy') IS NULL
@@ -790,14 +877,14 @@ CREATE NONCLUSTERED INDEX IX_Session_Active ON Scenario_Session(SessionStatus) W
 -- scenario numbers are legal; a repeat at the SAME number collides (double-click guard).
 -- Drops the old 2-column index first so re-running widens it.
 IF EXISTS (SELECT 1 FROM sys.indexes i
-           WHERE i.name = 'UX_Scenario_ActiveIdentity' AND i.object_id = OBJECT_ID('dbo.Threat_Scenario_Output')
+           WHERE i.name = 'UX_Scenario_ActiveIdentity' AND i.object_id = OBJECT_ID('dbo.Threat_Scenario')
            AND NOT EXISTS (SELECT 1 FROM sys.index_columns ic
                            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
                            WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
                            AND c.name = 'ScenarioNumber'))
-    DROP INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output;
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveIdentity' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
-CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output(SessionID, IdentityHash, ScenarioNumber) WHERE Superseded = 0;
+    DROP INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveIdentity' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario(SessionID, IdentityHash, ScenarioNumber) WHERE Superseded = 0;
 
 -- One ACCEPTED scenario per (session, threat identity, ScenarioNumber). Accepted is decoupled
 -- from Superseded (a reviewer may accept an older, superseded version), so the active-identity
@@ -805,8 +892,8 @@ CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario_Output(Session
 -- IdentityHash IS NOT NULL: a NULL hash means identity unknown (pre-IdentityHash legacy rows) —
 -- unknown identities are distinct scenarios, and SQL Server's NULLs-compare-equal unique
 -- semantics would falsely collide two of them; those rows are covered by accept's app guard only.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveAccepted' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
-CREATE UNIQUE INDEX UX_Scenario_ActiveAccepted ON Threat_Scenario_Output(SessionID, IdentityHash, ScenarioNumber) WHERE Accepted = 1 AND IdentityHash IS NOT NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveAccepted' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+CREATE UNIQUE INDEX UX_Scenario_ActiveAccepted ON Threat_Scenario(SessionID, IdentityHash, ScenarioNumber) WHERE Accepted = 1 AND IdentityHash IS NOT NULL;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
 CREATE INDEX IX_PromptLog_Session ON Prompt_Log(SessionID, SubsystemID);
@@ -841,8 +928,8 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScopedThreat_SessionAc
 CREATE INDEX IX_ScopedThreat_SessionActiveScores ON Scoped_Threat(SessionID, Superseded)
     INCLUDE (ThreatID, Score, ScopeRank);
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioOutput_SessionSubActive' AND object_id = OBJECT_ID('dbo.Threat_Scenario_Output'))
-CREATE INDEX IX_ScenarioOutput_SessionSubActive ON Threat_Scenario_Output(SessionID, SubsystemID) WHERE Superseded = 0;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Scenario_SessionSubActive' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+CREATE INDEX IX_Scenario_SessionSubActive ON Threat_Scenario(SessionID, SubsystemID) WHERE Superseded = 0;
 -- Backs dal.active_scenario_rows. Not covering ScenarioJSON on purpose — that column holds
 -- the whole scenario, so including it would duplicate the table into the index.
 
@@ -851,9 +938,9 @@ CREATE INDEX IX_ScenarioAudit_SessionSubEvent ON Scenario_Audit(SessionID, Subsy
 
 -- "Show me every decision on this scenario, newest first." Filtered so it costs nothing for the
 -- session/subsystem rows that carry no ScenarioID, which is the overwhelming majority of the ledger.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Output' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Scenario' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
     AND COL_LENGTH('dbo.Scenario_Audit', 'ScenarioID') IS NOT NULL
-    EXEC('CREATE INDEX IX_ScenarioAudit_Output ON Scenario_Audit(ScenarioID, CreatedAt DESC) WHERE ScenarioID IS NOT NULL');
+    EXEC('CREATE INDEX IX_ScenarioAudit_Scenario ON Scenario_Audit(ScenarioID, CreatedAt DESC) WHERE ScenarioID IS NOT NULL');
 
 -- Same shape for the plan dimension, filtered for the same reason: session- and scenario-scoped
 -- rows carry no PlanID and are the overwhelming majority of the ledger.
@@ -885,8 +972,8 @@ CREATE INDEX IX_Session_EntityUser ON Scenario_Session(EntityID, UserID) INCLUDE
 
 -- One active treatment plan per scenario — the concurrent-POST race arbiter (the losing
 -- INSERT hits this and surfaces as 409 generation_in_progress).
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_TreatmentPlan_ActiveOutput' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
-CREATE UNIQUE INDEX UX_TreatmentPlan_ActiveOutput ON Risk_Treatment_Plan(ScenarioID) WHERE Superseded = 0;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_TreatmentPlan_ActiveScenario' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
+CREATE UNIQUE INDEX UX_TreatmentPlan_ActiveScenario ON Risk_Treatment_Plan(ScenarioID) WHERE Superseded = 0;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_TreatmentPlan_SessionActive' AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
 CREATE INDEX IX_TreatmentPlan_SessionActive ON Risk_Treatment_Plan(SessionID) WHERE Superseded = 0;
@@ -970,7 +1057,7 @@ UNION ALL
 SELECT TABLE_NAME, 1 FROM INFORMATION_SCHEMA.TABLES
 WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME IN (
     'Scenario_Session','Subsystem_Stage_State','Identified_Threat','Identified_Duplicate_Threat',
-    'Scoped_Threat','Threat_Scenario_Output','Scenario_Audit',
+    'Scoped_Threat','Threat_Scenario','Scenario_Audit',
     'Prompt_Log','Risk_Treatment_Plan','Config_Tuning','API_Client');
 
 
@@ -1034,10 +1121,10 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Session', 'Mode') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Scenario_Session'), 'Mode', 'CharMaxLen') < 100
     ALTER TABLE Scenario_Session ALTER COLUMN Mode nvarchar(100) NOT NULL;
-IF OBJECT_ID('dbo.Threat_Scenario_Output', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Scenario_Output', 'IdentityHash') IS NOT NULL
-    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Scenario_Output'), 'IdentityHash', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Scenario_Output ALTER COLUMN IdentityHash nvarchar(100) NULL;IF OBJECT_ID('dbo.API_Client', 'U') IS NOT NULL
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'IdentityHash') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Scenario'), 'IdentityHash', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Scenario ALTER COLUMN IdentityHash nvarchar(100) NULL;IF OBJECT_ID('dbo.API_Client', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.API_Client', 'KeyHash') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.API_Client'), 'KeyHash', 'CharMaxLen') < 100
     ALTER TABLE API_Client ALTER COLUMN KeyHash nvarchar(100) NOT NULL;

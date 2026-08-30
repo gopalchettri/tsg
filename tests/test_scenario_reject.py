@@ -1,6 +1,6 @@
 """Per-scenario reject, and the accept/reject mutual exclusion.
 
-The two decisions are mutually exclusive by CK_ScenarioOutput_DecisionExclusive. Before
+The two decisions are mutually exclusive by CK_Scenario_DecisionExclusive. Before
 dal.decide_scenarios they were two independent UPDATEs, each enforcing only its own half — so
 accepting a rejected scenario reached the database and surfaced as an IntegrityError the accept
 path mislabelled `duplicate_identity`. `test_reject_then_accept_is_refused_with_the_right_reason`
@@ -50,8 +50,8 @@ def _accept(Session, sid: str, subset, monkeypatch, actor: str = CREATOR) -> int
 def _row(Session, oid: str):
     with Session() as s:
         return s.execute(
-            m.Threat_Scenario_Output.__table__.select().where(
-                m.Threat_Scenario_Output.ScenarioID == oid)).mappings().one()
+            m.Threat_Scenario.__table__.select().where(
+                m.Threat_Scenario.ScenarioID == oid)).mappings().one()
 
 
 def _audit(Session, sid: str, event_type=None) -> list:

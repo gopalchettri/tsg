@@ -3,7 +3,7 @@
 Create is first-generation-only, /regenerate takes an EMPTY body (register data carried from
 the ACTIVE version's frozen snapshot), and review's optional plan_id makes approving a historical
 COMPLETE version the atomic version switch. Real SQLite tables + the partial unique index
-UX_TreatmentPlan_ActiveOutput (the ORM declares no indexes — without creating it here the race
+UX_TreatmentPlan_ActiveScenario (the ORM declares no indexes — without creating it here the race
 tests would be toothless), route functions exercised directly with db_session/get_authorized_session
 monkeypatched — same style as test_accept_any_version.py.
 """
@@ -35,7 +35,7 @@ SESSION_ID = "5aa85f64-5717-4562-b3fc-2c963f66afa6"
 
 def _engine():
     engine = create_engine("sqlite://")
-    for table in (m.Scenario_Session, m.Threat_Scenario_Output, m.Scoped_Threat,
+    for table in (m.Scenario_Session, m.Threat_Scenario, m.Scoped_Threat,
                 m.Identified_Threat, m.Risk_Treatment_Plan, m.Scenario_Audit,
                 m.Threat_Scenario_Control_Map, m.Control_Library):
         table.__table__.create(engine)
@@ -43,7 +43,7 @@ def _engine():
         # The MSSQL arbiter, recreated: SQLite supports partial unique indexes, and the ORM
         # models deliberately declare none (DB-first schema) — without this the insert-race
         # and swap tests could not fail even with the fences deleted.
-        conn.execute(text("CREATE UNIQUE INDEX UX_TreatmentPlan_ActiveOutput "
+        conn.execute(text("CREATE UNIQUE INDEX UX_TreatmentPlan_ActiveScenario "
                           "ON Risk_Treatment_Plan(ScenarioID) WHERE Superseded = 0"))
     return engine
 
@@ -61,7 +61,7 @@ def _seed(Session) -> None:
             CurrentStage="APPROVED", StageStatus=StageStatus.COMPLETE, Mode="AUTO",
             CurrentSubsystemIndex=0, SubsystemsJSON="[]", AssetContextJSON="{}",
             CreatedAt=_now(), UpdatedAt=_now()))
-        s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+        s.execute(m.Threat_Scenario.__table__.insert().values(
             ScenarioID=SCENARIO_ID, SessionID=SESSION_ID, TenantID="t", EntityID="86",
             UserID="u1", SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status="complete",
             ScenarioJSON=json.dumps({"scenario_title": "T", "scenario_statement": "s",
@@ -450,7 +450,7 @@ def test_toctou_fence_on_supersede(monkeypatch):
 
 def test_index_arbitrates_double_active_insert():
     """The recreated partial unique index has teeth: a second Superseded=0 row for one
-    scenario_id is rejected by SQLite exactly as MSSQL's UX_TreatmentPlan_ActiveOutput would."""
+    scenario_id is rejected by SQLite exactly as MSSQL's UX_TreatmentPlan_ActiveScenario would."""
     engine = _engine()
     Session = sessionmaker(bind=engine, future=True)
     _seed(Session)

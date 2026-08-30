@@ -63,7 +63,7 @@ def client(tmp_path, monkeypatch):
 
     engine = create_engine(f"sqlite:///{db_path}", future=True)
     for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Identified_Threat,
-                m.Scoped_Threat, m.Threat_Scenario_Output, m.Scenario_Audit,
+                m.Scoped_Threat, m.Threat_Scenario, m.Scenario_Audit,
                 m.Threat_Type, m.Threat_Catalogue, m.ThreatType_ThreatActor_Map,
                 m.Threat_Catalogue_Category_Map, m.Control_Library,
                 m.Threat_Scenario_Control_Map,
@@ -127,7 +127,7 @@ def _seed_reviewable_session(client) -> tuple[str, str, str]:
             ScopedThreatID=stid, SessionID=sid, TenantID=TENANT, EntityID=ENTITY, UserID=USER,
             SubsystemID=0, ThreatID=tid, Score=80.0, ScopeRank=1, Selected=1,
             Superseded=0, CreatedAt=_now()))
-        s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+        s.execute(m.Threat_Scenario.__table__.insert().values(
             ScenarioID=oid, SessionID=sid, TenantID=TENANT, EntityID=ENTITY, UserID=USER,
             SubsystemID=0, ScopedThreatID=stid, Status="complete",
             ScenarioJSON=json.dumps({"scenario_title": "Ransomware locks the historian",

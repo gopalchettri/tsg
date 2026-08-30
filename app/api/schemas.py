@@ -723,7 +723,7 @@ class SupportingSystemApplicability(ApiModel):
     """The LLM's own judgment (prompts.py::scenario_prompt) of whether this scenario involves a
     given supporting system in the session's scope, one entry per system. Rides straight through
     from the LLM's own JSON, same treatment as entry_point: no DB enrichment, no separate
-    persistence (Threat_Scenario_Output.ScenarioJSON already stores the whole scenario dict)."""
+    persistence (Threat_Scenario.ScenarioJSON already stores the whole scenario dict)."""
     supporting_system: str = Field(description="Supporting system name, copied exactly from the session's scope.")
     applicable: bool = Field(description="Whether this scenario meaningfully involves or affects this system.")
     justification: str = Field(description="One-sentence rationale for the applicable value.")
@@ -844,7 +844,7 @@ class ScenarioResult(ApiModel):
         default=None,
         description="User id of whoever rejected this scenario. Null if it has not been rejected. "
                     "A scenario can never carry both an acceptor and a rejecter — "
-                    "CK_ScenarioOutput_DecisionExclusive forbids it in the database.")
+                    "CK_Scenario_DecisionExclusive forbids it in the database.")
     rejected_at: datetime | None = Field(
         default=None, description="When it was rejected (naive UTC). Null if not rejected.")
     moderation_checked: bool = Field(
@@ -902,7 +902,7 @@ class ScenarioResult(ApiModel):
     # caller polling /results mid-stage sees scenarios whose controls simply aren't computed yet.
     # Without this flag that state is indistinguishable from "mapped, nothing matched", and the
     # smoke guide's "an empty controls list is normal" then reads as reassurance in BOTH cases.
-    # Mirrors Threat_Scenario_Output.ControlsMappedAt, so false ALSO covers the unseeded-library
+    # Mirrors Threat_Scenario.ControlsMappedAt, so false ALSO covers the unseeded-library
     # case: control_mapping bails at `controls.no_candidates` without stamping, deliberately, so
     # those outputs are picked up by a later run once Seed_to_Control_library.sql has been applied.
     scenario_source: str = Field(

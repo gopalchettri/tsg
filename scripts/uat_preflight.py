@@ -124,11 +124,11 @@ def main() -> int:
         from app.db import models as m
         from app.db.engine import db_session
         with db_session() as sess:
-            oid = sess.execute(select(m.Threat_Scenario_Output.ScenarioID).limit(1)).scalar()
+            oid = sess.execute(select(m.Threat_Scenario.ScenarioID).limit(1)).scalar()
             if oid is None:
-                raise SkipCheck("no Threat_Scenario_Output rows yet — run one session first")
-            hits = sess.execute(select(func.count()).select_from(m.Threat_Scenario_Output)
-                                .where(m.Threat_Scenario_Output.ScenarioID == str(oid).upper())).scalar()
+                raise SkipCheck("no Threat_Scenario rows yet — run one session first")
+            hits = sess.execute(select(func.count()).select_from(m.Threat_Scenario)
+                                .where(m.Threat_Scenario.ScenarioID == str(oid).upper())).scalar()
         if hits != 1:
             raise RuntimeError(f"uppercase form of {oid} matched {hits} rows, expected 1")
         return "uppercase form resolves to the same row"

@@ -8,7 +8,7 @@ for an unmounted router are inert, but a mounted route missing from the registry
 POST takes the register's risk data IN the request body (TSG reads NO risk-module tables),
 freezes it with TSG's own scenario/asset context into InputSnapshotJSON, inserts the RUNNING
 plan row and enqueues; the GET on the same path is the poll endpoint (no separate job-status
-route). The filtered unique index UX_TreatmentPlan_ActiveOutput — not any SELECT — is the
+route). The filtered unique index UX_TreatmentPlan_ActiveScenario — not any SELECT — is the
 concurrent-POST arbiter.
 """
 from __future__ import annotations
@@ -126,7 +126,7 @@ def post_treatment_plan(session_id: str, scenario_id: str, body: TreatmentPlanBo
     every later version is minted by POST .../treatment-plan/regenerate, which reuses the frozen
     register data and takes an empty body. (BREAKING wire change from the old re-POST
     semantics — see docs/TSG_UI_API_INTEGRATION.md.) Two concurrent first-creates both pass the
-    read below; UX_TreatmentPlan_ActiveOutput arbitrates the insert race (loser → 409, same as
+    read below; UX_TreatmentPlan_ActiveScenario arbitrates the insert race (loser → 409, same as
     always)."""
     return _launch_generation(
         session_id, scenario_id, principal,
@@ -246,7 +246,7 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
             TenantID=session_row["TenantID"], EntityID=session_row["EntityID"],
             SubsystemID=ASSET_UNIT_ID, EventType=AuditEventType.treatment_plan_requested,
             ActorUserID=principal.user_id,
-            # scenario_id on the COLUMN, not only inside DetailJSON. IX_ScenarioAudit_Output is a
+            # scenario_id on the COLUMN, not only inside DetailJSON. IX_ScenarioAudit_Scenario is a
             # FILTERED index (WHERE scenario_id IS NOT NULL), so leaving it null excluded these rows
             # from it entirely — which is why the per-scenario trail had to fetch the whole
             # session and narrow in Python ("DetailJSON is opaque to SQL here").

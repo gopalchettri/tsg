@@ -29,7 +29,7 @@ from app.pipeline import control_mapping, grounding
 
 def _engine():
     engine = create_engine("sqlite://")
-    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario_Output,
+    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Threat_Scenario_Control_Map, m.Scenario_Audit,
                 # map_controls joins these to put the THREAT in the control query
                 # (control_mapping.collect_control_query) — without them the join
@@ -52,7 +52,7 @@ def _seed(s, session_id: str, task_id: str, epoch: int = 1) -> None:
         GenerationEpoch=epoch, ActiveTaskID=task_id,
         LeaseExpiresAt=now + timedelta(minutes=10), HeartbeatAt=now, AttemptCount=1, UpdatedAt=now,
     ))
-    s.execute(m.Threat_Scenario_Output.__table__.insert().values(
+    s.execute(m.Threat_Scenario.__table__.insert().values(
         ScenarioID=str(uuid.uuid4()), SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
         SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
         ScenarioJSON=json.dumps({"controls": [{"name": "MFA", "why": "reduces credential abuse"}],
@@ -90,7 +90,7 @@ class _FakeLLM:
 def _counts(Session):
     with Session() as s:
         maps = s.execute(m.Threat_Scenario_Control_Map.__table__.select()).fetchall()
-        outputs = s.execute(m.Threat_Scenario_Output.__table__.select()).fetchall()
+        outputs = s.execute(m.Threat_Scenario.__table__.select()).fetchall()
         audits = s.execute(m.Scenario_Audit.__table__.select()).fetchall()
     return maps, outputs, audits
 

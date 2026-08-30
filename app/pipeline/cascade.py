@@ -77,7 +77,7 @@ _REASON_INFO: dict[str, dict[str, str]] = {
     },
     "output_not_found_or_superseded": {
         "detail": "One or more requested ScenarioIDs did not resolve to an active "
-                "(non-superseded) Threat_Scenario_Output row for this session/subsystem — "
+                "(non-superseded) Threat_Scenario row for this session/subsystem — "
                 "most often stale ids captured before a prior regeneration already replaced "
                 "them, or ids that belong to a different session.",
         "message": "One or more of the scenarios you tried to regenerate have already been "
@@ -207,7 +207,7 @@ def _regen_replacements(sess: Session, sid: str, subsystem_id: int, epoch: int) 
     Each item has `old` and `new` IDs. A retained row has `old=None`, which lets callers derive
     all new output IDs from the same result.
     """
-    out = m.Threat_Scenario_Output
+    out = m.Threat_Scenario
     return [{"old": str(old) if old else None, "new": str(new)} for new, old in sess.execute(
         select(out.ScenarioID, out.ReplacesScenarioID).where(
             out.SessionID == sid, out.SubsystemID == subsystem_id,
@@ -273,7 +273,7 @@ def get_threat_id_to_redo(sess: Session, session_id: str, subsystem_id: int,
     if not ids:
         raise RegenerateConflict(f"{granularity} regeneration requires at least one target id",
                                 reason="no_target_ids")
-    out = m.Threat_Scenario_Output
+    out = m.Threat_Scenario
     rows = sess.execute(
         select(out.ScenarioID, m.Scoped_Threat.ThreatID, out.ScopedThreatID,
             out.ScenarioNumber, out.IdentityHash)
