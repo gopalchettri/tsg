@@ -90,6 +90,7 @@ from app.core.enums import (
     SubsystemLevel,
     TreatmentGateReason,
     TreatmentOutcomeReason,
+    TreatmentProgress,
     TreatmentReviewStatus,
     YesNo,
 )
@@ -2589,6 +2590,42 @@ class TreatmentBoardRow(ApiModel):
     completed_at: datetime | None = Field(default=None)
 
 
+class TreatmentPlanProgress(ApiModel):
+    """The session's remediation-planning progress — the plan board's answer to
+    SessionProgress, so a UI can render one status line without folding the rows itself.
+
+    Every count is over the session's ACCEPTED scenarios, and they sum to accepted_scenarios:
+    each scenario lands in exactly one bucket. Derived from the same rows the board already
+    returns, so this costs no extra query.
+    """
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "not_requested": 3, "running": 1, "complete": 3, "error": 1,
+        "awaiting_review": 2, "approved": 1, "rejected": 0, "overall": "in_progress"}})
+
+    not_requested: int = Field(
+        description="Accepted scenarios with no plan yet — what the UI's Generate button "
+                    "counts.")
+    running: int = Field(description="Plans currently generating.")
+    complete: int = Field(
+        description="Plans that finished generating, REVIEWED OR NOT — the generation total. "
+                    "It therefore OVERLAPS awaiting_review/approved/rejected, which split this "
+                    "same set by review verdict; only the four buckets not_requested + running "
+                    "+ complete + error sum to accepted_scenarios.")
+    error: int = Field(description="Plans that failed (a stale RUNNING projects as ERROR).")
+    awaiting_review: int = Field(
+        description="COMPLETE plans with no approve/reject decision yet — THE review-queue "
+                    "count, and the reason `overall` is not simply 'complete' once generation "
+                    "finishes.")
+    approved: int = Field(description="COMPLETE plans a reviewer approved.")
+    rejected: int = Field(description="COMPLETE plans a reviewer rejected.")
+    overall: TreatmentProgress = Field(
+        description="One rolled-up status for the whole session's planning — the plan-board "
+                    "counterpart of SessionProgress.overall. See TreatmentProgress for the "
+                    "priority order; an ERROR outranks work still running, and a session whose "
+                    "plans are all generated but unreviewed reports `awaiting_review`, never "
+                    "`complete`.")
+
+
 class TreatmentBoard(ApiModel):
     """GET /v1/sessions/{id}/treatment-plans — every accepted scenario's plan state in ONE
     call (the page the reviewer looks at daily; replaces N per-scenario polls)."""
@@ -2601,6 +2638,9 @@ class TreatmentBoard(ApiModel):
                    "plan_id": None, "status": None}]}})
     session_id: str
     accepted_scenarios: int = Field(description="How many accepted scenarios the session holds.")
+    progress: TreatmentPlanProgress = Field(
+        description="Rolled-up planning status for the whole session — read this to render a "
+                    "status line or a progress bar without iterating `plans`.")
     plans: list[TreatmentBoardRow]
 
 

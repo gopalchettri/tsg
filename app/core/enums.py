@@ -414,6 +414,35 @@ class UnacceptGateReason(StrEnum):
                                                          # undoing beneath it would orphan the plan
 
 
+class TreatmentProgress(StrEnum):
+    """How far REMEDIATION PLANNING has got for a whole session, DERIVED — never stored.
+
+    The scenario-generation side has SessionProgress.overall (`/v1/sessions/{id}`), so a UI can
+    render one status without reading a list. The plan board had no equivalent: it returned a row
+    per accepted scenario and left every client to fold them itself — which means each client
+    invents its own rules for "is planning done", and two screens can disagree about one session.
+
+    Computed from the board rows the route already holds, so it costs no extra query. Evaluated
+    top-to-bottom, FIRST MATCH WINS — the order is the point:
+
+      any plan ERROR                          -> error       (a failure outranks progress)
+      any plan RUNNING                        -> in_progress (work is still happening)
+      no plan requested for any scenario      -> pending     (the UI shows Generate)
+      any COMPLETE plan with no review verdict-> awaiting_review
+      otherwise                               -> complete    (every plan reviewed)
+
+    `error` before `in_progress` deliberately: a board with one failed and one running plan needs
+    the failure surfaced now, not after the other finishes. And `awaiting_review` before
+    `complete` for the same reason SessionProgress does it — a session whose plans are all
+    generated but unreviewed is NOT finished, and reporting it as such empties the review queue.
+    """
+    pending = "pending"                  # nothing requested yet for any accepted scenario
+    in_progress = "in_progress"          # at least one plan generating
+    awaiting_review = "awaiting_review"   # generated, a human still owes approve/reject
+    complete = "complete"                # every plan generated AND reviewed
+    error = "error"                      # at least one plan failed
+
+
 class TreatmentGateReason(StrEnum):
     """Why a treatment-plan request is refused — HTTP 409 `details.reason` (see
     docs/RISK_TREATMENT_PLAN_SDD.md §5.3). Separate from ReviewGateReason because treatment runs

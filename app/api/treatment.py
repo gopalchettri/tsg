@@ -36,6 +36,7 @@ from app.api.schemas import (
     TreatmentPlanAccepted,
     TreatmentPlanBody,
     TreatmentPlanDocument,
+    TreatmentPlanProgress,
     TreatmentPlanRegenerateBody,
     TreatmentPlanStatus,
     TreatmentRegisterPage,
@@ -57,6 +58,7 @@ from app.core.enums import (
     StageStatus,
     TreatmentGateReason,
     TreatmentOutcomeReason,
+    TreatmentProgress,
     TreatmentReviewStatus,
     TreatmentStrategy,
 )
@@ -349,6 +351,58 @@ def get_treatment_plan(session_id: str, scenario_id: str,
         return _plan_status_from_row(row, stale_cutoff, actor_ids, controls, superseded=older)
 
 
+def _board_progress(plans: list[TreatmentBoardRow]) -> TreatmentPlanProgress:
+    """Fold the board's rows into one planning status — the plan-board counterpart of
+    SessionProgress.overall.
+
+    A PURE function over the rows the route already built, so it costs no query and can be
+    tested without a database. It reads the PRESENTED status, not the stored one: _present_status
+    projects a stale RUNNING to ERROR, and a rollup that read Risk_Treatment_Plan.Status directly
+    would report a dead plan as still generating forever.
+
+    not_requested + running + complete + error partition the accepted scenarios; the three review
+    buckets re-split `complete` by verdict and deliberately overlap it. Priority order lives in
+    TreatmentProgress — error outranks running, and awaiting_review outranks complete.
+    """
+    n = {"not_requested": 0, "running": 0, "complete": 0, "error": 0,
+         "awaiting_review": 0, "approved": 0, "rejected": 0}
+    for p in plans:
+        if p.plan_id is None or p.status is None:
+            n["not_requested"] += 1
+            continue
+        if p.status == str(StageStatus.ERROR):
+            n["error"] += 1
+            continue
+        if p.status == str(StageStatus.RUNNING):
+            n["running"] += 1
+            continue
+        n["complete"] += 1
+        if p.review_status == str(TreatmentReviewStatus.approved):
+            n["approved"] += 1
+        elif p.review_status == str(TreatmentReviewStatus.rejected):
+            n["rejected"] += 1
+        else:
+            n["awaiting_review"] += 1
+
+    if n["error"]:
+        overall = TreatmentProgress.error
+    elif n["running"]:
+        overall = TreatmentProgress.in_progress
+    elif not plans or n["not_requested"] == len(plans):
+        # No accepted scenario has a plan yet — including a session with nothing accepted, where
+        # "pending" is the honest answer rather than the vacuous "complete" an empty board would
+        # otherwise fold to.
+        overall = TreatmentProgress.pending
+    elif n["not_requested"]:
+        # Some planned, some not: work remains, and it is a human's to start.
+        overall = TreatmentProgress.in_progress
+    elif n["awaiting_review"]:
+        overall = TreatmentProgress.awaiting_review
+    else:
+        overall = TreatmentProgress.complete
+    return TreatmentPlanProgress(**n, overall=overall)
+
+
 def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
                           actor_ids: dict[str, int] | None = None,
                           controls: list | None = None,
@@ -554,7 +608,8 @@ def get_treatment_board(session_id: str,
                             if e.plan_id != r["PlanID"]]
                             if include_superseded else None),
                 created_at=r["PlanCreatedAt"], completed_at=r["PlanCompletedAt"]))
-    return TreatmentBoard(session_id=session_id, accepted_scenarios=len(rows), plans=plans)
+    return TreatmentBoard(session_id=session_id, accepted_scenarios=len(rows),
+                          progress=_board_progress(plans), plans=plans)
 
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/cancel",
