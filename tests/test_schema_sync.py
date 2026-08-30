@@ -227,20 +227,49 @@ _FROZEN_TABLES = ("Threat_Category", "Threat_Type", "Threat_Catalogue", "Threat_
 _GUARD_MARKERS = ("COL_LENGTH", "COLUMNPROPERTY", "OBJECT_ID", "sys.indexes", "IF NOT EXISTS",
                 "IF EXISTS")
 
+# The ONLY sanctioned DROP COLUMNs against a frozen table. Keyed per (table, column) rather than
+# per table on purpose: approving one removal must not silently authorise the next one on the same
+# table. Anything not listed still fails outright -- a future edit that drops a column has to come
+# through this list, in review, with a date and a reason.
+_APPROVED_COLUMN_DROPS = {
+    # 2026-08-30, user instruction ("they are not required"); dev data already deleted.
+    ("Threat_Category", "SecurityObjective"),  # no code path ever read it
+    ("Threat_Type", "Description"),            # never embedded, never displayed
+    # This one DID carry curated data: it was the second half of the embedded passage
+    # (embeddings.catalogue_passage_text) and was shown to the validator LLM, and dropping it
+    # deletes the 75 seeded scenario descriptions. Catalogue matching is name-only from here, so
+    # the stored grounding calibration has to be re-run.
+    ("Threat_Catalogue", "Description"),
+}
+
 
 def test_no_destructive_statement_against_a_frozen_table() -> None:
+    """Row-destroying statements are forbidden outright; column drops only by explicit approval."""
+    seen: set[tuple[str, str]] = set()
     for sql in sorted(_SCRIPTS.glob("*.sql")):
         text = re.sub(r"--[^\n]*", "", sql.read_text(encoding="utf-8", errors="replace"))
         for tbl in _FROZEN_TABLES:
             for verb in (rf"DROP\s+TABLE\s+(?:dbo\.)?{tbl}\b",
                         rf"TRUNCATE\s+TABLE\s+(?:dbo\.)?{tbl}\b",
-                        rf"DELETE\s+FROM\s+(?:dbo\.)?{tbl}\b",
-                        rf"ALTER\s+TABLE\s+(?:dbo\.)?{tbl}\s+DROP\s+COLUMN"):
+                        rf"DELETE\s+FROM\s+(?:dbo\.)?{tbl}\b"):
                 assert not re.search(verb, text, re.IGNORECASE), (
                     f"{sql.name}: destructive statement against frozen table {tbl} "
                     f"(pattern {verb}) -- the six master tables hold curated data that must "
                     "survive every deployment")
+            for col in re.findall(
+                    rf"ALTER\s+TABLE\s+(?:dbo\.)?{tbl}\s+DROP\s+COLUMN\s+(\w+)", text, re.IGNORECASE):
+                seen.add((tbl, col))
+                assert (tbl, col) in _APPROVED_COLUMN_DROPS, (
+                    f"{sql.name}: unapproved DROP COLUMN {tbl}.{col} on a frozen master table. "
+                    "It destroys curated data and cannot be undone without a restore. If it is "
+                    "genuinely intended, add it to _APPROVED_COLUMN_DROPS with the date and the "
+                    "reason, so the decision is reviewable instead of incidental.")
 
+    # The list must not outlive the change it authorised: a stale entry stands as pre-approval for
+    # a removal nobody discussed.
+    stale = _APPROVED_COLUMN_DROPS - seen
+    assert not stale, (
+        f"_APPROVED_COLUMN_DROPS lists drops no script performs: {sorted(stale)} -- remove them.")
 
 def test_every_alter_against_a_frozen_table_is_guarded() -> None:
     """Every ALTER TABLE <frozen> must be the body of an IF existence/width guard -- either

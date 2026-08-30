@@ -28,6 +28,7 @@ CREATE TABLE Threat_Category (
     ThreatCategoryID    int            NOT NULL CONSTRAINT PK_Threat_Category PRIMARY KEY,
     ThreatCategoryName  nvarchar(200)  NOT NULL,
     ThreatCategoryCode  nvarchar(100)   NULL,
+    SecurityObjective   nvarchar(200)  NULL,
     IsActive            bit            NOT NULL,
     IsDeleted           bit            NOT NULL,
     CreatedAt           datetime2      NULL,
@@ -40,6 +41,7 @@ IF OBJECT_ID('dbo.Threat_Type', 'U') IS NULL
 CREATE TABLE Threat_Type (
     ThreatTypeID             int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Type PRIMARY KEY,
     ThreatTypeName           nvarchar(300)  NOT NULL,
+    Description              nvarchar(max)  NULL,
     SectorID                 int            NULL,
     ThreatCategoryID  int            NULL,
     IsActive                 bit            NOT NULL,
@@ -55,6 +57,7 @@ CREATE TABLE Threat_Catalogue (
     ThreatCatalogueID  int            IDENTITY(1,1) NOT NULL CONSTRAINT PK_Threat_Catalogue PRIMARY KEY,
     ThreatTypeID       int            NOT NULL,
     ThreatName         nvarchar(500)  NOT NULL,
+    Description        nvarchar(max)  NULL,
     SectorID           int            NULL,
     IsActive           bit            NOT NULL,
     IsDeleted          bit            NOT NULL,
@@ -95,38 +98,6 @@ IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat
 
 IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL AND COL_LENGTH('dbo.Threat_Actor', 'CreatedAt') IS NULL
     ALTER TABLE Threat_Actor ADD CreatedAt datetime2 NULL, CreatedBy nvarchar(200) NULL, UpdatedAt datetime2 NULL, UpdatedBy nvarchar(200) NULL;
-
--- ---------------------------------------------------------------------------
--- REMOVED COLUMNS (2026-08-30): Threat_Category.SecurityObjective,
--- Threat_Type.Description, Threat_Catalogue.Description
--- ---------------------------------------------------------------------------
--- Nothing read SecurityObjective, and Threat_Type.Description was never embedded or shown.
--- Threat_Catalogue.Description WAS load-bearing until this change: it was the second half of
--- the embedded passage (embeddings.catalogue_passage_text) and was shown to the validator LLM.
--- Both are name-only now, so catalogue matching scores against the NAME ALONE.
--- RE-RUN POST /v1/tsg/grounding/calibrate after this upgrade, or the stored threshold is being
--- applied to text it was never measured against.
---
--- THIS IS THE ONLY DROP IN ANY OF THESE SCRIPTS, and it is a sanctioned exception to the
--- frozen-master-table rule enforced by tests/test_schema_sync.py. It DESTROYS the 75 curated
--- catalogue descriptions that shipped in 3. Seed_to_Threat_library.sql (recoverable only from
--- git history). Everything else in these scripts is additive and re-runnable; a DROP COLUMN is
--- not reversible without a restore. Guarded on the column still existing, so it fires once and
--- no-ops afterwards, and placed AFTER every CREATE/ADD above so an earlier failure stops the
--- script before it can reach here.
-IF OBJECT_ID('dbo.Threat_Category', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Category', 'SecurityObjective') IS NOT NULL
-    ALTER TABLE Threat_Category DROP COLUMN SecurityObjective;
-
-IF OBJECT_ID('dbo.Threat_Type', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Type', 'Description') IS NOT NULL
-    ALTER TABLE Threat_Type DROP COLUMN Description;
-
-IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Catalogue', 'Description') IS NOT NULL
-    ALTER TABLE Threat_Catalogue DROP COLUMN Description;
-GO
-
 
 -- Natural-key guard indexes. Makes concurrent promote-on-accept safe: two
 -- sessions accepting at once can't both create the same library master.

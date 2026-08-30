@@ -128,7 +128,6 @@ def _seed_library(s) -> None:
         IsActive=True, IsDeleted=False))
     s.execute(m.Threat_Catalogue.__table__.insert().values(
         ThreatCatalogueID=418, ThreatTypeID=7, ThreatName=RETRIEVED_NAME,
-        Description="An actor alters pump setpoints so control logic integrity is lost.",
         IsActive=True, IsDeleted=False, CreatedBy="seed", CreatedAt=NOW))
     s.execute(m.Threat_Actor.__table__.insert().values(
         ThreatActorID=5, ThreatActorName="Nation-state/APT", IsCapable=1,
@@ -278,7 +277,6 @@ def test_two_catalogue_rows_retrieved_together_are_never_compared_to_each_other(
         _seed_library(s)
         s.execute(m.Threat_Catalogue.__table__.insert().values(
             ThreatCatalogueID=419, ThreatTypeID=7, ThreatName=SIBLING_NAME,
-            Description="A second, textually distinct row the curator kept separate.",
             IsActive=True, IsDeleted=False, CreatedBy="seed", CreatedAt=NOW))
         scenario_session = _seed_session(s)
         threats, _prov = find_threats(s, scenario_session, SUBSYSTEMS, ASSET_CONTEXT, llm,

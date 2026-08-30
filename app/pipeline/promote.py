@@ -13,7 +13,7 @@ so the row is genuinely new.
 
 What a NEW threat writes, in one transaction:
     Threat_Type                    (if the type itself is new — name-only dedup)
-    Threat_Catalogue               (Description = the AI's threat description; name-only
+    Threat_Catalogue               (name only — Description was removed as unused; name-only
                                     natural key, app-owned normalized-name dedup first)
     Threat_Catalogue_Category_Map  (the resolved category, when known)
     ThreatType_ThreatActor_Map     (the threat's stored actor ids — linked per TYPE, the
@@ -147,7 +147,7 @@ def _promote_threat(sess: Session, threat: Any, type_id: int, category_id: int |
                 _actor_entries(sess, threat, type_id, write=False))
 
     new_id, created = dal.upsert_threat_catalogue(
-        sess, generic, type_id, description=threat.Description, created_by=user_id)
+        sess, generic, type_id, created_by=user_id)
 
     # Curation for the freshly minted row: the resolved category on the map, and the stored
     # actors on the TYPE map (actors attach per type in this model).

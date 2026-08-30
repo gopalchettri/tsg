@@ -7,7 +7,7 @@ Properties this file pins, post 2026-08 catalogue reversal:
 2. EXISTING is sacred: a live stored ThreatCatalogueID (or a normalized-name twin under the
    same type) is reused and the library's curated junction rows are NEVER touched — curation
    stays the curators'.
-3. INSERTED copies the AI Description into Threat_Catalogue.Description and writes BOTH
+3. INSERTED writes the name only (Threat_Catalogue.Description was removed) and writes BOTH
    junction maps — the category membership row and the TYPE-actor links for the stored LIVE
    actor ids — so the next session receives the threat fully curated. Controls are REPORTED
    from the scenario's own mapping only, never written (the catalogue has no threat→control
@@ -235,7 +235,6 @@ def test_new_threat_writes_row_and_both_junction_maps(sf):
 
     with sf() as s:
         row = s.get(m.Threat_Catalogue, r.threat["id"])
-        assert row.Description == "Encrypts stored data; demands payment."
         assert row.ThreatName == "Ransomware encrypts historian data at rest"
         assert row.ThreatTypeID == TYPE_ID and row.IsActive and not row.IsDeleted
 

@@ -705,9 +705,9 @@ def _build_retrieved_records(cand: dict, sid: str, tenant: str, ss: int,
         guid(), sid, tenant, ss, cand["type_name"][:300], pcat, cand["threat_name"][:500],
         gr, scenario_session["EntityID"], scenario_session.get("UserID"),
         generic_name=cand["threat_name"],
-        # The catalogue row's own description (clipped to the column) — this threat IS that
-        # row, so its wording is already curated; no AI description is involved on this path.
-        description=cand.get("description") or None,
+        # No description on this path. It used to be the catalogue row's own curated wording,
+        # but Threat_Catalogue.Description was removed as unused, so a library-sourced threat
+        # now carries NULL here while the generated path below still records the AI's.
         category_id=category_id)
     # Additive keys, ignored by _dedup_key/scoring: full multi-category membership for the
     # coverage grid, plus retrieval/validator provenance for the audit trail.

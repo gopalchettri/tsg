@@ -1906,13 +1906,14 @@ def find_actor_id_by_norm_name(sess: Session, name: str) -> int | None:
     return _find_active_id_by_norm_name(
         sess, m.Threat_Actor, m.Threat_Actor.ThreatActorID, m.Threat_Actor.ThreatActorName, name)
 def upsert_threat_type(sess: Session, name: str, category_id: int | None,
-                    description: str | None = None, source: str = "ai_auto_promoted",
+                    source: str = "ai_auto_promoted",
                     created_by: str | None = None) -> tuple[int, bool]:
     """Insert-if-not-exists on `UX_ThreatType_NaturalKey`; returns (winning ThreatTypeID, created).
 
     `source`/`created_by` are FIRST-WRITER provenance: the collision branch never writes Updated*,
     because re-asserting a row is not an edit. No sector: SectorID is unmapped (sector logic
-    removed 2026-08, user instruction)."""
+    removed 2026-08, user instruction), and no description: Threat_Type.Description was
+    removed as unused."""
     # Bound to ThreatTypeName's real column width (Unicode(300)) before the INSERT: an over-long
     # name raises DataError, NOT the IntegrityError caught here, so it would abort the whole
     # accept-session transaction.
@@ -1928,7 +1929,7 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None,
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Type).values(
                 ThreatTypeName=name, ThreatCategoryID=category_id,
-                Description=description, IsActive=True, IsDeleted=False, Source=source,
+                IsActive=True, IsDeleted=False, Source=source,
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res), True
     except IntegrityError:
@@ -1950,7 +1951,7 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None,
 
 
 def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
-                            description: str | None = None, source: str = "promote-api",
+                            source: str = "promote-api",
                             created_by: str | None = None) -> tuple[int, bool]:
     """Insert-if-not-exists on Threat_Catalogue; returns (winning ThreatCatalogueID, created).
 
@@ -1959,12 +1960,14 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
     type+name+sector predicate would find nothing on a cross-type name collision and turn every
     such promotion into a 500. The caller runs the app-owned normalized-name dedup first
     (find_catalogue_id_by_norm_name, type-scoped); this function only mints. No sector —
-    SectorID stays unmapped and NULL (sector logic removed 2026-08, user instruction)."""
+    SectorID stays unmapped and NULL (sector logic removed 2026-08, user instruction), and no
+    description — Threat_Catalogue.Description was removed as unused, so the promoted row now
+    carries its name alone."""
     name = name[:500]
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Catalogue).values(
-                ThreatTypeID=type_id, ThreatName=name, Description=description,
+                ThreatTypeID=type_id, ThreatName=name,
                 IsActive=True, IsDeleted=False, Source=source,
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res), True

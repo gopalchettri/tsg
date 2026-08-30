@@ -113,7 +113,7 @@ def _load_candidates(sess: Session) -> list[dict]:
     grid-unplaceable — dal.categories_for_catalogue_threats documents the per-threat rule."""
     tc, tt = m.Threat_Catalogue, m.Threat_Type
     rows = [dict(row) for row in sess.execute(
-        select(tc.ThreatCatalogueID, tc.ThreatName, tc.Description,
+        select(tc.ThreatCatalogueID, tc.ThreatName,
             tc.ThreatTypeID, tt.ThreatTypeName, tt.ThreatCategoryID)
         .select_from(tc.__table__.join(tt.__table__, tt.ThreatTypeID == tc.ThreatTypeID))
         .where(tc.IsActive == True, tc.IsDeleted == False,
@@ -185,7 +185,7 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
         _t.result(candidates_after_type_filter=len(rows))
 
     corpus = [{"text": embeddings.catalogue_passage_text(
-                r["ThreatName"], r["Description"], s.max_embed_chars),
+                r["ThreatName"], s.max_embed_chars),
             "name": r["ThreatName"], "vector": None} for r in rows]
     queries = build_queries(subsystems, asset_context)
     # Embeddings are best-effort: corpus passage vectors through the shared cache, query
@@ -247,7 +247,6 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
             "catalogue_id": r["ThreatCatalogueID"],
             "type_id": r["ThreatTypeID"], "type_name": r["ThreatTypeName"],
             "threat_name": r["ThreatName"],
-            "description": r["Description"] or "",
             "categories": r["categories"],
             "retrieval_score": round(best.get(i, 0.0), 6),
             "subsystem_ids": attribution.get(r["ThreatTypeID"], []),

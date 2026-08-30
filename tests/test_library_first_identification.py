@@ -155,7 +155,6 @@ def _seed_library(s, include_live: bool = True) -> None:
             (777, "Orphaned manipulation threat", 11, False)):
         s.execute(m.Threat_Catalogue.__table__.insert().values(
             ThreatCatalogueID=cid, ThreatTypeID=tid, ThreatName=name,
-            Description=f"Scenario prose for {name}.",
             IsActive=True, IsDeleted=deleted, Source="seed",
             CreatedBy="seed", CreatedAt=NOW))
     for aid, name in ((1, "APT33"), (2, "AquaViper")):
@@ -224,7 +223,9 @@ def test_library_first_end_to_end(monkeypatch):
                                          "Payment card skimming at POS terminals"}
     # Payload shape: index/category/type/name/description only — the theme/risk_statement
     # legs left with the register model.
-    assert all(set(c) == {"index", "category", "type", "name", "description"} for c in cands)
+    # No "description": Threat_Catalogue.Description was removed, so the validator now judges
+    # relevance from category/type/name alone.
+    assert all(set(c) == {"index", "category", "type", "name"} for c in cands)
 
     with Session() as s:
         rows = {r.ThreatCatalogueID: r
@@ -242,8 +243,10 @@ def test_library_first_end_to_end(monkeypatch):
             # so explicitly — NULL here means "pre-feature row", a different fact.
             assert r.GroundingThresholdOrigin == "not_applicable"
             assert r.LibraryThreatName == r.ThreatName
-            # Curated wording is the description — clipped to the column, no AI prose.
-            assert r.Description == f"Scenario prose for {r.ThreatName}."[:200]
+            # NO description on a library-sourced threat: Threat_Catalogue.Description was
+            # removed as unused, so there is no curated wording left to copy down. The
+            # generated path still records the AI's own.
+            assert r.Description is None
             # Immutable provenance: this threat came FROM the catalogue, so it is not
             # AI-generated — the one column promotion must never rewrite.
             assert r.IsAIGenerated is False
@@ -338,7 +341,6 @@ def test_retrieval_eligibility_and_candidate_shape():
     assert by_id[418]["type_id"] == 7
     assert by_id[418]["type_name"] == "Logic/Configuration Manipulation"
     # The catalogue row's own curated description rides on the candidate.
-    assert by_id[418]["description"] == "Scenario prose for Unauthorised setpoint modification."
     # PER-TYPE junction actors, name-sorted, ids aligned; type 9 has none linked.
     assert by_id[418]["actors"] == ["APT33", "AquaViper"]
     assert by_id[418]["actor_ids"] == [1, 2]

@@ -1884,22 +1884,20 @@ class ThreatCategoryCreate(ApiModel):
     onto the same id, so the caller owns the choice."""
     model_config = ConfigDict(json_schema_extra={"example": {
         "threat_category_id": 7, "threat_category_name": "Elevation of Privilege",
-        "threat_category_code": "EOP", "security_objective": "Authorization"}})
+        "threat_category_code": "EOP"}})
 
     threat_category_id: int = Field(ge=1, description="Primary key. Required — this table's PK is not auto-generated.")
     threat_category_name: str = Field(min_length=1, max_length=200, description="Display name, e.g. 'Elevation of Privilege'.")
     threat_category_code: str | None = Field(default=None, max_length=20, description="Short code, e.g. 'EOP'.")
-    security_objective: str | None = Field(default=None, max_length=200, description="CIA objective this category maps to.")
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
 
 class ThreatCategoryUpdate(ApiModel):
     """Partial update — send only what changes. At least one field is required."""
-    model_config = ConfigDict(json_schema_extra={"example": {"security_objective": "Authorization"}})
+    model_config = ConfigDict(json_schema_extra={"example": {"threat_category_code": "EOP"}})
 
     threat_category_name: str | None = Field(default=None, min_length=1, max_length=200)
     threat_category_code: str | None = Field(default=None, max_length=20)
-    security_objective: str | None = Field(default=None, max_length=200)
     is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a name clash.")
 
 
@@ -1908,18 +1906,15 @@ class ThreatCategoryRow(LibraryRowAudit):
     threat_category_id: int = Field(description="Primary key.")
     threat_category_name: str = Field(description="Display name.")
     threat_category_code: str | None = Field(default=None, description="Short code.")
-    security_objective: str | None = Field(default=None, description="CIA objective.")
 
 
 class ThreatTypeCreate(ApiModel):
     """New Threat_Type row (a threat FAMILY). Unique on NAME alone among live rows — a name
     freed by a soft delete can be reused."""
     model_config = ConfigDict(json_schema_extra={"example": {
-        "threat_type_name": "Credential Abuse", "description": "Attacks that misuse valid credentials.",
-        "threat_category_id": 4}})
+        "threat_type_name": "Credential Abuse", "threat_category_id": 4}})
 
     threat_type_name: str = Field(min_length=1, max_length=300, description="Family name. Also the text the AI matches against — keep it descriptive.")
-    description: str | None = Field(default=None, description="Free text. Not embedded; only the name is matched.")
     threat_category_id: int | None = Field(default=None, ge=1, description="Owning STRIDE category. Must reference a live Threat_Category row.")
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
@@ -1931,7 +1926,6 @@ class ThreatTypeUpdate(ApiModel):
     model_config = ConfigDict(json_schema_extra={"example": {"threat_type_name": "Credential Abuse & Session Theft"}})
 
     threat_type_name: str | None = Field(default=None, min_length=1, max_length=300)
-    description: str | None = Field(default=None)
     threat_category_id: int | None = Field(default=None, ge=1)
     is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a natural-key clash.")
 
@@ -1940,7 +1934,6 @@ class ThreatTypeRow(LibraryRowAudit):
     """One Threat_Type row as returned by the CRUD endpoints."""
     threat_type_id: int = Field(description="Primary key.")
     threat_type_name: str = Field(description="Family name.")
-    description: str | None = Field(default=None)
     threat_category_id: int | None = Field(default=None)
 
 
@@ -1948,25 +1941,23 @@ class ThreatCatalogueCreate(ApiModel):
     """New Threat_Catalogue row (one EXACT threat under a family). Name-unique among live rows
     (UX_ThreatCatalogue_NaturalKey); the app also dedups by normalized name."""
     model_config = ConfigDict(json_schema_extra={"example": {
-        "threat_type_id": 12, "threat_name": "Credential phishing and MFA session theft",
-        "description": "Adversary-in-the-middle phishing that replays the session cookie."}})
+        "threat_type_id": 12, "threat_name": "Credential phishing and MFA session theft"}})
 
     threat_type_id: int = Field(ge=1, description="Owning family. Must reference a live Threat_Type row.")
-    threat_name: str = Field(min_length=1, max_length=500, description="Exact threat name. Also the text the AI matches against.")
-    description: str | None = Field(default=None, description="Free text; embedded together with the name (catalogue_passage_text).")
+    threat_name: str = Field(min_length=1, max_length=500, description="Exact threat name. This IS the text the AI matches against.")
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
 
 class ThreatCatalogueUpdate(ApiModel):
     """Partial update — send only what changes. At least one field is required.
 
-    Renaming OR re-describing re-embeds this row for AI matching — see the endpoint's
-    `embeddings_job_id`."""
-    model_config = ConfigDict(json_schema_extra={"example": {"description": "Updated wording."}})
+    Renaming re-embeds this row for AI matching — see the endpoint's `embeddings_job_id`.
+    Description was removed as unused, so the name is now the whole embedded passage."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "threat_name": "Credential phishing and MFA session theft"}})
 
     threat_type_id: int | None = Field(default=None, ge=1)
     threat_name: str | None = Field(default=None, min_length=1, max_length=500)
-    description: str | None = Field(default=None)
     is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a natural-key clash.")
 
 
@@ -1975,7 +1966,6 @@ class ThreatCatalogueRow(LibraryRowAudit):
     threat_catalogue_id: int = Field(description="Primary key.")
     threat_type_id: int = Field(description="Owning family.")
     threat_name: str = Field(description="Exact threat name.")
-    description: str | None = Field(default=None)
 
 
 class ThreatActorCreate(ApiModel):

@@ -22,20 +22,7 @@ from app.core.stride import STRIDE_ORDER
 
 log = get_logger(__name__)
 
-
-# An audit-trail stamp: recorded on every generation (tasks.py) so a reviewer can tell which
-# prompt version produced a given scenario. Bump it whenever a prompt's CONTRACT or content
-# changes meaningfully enough to be worth distinguishing in that history.
-#
-# 2.0 — the library-first redesign: threats_prompt stopped asking for actors, scenario_prompt
-# stopped asking for controls, and threat_validation_prompt (new) judges library candidates.
-# 2.1 — STRIDE coverage quota: threats_prompt takes a per-category target instead of soft
-# "prioritize covering every category" prose, and the category list it offers is now in
-# canonical STRIDE order rather than the seed's alphabetical id order. Stored scenarios must
-# not be served across this: a threat's category picks its narrative shape
-# (_STRIDE_SCENARIO_SHAPES), and threats are no longer labelled the way they were when those
-# scenarios were written.
-PROMPT_VERSION = "2.1"
+PROMPT_VERSION = "1.0"
 
 # The stable key for "the threat reached the asset directly, through no supporting system".
 # Supporting-system ids are positive DB primary keys, so 0 is free. Deliberately NOT reusing
@@ -365,8 +352,8 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
     ]
 
 def threat_validation_prompt(asset_name: str, asset_context: dict[str, Any],
-                             subsystems: list[dict[str, Any]],
-                             candidates: list[dict[str, Any]]) -> list[dict]:
+                            subsystems: list[dict[str, Any]],
+                            candidates: list[dict[str, Any]]) -> list[dict]:
     """Stage-1a validator: judge LIBRARY candidates' applicability to THIS asset — the LLM as
     a VALIDATOR, never a search engine. Candidates arrive index-keyed (1..N), never by DB id:
     _EXCLUDE_DB_KEY_TO_PROMPT stays intact and the server maps indexes back to catalogue rows.
@@ -382,7 +369,6 @@ def threat_validation_prompt(asset_name: str, asset_context: dict[str, Any],
         "category": [redact(c) for c in (cand.get("categories") or [])],
         "type": redact(cand.get("type_name")),
         "name": redact(cand.get("threat_name")),
-        "description": redact((cand.get("description") or "")[:600]),
     } for i, cand in enumerate(candidates, start=1)]
     system_content = (
         "You are a critical-infrastructure threat analyst VALIDATING pre-selected library "

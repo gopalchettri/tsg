@@ -69,11 +69,11 @@ def _engine():
 
 
 def _catalogue_row(s, *, cid: int, name: str, type_id: int = 7,
-                   description: str | None = None, is_active: bool = True,
+                   is_active: bool = True,
                    is_deleted: bool = False) -> None:
     s.execute(m.Threat_Catalogue.__table__.insert().values(
         ThreatCatalogueID=cid, ThreatTypeID=type_id, ThreatName=name,
-        Description=description, IsActive=is_active, IsDeleted=is_deleted,
+        IsActive=is_active, IsDeleted=is_deleted,
         Source="seed"))
 
 
@@ -96,15 +96,14 @@ def _seed(s, *, extra_rows: int = 0) -> None:
     s.execute(m.Threat_Type.__table__.insert().values(
         ThreatTypeID=9, ThreatTypeName="Ledger Fraud", ThreatCategoryID=4,
         IsActive=True, IsDeleted=False))
-    _catalogue_row(s, cid=418, name="Siemens SCADA setpoint tampering",
-                   description="Manipulates the Siemens SCADA HMI Server setpoints.")
+    _catalogue_row(s, cid=418, name="Siemens SCADA setpoint tampering")
     _catalogue_row(s, cid=500, name="Zyzzogeton ledger skimming", type_id=9)
     _catalogue_row(s, cid=600, name="Inactive catalogue threat", is_active=False)
     _catalogue_row(s, cid=601, name="Deleted catalogue threat", is_deleted=True)
     _catalogue_row(s, cid=700, name="Siemens SCADA orphaned tampering", type_id=8)
     for i in range(extra_rows):
         _catalogue_row(s, cid=2000 + i, name=f"Zyzzogeton variant {i} ledger skimming",
-                       type_id=9, description=f"Qorvex offshore clearing scheme {i}.")
+                       type_id=9)
 
 
 def _retrieve(s, llm=None):
@@ -159,7 +158,7 @@ def test_selection_source_is_only_hybrid_and_candidate_shape_is_exact():
         _seed(s, extra_rows=3)
         candidates = _retrieve(s)
     assert candidates
-    expected_keys = {"catalogue_id", "type_id", "type_name", "threat_name", "description",
+    expected_keys = {"catalogue_id", "type_id", "type_name", "threat_name",
                      "categories", "retrieval_score", "subsystem_ids", "selection_source",
                      "ranking_degraded", "actors", "actor_ids"}
     assert all(set(c) == expected_keys for c in candidates)
@@ -168,7 +167,6 @@ def test_selection_source_is_only_hybrid_and_candidate_shape_is_exact():
     by_id = {c["catalogue_id"]: c for c in candidates}
     assert by_id[418]["type_id"] == 7
     assert by_id[418]["type_name"] == "Siemens SCADA Setpoint Tampering"
-    assert by_id[500]["description"] == ""          # NULL Description -> safe empty
 
 
 def test_ranking_degraded_flag_rides_on_every_candidate_when_embeds_fail():

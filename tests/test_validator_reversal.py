@@ -148,12 +148,10 @@ def _seed_library(s, include_other: bool = False) -> None:
         ThreatTypeID=7, ThreatActorID=9))
     s.execute(m.Threat_Catalogue.__table__.insert().values(
         ThreatCatalogueID=REJECTED_ID, ThreatTypeID=7, ThreatName=REJECTED_NAME,
-        Description="Tampering with parameters of a public web application.",
         IsActive=True, IsDeleted=False, CreatedBy="seed", CreatedAt=NOW))
     if include_other:
         s.execute(m.Threat_Catalogue.__table__.insert().values(
             ThreatCatalogueID=OTHER_ID, ThreatTypeID=7, ThreatName=OTHER_NAME,
-            Description="Unauthorised modification of legacy firmware configuration.",
             IsActive=True, IsDeleted=False, CreatedBy="seed", CreatedAt=NOW))
 
 

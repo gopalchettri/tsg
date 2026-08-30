@@ -420,7 +420,6 @@ class Threat_Category(Base):
     ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     ThreatCategoryName: Mapped[str] = mapped_column(Unicode(200))
     ThreatCategoryCode: Mapped[str | None] = mapped_column(Unicode(100))
-    SecurityObjective: Mapped[str | None] = mapped_column(Unicode(200))
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
@@ -433,9 +432,9 @@ class Threat_Type(Base):
     __tablename__ = "Threat_Type"
     ThreatTypeID: Mapped[int] = mapped_column(Integer, primary_key=True)
     ThreatTypeName: Mapped[str] = mapped_column(Unicode(300))
-    Description: Mapped[str | None] = mapped_column(UnicodeText)
     # SectorID exists in the frozen table but is deliberately UNMAPPED: sector logic was removed
-    # 2026-08 per user instruction — the code ignores the column entirely.
+    # 2026-08 per user instruction — the code ignores the column entirely. Description was
+    # DROPPED 2026-08-30 as unused (nothing read it).
     ThreatCategoryID: Mapped[int | None] = mapped_column(Integer)
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -473,7 +472,8 @@ class Threat_Catalogue(Base):
     ThreatCatalogueID: Mapped[int] = mapped_column(Integer, primary_key=True)
     ThreatTypeID: Mapped[int] = mapped_column(Integer)
     ThreatName: Mapped[str] = mapped_column(Unicode(500))
-    Description: Mapped[str | None] = mapped_column(UnicodeText)
+    # Description was DROPPED 2026-08-30. It had fed the embedded passage
+    # (embeddings.catalogue_passage_text) and the validator prompt; both are now name-only.
     # SectorID exists in the frozen table but is deliberately UNMAPPED — same rule as
     # Threat_Type.SectorID above (sector logic removed 2026-08, user instruction).
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)

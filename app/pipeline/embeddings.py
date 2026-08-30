@@ -54,11 +54,13 @@ _CONTROL_TEXT = m.Control_Library.ControlName + ": " + func.coalesce(m.Control_L
 
 # group name -> (table, name column). Single source of truth — the admin API and
 # scripts/refresh_embeddings.py both use this instead of re-deriving it. Groups whose text is
-# COMPOSED across joins (threat_catalogue) carry a None column and are gathered by
-# _group_texts' special case instead — the composition function is shared with the query path
-# (catalogue_passage_text), so warm-cache text and query text can never drift apart (G10: the
-# pre-2026-08 catalogue group warmed bare names while retrieval embedded name+description, so
-# retrieval vectors were never pre-warmed; the shared composer removes that class).
+# gathered through a JOIN (threat_catalogue) carry a None column and are handled by
+# _group_texts' special case instead. That case survives the removal of Description: the passage
+# is now name-only, but the eligibility filter still needs the join, because a catalogue row whose
+# TYPE is inactive must not be warmed (retrieval will not query it either — warm set == query set).
+# The text itself comes from the shared catalogue_passage_text so warm-cache and query bytes cannot
+# drift (G10: the pre-2026-08 group warmed bare names while retrieval embedded name+description, so
+# retrieval vectors were never pre-warmed; sharing the composer removed that class of bug).
 _GROUPS = {
     "threat_type": (m.Threat_Type, m.Threat_Type.ThreatTypeName),
     "threat_catalogue": (m.Threat_Catalogue, None),
@@ -70,14 +72,15 @@ _GROUPS = {
 }
 
 
-def catalogue_passage_text(name, description, limit: int) -> str:
-    """THE passage text for one catalogue threat — name + description, truncated to the embed
-    limit. Single source shared by retrieval's corpus build, the admin CRUD's embed hook and
-    this module's warm/refresh path, BY CONSTRUCTION the same bytes (G10)."""
-    head = str(name or "").strip()
-    tail = str(description or "").strip()
-    text = head + (": " + tail if tail else "")
-    return text[:limit]
+def catalogue_passage_text(name, limit: int) -> str:
+    """THE passage text for one catalogue threat — the name, truncated to the embed limit.
+
+    Was name + ": " + description until Threat_Catalogue.Description was removed as unused; the
+    passage is now name-only. Kept as a function rather than inlined because its whole job is that
+    retrieval's corpus build and this module's warm/refresh path produce the SAME BYTES (G10) —
+    including the same truncation. Two call sites each doing their own [:limit] is exactly the
+    drift this prevents."""
+    return str(name or "").strip()[:limit]
 
 
 def _catalogue_texts(sess: Session) -> list[str]:
@@ -85,9 +88,9 @@ def _catalogue_texts(sess: Session) -> list[str]:
     the same eligibility retrieval applies, so the warm set is exactly the query set)."""
     limit = get_settings().max_embed_chars
     tc, tt = m.Threat_Catalogue, m.Threat_Type
-    return [catalogue_passage_text(name, desc, limit)
-            for name, desc in sess.execute(
-                select(tc.ThreatName, tc.Description)
+    return [catalogue_passage_text(name, limit)
+            for (name,) in sess.execute(
+                select(tc.ThreatName)
                 .select_from(tc.__table__.join(tt.__table__, tt.ThreatTypeID == tc.ThreatTypeID))
                 .where(tc.IsActive == True, tc.IsDeleted == False,
                     tt.IsActive == True, tt.IsDeleted == False)
