@@ -110,6 +110,10 @@ Then, once, in SQL Server: `ALTER DATABASE TSG SET READ_COMMITTED_SNAPSHOT ON;`
 > If a migration says a table doesn't exist, your `TSG` is missing the platform base tables —
 > those must be present first (the app reuses them, it does not create them).
 
+> `scripts/bootstrap_schema.sql` is the alternative one-stop path for a database you do not manage with
+> alembic; it is safe to re-run and covers migrations 0002-0019. Follow it with `alembic stamp 0019`
+> only if alembic will ever manage that database.
+
 ---
 
 ## 5. Run the services
@@ -141,8 +145,21 @@ curl http://YOUR_HOST:8000/healthz    # {"status":"ok"}
 curl http://YOUR_HOST:8000/readyz     # {"status":"ready"}  (DB reachable)
 ```
 
-Check the logs (structured JSON). On boot the **api** runs the DB invariant checks (it refuses to
-start if a required index/column is missing), and the **worker** warm-loads the models (if local).
+Check the logs (structured JSON). On boot **both the api and the worker** run the same DB invariant
+checks — each refuses to start if a required index or column is missing, or if a required index exists
+under the right name but over the wrong table/columns. The worker logs a failure as one
+`worker.boot_guard_failed` record and exits; the api fails its lifespan startup. The worker also
+warm-loads the models (if local).
+
+> **`required indexes exist under the right name but on the wrong table/columns`** — the database has an
+> index carrying a guard's name but built over different columns, so it enforces a rule the app never
+> asked for (typically a hand-made index, or one built against a pre-existing threat library whose
+> category column is `ThreatCategoryID` rather than `PrimaryThreatCategoryID`). The message names, per
+> index, what the code needs and what is actually there. Fix it by running `alembic upgrade head`
+> (migration `0019` rebuilds exactly the drifted indexes and nothing else) or by re-running
+> `scripts/bootstrap_schema.sql`. If the rebuild reports duplicate keys, the wrong index had been
+> letting duplicate rows in: de-duplicate the table on the columns the message names first — where the
+> index is filtered, soft-deleting the losers with `IsDeleted = 1` is enough.
 
 ---
 

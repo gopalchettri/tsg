@@ -1,6 +1,6 @@
 -- ============================================================================
 -- TSG bootstrap schema — THE one-stop production script for the TSG database.
--- Consolidates the baseline TSG tables + migrations 0002-0017 into one
+-- Consolidates the baseline TSG tables + migrations 0002-0019 into one
 -- idempotent T-SQL script. (0017 is a legacy-data vocabulary rename on
 -- Scenario_Audit.EventType — no schema/DDL change, so a fresh bootstrap DB
 -- has nothing to apply for it; it only matters when healing an existing DB.) Production databases are stood up AND upgraded by
@@ -10,8 +10,12 @@
 --   * creates any missing table (final, fully-migrated shape);
 --   * adds any missing column to a table that already exists (Section 3 —
 --     the migration chain's ALTER logic, synced in);
---   * creates any missing index;
---   * never drops anything, never modifies existing rows or data.
+--   * creates any missing index, and REBUILDS a guard index that exists
+--     under a required name but over the wrong table/columns (Section 3b,
+--     migration 0019) — the one and only thing this script drops, because
+--     such an index enforces a rule the app never asked for and the app now
+--     refuses to boot against it;
+--   * never drops a table, a column or a row, never modifies existing data.
 --
 -- Creates TSG's own pipeline tables AND the threat-library master tables
 -- (Threat_Category/Type/Catalogue/Actor + the type-actor map) — the latter
@@ -25,9 +29,9 @@
 --
 -- Alembic is NOT required for a database managed by this script. Only if
 -- alembic will ever manage this database (dev environments): run
--- `alembic stamp 0017` once after this script (its DDL matches migrations
--- 0002-0017 exactly). If newer migrations exist by the time you're reading
--- this (check migrations/versions/ against the range above), stamp 0017
+-- `alembic stamp 0019` once after this script (its DDL matches migrations
+-- 0002-0019 exactly). If newer migrations exist by the time you're reading
+-- this (check migrations/versions/ against the range above), stamp 0019
 -- first, then run `alembic upgrade head` to pick up anything added since.
 --
 -- tests/test_schema_sync.py asserts every models.py column appears in the
@@ -283,6 +287,29 @@ CREATE TABLE Config_Threat_Rule (   -- R12/0016: scoping rules (SDD §5.4/Append
 GO
 
 -- ============================================================
+-- SECTION 2a — Columns the threat-library masters may predate (0019/M2).
+--
+-- The masters are seeded externally (SDD §7.7) and Section 2 creates them only
+-- when they are ABSENT, so a deployment that already had its own
+-- Threat_Type/Threat_Catalogue has never received the columns TSG's natural-key
+-- guard indexes are keyed on from any script — Section 5's CREATE would fail
+-- with "Invalid column name" on precisely the databases that need it most.
+--
+-- This runs BEFORE Section 2b on purpose: 2b's IDENTITY rebuild copies these
+-- columns by name out of the old table, so it needs them to exist first.
+-- Adding a NULLable column is additive — no existing row changes.
+-- ============================================================
+
+IF COL_LENGTH('dbo.Threat_Type', 'PrimaryThreatCategoryID') IS NULL
+    ALTER TABLE Threat_Type ADD PrimaryThreatCategoryID int NULL;
+IF COL_LENGTH('dbo.Threat_Type', 'SectorID') IS NULL
+    ALTER TABLE Threat_Type ADD SectorID int NULL;
+IF COL_LENGTH('dbo.Threat_Catalogue', 'SectorID') IS NULL
+    ALTER TABLE Threat_Catalogue ADD SectorID int NULL;
+
+GO
+
+-- ============================================================
 -- SECTION 2b — Retrofit IDENTITY onto a pre-existing Threat_Type/Catalogue/
 -- Actor table that predates this script's IDENTITY declaration above (the
 -- CREATE TABLE guards in Section 2 only fire for a table that doesn't exist
@@ -407,6 +434,71 @@ IF COL_LENGTH('dbo.Threat_Scenario_Output', 'EntityID') IS NULL
 GO
 
 -- ============================================================
+-- SECTION 3b — Rebuild guard indexes whose SHAPE has drifted (0019)
+--
+-- Sections 4 and 5 below guard every CREATE with
+-- `IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = '<name>' ...)`, which
+-- reasons about the index NAME and nothing else. An index carrying a required
+-- name but built over the WRONG columns — by hand, or against an
+-- externally-seeded library whose category column is `ThreatCategoryID` rather
+-- than `PrimaryThreatCategoryID` — therefore survives every re-run of this
+-- script forever: the guard sees the name and skips. Meanwhile it enforces a
+-- rule the application never asked for, so the duplicate-master race
+-- dal.upsert_threat_* deliberately loses (R10) is not actually guarded, and
+-- app/db/invariants.py (which compares the full shape) refuses to boot the API
+-- or a Celery worker against that database.
+--
+-- So: drop exactly those here, and Sections 4/5 rebuild them correctly a few
+-- lines below. This is the ONE thing this script drops — indexes only, never a
+-- table, a column or a row — and it is a no-op on a database whose guard
+-- indexes are already the right shape.
+--
+-- Keep #GuardIndex in lockstep with REQUIRED_INDEXES in app/db/invariants.py;
+-- tests/test_schema_sync.py fails the build if the two ever disagree.
+-- ============================================================
+
+IF OBJECT_ID('tempdb..#GuardIndex') IS NOT NULL DROP TABLE #GuardIndex;
+-- COLLATE DATABASE_DEFAULT on every column: a temp table is created in tempdb and
+-- inherits tempdb's collation, so joining these columns to sys.indexes/sys.tables
+-- raises "Cannot resolve the collation conflict" on any server whose user database
+-- collation differs from tempdb's. KeyColumns is comma-separated, IN ORDER.
+CREATE TABLE #GuardIndex (
+    IndexName  sysname        COLLATE DATABASE_DEFAULT NOT NULL PRIMARY KEY,
+    TableName  sysname        COLLATE DATABASE_DEFAULT NOT NULL,
+    KeyColumns nvarchar(1000) COLLATE DATABASE_DEFAULT NOT NULL
+);
+INSERT INTO #GuardIndex (IndexName, TableName, KeyColumns) VALUES
+    ('UX_Session_ActiveAsset',        'Scenario_Session',       'EntityID,AssetExternalID'),
+    ('UX_Profile_Active',             'Subsystem_Profile',      'SessionID,SubsystemID'),
+    ('UX_Scenario_ActiveIdentity',    'Threat_Scenario_Output', 'SessionID,IdentityHash'),
+    ('UX_ThreatType_NaturalKey',      'Threat_Type',            'ThreatTypeName,PrimaryThreatCategoryID,SectorID'),
+    ('UX_ThreatCatalogue_NaturalKey', 'Threat_Catalogue',       'ThreatTypeID,ThreatName,SectorID'),
+    ('UX_ThreatActor_NaturalKey',     'Threat_Actor',           'ThreatActorName');
+
+DECLARE @drop nvarchar(max) = N'';
+SELECT @drop = @drop + N'DROP INDEX ' + QUOTENAME(i.name) + N' ON '
+                     + QUOTENAME(SCHEMA_NAME(t.schema_id)) + N'.' + QUOTENAME(t.name) + N';'
+FROM sys.indexes i
+JOIN sys.tables t  ON t.object_id = i.object_id
+JOIN #GuardIndex g ON g.IndexName = i.name
+WHERE i.is_unique = 0                                    -- present, but enforcing nothing
+   OR t.name <> g.TableName                              -- right name, wrong table
+   OR ISNULL(STUFF((SELECT N',' + c.name                 -- right name, wrong columns (or wrong order)
+                    FROM sys.index_columns ic
+                    JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                    WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
+                      AND ic.is_included_column = 0      -- INCLUDE columns are payload, not part of the rule
+                      AND ic.key_ordinal > 0             -- ...and so is the clustering key SQL Server appends
+                                                         --    to a UNIQUE nonclustered index (key_ordinal 0)
+                    ORDER BY ic.key_ordinal
+                    FOR XML PATH('')), 1, 1, N''), N'') <> g.KeyColumns;
+
+IF @drop <> N'' EXEC sp_executesql @drop;
+DROP TABLE #GuardIndex;
+
+GO
+
+-- ============================================================
 -- SECTION 4 — TSG's own guard indexes (0004, 0005, 0006, 0009, 0012)
 -- ============================================================
 
@@ -446,3 +538,9 @@ CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatType
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
 CREATE UNIQUE INDEX UX_ThreatActor_NaturalKey ON Threat_Actor(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0;
+
+-- Not a guard — a supporting lookup index (0018). grounding.get_possible_types()
+-- filters active Threat_Type rows by (PrimaryThreatCategoryID, SectorID) on every
+-- grounding call; this gives that filter a direct path instead of a table scan.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ThreatType_Category_Active' AND object_id = OBJECT_ID('dbo.Threat_Type'))
+CREATE INDEX IX_ThreatType_Category_Active ON Threat_Type(PrimaryThreatCategoryID, SectorID) WHERE IsActive = 1 AND IsDeleted = 0;

@@ -21,13 +21,19 @@ WHEN THIS RUNS: called once at boot (see `verify_startup` below) and also in
 CI, so a bad deploy is caught before it ever reaches production traffic.
 
 WHY SOME CHECKS SKIP ON SQLite: the unit test suite runs against SQLite (fast,
-no real database needed), but SQLite doesn't have the same system tables
-(`sys.indexes`, `INFORMATION_SCHEMA`) that real SQL Server has. So the
-index/NOT-NULL checks below only run when the app is actually talking to
-MSSQL; they're skipped during SQLite-based tests, where they wouldn't make
-sense anyway.
+no real database needed), and its schema is a hand-built fixture
+(tests/conftest.py), not the real production schema. Asserting the production
+schema's guards against that fixture would only ever be testing the fixture, so
+`verify_startup` runs checklists 1 and 2 exclusively against real MSSQL.
+Checklist 1's machinery is nevertheless dialect-portable (it reads SQLite's
+`pragma_index_list` where it reads SQL Server's `sys.indexes`) so that
+tests/test_invariants.py can drive the real comparison end to end against a
+real database instead of leaving it untested — an untested boot check is how a
+wrong-shaped index reached a deployed database in the first place.
 """
 from __future__ import annotations
+
+from typing import NamedTuple
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -37,11 +43,12 @@ from app.db import models as m
 # ============================================================================
 # CHECKLIST 1 — "did the database actually get its safety locks installed?"
 #
-# Each name below is a UNIQUE INDEX: a rule you tell the database to enforce
+# Each entry below is a UNIQUE INDEX: a rule you tell the database to enforce
 # FOR you, so the database itself refuses bad data, instead of trusting the
 # application code to always remember to check. These indexes are created by
 # separate migration scripts (not by this file) — this file only checks that
-# they actually exist before the app is allowed to start.
+# they exist, on the right table, over the right columns, before the app is
+# allowed to start.
 #
 # CONCRETE EXAMPLE of what one of these prevents: `UX_Session_ActiveAsset`
 # stops two people from clicking "start a new session" on the exact same
@@ -49,19 +56,80 @@ from app.db import models as m
 # running simultaneously, stepping on each other's data. Without the index,
 # the database would happily accept both inserts.
 #
-# This list grows by one line every time a new milestone adds a new index the
+# WHY EACH ENTRY IS A FULL SHAPE AND NOT JUST A NAME: an index name is only a
+# label — on its own it says nothing about what the index actually enforces.
+# A hand-made index called `UX_ThreatType_NaturalKey` sitting on the WRONG
+# column (a legacy `ThreatCategoryID` instead of `PrimaryThreatCategoryID`,
+# say) sails straight past a name-only check while enforcing a rule the code
+# never asked for — and the duplicate-master race that index exists to lose
+# safely (R10, `dal.upsert_threat_type`) is then completely unguarded, with
+# nothing anywhere reporting a problem. That is not hypothetical: it is what
+# a UAT database was found doing. So each entry carries the table, the key
+# columns IN ORDER, and whether the index must be UNIQUE, and
+# `_assert_indexes` below compares every part of it.
+#
+# `filter_sql` is the index's WHERE clause. It is deliberately NOT part of the
+# boot comparison: SQL Server rewrites a filter into its own normalized form
+# (`IsActive = 1` comes back as `([IsActive]=(1))`), so comparing the text is
+# a false-alarm generator. It lives here so that ONE definition of each guard
+# index exists in ONE place — migration 0019 rebuilds a drifted index straight
+# from `IndexSpec.ddl()`, and tests/test_schema_sync.py asserts the CREATE
+# statements in scripts/bootstrap_schema.sql and in the SQLite test harness
+# still agree with these specs.
+#
+# This list grows by one entry every time a new milestone adds a new index the
 # code now depends on.
 # ============================================================================
+class IndexSpec(NamedTuple):
+    """One required index, described completely enough to both CHECK it and
+    REBUILD it. `columns` is ordered — a unique index on (A, B) and one on
+    (B, A) enforce the same rule, but only the first is usable as a seek for
+    the queries written against it, so order is part of the contract."""
+
+    name: str
+    table: str
+    columns: tuple[str, ...]
+    filter_sql: str | None = None
+    unique: bool = True
+
+    def ddl(self) -> str:
+        """The exact CREATE statement that brings this index into existence —
+        the single source of truth migration 0019 rebuilds a drifted index
+        from, so a repair can never disagree with what boot demands."""
+        unique = "UNIQUE " if self.unique else ""
+        where = f" WHERE {self.filter_sql}" if self.filter_sql else ""
+        return f"CREATE {unique}INDEX {self.name} ON {self.table}({', '.join(self.columns)}){where}"
+
+    def describe(self) -> str:
+        """`Threat_Type(ThreatTypeName, PrimaryThreatCategoryID, SectorID)` — the
+        shape, for error messages an operator has to act on at 2am."""
+        return f"{self.table}({', '.join(self.columns)})"
+
+
 REQUIRED_INDEXES = [
     # One active session per asset / one active profile per subsystem / one
     # active scenario per scoped threat. Stops duplicate "current" rows from
     # a retried or racing request.
-    "UX_Session_ActiveAsset", "UX_Profile_Active", "UX_Scenario_ActiveIdentity",
+    IndexSpec("UX_Session_ActiveAsset", "Scenario_Session",
+              ("EntityID", "AssetExternalID"), "SessionStatus = 'active'"),
+    IndexSpec("UX_Profile_Active", "Subsystem_Profile",
+              ("SessionID", "SubsystemID"), "Superseded = 0"),
+    IndexSpec("UX_Scenario_ActiveIdentity", "Threat_Scenario_Output",
+              ("SessionID", "IdentityHash"), "Superseded = 0"),
     # Master-library natural-key UNIQUE. Stops two people accepting sessions at
     # the same moment from both creating a DUPLICATE "Ransomware via USB"
     # threat type in the shared library (safe concurrent promotion, R10).
-    "UX_ThreatType_NaturalKey", "UX_ThreatCatalogue_NaturalKey", "UX_ThreatActor_NaturalKey",
+    # Filtered on IsActive/IsDeleted so a soft-deleted master's name is reusable.
+    IndexSpec("UX_ThreatType_NaturalKey", "Threat_Type",
+              ("ThreatTypeName", "PrimaryThreatCategoryID", "SectorID"),
+              "IsActive = 1 AND IsDeleted = 0"),
+    IndexSpec("UX_ThreatCatalogue_NaturalKey", "Threat_Catalogue",
+              ("ThreatTypeID", "ThreatName", "SectorID"),
+              "IsActive = 1 AND IsDeleted = 0"),
+    IndexSpec("UX_ThreatActor_NaturalKey", "Threat_Actor",
+              ("ThreatActorName",), "IsActive = 1 AND IsDeleted = 0"),
 ]
+
 
 # ============================================================================
 # CHECKLIST 2 — "are these specific columns actually locked down the way the
@@ -133,12 +201,12 @@ def verify_startup(engine: Engine) -> None:
     exists to support. Call it once, at boot (and in CI).
 
     Step by step:
-      1. If we're talking to real MSSQL, run checklist 1 (indexes exist?) and
-         checklist 2 (NOT-NULL columns really are NOT NULL?). These need
-         MSSQL's system tables, so they're skipped entirely on SQLite (where
-         those system tables don't exist in the same form — running the tests
-         there would either error out or trivially always pass, neither of
-         which tells us anything useful).
+      1. If we're talking to real MSSQL, run checklist 1 (does every required
+         index exist, on the right table, over the right columns, UNIQUE?) and
+         checklist 2 (NOT-NULL columns really are NOT NULL?). Both are gated on
+         MSSQL because they assert the PRODUCTION schema, and the SQLite test
+         database is a hand-built fixture — asserting the fixture against
+         itself would prove nothing (see the module docstring).
       2. ALWAYS run checklist 3 (no duplicate "active" rows) — this one works
          identically on SQLite and MSSQL since it's just a plain COUNT/GROUP BY
          query, no dialect-specific system tables involved. This is why it's
@@ -154,22 +222,177 @@ def verify_startup(engine: Engine) -> None:
     _assert_no_duplicate_active(engine)
 
 
+class LiveIndex(NamedTuple):
+    """One index as it ACTUALLY exists in the database right now, read back
+    from the server's own catalog — the thing an `IndexSpec` is compared to."""
+
+    table: str
+    columns: tuple[str, ...]
+    unique: bool
+
+
+class IndexDrift(NamedTuple):
+    """Everything wrong with the live indexes, sorted into the three kinds of
+    wrong, because each one means a different thing went wrong and needs a
+    different fix:
+
+      * `missing`     — the name isn't in the database at all. A migration
+                        never ran. Fix: run migrations / bootstrap_schema.sql.
+      * `wrong_shape` — the name IS there, but on another table or over other
+                        columns. Somebody built it by hand, or it predates a
+                        column rename. Fix: rebuild it (migration 0019).
+      * `not_unique`  — right name, right columns, but created without UNIQUE,
+                        so it enforces NOTHING and every insert the app expects
+                        the database to reject is silently accepted. Fix:
+                        rebuild it (migration 0019).
+    """
+
+    missing: list[IndexSpec]
+    wrong_shape: list[tuple[IndexSpec, tuple[LiveIndex, ...]]]
+    not_unique: list[IndexSpec]
+
+    def __bool__(self) -> bool:
+        return bool(self.missing or self.wrong_shape or self.not_unique)
+
+
+# Every named index in the database, with the table it sits on, its key columns
+# in declared order, and whether it is UNIQUE.
+#
+# `is_included_column = 0 AND key_ordinal > 0` is what makes this the KEY of the
+# index and nothing else. Two different things hide in sys.index_columns that are
+# not part of the rule the index enforces: INCLUDE columns (payload carried for
+# covering reads), and — the subtle one — the clustering-key columns SQL Server
+# silently appends to a UNIQUE nonclustered index, which come back with
+# is_included_column = 0 and key_ordinal = 0. Without the key_ordinal filter,
+# every unique index on a table with a clustered primary key reads back with
+# extra trailing columns and is declared drifted: a boot failure on a database
+# that is perfectly correct.
+_MSSQL_INDEX_CATALOG = text(
+    "SELECT i.name AS index_name, t.name AS table_name, i.is_unique AS is_unique, "
+    "       c.name AS column_name, ic.key_ordinal AS key_ordinal "
+    "FROM sys.indexes i "
+    "JOIN sys.tables t ON t.object_id = i.object_id "
+    "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+    "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+    "WHERE i.name IS NOT NULL AND ic.is_included_column = 0 AND ic.key_ordinal > 0 "
+    "ORDER BY i.name, ic.key_ordinal"
+)
+
+# The same read for SQLite. Production is always MSSQL, but the whole automated
+# test suite runs on SQLite — without this, CHECKLIST 1 would have no test
+# coverage at all, which is precisely how a wrong-shaped index reached a
+# deployed database unnoticed in the first place.
+_SQLITE_INDEX_CATALOG = text(
+    "SELECT il.name AS index_name, m.name AS table_name, il.[unique] AS is_unique, "
+    "       ii.name AS column_name, ii.seqno AS key_ordinal "
+    "FROM sqlite_master m "
+    "JOIN pragma_index_list(m.name) il "
+    "JOIN pragma_index_info(il.name) ii "
+    "WHERE m.type = 'table' AND il.origin = 'c' AND ii.name IS NOT NULL "
+    "ORDER BY il.name, ii.seqno"
+)
+
+
+def read_index_catalog(conn) -> dict[str, list[LiveIndex]]:
+    """Ask the database itself what indexes it really has.
+
+    Keyed by index NAME, and the value is a LIST because an index name is only
+    unique per-table in SQL Server — the same name can legitimately sit on two
+    different tables, and "the right name, but on the wrong table" is one of
+    the exact failures this file exists to catch, so we have to see all of them.
+
+    Public (not `_`-prefixed) on purpose: migration 0019 reads the live catalog
+    through this same function, so a repair decides "has this drifted?" using
+    the identical query the boot check uses to decide "is this broken?".
+    """
+    dialect = conn.engine.dialect.name
+    sql = _SQLITE_INDEX_CATALOG if dialect == "sqlite" else _MSSQL_INDEX_CATALOG
+    ordered: dict[tuple[str, str], list[tuple[int, str]]] = {}
+    unique: dict[tuple[str, str], bool] = {}
+    for row in conn.execute(sql).mappings():
+        key = (row["index_name"], row["table_name"])
+        ordered.setdefault(key, []).append((row["key_ordinal"], row["column_name"]))
+        unique[key] = bool(row["is_unique"])
+    catalog: dict[str, list[LiveIndex]] = {}
+    for (index_name, table_name), cols in ordered.items():
+        catalog.setdefault(index_name, []).append(
+            LiveIndex(table_name, tuple(col for _, col in sorted(cols)), unique[(index_name, table_name)])
+        )
+    return catalog
+
+
+def diff_index_catalog(catalog: dict[str, list[LiveIndex]],
+                       specs: list[IndexSpec] | None = None) -> IndexDrift:
+    """Compare what the database HAS against what the code NEEDS — a pure
+    function over the catalog dict, so the comparison itself is unit-testable
+    without a database of any flavour.
+
+    Identifier comparison is case-insensitive because SQL Server's default
+    collation treats `SectorID` and `sectorid` as the same column; raising a
+    boot failure over letter case would be a false alarm that teaches operators
+    to ignore this check.
+    """
+    specs = REQUIRED_INDEXES if specs is None else specs
+    lowered = {name.casefold(): placements for name, placements in catalog.items()}
+    missing: list[IndexSpec] = []
+    wrong_shape: list[tuple[IndexSpec, tuple[LiveIndex, ...]]] = []
+    not_unique: list[IndexSpec] = []
+    for spec in specs:
+        placements = lowered.get(spec.name.casefold())
+        if not placements:
+            missing.append(spec)
+            continue
+        matched = [p for p in placements
+                   if p.table.casefold() == spec.table.casefold()
+                   and tuple(c.casefold() for c in p.columns) == tuple(c.casefold() for c in spec.columns)]
+        if not matched:
+            wrong_shape.append((spec, tuple(placements)))
+        elif spec.unique and not any(p.unique for p in matched):
+            not_unique.append(spec)
+    return IndexDrift(missing, wrong_shape, not_unique)
+
+
 def _assert_indexes(engine: Engine) -> None:
-    """Runs CHECKLIST 1. How it works: ask SQL Server's own system catalog
-    (`sys.indexes`) for the names of every index that currently exists in the
-    database, then compare that list against `REQUIRED_INDEXES` above. Any
-    name in `REQUIRED_INDEXES` that ISN'T in the real database gets collected
-    into `missing`, and if that list is non-empty, the app refuses to boot
-    with a clear error message naming exactly which index(es) are missing —
-    so whoever sees the error knows precisely which migration didn't run.
+    """Runs CHECKLIST 1. How it works: ask the database's own catalog for every
+    index that currently exists — its name, the table it sits on, its key
+    columns in order, and whether it is UNIQUE — then compare that against
+    `REQUIRED_INDEXES` above. Anything that doesn't line up stops the boot with
+    a message naming the index, what the code needs, and what is actually there,
+    so whoever reads it knows both what is wrong and which fix to run.
+
+    Every failing index is reported at once, not just the first one: an operator
+    fixing a broken deployment should get the whole list in one restart, not
+    discover the next problem only after fixing this one.
     """
     with engine.connect() as c:
-        present = {
-            r[0] for r in c.execute(text("SELECT name FROM sys.indexes WHERE name IS NOT NULL"))
-        }
-    missing = [ix for ix in REQUIRED_INDEXES if ix not in present]
-    if missing:
-        raise StartupInvariantError(f"missing required indexes (run migrations): {missing}")
+        drift = diff_index_catalog(read_index_catalog(c))
+    if not drift:
+        return
+    problems: list[str] = []
+    if drift.missing:
+        problems.append(
+            "missing required indexes (run migrations): "
+            f"{[s.name for s in drift.missing]}"
+        )
+    if drift.wrong_shape:
+        problems.append(
+            "required indexes exist under the right name but on the wrong table/columns: "
+            + "; ".join(
+                f"{spec.name} needs {spec.describe()} but found "
+                + " and ".join(f"{p.table}({', '.join(p.columns)})" for p in found)
+                for spec, found in drift.wrong_shape
+            )
+        )
+    if drift.not_unique:
+        problems.append(
+            "required indexes exist but are NOT UNIQUE, so they enforce nothing: "
+            f"{[s.name for s in drift.not_unique]}"
+        )
+    raise StartupInvariantError(
+        " | ".join(problems)
+        + " — run `alembic upgrade head` (migration 0019 rebuilds a drifted guard index)"
+        " or re-run scripts/bootstrap_schema.sql"
+    )
 
 
 def _assert_not_null(engine: Engine) -> None:

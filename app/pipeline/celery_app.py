@@ -68,13 +68,29 @@ def _init_worker(**_):
     service actually runs. Without `worker_init` (fires once for any pool, before
     the pool even starts), a gevent worker would silently skip the fail-closed
     security-posture guard and the fail-fast local-model check entirely — the same
-    root cause `configure_logging`'s own eager-import-time fix addresses for logging."""
+    root cause `configure_logging`'s own eager-import-time fix addresses for logging.
+
+    The DB invariant guard runs here for the same reason it runs in the API's
+    lifespan hook: a worker is just as capable of writing to the database as the
+    API is, so a worker that boots against a schema missing (or misshapen) guards
+    would corrupt data the API would have refused to touch. Celery swallows a
+    signal handler's traceback into its own startup noise, so the failure is
+    logged as one structured `worker.boot_guard_failed` record — naming the exact
+    invariant that failed — before being re-raised to kill the process."""
     from app.core.config import assert_security_posture
+    from app.core.logging import get_logger
+    from app.db.engine import get_engine
+    from app.db.invariants import verify_startup
     from app.pipeline.local_models import validate_local_models
 
     configure_logging()
-    assert_security_posture()          # fail-closed: same auth/binding guard as the API
-    validate_local_models(warm=True)   # fail-fast + warm the local models so the 1st request is fast
+    try:
+        assert_security_posture()          # fail-closed: same auth/binding guard as the API
+        verify_startup(get_engine())       # fail-fast: same DB invariant guard as the API
+        validate_local_models(warm=True)   # fail-fast + warm the local models so the 1st request is fast
+    except Exception as exc:
+        get_logger().critical("worker.boot_guard_failed", error=repr(exc), exc_info=True)
+        raise
 
 
 @celery_app.task(bind=True, name="tsg.run_pipeline")
