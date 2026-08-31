@@ -89,3 +89,20 @@ def test_bootstrap_shape_repair_table_matches_required_indexes():
         "bootstrap_schema.sql Section 3b's #GuardIndex table has drifted from "
         "invariants.REQUIRED_INDEXES — the repair would silently skip an index"
     )
+
+
+def test_manual_repair_script_matches_required_indexes():
+    """scripts/fix_guard_index_shape.sql is the hand-run repair for a database
+    not managed by alembic. It rebuilds each guard index from its own copy of
+    the specs, so a stale copy would quietly rebuild the WRONG shape — leaving a
+    database that still cannot boot, with a script that reports success."""
+    sql = (_ROOT / "scripts" / "fix_guard_index_shape.sql").read_text(encoding="utf-8")
+    block = re.search(r"INSERT INTO #GuardIndex .*?VALUES(.*?);\s*\nGO", sql, re.S)
+    assert block, "fix_guard_index_shape.sql has no #GuardIndex spec table"
+    rows = {name: (table, cols, filt.replace("''", "'")) for name, table, cols, filt in
+            re.findall(r"\('(\w+)',\s*'(\w+)',\s*'([\w,]+)',\s*'((?:[^']|'')*)'\)", block.group(1))}
+    expected = {spec.name: (spec.table, ",".join(spec.columns), spec.filter_sql)
+                for spec in REQUIRED_INDEXES}
+    assert rows == expected, (
+        "scripts/fix_guard_index_shape.sql has drifted from invariants.REQUIRED_INDEXES"
+    )
