@@ -89,7 +89,7 @@ def _seed(Session) -> tuple[str, str]:
             ThreatCategory="Denial of Service", ThreatType="Ransomware on OT support systems",
             ThreatName="Ransomware on OT support systems",
             ThreatTypeID=57, ThreatCatalogueID=418, ThreatCategoryID=5,
-            Description="Ransomware encrypts OT support systems.", IsThreatAIGenerated=False,
+            IsThreatAIGenerated=False,
             LibraryThreatType="Malware/Ransomware", LibraryThreatName="OT ransomware",
             GroundingStatus="verified", GroundingScore=100.0, Superseded=0, CreatedAt=NOW,
             ThreatActorsJSON=json.dumps({"actors": ["Nation-state/APT"], "validated": True})))
@@ -169,7 +169,8 @@ def test_get_results_does_not_crash_on_a_real_active_threat(monkeypatch):
     assert t.threat_type_id == 57
     assert t.threat_catalogue_id == 418
     assert t.threat_category_id == 5
-    assert t.description == "Ransomware encrypts OT support systems."
+    # description was REMOVED from the threat block on 2026-09-05 (the column went with it).
+    assert not hasattr(t, "description")
     assert t.is_threat_ai_generated is False
     assert t.is_threat_type_ai_generated is False  # threat_type_id == 57, a real library match
     assert t.grounding_status == "verified"

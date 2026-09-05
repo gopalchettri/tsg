@@ -32,6 +32,7 @@ from app.db.dal import RegenerateConflict, guid, now
 from app.db.engine import db_session
 from app.pipeline import control_mapping, tasks
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
+from app.pipeline.pipeline_common import TRANSIENT_INFRA_ERRORS, log_transient_infra_retry
 from app.sse import bus
 
 log = get_logger(__name__)
@@ -89,8 +90,9 @@ _REASON_INFO: dict[str, dict[str, str]] = {
 def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, kind: str) -> Generator[bool]:
     """Yield whether the per-subsystem lock was acquired.
 
-    Commit acquisition before work so a later rollback cannot release it. Release failures are
-    logged and do not replace an exception from the wrapped work.
+    Commit acquisition before work so a later rollback cannot release it. On an exception the
+    session is rolled back BEFORE the release so a failed transaction cannot block it. Release
+    failures are logged and do not replace an exception from the wrapped work.
     """
     # acquire_execution_lock, not acquire_lock: every caller here is a regenerate/next-set
     # execution, which runs on a session already completed at its review barrier.
@@ -100,6 +102,12 @@ def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, ki
         sess.commit()
     try:
         yield acquired
+    except BaseException:
+        # A DB error inside the wrapped work leaves the transaction in a failed state;
+        # without this rollback the release below would raise PendingRollbackError into
+        # the guarded except — the lock would then stay held into the Celery retry.
+        sess.rollback()
+        raise
     finally:
         if acquired:
             try:
@@ -348,6 +356,15 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
             sess.commit()
         _publish_regen_result(sid, subsystem_id, target_ids, [], reason=exc.reason)
         return tasks.decide_session_outcome(sess, scenario_session)
+    except TRANSIENT_INFRA_ERRORS as exc:
+        # Same contract as run_pipeline/next_set: a DB blip while reading the targets is
+        # not a failed regeneration — re-raise for Celery's autoretry (the endpoint's
+        # epoch CAS makes the redelivery idempotent). Routing this into _record_failure
+        # would cancel the session over a deadlock/connection reset.
+        log_transient_infra_retry(site="regenerate.pre_lock", session_id=sid,
+                                subsystem_id=subsystem_id, exc=exc)
+        sess.rollback()
+        raise
     except Exception as exc:  # noqa: BLE001
         log.error("regen.pre_lock_error", session_id=sid, subsystem=subsystem_id, error=repr(exc))
         # Record this failure directly because no stage claim exists yet.
@@ -401,6 +418,13 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
             _publish_regen_result(sid, subsystem_id, target_ids, [], reason=exc.reason)
         except LLMSlotUnavailable:
             # Let task retry handling process this transient capacity error.
+            raise
+        except TRANSIENT_INFRA_ERRORS as exc:
+            # Infrastructure hiccup, not a failed regeneration: re-raise for Celery's
+            # autoretry instead of cancelling the session via _record_failure.
+            # _subsystem_lock rolls the failed transaction back before releasing.
+            log_transient_infra_retry(site="regenerate.subsystem", session_id=sid,
+                                    subsystem_id=subsystem_id, exc=exc)
             raise
         except Exception as exc:  # noqa: BLE001
             tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch)
@@ -546,6 +570,12 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
                                                         max_threats=next_set_size - len(fresh))
                 except LLMSlotUnavailable:
                     raise
+                except TRANSIENT_INFRA_ERRORS:
+                    # Infrastructure hiccup, not a click outcome: must NOT fall through to
+                    # the finish_stage(COMPLETE) below, which would make a failed retrieval
+                    # indistinguishable from a healthy round. The outer transient handler
+                    # logs the full detail; Celery's autoretry re-runs the stage.
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     # Finish the stage below so this failure does not block the session.
                     log.error("next_set.additive_find_threats_failed", session_id=sid, subsystem=subsystem_id, error=repr(exc))
@@ -592,6 +622,14 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
                                             subsystems, asset_context, llm, task_id, next_set_size,
                                             additive_failed=additive_failed)
         except LLMSlotUnavailable:
+            raise
+        except TRANSIENT_INFRA_ERRORS as exc:
+            # Same contract as run_pipeline's handler: a transient deadlock/connection
+            # blip anywhere in this round retries the stage instead of being recorded as
+            # a failed click. Logged HERE (once, whatever the inner origin) with full
+            # detail; the _subsystem_lock context manager still releases on the way out.
+            log_transient_infra_retry(site="next_set.round", session_id=sid,
+                                    subsystem_id=subsystem_id, exc=exc)
             raise
         except Exception as exc:  # noqa: BLE001
             tasks._record_failure(sess, scenario_session, subsystem_id, exc, epoch)

@@ -119,7 +119,6 @@ def _seed_reviewable_session(client) -> tuple[str, str, str]:
             ThreatID=tid, SessionID=sid, TenantID=TENANT, EntityID=ENTITY, UserID=USER,
             SubsystemID=0, ThreatCategory="Tampering", ThreatType="Ransomware",
             ThreatName="Ransomware encrypts historian data", GenericName="Ransomware encrypts data",
-            Description="Encrypts stored data at rest and demands payment.",
             ThreatTypeID=7, ThreatCatalogueID=None,
             ThreatActorsJSON=json.dumps({"actors": [], "actor_ids": [], "validated": True}),
             GroundingStatus="unverified", Superseded=0, CreatedAt=_now()))

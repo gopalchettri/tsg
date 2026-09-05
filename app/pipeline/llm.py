@@ -353,6 +353,11 @@ class LiteLLMClient:
         common["stream"] = False
         if s.llm_reasoning_effort is not None:
             common["reasoning_effort"] = s.llm_reasoning_effort
+        # Bounded cost per call (SDD §16.2 "limit output size"): without it a model in a
+        # repetition loop generates until the 90s timeout. drop_params above covers a provider
+        # that rejects the parameter; litellm maps it to max_completion_tokens where required.
+        if s.llm_max_output_tokens is not None:
+            common["max_tokens"] = s.llm_max_output_tokens
         if s.llm_provider == "azure_openai":
             if model:  # Azure addresses a DEPLOYMENT, not a model name — a per-call model can't apply here
                 log.debug("llm.azure_ignores_per_call_model", requested=model,
@@ -460,6 +465,7 @@ class LiteLLMClient:
                 # only recorded when actually pinned; read back from `kwargs` (the resolved
                 # value) rather than re-deriving _chat_kwargs' precedence a second time.
                 **({"temperature": kwargs["temperature"]} if "temperature" in kwargs else {}),
+                **({"max_tokens": kwargs["max_tokens"]} if "max_tokens" in kwargs else {}),
                 **({"reasoning_effort": self.s.llm_reasoning_effort}
                 if self.s.llm_reasoning_effort is not None else {}),
                 # Only present when the fallback actually served this answer — provenance is

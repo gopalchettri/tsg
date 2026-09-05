@@ -18,11 +18,10 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterator
-from datetime import UTC, datetime
 from typing import Any
 
 from app.core.logging import get_logger
-from app.intel.fetchers import _doc, _get
+from app.intel.fetchers import _doc, _get, parse_dt, scope_keys
 
 log = get_logger(__name__)
 
@@ -35,33 +34,57 @@ _STATUS_COLLECTION = "intel_feed_status"
 _PAGE_ATTEMPTS = 2
 
 
-def _parse_dt(value: Any) -> datetime | None:
-    """OTX timestamps are naive ISO strings ('2026-07-31T06:19:30.378000') — read as UTC."""
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(value))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+def _names(items: Any, keys: tuple[str, ...] = ("display_name", "name", "id")) -> list[str]:
+    """OTX list fields arrive as plain strings or as dicts depending on the endpoint version —
+    normalize both to stripped strings, taking the first of `keys` a dict carries."""
+    out: list[str] = []
+    for x in items or []:
+        if isinstance(x, dict):
+            x = next((x[k] for k in keys if x.get(k)), "")
+        x = str(x).strip()
+        if x:
+            out.append(x)
+    return out
 
 
 def pulse_doc(p: dict) -> dict:
-    """One OTX pulse -> the shared intel doc shape."""
+    """One OTX pulse -> the shared intel doc shape.
+
+    Keeps the structured fields a pulse already carries: `industries` and `targeted_countries`
+    become `scope_tags` (so an Energy-sector asset matches an Energy-tagged campaign by
+    structure, never by a word in the title), malware families and ATT&CK ids join the tags,
+    and the attributed adversary gets an equality key for the reserved actor slot."""
     adv = (p.get("adversary") or "").strip()
     # Attribution reaches the prompt ONLY through the title (prompts._intel_block emits
     # id/title/url, title capped at 140 chars), so prepend it where truncation cannot reach.
     title = f"[{adv}] {p.get('name', '')}" if adv else p.get("name", "")
-    tags = ([adv.lower()] if adv else []) + [t for t in (p.get("tags") or [])]
+    industries = _names(p.get("industries"))
+    countries = _names(p.get("targeted_countries"))
+    malware = _names(p.get("malware_families"))
+    attack_ids = _names(p.get("attack_ids"), keys=("id", "name"))   # the technique id, not its name
+    tags = (([adv.lower()] if adv else [])
+            + [t for t in (p.get("tags") or []) if t]
+            + [m.lower() for m in malware]
+            + [a.upper() for a in attack_ids])
     doc = _doc(_FEED, "pulse", p.get("id", ""), title,
             description=p.get("description", ""),
             url=f"https://otx.alienvault.com/pulse/{p.get('id', '')}",
-            tags=tags[:20], raw=None)
+            tags=tags, raw=None,
+            scope_tags=scope_keys(sectors=industries, countries=countries))
     if adv:
         # its own field for the /items API: community pulse names may legitimately start
         # with [brackets], so attribution is never re-parsed back out of the title
         doc["adversary"] = adv[:200]
-    published = _parse_dt(p.get("modified") or p.get("created"))
+        doc["adversary_key"] = adv.lower()[:200]       # fetchers.query_actor_pulses equality key
+    if industries:
+        doc["industries"] = industries[:20]
+    if countries:
+        doc["targeted_countries"] = countries[:20]
+    if malware:
+        doc["malware_families"] = malware[:20]
+    if attack_ids:
+        doc["attack_ids"] = attack_ids[:30]
+    published = parse_dt(p.get("modified") or p.get("created"))
     if published:
         # the pulse's OWN date — query_intel ranks on it, so "top 5 matches" means the most
         # recently updated threats rather than whichever page happened to sync last

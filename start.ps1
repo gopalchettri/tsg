@@ -33,13 +33,13 @@
     HTTP port for the FastAPI server. Default 8000.
 
 .PARAMETER Concurrency
-    Celery gevent-pool concurrency (the worker's -c flag). Default 50, matching
-    docker/compose.prod.yml. This is how many tasks ONE worker runs in parallel — gevent
+    Celery gevent-pool concurrency (the worker's -c flag). Default 10 — laptop-safe;
+    docker/compose.prod.yml runs 50. How many tasks ONE worker runs in parallel — gevent
     greenlets (cooperative threads in one process, right for IO-bound LLM/DB calls), not OS
     processes. Since worker_prefetch_multiplier=1 (app/pipeline/celery_app.py), it is also
     the most messages the worker may reserve from the queue — reservation can never exceed
-    what is actually running. Lower it (e.g. -Concurrency 10) on a laptop or when the LLM
-    endpoint rate-limits.
+    what is actually running. Raise it (e.g. -Concurrency 50) when the box and the LLM
+    endpoint can take it; keep it low when the endpoint rate-limits.
 
 .PARAMETER Reload
     Pass -Reload to start uvicorn with --reload.
@@ -64,7 +64,7 @@
     .\start.ps1 -EnvFile .env.uat
 
 .EXAMPLE
-    .\start.ps1 -Reload -Concurrency 10
+    .\start.ps1 -Reload -Concurrency 50
 
 .EXAMPLE
     .\start.ps1 -NoFlower
@@ -77,7 +77,7 @@ param(
     # working unchanged; -EnvFile overrides it. Either way the value ends up SET, never guessed.
     [string]$EnvFile = $(if ($env:TSG_ENV_FILE) { $env:TSG_ENV_FILE } else { '.env' }),
     [int]$Port = 8000,
-    [int]$Concurrency = 50,
+    [int]$Concurrency = 10,
     [switch]$Reload,
     [switch]$SkipDocker,
     [switch]$NoFlower,
@@ -151,6 +151,16 @@ if (-not (Test-Path -LiteralPath $envPath)) {
 # Absolute path, so every spawned window resolves the same file whatever its cwd; Start-Process
 # hands this process's environment to all of them (worker, beat, uvicorn, Flower).
 $env:TSG_ENV_FILE = $envPath
+
+# No progress bars in the spawned windows. The transformers 'Loading weights' bar (and every
+# Hugging Face download bar) writes carriage-return frames to stderr; under Windows PowerShell
+# 5.1 the 2>&1 below wraps each one in an ErrorRecord, and an EMPTY frame has no message, so
+# ToString() prints the exception's TYPE NAME instead - the literal line
+# 'System.Management.Automation.RemoteException' that shows up in celery.log/api.log around every
+# model load. Killing the bar at the source removes the write itself; the ForEach ToString()
+# flattening stays for real stderr text. transformers.utils.logging keys its bar off this same
+# hub setting (are_progress_bars_disabled), so one variable covers both.
+$env:HF_HUB_DISABLE_PROGRESS_BARS = "1"
 
 # APP_ENV is the env file's own declaration of which deployment it describes (config.py:64), and
 # what the boot posture guard enforces (config.py GATE 1: a dev/local build pointed at
@@ -323,7 +333,7 @@ function Start-InNewWindow {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Celery worker (new window) -- gevent pool, matches compose.prod.yml's -c 50
+# 3. Celery worker (new window) -- gevent pool, -c defaults to 10; compose.prod.yml runs 50
 # ---------------------------------------------------------------------------
 
 # Explicit interpreter, not a bare `celery` -- same reason $venvPython exists above: if

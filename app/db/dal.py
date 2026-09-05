@@ -240,6 +240,8 @@ _SESSION_BOARD_COLS = (
     m.Scenario_Session.UserID, m.Scenario_Session.AssetID, m.Scenario_Session.AssetName,
     m.Scenario_Session.SessionStatus, m.Scenario_Session.CurrentStage,
     m.Scenario_Session.StageStatus, m.Scenario_Session.CompletedAt,
+    # Control mapping owns no stage row, so its timing cannot ride stage_rows like the other two.
+    m.Scenario_Session.ControlMapSeconds,
 )
 
 def execute_dml(sess: Session, stmt: Executable) -> CursorResult[Any]:
@@ -260,6 +262,22 @@ def inserted_pk(res: CursorResult[Any]) -> int:
 def now() -> datetime:
     """Current UTC timestamp — one clock convention for every CreatedAt/UpdatedAt/LeaseExpiresAt."""
     return datetime.now(UTC)
+
+
+def span_seconds(start: datetime | None, end: datetime | None) -> float | None:
+    """Seconds between two stamps written by now(), 2 dp - the ONE subtraction behind every
+    reported duration (stage spans, per-scenario gen_seconds, the trace's seconds field).
+
+    None when either end is missing ("not measured", never 0.0) AND when end < start: a negative
+    span is not a duration, it is two stamps from different attempts or from different clocks
+    (claim on one worker, finish on another after a Celery retry - NTP is a deployment
+    precondition here exactly as it already is for lease expiry). build_board logs that case
+    rather than publish it. Never mix a DB-read stamp (naive - pyodbc drops tzinfo) with a fresh
+    now() (aware): every pair today is same-source; keep it that way.
+    """
+    if start is None or end is None or end < start:
+        return None
+    return round((end - start).total_seconds(), 2)
 
 def guid() -> str:
     """Sequential (COMB) uuid, never uuid4: uniqueidentifier PKs are clustered, so a random key
@@ -618,6 +636,15 @@ def claim_stage(
             HeartbeatAt=_now,
             AttemptCount=m.Subsystem_Stage_State.AttemptCount + 1,
             UpdatedAt=_now,
+            # The stage clock starts here, on the SAME instant as the lease. Deliberately
+            # overwritten on a re-claim, in step with AttemptCount: it marks the start of the
+            # attempt that produced the CURRENT result, not the first attempt ever made.
+            StartedAt=_now,
+            # And the previous attempt's END goes with it. claim_stage re-claims ERROR rows and
+            # regen'd IDLE rows, both of which may carry a FinishedAt from before; left in place
+            # it pairs with the fresh StartedAt as finished-before-started, and the board would
+            # publish a negative duration for the whole retry. A RUNNING row has no end yet.
+            FinishedAt=None,
         )
     )
     won = res.rowcount == 1
@@ -800,6 +827,7 @@ def finish_stage(
     Unfenced, a stalled worker's late result overwrites whatever replaced it: COMPLETE over the
     reaper's ERROR, or epoch-N status over the epoch-N+1 IDLE a regen just wrote, leaving the row
     unclaimable. `LeaseExpiresAt` is cleared so a finished row never trips the reaper."""
+    _now = now()
     res = execute_dml(
         sess,
         update(m.Subsystem_Stage_State)
@@ -811,7 +839,11 @@ def finish_stage(
             m.Subsystem_Stage_State.ActiveTaskID == task_id,    # fencing token: our claim
             m.Subsystem_Stage_State.Status == StageStatus.RUNNING,
         )
-        .values(Status=status, ErrorMessage=error, LeaseExpiresAt=None, UpdatedAt=now())
+        # FinishedAt and UpdatedAt share ONE instant, for the same reason claim_stage binds
+        # `_now`: two now() calls drift apart, and a stage duration derived from drifting
+        # endpoints is exactly the kind of discrepancy these columns exist to avoid.
+        .values(Status=status, ErrorMessage=error, LeaseExpiresAt=None,
+                UpdatedAt=_now, FinishedAt=_now)
     )
     settled = res.rowcount == 1
     with trace_step("STAGE FINISH", session_id, subsystem=subsystem_id, level=str(level),
@@ -895,6 +927,10 @@ def stage_rows(sess: Session, session_id: str) -> list[RowMapping]:
                 m.Subsystem_Stage_State.Level,
                 m.Subsystem_Stage_State.Status,
                 m.Subsystem_Stage_State.ErrorMessage,
+                # The stage span. api.sessions.build_board derives progress.timings from these
+                # two by subtraction — no duration is stored, so nothing can disagree.
+                m.Subsystem_Stage_State.StartedAt,
+                m.Subsystem_Stage_State.FinishedAt,
             ).where(
                 m.Subsystem_Stage_State.SessionID == session_id,
                 m.Subsystem_Stage_State.Level != SubsystemLevel.LOCK,
@@ -958,7 +994,10 @@ def reset_stage_for_regen(sess: Session, session_id: str, subsystem_id: int, lev
             m.Subsystem_Stage_State.GenerationEpoch < new_epoch,
         )
         .values(GenerationEpoch=new_epoch, Status=StageStatus.IDLE, AttemptCount=0,
-            ErrorMessage=None, UpdatedAt=now())
+            ErrorMessage=None, UpdatedAt=now(),
+            # An IDLE row at a new epoch has no attempt: neither end of the previous epoch's
+            # span may survive, or the next claim pairs its StartedAt with a stale FinishedAt.
+            StartedAt=None, FinishedAt=None)
     )
 
 
@@ -1233,7 +1272,7 @@ def scenario_threat_columns():
     it = m.Identified_Threat
     return (it.ThreatID, it.ThreatTypeID, it.ThreatCatalogueID,
             it.ThreatCategory, it.ThreatCategoryID, it.ThreatType, it.ThreatName,
-            it.Description, it.ThreatActorsJSON, it.LibraryThreatType, it.LibraryThreatName,
+            it.ThreatActorsJSON, it.LibraryThreatType, it.LibraryThreatName,
             it.GroundingStatus, it.GroundingScore, it.IsThreatAIGenerated, it.IsThreatTypeAIGenerated)
 
 
@@ -1242,6 +1281,10 @@ def _scenario_read_select():
     return (
         select(out.ScenarioID, out.SessionID, out.SubsystemID, out.ScenarioJSON,
             out.Accepted, out.Superseded, out.ScenarioNumber, out.CreatedAt, out.ControlsMappedAt,
+            out.ControlMapAttempts,
+            # Per-scenario generation span. CreatedAt is when the row was PERSISTED (sequentially,
+            # after the whole batch generated), so it is not a substitute for either of these.
+            out.GenStartedAt, out.GenFinishedAt,
             # WHO decided, and when. Rides this SELECT — no extra round trip at any page size.
             # RejectedAt/RejectedBy have been stored since 2026-08 and were never read back by any
             # route; the Accepted pair is new. Both are surfaced together so the two halves of one
@@ -1892,6 +1935,29 @@ def has_undecided_scenarios(sess: Session, session_id: str) -> bool:
     ).scalar_one() > 0
 
 
+def accumulate_control_map_seconds(sess: Session, session_id: str, seconds: float) -> None:
+    """Add one mapping pass's WORKING seconds to the session's running total.
+
+    Cumulative (+=), not a span, and that is the whole point. Control mapping owns no stage row
+    and legitimately resumes across several tsg.map_controls_sweep ticks 300s apart, so a
+    StartedAt/FinishedAt pair would report mostly WAITING — a number nobody could act on. This
+    reports the time actually spent mapping, however many passes it took.
+
+    It is therefore the ONE reported timing that is not a plain wall-clock span, which is why
+    SessionProgress.timings documents `controls` differently from `threats`/`scenarios`.
+
+    COALESCE starts the sum from 0.0 on the first pass, so one UPDATE is the whole job.
+    """
+    execute_dml(
+        sess,
+        update(m.Scenario_Session)
+        .where(m.Scenario_Session.SessionID == session_id)
+        .values(
+            ControlMapSeconds=func.coalesce(m.Scenario_Session.ControlMapSeconds, 0.0) + seconds,
+        ),
+    )
+
+
 def control_mapping_progress(sess: Session, session_id: str) -> str:
     """Session-level roll-up of Step-4 control mapping — see ControlMappingStatus.
 
@@ -1903,15 +1969,28 @@ def control_mapping_progress(sess: Session, session_id: str) -> str:
     PENDING when there is nothing to map yet, which is also the honest answer before scenarios
     exist: mapping has not started, and reporting COMPLETE for an empty set would tell a client
     the card is ready to render when nothing has been generated.
+
+    ERROR outranks every other value — checked first, same "a failure outranks progress" priority
+    rule TreatmentProgress documents — when at least one active scenario has used up its mapping
+    attempt limit (ControlMapAttempts >= control_map_max_attempts) without a ControlsMappedAt
+    stamp. This IS a dead end, by explicit owner instruction: control_mapping.py permanently
+    excludes that row from every future mapping pass, so this status will not clear on its own —
+    it needs a regenerate or a manual re-run of that scenario.
     """
-    total, mapped = sess.execute(
+    max_attempts = get_settings().control_map_max_attempts
+    total, mapped, exhausted = sess.execute(
         select(func.count(),
-               func.sum(case((m.Threat_Scenario.ControlsMappedAt.is_(None), 0), else_=1)))
+               func.sum(case((m.Threat_Scenario.ControlsMappedAt.is_(None), 0), else_=1)),
+               func.sum(case((and_(m.Threat_Scenario.ControlsMappedAt.is_(None),
+                                    m.Threat_Scenario.ControlMapAttempts >= max_attempts), 1),
+                            else_=0)))
         .where(m.Threat_Scenario.SessionID == session_id,
                m.Threat_Scenario.Status == ScenarioStatus.complete,
                or_(active(m.Threat_Scenario.Superseded), m.Threat_Scenario.Accepted == 1))
     ).one()
-    total, mapped = int(total or 0), int(mapped or 0)
+    total, mapped, exhausted = int(total or 0), int(mapped or 0), int(exhausted or 0)
+    if exhausted:
+        return str(ControlMappingStatus.ERROR)
     if total == 0 or mapped == 0:
         return str(ControlMappingStatus.PENDING)
     return str(ControlMappingStatus.COMPLETE if mapped >= total else ControlMappingStatus.RUNNING)
@@ -1953,7 +2032,8 @@ def latest_regen_outcome(sess: Session, session_id: str, subsystem_id: int) -> d
 # ---------------------------------------------------------------------------
 
 
-def _find_active_id_by_norm_name(sess: Session, model, pk_col, name_col, name: str) -> int | None:
+def _find_active_id_by_norm_name(sess: Session, model, pk_col, name_col, name: str,
+                                *, require_active: bool = True) -> int | None:
     """The single implementation behind the three by-normalized-name lookups.
 
     The comparison runs in PYTHON, not SQL: MSSQL has no equivalent of the NFKD fold or the
@@ -1967,22 +2047,32 @@ def _find_active_id_by_norm_name(sess: Session, model, pk_col, name_col, name: s
     a database whose unique index was never built, or from the documented concurrent-insert
     window), return None and let the caller insert rather than silently binding to whichever row
     the engine happened to return first. Never guesses.
+
+    `require_active` defaults True (the actor lookup's contract, unchanged): only a curator-
+    approved row counts as a match. The promote API's type dedup passes False — an AI-promoted
+    row starts IsActive=False (pending review), and a same-named PENDING row must still count
+    as "this already exists" or a repeat promotion mints a duplicate instead of reusing it.
     """
     key = normalize_name(name)
     if not key:
         return None
-    hits = [rid for rid, rname in sess.execute(
-        select(pk_col, name_col).where(model.IsActive == True, model.IsDeleted == False))
+    conds = [model.IsDeleted == False]
+    if require_active:
+        conds.append(model.IsActive == True)
+    hits = [rid for rid, rname in sess.execute(select(pk_col, name_col).where(*conds))
         if normalize_name(rname or "") == key]
     return hits[0] if len(hits) == 1 else None
 
 
 def find_type_id_by_norm_name(sess: Session, name: str) -> int | None:
-    """Active Threat_Type whose name normalizes to `name`'s key, ignoring category and sector —
+    """Live Threat_Type whose name normalizes to `name`'s key, ignoring category and sector —
     those used to be part of the natural key and are exactly what let one name fork into several
-    rows."""
+    rows. `require_active=False`: the promote API's own dedup guard, so a PENDING (IsActive=False)
+    row from an earlier AI promotion still counts as "this type exists" — only IsDeleted marks a
+    type as gone for this purpose."""
     return _find_active_id_by_norm_name(
-        sess, m.Threat_Type, m.Threat_Type.ThreatTypeID, m.Threat_Type.ThreatTypeName, name)
+        sess, m.Threat_Type, m.Threat_Type.ThreatTypeID, m.Threat_Type.ThreatTypeName, name,
+        require_active=False)
 
 
 def find_catalogue_id_by_norm_name(sess: Session, type_id: int, name: str) -> int | None:
@@ -1990,14 +2080,17 @@ def find_catalogue_id_by_norm_name(sess: Session, type_id: int, name: str) -> in
     the promote API's duplicate guard, scoped to the already-matched type so one generic name
     under two types stays two threats. ANY live match means the threat exists; several matches
     (legacy duplicates) resolve to the lowest id deterministically — returning None on
-    ambiguity would make the promote API mint another copy."""
+    ambiguity would make the promote API mint another copy.
+
+    Not filtered to IsActive: a PENDING (IsActive=False) row from an earlier AI promotion still
+    counts as "this threat exists" — only IsDeleted marks a row as gone for this purpose."""
     key = normalize_name(name)
     if not key:
         return None
     tc = m.Threat_Catalogue
     hits = [cid for cid, cname in sess.execute(
         select(tc.ThreatCatalogueID, tc.ThreatName).where(
-            tc.ThreatTypeID == type_id, tc.IsActive == True, tc.IsDeleted == False))
+            tc.ThreatTypeID == type_id, tc.IsDeleted == False))
         if normalize_name(cname or "") == key]
     return min(hits) if hits else None
 
@@ -2030,18 +2123,23 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None,
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Type).values(
                 ThreatTypeName=name, ThreatCategoryID=category_id,
-                IsActive=True, IsDeleted=False, Source=source,
+                # PENDING, not live: an AI-promoted type is not yet curator-reviewed, so it must
+                # not be trusted as ground truth for future grounding/matching (which filters to
+                # IsActive=True). threat_type_active/find_type_id_by_norm_name read IsDeleted only,
+                # so this row still counts as "exists" for promote's own reuse/idempotency.
+                IsActive=False, IsDeleted=False, Source=source,
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res), True
     except IntegrityError:
         # Recovery MUST select on exactly the index's columns — name ALONE since the key became
         # UX_ThreatType_NaturalKey(ThreatTypeName). It previously also filtered category+sector;
         # left that way, a collision against a same-name row under a DIFFERENT category or sector
-        # finds nothing here and re-raises, turning every such promotion into a 500.
+        # finds nothing here and re-raises, turning every such promotion into a 500. Not filtered
+        # to IsActive either, for the same reason as the dedup check above.
         winner = sess.execute(
             select(m.Threat_Type.ThreatTypeID).where(
                 m.Threat_Type.ThreatTypeName == name,
-                m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
+                m.Threat_Type.IsDeleted == False)
         ).scalar()
         if winner is None:  # not a natural-key duplicate — fail loud, never return a NULL id
             raise
@@ -2069,14 +2167,17 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Catalogue).values(
                 ThreatTypeID=type_id, ThreatName=name,
-                IsActive=True, IsDeleted=False, Source=source,
+                # PENDING, not live — see upsert_threat_type's matching comment: not yet
+                # curator-reviewed, invisible to grounding/matching until approved, but still
+                # counts as "exists" for promote's own reuse via IsDeleted-only checks.
+                IsActive=False, IsDeleted=False, Source=source,
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res), True
     except IntegrityError:
         winner = sess.execute(
             select(m.Threat_Catalogue.ThreatCatalogueID).where(
                 m.Threat_Catalogue.ThreatName == name,
-                m.Threat_Catalogue.IsActive == True, m.Threat_Catalogue.IsDeleted == False)
+                m.Threat_Catalogue.IsDeleted == False)
         ).scalar()
         if winner is None:  # not a natural-key duplicate — fail loud, never return a NULL id
             raise
@@ -2084,25 +2185,29 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
 
 
 def catalogue_active(sess: Session, catalogue_id: int) -> bool:
-    """Liveness check for a stored ThreatCatalogueID — the catalogue sibling of
-    threat_type_active. A threat grounded weeks ago can point at a catalogue row a curator has
-    since retired; callers treat False the same way they treat a dead type id."""
+    """EXISTENCE check for a stored ThreatCatalogueID — the catalogue sibling of
+    threat_type_active. Despite the name, this is IsDeleted-only, not IsActive-gated: a PENDING
+    (IsActive=False, not-yet-reviewed) row from an AI promotion must still count as "exists" so
+    a repeat promote call reuses it instead of minting a duplicate. A threat grounded weeks ago
+    can also point at a row a curator has since hard-deleted; callers treat False the same way
+    they treat a dead type id. IsActive itself still gates grounding/matching elsewhere — this
+    function answers a different question (is the row gone), not that one."""
     tc = m.Threat_Catalogue
     return sess.execute(
         select(tc.ThreatCatalogueID).where(tc.ThreatCatalogueID == catalogue_id,
-                                           tc.IsActive == True, tc.IsDeleted == False)
+                                           tc.IsDeleted == False)
     ).first() is not None
 
 
 def catalogue_rows_active(sess: Session, catalogue_ids: Sequence[int]) -> set[int]:
-    """Which of these catalogue ids are still live — one query, not one per id (the accept
-    liveness gate checks a whole session's threats at once)."""
+    """Which of these catalogue ids still EXIST (IsDeleted-only, see catalogue_active) — one
+    query, not one per id (the accept liveness gate checks a whole session's threats at once)."""
     if not catalogue_ids:
         return set()
     tc = m.Threat_Catalogue
     return {row[0] for row in sess.execute(
         select(tc.ThreatCatalogueID).where(tc.ThreatCatalogueID.in_(list(catalogue_ids)),
-                                           tc.IsActive == True, tc.IsDeleted == False))}
+                                           tc.IsDeleted == False))}
 
 
 def categories_for_catalogue_threats(sess: Session, catalogue_ids) -> dict[int, list[str]]:
@@ -2217,15 +2322,18 @@ def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promote
 
 
 def threat_type_active(sess: Session, type_id: int) -> bool:
-    """Liveness check for a grounded type id, keyed by PK: is this Threat_Type still active
-    and not soft-deleted? Called from promote_scenario_to_library (app/pipeline/promote.py) —
-    a curator can retire a type between a scenario being generated and being promoted;
-    trusting the stale id would mint a catalogue row under a retired type while the response
-    reports success. Same predicate as find_active_type_id_by_name, keyed by PK instead of name."""
+    """EXISTENCE check for a grounded type id, keyed by PK: does this Threat_Type still exist
+    (IsDeleted-only — despite the name, NOT gated on IsActive)? Called from
+    promote_scenario_to_library (app/pipeline/promote.py) for two things: (1) a curator can hard-
+    delete a type between a scenario being generated and being promoted — trusting the stale id
+    would mint a catalogue row under a gone type while the response reports success; (2) an
+    AI-promoted type starts IsActive=False (pending review), and it must still count as "exists"
+    here, or every repeat promotion of the same scenario would try to mint a duplicate instead of
+    reusing it. IsActive alone still gates grounding/matching elsewhere (grounding.py,
+    threat_retrieval.py, embeddings.py) — this function answers a different question."""
     return sess.execute(
         select(m.Threat_Type.ThreatTypeID).where(
-            m.Threat_Type.ThreatTypeID == type_id,
-            m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False)
+            m.Threat_Type.ThreatTypeID == type_id, m.Threat_Type.IsDeleted == False)
     ).first() is not None
 
 
@@ -2425,6 +2533,28 @@ def finish_plan(sess: Session, plan_id: str, *, status: StageStatus, task_id: st
     ).values(**values)).rowcount == 1
 
 
+def plan_status_row(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
+    """STATUS ONLY for the poll endpoint — deliberately NOT active_plan_row.
+
+    A status poll is hit repeatedly while a plan generates, and active_plan_row hauls PlanJSON,
+    ScenarioJSON and the whole threat join: tens of KB per call for a caller that wants three
+    strings. This selects the plan-table columns the lifecycle is derived from and nothing else,
+    so polling stays cheap no matter how large the plan grows.
+
+    Same SessionID predicate as active_plan_row, for the same reason: it keeps a foreign
+    ScenarioID a 404 rather than a cross-tenant leak. None on a malformed GUID.
+    """
+    if not _valid_guid(output_id):
+        return None
+    p = m.Risk_Treatment_Plan
+    return sess.execute(
+        select(p.PlanID, p.SessionID, p.ScenarioID, p.Status, p.ErrorMessage, p.ErrorReason,
+            p.ReviewStatus, p.ReviewedBy, p.ReviewedAt, p.UserID,
+            p.CreatedAt, p.UpdatedAt, p.CompletedAt)
+        .where(p.SessionID == session_id, p.ScenarioID == output_id, active(p.Superseded))
+    ).mappings().first()
+
+
 def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
     """The scenario's one active plan row for the GET poll, with its scenario JSON alongside. The
     SessionID predicate keeps a foreign ScenarioID a 404, not a leak; None on a malformed GUID.
@@ -2584,14 +2714,24 @@ def superseded_plan_rows(sess: Session, session_id: str,
     trip (the board's ?include_superseded=true; global newest-first order keeps each scenario's
     group newest-first after the caller buckets by ScenarioID). Both forms seek
     IX_TreatmentPlan_SessionHistory — the table's other two indexes are filtered Superseded = 0
-    and serve no history predicate (the sessions._ancestry trap). Plan-table columns only — deliberately no
-    scenario/threat joins: those hang off the ScenarioID and are identical for every version, the
-    caller already serves them once on the top-level (active) object, and re-hauling the same
-    multi-KB ScenarioJSON per history row would multiply the DB read and the response for zero
-    information (history rows therefore present scenario=null). InputSnapshotJSON stays excluded
-    too — tens of KB per version; that is the evidence endpoint's job. ValidationJSON and
-    ReviewComment are excluded as well: they feed only wire-hidden (exclude=True) fields, so a
-    blob per history row would buy nothing — the presenter reads them with .get."""
+    and serve no history predicate (the sessions._ancestry trap).
+
+    NO scenario/threat joins, deliberately: those hang off the ScenarioID and are identical for
+    every version, so re-hauling the same multi-KB ScenarioJSON per history row would multiply the
+    DB read for zero information. The ROUTES overlay the active row's single copy instead
+    (api.treatment._SCENARIO_ECHO_KEYS), so a history row still publishes scenario/threat/actors —
+    this query just does not pay for them N times.
+
+    Every PER-VERSION column IS selected, UserID/Cancelled*/ValidationJSON included: they describe
+    THIS attempt (who generated it, who stopped it, what validation said of it) and cannot be
+    echoed from the active row. They were absent for three schema changes and the presenter's
+    defensive .get published null/false rather than raising, so a superseded row reported
+    created_by=null and moderation_flagged=false whatever it had actually recorded. A new column
+    that feeds a wire field belongs HERE as well as in active_plan_row.
+
+    InputSnapshotJSON stays excluded — tens of KB per version; that is the evidence endpoint's
+    job. ReviewComment stays excluded — it is genuinely exclude=True on the model and never
+    reaches the wire."""
     if output_id is not None and not _valid_guid(output_id):
         return []
     p = m.Risk_Treatment_Plan
@@ -2599,7 +2739,10 @@ def superseded_plan_rows(sess: Session, session_id: str,
         select(p.PlanID, p.SessionID, p.ScenarioID, p.Status, p.TreatmentStrategy,
             p.RiskIdentificationDate, p.PlanJSON, p.ErrorMessage,
             p.RiskLevel, p.ReviewStatus, p.ReviewedBy, p.ReviewedAt,
-            p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
+            p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt,
+            # Per-VERSION attribution and advisories: the same three active_plan_row selects,
+            # plus the validation blob behind warnings/moderation_flagged. Same row, no join.
+            p.UserID, p.CancelledAt, p.CancelledBy, p.ValidationJSON)
         # literal_execute renders `Superseded = 1` INLINE: SQL Server cannot match a
         # parameterized predicate against the filtered IX_TreatmentPlan_SessionHistory (the
         # cached plan must hold for every parameter value — FORCESEEK errors 8622 on the

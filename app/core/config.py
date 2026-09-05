@@ -139,6 +139,19 @@ class Settings(BaseSettings):
     intel_enabled: bool = True
     # TSG_INTEL_TTL_DAYS — purges only items a feed has DROPPED; present items never expire.
     intel_ttl_days: int = 30
+    # TSG_INTEL_REFRESH_INTERVAL_SECONDS — beat schedule for refreshing every enabled feed
+    # (SDD §33: configured source refresh runs on a scheduler). 0 (default) = admin-triggered
+    # only. 86400 = daily. celery beat MUST read the same env as the workers, or the schedule
+    # silently differs from what the API reports.
+    intel_refresh_interval_seconds: int = Field(0, ge=0)
+    # TSG_INTEL_STALE_AFTER_SECONDS — an ENABLED feed with no successful refresh inside this
+    # window reports stale=true on GET /feeds and raises an intel.feed_stale self-check
+    # warning (SDD SOURCE_STALE). Default 48h = two missed daily runs.
+    intel_stale_after_seconds: int = Field(172800, ge=60)
+    # TSG_INTEL_HOME_COUNTRY — the operator's country as the feeds spell it, e.g.
+    # "United Arab Emirates"; matched by equality against OTX targeted_countries and CISA
+    # countries-deployed. Empty (default) = no country matching.
+    intel_home_country: str = ""
 
     # TSG_INTEL_KEV_ENABLED / _URL — CISA Known Exploited Vulnerabilities feed (no auth).
     intel_kev_enabled: bool = True
@@ -219,6 +232,11 @@ class Settings(BaseSettings):
     # these feed the stage-lease/treatment-staleness derivation (_derive_stage_lease_seconds).
     llm_timeout_seconds: float = 90.0
     llm_max_retries: int = 3
+
+    # TSG_LLM_MAX_OUTPUT_TOKENS — cap on completion tokens per chat call (SDD §16.2 output-size
+    # limit). None (default) = provider default. Sent as `max_tokens`; drop_params covers a
+    # provider that rejects it. Scenario/threat JSON fits comfortably in 4096.
+    llm_max_output_tokens: int | None = Field(None, ge=256, le=32768)
 
     # LLM_JSON_MODE — ask the provider to guarantee valid JSON (not every provider supports it).
     llm_json_mode: bool = Field(False, validation_alias=AliasChoices("LLM_JSON_MODE", "TSG_LLM_JSON_MODE"))
@@ -313,6 +331,24 @@ class Settings(BaseSettings):
     # TSG_GROUNDING_SHORTLIST_K — shortlisted entries sent to the precise scorer.
     grounding_shortlist_k: int = 10
 
+    # TSG_THREAT_RETRIEVAL_TOP_K — library candidates that reach the RERANKER per retrieval
+    # query (the Top-K pool of the library-first funnel; K >> requested count). This bound is
+    # what keeps Stage-1a constant-cost as the catalogue grows — candidates outside the pool
+    # never reach the relevance gate this round.
+    threat_retrieval_top_k: int = Field(100, ge=1)
+    # TSG_THREAT_RELEVANCE_THRESHOLD — rerank score (0-100) a library candidate needs to pass
+    # the relevance gate first-class; below it a candidate survives only as flagged BACKFILL
+    # (count is always met; the threshold itself is never lowered). SET EXPLICITLY once
+    # measured (scripts/measure_threat_relevance_scores.py): the gate's queries are
+    # asset/subsystem context prose, not threat labels, so the grounding calibration's
+    # MatchTh does NOT transfer — the same label-vs-paragraph trap control_map_min_score
+    # documents above.
+    threat_relevance_threshold: float = Field(50.0, ge=0.0, le=100.0)
+    # TSG_THREAT_LLM_MAX_GENERATION — hard ceiling on threats requested from ONE
+    # gap-generation call, applied after the gap_generation_buffer multiplier. Keeps the LLM
+    # fallback bounded whatever the gap arithmetic says.
+    threat_llm_max_generation: int = Field(15, ge=1)
+
     # --- 11. Controls mapping (Step 4) ------------------------------------------------
 
     # TSG_CONTROL_MAP_TOP_K — most controls kept per scenario ("up to K", never padded).
@@ -334,6 +370,16 @@ class Settings(BaseSettings):
     # is the "next run" for outputs mapping deliberately left unstamped). Ticking faster than
     # stage_lease_seconds buys nothing.
     control_map_sweep_interval_seconds: float = 300.0
+
+    # TSG_CONTROL_MAP_MAX_ATTEMPTS — HARD CUTOFF, by explicit owner instruction: once a scenario
+    # reaches this many mapping attempts without a ControlsMappedAt stamp, it is permanently
+    # excluded from every future sweep/pipeline mapping pass — not retried again even if the
+    # underlying cause (e.g. no control-library candidates for its category) is later fixed; that
+    # needs a regenerate or a manual re-run. Same default as stage_max_attempts: at the default
+    # sweep interval, 5 attempts is ~25 minutes of retries — enough for a transient blip (a lost
+    # lease, one LLM 429) to clear, short enough that a structural gap is identified quickly
+    # rather than burning a SWEEP_LIMIT slot forever.
+    control_map_max_attempts: int = Field(5, ge=1)
     # TSG_RERANK_CONCURRENCY — concurrent REMOTE rerank calls (local reranker ignores this).
     rerank_concurrency: int = Field(8, ge=1)
     # TSG_SCENARIO_GENERATION_CONCURRENCY — scenarios generated at once per write_scenarios
@@ -356,8 +402,8 @@ class Settings(BaseSettings):
     # TSG_MAX_ACTORS_PER_THREAT — caps actor names per threat (candidate rows + triage work).
     max_actors_per_threat: int = Field(10, ge=1)
 
-    # TSG_VALIDATOR_BATCH_SIZE — library candidates judged per LLM validation call.
-    validator_batch_size: int = Field(20, ge=1)
+    # (TSG_VALIDATOR_BATCH_SIZE is gone with the LLM validator itself — the library-first
+    # funnel gates candidates with the local reranker; extra='ignore' swallows stale lines.)
 
     # TSG_COVERAGE_ATTEMPT_SLACK — extra generation attempts beyond a threat's coverage target
     # (its AI-declared plausible entry points). A non-termination guard, not a depth policy.
@@ -598,6 +644,17 @@ class Settings(BaseSettings):
                 f"max_proposal_chars ({self.max_proposal_chars}) must not exceed max_embed_chars "
                 f"({self.max_embed_chars}) — embed() errors on an over-limit text instead of "
                 "truncating it, which would lose every threat in the batch.")
+        return self
+
+    # A per-feed intel refresh job may run up to 660s (intel_refresh_feed_task's time_limit), and
+    # two overlapping OTX walks would both advance the shared page cursor. 0 = admin-only.
+    @model_validator(mode="after")
+    def _validate_intel_refresh_interval(self) -> Settings:
+        if 0 < self.intel_refresh_interval_seconds < 900:
+            raise ValueError(
+                f"intel_refresh_interval_seconds ({self.intel_refresh_interval_seconds}) must be 0 "
+                "(admin-triggered only) or at least 900 — a per-feed refresh job may run up to 660s, "
+                "and overlapping OTX walks would double-work the shared page cursor.")
         return self
 
     # One scenario-text query per output draws its top-K from a single reranked shortlist, so a
@@ -871,6 +928,7 @@ def assert_security_posture(settings: Settings | None = None) -> None:
     # the prod scope table is confirmed", an instruction nobody will ever act on. A warning that
     # fires on every boot and can never be resolved only trains operators to skip this channel,
     # which also carries db.tls_certificate_unverified above. Stated once, at the right level.
+
     if s.app_env in ("staging", "prod") and not s.verify_membership:
         from app.core.logging import get_logger
         get_logger(__name__).info(

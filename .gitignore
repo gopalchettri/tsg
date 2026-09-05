@@ -30,3 +30,5 @@ uvicorn_*.log
 logs/
 deploy/monitoring-secrets.yaml
 deploy/secrets.ai-remediation.yaml
+# local model weights (2-3 GB each) - see .env.example section 7
+models/

@@ -33,6 +33,7 @@ import logging
 import os
 import pprint
 import sys
+import threading
 import time
 from itertools import count
 from logging.handlers import RotatingFileHandler
@@ -80,6 +81,13 @@ def trace_dir() -> Path:
     return path
 
 
+#: Guards handler CREATION in open_rotating_writer. Emitting through an existing handler is
+#: already safe (RotatingFileHandler holds its own lock); attaching one is the check-then-act
+#: that was not. gevent's cooperative lock in the worker; a real one in the FastAPI process,
+#: whose sync routes run on OS threads.
+_WRITER_LOCK = threading.Lock()
+
+
 def open_rotating_writer(stem: str) -> logging.Logger:
     """A dedicated, non-propagating logger whose one handler rotates by size. `stem` is a
     filename template containing `{pid}`, e.g. "trace-{pid}.txt".
@@ -96,17 +104,26 @@ def open_rotating_writer(stem: str) -> logging.Logger:
     Reuses stdlib RotatingFileHandler rather than hand-rolling rotation: it already holds the
     per-instance lock that makes gevent greenlets and native threads safe.
     """
-    s = get_settings()
     logger = logging.getLogger(f"tsg.tracefile.{stem}")
-    if logger.handlers:            # configure_logging is re-callable; do not stack handlers
+    if logger.handlers:            # fast path, no lock: configure_logging is re-callable
         return logger
-    handler = RotatingFileHandler(
-        trace_dir() / stem.format(pid=os.getpid()),
-        maxBytes=s.trace_max_bytes, backupCount=s.trace_backups, encoding="utf-8", delay=True)
-    handler.setFormatter(logging.Formatter("%(message)s"))  # the line is already rendered
-    logger.addHandler(handler)
-    logger.propagate = False       # never re-enter the root handler; this is a raw file sink
-    logger.setLevel(logging.INFO)
+    # Double-checked: trace_step first fires from five greenlets at once (the scenario fan-out)
+    # and from concurrent API threads, all on a cold stem. Without the lock every one passes the
+    # empty check above and each attaches its own handler - every line written N times, and N
+    # rotations fighting over one file (PermissionError on Windows, swallowed by
+    # logging.handleError, so the file just grows past its cap). The section does no I/O:
+    # delay=True defers the open to the first emit.
+    with _WRITER_LOCK:
+        if logger.handlers:        # the caller that lost the race to the first check
+            return logger
+        s = get_settings()
+        handler = RotatingFileHandler(
+            trace_dir() / stem.format(pid=os.getpid()),
+            maxBytes=s.trace_max_bytes, backupCount=s.trace_backups, encoding="utf-8", delay=True)
+        handler.setFormatter(logging.Formatter("%(message)s"))  # the line is already rendered
+        logger.addHandler(handler)
+        logger.propagate = False   # never re-enter the root handler; this is a raw file sink
+        logger.setLevel(logging.INFO)
     return logger
 
 
@@ -159,6 +176,23 @@ class _NullStep:
 _NULL_STEP = _NullStep()
 
 
+def _contextvar_sid() -> str:
+    """The session id structlog already has bound, for trace sites that carry none themselves.
+
+    celery_app's `task_prerun` binds `session_id` into structlog's contextvars for the whole
+    task, so it is already available to any code the task reaches. Reading it HERE, in the shared
+    helper, fixes every present and future trace site at once — and covers the `file` and
+    `console` sinks, which never see contextvars at all (only the `log` sink does).
+
+    Never raises: a trace is diagnostics, and diagnostics must not be able to fail the work they
+    are observing.
+    """
+    try:
+        return str(structlog.contextvars.get_contextvars().get("session_id") or "")
+    except Exception:  # noqa: BLE001 - see docstring: a trace must never break its caller
+        return ""
+
+
 class trace_step:
     """Context manager emitting a BEGIN/END pair for one pipeline step. See module docstring."""
 
@@ -167,11 +201,17 @@ class trace_step:
     def __init__(self, step: str, sid: str | None, **fields: Any) -> None:
         self._sinks = active_sinks()
         self._step = step
-        self._sid = (sid or "")[:8]
         self._in = fields
         self._out: dict[str, Any] = {}
         if not self._sinks:
+            self._sid = ""
             return                                   # cheapest possible disabled path
+        # `sid` is None at sites with no session in scope. "LLM CALL" (llm.py) is the one that
+        # mattered: every LLM duration was recorded with an empty session_id and so could not be
+        # joined to the scenario that made it. Falling back to the contextvar fixes that without
+        # threading a sid parameter through llm.chat and all of its callers. Resolved AFTER the
+        # disabled-path return above, so the no-op case stays as cheap as it was.
+        self._sid = (sid or _contextvar_sid())[:8]
         frame = sys._getframe(1)                     # the CALLER, since __init__ runs there
         self._loc = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}"
         self._n = next(_COUNTER)

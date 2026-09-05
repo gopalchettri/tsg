@@ -219,9 +219,15 @@ class ControlMatches(NamedTuple):
 
 
 def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] | None]],
-                        rows: list[dict[str, Any]], s: Settings) -> list[ControlMatches]:
+                        rows: list[dict[str, Any]], s: Settings,
+                        shortlist_k: int | None = None,
+                        group: str = "control_library") -> list[ControlMatches]:
     """Batch Step-4 grounding: every query shortlists against the same candidate set, then
     all shortlists rerank in one llm.rerank_many call instead of one round trip per query.
+
+    `shortlist_k`/`group` generalize the batch to OTHER row pools (threat retrieval's
+    relevance gate runs this exact funnel over Threat_Catalogue rows) — left unset, both
+    keep the original control-mapping behavior, so that call site is unchanged.
 
     `queries` = (text, optionally pre-embedded qv). Returns, PER QUERY, a ControlMatches
     carrying the full reranked shortlist best-first — never collapsed to a single best: the
@@ -259,9 +265,9 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
     # Resolve the cached matrix once for the whole batch (cheap once, wasteful per query);
     # dict-path vectors only if the matrix is unavailable.
     matrix_info = embeddings.get_matrix(llm, names, model_id=s.embedding_model,
-                                        group="control_library", kind="passage")
+                                        group=group, kind="passage")
     name_vecs = None if matrix_info is not None else embeddings.get_vectors(
-        llm, names, model_id=s.embedding_model, group="control_library", kind="passage")
+        llm, names, model_id=s.embedding_model, group=group, kind="passage")
     # BM25 keyword leg: corpus tokenized once per batch; per query its top-ck hits are one of
     # the two rankings fed to RRF below. Zero-score docs never enter
     # (hybrid_search._ranked_indices excludes them), so an all-miss query contributes no
@@ -272,7 +278,7 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
     # discarded unscored — see control_map_shortlist_k. Each leg is bounded by ck and the FUSED
     # result is bounded by ck too, so this is now the true number of cross-encoder pairs per
     # query — it used to be up to 2x this, because the legs were unioned rather than fused.
-    ck = s.control_map_shortlist_k
+    ck = shortlist_k if shortlist_k is not None else s.control_map_shortlist_k
     shortlists: list[list[dict[str, Any]]] = []
     for query, qv in queries:
         if qv is None:
@@ -285,7 +291,7 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
         if sl is None:
             if name_vecs is None:
                 name_vecs = embeddings.get_vectors(llm, names, model_id=s.embedding_model,
-                                                group="control_library", kind="passage")
+                                                group=group, kind="passage")
             sl = _shortlist_candidates(qv, rows, name_vecs, "text", s, ck)
         kw_scores = hybrid_search.bm25_scores(hybrid_search.tokenize(query), docs_tokens)
         kw_top = hybrid_search._ranked_indices(kw_scores)[:ck]
@@ -658,6 +664,10 @@ def prime_query_embeddings(llm: LLMClient, proposals: list[dict[str, Any]], cach
         return
     try:
         vecs = llm.embed(texts, kind="query")
+    except LLMSlotUnavailable:
+        # NEVER swallowed — codebase-wide contract (llm.py): the Celery stage retry must
+        # see it. Degrading here would silently trade a clean retry for extra round trips.
+        raise
     except Exception:
         log.warning("grounding.prime_embeddings_failed", count=len(texts), exc_info=True)
         return

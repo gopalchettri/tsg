@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.core.config import get_settings
 from app.core.enums import ScenarioStatus, StageStatus, SubsystemLevel
 from app.db import models as m
 from app.pipeline import control_mapping, grounding
@@ -43,7 +44,8 @@ def _engine():
     return engine
 
 
-def _seed(s, session_id: str, task_id: str, n_outputs: int = 3) -> list[str]:
+def _seed(s, session_id: str, task_id: str, n_outputs: int = 3,
+        control_map_attempts: int = 0) -> list[str]:
     s.execute(m.Scenario_Session.__table__.insert().values(
         SessionID=session_id, TenantID="t", EntityID="e", UserID="u", AssetName="a", AssetID="1",
         SessionStatus="active", CurrentStage="SCENARIOS", StageStatus="RUNNING", Mode="full",
@@ -62,7 +64,8 @@ def _seed(s, session_id: str, task_id: str, n_outputs: int = 3) -> list[str]:
             SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
             ScenarioJSON=json.dumps({"scenario_title": f"title {i}",
                                     "scenario_statement": f"statement {i}"}),
-            Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW))
+            Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW,
+            ControlMapAttempts=control_map_attempts))
     s.commit()
     return ids
 
@@ -179,3 +182,64 @@ def test_total_rerank_failure_still_rolls_back_and_stamps_nothing(monkeypatch):
     outputs, maps, audits = _state(Session)
     assert all(outputs[oid].ControlsMappedAt is None for oid in ids)
     assert maps == [] and audits == []
+
+
+def test_the_final_allowed_attempt_that_succeeds_does_not_log_exhausted(monkeypatch):
+    """Found live: a scenario on its LAST allowed attempt (control_map_max_attempts - 1 already
+    used) that SUCCEEDS must not have `controls.mapping_exhausted` logged for it — that log means
+    "used up its last try and still failed", and this one just succeeded. Before this fix, the
+    check ran right after incrementing the attempt counter, before the attempt itself, so it fired
+    unconditionally regardless of outcome."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid, task_id = str(uuid.uuid4()), str(uuid.uuid4())
+    max_attempts = get_settings().control_map_max_attempts
+    with Session() as s:
+        ids = _seed(s, sid, task_id, n_outputs=1, control_map_attempts=max_attempts - 1)
+
+    logged: list[dict] = []
+    monkeypatch.setattr(control_mapping.log, "error",
+                        lambda event, **kw: logged.append({"event": event, **kw}))
+    _stub(monkeypatch, lambda i: _HIT)
+    _run(Session, sid, task_id)
+
+    outputs, _maps, _ = _state(Session)
+    assert outputs[ids[0]].ControlsMappedAt is not None, "the final allowed attempt must still succeed"
+    assert not [e for e in logged if e["event"] == "controls.mapping_exhausted"], (
+        "must not report 'exhausted' for an attempt that just succeeded")
+
+
+def test_the_final_allowed_attempt_that_fails_logs_exhausted_and_stops_for_good(monkeypatch):
+    """HARD CUTOFF, by explicit owner instruction. A scenario on its last allowed attempt that
+    FAILS must be reported once, and from then on must never be attempted again — even if a later
+    call would have succeeded, proving this is a stop, not a backoff."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid, task_id = str(uuid.uuid4()), str(uuid.uuid4())
+    max_attempts = get_settings().control_map_max_attempts
+    with Session() as s:
+        ids = _seed(s, sid, task_id, n_outputs=1, control_map_attempts=max_attempts - 1)
+
+    logged: list[dict] = []
+    monkeypatch.setattr(control_mapping.log, "error",
+                        lambda event, **kw: logged.append({"event": event, **kw}))
+    _stub(monkeypatch, lambda i: _NO_ANSWER)
+    _run(Session, sid, task_id)
+
+    outputs, _, _ = _state(Session)
+    assert outputs[ids[0]].ControlsMappedAt is None, "still unmapped after the retry"
+    exhausted_logs = [e for e in logged if e["event"] == "controls.mapping_exhausted"]
+    assert len(exhausted_logs) == 1
+    assert exhausted_logs[0]["scenario_ids"] == [ids[0]]
+    assert exhausted_logs[0]["attempts"] == max_attempts
+
+    # --- the "stop, not a backoff" half: a later call must not touch it again, even though this
+    # stub would now succeed if it were ever given the chance -----------------------------------
+    _stub(monkeypatch, lambda i: _HIT)
+    _run(Session, sid, task_id)
+
+    outputs, maps, _ = _state(Session)
+    assert outputs[ids[0]].ControlsMappedAt is None, "must stay unmapped forever - no recovery"
+    assert maps == [], "must never be attempted again, so nothing is ever inserted"
+    assert len([e for e in logged if e["event"] == "controls.mapping_exhausted"]) == 1, (
+        "no second log either - it was never re-attempted, so there is nothing new to report")

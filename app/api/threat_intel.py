@@ -21,7 +21,7 @@ from typing import Annotated
 from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
-from app.api.admin_jobs import FAMILY_INTEL, intel_job_channel_key, mark_admin_job
+from app.api.admin_jobs import FAMILY_INTEL, intel_job_channel_key
 from app.api.admin_sse import admin_job_event_stream
 from app.api.deps import Principal, get_admin_principal, require_admin
 from app.api.schemas import (
@@ -35,10 +35,9 @@ from app.api.schemas import (
 )
 from app.core.enums import SSEEventType
 from app.core.logging import get_logger
-from app.db import dal
 from app.db.dal import NotFoundError
 from app.intel.fetchers import ALL_FEEDS, enabled_feed_names, feed_status, list_intel
-from app.pipeline.celery_app import intel_refresh_feed_task
+from app.pipeline.celery_app import dispatch_refresh
 
 router = APIRouter(
     prefix="/v1/tsg/threat-intel",
@@ -49,18 +48,11 @@ log = get_logger(__name__)
 
 
 def _dispatch(feeds: list[str], user_id: str | None) -> IntelRefreshAccepted:
-    """Queue one job per feed — the fan-out. Indirection so tests can run refreshes
-    synchronously, same pattern as admin.py's _enqueue.
-
-    No entity_id in the shadow label: this is an admin action, cross-tenant by design."""
-    jobs = {}
-    for feed in feeds:
-        task = intel_refresh_feed_task.apply_async(args=(feed,), shadow=(
-            f"intel-refresh: {feed} · by {user_id} · "
-            f"{dal.now():%Y-%m-%d %H:%M} UTC"))
-        mark_admin_job(task.id, FAMILY_INTEL, f"intel-refresh: {feed}", user_id)  # best-effort — see admin_jobs.mark_admin_job
-        jobs[feed] = task.id
-    return IntelRefreshAccepted(jobs=jobs)
+    """Queue one job per feed. The fan-out itself lives in celery_app.dispatch_refresh so the
+    scheduled refresh (tsg.intel_refresh_all) and this route are one code path; this
+    indirection stays so tests can run refreshes synchronously, same pattern as admin.py's
+    _enqueue."""
+    return IntelRefreshAccepted(jobs=dispatch_refresh(feeds, user_id))
 
 
 @router.get("/feeds", response_model=IntelFeedsResponse)

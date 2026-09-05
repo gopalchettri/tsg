@@ -27,8 +27,12 @@ _RETIRED = {
     "gate_matching_subsystems",
     "_RULE_KEY_FIELDS",
     "IsUniversal",              # withdrawn column (frozen master tables)
-    "threat_retrieval_top_k",   # deleted cap -- no deployment ever enabled it
-    "universal_threat_families",  # the cap exemption list, deleted with it
+    # threat_retrieval_top_k: DELIBERATELY REINTRODUCED by the library-first rerank-gate
+    # redesign (docs/TSG_LibraryFirst_ThreatIdentification_Plan.md). The old symbol was an
+    # unused eligibility cap; the new one is the Top-K pool bound that keeps the relevance
+    # gate constant-cost as the catalogue grows — removed from this tripwire per its own
+    # instructions above.
+    "universal_threat_families",  # the old cap's exemption list, still retired
     "default_rule_weight",
     "auto_ot_relevance_weight",
     "ThreatRuleCreate",

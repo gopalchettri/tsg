@@ -138,3 +138,76 @@ def test_the_fold_reads_the_PRESENTED_status_not_the_stored_one():
     plan as generating forever — defeating the staleness projection one layer up."""
     assert _board_progress([_row("ERROR")]).generation == ERROR
     assert _board_progress([_row("RUNNING")]).generation == RUNNING
+
+
+# ---------------------------------------------------------------------------
+# The SAME fold, over one scenario — GET .../scenarios/{id}/treatment-plan
+# ---------------------------------------------------------------------------
+
+def test_one_plan_folds_through_the_same_function_as_the_board():
+    """The per-scenario screen and the board must never disagree about one plan, so both go
+    through _progress_of. Duplicating the priority order into a second place is exactly how two
+    screens drift apart — this asserts the single-plan answer IS the board answer for the same
+    row, rather than merely resembling it."""
+    from app.api.treatment import _progress_of
+    one = ("plan-1", "COMPLETE", None)
+    assert _progress_of([one]) == _board_progress([_row("COMPLETE")])
+    assert _progress_of([one]).overall == TreatmentProgress.awaiting_review
+
+
+def test_a_single_plans_lifecycle_covers_its_reachable_states():
+    """`pending` is absent on purpose: the single-plan GET 404s when no plan exists, so a
+    per-scenario response can never carry it. The other five are all reachable."""
+    from app.api.treatment import _progress_of
+    got = {
+        _progress_of([("p", "RUNNING", None)]).overall,
+        _progress_of([("p", "COMPLETE", None)]).overall,
+        _progress_of([("p", "COMPLETE", "rejected")]).overall,
+        _progress_of([("p", "COMPLETE", "approved")]).overall,
+        _progress_of([("p", "ERROR", None)]).overall,
+    }
+    assert got == set(TreatmentProgress) - {TreatmentProgress.pending}
+
+
+# ---------------------------------------------------------------------------
+# GET .../treatment-plan/status — the cheap poll
+# ---------------------------------------------------------------------------
+
+def test_the_status_endpoint_is_registered_for_entity_scoped_auth():
+    """create_app() refuses to boot if a live route is in neither registry, so a missing entry
+    is a hard failure rather than an unauthenticated endpoint. Asserted explicitly because the
+    consequence of getting it wrong is a data leak, not a 500."""
+    from app.api.route_audit import _ENTITY_SCOPED_ROUTES
+    assert ("GET",
+            "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/status"
+            ) in _ENTITY_SCOPED_ROUTES
+
+
+def test_the_status_query_carries_no_plan_or_scenario_blob():
+    """THE reason this endpoint exists. active_plan_row hauls PlanJSON, ScenarioJSON and the
+    whole threat join — tens of KB re-downloaded on every tick of a poll that reads three
+    strings. plan_status_row must select plan-table columns only; adding a blob here silently
+    turns the cheap poll back into the expensive one."""
+    import ast
+    import inspect
+
+    from app.db import dal
+    # The DOCSTRING names the blobs it deliberately avoids, so scanning raw source would match
+    # its own explanation. Strip it and scan the executable body only.
+    tree = ast.parse(inspect.getsource(dal.plan_status_row).lstrip())
+    fn = tree.body[0]
+    body = fn.body[1:] if ast.get_docstring(fn) else fn.body
+    code = " ".join(ast.dump(n) for n in body)
+    for blob in ("PlanJSON", "ScenarioJSON", "ValidationJSON", "InputSnapshotJSON",
+                 "Identified_Threat", "scenario_threat_columns"):
+        assert blob not in code, f"{blob} would make the status poll expensive again"
+
+
+def test_status_and_board_agree_because_they_share_one_fold():
+    """The per-scenario poll and the session board must never disagree about one plan. Both go
+    through _progress_of, so this asserts they are the SAME answer rather than two
+    implementations that happen to match today."""
+    from app.api.treatment import _progress_of
+    for status, review in (("RUNNING", None), ("COMPLETE", None),
+                           ("COMPLETE", "approved"), ("COMPLETE", "rejected"), ("ERROR", None)):
+        assert _progress_of([("p", status, review)]) == _board_progress([_row(status, review)])

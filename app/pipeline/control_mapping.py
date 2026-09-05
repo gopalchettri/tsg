@@ -11,17 +11,20 @@ from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
 from sqlalchemy import func, insert, or_, select, update
+from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.enums import (
     AuditEventType,
+    ControlMappingExhaustionReason,
     ScenarioStatus,
     StageStatus,
     SubsystemLevel,
     WorkflowStage,
 )
 from app.core.logging import get_logger
+from app.core.tracing import trace_step
 from app.db import dal
 from app.db import models as m
 from app.db.dal import guid, now
@@ -37,17 +40,33 @@ def session_is_ot(sess: Session, subsystems: list[dict] | None, asset_context: d
     neither a matching code nor a recognizable name simply doesn't count; there is no free-text
     fallback (found 2026-08-27: the prior version of this check pattern-matched the asset's own
     free-text type instead of its already-available, DB-resolved ctm_scan_category)."""
+    return "OT" in session_category_codes(sess, subsystems, asset_context)
+
+
+def session_category_codes(sess: Session, subsystems: list[dict] | None, asset_context: dict) -> set[str]:
+    """The session's ctm_scan_category CODES ('IT', 'OT', 'DATA_INFO', 'HUMAN_ROLE', 'FAC_LOC',
+    'PHY_INFRA'), resolved from the asset's and every subsystem's category id. A row with no
+    code but a recognizable "(OT)"/"(IT)" name still counts — same tolerance session_is_ot
+    always had. Consumed by session_is_ot and by tasks._fetch_intel's prefer-order."""
     ids = threat_retrieval.session_category_ids(subsystems, asset_context)
     if not ids:
-        return False
-    for _cat_id, code, name in sess.execute(
-            select(m.ctm_scan_category.id, m.ctm_scan_category.code, m.ctm_scan_category.name)
+        return set()
+    out: set[str] = set()
+    for code, name in sess.execute(
+            select(m.ctm_scan_category.code, m.ctm_scan_category.name)
             .where(m.ctm_scan_category.id.in_(sorted(ids)))):
-        if (code or "").strip().casefold() == "ot":
-            return True
-        if "(ot)" in (name or "").casefold():
-            return True
-    return False
+        c = (code or "").strip().upper()
+        if c:
+            out.add(c)
+        # The name's "(OT)"/"(IT)" marker counts REGARDLESS of the code: a row coded OT_LEGACY
+        # but named "Operational Technology (OT)" is still OT — session_is_ot always read the
+        # name, and this must not be narrower than it was.
+        n = (name or "").casefold()
+        if "(ot)" in n:
+            out.add("OT")
+        if "(it)" in n:
+            out.add("IT")
+    return out
 
 
 def _resolve_control_labels(sess: Session, asset_context: dict,
@@ -160,6 +179,20 @@ class MappingTally(NamedTuple):
     skipped: int
 
 
+def _under_attempt_limit(attempts_col):
+    """The control-mapping eligibility predicate — factored into ONE function so
+    `eligible_outputs` and `sessions_awaiting_control_mapping` cannot drift apart the way their
+    accepted/superseded predicate once did (see eligible_outputs' own docstring on that incident).
+
+    HARD CUTOFF, by explicit owner instruction: once a row reaches control_map_max_attempts
+    without a ControlsMappedAt stamp, it is excluded from every future sweep/pipeline mapping pass
+    - permanently, not a backoff. It will not be retried again even if the underlying cause (e.g.
+    an empty control library for its category) is later fixed; that requires a regenerate. A fresh
+    row (ControlMapAttempts=0) is always eligible, exactly as before this limit existed - no
+    behaviour change for the common case."""
+    return attempts_col < get_settings().control_map_max_attempts
+
+
 def eligible_outputs(sess: Session, session_id: str) -> list:
     """Outputs this session still owes controls, each row carrying its own threat identity.
 
@@ -186,6 +219,7 @@ def eligible_outputs(sess: Session, session_id: str) -> list:
             or_(dal.active(out_t.Superseded), out_t.Accepted == 1),
             out_t.Status == ScenarioStatus.complete,
             out_t.ControlsMappedAt.is_(None),
+            _under_attempt_limit(out_t.ControlMapAttempts),
             ~already_mapped.exists())
     ).all()
 
@@ -234,6 +268,60 @@ def select_matching_controls(scenario_id: str, session_id: str, matches, min_sco
     return keep, dropped
 
 
+def _record_control_map_attempts(sess: Session, outputs) -> list[str]:
+    """Increment ControlMapAttempts for every output about to be attempted this pass, committed
+    immediately - the same CAS-increment idiom claim_stage uses for
+    Subsystem_Stage_State.AttemptCount. Committing here, before the savepoint a later exception
+    can roll back, is what makes the counter reliable even when the rest of the pass crashes -
+    that is exactly the case an attempt limit needs to count.
+
+    Every output here is still fresh or on its LAST allowed attempt (control_map_max_attempts) -
+    nothing excludes a row from the rest of map_controls this pass, so an output on its final try
+    still gets a real chance to succeed before the cutoff takes effect for good.
+
+    Returns the ids now at or past control_map_max_attempts - candidates for
+    _log_if_still_exhausted, NOT yet a claim that any of them are still unmapped. Checking that
+    here, before the attempt runs, would log "exhausted" on a row that goes on to succeed on this
+    very last try - the caller re-checks once the pass has actually settled.
+    """
+    ids = [row[0] for row in outputs]
+    sess.execute(update(m.Threat_Scenario)
+                .where(m.Threat_Scenario.ScenarioID.in_(ids))
+                .values(ControlMapAttempts=m.Threat_Scenario.ControlMapAttempts + 1))
+    sess.commit()
+    max_attempts = get_settings().control_map_max_attempts
+    return sess.execute(
+        select(m.Threat_Scenario.ScenarioID)
+        .where(m.Threat_Scenario.ScenarioID.in_(ids),
+            m.Threat_Scenario.ControlMapAttempts >= max_attempts)
+    ).scalars().all()
+
+
+def _log_if_still_exhausted(sess: Session, session_id: str, over_budget_ids: list) -> None:
+    """The other half of _record_control_map_attempts - called from map_controls' `finally`, so
+    it runs exactly once no matter which of that function's several early returns (or its
+    exception path) fired, on the pass's ACTUAL outcome rather than its attempt count alone.
+
+    Logs the ids that are BOTH at/past the limit AND still ControlsMappedAt IS NULL once the pass
+    is done - i.e. this WAS their last allowed attempt and it failed. Fires exactly once per
+    scenario: once logged, `_under_attempt_limit` permanently excludes these ids from every future
+    `eligible_outputs`/`sessions_awaiting_control_mapping` call, so there is no later retry left to
+    log again - by explicit owner instruction, this is a stop, not a backoff.
+    """
+    if not over_budget_ids:
+        return
+    max_attempts = get_settings().control_map_max_attempts
+    still_unmapped = sess.execute(
+        select(m.Threat_Scenario.ScenarioID)
+        .where(m.Threat_Scenario.ScenarioID.in_(over_budget_ids),
+            m.Threat_Scenario.ControlsMappedAt.is_(None))
+    ).scalars().all()
+    if still_unmapped:
+        log.error("controls.mapping_exhausted", session_id=session_id,
+                scenario_ids=[str(sid) for sid in still_unmapped], attempts=max_attempts,
+                reason=ControlMappingExhaustionReason.retry_budget_exhausted)
+
+
 def _stamp_mapped_outputs(sess: Session, outputs, per_output, answered: list[str]) -> None:
     """Timestamp the outputs we ACTUALLY ANSWERED, plus those with no groundable query.
 
@@ -267,10 +355,10 @@ def _record_control_mapping(sess: Session, scenario_session: dict, subsystem_id:
                     # the metric was constant. Historical rows keep the old key.
                     DetailJSON=json.dumps({"outputs": queried, "mapped": tally.inserted,
                                             "dropped": tally.dropped,
-                                            # Same discipline as tasks._validate_candidates'
-                                            # `degraded`: a fail-open path must PERSIST how often
-                                            # it degraded, or afterwards a degraded run is
-                                            # indistinguishable from a clean one.
+                                            # Same discipline as find_threats' relevance-gate
+                                            # `gate_failed`: a fail-open path must PERSIST how
+                                            # often it degraded, or afterwards a degraded run
+                                            # is indistinguishable from a clean one.
                                             "unanswered": tally.unanswered,
                                             "skipped": tally.skipped,
                                             "itot_labels": itot_labels or [],
@@ -289,6 +377,57 @@ def _record_control_mapping(sess: Session, scenario_session: dict, subsystem_id:
 
 def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
                 subsystems: list[dict] | None, llm: LLMClient, subsystem_id: int,
+                task_id: str, epoch: int, *, durable: bool) -> None:
+    """Step-4 control mapping, timed. Delegates to `_map_controls_once` — see its docstring.
+
+    The timing lives in this wrapper rather than inside the body ON PURPOSE: the body has five
+    early returns and a broad exception handler, so measuring AROUND the call is the only way one
+    measurement covers every exit path, and `finally` guarantees the number is recorded even when
+    the pass bails out early.
+
+    perf_counter, not dal.now: this is a DURATION — monotonic, immune to a clock step mid-run —
+    the same reasoning already written above the grounding call inside. The SAME value feeds both
+    the trace record and the database, so those two can never disagree.
+
+    This is the pipeline's longest step (a real run spent 604s of 724s here) and had no
+    instrumentation at all before this.
+    """
+    sid = scenario_session["SessionID"]
+    _t0 = time.perf_counter()
+    with trace_step("CONTROL MAPPING", sid, subsystem=subsystem_id, epoch=epoch,
+                    durable=durable) as _t:
+        try:
+            _map_controls_once(sess, scenario_session, asset_context, subsystems, llm,
+                            subsystem_id, task_id, epoch, durable=durable)
+        finally:
+            seconds = time.perf_counter() - _t0
+            _t.result(seconds=round(seconds, 2))
+            try:
+                try:
+                    # Cumulative: this pass may be one of several sweep ticks, so the session's
+                    # total is the sum of the work, not a span across the waiting in between.
+                    dal.accumulate_control_map_seconds(sess, sid, seconds)
+                except PendingRollbackError:
+                    # The pass left `sess` needing a rollback - a failed flush or an invalidated
+                    # connection escaped the body's own handler (its begin_nested runs outside
+                    # that try, its finally issues a SELECT, and a BaseException such as a gevent
+                    # Timeout bypasses `except Exception` entirely). Whatever was pending is
+                    # already unrecoverable, so rolling back discards nothing; the accumulate is
+                    # a standalone atomic UPDATE and is safe to issue once more.
+                    sess.rollback()
+                    dal.accumulate_control_map_seconds(sess, sid, seconds)
+                if durable:
+                    sess.commit()
+            # Same posture as the body: telemetry must never fail the pass it is measuring.
+            # seconds= is the size of the hole: the column is cumulative, so a lost pass
+            # under-reports the session forever with no other trace of it.
+            except Exception:
+                log.warning("controls.timing_write_failed", session_id=sid,
+                            seconds=round(seconds, 2), exc_info=True)
+
+
+def _map_controls_once(sess: Session, scenario_session: dict, asset_context: dict,
+                subsystems: list[dict] | None, llm: LLMClient, subsystem_id: int,
                 task_id: str, epoch: int, *, durable: bool = False) -> None:
     """Store top control matches for active, complete scenario outputs.
 
@@ -302,12 +441,15 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
     """
     # A savepoint prevents mapping errors from rolling back scenario writes.
     sp = sess.begin_nested()
+    # Bound before try/except so `finally` always finds it, however this pass exits.
+    over_budget_ids: list = []
     try:
         s = get_settings()
         sid, ss = scenario_session["SessionID"], subsystem_id
         outputs = eligible_outputs(sess, sid)
         if not outputs:
             return
+        over_budget_ids = _record_control_map_attempts(sess, outputs)
         labels = _resolve_control_labels(sess, asset_context, subsystems)
         candidates = grounding.get_control_candidates(sess, labels) if outputs else []
         if outputs and not candidates:
@@ -393,6 +535,11 @@ def map_controls(sess: Session, scenario_session: dict, asset_context: dict,
         # Close the savepoint after normal returns and early returns.
         if sp.is_active:
             sp.commit()
+        # ONE place, covering every exit path (normal completion, every early return above, and
+        # the exception handler) - the pass has now genuinely settled, so this reflects the ACTUAL
+        # outcome instead of firing on a backed-off retry that goes on to succeed within this same
+        # pass (see _log_if_still_exhausted's own docstring).
+        _log_if_still_exhausted(sess, scenario_session.get("SessionID"), over_budget_ids)
 
 
 #: Sessions created before this are NEVER swept. The sweep exists to give the retry queue a
@@ -447,6 +594,7 @@ def sessions_awaiting_control_mapping(sess: Session, limit: int = SWEEP_LIMIT) -
             # permanent empty control list on a scenario a reviewer can see and has signed off.
             or_(dal.active(out.Superseded), out.Accepted == 1),
             out.ControlsMappedAt.is_(None),
+            _under_attempt_limit(out.ControlMapAttempts),
             ses.CreatedAt >= CONTROL_MAP_SWEEP_FROM,
             st.Status.in_([StageStatus.AWAITING_DECISION, StageStatus.COMPLETE]),
             st.UpdatedAt < cutoff)

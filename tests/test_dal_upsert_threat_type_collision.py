@@ -25,28 +25,38 @@ def _engine_with_live_index():
     m.Threat_Type.__table__.create(engine)
     with engine.begin() as conn:
         # The LIVE, FILTERED natural-key backstop — matches production's
-        # UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName) WHERE IsActive=1 AND
-        # IsDeleted=0 exactly (2. Threat_library.sql), so a soft-deleted same-name row is
-        # correctly NOT a collision. Raw DDL so no Index object pollutes the shared table
-        # metadata for other test files — same pattern as test_promote_scenario_library.py.
+        # UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName) WHERE IsDeleted=0 exactly
+        # (2. Threat_library.sql, widened 2026-09-04 — see promote.py Change 3: a filtered index
+        # scoped to IsActive=1 only restricts rows that themselves satisfy that predicate, so it
+        # gave ZERO protection once inserts started IsActive=0). A hard-deleted same-name row is
+        # correctly NOT a collision; a merely-pending (IsActive=0, IsDeleted=0) one now IS. Raw
+        # DDL so no Index object pollutes the shared table metadata for other test files — same
+        # pattern as test_promote_scenario_library.py.
         conn.exec_driver_sql(
             "CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName) "
-            "WHERE IsActive = 1 AND IsDeleted = 0")
+            "WHERE IsDeleted = 0")
     return engine
 
 
 def test_integrity_error_recovery_returns_the_existing_winner(monkeypatch):
-    """Simulates the lost-race window: by the time this call's own pre-check ran, the winner's
-    row was not yet visible/committed (monkeypatched to miss) — but by the time this call's
-    INSERT executes, the winner has committed, so the real filtered index raises. The recovery
-    must select by ThreatTypeName ALONE among ACTIVE rows and return that row's id — not raise,
-    and never mint a second row."""
+    """Simulates the lost-race window against an ALREADY-APPROVED type: by the time this call's
+    own pre-check ran, the winner's row was not yet visible/committed (monkeypatched to miss) —
+    but by the time this call's INSERT executes, the winner has committed, so the real filtered
+    index (WHERE IsActive=1 AND IsDeleted=0) raises. The recovery must select by ThreatTypeName
+    ALONE and return that row's id — not raise, and never mint a second row.
+
+    The winner is seeded directly as IsActive=True (not via upsert_threat_type, which now always
+    inserts PENDING/IsActive=False) to represent a name a curator already approved — the one case
+    the filtered index still actually collides on. See
+    test_two_pending_inserts_of_the_same_name_are_not_deduped_by_the_index below for the case
+    this index no longer catches."""
     engine = _engine_with_live_index()
     Session = sessionmaker(bind=engine, future=True)
     with Session() as s:
-        winner_id, created_first = dal.upsert_threat_type(s, "Supply Chain Compromise", None)
+        s.add(m.Threat_Type(ThreatTypeName="Supply Chain Compromise", ThreatCategoryID=None,
+                            IsActive=True, IsDeleted=False))
         s.commit()
-    assert created_first is True
+        winner_id = s.query(m.Threat_Type.ThreatTypeID).scalar()
 
     monkeypatch.setattr(dal, "find_type_id_by_norm_name", lambda sess, name: None)
     with Session() as s:
@@ -58,10 +68,37 @@ def test_integrity_error_recovery_returns_the_existing_winner(monkeypatch):
         assert s.query(m.Threat_Type).count() == 1, "the recovery minted a twin"
 
 
+def test_two_pending_inserts_of_the_same_new_name_still_dedupe_via_widened_index(monkeypatch):
+    """UX_ThreatType_NaturalKey was widened to WHERE IsDeleted=0 (2026-09-04) specifically because
+    upsert_threat_type now inserts PENDING (IsActive=False, awaiting curator review): a filter
+    scoped to IsActive=1 would never even see such an insert, giving zero duplicate protection.
+    With the widened filter, two truly SIMULTANEOUS first-time promotions of the same brand-new
+    name (dedup bypassed here to simulate the lost race) must still collide at the DB level and
+    recover to one winner — exactly like the already-active case in
+    test_integrity_error_recovery_returns_the_existing_winner, just for a pending row instead."""
+    engine = _engine_with_live_index()
+    Session = sessionmaker(bind=engine, future=True)
+
+    monkeypatch.setattr(dal, "find_type_id_by_norm_name", lambda sess, name: None)
+    with Session() as s:
+        id_a, created_a = dal.upsert_threat_type(s, "Novel Attack Pattern", None)
+        s.commit()
+    with Session() as s:
+        id_b, created_b = dal.upsert_threat_type(s, "Novel Attack Pattern", None)
+        s.commit()
+
+    assert created_a is True and created_b is False
+    assert id_a == id_b
+    with Session() as s:
+        rows = s.query(m.Threat_Type).filter_by(ThreatTypeName="Novel Attack Pattern").all()
+        assert len(rows) == 1 and not rows[0].IsActive
+
+
 def test_soft_deleted_same_name_row_does_not_block_or_get_reused():
-    """A retired type must not shadow a brand-new one with the same name: the filtered index
-    permits the insert (no collision), and upsert_threat_type must mint a genuinely NEW active
-    row rather than being fooled into 'recovering' the dead one."""
+    """A retired (hard-deleted) type must not shadow a brand-new one with the same name: the
+    filtered index permits the insert (no collision), and upsert_threat_type must mint a
+    genuinely NEW row — PENDING (IsActive=False), not active, since that's the insert default
+    now — rather than being fooled into 'recovering' the dead one."""
     engine = _engine_with_live_index()
     Session = sessionmaker(bind=engine, future=True)
     with Session() as s:
@@ -76,5 +113,5 @@ def test_soft_deleted_same_name_row_does_not_block_or_get_reused():
     with Session() as s:
         rows = s.query(m.Threat_Type).all()
         assert len(rows) == 2, "the soft-deleted row blocked or absorbed the new insert"
-        live = [r for r in rows if r.IsActive]
-        assert len(live) == 1 and live[0].ThreatTypeID == new_id
+        pending = [r for r in rows if not r.IsDeleted]
+        assert len(pending) == 1 and pending[0].ThreatTypeID == new_id and not pending[0].IsActive

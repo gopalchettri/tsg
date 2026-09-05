@@ -14,11 +14,28 @@ import importlib.util
 import os
 from collections.abc import Callable, Sequence
 from functools import lru_cache
+from pathlib import Path
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
+
+#: Project root - app/pipeline/local_models.py -> app/pipeline -> app -> <root>. Same idiom as
+#: tracing._ROOT and env_selfcheck: a RELATIVE model path resolves against this, never the CWD.
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_model_path(path: str) -> str:
+    """EMBEDDING_MODEL / RERANKER_MODEL as an absolute path.
+
+    .env.example ships `models/multilingual-e5-large`. Resolved against the CWD that only works
+    when the process happens to start in tsg/ (start.ps1 does; a bare `uvicorn`/`celery` from
+    elsewhere, or Docker's WORKDIR /app, does not) and fails at boot with "path not found".
+    Anchoring here makes the setting mean the same thing however the process was launched.
+    Absolute paths (the Docker bind mounts, /models/e5) pass through untouched.
+    """
+    return path if os.path.isabs(path) else str(_ROOT / path)
 
 
 def _offload(fn: Callable):
@@ -78,7 +95,7 @@ def embed(texts: Sequence[str]) -> list[list[float]]:
         return []
 
     def _run():
-        model = _embedder(get_settings().embedding_model)
+        model = _embedder(resolve_model_path(get_settings().embedding_model))
         vectors = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True,
                                 show_progress_bar=False)
         return [v.tolist() for v in vectors]
@@ -105,7 +122,7 @@ def rerank_pairs(pairs: Sequence[tuple[str, str]]) -> list[float]:
         return []
 
     def _run():
-        model = _reranker(get_settings().reranker_model)
+        model = _reranker(resolve_model_path(get_settings().reranker_model))
         scores = [float(x) for x in model.predict(pairs, show_progress_bar=False)]
         out_of_range = [x for x in scores if x < -0.05 or x > 1.05]
         if out_of_range:
@@ -152,21 +169,26 @@ def validate_local_models(settings: Settings | None = None, *, warm: bool) -> No
     local_used = s.embedding_provider == "local" or s.reranker_provider == "local"
 
     # Config-level checks (always): paths exist, e5 prefix scheme is unambiguous.
+    # Resolved ONCE, up front, and the same string is what _embedder/_reranker are cached on
+    # here and in embed()/rerank_pairs() - a relative setting cannot warm one cache slot here and
+    # miss it at request time.
+    embedding_path = resolve_model_path(s.embedding_model)
+    reranker_path = resolve_model_path(s.reranker_model)
     if s.embedding_provider == "local":
-        _require_path_exists("EMBEDDING_MODEL", s.embedding_model)
+        _require_path_exists("EMBEDDING_MODEL", embedding_path)
         _check_embedding_prefix_style(s.embedding_model, s.embedding_prefix_style)
     if s.reranker_provider == "local":
-        _require_path_exists("RERANKER_MODEL", s.reranker_model)
+        _require_path_exists("RERANKER_MODEL", reranker_path)
 
     # Load-time checks (warm only): the package must be installed before we load models.
     if warm and local_used:
         _require_sentence_transformers_installed()
         if s.embedding_provider == "local":
-            dim = _embedder(s.embedding_model).get_embedding_dimension()
+            dim = _embedder(embedding_path).get_embedding_dimension()
             if dim != s.embedding_dimensions:
                 raise RuntimeError(f"EMBEDDING_DIMENSIONS={s.embedding_dimensions} but model reports {dim}")
         if s.reranker_provider == "local":
-            _reranker(s.reranker_model)
+            _reranker(reranker_path)
 
 
 if __name__ == "__main__":  # self-check: offload returns the same values (inline path here)

@@ -28,9 +28,9 @@
 
 .PARAMETER Concurrency
     Celery gevent-pool concurrency (the worker's -c flag: parallel task slots for one
-    worker, gevent greenlets not processes). Passed through to start.ps1. Default 50 —
+    worker, gevent greenlets not processes). Passed through to start.ps1. Default 10 —
     see start.ps1's .PARAMETER Concurrency help for the full explanation and when to
-    lower it.
+    change it.
 
 .PARAMETER Reload
     Start uvicorn with --reload. Passed through to start.ps1.
@@ -48,14 +48,14 @@
     .\run.ps1 -Check
 
 .EXAMPLE
-    .\run.ps1 -Reload -Concurrency 10
+    .\run.ps1 -Reload -Concurrency 50
 #>
 
 [CmdletBinding()]
 param(
     [switch]$Check,
     [int]$Port = 8000,
-    [int]$Concurrency = 50,
+    [int]$Concurrency = 10,
     [switch]$Reload,
     [switch]$NoFlower,
     [int]$FlowerPort = 5555

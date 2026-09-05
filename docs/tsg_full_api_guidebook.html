@@ -99,12 +99,12 @@ footer{color:var(--ink-faint); font-size:12px; margin-top:40px; padding-top:16px
 <div class="shell">
   <nav>
     <div class="brand">TSG API Guidebook</div>
-    <div class="tag">46 routes, live-verified</div>
+    <div class="tag">47 routes, live-verified</div>
     <input id="search" type="text" placeholder="Search routes...">
     <a href="#golden-path" class="golden-link">★ Golden path (start here)</a>
     <h2>Sections</h2>
     <a href="#generation" data-nav>Threat Scenario Generation &amp; Scenario Reads <span class="count">15</span></a>
-<a href="#treatment" data-nav>Remediation Plans <span class="count">10</span></a>
+<a href="#treatment" data-nav>Remediation Plans <span class="count">11</span></a>
 <a href="#intel" data-nav>Threat Intel Admin <span class="count">5</span></a>
 <a href="#library_admin" data-nav>Embeddings &amp; Grounding Admin <span class="count">11</span></a>
 <a href="#ops" data-nav>API Clients &amp; Health <span class="count">5</span></a>
@@ -112,7 +112,7 @@ footer{color:var(--ink-faint); font-size:12px; margin-top:40px; padding-top:16px
   <main>
     <h1>TSG API Testing Guidebook</h1>
     <p class="sub">Every route in the app: exact request body, complete response, tables touched, and a copy-pasteable
-    SQL query to verify the result yourself. Request and response blocks are DERIVED from the running app's own OpenAPI spec (regenerated 2026-08-30), so a field rename in schemas.py reaches this page on the next run. Purpose, auth, SQL and notes are hand-written and carried forward.</p>
+    SQL query to verify the result yourself. Request and response blocks are DERIVED from the running app's own OpenAPI spec (regenerated 2026-08-31), so a field rename in schemas.py reaches this page on the next run. Purpose, auth, SQL and notes are hand-written and carried forward.</p>
     <div class="vars">
       <div class="lbl2">Set once, reuse everywhere below</div>
       <pre>API_KEY="&lt;X-API-Key&gt;"   ADMIN_KEY="&lt;X-Admin-Key&gt;"
@@ -212,6 +212,7 @@ USER_ID="&lt;user id&gt;"     ENTITY_ID="78"      HOST="http://localhost:8000"</
     &quot;overall&quot;: &quot;awaiting_review&quot;,
     &quot;scenarios&quot;: &quot;AWAITING_DECISION&quot;,
     &quot;threats&quot;: &quot;COMPLETE&quot;,
+    &quot;controls&quot;: &quot;PENDING&quot;,
     &quot;last_next_set&quot;: {
       &quot;outcome&quot;: &quot;complete&quot;,
       &quot;requested&quot;: 0,
@@ -236,8 +237,7 @@ USER_ID="&lt;user id&gt;"     ENTITY_ID="78"      HOST="http://localhost:8000"</
       &quot;rescored_threat_ids&quot;: [
         &quot;&lt;rescored_threat_ids&gt;&quot;
       ],
-      &quot;epoch&quot;: 0,
-      &quot;user_note&quot;: &quot;&lt;user_note&gt;&quot;
+      &quot;epoch&quot;: 0
     },
     &quot;coverage&quot;: {
       &quot;cells&quot;: 0,
@@ -258,7 +258,7 @@ USER_ID="&lt;user id&gt;"     ENTITY_ID="78"      HOST="http://localhost:8000"</
   },
   &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   &quot;session_status&quot;: &quot;active&quot;,
-  &quot;stage_status&quot;: &quot;AWAITING_DECISION&quot;,
+  &quot;stage_status&quot;: &quot;COMPLETE&quot;,
   &quot;user_id&quot;: &quot;qa-user&quot;
 }</pre>
   </div>
@@ -384,7 +384,6 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
         &quot;threat_category_id&quot;: 0,
         &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
         &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
-        &quot;description&quot;: &quot;&lt;description&gt;&quot;,
         &quot;threat_type_id&quot;: 0,
         &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
         &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
@@ -408,6 +407,7 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
     &quot;threats&quot;: &quot;&lt;threats&gt;&quot;,
     &quot;scenarios&quot;: &quot;&lt;scenarios&gt;&quot;,
     &quot;overall&quot;: &quot;&lt;overall&gt;&quot;,
+    &quot;controls&quot;: &quot;PENDING&quot;,
     &quot;error_message&quot;: {},
     &quot;last_next_set&quot;: {
       &quot;outcome&quot;: &quot;complete&quot;,
@@ -433,8 +433,7 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
       &quot;rescored_threat_ids&quot;: [
         &quot;&lt;rescored_threat_ids&gt;&quot;
       ],
-      &quot;epoch&quot;: 0,
-      &quot;user_note&quot;: &quot;&lt;user_note&gt;&quot;
+      &quot;epoch&quot;: 0
     },
     &quot;coverage&quot;: {
       &quot;cells&quot;: 0,
@@ -544,7 +543,6 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
         &quot;threat_category_id&quot;: 0,
         &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
         &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
-        &quot;description&quot;: &quot;&lt;description&gt;&quot;,
         &quot;threat_type_id&quot;: 0,
         &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
         &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
@@ -733,8 +731,7 @@ SELECT ScenarioID, ScenarioNumber, GenerationEpoch FROM Threat_Scenario WHERE Se
     <pre>{
   &quot;scenario_ids&quot;: [
     &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;
-  ],
-  &quot;user_note&quot;: &quot;Please emphasize the insider-threat vector.&quot;
+  ]
 }</pre>
   </div>
   <div class="blk">
@@ -946,7 +943,6 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     &quot;threat_category_id&quot;: 0,
     &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
     &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
-    &quot;description&quot;: &quot;&lt;description&gt;&quot;,
     &quot;threat_type_id&quot;: 0,
     &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
     &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
@@ -1012,7 +1008,6 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;threat_category_id&quot;: 0,
       &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
       &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
-      &quot;description&quot;: &quot;&lt;description&gt;&quot;,
       &quot;threat_type_id&quot;: 0,
       &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
       &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
@@ -1109,7 +1104,6 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;threat_category_id&quot;: 0,
       &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
       &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
-      &quot;description&quot;: &quot;&lt;description&gt;&quot;,
       &quot;threat_type_id&quot;: 0,
       &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
       &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
@@ -1215,6 +1209,51 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     <p class="errs"><span class="lbl">Errors</span> 404 if session_id doesn&#x27;t exist, or scenario_id isn&#x27;t a scenario of this session (&quot;scenario not found in this session&quot;); 403 EntityForbidden if X-Entity-Id doesn&#x27;t own the session; 409 scenario_not_accepted if the scenario&#x27;s Accepted flag isn&#x27;t 1; 409 plan_already_exists if ANY plan row (RUNNING/COMPLETE/ERROR) already exists for this scenario — use /regenerate instead; 422 on a schema violation (rating out of 1-5/1-25, mitigation_end_date before mitigation_start_date, one mitigation date without the other, or any forbidden extra key); 503 if the Celery broker can&#x27;t be reached to enqueue (the row is already committed and parked ERROR/enqueue_failed — regenerate to retry).</p>
   </details>
 </article>
+<article class="api" id="get-v1-sessions-session-id-scenarios-scenario-id-treatment-plan-status">
+  <div class="api-head">
+    <span class="method m-get">GET</span>
+    <span class="path">/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/status</span>
+  </div>
+  <p class="purpose">Cheap status-only poll for one scenario&#x27;s remediation plan: the lifecycle stage and the review verdict, with no plan content, no scenario and no threat attached.</p>
+  <p class="auth"><span class="lbl">Auth</span> get_principal: X-API-Key, X-User-Id, X-Entity-Id (must equal the session&#x27;s EntityID or 403), X-Tenant-Id — all required, same as every session-scoped route in this file.</p>
+  <div class="blk">
+    <h3>Request</h3>
+    <pre>none — path params session_id/scenario_id only. There is no request body and no query parameter; this is a plain GET.</pre>
+  </div>
+  <div class="blk">
+    <h3>Response <span class="status">200 (404 if no plan has ever been requested for this scenario)</span></h3>
+    <pre>{
+  &quot;created_by&quot;: &quot;dewa&quot;,
+  &quot;plan_id&quot;: &quot;442b4bd2-98ab-8ac4-b589-01a054d68dbf&quot;,
+  &quot;progress&quot;: {
+    &quot;generation&quot;: &quot;COMPLETE&quot;,
+    &quot;overall&quot;: &quot;awaiting_review&quot;,
+    &quot;review&quot;: &quot;PENDING&quot;
+  },
+  &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
+  &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;,
+  &quot;status&quot;: &quot;COMPLETE&quot;,
+  &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
+  &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
+  &quot;reviewed_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+  &quot;error_message&quot;: &quot;&lt;error_message&gt;&quot;,
+  &quot;reason&quot;: &quot;generation_failed&quot;,
+  &quot;created_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+  &quot;updated_at&quot;: &quot;2026-08-30T12:00:00&quot;,
+  &quot;completed_at&quot;: &quot;2026-08-30T12:00:00&quot;
+}</pre>
+  </div>
+  <div class="blk verify">
+    <h3>Verify in the database</h3>
+    <pre>SELECT PlanID, Status, ReviewStatus, ReviewedBy, UpdatedAt, CompletedAt FROM Risk_Treatment_Plan WHERE SessionID = &#x27;{session_id}&#x27; AND ScenarioID = &#x27;{scenario_id}&#x27; AND Superseded = 0;</pre>
+  </div>
+  <div class="tables"><span class="tbl">Risk_Treatment_Plan</span><span class="tbl">Scenario_Session</span></div>
+  <details class="notes">
+    <summary>Implementation notes &amp; error cases</summary>
+    <p>Switch the UI on progress.overall, which names both the state and the action it implies: pending -&gt; Generate, generating -&gt; spinner, awaiting_review -&gt; Review, rejected -&gt; Regenerate, approved -&gt; done, error -&gt; Retry. `pending` can never appear in a 200 here — no plan row means 404, and that IS the pending state. progress is folded by the same function GET /v1/sessions/{session_id}/treatment-plans uses, so the per-scenario poll and the session board can never disagree about one plan. WHY THIS EXISTS SEPARATELY FROM THE FULL GET: dal.plan_status_row selects plan-table columns only and deliberately never joins PlanJSON, ScenarioJSON or the threat tables — GET .../treatment-plan returns the entire plan document, tens of KB that a poller re-downloads every tick for the three strings it actually reads. A test asserts the status query carries no blob, so the cheap poll cannot silently become the expensive one. Poll this while generating, then call GET .../treatment-plan once for the content. A RUNNING row older than treatment_stale_seconds is PRESENTED as status=ERROR/reason=timed_out exactly as the full GET does; the stored row is never rewritten, so a late worker finish can still flip it back on a later poll. There is no separate SSE stream for plans — the advisory treatment_plan_result event rides the session channel, GET /v1/sessions/{session_id}/events.</p>
+    <p class="errs"><span class="lbl">Errors</span> 404 (&quot;no treatment plan has been requested for this scenario&quot;) when the scenario has no plan row — treat this as the pending state, not as an error; 404 if scenario_id is not a scenario of this session, or session_id itself is unknown; 403 EntityForbidden if the caller&#x27;s X-Entity-Id does not own the session; 401 if X-API-Key/X-User-Id/X-Entity-Id/X-Tenant-Id are missing or the key is invalid. The whole router is unmounted (plain 404 on every path under it) when settings.risk_module_enabled is False.</p>
+  </details>
+</article>
 <article class="api" id="get-v1-sessions-session-id-scenarios-scenario-id-treatment-plan">
   <div class="api-head">
     <span class="method m-get">GET</span>
@@ -1251,13 +1290,14 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
           &quot;control_name&quot;: &quot;Access Restriction For Change&quot;,
           &quot;control_type&quot;: &quot;preventive&quot;,
           &quot;description&quot;: &quot;Enforce role-based access control and least-privilege…&quot;,
+          &quot;domain&quot;: &quot;Configuration Management&quot;,
           &quot;priority&quot;: &quot;Critical&quot;
         }
       ]
     },
     &quot;impacted_business_division&quot;: &quot;Water Treatment Operations&quot;,
     &quot;mitigation_owner&quot;: &quot;OT Security Team&quot;,
-    &quot;mitigation_timeline&quot;: &quot;90 days overall; critical actions within 30 days&quot;,
+    &quot;mitigation_timeline&quot;: &quot;2026-09-28&quot;,
     &quot;risk_owner&quot;: &quot;Head of OT Operations&quot;,
     &quot;title&quot;: &quot;Remote Access Hardening&quot;,
     &quot;treatment_plan&quot;: &quot;Mitigate&quot;
@@ -1271,12 +1311,58 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     &quot;scenario_title&quot;: &quot;Ransomware via exposed RDP&quot;,
     &quot;threat_category&quot;: &quot;Elevation of Privilege&quot;,
     &quot;threat_name&quot;: &quot;Stolen RDP credentials&quot;,
-    &quot;threat_type&quot;: &quot;Credential Abuse&quot;
+    &quot;threat_type&quot;: &quot;Credential Abuse&quot;,
+    &quot;supporting_systems_involved&quot;: [
+      {
+        &quot;supporting_system_id&quot;: 0,
+        &quot;supporting_system&quot;: &quot;&lt;supporting_system&gt;&quot;,
+        &quot;is_entry_point&quot;: false,
+        &quot;justification&quot;: &quot;&quot;
+      }
+    ]
   },
   &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
   &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;,
   &quot;status&quot;: &quot;COMPLETE&quot;,
   &quot;treatment_strategy&quot;: &quot;Mitigate&quot;,
+  &quot;progress&quot;: {
+    &quot;generation&quot;: &quot;PENDING&quot;,
+    &quot;review&quot;: &quot;PENDING&quot;,
+    &quot;overall&quot;: &quot;pending&quot;
+  },
+  &quot;threat&quot;: {
+    &quot;threat_id&quot;: &quot;&lt;threat_id&gt;&quot;,
+    &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+    &quot;threat_category_id&quot;: 0,
+    &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+    &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+    &quot;threat_type_id&quot;: 0,
+    &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
+    &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
+    &quot;grounding_status&quot;: &quot;&lt;grounding_status&gt;&quot;,
+    &quot;threat_catalogue_id&quot;: 0,
+    &quot;is_threat_type_ai_generated&quot;: false,
+    &quot;is_threat_ai_generated&quot;: false,
+    &quot;grounding_score&quot;: 0.0,
+    &quot;score&quot;: 0.0,
+    &quot;scope_rank&quot;: 0
+  },
+  &quot;controls&quot;: [
+    {
+      &quot;control_id&quot;: 0,
+      &quot;control_code&quot;: &quot;&lt;control_code&gt;&quot;,
+      &quot;domain&quot;: &quot;&lt;domain&gt;&quot;,
+      &quot;control_name&quot;: &quot;&lt;control_name&gt;&quot;,
+      &quot;map_rank&quot;: 0,
+      &quot;score&quot;: 0.0,
+      &quot;standards&quot;: [
+        {
+          &quot;standard_id&quot;: 0,
+          &quot;standard_name&quot;: &quot;&lt;standard_name&gt;&quot;
+        }
+      ]
+    }
+  ],
   &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
   &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
   &quot;reviewed_at&quot;: &quot;2026-08-30T12:00:00&quot;,
@@ -1509,15 +1595,65 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;superseded&quot;: [
         {
           &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+          &quot;progress&quot;: {
+            &quot;generation&quot;: &quot;PENDING&quot;,
+            &quot;review&quot;: &quot;PENDING&quot;,
+            &quot;overall&quot;: &quot;pending&quot;
+          },
           &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
           &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
           &quot;status&quot;: &quot;&lt;status&gt;&quot;,
           &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
-          &quot;scenario&quot;: {},
+          &quot;scenario&quot;: {
+            &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+            &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+            &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+            &quot;supporting_systems_involved&quot;: [
+              {
+                &quot;supporting_system_id&quot;: 0,
+                &quot;supporting_system&quot;: &quot;&lt;supporting_system&gt;&quot;,
+                &quot;is_entry_point&quot;: false,
+                &quot;justification&quot;: &quot;&quot;
+              }
+            ]
+          },
+          &quot;threat&quot;: {
+            &quot;threat_id&quot;: &quot;&lt;threat_id&gt;&quot;,
+            &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+            &quot;threat_category_id&quot;: 0,
+            &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+            &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+            &quot;threat_type_id&quot;: 0,
+            &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
+            &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
+            &quot;grounding_status&quot;: &quot;&lt;grounding_status&gt;&quot;,
+            &quot;threat_catalogue_id&quot;: 0,
+            &quot;is_threat_type_ai_generated&quot;: false,
+            &quot;is_threat_ai_generated&quot;: false,
+            &quot;grounding_score&quot;: 0.0,
+            &quot;score&quot;: 0.0,
+            &quot;scope_rank&quot;: 0
+          },
           &quot;actors&quot;: [
             {
               &quot;actor_id&quot;: 0,
               &quot;actor_name&quot;: &quot;&lt;actor_name&gt;&quot;
+            }
+          ],
+          &quot;controls&quot;: [
+            {
+              &quot;control_id&quot;: 0,
+              &quot;control_code&quot;: &quot;&lt;control_code&gt;&quot;,
+              &quot;domain&quot;: &quot;&lt;domain&gt;&quot;,
+              &quot;control_name&quot;: &quot;&lt;control_name&gt;&quot;,
+              &quot;map_rank&quot;: 0,
+              &quot;score&quot;: 0.0,
+              &quot;standards&quot;: [
+                {
+                  &quot;standard_id&quot;: null,
+                  &quot;standard_name&quot;: null
+                }
+              ]
             }
           ],
           &quot;risk_level&quot;: &quot;&lt;risk_level&gt;&quot;,
@@ -1554,15 +1690,65 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;superseded&quot;: [
         {
           &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
+          &quot;progress&quot;: {
+            &quot;generation&quot;: &quot;PENDING&quot;,
+            &quot;review&quot;: &quot;PENDING&quot;,
+            &quot;overall&quot;: &quot;pending&quot;
+          },
           &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
           &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
           &quot;status&quot;: &quot;&lt;status&gt;&quot;,
           &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
-          &quot;scenario&quot;: {},
+          &quot;scenario&quot;: {
+            &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+            &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+            &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+            &quot;supporting_systems_involved&quot;: [
+              {
+                &quot;supporting_system_id&quot;: 0,
+                &quot;supporting_system&quot;: &quot;&lt;supporting_system&gt;&quot;,
+                &quot;is_entry_point&quot;: false,
+                &quot;justification&quot;: &quot;&quot;
+              }
+            ]
+          },
+          &quot;threat&quot;: {
+            &quot;threat_id&quot;: &quot;&lt;threat_id&gt;&quot;,
+            &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+            &quot;threat_category_id&quot;: 0,
+            &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+            &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+            &quot;threat_type_id&quot;: 0,
+            &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
+            &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
+            &quot;grounding_status&quot;: &quot;&lt;grounding_status&gt;&quot;,
+            &quot;threat_catalogue_id&quot;: 0,
+            &quot;is_threat_type_ai_generated&quot;: false,
+            &quot;is_threat_ai_generated&quot;: false,
+            &quot;grounding_score&quot;: 0.0,
+            &quot;score&quot;: 0.0,
+            &quot;scope_rank&quot;: 0
+          },
           &quot;actors&quot;: [
             {
               &quot;actor_id&quot;: 0,
               &quot;actor_name&quot;: &quot;&lt;actor_name&gt;&quot;
+            }
+          ],
+          &quot;controls&quot;: [
+            {
+              &quot;control_id&quot;: 0,
+              &quot;control_code&quot;: &quot;&lt;control_code&gt;&quot;,
+              &quot;domain&quot;: &quot;&lt;domain&gt;&quot;,
+              &quot;control_name&quot;: &quot;&lt;control_name&gt;&quot;,
+              &quot;map_rank&quot;: 0,
+              &quot;score&quot;: 0.0,
+              &quot;standards&quot;: [
+                {
+                  &quot;standard_id&quot;: null,
+                  &quot;standard_name&quot;: null
+                }
+              ]
             }
           ],
           &quot;risk_level&quot;: &quot;&lt;risk_level&gt;&quot;,
@@ -1587,7 +1773,12 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;completed_at&quot;: &quot;2026-08-30T12:00:00&quot;
     }
   ],
-  &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;
+  &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;,
+  &quot;progress&quot;: {
+    &quot;generation&quot;: &quot;PENDING&quot;,
+    &quot;review&quot;: &quot;PENDING&quot;,
+    &quot;overall&quot;: &quot;pending&quot;
+  }
 }</pre>
   </div>
   <div class="blk verify">
@@ -1631,11 +1822,56 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
       &quot;error_message&quot;: &quot;&lt;error_message&gt;&quot;,
       &quot;reason&quot;: &quot;generation_failed&quot;,
-      &quot;scenario&quot;: {},
+      &quot;scenario&quot;: {
+        &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+        &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+        &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+        &quot;supporting_systems_involved&quot;: [
+          {
+            &quot;supporting_system_id&quot;: 0,
+            &quot;supporting_system&quot;: &quot;&lt;supporting_system&gt;&quot;,
+            &quot;is_entry_point&quot;: false,
+            &quot;justification&quot;: &quot;&quot;
+          }
+        ]
+      },
+      &quot;threat&quot;: {
+        &quot;threat_id&quot;: &quot;&lt;threat_id&gt;&quot;,
+        &quot;threat_category&quot;: &quot;&lt;threat_category&gt;&quot;,
+        &quot;threat_category_id&quot;: 0,
+        &quot;threat_type&quot;: &quot;&lt;threat_type&gt;&quot;,
+        &quot;threat_name&quot;: &quot;&lt;threat_name&gt;&quot;,
+        &quot;threat_type_id&quot;: 0,
+        &quot;library_threat_type&quot;: &quot;&lt;library_threat_type&gt;&quot;,
+        &quot;library_threat_name&quot;: &quot;&lt;library_threat_name&gt;&quot;,
+        &quot;grounding_status&quot;: &quot;&lt;grounding_status&gt;&quot;,
+        &quot;threat_catalogue_id&quot;: 0,
+        &quot;is_threat_type_ai_generated&quot;: false,
+        &quot;is_threat_ai_generated&quot;: false,
+        &quot;grounding_score&quot;: 0.0,
+        &quot;score&quot;: 0.0,
+        &quot;scope_rank&quot;: 0
+      },
       &quot;actors&quot;: [
         {
           &quot;actor_id&quot;: 0,
           &quot;actor_name&quot;: &quot;&lt;actor_name&gt;&quot;
+        }
+      ],
+      &quot;controls&quot;: [
+        {
+          &quot;control_id&quot;: 0,
+          &quot;control_code&quot;: &quot;&lt;control_code&gt;&quot;,
+          &quot;domain&quot;: &quot;&lt;domain&gt;&quot;,
+          &quot;control_name&quot;: &quot;&lt;control_name&gt;&quot;,
+          &quot;map_rank&quot;: 0,
+          &quot;score&quot;: 0.0,
+          &quot;standards&quot;: [
+            {
+              &quot;standard_id&quot;: 0,
+              &quot;standard_name&quot;: &quot;&lt;standard_name&gt;&quot;
+            }
+          ]
         }
       ],
       &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
@@ -2253,7 +2489,7 @@ data: {&quot;type&quot;: &quot;grounding_job_update&quot;, &quot;job_id&quot;: &
   <p class="auth"><span class="lbl">Auth</span> X-Admin-Key header only (router-level require_admin dependency). No X-User-Id/X-Entity-Id/X-Tenant-Id needed for this route.</p>
   <div class="blk">
     <h3>Request</h3>
-    <pre>none — no request body</pre>
+    <pre>none &#x2014; no request body. Optional query param module=&lt;module name&gt; filters to clients registered for that module; omit it to list every client.</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">200</span></h3>

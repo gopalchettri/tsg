@@ -17,6 +17,15 @@ class SessionStatus(StrEnum):
     cancelled = "cancelled"  # user cancel, fatal error, or reaper gave up — terminal, lock released
 
 
+class InfraErrorKind(StrEnum):
+    """Classification for TRANSIENT infrastructure failures that are re-raised for a
+    Celery stage retry instead of being recorded as work failures
+    (pipeline_common.TRANSIENT_INFRA_ERRORS). Enum-valued so the `error_kind` log field
+    stays stable for Loki/Promtail queries; extend it when a new exception class joins
+    the transient contract."""
+    database_transient = "database_transient"  # sqlalchemy OperationalError: deadlock, connection reset, timeout
+
+
 class SessionMode(StrEnum):
     AUTO = "AUTO"   # the only implemented mode: both stages run back-to-back per subsystem,
                     # stopping only at the single REVIEW gate. MANUAL is reserved, no code path
@@ -59,10 +68,29 @@ class ControlMappingStatus(StrEnum):
     That distinction already exists per scenario as ScenarioResult.controls_mapped; this is the
     session-level roll-up of the same fact, computed from Threat_Scenario.ControlsMappedAt, so a
     client can wait for COMPLETE before rendering the finished card.
+
+    ERROR IS permanent, by explicit owner instruction: a scenario reaches it once it has used up
+    control_map_max_attempts without a ControlsMappedAt stamp, and at that point
+    control_mapping._under_attempt_limit permanently excludes it from every future
+    eligible_outputs/sessions_awaiting_control_mapping call. Nothing retries it again on its own;
+    recovering it needs a regenerate or a manual re-run.
     """
     PENDING = "PENDING"    # scenarios not written yet, or written and none mapped
     RUNNING = "RUNNING"    # some scenarios mapped, some not
     COMPLETE = "COMPLETE"  # every active scenario carries a ControlsMappedAt stamp
+    ERROR = "ERROR"        # at least one active scenario exhausted its fast retry budget; still
+                        # being retried on the slow backoff cadence, not abandoned
+
+
+class ControlMappingExhaustionReason(StrEnum):
+    """Why one scenario's `controls_mapping_exhausted` flag is set — the machine-readable half of
+    that flag, same split as TreatmentOutcomeReason/ClickOutcomeReason: a client switches on this,
+    never on an English sentence. One member today; more room to distinguish causes later (e.g. a
+    library-gap-specific code) without a wire break — RegenGranularity ships the same way, one
+    member by design, for the identical reason."""
+    retry_budget_exhausted = "retry_budget_exhausted"  # ControlMapAttempts >= control_map_max_attempts
+                                                    # without a ControlsMappedAt stamp; PERMANENT -
+                                                    # excluded from every future mapping pass
 
 
 class SubsystemLevel(StrEnum):
@@ -94,8 +122,10 @@ class DuplicateReason(StrEnum):
     semantic_similarity = "semantic_same_threat"           # THE reason for every semantic drop now:
                                                         # cosine >= max(semantic_cross_category_threshold,
                                                         # session threshold), whatever the categories
-    # A Stage-1b GENERATED proposal regrounded to a library row this round's VALIDATOR already
-    # rejected as NOT_RELEVANT for this asset. The validator's drop is a hard drop (GAP-B) — a
+    # HISTORICAL ONLY — never written since the LLM validator was replaced by the local
+    # rerank relevance gate (library-first redesign): kept so old audit rows stay readable.
+    # It used to mean: a Stage-1b GENERATED proposal regrounded to a library row that
+    # round's validator had rejected as NOT_RELEVANT for this asset (GAP-B) — a
     # proposal reaching the same catalogue row by a different path must not silently reverse it.
     validator_rejected = "validator_rejected"
                                                         # (tasks.py::_semantic_duplicates)
@@ -419,8 +449,9 @@ class TreatmentStageStatus(StrEnum):
 
     The same vocabulary SessionProgress publishes for threats/scenarios/controls, so a UI reads
     the plan board's stages exactly the way it reads the generation board's: one status string
-    per named stage, no arithmetic. Values match ControlMappingStatus plus ERROR — planning can
-    fail, control mapping cannot (it fails open to an empty list).
+    per named stage, no arithmetic. Values match ControlMappingStatus, ERROR included: both are now
+    genuinely terminal (a plan failure needs a regenerate; a control-mapping ERROR needs a
+    regenerate or a manual re-run — control_map_max_attempts is a hard cutoff, not a backoff).
     """
     PENDING = "PENDING"      # nothing started: no plan requested / nothing generated to review
     RUNNING = "RUNNING"      # at least one plan generating

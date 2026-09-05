@@ -23,7 +23,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import get_settings
-from app.core.enums import ScenarioStatus, StageStatus, SubsystemLevel
+from app.core.enums import ControlMappingStatus, ScenarioStatus, StageStatus, SubsystemLevel
 from app.db import models as m
 from app.pipeline import cascade, control_mapping, grounding
 
@@ -43,7 +43,7 @@ def _engine():
 def _seed(s, *, created_offset_days: int = 1, stage_status: str = StageStatus.AWAITING_DECISION,
         settled_secs_ago: int = STALE, lock_status: str = StageStatus.IDLE,
         lock_task: str | None = None, accepted: int = 0,
-        superseded: int = 0) -> tuple[str, str]:
+        superseded: int = 0, control_map_attempts: int = 0) -> tuple[str, str]:
     """One session whose SCENARIOS stage is settled and whose single complete output was never
     control-mapped — i.e. exactly the state the old code stranded forever."""
     now = datetime.now(UTC)
@@ -66,7 +66,7 @@ def _seed(s, *, created_offset_days: int = 1, stage_status: str = StageStatus.AW
         ScenarioJSON=json.dumps({"scenario_title": "Setpoint manipulation on the HMI",
                                 "scenario_statement": "An attacker writes an unsafe setpoint."}),
         Accepted=accepted, Superseded=superseded, ScenarioNumber=1, GenerationEpoch=EPOCH,
-        ControlsMappedAt=None, CreatedAt=now))
+        ControlsMappedAt=None, ControlMapAttempts=control_map_attempts, CreatedAt=now))
     s.commit()
     return sid, scenario_id
 
@@ -231,3 +231,41 @@ def test_one_failing_session_does_not_stall_the_others(monkeypatch):
         assert cascade.run_control_map_sweep(s, _FakeLLM()) == [healthy]
         assert _mapped(s, healthy_out)[0] == 2, "the healthy session must still be mapped"
         assert _mapped(s, poison_out) == (0, None), "the failing one stays queued for the next tick"
+
+
+def test_a_row_at_its_attempt_limit_is_excluded_and_reports_error(monkeypatch):
+    """A row that already used up its attempt limit (control_map_max_attempts) must NEVER be
+    picked up again - that is exactly the queue-starvation this hard cutoff exists to stop: a
+    permanently-failing row must stop occupying one of SWEEP_LIMIT's scarce slots on every single
+    tick. HARD CUTOFF, by explicit owner instruction, not a backoff: grounding is stubbed to
+    SUCCEED here on purpose, so this also proves the row is excluded before it ever gets a chance
+    to try again - it is never re-attempted, whether or not the underlying cause was ever fixed.
+    dal.control_mapping_progress must also report ERROR, so a polling client is told the truth
+    instead of an endless PENDING/RUNNING."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    _stub_grounding(monkeypatch)
+    max_attempts = get_settings().control_map_max_attempts
+    with Session() as s:
+        sid, scenario_id = _seed(s, control_map_attempts=max_attempts)
+        assert control_mapping.sessions_awaiting_control_mapping(s) == []
+        assert cascade.run_control_map_sweep(s, _FakeLLM()) == []
+        assert _mapped(s, scenario_id) == (0, None)
+        assert cascade.dal.control_mapping_progress(s, sid) == str(ControlMappingStatus.ERROR)
+
+
+def test_a_row_past_its_budget_stops_stalling_a_healthy_row_across_ticks(monkeypatch):
+    """The starvation scenario this whole fix targets: a session that fails every attempt sorts
+    oldest-first and would occupy a SWEEP_LIMIT slot forever under the old unbounded-retry code.
+    Once it is past its attempt limit, a healthy session behind it in the queue must be swept
+    instead - extending test_one_failing_session_does_not_stall_the_others' single-tick isolation
+    to the multi-tick case that motivated this fix."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    _stub_grounding(monkeypatch)
+    max_attempts = get_settings().control_map_max_attempts
+    with Session() as s:
+        _stuck, stuck_out = _seed(s, settled_secs_ago=STALE * 3,
+                                control_map_attempts=max_attempts)   # ordered FIRST, but off budget
+        healthy, healthy_out = _seed(s, settled_secs_ago=STALE)
+        assert cascade.run_control_map_sweep(s, _FakeLLM()) == [healthy]
+        assert _mapped(s, healthy_out)[0] == 2, "the healthy session must still be mapped"
+        assert _mapped(s, stuck_out) == (0, None), "the exhausted one is skipped, not retried"

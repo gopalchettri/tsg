@@ -39,7 +39,8 @@ END
 GO
 
 -- ---------------------------------------------------------------------------
--- Threat_Scenario_Output -> Threat_Scenario, plus the six object names reading "Output"
+-- Threat_Scenario_Output -> Threat_Scenario, plus the five object names reading
+-- "Output" that can be renamed, and the one filtered index that must be dropped
 -- ---------------------------------------------------------------------------
 -- POSITION IS LOAD-BEARING: this block MUST run before every CREATE TABLE, ADD
 -- CONSTRAINT and CREATE INDEX below. Those are guarded on the NEW names, so run
@@ -84,15 +85,32 @@ IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioOutput_SessionSubA
                    'IX_Scenario_SessionSubActive', 'INDEX';
 
 -- On Scenario_Audit, not the renamed table: "Output" here named the id it indexes.
+-- DROPPED, not renamed: this one is FILTERED (WHERE OutputID IS NOT NULL), and a
+-- filtered predicate is stored as TEXT naming its column. While it exists, the
+-- sp_rename of Scenario_Audit.OutputID below fails Msg 5074 / Msg 4922 no matter
+-- what the index is called -- renaming it first only changes which name is stuck.
+-- Section 3 recreates it on ScenarioID; same drop-then-recreate shape as the
+-- IX_ScenarioAudit_SessionSubEvent block further down. Deliberately NOT in
+-- invariants.REQUIRED_INDEXES, so nothing boot-asserts it mid-script.
 IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Output'
            AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
-    AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Scenario'
-                    AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
-    EXEC sp_rename 'dbo.Scenario_Audit.IX_ScenarioAudit_Output',
-                   'IX_ScenarioAudit_Scenario', 'INDEX';
+    DROP INDEX IX_ScenarioAudit_Output ON Scenario_Audit;
 
--- Also registered in invariants.REQUIRED_INDEXES and TSG_Verify.sql section 2 --
--- all three must carry the new name together, or the app refuses to boot.
+-- Repairs a database stuck by the failure above: that run renamed the index and
+-- then could not rename the column, leaving the NEW index name over the OLD column,
+-- a state no guard here used to match. The COL_LENGTH test fires ONLY in that state
+-- -- on a healthy database OutputID is gone, so the good index is kept. The ADD
+-- OutputID guard in Section 1 is what stops a re-run re-arming this.
+IF COL_LENGTH('dbo.Scenario_Audit', 'OutputID') IS NOT NULL
+    AND EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Scenario'
+                AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+    DROP INDEX IX_ScenarioAudit_Scenario ON Scenario_Audit;
+
+-- The only one of the three boot-asserted: invariants.REQUIRED_INDEXES pins this name
+-- (app/db/invariants.py), so a database still carrying UX_TreatmentPlan_ActiveOutput
+-- refuses to start. TSG_Verify.sql checks it too. IX_Scenario_SessionSubActive above
+-- is performance-only, and IX_ScenarioAudit_Scenario is now created fresh by Section 3
+-- rather than renamed.
 IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_TreatmentPlan_ActiveOutput'
            AND object_id = OBJECT_ID('dbo.Risk_Treatment_Plan'))
     AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_TreatmentPlan_ActiveScenario'
@@ -127,6 +145,7 @@ CREATE TABLE Scenario_Session (
     CreatedAt             datetime2      NULL,
     UpdatedAt             datetime2      NULL,
     CompletedAt           datetime2      NULL,
+    ControlMapSeconds     float          NULL,               -- seconds ACTUALLY SPENT mapping, summed over every sweep pass; NOT a span (mapping resumes across ticks 300s apart, so a span would be mostly waiting)
     CONSTRAINT CK_Session_Status CHECK (SessionStatus IN ('active', 'completed', 'cancelled'))
 );
 
@@ -144,6 +163,12 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
 IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Session', 'CancelledBy') IS NULL
     ALTER TABLE Scenario_Session ADD CancelledBy nvarchar(200) NULL;
+
+-- Control-mapping working time, for the per-step timings the status board reports.
+-- Independently guarded per column, same reason as the cancellation pair above.
+IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Scenario_Session', 'ControlMapSeconds') IS NULL
+    ALTER TABLE Scenario_Session ADD ControlMapSeconds float NULL;
 
 GO
 
@@ -180,13 +205,25 @@ CREATE TABLE Subsystem_Stage_State (
     AttemptCount     int           NOT NULL CONSTRAINT DF_SSS_AttemptCount DEFAULT 0,
     ErrorMessage     nvarchar(max) NULL,
     UpdatedAt        datetime2     NOT NULL,
-    CreatedAt datetime2 NULL CONSTRAINT DF_StageState_CreatedAt DEFAULT SYSUTCDATETIME()
+    CreatedAt datetime2 NULL CONSTRAINT DF_StageState_CreatedAt DEFAULT SYSUTCDATETIME(),
+    StartedAt        datetime2     NULL,                     -- stage span start, written by dal.claim_stage; the ONLY source of per-stage duration
+    FinishedAt       datetime2     NULL                      -- stage span end, written by dal.finish_stage. UpdatedAt cannot substitute: every lease renewal overwrites it
 );
 
 -- Adds CreatedAt for pre-2026-07-30 databases.
 IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Subsystem_Stage_State', 'CreatedAt') IS NULL
     ALTER TABLE Subsystem_Stage_State ADD CreatedAt datetime2 NULL CONSTRAINT DF_StageState_CreatedAt DEFAULT SYSUTCDATETIME();
+
+-- Per-stage timing span (threat identification / scenarios). Existing rows stay NULL: there is no
+-- historical start or finish to backfill, and the API reports NULL rather than inventing one.
+IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Subsystem_Stage_State', 'StartedAt') IS NULL
+    ALTER TABLE Subsystem_Stage_State ADD StartedAt datetime2 NULL;
+
+IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Subsystem_Stage_State', 'FinishedAt') IS NULL
+    ALTER TABLE Subsystem_Stage_State ADD FinishedAt datetime2 NULL;
 
 GO
 
@@ -213,7 +250,6 @@ CREATE TABLE Identified_Threat (
     ThreatType         nvarchar(300) NOT NULL,
     ThreatName         nvarchar(500) NULL,
     GenericName        nvarchar(500) NULL,   -- library-shaped ThreatName (no asset/product names); NULL = legacy row
-    Description        nvarchar(200) NULL,   -- AI description OF THE THREAT; copied to crm_threat_risk_register.threat_scenario on promotion
     ThreatCategoryID   int           NULL,   -- resolved category id (grounding already computes it); ThreatCategory text kept for display
     ThreatActorsJSON   nvarchar(max) NULL,
     LibraryThreatType  nvarchar(300) NULL,
@@ -291,15 +327,19 @@ IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Identified_Threat', 'GenericName') IS NULL
     ALTER TABLE Identified_Threat ADD GenericName nvarchar(500) NULL;
 
--- Description carries the AI's wording into crm_threat_risk_register.threat_scenario;
 -- ThreatCategoryID stops consumers re-deriving a category id grounding already resolved.
-IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Identified_Threat', 'Description') IS NULL
-    ALTER TABLE Identified_Threat ADD Description nvarchar(200) NULL;
-
 IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Identified_Threat', 'ThreatCategoryID') IS NULL
     ALTER TABLE Identified_Threat ADD ThreatCategoryID int NULL;
+
+-- Description DROPPED 2026-09-05 (user instruction) - the last of the three, after Threat_Type's
+-- and Threat_Catalogue's went on 2026-08-30. Nothing read it: promotion stopped copying it when
+-- Threat_Catalogue.Description went, leaving the /results payload as its only consumer, and the
+-- model is no longer asked to produce one (prompts.py). The comment this replaces was already
+-- stale - promote.py never wrote crm_threat_risk_register.threat_scenario from this column.
+-- Guarded, so re-running against an already-dropped database is a provable no-op.
+IF COL_LENGTH('dbo.Identified_Threat', 'Description') IS NOT NULL
+    ALTER TABLE Identified_Threat DROP COLUMN Description;
 
 -- The library identity (Threat_Catalogue row matched at Stage 1).
 IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NOT NULL
@@ -344,6 +384,9 @@ CREATE TABLE Threat_Scenario (
     ErrorMessage         nvarchar(max) NULL,
     CreatedAt            datetime2     NULL,
     ControlsMappedAt     datetime2     NULL,  -- Step-4 attempt stamp; NULL = not yet tried
+    ControlMapAttempts   int           NOT NULL CONSTRAINT DF_ThreatScenario_ControlMapAttempts DEFAULT 0,  -- mapping passes survived without a ControlsMappedAt stamp; >= TSG_CONTROL_MAP_MAX_ATTEMPTS permanently stops retrying (hard cutoff)
+    GenStartedAt         datetime2     NULL,  -- per-scenario generation span; duration is DERIVED (finish - start), never stored
+    GenFinishedAt        datetime2     NULL,  -- these OVERLAP across rows (generation fans out 5 at a time), so never sum them for a stage total
     -- Per-scenario review decision; NULL/NULL = pending. Nullable columns rather
     -- than a status value because Status is the GENERATION outcome and is
     -- load-bearing in the accept predicates. Mutually exclusive with Accepted=1.
@@ -356,6 +399,31 @@ IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario', 'ControlsMappedAt') IS NULL
     ALTER TABLE Threat_Scenario ADD ControlsMappedAt datetime2 NULL;
 
+-- Adds the control-mapping attempt-limit column for pre-retry-limit databases. Existing rows get
+-- ControlMapAttempts=0, i.e. a full fresh attempt budget - correct, since there is no reliable
+-- historical attempt count to backfill.
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'ControlMapAttempts') IS NULL
+    ALTER TABLE Threat_Scenario ADD ControlMapAttempts int NOT NULL
+        CONSTRAINT DF_ThreatScenario_ControlMapAttempts DEFAULT 0;
+
+-- Per-scenario generation span. Existing rows stay NULL - CreatedAt records when the row was
+-- PERSISTED (sequentially, after the whole batch finished), so it cannot be used to backfill a
+-- generation start. Guarded independently per column.
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'GenStartedAt') IS NULL
+    ALTER TABLE Threat_Scenario ADD GenStartedAt datetime2 NULL;
+
+IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'GenFinishedAt') IS NULL
+    ALTER TABLE Threat_Scenario ADD GenFinishedAt datetime2 NULL;
+
+-- Drops ControlMapLastAttemptAt for databases that picked it up from an earlier, superseded
+-- version of this fix (a backoff-lane clock that was never shipped as the final design - the
+-- limit above is a hard cutoff, not a backoff, so nothing ever read this column).
+IF COL_LENGTH('dbo.Threat_Scenario', 'ControlMapLastAttemptAt') IS NOT NULL
+    ALTER TABLE Threat_Scenario DROP COLUMN ControlMapLastAttemptAt;
+
 -- Adds ScenarioNumber for pre-2026-07-29 databases.
 IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario', 'ScenarioNumber') IS NULL
@@ -364,6 +432,7 @@ IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
 -- Adds ReplacesOutputID for pre-2026-07-30 databases. Legacy rows simply read as originals.
 IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Scenario', 'ReplacesOutputID') IS NULL
+    AND COL_LENGTH('dbo.Threat_Scenario', 'ReplacesScenarioID') IS NULL
     ALTER TABLE Threat_Scenario ADD ReplacesOutputID uniqueidentifier NULL;
 
 -- Adds the per-scenario review decision for pre-2026-08-23 databases. Legacy rows read as
@@ -409,6 +478,7 @@ IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NOT NULL
 -- correct: they were session-scoped events and belong to no single scenario.
 IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Scenario_Audit', 'OutputID') IS NULL
+    AND COL_LENGTH('dbo.Scenario_Audit', 'ScenarioID') IS NULL
     ALTER TABLE Scenario_Audit ADD OutputID uniqueidentifier NULL;
 
 -- The PLAN a treatment event concerns. A real column, not a DetailJSON key,
@@ -521,9 +591,11 @@ IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
 -- OutputID -> ScenarioID. The column identifies a SCENARIO; "output" named the
 -- table it happened to live in, not the thing itself.
 --
--- sp_rename keeps the data in place, and INDEXES FOLLOW AUTOMATICALLY -- SQL
--- Server stores index key references by column ID. The index NAMES are renamed by
--- the guarded block at the top of this file.
+-- sp_rename keeps the data in place, and index KEY references follow automatically
+-- -- SQL Server stores those by column ID. A FILTERED index does NOT follow: its
+-- predicate is stored as text naming the column, so it blocks the rename outright
+-- (Msg 5074) and has to be dropped first. The block at the top of this file renames
+-- the index names that can be renamed and drops the one filtered index that cannot.
 --
 -- Guarded BOTH ways on every table: runs once, no-op afterwards, and on a fresh
 -- install the CREATE TABLEs already declare ScenarioID. Order-independent -- each

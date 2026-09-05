@@ -35,7 +35,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.enums import ScenarioStatus, StageStatus, SubsystemLevel
 from app.db import models as m
-from app.pipeline import control_mapping, tasks, threat_retrieval
+from app.pipeline import control_mapping, tasks, threat_identification, threat_retrieval
 
 S, T, R = "Spoofing", "Tampering", "Repudiation"
 INFO, D, E = "Information Disclosure", "Denial of Service", "Elevation of Privilege"
@@ -137,14 +137,16 @@ def test_cold_start_find_threats_generates_everything_unverified(monkeypatch):
     with Session() as s:
         _seed_stage(s, sid)
 
-    monkeypatch.setattr(tasks, "_send_live_update", lambda *a, **k: None)  # no Redis
+    # Stage 1 lives in threat_identification now (structure pass) — patch the module that
+    # actually resolves these names at call time, not tasks' re-export.
+    monkeypatch.setattr(threat_identification, "_send_live_update", lambda *a, **k: None)  # no Redis
     ask_stages = []
 
     def fake_ask_ai(sess, llm, messages, **kw):
         ask_stages.append(kw.get("stage"))
         return list(_PROPOSALS), None
 
-    monkeypatch.setattr(tasks, "_ask_ai", fake_ask_ai)
+    monkeypatch.setattr(threat_identification, "_ask_ai", fake_ask_ai)
 
     with Session() as s:
         threats, _prov = tasks.find_threats(
@@ -379,6 +381,21 @@ def test_session_is_ot_matches_by_parenthetical_when_code_is_missing():
     assert _is_ot(engine, 50) is True
 
 
+def test_session_category_codes_reads_name_even_when_code_is_nonstandard():
+    """The "(OT)" name marker counts regardless of the code — a row coded OT_LEGACY but named
+    "Operational Technology (OT)" is still OT. session_is_ot always read the name; the codes
+    helper must not be narrower than it was."""
+    engine = create_engine("sqlite://")
+    m.ctm_scan_category.__table__.create(engine)
+    with sessionmaker(engine)() as s:
+        s.execute(m.ctm_scan_category.__table__.insert().values(
+            id=51, code="OT_LEGACY", name="Operational Technology (OT)"))
+        s.commit()
+    assert _is_ot(engine, 51) is True
+    with sessionmaker(engine)() as s:
+        assert control_mapping.session_category_codes(s, [], {"asset_type_id": 51}) == {"OT_LEGACY", "OT"}
+
+
 def test_session_is_ot_false_when_no_category_ids_resolve():
     engine = _control_engine(controls=[], categories=_CATS)
     with sessionmaker(engine)() as s:
@@ -386,29 +403,36 @@ def test_session_is_ot_false_when_no_category_ids_resolve():
 
 
 def test_intel_vocabulary_is_ot_uses_session_is_ot():
-    """tasks._intel_vocabulary's is_ot flag is exactly control_mapping.session_is_ot's
-    answer now — DB-driven, not the old free-text itot_family() guess on asset_type."""
+    """tasks._intel_vocabulary's categories come from control_mapping.session_category_codes —
+    DB-driven, not the old free-text itot_family() guess on asset_type. One OT subsystem is
+    enough for the OT code to be present (and so for ICS advisories to be drawn first)."""
     engine = _control_engine(controls=[], categories=_CATS)
     with sessionmaker(engine)() as s:
-        terms, is_ot = tasks._intel_vocabulary(
+        terms = tasks._intel_vocabulary(
             s, [{"asset_type_id": OT_CAT, "technology_used": ["Siemens SCADA"]}],
             {"asset_type_id": IT_CAT, "asset_type": "Custom Application"})
-    assert is_ot is True
-    assert "Siemens SCADA" in terms
+    assert "OT" in terms.categories and "IT" in terms.categories
+    assert "Siemens SCADA" in terms.product
+    assert "Custom Application" not in terms.product     # asset_type is a label, not a product
 
 
-def test_intel_vocabulary_includes_the_2026_08_27_added_subsystem_fields():
-    """targeted_users/accessability_channel/hosting_location/managed_by joined
-    _INTEL_TECH_FIELDS on 2026-08-27, kept in sync with scenario_profile/threat_retrieval's
-    field lists — each must now contribute an intel search term."""
+def test_intel_vocabulary_management_labels_are_not_product_terms(monkeypatch):
+    """targeted_users/accessability_channel/hosting_location/managed_by were search terms from
+    2026-08-27 to 2026-09-02; values like "Outsourced" or "Cloud" are management labels that
+    only ever matched noise, so they were dropped from _INTEL_TECH_FIELDS. Sector fields go to
+    the structured `scope` side, never to the regex `product` side."""
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "intel_home_country", "")   # the local .env may set one
     engine = _control_engine(controls=[], categories=_CATS)
     sub = {"asset_type_id": IT_CAT, "targeted_users": ["Remote vendors"],
            "accessability_channel": "Internet-facing", "hosting_location": "Cloud",
-           "managed_by": "Outsourced"}
+           "managed_by": "Outsourced", "database_platforms": ["Oracle"]}
     with sessionmaker(engine)() as s:
-        terms, _is_ot = tasks._intel_vocabulary(s, [sub], {"asset_type_id": IT_CAT})
-    for term in ("Remote vendors", "Internet-facing", "Cloud", "Outsourced"):
-        assert term in terms
+        terms = tasks._intel_vocabulary(s, [sub], {"asset_type_id": IT_CAT, "sector": "Energy"})
+    assert terms.product == ["Oracle"]
+    assert terms.scope == ["sector:energy"]
+    assert terms.categories == {"IT"}
 
 
 if __name__ == "__main__":

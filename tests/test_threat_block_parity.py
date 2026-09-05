@@ -54,9 +54,11 @@ def test_all_scenario_reads_select_the_one_shared_threat_column_list():
     ssrc = (_ROOT / "app" / "api" / "sessions.py").read_text(encoding="utf-8")
     assert "*dal.scenario_threat_columns()," in ssrc
     # And the list carries the catalogue-model fields; the register-era columns are gone.
-    assert {"ThreatCatalogueID", "ThreatCategoryID", "Description",
+    assert {"ThreatCatalogueID", "ThreatCategoryID",
             "IsThreatAIGenerated"} <= canonical
-    assert not {"ThemeID", "AssetTypeID"} & canonical
+    # Description joined ThemeID/AssetTypeID as a removed column on 2026-09-05: the last of
+    # the three threat descriptions, and the shared list must not quietly re-acquire it.
+    assert not {"ThemeID", "AssetTypeID", "Description"} & canonical
 
 
 def _gr(catalogue_id=None):
@@ -74,7 +76,7 @@ def _record(gr):
     row, summary = tasks._build_threat_records(
         str(uuid.uuid4()), str(uuid.uuid4()), "t", 0, "Tampering type", "Tampering",
         "Setpoint change", gr, "e", "u", generic_name="Setpoint change",
-        description="An attacker alters setpoints.", category_id=6)
+        category_id=6)
     return row, summary
 
 

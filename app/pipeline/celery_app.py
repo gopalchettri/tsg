@@ -30,9 +30,11 @@ from celery.signals import (  # type: ignore[import-untyped]
 )
 
 from app.api.admin_jobs import (
+    FAMILY_INTEL,
     emb_job_channel_key,
     grounding_job_channel_key,
     intel_job_channel_key,
+    mark_admin_job,
 )
 from app.core.config import get_settings
 from app.core.enums import (
@@ -42,18 +44,20 @@ from app.core.enums import (
     StageStatus,
     TreatmentOutcomeReason,
 )
-from app.core.logging import configure_logging
+from app.core.logging import configure_logging, get_logger
 from app.db import dal
 from app.db.dal import guid
 from app.db.engine import db_session
 from app.pipeline import cascade, embeddings, grounding, treatment
 from app.pipeline.llm import LLMSlotUnavailable, get_llm
+from app.pipeline.pipeline_common import TRANSIENT_INFRA_ERRORS
 from app.pipeline.reaper import clean_up_abandoned_sessions
 from app.pipeline.selfcheck import run_self_checks
 from app.pipeline.tasks import _process_all_supporting_systems
 from app.sse import bus
 
 _s = get_settings()
+log = get_logger(__name__)
 
 # Bounded retry for _init_worker's verify_litellm_models() call — see its own comment below.
 # Lives in Settings.llm_verify_max_attempts / Settings.llm_verify_retry_backoff_seconds now
@@ -120,9 +124,13 @@ celery_app.conf.update(
         "map-controls-sweep": {"task": "tsg.map_controls_sweep",
                             "schedule": _s.control_map_sweep_interval_seconds},
         "operational-self-check": {"task": "tsg.self_check", "schedule": _s.self_check_interval_seconds},
-        # threat-intel refresh is deliberately NOT scheduled here — it is admin-triggered only
-        # via POST /v1/tsg/threat-intel/feeds/refresh and .../feeds/{feed}/refresh (see
-        # threat_intel.py::_dispatch), same posture as calibrate_grounding_task.
+        # threat-intel refresh is scheduled ONLY when TSG_INTEL_REFRESH_INTERVAL_SECONDS > 0
+        # (SDD §33: configured source refresh runs on a scheduler). At 0 — the default — it stays
+        # admin-triggered via POST /v1/tsg/threat-intel/feeds/refresh. Either path fans out
+        # through dispatch_refresh below, so beat and the API label and track jobs identically.
+        **({"intel-refresh": {"task": "tsg.intel_refresh_all",
+                              "schedule": _s.intel_refresh_interval_seconds}}
+           if _s.intel_refresh_interval_seconds > 0 else {}),
     },
 )
 
@@ -444,14 +452,16 @@ def _clear_task_context(**_kw) -> None:
 
 
 @celery_app.task(bind=True, name="tsg.run_pipeline",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None)
+                autoretry_for=(LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS),
+                retry_backoff=True, max_retries=None)
 def run_pipeline_task(self, session_id: str) -> None:
     """Runs the whole pipeline for one session; queued by the API on session creation.
     `self.request.id` is the run id stamped into each claimed stage, so the CAS can tell an
     acks_late redelivery from a fresh run.
 
-    `autoretry_for=(LLMSlotUnavailable,)`: a slot shortage is temporary and the retry resumes via
-    claim_stage's CAS. `max_retries=None` — AttemptCount's poison-terminal cap is the real ceiling.
+    `autoretry_for`: a slot shortage or a transient DB error (TRANSIENT_INFRA_ERRORS —
+    deadlock, connection reset) is temporary and the retry resumes via claim_stage's CAS.
+    `max_retries=None` — AttemptCount's poison-terminal cap is the real ceiling.
     """
     with db_session() as sess:
         _process_all_supporting_systems(sess, session_id, get_llm(), self.request.id or guid())
@@ -464,7 +474,8 @@ def run_pipeline_task(self, session_id: str) -> None:
 # raises INSIDE the greenlet, so cascade._subsystem_lock's `finally` runs and the lock is released
 # properly; the hard limit is only the backstop if the soft signal is ignored.
 @celery_app.task(bind=True, name="tsg.regenerate",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None,
+                autoretry_for=(LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS),
+                retry_backoff=True, max_retries=None,
                 soft_time_limit=_s.subsystem_task_soft_limit_seconds,
                 time_limit=_s.subsystem_task_hard_limit_seconds)
 def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
@@ -484,7 +495,8 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
 # task that hung in the field: it settled its SCENARIOS stage, then stopped without releasing the
 # `_LOCK` or finalising the session, and nothing forced it out for the rest of the worker's life.
 @celery_app.task(bind=True, name="tsg.next_set",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True, max_retries=None,
+                autoretry_for=(LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS),
+                retry_backoff=True, max_retries=None,
                 soft_time_limit=_s.subsystem_task_soft_limit_seconds,
                 time_limit=_s.subsystem_task_hard_limit_seconds)
 def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_epoch: int) -> None:
@@ -505,33 +517,42 @@ def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_
 # AttemptCount column, so `max_retries=None` here had no ceiling at all — PlanID fences DUPLICATES,
 # it does not count attempts. A sustained provider 429 retried forever and pinned the row RUNNING.
 @celery_app.task(bind=True, name="tsg.generate_treatment_plan",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True,
+                autoretry_for=(LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS), retry_backoff=True,
                 max_retries=_s.admin_embedding_max_retries)
 def generate_treatment_plan_task(self, plan_id: str) -> None:
     """One Risk Treatment Plan attempt (docs/RISK_TREATMENT_PLAN_SDD.md §6.2); queued after the
     RUNNING row is committed. A retry (same task id) resumes via claim_plan's own-task branch, so
-    a slot-exhausted attempt never wedges the row. No epoch — plan rows are never reused
-    (regenerate = supersede + new row), so PlanID itself is the fence.
+    a slot-exhausted OR transient-infra-interrupted attempt never wedges the row. No epoch — plan
+    rows are never reused (regenerate = supersede + new row), so PlanID itself is the fence.
 
     The EXHAUSTED attempt parks the row terminally. Bounding the retries alone would only trade
     "retries forever" for "stuck in RUNNING forever, silently" — worse, because the retry traffic
     that would make someone look disappears. Same discrimination as calibrate_grounding_task:
-    re-raise while attempts remain, close the row on the last one."""
+    re-raise while attempts remain, close the row on the last one. Both exhaustion branches use
+    TreatmentOutcomeReason.generation_failed ("retryable as-is") — NEVER timed_out, which
+    api.treatment._present_status computes only as a read-time projection over a still-RUNNING
+    row with a stalled clock; a row this branch closes is already ERROR, so writing timed_out
+    here would persist a value the column's own contract says has no writer."""
     task_id = self.request.id or guid()  # ONE value: finish_plan's CAS is fenced on ActiveTaskID,
     #                                      which claim_plan committed under this exact id
     try:
         with db_session() as sess:
             treatment.run_treatment_generation(sess, plan_id, get_llm(), task_id)
-    except LLMSlotUnavailable:
+    except (LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS) as exc:
         if self.request.retries < self.max_retries:
             raise  # attempts remain — autoretry_for backs off and re-runs
+        transient = isinstance(exc, TRANSIENT_INFRA_ERRORS)
+        message = ("a database issue interrupted every attempt — regenerate the plan "
+                "(POST .../treatment-plan/regenerate)" if transient else
+                "the AI service stayed busy for every attempt — regenerate the plan "
+                "(POST .../treatment-plan/regenerate)")
         with db_session() as sess:
             dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=task_id,
-                            error_message="the AI service stayed busy for every attempt — "
-                                        "regenerate the plan (POST .../treatment-plan/regenerate)",
-                            error_reason=TreatmentOutcomeReason.timed_out)
+                            error_message=message,
+                            error_reason=TreatmentOutcomeReason.generation_failed)
         from app.core.logging import get_logger  # module idiom: no module-level logger here
-        get_logger(__name__).error("treatment.slot_retries_exhausted", plan_id=plan_id,
+        get_logger(__name__).error("treatment.retries_exhausted", plan_id=plan_id,
+                                transient_infra=transient, error_class=type(exc).__name__,
                                 retries=self.request.retries, exc_info=True)
         raise
 
@@ -700,9 +721,50 @@ def intel_refresh_feed_task(self, feed: str) -> int:
     return count
 
 
+def dispatch_refresh(feeds: list[str], user_id: str | None) -> dict[str, str]:
+    """Queue one intel_refresh_feed job per feed — THE fan-out, shared by the admin API
+    (threat_intel._dispatch) and intel_refresh_all_task so both paths label and track jobs
+    identically. One job per feed rather than one job for all, so a slow or broken feed can
+    neither delay nor fail the others. No entity_id in the shadow label: cross-tenant by
+    design. Returns feed -> job id."""
+    jobs: dict[str, str] = {}
+    for feed in feeds:
+        task = intel_refresh_feed_task.apply_async(args=(feed,), shadow=(
+            f"intel-refresh: {feed} · by {user_id} · {dal.now():%Y-%m-%d %H:%M} UTC"))
+        mark_admin_job(task.id, FAMILY_INTEL, f"intel-refresh: {feed}", user_id)  # best-effort — see admin_jobs.mark_admin_job
+        jobs[feed] = task.id
+    return jobs
+
+
+@celery_app.task(name="tsg.intel_refresh_all")
+def intel_refresh_all_task() -> dict[str, str]:
+    """Beat entry point (TSG_INTEL_REFRESH_INTERVAL_SECONDS > 0): refresh every enabled feed
+    exactly as the admin route does. Cheap — it only enqueues; the per-feed jobs do the work."""
+    from app.intel.fetchers import enabled_feed_names
+
+    jobs = dispatch_refresh(enabled_feed_names(), user_id="beat")
+    log.info("intel.scheduled_refresh_dispatched", jobs=jobs)
+    return jobs
+
+
 @celery_app.task(name="tsg.self_check")
 def self_check_task() -> list[str]:
     """Periodic operational self-check (tempdb growth, pool saturation, active-session ceiling);
-    scheduled by `beat_schedule` above. run_self_checks() already logs every check that fires."""
+    scheduled by `beat_schedule` above. run_self_checks() already logs every check that fires.
+    Also the SDD SOURCE_STALE signal for live intel: an enabled feed with no successful refresh
+    inside TSG_INTEL_STALE_AFTER_SECONDS is logged so monitoring can alert on it."""
     with db_session() as sess:
-        return run_self_checks(sess)
+        fired = run_self_checks(sess)
+    try:
+        from app.intel.fetchers import feed_status
+
+        for f in feed_status():
+            if f["stale"]:
+                last_ok = f["last_success_at"]
+                log.warning("intel.feed_stale", feed=f["feed"],
+                            last_success_at=last_ok.isoformat() if last_ok else None,
+                            last_error=f["last_error"])
+                fired.append(f"intel.feed_stale:{f['feed']}")
+    except Exception:  # a self-check never breaks the self-check
+        log.warning("intel.stale_check_failed", exc_info=True)
+    return fired

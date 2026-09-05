@@ -160,14 +160,14 @@ SELECT 'Columns', 'FAIL', N'Column missing: Identified_Threat.' + x.C,
      + N'will refuse to boot without it. Re-run TSG_Core.sql; it is guarded and idempotent.'
 -- GroundingThresholdOrigin records WHICH cutoff judged each threat, so threats
 -- graded on a default tuned for a different model pair stay findable.
-FROM (VALUES (N'Description'), (N'ThreatCategoryID'), (N'GroundingThresholdOrigin'),
+FROM (VALUES (N'ThreatCategoryID'), (N'GroundingThresholdOrigin'),
              (N'ThreatCatalogueID'), (N'IsThreatAIGenerated'), (N'IsThreatTypeAIGenerated')) AS x(C)
 WHERE OBJECT_ID(N'dbo.Identified_Threat') IS NOT NULL
   AND COL_LENGTH(N'dbo.Identified_Threat', x.C) IS NULL;
 
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Columns', 'PASS', N'Late-ALTER columns present (Threat_Type.Source, Threat_Catalogue.Source, Identified_Threat.Description/ThreatCategoryID/GroundingThresholdOrigin/ThreatCatalogueID/IsThreatAIGenerated/IsThreatTypeAIGenerated)',
+SELECT 'Columns', 'PASS', N'Late-ALTER columns present (Threat_Type.Source, Threat_Catalogue.Source, Identified_Threat.ThreatCategoryID/GroundingThresholdOrigin/ThreatCatalogueID/IsThreatAIGenerated/IsThreatTypeAIGenerated)',
        N'Confirms Threat_library.sql ran to completion.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Columns');
 

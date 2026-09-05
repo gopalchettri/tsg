@@ -106,6 +106,7 @@ Sent exactly once per connect/reconnect, **before** any live event, as the full 
     "threats": "COMPLETE", "scenarios": "COMPLETE", "controls": "COMPLETE",
     "overall": "awaiting_review",
     "error_message": {},
+    "timings": {"threats": 34.21, "scenarios": 42.03, "controls": 604.12},
     "last_next_set": {"outcome": "partial_retryable", "requested": 5, "delivered": 3,
                     "variants": 0, "reason": null, "epoch": 4},
     "last_regen": null
@@ -433,7 +434,7 @@ section 6: a typed client reading the old names fails to parse rather than silen
 | Model | Was | Now |
 |---|---|---|
 | `ThreatResult` | `threat_id`, `threat_type`, `threat_name`, `grounding_status`, `threat_catalogue_id`, `threat_actors`, `grounding_score`, `score`, `scope_rank` | `ThreatID`, `ThreatType`, `ThreatName`, `GroundingStatus`, `ThreatCatalogueID`, `Actors` (keyed refs), `GroundingScore`, `Score`, `ScopeRank` |
-| `ThreatResult` | — | **new:** `ThreatCategory`, `ThreatCategoryID`, `Description`, `ThreatTypeID`, `LibraryThreatType`, `LibraryThreatName`, `IsAIGenerated` |
+| `ThreatResult` | — | **new:** `ThreatCategory`, `ThreatCategoryID`, `ThreatTypeID`, `LibraryThreatType`, `LibraryThreatName`, `IsAIGenerated` (`Description` was added here and removed again on 2026-09-05 with its column) |
 | `MappedControl` | `control_library_id`, `control_code`, `domain`, `control_name`, `rank`, `score`, `standards` | `ControlLibraryID`, `ControlCode`, `Domain`, `ControlName`, `MapRank`, `Score`, `StandardNames` |
 | `ScenarioResult` | `scenario_id`, `threat_id`, `accepted`, `generation_epoch`, `scenario_number`, `controls_mapped` | `OutputID`, `ThreatID`, `Accepted`, `GenerationEpoch`, `ScenarioNumber`, `ControlsMapped` |
 | `AcceptedScenario` / `ScenarioListItem` | `scenario_id`, `supporting_system_id`, `threat_type_id`, `threat_catalogue_id`, `threat_type`, `threat_name`, `threat_actors`, `scenario_number`, `accepted`, `superseded`, `created_at` | `OutputID`, `SubsystemID`, `ThreatTypeID`, `ThreatCatalogueID`, `ThreatType`, `ThreatName`, `ThreatActors`, `ScenarioNumber`, `Accepted`, `Superseded`, `CreatedAt` |
@@ -589,3 +590,40 @@ were compensating for that skew client-side, remove the compensation.
 `GET /v1/sessions/{session_id}/results.xlsx` is deleted. It raised a 500 on any scenario whose model
 emitted an object where prose was expected (the narrative block passes model-authored content
 through verbatim by design), and one such scenario killed the whole download rather than one row.
+
+---
+
+## 11. `progress.timings` — ADDITIVE: seconds per step
+
+New key inside `progress`, on both `GET /v1/sessions/{session_id}` and every `reconcile` event.
+Like `coverage` (§9) it breaks nothing: a client that ignores it behaves exactly as before.
+
+```json
+"timings": { "threats": 34.21, "scenarios": 42.03, "controls": 604.12 }
+```
+
+`null` on sessions that ran before timings were recorded. A step is **absent until it has
+finished** — a missing key means "not measured", never zero — so during a regenerate the
+`scenarios` key disappears and comes back when the new attempt completes.
+
+**What the three numbers are.**
+
+| key | what it measures | how |
+|---|---|---|
+| `threats` | threat identification, wall clock | `FinishedAt − StartedAt` on the stage row |
+| `scenarios` | scenario generation, wall clock | same; the stage row closes **before** control mapping starts, so the two never overlap |
+| `controls` | control mapping, **working seconds summed across passes** | not a span: mapping resumes across background sweeps minutes apart, and a start-to-finish span would report mostly waiting |
+
+Durations are derived from stored timestamps at read time and never stored themselves, so no
+two published numbers can drift apart. A span that would come out negative (a stale stamp, or
+two workers' clocks after a retry) is withheld and logged as `progress.negative_stage_span`.
+
+**There is deliberately no scenario total.** Scenarios generate several at a time, so the
+per-scenario numbers overlap; adding them up would contradict `scenarios`. Per scenario,
+`/results` carries `gen_started_at`, `gen_finished_at` and `gen_seconds` — for failed scenarios
+too — so the overlap is visible in the data rather than explained in a caveat. Use
+`scenarios` for how long the stage took and `gen_seconds` to find which scenario was slow.
+
+**Durable mirror:** the stamps live on `Subsystem_Stage_State` / `Threat_Scenario` /
+`Scenario_Session` and are what the poll reads; no dedicated SSE event announces them — re-read
+the board (or reconnect, which sends `reconcile`) after the relevant `stage_completed`.

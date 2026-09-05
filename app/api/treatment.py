@@ -39,6 +39,7 @@ from app.api.schemas import (
     TreatmentPlanProgress,
     TreatmentPlanRegenerateBody,
     TreatmentPlanStatus,
+    TreatmentPlanStatusSummary,
     TreatmentRegisterPage,
     TreatmentRegisterRow,
     TreatmentReviewBody,
@@ -114,6 +115,15 @@ def _conflict(reason: TreatmentGateReason) -> treatment.TreatmentConflict:
 #: would have it silently trimmed away by a list nobody remembered to update. One declaration now.
 #: (The AI's own schema was narrowed to exactly this set; see prompts.treatment_prompt.)
 _VISIBLE_PLAN_KEYS = tuple(TreatmentPlanDocument.model_fields)
+
+#: The VERSION-INDEPENDENT columns of a plan row: they hang off ScenarioID, so every version of
+#: one plan carries the identical values. dal.superseded_plan_rows deliberately does not re-haul
+#: them per history row (multi-KB ScenarioJSON, N times, for zero new information) — the routes
+#: overlay the active row's single copy onto each history row instead. DERIVED from the same
+#: dal.scenario_threat_columns() the selects unpack, never restated: a hand-copied name list that
+#: silently stops matching its query is exactly the drift that left history rows blank.
+_SCENARIO_ECHO_KEYS = ("ScenarioJSON", "Score", "ScopeRank",
+                       *(c.key for c in dal.scenario_threat_columns()))
 
 
 def enqueue_treatment_plan(plan_id: str, entity_id: str, user_id: str | None) -> None:
@@ -298,6 +308,47 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
                                 scenario_id=scn["ScenarioID"], status=str(StageStatus.RUNNING))
 
 
+@router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/status",
+            response_model=TreatmentPlanStatusSummary,
+            summary="Remediation plan status (cheap poll)")
+def get_treatment_plan_status(session_id: str, scenario_id: str,
+                            principal: Principal = Depends(get_principal)
+                            ) -> TreatmentPlanStatusSummary:
+    """One scenario's remediation lifecycle — the plan-side counterpart of
+    GET /v1/sessions/{session_id}.
+
+    Answers "where is this plan" and nothing else: no plan content, no scenario, no threat. Poll
+    this on a timer while a plan generates; call GET .../treatment-plan once it is COMPLETE to
+    fetch the plan itself. The split is the point — that endpoint returns the whole PlanJSON,
+    which is tens of KB a poller re-downloads on every tick for three strings it actually reads.
+
+    Switch on `progress.overall`: pending -> Generate, generating -> spinner, awaiting_review ->
+    Review, rejected -> Regenerate, approved -> done, error -> Retry. It is folded by the SAME
+    function the session board uses, so this and GET /v1/sessions/{id}/treatment-plans can never
+    disagree about one plan.
+
+    404 when no plan has ever been requested for this scenario — that is the `pending` state,
+    and it is why `pending` never appears in a 200 here. A stale RUNNING row is PRESENTED as
+    ERROR/timed-out exactly as the full GET does; the stored Status is not rewritten.
+    """
+    with db_session() as sess:
+        get_authorized_session(sess, session_id, principal)
+        row = dal.plan_status_row(sess, session_id, scenario_id)
+        if row is None:
+            raise dal.NotFoundError("no treatment plan has been requested for this scenario")
+        status, err, reason = _present_status(row["Status"], row["ErrorMessage"],
+                                            row["UpdatedAt"], treatment._stale_cutoff(),
+                                            row["ErrorReason"])
+        return TreatmentPlanStatusSummary(
+            session_id=row["SessionID"], scenario_id=row["ScenarioID"], plan_id=row["PlanID"],
+            progress=_progress_of([(row["PlanID"], status, row["ReviewStatus"])]),
+            status=status, review_status=row["ReviewStatus"], reviewed_by=row["ReviewedBy"],
+            reviewed_at=row["ReviewedAt"], created_by=row["UserID"],
+            error_message=err, reason=reason,
+            created_at=row["CreatedAt"], updated_at=row["UpdatedAt"],
+            completed_at=row["CompletedAt"])
+
+
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan",
             response_model=TreatmentPlanStatus)
 def get_treatment_plan(session_id: str, scenario_id: str,
@@ -311,10 +362,13 @@ def get_treatment_plan(session_id: str, scenario_id: str,
 
     ?include_superseded=true additionally serves the regeneration history: the same top-level
     response (the current plan) plus `superseded` — every replaced version, newest first,
-    rendered by the same presenter (same trim, same staleness projection). History items carry
-    scenario=null: the scenario hangs off the scenario_id, identical for every version, so it is
-    served once on the top level instead of N+1 times. Default off keeps the hot polling
-    path's single-row query untouched.
+    rendered by the same presenter (same trim, same staleness projection). Every history item is
+    a FULL entry: its own plan, review verdict, created_by, cancelled_*, warnings and
+    moderation_flagged, plus the scenario/threat/actors/controls blocks — those four are
+    version-independent, so they are read ONCE for the active row and overlaid onto each history
+    item rather than re-queried per version. Only `progress` is null on them: a retired version
+    is history, not a live lifecycle. Default off keeps the hot polling path's single-row
+    query untouched.
 
     POLLING IS THE CONTRACT. The worker also emits an advisory `treatment_plan_result` on the
     session's SSE stream (GET /v1/sessions/{id}/events) so a client can refetch immediately, but
@@ -340,23 +394,39 @@ def get_treatment_plan(session_id: str, scenario_id: str,
         controls = _ctl.by_output.get(scenario_id, [])
         older = None
         if include_superseded:
+            # History rows carry no scenario/threat join — the scenario is version-independent,
+            # so overlay the ACTIVE row's single copy rather than re-selecting the same multi-KB
+            # blob once per version. The history row's own keys win (`{**echo, **r}`), so its
+            # per-version fields — created_by, cancelled_*, warnings, moderation_flagged — are
+            # never clobbered by the current version's. `controls` is the list already read
+            # above: same scenario, so the same controls, at no extra query.
+            echo = {k: row[k] for k in _SCENARIO_ECHO_KEYS if k in row}
             # PlanID guard: two SELECTs under READ COMMITTED — a regeneration committing
             # between them would supersede the row just read as current, making it show up in
             # BOTH places on one response. Dropping it here keeps the reply self-consistent.
-            # History rows carry no scenario/threat join, so their blocks are null/[] by
-            # construction — the scenario is version-independent and served once, on the
-            # top-level object below.
-            older = [_plan_status_from_row(r, stale_cutoff, actor_ids)
+            older = [_plan_status_from_row({**echo, **r}, stale_cutoff, actor_ids, controls,
+                                           superseded_row=True)
                     for r in dal.superseded_plan_rows(sess, session_id, scenario_id)
                     if r["PlanID"] != row["PlanID"]]
         return _plan_status_from_row(row, stale_cutoff, actor_ids, controls, superseded=older)
 
 
 def _board_progress(plans: list[TreatmentBoardRow]) -> TreatmentPlanProgress:
-    """Fold the board's rows into REMEDIATION's own two stages plus a rolled-up status.
+    """The board's rows -> the shared fold. Thin adapter; the logic lives in _progress_of."""
+    return _progress_of([(p.plan_id, p.status, p.review_status) for p in plans])
 
-    A PURE function over rows the route already built, so it costs no query and needs no
-    database to test. It reads the PRESENTED status, not the stored one: _present_status
+
+def _progress_of(rows: list[tuple[str | None, str | None, str | None]]) -> TreatmentPlanProgress:
+    """Fold (plan_id, status, review_status) triples into REMEDIATION's own two stages plus a
+    rolled-up lifecycle status.
+
+    ONE fold for BOTH endpoints — the session board (many scenarios) and the single-plan GET
+    (a list of one). Triples rather than a model type because the two callers build different
+    response objects; duplicating the priority order into each is exactly how two screens end up
+    disagreeing about the same plan.
+
+    PURE, so it costs no query and needs no database to test. It reads the PRESENTED status,
+    not the stored one: _present_status
     projects a stale RUNNING to ERROR before the row is built, and folding
     Risk_Treatment_Plan.Status directly would report a dead plan as generating forever.
 
@@ -369,12 +439,12 @@ def _board_progress(plans: list[TreatmentBoardRow]) -> TreatmentPlanProgress:
     outstanding, and reporting generation COMPLETE while a scenario has nothing would tell a UI
     to stop offering Generate.
     """
-    total = len(plans)
-    requested = [p for p in plans if p.plan_id is not None and p.status is not None]
-    errored = [p for p in requested if p.status == str(StageStatus.ERROR)]
-    running = [p for p in requested if p.status == str(StageStatus.RUNNING)]
-    generated = [p for p in requested if p.status == str(StageStatus.COMPLETE)]
-    undecided = [p for p in generated if p.review_status not in
+    total = len(rows)
+    requested = [r for r in rows if r[0] is not None and r[1] is not None]
+    errored = [r for r in requested if r[1] == str(StageStatus.ERROR)]
+    running = [r for r in requested if r[1] == str(StageStatus.RUNNING)]
+    generated = [r for r in requested if r[1] == str(StageStatus.COMPLETE)]
+    undecided = [r for r in generated if r[2] not in
                  (str(TreatmentReviewStatus.approved), str(TreatmentReviewStatus.rejected))]
 
     if errored:
@@ -405,7 +475,7 @@ def _board_progress(plans: list[TreatmentBoardRow]) -> TreatmentPlanProgress:
         overall = TreatmentProgress.generating
     elif undecided:
         overall = TreatmentProgress.awaiting_review
-    elif any(p.review_status == str(TreatmentReviewStatus.rejected) for p in generated):
+    elif any(r[2] == str(TreatmentReviewStatus.rejected) for r in generated):
         # Everyone has decided and someone said no. NOT terminal: regenerate operates on the
         # active version whatever its verdict, so this is work still outstanding — folding it
         # into `approved` would hide the one state that needs a person to act.
@@ -418,6 +488,7 @@ def _board_progress(plans: list[TreatmentBoardRow]) -> TreatmentPlanProgress:
 def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
                           actor_ids: dict[str, int] | None = None,
                           controls: list | None = None,
+                          superseded_row: bool = False,
                         superseded: list[TreatmentPlanStatus] | None = None) -> TreatmentPlanStatus:
     """One plan row -> the wire model. Shared by the single-plan GET, the Excel export, the
     versions history (?include_superseded) and the detailed register (?include_plan), so no
@@ -432,8 +503,10 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
         row["Status"], row["ErrorMessage"], row["UpdatedAt"], stale_cutoff, row["ErrorReason"])
 
     plan = _visible_plan(row["PlanJSON"], row["PlanID"])
-    # .get, not []: history rows (dal.superseded_plan_rows) carry no scenario/threat join —
-    # the scenario is version-independent, served once on the top-level object.
+    # .get, not []: not every feeding select carries these. History rows (superseded_plan_rows)
+    # have no scenario/threat join of their own — the single-plan GET overlays the active row's
+    # copy before calling in, but the board does not, and a missing column must publish null
+    # rather than KeyError the whole response.
     # THE SAME BUILDER /results USES, not a narrower local copy. This used to whitelist six
     # keys, so a reviewer approving a remediation plan saw strictly LESS about the scenario than
     # the results screen showed — no assumptions, no supporting_systems_involved, no threat ids.
@@ -445,6 +518,12 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
     return TreatmentPlanStatus(
         plan_id=row["PlanID"], session_id=row["SessionID"], scenario_id=row["ScenarioID"],
         status=status, treatment_strategy=row["TreatmentStrategy"],
+        # THE SAME fold the board uses, over a list of one — so the per-scenario screen and the
+        # board cannot report different lifecycle states for the same plan. `superseded` is the
+        # one exception: a retired version is history, not a live lifecycle, and the caller
+        # passes is_superseded=True to null it out.
+        progress=(None if superseded_row
+                  else _progress_of([(row["PlanID"], status, row["ReviewStatus"])])),
         scenario=scenario,
         # SIBLINGS of `scenario`, never inside it — the same four-block shape /results publishes
         # (scenario / threat / actors / controls). Every one of these reads the row with .get()
@@ -593,7 +672,7 @@ def get_treatment_board(session_id: str,
         if include_superseded:
             for h in dal.superseded_plan_rows(sess, session_id):
                 history.setdefault(h["ScenarioID"], []).append(
-                    _plan_status_from_row(h, stale_cutoff, actor_ids))
+                    _plan_status_from_row(h, stale_cutoff, actor_ids, superseded_row=True))
         plans = []
         for r in rows:
             # All three default to None together: a scenario with no plan yet leaves every one
@@ -663,9 +742,11 @@ def post_cancel_treatment_plan(session_id: str, scenario_id: str,
             response_model=TreatmentReviewResponse, responses=_CONFLICT_RESPONSES)
 def post_review_treatment_plan(session_id: str, scenario_id: str, body: TreatmentReviewBody,
                             principal: Principal = Depends(get_principal)) -> TreatmentReviewResponse:
-    """Record the human adoption decision. Default (no plan_id, or the active plan's id): the
-    verdict lands on the ACTIVE, COMPLETE plan — a re-review overwrites (latest wins), and a
-    regenerated plan always starts unreviewed. With a HISTORICAL plan_id and decision=approved:
+    """Record the human adoption decision. `plan_id` is REQUIRED — a verdict always names the
+    version it applies to, so a regeneration landing between the reviewer's GET and this POST
+    can never redirect it onto a plan nobody read. With the ACTIVE plan's id: the verdict lands
+    on it — a re-review overwrites (latest wins), and a regenerated plan always starts
+    unreviewed. With a HISTORICAL plan_id and decision=approved:
     the atomic version switch — retire the active row, reactivate the target, stamp the verdict,
     all-or-nothing — approving an older version IS making it the plan (last human decision
     wins; the displaced version keeps its own verdict in history). Rejecting a historical
@@ -685,7 +766,7 @@ def post_review_treatment_plan(session_id: str, scenario_id: str, body: Treatmen
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
 
         target_id = body.plan_id  # canonicalized at the schema boundary; row ids canonical too
-        if target_id is not None and target_id != str(row["PlanID"]):
+        if target_id != str(row["PlanID"]):
             # --- Version-switch branch: verdict targets a historical version ---
             if not dal.plan_version_exists(sess, session_id, scenario_id, target_id):
                 raise dal.NotFoundError("no such plan version for this scenario")

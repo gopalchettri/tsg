@@ -106,8 +106,7 @@ def _seed_catalogue(sf, *, cid, name, type_id=TYPE_ID):
 
 def _seed(sf, *, accepted=1, rejected_at=None, superseded_out=0, superseded_threat=0,
           status=ScenarioStatus.complete, actors_json=ACTORS_JSON, type_id=TYPE_ID,
-          catalogue_id=None, generic_name="Ransomware encrypts historian data at rest",
-          description="Encrypts stored data; demands payment."):
+          catalogue_id=None, generic_name="Ransomware encrypts historian data at rest"):
     """One session -> threat -> scoped threat -> scenario chain (legacy fixture shape,
     catalogue-era id columns). Returns (session dict, scenario_id, threat_id)."""
     sid, tid, oid, stid = _guid(), _guid(), _guid(), _guid()
@@ -116,7 +115,7 @@ def _seed(sf, *, accepted=1, rejected_at=None, superseded_out=0, superseded_thre
             ThreatID=tid, SessionID=sid, TenantID="t", EntityID="e", UserID="u", SubsystemID=0,
             ThreatCategory="Tampering", ThreatCategoryID=CAT_ID, ThreatType="Ransomware",
             ThreatName="Ransomware encrypts the ACME Historian", GenericName=generic_name,
-            Description=description, ThreatTypeID=type_id, ThreatCatalogueID=catalogue_id,
+            ThreatTypeID=type_id, ThreatCatalogueID=catalogue_id,
             ThreatActorsJSON=actors_json, GroundingStatus="unverified",
             Superseded=superseded_threat))
         s.add(m.Scoped_Threat(ScopedThreatID=stid, SessionID=sid, TenantID="t", EntityID="e",
@@ -191,6 +190,37 @@ def test_live_catalogue_id_is_reused_and_junctions_never_touched(sf):
     assert after[3] == before[3] + 1        # the promotion itself is still audited
 
 
+def test_existing_catalogue_row_is_retyped_when_its_type_is_retired(sf):
+    """A curator can retire a Threat_Type between generation and promotion (see the
+    threat_type_active docstring). _promote_type then mints a replacement type, and a reused
+    EXISTING catalogue row must be repointed to it -- leaving it pointed at the dead type would
+    silently disagree with every other record this promotion just wrote.
+
+    Retirement is IsDeleted=True, not IsActive=False: since an AI-promoted row also starts
+    IsActive=False (pending review, dal.upsert_threat_type), only IsDeleted still means "gone"
+    for threat_type_active's reuse check."""
+    _seed_catalogue(sf, cid=501, name="Credential Phishing", type_id=TYPE_ID)
+    ss, oid, _ = _seed(sf, catalogue_id=501, type_id=TYPE_ID)
+
+    with sf() as s:
+        s.execute(update(m.Threat_Type).where(m.Threat_Type.ThreatTypeID == TYPE_ID)
+                  .values(IsDeleted=True))
+        s.commit()
+
+    with sf() as s:
+        r = promote.promote_scenario_to_library(s, ss, oid, "reviewer")
+
+    assert r.threat_type["status"] == promote.INSERTED
+    new_type_id = r.threat_type["id"]
+    assert new_type_id != TYPE_ID
+    assert r.threat["status"] == promote.EXISTING and r.threat["id"] == 501
+
+    with sf() as s:
+        row = s.get(m.Threat_Catalogue, 501)
+        assert row.ThreatTypeID == new_type_id, \
+            "reused catalogue row was left pointing at the retired type"
+
+
 def test_normalized_name_twin_is_reused_not_reminted(sf):
     """The app's TYPE-scoped normalized-name lookup is the first duplicate guard.
     'credential-phishing' and 'Credential Phishing' under one type are one identity; minting a
@@ -230,13 +260,15 @@ def test_new_threat_writes_row_and_both_junction_maps(sf):
     assert r.threat_type["status"] == promote.EXISTING   # grounded live type id was reused
     assert r.created_count == 1 and r.success is True
     assert r.controls_mapped is True
-    assert [c["ControlLibraryID"] for c in r.controls] == [771]
+    assert [c["control_id"] for c in r.controls] == [771]
     assert all(a["linked"] is True for a in r.threat_actors)
 
     with sf() as s:
         row = s.get(m.Threat_Catalogue, r.threat["id"])
         assert row.ThreatName == "Ransomware encrypts historian data at rest"
-        assert row.ThreatTypeID == TYPE_ID and row.IsActive and not row.IsDeleted
+        # PENDING, not live: an AI-promoted row starts IsActive=False (awaiting curator review) —
+        # see dal.upsert_threat_catalogue. Still counts as existing (IsDeleted=False).
+        assert row.ThreatTypeID == TYPE_ID and not row.IsActive and not row.IsDeleted
 
         actors = s.execute(
             select(m.ThreatType_ThreatActor_Map.ThreatActorID).where(

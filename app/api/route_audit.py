@@ -50,6 +50,7 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     # unconditional; when the router IS mounted, missing entries would fail the boot.
     ("POST", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan"),
     ("GET", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan"),
+    ("GET", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/status"),
     ("GET", "/v1/sessions/{session_id}/treatment-plans"),
     ("POST", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/regenerate"),
     ("POST", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/cancel"),

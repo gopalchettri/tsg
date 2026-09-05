@@ -109,14 +109,23 @@ def clean_up_abandoned_sessions(sess: Session) -> list[str]:
         sess.execute(
             update(ss)
             .where(ss.StateID.in_(chunk), ss.Status == StageStatus.RUNNING, expired)
-            .values(Status=StageStatus.ERROR, LeaseExpiresAt=None, UpdatedAt=_now)
+            # FinishedAt=HeartbeatAt, not _now: the worker died somewhere in
+            # (HeartbeatAt, LeaseExpiresAt] and this sweep runs later still. The last proof of
+            # life is the honest lower bound on when the stage stopped; _now would bill it for
+            # the reaper's own latency. Without a stamp the board reports no duration at all for
+            # exactly the failure an operator most wants timed.
+            .values(Status=StageStatus.ERROR, LeaseExpiresAt=None, UpdatedAt=_now,
+                    FinishedAt=ss.HeartbeatAt)
         )
     # 2. Reclaim expired RUNNING `_LOCK` rows → IDLE so the reaper (and any redelivery) can re-take them.
     lock_ids = [row[0] for row in expired_locks]
     for chunk in _split_into_batches(lock_ids):
         sess.execute(
             update(ss)
-            .where(ss.StateID.in_(chunk), ss.Status == StageStatus.RUNNING, expired)
+            # Level == LOCK in the statement itself, not only in the SELECT that fed `chunk`:
+            # _LOCK rows carry no span, and the static writer test reads the lock-ness from here.
+            .where(ss.StateID.in_(chunk), ss.Level == SubsystemLevel.LOCK,
+                   ss.Status == StageStatus.RUNNING, expired)
             .values(Status=StageStatus.IDLE, ActiveTaskID=None, LeaseExpiresAt=None, UpdatedAt=_now)
         )
     sess.commit()  # durable before step 3 takes any lock
@@ -211,12 +220,13 @@ def recover_session_now(sess: Session, scenario_session: dict) -> str | None:
             sess.execute(
                 update(ss).where(ss.StateID.in_(work_ids), ss.Status == StageStatus.RUNNING, expired)
                 .values(Status=StageStatus.ERROR, ErrorMessage="reaped: worker gone",
-                        LeaseExpiresAt=None, UpdatedAt=_now))
+                        LeaseExpiresAt=None, UpdatedAt=_now,
+                        FinishedAt=ss.HeartbeatAt))   # last proof of life - see step 1 above
         if lock_ids:
             sess.execute(
-                update(ss).where(ss.StateID.in_(lock_ids), ss.Status == StageStatus.RUNNING, expired)
+                update(ss).where(ss.StateID.in_(lock_ids), ss.Level == SubsystemLevel.LOCK, ss.Status == StageStatus.RUNNING, expired)
                 .values(Status=StageStatus.IDLE, ActiveTaskID=None, LeaseExpiresAt=None,
-                        UpdatedAt=_now))
+                        UpdatedAt=_now))   # a _LOCK row: no span; Level == LOCK is in the WHERE
         sess.commit()  # durable before recover_abandoned_session tries to take the lock
         log.warning("reaper.on_demand_reclaim", session_id=sid,
                     work_rows=len(work_ids), lock_rows=len(lock_ids))
@@ -253,7 +263,10 @@ def recover_abandoned_session(sess: Session, scenario_session: dict) -> str | No
                 m.Subsystem_Stage_State.Level != SubsystemLevel.LOCK,
                 m.Subsystem_Stage_State.Status.in_([StageStatus.IDLE, StageStatus.RUNNING]))
             # now(), not _now: this write happens later, under the lock
-            .values(Status=StageStatus.ERROR, ErrorMessage="reaped: worker gone", LeaseExpiresAt=None, UpdatedAt=now())
+            # FinishedAt=HeartbeatAt: last proof of life for a RUNNING row; an IDLE row that never
+            # ran has no heartbeat and so gets NULL - "not measured", which is the truth.
+            .values(Status=StageStatus.ERROR, ErrorMessage="reaped: worker gone", LeaseExpiresAt=None,
+                    UpdatedAt=now(), FinishedAt=m.Subsystem_Stage_State.HeartbeatAt)
         )
         # decide_session_outcome runs next — with every leftover row now ERROR (or already
         # terminal) it's guaranteed to take a terminal branch and commit there, so the publish

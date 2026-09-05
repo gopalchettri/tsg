@@ -1,0 +1,85 @@
+# TSG API + Celery worker + beat + Flower, in Docker, talking to MSSQL,
+# Redis and MongoDB installed NATIVELY on this laptop via host.docker.internal.
+# No db/redis/mongo containers here — see the demo runbook for the
+# native-service prerequisites this depends on (TCP/IP + SQL auth on SQL
+# Server, firewall rules, Redis/Mongo bound to more than loopback).
+#
+# Usage (from the tsg folder):
+#   docker build -t tsg:latest .
+#   docker compose -f docker/compose.demo.yml up -d
+services:
+  api:
+    image: tsg:latest
+    restart: unless-stopped
+    command: ["gunicorn", "app.main:app", "-k", "uvicorn.workers.UvicornWorker",
+              "-w", "4", "-b", "0.0.0.0:8000", "--timeout", "120"]
+    env_file: [../.env.demo]
+    ports: ["8000:8000"]
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/ready').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    image: tsg:latest
+    restart: unless-stopped
+    command: ["celery", "-A", "app.pipeline.celery_worker.celery_app", "worker",
+              "-P", "gevent", "-c", "50", "-l", "info"]
+    env_file: [../.env.demo]
+    stop_grace_period: 300s
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.pipeline.celery_worker.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 240s
+
+  beat:
+    image: tsg:latest
+    restart: unless-stopped
+    command: ["celery", "-A", "app.pipeline.celery_app.celery_app", "beat", "-l", "info"]
+    env_file: [../.env.demo]
+    healthcheck:
+      test: ["CMD-SHELL", "find /app -maxdepth 1 -name 'celerybeat-schedule*' -newermt '-360 seconds' | grep -q ."]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Celery task dashboard — optional, useful to show the pipeline working
+  # live during a demo. Delete this service block if it isn't wanted.
+  # Refuses to start unless TSG_FLOWER_BASIC_AUTH is set in .env.demo.
+  flower:
+    image: tsg:latest
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        test -n "$$TSG_FLOWER_BASIC_AUTH" || {
+          echo "REFUSING TO START: TSG_FLOWER_BASIC_AUTH is empty. Set it in .env.demo." >&2
+          exit 1
+        }
+        exec celery -A app.pipeline.celery_app.celery_app flower \
+          --address=0.0.0.0 --port=5555 \
+          --persistent=True --db=/data/flower.db \
+          --basic-auth="$$TSG_FLOWER_BASIC_AUTH" \
+          --logging=error
+    env_file: [../.env.demo]
+    depends_on:
+      worker: { condition: service_healthy }
+      beat: { condition: service_healthy }
+      api: { condition: service_healthy }
+    ports: ["5555:5555"]
+    volumes: ["flower-data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; socket.create_connection(('127.0.0.1', 5555), 4).close()\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  flower-data:

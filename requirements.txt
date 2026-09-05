@@ -20,7 +20,6 @@ numpy>=2.4.1
 pymongo>=4.17.0
 structlog>=26.1.0
 flower>=2.0.1
-prometheus-client>=0.26.0
 httpx>=0.28.1
 mypy>=2.3.0
 ruff>=0.16.1

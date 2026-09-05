@@ -19,7 +19,9 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import create_engine
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app.core.enums import ScenarioStatus, StageStatus, SubsystemLevel
@@ -165,3 +167,32 @@ def test_exception_after_savepoint_release_does_not_raise(monkeypatch):
 
 if __name__ == "__main__":
     print("run via pytest")
+
+
+def test_a_pass_that_leaves_the_session_needing_rollback_still_records_its_seconds(monkeypatch) -> None:
+    """ControlMapSeconds is cumulative, so a pass whose accumulate fails under-reports the session
+    FOREVER with no marker. The one state in which the accumulate is guaranteed to fail is a
+    session left needing a rollback (SQLAlchemy raises PendingRollbackError on the next execute).
+    The wrapper must roll back and issue the standalone UPDATE once more, not swallow the loss."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine)
+    sid, task_id = str(uuid.uuid4()), str(uuid.uuid4())
+    with Session() as s:
+        _seed(s, sid, task_id)
+
+    def _poison(sess, *_a, **_k):
+        # A genuine failed flush that nobody rolls back - a duplicate primary key.
+        sess.add(m.Scenario_Session(SessionID=sid, TenantID="t", EntityID="e", AssetName="a",
+                                    AssetID="1", SessionStatus="active", CurrentStage="SCENARIOS",
+                                    StageStatus="RUNNING", Mode="full", SubsystemsJSON="[]"))
+        with pytest.raises(IntegrityError):
+            sess.flush()
+
+    monkeypatch.setattr(control_mapping, "_map_controls_once", _poison)
+    with Session() as s:
+        control_mapping.map_controls(s, {"SessionID": sid}, {}, None, _FakeLLM(), 0, task_id, 1,
+                                     durable=True)
+    with Session() as s:
+        seconds = s.execute(select(m.Scenario_Session.ControlMapSeconds)
+                            .where(m.Scenario_Session.SessionID == sid)).scalar()
+    assert seconds is not None and seconds >= 0.0, "the pass's seconds were lost"

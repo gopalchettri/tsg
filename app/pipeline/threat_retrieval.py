@@ -5,8 +5,8 @@ Selects candidate Threat_Catalogue rows for an asset BEFORE any generation happe
     1. LIBRARY FILTER    live catalogue rows (IsActive=1, IsDeleted=0) whose parent
                         Threat_Type is also active. No sector filter (removed 2026-08,
                         user instruction) and no asset-type filter (the catalogue has no
-                        asset-type column) — eligibility is the whole active library,
-                        and the validator decides relevance.
+                        asset-type column) — eligibility is the whole active library;
+                        relevance is decided by the rerank gate downstream.
     2. HYBRID RANKING    per-supporting-system queries + one asset-level query, each
                         scored by BM25 keyword + embedding cosine, RRF-fused
                         (hybrid_search.hybrid_match); a candidate keeps its best
@@ -15,8 +15,17 @@ Selects candidate Threat_Catalogue rows for an asset BEFORE any generation happe
                         text is the threat's name + description, composed by the ONE
                         shared function (embeddings.catalogue_passage_text) so warm
                         vectors and query vectors are the same bytes (G10).
-    3. NO CAP            every eligible candidate goes forward to the validator —
-                        exhaustive, provable coverage at today's library size.
+    3. TOP-K POOL        only the best `threat_retrieval_top_k` candidates go forward
+                        (K >> requested count). The cap keeps every later stage — the
+                        rerank gate above all — CONSTANT-cost as the catalogue grows;
+                        the RRF tail it cuts is ranked weak by both legs. (Replaces
+                        the old NO-CAP + LLM-validator design, which billed ~1 chat
+                        batch per 40 catalogue rows per run.)
+
+    score_relevance() then reranks that pool (grounding.ground_control_queries — the same
+    funnel control mapping uses) into 0-100 scores; tasks.find_threats gates on
+    `threat_relevance_threshold`. The RRF fused score is used ONLY to shortlist — it is a
+    rank-sum, never comparable to the reranker scale the threshold is pinned against.
 
 Multi-STRIDE category membership comes from Threat_Catalogue_Category_Map (authoritative
 when populated) with the type's own category as the fallback, re-sorted into canonical
@@ -25,9 +34,9 @@ STRIDE order — map row order encodes the seed alphabet and must not survive.
 Actors ride per TYPE (ThreatType_ThreatActor_Map — every catalogue threat under one type
 shares the list), as (id, name) pairs so actor_ids stay intact end to end.
 
-The LLM validator (tasks._validate_candidates) then judges what this returns; nothing
-here calls a model for chat. Scoring here is RANKING ONLY — eligibility is decided by
-the validator, never by a similarity number.
+Nothing here calls a model for chat: retrieval, shortlist, and rerank are all local (or
+local-class reranker) work. Relevance is decided by the rerank gate in tasks.find_threats;
+the LLM's only remaining Stage-1 job is generating the gap the gated library cannot fill.
 
 Empty library / failed embeds degrade loudly to keyword-only or to [] — the caller
 (find_threats) then runs generation-only, which is exactly the cold-start behaviour:
@@ -47,7 +56,7 @@ from app.core.tracing import trace_step
 from app.db import dal
 from app.db import models as m
 from app.pipeline import embeddings, hybrid_search
-from app.pipeline.llm import LLMClient
+from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 
 log = get_logger(__name__)
 
@@ -162,8 +171,12 @@ def attribute_to_subsystems(subsystems: list[dict] | None,
 
 def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dict] | None,
                             asset_context: dict,
-                            session_id: str | None = None) -> list[dict]:
-    """The funnel. Returns candidate dicts best-first (score desc, then catalogue id):
+                            session_id: str | None = None,
+                            queries: list[str] | None = None,
+                            query_vecs: list[list[float] | None] | None = None) -> list[dict]:
+    """Find and rank the library threats that might apply to this asset.
+
+    The funnel. Returns candidate dicts best-first (score desc, then catalogue id):
 
         {"catalogue_id", "type_id", "type_name", "threat_name", "description",
         "categories": [names], "retrieval_score": 0..1,
@@ -172,7 +185,12 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
         "selection_source": "hybrid", "ranking_degraded": bool}
 
     [] when the catalogue holds nothing eligible — the caller degrades to generation-only
-    (the cold-start guarantee: the AI generates everything, types included)."""
+    (the cold-start guarantee: the AI generates everything, types included).
+
+    `queries`/`query_vecs`: pre-built retrieval queries and their embeddings, so the caller
+    (find_threats runs this AND score_relevance on the same queries) pays ONE embed round
+    for the whole funnel. Absent or mismatched -> built/embedded here, exactly as before,
+    including this function's own keyword-only degradation semantics."""
     s = get_settings()
     # The `return []` below sits INSIDE the block on purpose: a context manager still emits its
     # END on an early return, where paired IN/OUT calls would leave a dangling BEGIN.
@@ -187,11 +205,17 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
     corpus = [{"text": embeddings.catalogue_passage_text(
                 r["ThreatName"], s.max_embed_chars),
             "name": r["ThreatName"], "vector": None} for r in rows]
-    queries = build_queries(subsystems, asset_context)
+    supplied_qvs = (queries is not None and query_vecs is not None
+                    and len(query_vecs) == len(queries))
+    if queries is None:
+        queries = build_queries(subsystems, asset_context)
     # Embeddings are best-effort: corpus passage vectors through the shared cache, query
-    # vectors in one batch. Any failure degrades to keyword-only — ranking gets weaker,
-    # eligibility is untouched.
-    query_vecs: list[list[float] | None] = [None] * len(queries)
+    # vectors in one batch (skipped when the caller already supplied them). Any failure
+    # degrades to keyword-only — ranking gets weaker, eligibility is untouched.
+    # LLMSlotUnavailable is the ONE exception that must NOT degrade: the Celery stage retry
+    # re-runs the whole stage cleanly, where keyword-only would store a materially worse
+    # candidate set a retry would have gotten right.
+    query_vecs = list(query_vecs) if supplied_qvs else [None] * len(queries)
     ranking_degraded = False
     try:
         texts = [c["text"] for c in corpus]
@@ -199,7 +223,7 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
                                     group="threat_catalogue", kind="passage")
         for c in corpus:
             c["vector"] = vecs.get(c["text"])
-        if queries:
+        if queries and not supplied_qvs:
             qvs = llm.embed(queries, kind="query")
             if len(qvs) == len(queries):
                 query_vecs = list(qvs)
@@ -211,6 +235,8 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
                 ranking_degraded = True
                 log.warning("threat_retrieval.embed_length_mismatch_keyword_only",
                             session_id=session_id, queries=len(queries), vectors=len(qvs))
+    except LLMSlotUnavailable:
+        raise
     except Exception:
         # Keyword-only is a WEAKER ANSWER, not a failure — eligibility is untouched and the
         # session still completes. That is exactly why it has to be recorded: a run ranked by
@@ -220,21 +246,27 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
         log.warning("threat_retrieval.embed_failed_keyword_only",
                     session_id=session_id, candidates=len(rows), exc_info=True)
 
+    # Corpus tokenized ONCE for every query's BM25 leg — per-call tokenization re-did QxN
+    # work on an unchanging corpus (the same hoist ground_control_queries applies).
+    docs_tokens = [hybrid_search.tokenize(c["text"]) for c in corpus]
     best: dict[int, float] = {}  # row index -> best fused score across queries
     for q, qv in zip(queries, query_vecs):
         with trace_step("HYBRID SEARCH", session_id, query_text=q, candidate_count=len(corpus),
                         query_vec_present=qv is not None,
                         ranking_degraded=ranking_degraded) as _t:
-            results = hybrid_search.hybrid_match(q, corpus, query_vec=qv)
+            results = hybrid_search.hybrid_match(q, corpus, query_vec=qv,
+                                                docs_tokens=docs_tokens)
             _t.result(matches=len(results), top=results[:5])
         for idx, score in results:
             if score > best.get(idx, 0.0):
                 best[idx] = score
 
-    # No cap: every eligible candidate is forwarded, best-first — the validator decides
-    # relevance. See the module docstring for why there is no top-k.
+    # Top-K pool: only the best fused candidates go forward (K >> requested count) — the
+    # bound that keeps the rerank gate constant-cost as the catalogue grows. See the module
+    # docstring; the tail cut here is ranked weak by BOTH legs.
     order = sorted(range(len(rows)),
                 key=lambda i: (-best.get(i, 0.0), rows[i]["ThreatCatalogueID"]))
+    order = order[:s.threat_retrieval_top_k]
 
     attribution = attribute_to_subsystems(
         subsystems, sorted({r["ThreatTypeID"] for r in rows}))
@@ -261,3 +293,60 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
         })
     log.info("threat_retrieval.candidates", total=len(rows), forwarded=len(out))
     return out
+
+
+def score_relevance(llm: LLMClient, candidates: list[dict], subsystems: list[dict] | None,
+                    asset_context: dict, s=None,
+                    queries: list[str] | None = None,
+                    query_vecs: list[list[float] | None] | None = None) -> dict[int, float]:
+    """Score how relevant each library candidate is to this asset (0-100).
+
+    Reranker relevance scores for retrieved candidates: {catalogue_id: score, 0-100}.
+
+    The single defined relevance decision of the library-first funnel. Reuses
+    grounding.ground_control_queries — the identical shortlist+rerank_many batch control
+    mapping runs — over the Top-K candidate pool, with the SAME passage text retrieval
+    embedded (embeddings.catalogue_passage_text; G10: warm vectors and rerank docs are the
+    same bytes). A candidate keeps its best score across queries, mirroring the fused-score
+    rule above.
+
+    Scores land on the reranker's 0-100 scale — the scale `threat_relevance_threshold` is
+    pinned against. NEVER gate on the RRF fused score: it is a rank-sum.
+
+    Raises on infrastructure failure (embed/rerank hard failure) — the caller decides the
+    degradation (find_threats forwards the pool ungated + ranking_degraded), because a gate
+    silently passing everything would be indistinguishable from a healthy permissive one.
+    """
+    from app.pipeline import grounding  # lazy: grounding imports this module's siblings
+    s = s or get_settings()
+    if not candidates:
+        return {}
+    if queries is None:
+        queries = build_queries(subsystems, asset_context)
+    if not queries:
+        return {}
+    rows = [{"text": embeddings.catalogue_passage_text(c["threat_name"], s.max_embed_chars),
+            "catalogue_id": c["catalogue_id"]} for c in candidates]
+    # Caller-supplied embeddings (find_threats embeds the funnel's queries ONCE) — only
+    # embed here when absent/mismatched, preserving the standalone-call behavior.
+    if query_vecs is not None and len(query_vecs) == len(queries):
+        qvs: list[list[float] | None] = list(query_vecs)
+    else:
+        qvs = [None] * len(queries)
+        vecs = llm.embed(queries, kind="query")
+        if len(vecs) == len(queries):
+            qvs = list(vecs)
+    matches = grounding.ground_control_queries(
+        llm, list(zip(queries, qvs)), rows, s,
+        shortlist_k=s.threat_retrieval_top_k, group="threat_catalogue")
+    unanswered = sum(1 for cm in matches if not cm.answered)
+    if matches and unanswered == len(matches):
+        # Every query's rerank failed — that is a gate outage, not "nothing relevant".
+        raise RuntimeError(f"relevance gate: all {len(matches)} query reranks failed")
+    best: dict[int, float] = {}
+    for cm in matches:
+        for row, score in cm.matches:
+            cid = row["catalogue_id"]
+            if score > best.get(cid, float("-inf")):
+                best[cid] = float(score)
+    return best

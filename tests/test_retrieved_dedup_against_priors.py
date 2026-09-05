@@ -72,9 +72,9 @@ SIBLING_NAME = "Unauthorised setpoint tampering"
 
 
 class FakeLLM:
-    """Deterministic: retrieval always surfaces the seeded catalogue rows; the validator
-    keeps every candidate (RELEVANT); Stage-1b gap generation proposes nothing — so each
-    test isolates ONE dedup decision.
+    """Deterministic: retrieval always surfaces the seeded catalogue rows; the rerank gate
+    passes every candidate (default score 80, above the 50 threshold); Stage-1b gap
+    generation proposes nothing — so each test isolates ONE dedup decision.
 
     `collapse`: names that all embed onto ONE axis (identical vector, cosine 1.0). Every
     other unique text gets its own orthogonal one-hot slot."""
@@ -95,21 +95,11 @@ class FakeLLM:
         return out
 
     def rerank(self, query, docs):
-        return [95.0 if d.strip().lower() == query.strip().lower() else 5.0 for d in docs]
+        # Exact match wins outright; everything else clears the relevance gate (80 >= the
+        # default 50) so these tests exercise DEDUP decisions, never the gate's.
+        return [95.0 if d.strip().lower() == query.strip().lower() else 80.0 for d in docs]
 
     def chat(self, messages, temperature=None, expected_type=None):
-        system = messages[0]["content"]
-        if "VALIDATING pre-selected library threats" in system:
-            user = messages[-1]["content"]
-            payload = json.loads(user[user.index("{"):])
-            verdicts = [{"index": c["index"], "verdict": "RELEVANT",
-                         "justification": "SCADA setpoints are remotely modifiable here"}
-                        for c in payload["candidate_threats"]]
-            # OBJECT-shaped, per the threat_validation contract (prompts.py). Leaving this
-            # as a bare array would NOT fail this file loudly: every verdict here is
-            # RELEVANT, and the fail-open path also yields "kept", so the test would keep
-            # passing while silently exercising none of the validator.
-            return json.dumps({"verdicts": verdicts}), None
         return json.dumps([]), None  # Stage-1b: no gap-fill proposals in these tests
 
 

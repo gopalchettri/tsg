@@ -82,6 +82,7 @@ from app.core.config import CONTROL_DESCRIPTION_MAX_CHARS, CONTROL_NAME_MAX_CHAR
 from app.core.enums import (
     CeleryJobState,
     ClickOutcomeReason,
+    ControlMappingExhaustionReason,
     NextSetOutcome,
     ReviewGateReason,
     RiskLevel,
@@ -133,14 +134,13 @@ def _canonical_scenario_ids(v: list[str] | None) -> list[str] | None:
     return out
 
 
-def _canonical_guid_or_none(v: str | None) -> str | None:
+def _canonical_guid(v: str) -> str:
     """Scalar sibling of _canonical_scenario_ids — same trust-boundary rule for single-id fields
     (TreatmentReviewBody.plan_id): MSSQL returns uppercase GUIDs, dal.guid() stores lowercase,
     Python compares case-sensitively — an un-canonicalized id would silently flip a branch
     decision (e.g. 'is this the active plan version?'). Malformed input dies here as a clean
-    422, never a driver-level 500."""
-    if v is None:
-        return None
+    422, never a driver-level 500. No None branch: its one field is REQUIRED, so pydantic has
+    already rejected a missing value before this runs."""
     try:
         return canonical_guid(v)
     except (ValueError, AttributeError, TypeError):
@@ -413,6 +413,7 @@ class SessionProgress(ApiModel):
             "example": {
                 "threats": "COMPLETE", "scenarios": "COMPLETE", "controls": "COMPLETE",
                 "overall": "awaiting_review", "error_message": {},
+                "timings": {"threats": 34.21, "scenarios": 42.03, "controls": 604.12},
                 "last_next_set": {
                     "outcome": "partial_retryable", "requested": 5, "delivered": 3,
                     "variants": 0, "reason": None, "epoch": 4,
@@ -454,6 +455,28 @@ class SessionProgress(ApiModel):
                     "step in the pipeline, and scenarios become visible BEFORE their controls "
                     "do, so poll this before rendering a finished card. The per-scenario twin is "
                     "ScenarioResult.controls_mapped.")
+    # ADDITIVE (unlike the error_message reshape below): a new optional key, so an old client
+    # that ignores it is unaffected.
+    timings: dict[str, float] | None = Field(
+        default=None,
+        description=(
+            "How long each step took, in seconds, keyed by step ('threats'/'scenarios'/"
+            "'controls'). Null on sessions that ran before timings were recorded; a step is "
+            "omitted until it has finished, so a missing key means 'not measured', never zero. "
+            "'threats' and 'scenarios' are wall-clock spans and do NOT overlap each other - "
+            "'scenarios' ends before control mapping begins. 'controls' is the ONE exception: "
+            "control mapping resumes across background sweeps minutes apart, so reporting a "
+            "start-to-finish span would report mostly WAITING - this is the time actually SPENT "
+            "mapping, summed over every pass. "
+            "There is deliberately no scenario total here: scenarios generate several at a time, "
+            "so the per-scenario ScenarioResult.gen_seconds values OVERLAP and summing them "
+            "would contradict 'scenarios' above. Use 'scenarios' for how long the stage took, "
+            "and gen_seconds to find which individual scenario was slow. Spans are measured on "
+            "the worker that ran the step; a retry resumed on another worker can shift one by "
+            "the two machines' clock skew, and a span that would come out negative is withheld, "
+            "never published."
+        ),
+    )
     # BREAKING REST API CHANGE (plan item 7, deliberately shipped last and separately from the
     # rest of this file's changes): was `str | None`, last-row-wins across stages, so two
     # simultaneous stage failures silently dropped one message. Now a dict keyed by stage
@@ -593,14 +616,6 @@ class ThreatResult(ApiModel):
                                         "this equals LibraryThreatType; for a generated one it is the "
                                         "model's own wording, kept verbatim.")
     threat_name: str | None = Field(description="The threat's name AS PROPOSED - see ThreatType.")
-    description: str | None = Field(
-        default=None,
-        description="The AI's one-sentence description of this threat, written at identification "
-                    "time in asset-free language and copied into Threat_Catalogue.Description "
-                    "when the threat is promoted. For a library-retrieved threat this carries "
-                    "the catalogue's own description (clipped). Null when the model's wording "
-                    "named the asset (dropped rather than leaked into a shared library)."
-    )
     threat_type_id: int | None = Field(
         default=None,
         description="Id of the matched Threat_Type master row. Null when the type came back unverified."
@@ -864,6 +879,9 @@ _SCENARIO_RESULT_EXAMPLE: JsonDict = {
     "validation_errors": [],
     "generation_epoch": 1,
     "scenario_number": 1,
+    "gen_started_at": "2026-09-05T11:04:59.201234Z",
+    "gen_finished_at": "2026-09-05T11:05:17.631234Z",
+    "gen_seconds": 18.43,
     "controls_mapped": True,
     "scenario_source": "generated",
     "replaced_scenarios": [],
@@ -988,6 +1006,34 @@ class ScenarioResult(ApiModel):
             "entries."
         ),
     )
+    # How long THIS scenario took to generate. Three fields rather than one because the two ends
+    # are what make the concurrency legible: generation runs several scenarios at a time, so a
+    # handful of rows share a gen_started_at, and seeing that is what explains why the durations
+    # do not sum to progress.timings.scenarios.
+    gen_started_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When generation of this scenario began (UTC). Null on scenarios generated before "
+            "timings were recorded. NOT the same as when the row was created: the batch persists "
+            "sequentially after every scenario has finished generating."
+        ),
+    )
+    gen_finished_at: datetime | None = Field(
+        default=None,
+        description="When generation of this scenario finished (UTC). Null on older scenarios.",
+    )
+    gen_seconds: float | None = Field(
+        default=None,
+        description=(
+            "Seconds this scenario took to generate — gen_finished_at minus gen_started_at, "
+            "derived rather than stored so it cannot disagree with them. Null on older "
+            "scenarios; never 0.0 as a stand-in for 'unknown'. "
+            "DO NOT SUM THIS COLUMN to get the stage duration: scenarios generate several at a "
+            "time, so these values overlap and their total exceeds the real elapsed time by "
+            "roughly the concurrency factor. Use it to find WHICH scenario was slow; use "
+            "SessionProgress.timings.scenarios for how long the stage took."
+        ),
+    )
     # Step-4 mapping is a TAIL step of scenario generation (tasks.py::write_scenarios runs it once,
     # after every scenario in the batch is written), but scenario rows land incrementally — so a
     # caller polling /results mid-stage sees scenarios whose controls simply aren't computed yet.
@@ -1033,6 +1079,22 @@ class ScenarioResult(ApiModel):
             "ran — check the worker log for `controls.no_candidates` and confirm the control "
             "library is seeded."
         ),
+    )
+    controls_mapping_exhausted: bool = Field(
+        default=False,
+        description=(
+            "true = this scenario used up its control-mapping attempt limit "
+            "(control_map_max_attempts) without a match attempt succeeding. This is NOT a "
+            "library-gap signal (that is `controls_mapped: true` with an empty list) and it IS "
+            "PERMANENT: nothing retries this scenario's control mapping again on its own — "
+            "POST /regenerate/scenarios is the only way to get a fresh attempt. Surface it to a "
+            "human; it means something is wrong (e.g. the control library has nothing for this "
+            "category), not 'still working'."
+        ),
+    )
+    controls_mapping_exhaustion_reason: ControlMappingExhaustionReason | None = Field(
+        default=None,
+        description="Why `controls_mapping_exhausted` is true. Null unless it is.",
     )
     # Declared LAST on purpose: Pydantic serializes in declaration order, and a nested array of
     # whole scenarios ahead of the scalars would bury GenerationEpoch/ScenarioNumber/
@@ -1852,6 +1914,7 @@ class IntelFeedStatus(ApiModel):
                 "last_fetched_at": "2026-07-27T03:00:00Z",
                 "last_attempt_at": "2026-07-27T03:00:00Z",
                 "last_success_at": "2026-07-27T03:00:00Z", "last_error": None,
+                "source_version": "2026.07.27", "stale": False,
             }
         }
     )
@@ -1865,6 +1928,8 @@ class IntelFeedStatus(ApiModel):
     last_attempt_at: datetime | None = Field(default=None, description="When a refresh of this feed last ran, successful or not.")
     last_success_at: datetime | None = Field(default=None, description="When this feed last refreshed successfully.")
     last_error: str | None = Field(default=None, description="Error from the last attempt, or null if it succeeded.")
+    source_version: str | None = Field(default=None, description="The source release the last refresh synced — KEV catalogVersion, the CSAF mirror's newest change date. Null for feeds that publish none.")
+    stale: bool = Field(default=False, description="True when the feed is enabled but has had no successful refresh inside TSG_INTEL_STALE_AFTER_SECONDS (SDD SOURCE_STALE). Always false for a disabled feed.")
 
 
 class IntelFeedsResponse(ApiModel):
@@ -1927,7 +1992,11 @@ class IntelItem(ApiModel):
     url: str = Field(default="", description="Link back to the item at its source.")
     tags: list[str] = Field(default_factory=list, description="Source tags; for attributed OTX pulses the adversary is the first tag.")
     fetched_at: datetime | None = Field(default=None, description="UTC time this item was last written by a refresh (also its TTL clock). Null only on a malformed legacy doc.")
-    published_at: datetime | None = Field(default=None, description="The item's own date at its source (an OTX pulse's last-modified time); falls back to sync time for feeds that publish none. This is the ordering key — newest threat first.")
+    published_at: datetime | None = Field(default=None, description="The item's own date at its source (KEV dateAdded, CSAF release date, an OTX pulse's last-modified time); falls back to sync time for feeds that publish none. This is the ordering key — newest threat first.")
+    scope_tags: list[str] = Field(default_factory=list, description="Canonical scope keys the item is tagged with at its source — 'sector:energy', 'country:united arab emirates'. The scope tier of prompt matching uses these by equality.")
+    summary: str = Field(default="", description="The source's own one-line summary (KEV shortDescription, CSAF advisory summary). Emitted into the prompt for CISA-authored kinds only.")
+    severity: float | None = Field(default=None, description="Max CVSS base score, where the source publishes one (ICS advisories).")
+    cwes: list[str] = Field(default_factory=list, description="CWE ids the source lists.")
 
 
 class IntelItemsResponse(ApiModel):
@@ -2465,6 +2534,14 @@ class TreatmentPlanStatus(ApiModel):
                  "impacted_business_division": "Water Treatment Operations"}}})
 
     plan_id: str = Field(description="Risk_Treatment_Plan row id.")
+    progress: TreatmentPlanProgress | None = Field(
+        default=None,
+        description="THIS plan's lifecycle position — the same block the session board publishes "
+                    "(GET /v1/sessions/{id}/treatment-plans), folded over one scenario instead "
+                    "of all of them, so a per-scenario screen and the board can never disagree "
+                    "about the same plan. `overall` is the field to switch on: awaiting_review "
+                    "-> show Review, rejected -> show Regenerate, error -> show Retry. Null on a "
+                    "superseded-version row, which is history and has no live lifecycle.")
     session_id: str = Field(description="Owning session.")
     scenario_id: str = Field(description="The accepted scenario this plan treats.")
     status: str = Field(description="RUNNING | COMPLETE | ERROR — the poll signal (stale RUNNING projects as ERROR).")
@@ -2473,15 +2550,16 @@ class TreatmentPlanStatus(ApiModel):
         default=None,
         description="The accepted scenario this plan treats — IDENTICAL shape to "
                     "ScenarioResult.scenario, built by the same builder, so the plan screen and "
-                    "the results screen cannot show different detail for one scenario. Null "
-                    "only if the scenario row is unreadable (defensive parse), or on a "
-                    "superseded-version row, which carries no scenario join: the scenario is "
-                    "version-independent and served once on the top-level object.")
+                    "the results screen cannot show different detail for one scenario. Present "
+                    "on superseded-version entries too (the scenario is version-independent, so "
+                    "the active row's copy is overlaid onto each). Null if the scenario row is "
+                    "unreadable (defensive parse), or on the session board's history entries, "
+                    "whose own rows carry no scenario either.")
     threat: ThreatResult | None = Field(
         default=None,
         description="The threat this scenario was generated from, with every database key — "
                     "identical shape and rules to ScenarioResult.threat. Null when no "
-                    "Identified_Threat row joined, or on a superseded-version row.")
+                    "Identified_Threat row joined, or on the session board's history entries.")
     actors: list[ThreatActorRef] = Field(
         default_factory=list,
         description="Adversaries for this plan's underlying threat, each with its Threat_Actor "
@@ -2552,11 +2630,15 @@ class TreatmentPlanStatus(ApiModel):
     superseded: list[TreatmentPlanStatus] | None = Field(
         default=None,
         description="Regeneration history — every replaced version, newest first, each with its "
-                    "own plan_id, status, review verdict and plan content. Populated only on "
-                    "GET .../treatment-plan?include_superseded=true: null when not requested, "
-                    "[] when requested and the plan was never regenerated. History items carry "
-                    "scenario=null (the scenario is version-independent — read it once from the "
-                    "top level) and never nest their own history (one level deep).")
+                    "own plan_id, status, review verdict, plan content, created_by, "
+                    "cancelled_*, warnings and moderation_flagged — so one version can be told "
+                    "from another before adopting it via POST .../review with its plan_id. "
+                    "Populated only on GET .../treatment-plan?include_superseded=true: null when "
+                    "not requested, [] when requested and the plan was never regenerated. The "
+                    "scenario/threat/actors/controls blocks are version-independent and repeat "
+                    "the top-level values. `progress` is null on every entry (history has no "
+                    "live lifecycle), and entries never nest their own history (one level "
+                    "deep).")
     created_at: datetime | None = Field(default=None, exclude=True, description="When this attempt was requested.")
     completed_at: datetime | None = Field(default=None, exclude=True, description="When it reached COMPLETE/ERROR.")
 
@@ -2583,8 +2665,11 @@ class TreatmentBoardRow(ApiModel):
         default=None,
         description="Regeneration history — every replaced version of this scenario's plan, "
                     "newest first, the same entries the single-plan GET serves under "
-                    "?include_superseded=true (full plan content, own status/review verdict; "
-                    "scenario=null — read the title from this row). Populated only with "
+                    "?include_superseded=true (full plan content, own status/review verdict, "
+                    "created_by, cancelled_*, warnings). The scenario/threat/actors/controls "
+                    "blocks are null/[] here — this board does not read them for its own rows "
+                    "either; use scenario_title, or the single-plan GET for the full blocks. "
+                    "Populated only with "
                     "?include_superseded=true: null when not requested, [] when requested "
                     "and never regenerated.")
     created_at: datetime | None = Field(default=None)
@@ -2627,6 +2712,51 @@ class TreatmentPlanProgress(ApiModel):
                     "a rejected plan, so it is work still outstanding.")
 
 
+class TreatmentPlanStatusSummary(ApiModel):
+    """GET .../treatment-plan/status — one scenario's remediation lifecycle, and nothing else.
+
+    The remediation counterpart of GET /v1/sessions/{id}: a cheap poll a UI can hit on a timer
+    while a plan generates. Deliberately carries NO plan content, no scenario and no threat —
+    the full GET .../treatment-plan serves those, and a status poll that dragged tens of KB of
+    PlanJSON along would make polling expensive exactly when it happens most.
+
+    `progress` is folded by the same function the session board uses, so this endpoint and
+    GET /v1/sessions/{id}/treatment-plans can never disagree about the same plan.
+    """
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
+        "scenario_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
+        "plan_id": "442b4bd2-98ab-8ac4-b589-01a054d68dbf",
+        "progress": {"generation": "COMPLETE", "review": "PENDING",
+                     "overall": "awaiting_review"},
+        "status": "COMPLETE", "review_status": None, "reviewed_by": None,
+        "error_message": None, "reason": None, "created_by": "dewa"}})
+
+    session_id: str
+    scenario_id: str = Field(description="The accepted scenario this plan treats.")
+    plan_id: str = Field(description="Risk_Treatment_Plan row id — the ACTIVE version.")
+    progress: TreatmentPlanProgress = Field(
+        description="The lifecycle block. `overall` is the field to switch on: pending -> "
+                    "Generate, generating -> spinner, awaiting_review -> Review, rejected -> "
+                    "Regenerate, approved -> done, error -> Retry.")
+    status: str = Field(
+        description="RUNNING | COMPLETE | ERROR — the raw generation status a stale RUNNING is "
+                    "already projected from. `progress.generation` says the same thing in the "
+                    "board's vocabulary; this is kept for clients already reading it.")
+    review_status: str | None = Field(
+        default=None, description="approved / rejected / null (nobody has decided yet).")
+    reviewed_by: str | None = Field(default=None, description="Who decided, if anyone has.")
+    reviewed_at: datetime | None = Field(default=None, description="When (naive UTC).")
+    created_by: str | None = Field(default=None, description="Who requested the plan.")
+    error_message: str | None = Field(
+        default=None, description="Client-safe failure reason when status is ERROR.")
+    reason: TreatmentOutcomeReason | None = Field(
+        default=None, description="Why it ended this way when status is ERROR. Null otherwise.")
+    created_at: datetime | None = Field(default=None)
+    updated_at: datetime | None = Field(default=None)
+    completed_at: datetime | None = Field(default=None)
+
+
 class TreatmentBoard(ApiModel):
     """GET /v1/sessions/{id}/treatment-plans — every accepted scenario's plan state in ONE
     call (the page the reviewer looks at daily; replaces N per-scenario polls)."""
@@ -2656,27 +2786,33 @@ class TreatmentCancelResponse(ApiModel):
 class TreatmentReviewBody(ApiModel):
     """POST .../treatment-plan/review — record the human adoption decision on a COMPLETE
     plan. The reviewer's identity comes from the login token, never from this body."""
+    # plan_id is in the example because it is REQUIRED — json_schema_extra is a separate
+    # expression that survives a field change, and an example missing a required field is
+    # exactly how a published example ends up contradicting its own schema.
     model_config = ConfigDict(json_schema_extra={"example": {
-        "decision": "approved", "comment": "A3 timeline extended per operations."}})
+        "decision": "approved", "plan_id": "0f0e0d0c-0b0a-8988-8786-858483828180",
+        "comment": "A3 timeline extended per operations."}})
     decision: TreatmentReviewStatus = Field(description="approved | rejected.")
     comment: str | None = Field(default=None, max_length=2000, description="Optional reviewer comment.")
-    plan_id: str | None = Field(
-        default=None,
+    plan_id: str = Field(
         description=(
-            "Which plan version the decision targets. Omit (or pass the active version's id) to "
-            "review the current plan — today's behavior. Pass a HISTORICAL version's plan_id "
-            "(from GET .../treatment-plan?include_superseded=true) with decision='approved' to "
-            "make that version the current plan AND approve it, atomically — approving an older "
-            "version IS choosing it. Only COMPLETE versions can be adopted (409 not_complete "
-            "otherwise); rejecting a historical version is refused (409 version_not_active); a "
-            "running regeneration blocks the switch (409 generation_in_progress). Last human "
-            "decision wins: a later approval of another version displaces the operative plan; "
-            "the displaced version keeps its own verdict in history and every switch is audited. "
+            "REQUIRED — which plan version this decision applies to. Deliberately not optional: "
+            "'whatever is active right now' would let a regeneration committing between the GET "
+            "and this POST redirect the verdict onto a version the reviewer never read, and this "
+            "endpoint writes an audited adoption decision. Pass the ACTIVE version's id to "
+            "review the current plan. Pass a HISTORICAL version's plan_id (from GET "
+            ".../treatment-plan?include_superseded=true) with decision='approved' to make that "
+            "version the current plan AND approve it, atomically — approving an older version IS "
+            "choosing it. Only COMPLETE versions can be adopted (409 not_complete otherwise); "
+            "rejecting a historical version is refused (409 version_not_active); a running "
+            "regeneration blocks the switch (409 generation_in_progress). Last human decision "
+            "wins: a later approval of another version displaces the operative plan; the "
+            "displaced version keeps its own verdict in history and every switch is audited. "
             "Note: the entity register lists plans by original creation date, so a switched-to "
             "older version keeps its original position, not the top."
         ))
 
-    _canonicalize_plan_id = field_validator("plan_id")(_canonical_guid_or_none)
+    _canonicalize_plan_id = field_validator("plan_id")(_canonical_guid)
 
 
 class TreatmentReviewResponse(ApiModel):

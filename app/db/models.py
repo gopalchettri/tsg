@@ -95,6 +95,11 @@ class Scenario_Session(Base):
     # NULL on sessions cancelled before these columns existed.
     CancelledAt: Mapped[datetime | None] = mapped_column(DateTime)
     CancelledBy: Mapped[str | None] = mapped_column(Unicode(200))
+    # Step-4 control mapping is the only reported step that is NOT a plain wall-clock span:
+    # it can resume across several tsg.map_controls_sweep ticks 300s apart, so a StartedAt/
+    # FinishedAt pair would report mostly WAITING. This is the seconds actually spent mapping,
+    # accumulated (+=) once per pass by dal.accumulate_control_map_seconds.
+    ControlMapSeconds: Mapped[float | None] = mapped_column(Float)
 
 
 class Subsystem_Stage_State(Base):
@@ -115,6 +120,17 @@ class Subsystem_Stage_State(Base):
     UpdatedAt: Mapped[datetime] = mapped_column(DateTime)
     # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    # The stage's wall-clock span, and the ONLY source the API uses for per-stage duration.
+    # UpdatedAt cannot substitute: claim_stage, renew_lease, renew_lock_lease, release_lock AND
+    # finish_stage all overwrite it. CreatedAt cannot either: pipeline_common.set_up_progress_
+    # tracking stamps every level at once, so it is a session-creation time.
+    # StartedAt is the start of the attempt that produced the CURRENT result, not a first-attempt
+    # stamp - claim_stage overwrites it on a re-claim, in step with AttemptCount, and clears
+    # FinishedAt at the same time; reset_stage_for_regen clears both. EVERY terminal write stamps
+    # FinishedAt (finish_stage; _record_failure; the reaper uses HeartbeatAt, the last proof of
+    # life) - a static test enforces it, so a stage can never end without an end.
+    StartedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    FinishedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 # ---------------------------------------------------------------------------
 # Pipeline outputs (entity resolved via the session; carry TenantID+SubsystemID)
@@ -145,12 +161,10 @@ class Identified_Threat(Base):
     # validated server-side. Persisted at Stage 1 because accept-time triage runs days later;
     # NULL on legacy rows, where triage falls back to the string-strip.
     GenericName: Mapped[str | None] = mapped_column(Unicode(500))
-    # The AI's description OF THE THREAT (not of its type), written at Stage 1 and copied into
-    # Threat_Catalogue.Description on promotion. Capped at the column so an over-long
-    # AI value is impossible to store rather than merely discouraged. Asset-agnostic by
-    # construction: tasks._description_of drops it when the asset name appears, because the
-    # register is a shared cross-tenant library. NULL on legacy rows.
-    Description: Mapped[str | None] = mapped_column(Unicode(200))
+    # Description was DROPPED 2026-09-05 (user instruction) - the last of the three, after
+    # Threat_Type's and Threat_Catalogue's went on 2026-08-30. Nothing consumed it: promotion
+    # had already stopped copying it when Threat_Catalogue.Description went, leaving the
+    # /results payload as its only reader. The model is no longer asked for it (prompts.py).
     # The category id grounding.find_threat_in_library ALREADY resolves to narrow its type search
     # and used to discard, forcing accept.py to re-derive it from text three separate times.
     # Persisted so every later consumer reads an id instead of matching a string. NULL when the
@@ -280,6 +294,21 @@ class Threat_Scenario(Base):
     # this output; set on every attempt EVEN when zero controls matched, so an output is never
     # re-scanned/re-reranked on later runs. Regen mints a new ScenarioID (stamp NULL) naturally.
     ControlsMappedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    # How many mapping passes this row has survived without a ControlsMappedAt stamp. Same shape
+    # as Subsystem_Stage_State.AttemptCount, applied per-scenario: once >= control_map_max_attempts
+    # control_mapping._under_attempt_limit permanently excludes the row from every future
+    # eligible_outputs/sessions_awaiting_control_mapping call — a HARD CUTOFF by explicit owner
+    # instruction, not a backoff. Recovering a row past the limit needs a regenerate (which mints a
+    # new ScenarioID, so a fresh row starts at 0) — nothing resets this on its own.
+    ControlMapAttempts: Mapped[int] = mapped_column(Integer, default=0)
+    # Per-scenario generation span. The duration is DERIVED (finish - start) and never stored,
+    # so no second number can drift out of agreement with these two.
+    # These OVERLAP across rows: generation fans out scenario_generation_concurrency (default 5)
+    # at a time, so several rows share a GenStartedAt and summing their durations exceeds the
+    # stage's wall clock. That is why no scenario-total field is published anywhere - use the
+    # SCENARIOS stage span for "how long the stage took".
+    GenStartedAt: Mapped[datetime | None] = mapped_column(DateTime)
+    GenFinishedAt: Mapped[datetime | None] = mapped_column(DateTime)
     # Per-scenario review decision, independent of the session that produced the row: a reviewer
     # decides each scenario on their own schedule, so the verdict lives here, not on the session.
     # Both NULL = pending (nobody has looked) — which is what makes "seen and not chosen"
@@ -479,7 +508,8 @@ class Threat_Catalogue(Base):
     ThreatTypeID: Mapped[int] = mapped_column(Integer)
     ThreatName: Mapped[str] = mapped_column(Unicode(500))
     # Description was DROPPED 2026-08-30. It had fed the embedded passage
-    # (embeddings.catalogue_passage_text) and the validator prompt; both are now name-only.
+    # (embeddings.catalogue_passage_text) and the since-removed LLM validator prompt;
+    # the passage is now name-only.
     # SectorID was DROPPED the same day — same rule as Threat_Type.SectorID above
     # (sector logic removed 2026-08, user instruction).
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)

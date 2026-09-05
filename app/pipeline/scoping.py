@@ -4,9 +4,10 @@ Score = base score + grounding-confidence weight, ranked descending, with an opt
 floor. The old `Config_Threat_Rule` engine (tech_gates and relevance weights) was REMOVED
 2026-08: rule evaluation read only supporting systems and never the asset's own declared type,
 so on mixed assets the gates silently deleted correct threats (all 17 OT-gated types off an OT
-asset whose supporting systems were IT). Asset-level relevance is the Stage-1a LLM validator's
-job (tasks._validate_candidates) — its failure mode is visible extra candidates, never an
-invisible omission, which is the property a GRC assessment cannot trade away.
+asset whose supporting systems were IT). Asset-level relevance is Stage-1a's relevance gate's
+job (threat_retrieval.score_relevance + the gate in tasks.find_threats) — its failure mode is
+visible extra candidates, never an invisible omission, which is the property a GRC assessment
+cannot trade away.
 
 Same inputs → same ranking.
 """

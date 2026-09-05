@@ -125,12 +125,19 @@ def test_unverified_llm_model_also_kills_the_process(monkeypatch):
     assert caught.value.args[0] == 1, "an unverified model must exit non-zero, not report ready"
 
 
-def test_intel_refresh_is_never_auto_scheduled():
-    """threat-intel fetching is admin-triggered only (POST /v1/tsg/threat-intel/feeds/refresh
-    and .../feeds/{feed}/refresh) — same posture as grounding calibration. beat_schedule builds
-    this dict unconditionally at import time (no intel_enabled branch left in it at all), so a
-    single check pins the guarantee — intel_enabled now only gates prompt injection
-    (tasks.py::_fetch_intel), never scheduling."""
+def test_intel_refresh_is_scheduled_only_by_an_explicit_interval():
+    """threat-intel fetching is admin-triggered (POST /v1/tsg/threat-intel/feeds/refresh and
+    .../feeds/{feed}/refresh) UNLESS TSG_INTEL_REFRESH_INTERVAL_SECONDS > 0, in which case beat
+    runs the same fan-out on that period (SDD §33: configured source refresh on a scheduler).
+    beat_schedule is built at import from Settings, so the check pins the entry to the live
+    setting: absent at 0, present with exactly the configured period otherwise. intel_enabled
+    only gates prompt injection (tasks.py::_fetch_intel), never scheduling."""
+    from app.core.config import get_settings
     from app.pipeline import celery_app
 
-    assert "intel-refresh" not in celery_app.celery_app.conf.beat_schedule
+    interval = get_settings().intel_refresh_interval_seconds
+    entry = celery_app.celery_app.conf.beat_schedule.get("intel-refresh")
+    if interval > 0:
+        assert entry == {"task": "tsg.intel_refresh_all", "schedule": interval}
+    else:
+        assert entry is None

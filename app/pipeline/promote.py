@@ -126,8 +126,19 @@ def _promote_threat(sess: Session, threat: Any, type_id: int, category_id: int |
     catalogue_id = threat.ThreatCatalogueID
     if catalogue_id is not None and dal.catalogue_active(sess, catalogue_id):
         row = sess.execute(
-            select(m.Threat_Catalogue.ThreatName)
+            select(m.Threat_Catalogue.ThreatName, m.Threat_Catalogue.ThreatTypeID)
             .where(m.Threat_Catalogue.ThreatCatalogueID == catalogue_id)).first()
+        if row is not None and row.ThreatTypeID != type_id:
+            # The type this row pointed to was retired since generation and _promote_type just
+            # minted a replacement — repoint the row so it can never disagree with the type this
+            # promotion reports using. Name/category/standards are untouched: this is the one FK
+            # the app itself must keep valid, not curator-owned content.
+            sess.execute(
+                update(m.Threat_Catalogue)
+                .where(m.Threat_Catalogue.ThreatCatalogueID == catalogue_id)
+                .values(ThreatTypeID=type_id))
+            log.info("promote.catalogue_retyped", catalogue_id=catalogue_id,
+                    old_type_id=row.ThreatTypeID, new_type_id=type_id)
         return ({"id": catalogue_id,
                 "name": row.ThreatName if row else threat.ThreatName,
                 "type_id": type_id, "category_id": category_id,
@@ -221,9 +232,9 @@ def _read_controls(sess: Session, scenario_id: str) -> list[dict[str, Any]]:
         .join(lib, lib.ControlLibraryID == cmap.ControlLibraryID)
         .where(cmap.ScenarioID == scenario_id)
         .order_by(cmap.MapRank)).all()
-    return [{"ControlLibraryID": r.ControlLibraryID, "ControlCode": r.ControlCode,
-            "Domain": r.Domain, "ControlName": r.ControlName,
-            "MapRank": r.MapRank, "Score": r.Score} for r in rows]
+    return [{"control_id": r.ControlLibraryID, "control_code": r.ControlCode,
+            "domain": r.Domain, "control_name": r.ControlName,
+            "map_rank": r.MapRank, "score": r.Score} for r in rows]
 
 
 def promote_scenario_to_library(sess: Session, scenario_session: dict, scenario_id: str,
@@ -276,7 +287,7 @@ def promote_scenario_to_library(sess: Session, scenario_session: dict, scenario_
                             "statuses": {"threat_type": type_entry["status"],
                                             "threat": threat_entry["status"]},
                             "actor_ids": [a["id"] for a in actor_entries if a.get("id")],
-                            "control_ids": [c["ControlLibraryID"] for c in controls],
+                            "control_ids": [c["control_id"] for c in controls],
                             "source": "promote-to-library"}))
     sess.commit()
 

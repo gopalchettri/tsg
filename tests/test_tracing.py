@@ -19,6 +19,9 @@ import json
 import logging
 import os
 import sys
+import threading
+import time
+import uuid
 
 import pytest
 
@@ -187,3 +190,33 @@ def test_render_full_is_ascii_safe():
     unencodable character must not kill the traced call site."""
     rendered = tracing._render_full({"t": "Unauthorised setpoint — SCADA", "e": "\U0001F6E1"})
     assert rendered.isascii()
+
+
+def test_concurrent_first_use_attaches_exactly_one_handler(sinks, tmp_path, monkeypatch) -> None:
+    """open_rotating_writer was a check-then-act with no lock. trace_step("SCENARIO") now fires
+    from five greenlets at once and dal.claim_stage/finish_stage from concurrent API threads, so
+    a cold stem got N handlers: every line written N times, and N rotations fighting over one
+    file. A slow handler constructor widens the window so the race is deterministic: 8 before
+    the lock, 1 with it."""
+    sinks("file", tmp_path)
+    real = tracing.RotatingFileHandler
+
+    class _Slow(real):
+        def __init__(self, *a, **k):
+            time.sleep(0.3)                    # every thread passes the empty check meanwhile
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(tracing, "RotatingFileHandler", _Slow)
+    stem = f"race-{uuid.uuid4().hex}-{{pid}}.txt"
+    gate = threading.Barrier(8)
+
+    def go():
+        gate.wait()
+        tracing.open_rotating_writer(stem)
+
+    threads = [threading.Thread(target=go) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(logging.getLogger(f"tsg.tracefile.{stem}").handlers) == 1

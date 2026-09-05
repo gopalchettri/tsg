@@ -50,6 +50,7 @@ from app.db import models as m
 from app.pipeline import grounding, prompts
 from app.pipeline import llm as llm_mod
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
+from app.pipeline.pipeline_common import TRANSIENT_INFRA_ERRORS, log_transient_infra_retry
 from app.pipeline.tasks import ASSET_UNIT_ID, _ask_ai, _classify_llm_failure
 from app.pipeline.validation import LLMResponseParseError
 from app.sse import bus
@@ -673,7 +674,7 @@ def _plan_result_event(row, plan_id: str, status: StageStatus,
     can assert it against TreatmentPlanResultEvent without a bus or a DB. StrEnum members serialize
     as their value, so no str() conversion is needed here."""
     event = {"type": SSEEventType.treatment_plan_result,
-            "session_id": row["SessionID"], "ScenarioID": row["ScenarioID"],
+            "session_id": row["SessionID"], "scenario_id": row["ScenarioID"],
             "plan_id": plan_id, "status": status, "ts": dal.now().isoformat()}
     if reason is not None:
         event["reason"] = reason
@@ -718,8 +719,9 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
     """One plan attempt: claim CAS → prompt from the frozen snapshot → validate → inject the
     server-owned keys → finish CAS. Safe under acks_late redelivery AND autoretry (both
     re-run with the SAME task id — the claim's own-task branch resumes them; a bare read here
-    would run two LLM calls in parallel). LLMSlotUnavailable propagates for Celery's
-    autoretry; everything else parks the row in ERROR with a client-safe message."""
+    would run two LLM calls in parallel). LLMSlotUnavailable and TRANSIENT_INFRA_ERRORS both
+    propagate for Celery's autoretry; everything else parks the row in ERROR with a
+    client-safe message."""
     settings = get_settings()
     if not dal.claim_plan(sess, plan_id, task_id, _stale_cutoff()):
         sess.rollback()
@@ -797,6 +799,14 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
     except LLMSlotUnavailable:
         sess.rollback()
         raise  # Celery autoretry; the claim's own-task branch resumes on the retry
+    except TRANSIENT_INFRA_ERRORS as exc:
+        # Same contract as run_pipeline/next_set/regenerate: a DB blip mid-attempt is not a
+        # broken plan — re-raise for Celery's autoretry. claim_plan's own-task branch (dal.py)
+        # resumes the SAME task id cleanly, identical to the LLMSlotUnavailable path above.
+        sess.rollback()
+        log_transient_infra_retry(site="treatment.generation", session_id=row["SessionID"],
+                                subsystem_id=ASSET_UNIT_ID, exc=exc)
+        raise
     except Exception as exc:  # noqa: BLE001 — terminal: park the row, never crash the worker
         sess.rollback()  # discards only post-_ask_ai work; the Prompt_Log commit already landed
         reason, client_msg = _classify_failure(exc)
@@ -885,9 +895,14 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     assert any("control_type" in w for w in warns) and any("priority" in w for w in warns)
     assert any("applicable_to_all_subsystems" in w for w in warns)
     assert any("covered" in w for w in warns)  # covered + non-empty controls flagged
-    assert _validate_plan({
+    # Structurally clean AND fully covered — but the prompt still mandates at least one action
+    # (a verification action when coverage is "covered"), so an empty table still warns.
+    covered_no_actions = _validate_plan({
         "controls_to_be_implemented": {"control_coverage": "covered", "controls": []},
-        "remediation_action_plan": [], "applicable_to_all_subsystems": "Yes"}) == []
+        "remediation_action_plan": [], "applicable_to_all_subsystems": "Yes"})
+    assert covered_no_actions == ["remediation_action_plan is empty — the prompt mandates at "
+                                "least one action (verification actions when coverage is "
+                                "'covered')"], covered_no_actions
     try:
         _validate_plan({"controls_to_be_implemented": {"control_coverage": "gaps",
                                                         "controls": "nope"}})
@@ -950,7 +965,11 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     leaked = _clip("apply patches. db_password=Hunter2SecretValue then reboot")
     assert leaked is not None and "Hunter2SecretValue" not in leaked
     _cap = get_settings().treatment_free_text_cap
-    assert len(_clip("x" * (_cap + 500)) or "") == _cap
+    # Truncated length is cap + the appended " [truncated]" marker, not cap itself — the marker
+    # is deliberate (never silent, see _clip's docstring), so the self-check must expect it.
+    _marker = " [truncated]"
+    clipped = _clip("x" * (_cap + 500)) or ""
+    assert clipped.endswith(_marker) and len(clipped) == _cap + len(_marker), clipped
 
     # TreatmentConflict carries its wire reason.
     tc = TreatmentConflict("busy", reason=TreatmentGateReason.generation_in_progress)

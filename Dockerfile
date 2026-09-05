@@ -30,6 +30,16 @@ COPY app ./app
 COPY scripts ./scripts
 RUN pip install -r requirements.lock && pip install -e ".[${EXTRAS}]"
 
+# Source-protection: compile the application to bytecode and remove the .py
+# sources from the final image. Deterrent only (bytecode decompiles), not a
+# real security boundary — pair with not granting docker exec/image access
+# to anyone outside the operator. scripts/ is deliberately left as plain
+# .py: those are ops/preflight helpers (e.g. scripts/uat_preflight.py), not
+# product logic, and stay directly runnable for verification.
+RUN python -m compileall -b -q app \
+ && find app -name '*.py' -delete \
+ && find app -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+
 # Run as a non-root user. OpenShift's restricted-v2 SCC assigns a RANDOM uid in group 0,
 # so /app must be group-0 writable (chmod g=u) — uid 10001 is only the non-OpenShift default.
 RUN useradd -u 10001 -m appuser && chown -R appuser:0 /app && chmod -R g=u /app

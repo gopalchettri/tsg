@@ -57,6 +57,7 @@ from app.core import tuning
 from app.core.config import get_settings
 from app.core.enums import (
     AuditEventType,
+    ControlMappingExhaustionReason,
     RegenGranularity,
     ReviewGateReason,
     SessionMode,
@@ -214,6 +215,33 @@ def _wire_stage_status(status: str) -> str:
     return str(StageStatus.COMPLETE) if status == StageStatus.AWAITING_DECISION else str(status)
 
 
+def _stage_timings(session_id: str, rows, control_seconds) -> dict[str, float] | None:
+    """progress.timings: seconds per step, DERIVED from the stored stamps so no stored duration
+    can disagree with them. A step is absent until it has both ends ("not measured", never 0.0);
+    `controls` comes off the session because control mapping owns no stage row.
+
+    A span that comes out NEGATIVE is withheld and logged with both stamps: it is two stamps from
+    different attempts (a reset that kept an old FinishedAt) or from two workers' clocks (claim on
+    A, finish on B after a retry), not a duration - and a number that reads as one is worse than
+    a hole. dal.span_seconds refuses it; this is where the operator finds out why.
+    """
+    timings: dict[str, float] = {}
+    for row in rows:
+        level = str(row["Level"]).lower()
+        started, finished = row["StartedAt"], row["FinishedAt"]
+        if started and finished and finished < started:
+            log.warning("progress.negative_stage_span", session_id=session_id, level=level,
+                        started_at=started.isoformat(), finished_at=finished.isoformat())
+            continue
+        seconds = dal.span_seconds(started, finished)
+        if seconds is not None:
+            timings[level] = seconds
+    if control_seconds is not None:
+        # Summed working seconds across sweep passes, NOT a span - see the field description.
+        timings["controls"] = round(float(control_seconds), 2)
+    return timings or None
+
+
 def build_board(sess: Session, scenario_session: dict) -> dict:
     """The GET /sessions/{id} payload and the SSE reconnect-reconcile source.
 
@@ -235,7 +263,8 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
     # `error_message` as `Optional[str]` hard-fails to parse the response the moment this ships.
     # See docs/SSE_SESSION_PROGRESS_CONTRACT_GUIDE.md.
     error_messages: dict[str, str] = {}
-    for row in dal.stage_rows(sess, scenario_session["SessionID"]):
+    rows = dal.stage_rows(sess, scenario_session["SessionID"])   # read once; timings ride it too
+    for row in rows:
         level = str(row["Level"]).lower()
         stages[level] = str(row["Status"])
         if row["ErrorMessage"]:
@@ -266,6 +295,14 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
             # session-level roll-up a UI waits on before rendering the finished card.
             "controls": dal.control_mapping_progress(sess, scenario_session["SessionID"]),
             "error_message": error_messages,
+            # ADDITIVE, like coverage below - an old client that ignores it behaves as before.
+            # Seconds per step. `controls` is the ONE entry that is not a wall-clock span: control
+            # mapping resumes across sweep ticks 300s apart, so it reports the seconds actually
+            # SPENT mapping (dal.accumulate_control_map_seconds). See the field description.
+            # Deliberately NO scenario total: generation runs several at a time, so per-scenario
+            # durations overlap and summing them would contradict `scenarios` here.
+            "timings": _stage_timings(scenario_session["SessionID"], rows,
+                                      scenario_session.get("ControlMapSeconds")),
             # The DURABLE answer to "what did my last 'generate next set' click do?". The SSE
             # next_set_result event says the same thing, but publishing is best-effort with no
             # replay (app/sse/bus.py), so a polling client — or one whose stream dropped — has
@@ -431,7 +468,11 @@ def _scenario_select():
     out, st, it = m.Threat_Scenario, m.Scoped_Threat, m.Identified_Threat
     return select(
         out.ScenarioID, out.ScenarioJSON, out.Accepted, out.ValidationJSON, out.GenerationEpoch,
-        out.ScenarioNumber, out.ReplacesScenarioID, out.ControlsMappedAt, out.ScenarioSource,
+        out.ScenarioNumber, out.ReplacesScenarioID, out.ControlsMappedAt, out.ControlMapAttempts,
+        out.ScenarioSource,
+        # Per-scenario generation span. gen_seconds is derived from these on the way out
+        # (dal.span_seconds) rather than stored, so there is only ever one version of the fact.
+        out.GenStartedAt, out.GenFinishedAt,
         # WHO decided, and when — rides this SELECT, so /results gains it at no extra round trip.
         out.AcceptedAt, out.AcceptedBy, out.RejectedAt, out.RejectedBy,
         # ONE shared threat-column list (dal.scenario_threat_columns) for all three scenario
@@ -788,7 +829,6 @@ def _threat_block(threat_row: dict | None) -> dict | None:
         "threat_category_id": threat_row.get("ThreatCategoryID"),
         "threat_type": threat_row.get("ThreatType"),
         "threat_name": threat_row.get("ThreatName"),
-        "description": threat_row.get("Description"),
         "threat_type_id": threat_row.get("ThreatTypeID"),
         "library_threat_type": threat_row.get("LibraryThreatType"),
         "library_threat_name": threat_row.get("LibraryThreatName"),
@@ -853,6 +893,11 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                     actor_ids: dict[str, int] | None = None,
                     *, unavailable: bool = False) -> ScenarioResult:
     controls_mapped = row["ControlsMappedAt"] is not None
+    # .get(): not every select feeding this builder carries ControlMapAttempts yet — absent
+    # reads as 0 attempts, i.e. never exhausted, same "missing column = safe default" contract
+    # accepted_by/accepted_at etc. already use just below.
+    controls_mapping_exhausted = (not controls_mapped and row.get("ControlMapAttempts", 0)
+                                >= get_settings().control_map_max_attempts)
     checked, flagged, categories = _moderation_summary(row["ValidationJSON"])
     validation_status, validation_errors = _validation_summary(row["ValidationJSON"])
     return ScenarioResult(scenario_id=row["ScenarioID"],
@@ -872,6 +917,11 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                         validation_status=validation_status, validation_errors=validation_errors,
                         generation_epoch=row["GenerationEpoch"],
                         scenario_number=row["ScenarioNumber"],
+                        # .get(), same reason as accepted_by above: more than one select feeds
+                        # this builder, and a row without the columns publishes null.
+                        gen_started_at=row.get("GenStartedAt"),
+                        gen_finished_at=row.get("GenFinishedAt"),
+                        gen_seconds=dal.span_seconds(row.get("GenStartedAt"), row.get("GenFinishedAt")),
                         # NULL on every row written before the scenario library existed, and
                         # those were all authored for their own asset — so the legacy reading
                         # is "generated", not "unknown".
@@ -881,6 +931,10 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                         # documented "the library genuinely has nothing" — a claim we cannot make
                         # when the read never returned.
                         controls_unavailable=unavailable,
+                        controls_mapping_exhausted=controls_mapping_exhausted,
+                        controls_mapping_exhaustion_reason=(
+                            ControlMappingExhaustionReason.retry_budget_exhausted
+                            if controls_mapping_exhausted else None),
                         replaced_scenarios=replaced or [])
 
 
@@ -924,7 +978,8 @@ def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depend
 def post_promote_to_library(session_id: str, scenario_id: str,
                             principal: Principal = Depends(get_principal)) -> LibraryPromotionResponse:
     """Add this ACCEPTED scenario's threat type and threat to the library — Threat_Type for a
-    new type, Threat_Catalogue for a new threat (Description = the AI's threat wording), a
+    new type, Threat_Catalogue for a new threat (name only - the catalogue's Description
+    column was dropped 2026-08-30), a
     Threat_Catalogue_Category_Map row for its resolved category, and ThreatType_ThreatActor_Map
     links for its stored actors (actors attach per TYPE in this model). The ONLY library write
     path; every call is recorded in Scenario_Audit (who, when, per-item outcome).

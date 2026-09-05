@@ -206,7 +206,7 @@ def test_the_builder_actually_maps_the_columns_onto_the_wire_fields():
         "LibraryThreatName": None, "ScenarioJSON": None, "SessionID": "s1", "EntityID": "86",
         "UserID": CREATOR, "SessionStatus": "completed", "ScenarioNumber": 1,
         "Accepted": 1, "Superseded": 0, "CreatedAt": None, "ThreatActorsJSON": None,
-        "ThreatID": None, "ThreatCategory": None, "ThreatCategoryID": None, "Description": None,
+        "ThreatID": None, "ThreatCategory": None, "ThreatCategoryID": None,
         "GroundingStatus": None, "GroundingScore": None, "IsThreatAIGenerated": None,
         "Score": None, "ScopeRank": None, "ControlsMappedAt": None,
         "AcceptedBy": OTHER, "AcceptedAt": None, "RejectedBy": None, "RejectedAt": None,

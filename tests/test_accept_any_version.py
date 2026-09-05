@@ -472,8 +472,32 @@ def _seed_threat(Session, sid: str, *, type_id: int | None = None,
 
 
 def test_accept_refused_when_threat_type_is_inactive(monkeypatch):
-    """A curator retired the type between generation and accept: the gate must 409, not let
-    the accept silently succeed against a master row that no longer exists in good standing."""
+    """A curator retired (hard-deleted) the type between generation and accept: the gate must
+    409, not let the accept silently succeed against a master row that no longer exists in good
+    standing. Retirement here is IsDeleted=True, not IsActive=False: an AI-promoted type also
+    starts IsActive=False (pending review, dal.upsert_threat_type) and must NOT trip this gate —
+    only a genuinely deleted type should."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, _d = _versions_abcd(Session, sid)
+    with Session() as s:
+        s.execute(m.Threat_Type.__table__.insert().values(
+            ThreatTypeID=7, ThreatTypeName="Setpoint manipulation",
+            IsActive=False, IsDeleted=True))
+        s.commit()
+    _seed_threat(Session, sid, type_id=7)
+
+    with pytest.raises(MasterInactive) as exc_info:
+        _accept(Session, sid, [b], monkeypatch)
+    assert "Threat_Type inactive" in str(exc_info.value)
+    assert _flags(Session, b)[0] == 0, "nothing is written when the gate refuses"
+
+
+def test_accept_allowed_when_threat_type_is_pending_review(monkeypatch):
+    """A type promote-to-library just minted starts IsActive=False, IsDeleted=False (pending
+    curator review, not deleted) — accepting a session that references it must still succeed;
+    only IsDeleted marks a type as gone for this gate."""
     engine = _engine()
     Session = sessionmaker(bind=engine, future=True)
     sid = _seed_session(Session)
@@ -485,10 +509,9 @@ def test_accept_refused_when_threat_type_is_inactive(monkeypatch):
         s.commit()
     _seed_threat(Session, sid, type_id=7)
 
-    with pytest.raises(MasterInactive) as exc_info:
-        _accept(Session, sid, [b], monkeypatch)
-    assert "Threat_Type inactive" in str(exc_info.value)
-    assert _flags(Session, b)[0] == 0, "nothing is written when the gate refuses"
+    matched = _accept(Session, sid, [b], monkeypatch)
+    assert matched == 1
+    assert _flags(Session, b)[0] == 1, "a pending (not deleted) type must not block accept"
 
 
 def test_accept_refused_when_catalogue_row_is_deleted(monkeypatch):

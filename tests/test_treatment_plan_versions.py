@@ -1,7 +1,7 @@
 """Treatment-plan route split + accept-any-version (plan eager-swimming-acorn, phase 2).
 
 Create is first-generation-only, /regenerate takes an EMPTY body (register data carried from
-the ACTIVE version's frozen snapshot), and review's optional plan_id makes approving a historical
+the ACTIVE version's frozen snapshot), and review's REQUIRED plan_id makes approving a historical
 COMPLETE version the atomic version switch. Real SQLite tables + the partial unique index
 UX_TreatmentPlan_ActiveScenario (the ORM declares no indexes — without creating it here the race
 tests would be toothless), route functions exercised directly with db_session/get_authorized_session
@@ -16,16 +16,24 @@ from datetime import UTC, date, datetime
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import create_engine, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
 import app.api.treatment as treatment_api
 from app.api.deps import Principal
 from app.api.schemas import TreatmentPlanBody, TreatmentPlanRegenerateBody, TreatmentReviewBody
-from app.core.enums import AuditEventType, SessionStatus, StageStatus, TreatmentGateReason
+from app.core.enums import (
+    AuditEventType,
+    SessionStatus,
+    StageStatus,
+    TreatmentGateReason,
+    TreatmentOutcomeReason,
+)
 from app.db import dal
 from app.db import models as m
+from app.pipeline import celery_app
 from app.pipeline import treatment as treatment_mod
 from app.sse import bus
 
@@ -300,8 +308,51 @@ def _two_complete_versions(Session, monkeypatch) -> tuple[str, str]:
     return p1, p2
 
 
-def _review(plan_id=None, decision="approved") -> TreatmentReviewBody:
+def _review(plan_id, decision="approved") -> TreatmentReviewBody:
+    """plan_id is positional and REQUIRED, mirroring the wire contract — a default here would let
+    a test assert behaviour the API itself refuses to accept."""
     return TreatmentReviewBody(decision=decision, plan_id=plan_id)
+
+
+def test_review_without_a_plan_id_is_rejected_at_the_schema_boundary():
+    """The verdict must always name its version: 'whatever is active now' would let a
+    regeneration landing between the reviewer's GET and this POST move the approval onto a plan
+    nobody read. Pinned here because the route can no longer express the missing-id case."""
+    with pytest.raises(ValidationError):
+        TreatmentReviewBody(decision="approved")
+
+
+def test_a_malformed_plan_id_is_a_422_not_a_driver_error():
+    """_canonical_guid lost its None branch when the field became required; the malformed-input
+    path is the one that still has to die cleanly at the boundary."""
+    with pytest.raises(ValidationError):
+        TreatmentReviewBody(decision="approved", plan_id="not-a-guid")
+
+
+def test_history_entries_carry_the_scenario_and_their_own_generator(monkeypatch):
+    """End-to-end proof of the version PICKER, through the real route.
+
+    Choosing which version to adopt (the plan_id below) is only possible if the history entries
+    say what they are. They used to come back with scenario=null and created_by=null, because
+    dal.superseded_plan_rows carries no scenario join and did not select UserID — so every entry
+    looked identical apart from a timestamp. The scenario is version-independent, so the route
+    overlays the active row's single copy instead of re-hauling the blob per version."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    p1, p2 = _two_complete_versions(Session, monkeypatch)
+
+    resp = treatment_api.get_treatment_plan(SESSION_ID, SCENARIO_ID, include_superseded=True,
+                                            principal=_principal())
+
+    assert resp.plan_id == p2 and [e.plan_id for e in resp.superseded] == [p1]
+    older = resp.superseded[0]
+    assert older.scenario is not None, "a history entry with no scenario cannot be told from any other"
+    assert older.scenario.model_dump() == resp.scenario.model_dump()  # same scenario, both versions
+    assert older.created_by == "u1"                                   # who generated THAT version
+    assert older.progress is None                                     # history has no live lifecycle
+    assert resp.progress is not None                                  # the active plan still does
 
 
 def test_approve_historical_complete_swaps_atomically(monkeypatch):
@@ -467,6 +518,106 @@ def test_index_arbitrates_double_active_insert():
     with Session() as s, pytest.raises(IntegrityError):
         s.execute(m.Risk_Treatment_Plan.__table__.insert().values(**_plan_row(str(uuid.uuid4()))))
         s.flush()
+
+
+def test_generation_retries_transient_infra_error_instead_of_failing_the_plan(monkeypatch, caplog):
+    """A transient DB error (deadlock/connection reset) mid-attempt must re-raise for Celery's
+    autoretry — NOT be parked as a permanent ERROR — and the row must stay claimable under the
+    SAME task id, the retry path. Same contract as run_pipeline/next_set/regenerate."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    plan_id = _create(Session, monkeypatch).plan_id
+    task_id = "worker-task-1"
+
+    class _BoomLLM:
+        def chat(self, *a, **k):
+            raise OperationalError("SELECT ...", {}, Exception("deadlock victim"))
+
+    with Session() as s:
+        with pytest.raises(OperationalError):
+            treatment_mod.run_treatment_generation(s, plan_id, _BoomLLM(), task_id)
+
+        row = s.execute(select(m.Risk_Treatment_Plan.__table__)
+                        .where(m.Risk_Treatment_Plan.PlanID == plan_id)).mappings().one()
+        assert row["Status"] == str(StageStatus.RUNNING), \
+            "a transient blip must never park the plan as a permanent failure"
+        assert dal.claim_plan(s, plan_id, task_id, treatment_mod._stale_cutoff()), \
+            "plan must stay claimable under the same task id for Celery's retry"
+
+    assert any("transient_infra_error_retrying" in r.getMessage()
+               and "database_transient" in r.getMessage()
+               and "OperationalError" in r.getMessage() for r in caplog.records), \
+        "the transient-infra retry must be logged with enum kind and exception class"
+
+
+def test_generate_treatment_plan_task_autoretries_transient_infra_errors():
+    """Config pin: the Celery task must autoretry OperationalError alongside LLMSlotUnavailable —
+    without this, the re-raised transient reaches Celery and the task just FAILS instead of
+    retrying, silently regressing the resilience contract."""
+    assert OperationalError in celery_app.generate_treatment_plan_task.autoretry_for
+
+
+def _stub_claim_then_raise(exc: Exception):
+    """Fake run_treatment_generation: claims the row (mirrors the real claim_plan side effect
+    the task wrapper's finish_plan CAS depends on), then raises. Lets the exhaustion test drive
+    the Celery task wrapper's own retry-counting logic without a real LLM or snapshot."""
+    def _run(sess, plan_id, llm, task_id):
+        sess.execute(update(m.Risk_Treatment_Plan)
+                    .where(m.Risk_Treatment_Plan.PlanID == plan_id)
+                    .values(ActiveTaskID=task_id))
+        sess.commit()
+        raise exc
+    return _run
+
+
+@pytest.mark.parametrize("exc,expect_transient", [
+    (OperationalError("SELECT ...", {}, Exception("deadlock victim")), True),
+    (treatment_mod.LLMSlotUnavailable("no slots"), False),
+])
+def test_generation_task_exhaustion_uses_generation_failed_never_timed_out(
+        monkeypatch, exc, expect_transient):
+    """On the LAST retry attempt, the task wrapper must park the row ERROR with
+    TreatmentOutcomeReason.generation_failed — for BOTH a transient infra error and slot
+    exhaustion — never `timed_out`. `timed_out` is a READ-TIME projection
+    api.treatment._present_status computes only over a still-RUNNING row with a stalled clock
+    (app/api/treatment.py:605); a row this branch closes is already ERROR, so persisting
+    timed_out here would violate the column's own documented "no writer for it" contract
+    (app/core/enums.py:532-537) and mislabel a real, terminal failure as a silent worker death."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    plan_id = _create(Session, monkeypatch).plan_id
+
+    @contextmanager
+    def fake_db_session():
+        with Session() as s:
+            yield s
+            s.commit()
+
+    # celery_app.py's OWN db_session (app.db.engine's) is separate from treatment_api.db_session
+    # (already pointed at this test's SQLite engine by _wire) — without repointing it here too,
+    # the task's finish_plan call would silently no-op against a different database.
+    monkeypatch.setattr(celery_app, "db_session", fake_db_session)
+    monkeypatch.setattr(celery_app.treatment, "run_treatment_generation",
+                        _stub_claim_then_raise(exc))
+    monkeypatch.setattr(celery_app, "get_llm", lambda: None)
+
+    max_retries = celery_app.generate_treatment_plan_task.max_retries
+    with pytest.raises(type(exc)):
+        celery_app.generate_treatment_plan_task.apply(
+            args=(plan_id,), retries=max_retries, throw=True)
+
+    row = _plans(Session)[0]
+    assert row["Status"] == str(StageStatus.ERROR)
+    assert row["ErrorReason"] == str(TreatmentOutcomeReason.generation_failed), \
+        "exhausted retries must close the row generation_failed, never timed_out"
+    if expect_transient:
+        assert "database issue" in row["ErrorMessage"]
+    else:
+        assert "AI service" in row["ErrorMessage"]
 
 
 def test_gate_text_covers_every_raisable_member():

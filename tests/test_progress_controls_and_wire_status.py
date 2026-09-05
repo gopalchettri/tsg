@@ -102,16 +102,18 @@ class _CountSession:
 
 
 class _FakeSession:
-    """Returns one (total, mapped) aggregate — the shape control_mapping_progress selects."""
+    """Returns one (total, mapped, exhausted) aggregate — the shape control_mapping_progress
+    selects. `exhausted` defaults to 0 so every pre-existing PENDING/RUNNING/COMPLETE case here
+    can stay written as a plain (total, mapped) pair."""
 
-    def __init__(self, total, mapped):
-        self._row = (total, mapped)
+    def __init__(self, total, mapped, exhausted=0):
+        self._row = (total, mapped, exhausted)
 
     def execute(self, *_a, **_k):
         return _FakeResult(self._row)
 
 
-def test_controls_progress_covers_the_three_states():
+def test_controls_progress_covers_the_three_non_error_states():
     cases = [
         ((0, 0), ControlMappingStatus.PENDING),   # no scenarios yet
         ((6, 0), ControlMappingStatus.PENDING),   # written, none mapped
@@ -126,5 +128,14 @@ def test_controls_progress_covers_the_three_states():
 def test_a_null_sum_is_treated_as_pending_not_complete():
     """SUM() over zero rows is NULL, not 0. Coercing that to COMPLETE would tell a client the
     card is ready before a single scenario exists."""
-    assert dal.control_mapping_progress(_FakeSession(0, None), "s") == str(
+    assert dal.control_mapping_progress(_FakeSession(0, None, None), "s") == str(
         ControlMappingStatus.PENDING)
+
+
+def test_exhausted_outranks_running_and_complete_alike():
+    """Priority order is load-bearing here too, same discipline get_overall_status uses above: a
+    scenario stuck past its fast retry budget must be surfaced as ERROR even while OTHER
+    scenarios in the same session are still mid-flight or every one of them is otherwise mapped —
+    an operator needs to see it now, not once the rest of the session finishes."""
+    assert dal.control_mapping_progress(_FakeSession(6, 2, 1), "s") == str(ControlMappingStatus.ERROR)
+    assert dal.control_mapping_progress(_FakeSession(6, 6, 1), "s") == str(ControlMappingStatus.ERROR)

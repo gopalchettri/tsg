@@ -2,20 +2,17 @@ from __future__ import annotations
 
 import difflib
 import json
-import math
-import re
 from collections.abc import Callable
-from typing import Any, NamedTuple, overload
+from datetime import datetime
+from typing import Any, NamedTuple
 
 from sqlalchemy import func, insert, update
 from sqlalchemy.orm import Session
 
-from app.core import stride, tuning
+from app.core import tuning
 from app.core.config import get_settings
 from app.core.enums import (
     AuditEventType,
-    DuplicateReason,
-    GroundingStatus,
     ScenarioStatus,
     ScopingRejection,
     SelectionReason,
@@ -30,57 +27,77 @@ from app.core.security import _redact_value, is_placeholder
 from app.core.tracing import trace_step
 from app.db import dal
 from app.db import models as m
-from app.db.dal import execute_dml, guid, now
+from app.db.dal import execute_dml, guid, now, span_seconds
 from app.db.engine import db_session
+from app.intel import fetchers as intel
+from app.intel.fetchers import IntelTerms
 from app.pipeline import (
     control_mapping,
-    coverage,
-    grounding,
     prompts,
     scoping,
-    threat_retrieval,
     validation,
 )
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable, Provenance, moderate
+
+# --- Structure pass: Stage-1 threat identification and the shared stage primitives live
+# --- in their own modules now. These RE-EXPORTS keep every external import path working
+# --- unchanged: dal.identity_hash lazily imports tasks._dedup_key, promote.py imports
+# --- asset_agnostic_name, cascade.py calls tasks.find_threats/tasks.threat_label, and
+# --- the tests import the underscored helpers — all via `app.pipeline.tasks`, as before.
+# --- The per-name F401 suppressions below say the same thing to ruff: re-export, not dead
+# --- import. They sit only on names this module does not itself call (RUF100 removes any
+# --- that stops being needed), so the list stays honest as the split settles.
+from app.pipeline.pipeline_common import (
+    _EPOCH,
+    _WORK_LEVELS,
+    ASSET_UNIT_ID,
+    TRANSIENT_INFRA_ERRORS,
+    _ask_ai,
+    _asset_boundary_pattern,  # noqa: F401
+    _dedup_key,
+    _normalize,  # noqa: F401
+    _safe_text,  # noqa: F401
+    _send_live_update,
+    _summarize_ai_call,
+    asset_agnostic_name,  # noqa: F401
+    clean_library_name,  # noqa: F401
+    log_transient_infra_retry,
+    set_up_progress_tracking,  # noqa: F401
+    threat_label,  # noqa: F401
+)
+from app.pipeline.threat_identification import (
+    _build_retrieved_records,  # noqa: F401
+    _build_threat_records,  # noqa: F401
+    _duplicate_row,  # noqa: F401
+    _gap_ask,  # noqa: F401
+    _generic_name_of,  # noqa: F401
+    _semantic_duplicates,  # noqa: F401
+    _usable_category,  # noqa: F401
+    _usable_proposal,  # noqa: F401
+    find_threats,
+)
 from app.sse import bus
 
 log = get_logger(__name__)
 
-_EPOCH = 1
-_WORK_LEVELS = (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS)
 _SCENARIO_TEXT_FIELDS = ("scenario_title", "scenario_statement", "risk_statement")
-ASSET_UNIT_ID = 0
 
-#: Prepositions that can appear right before an asset name (e.g. "of X", "from X").
-#: Used by both cleanup steps in asset_agnostic_name so they can't drift out of sync —
-#: they used to be two separate lists that disagreed, which left leftover words like
-#: "from" dangling after the asset name was removed.
-_ASSET_PREPOSITIONS = "of|from|to|in|on|for|against|at"
-
-#: Subsystem fields used to build intel search terms (technology names, vendors, platforms).
-#: Subsystem asset_type is deliberately excluded — it's just an IT/OT label, not a product
-#: name, and is only used to decide is_ot. The asset-level asset_type (free text like
-#: "Power Plant") IS included below. targeted_users/accessability_channel/hosting_location/
-#: managed_by joined 2026-08-27 — kept in sync with threat_retrieval._SUBSYSTEM_QUERY_FIELDS.
+#: Subsystem fields that name a PRODUCT — a vendor, technology or platform — the intel search's
+#: regex tier (IntelTerms.product). Management labels (managed_by, hosting_location,
+#: accessability_channel, targeted_users) were dropped 2026-09-02: "In-house", "Outsourced",
+#: "Internal users" are not product names and only ever matched noise. Subsystem asset_type is
+#: excluded too — it's an IT/OT label; category CODES drive the prefer-order instead. Sector,
+#: sub_sector and critical_service go to IntelTerms.scope (structured equality), never here.
 _INTEL_TECH_FIELDS = ("technology_used", "vendor_name", "database_platforms",
-                    "saas_platform_list", "public_cloud_platforms",
-                    "targeted_users", "accessability_channel", "hosting_location",
-                    "managed_by")
+                    "saas_platform_list", "public_cloud_platforms")
 
-#: Placeholder values the model sends when it has no real name. Compared after stripping
-#: brackets/quotes/punctuation and lowercasing, so "N/A", '["N/A"]', "(none)", "NULL" etc.
-#: all match something here. Add new placeholders to this list only.
-_JUNK_NAME_TOKENS = frozenset({
-    "", "na", "n a", "none", "null", "nil", "tbd", "unknown", "not applicable",
-    "not available", "no name", "no threat", "empty", "NA", "N/A", "N A", "None", "NULL",
-    "Nil", "TBD", "Unknown", "Not Applicable", "[]","{}", "['']", '[""]', "['N/A']", 
-    '["N/A"]', "['None']", '["None"]', "['NULL']", '["NULL"]',
-})
-
-#: Max length for one proposal's text before it's embedded, now Settings.max_proposal_chars
-#: (default unchanged: 3500). Kept <= Settings.max_embed_chars by config.py's own boot-time
-#: validator (_validate_proposal_below_embed_cap) — embed() errors instead of truncating over
-#: that limit, which would lose every threat in the batch, not just the long one.
+#: Inventory dropdown values that name a CATEGORY, not a product. They clear the 4-char minimum
+#: but only ever match noise ("Cloud" hits every pulse tagged `cloud c2`). Compared casefolded;
+#: is_placeholder still handles the NA/Unknown family.
+_GENERIC_INVENTORY_VALUES = frozenset({
+    "cloud", "other", "others", "custom", "custom application", "application", "web application",
+    "database", "internal", "external", "legacy", "in-house", "outsourced", "on-premise",
+    "on-premises", "hybrid", "saas", "paas", "iaas"})
 
 class RegenTarget(NamedTuple):
     scenario_id: str
@@ -104,20 +121,16 @@ class _ScenarioBatch(NamedTuple):
     scoped_count: int
     fold: _ScenarioFold
     entry_vocab: dict
-    intel_terms: list
-    intel_ot: bool
+    intel_terms: IntelTerms
 
 class _Coverage(NamedTuple):
     vocab: dict
     frozen: list | None
     others: list | None
-    # Intel search terms from _intel_vocabulary. Defaults to None/False so old callers that
-    # don't pass this still work — missing terms just mean "no intel block", not a crash.
-    intel_terms: list | None = None
-    intel_ot: bool = False
+    # Intel search terms from _intel_vocabulary. Defaults to None so old callers that don't
+    # pass this still work — missing terms just mean "no intel block", not a crash.
+    intel_terms: IntelTerms | None = None
 
-def _normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip().casefold()
 
 def _flag_sibling_similarity(report: dict, scenario: dict, sibling_texts: list[tuple[int, str]],
                             ratio: float) -> None:
@@ -135,133 +148,6 @@ def _flag_sibling_similarity(report: dict, scenario: dict, sibling_texts: list[t
             return
 
 
-def threat_label(t: dict) -> str:
-    return (t.get("library_threat_name") or t.get("threat_name")
-            or t.get("library_threat_type") or t.get("threat_type") or "")
-
-
-def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
-                        threats: list[dict],
-                        priors: list[dict] | None = None,
-                        asset_name: str = "",
-                        threshold: float | None = None,
-                        compare_within: bool = True) -> dict[str, dict]:
-    """Find threat IDs that mean the same thing as a higher-ranked threat already in this
-    batch or already active on the session. The caller removes these before inserting.
-
-    Returns {threat_id: {"reason": DuplicateReason, "score": float,
-    "duplicate_of_threat_id": str | None}} — the id it matched is only known when the match is a
-    THIS-BATCH sibling or a prior threat carrying its own threat_id; still None otherwise (a
-    prior entry with no id available), same "best-effort" contract as _duplicate_row's caller.
-
-    Why: exact-match dedup (dal.identity_hash) misses paraphrases — "Data leakage from X"
-    and "Unauthorised disclosure of X" would both get inserted as separate threats. This
-    catches those by comparing embeddings of the asset-stripped threat label.
-
-    First-wins: each threat is only compared against threats that survived so far, never
-    against ones already dropped. Similarity isn't transitive (A~B and B~C doesn't mean
-    A~C), so comparing against a dropped item could wrongly chain-drop something. This
-    only works because threats always arrive in a stable, deterministic order.
-
-    compare_within=False turns off that within-`threats` comparison entirely (only `priors`
-    can drop an entry) — for retrieved LIBRARY candidates, whose distinctness from each
-    other the curator already vouched for, so only a match against something OUTSIDE this
-    round's library set should count."""
-    # Labels are compared with the asset name stripped out first (same as grounding does).
-    # Every label ends in "... of <asset name>", so leaving it in mostly just confirms
-    # "same asset" rather than "same threat" — stripping it raised the median similarity
-    # score from 0.814 to 0.899 in testing.
-    #
-    # The drop decision is CATEGORY-BLIND. A shared STRIDE category is a ~1-in-6 coincidence
-    # that says nothing about two threats meaning the same thing, and an earlier design that
-    # judged same-category pairs at a lower bar merged distinct threats that merely share
-    # vocabulary (one real asset run collapsed to 6 survivors, all reasoned
-    # semantic_same_category). Category affects NEITHER the decision NOR the record now:
-    # every semantic drop is written as DuplicateReason.semantic_similarity — the old
-    # same/cross-category reasons survive only as historical row values (enums.py).
-    def _cat(t: dict) -> str:
-        return str(t.get("category") or "").strip().casefold()
-
-    def _key(t: dict) -> str:
-        return asset_agnostic_name(threat_label(t), asset_name) or ""
-
-    raw_entries = [(t.get("threat_id"), _key(t), _cat(t)) for t in threats]
-    # Separate name for the filtered list so the `if tid and lbl` guard is reflected in the
-    # annotation: rebinding the same name keeps the pre-filter `str | None`, and every downstream
-    # use (dupes[tid], tid_of[lbl]) then reads as a possible None key.
-    entries: list[tuple[str, str, Any]] = [(tid, lbl, c) for tid, lbl, c in raw_entries if tid and lbl]
-    prior_entries = [(t.get("threat_id"), _key(t), _cat(t)) for t in (priors or [])]
-    prior_entries = [(tid, lbl, c) for tid, lbl, c in prior_entries if lbl]
-    if not entries or not (prior_entries or len(entries) > 1):
-        return {}
-    labels = [lbl for _tid, lbl, _c in entries]
-    prior = [lbl for _tid, lbl, _c in prior_entries]
-    # The label-clash map resolves to the FIRST holder — the SURVIVOR. On a label clash the
-    # survivor is the prior-round threat, or the first of two identical-label proposals; the
-    # later holder is the one that gets dropped as its duplicate. Last-writer-wins here
-    # corrupted the audit trail: an identical-label duplicate's DuplicateOfThreatID pointed at
-    # ITSELF (a threat never inserted) — the map must name the SURVIVING threat's id, not
-    # whichever entry happened to write the label last.
-    tid_of: dict[str, str] = {}
-    for tid, lbl, _c in prior_entries + entries:
-        if tid and lbl not in tid_of:
-            tid_of[lbl] = tid
-    if threshold is None:  # use the caller's session-tuned value if given, otherwise fall back to config
-        threshold = get_settings().semantic_near_duplicate_threshold
-    # ONE bar for every pair, whatever the categories: real near-duplicates can score LOWER
-    # than two genuinely different threats ("Unauthorized disclosure of X" vs "Unauthorized
-    # modification of X" measured 0.969 — two REAL threats one word apart), so the bar must sit
-    # above that trap for ALL pairs, not just cross-category ones. The session-tuned threshold
-    # can only RAISE it (set it to 1.0 to disable the gate without a deploy), never lower it
-    # below the config base.
-    drop_threshold = max(get_settings().semantic_cross_category_threshold, threshold)
-    try:
-        # `texts` is just the unique strings to embed, so we don't pay to embed the same
-        # label twice. It is NOT a count of how many threats there are — several threats can
-        # share one label. (An earlier version bailed out early whenever there were fewer than
-        # 2 unique texts, which skipped the exact case it was meant to catch: many threats
-        # sharing one label.) The real "nothing to compare" check already happened above;
-        # this just guards against an empty list.
-        texts = list(dict.fromkeys([lbl for lbl in labels if lbl] + prior))
-        if not texts:
-            return {}
-
-        vectors = dict(zip(texts, llm.embed(texts, kind="query")))
-
-        norms = {t: math.sqrt(sum(x * x for x in v)) or 1.0 for t, v in vectors.items()}
-    except Exception:
-        # If the similarity check itself fails, don't block threat generation for it — just
-        # act as if no duplicates were found. Raising here would lose every threat in the round.
-        log.warning("threats.semantic_scan_failed", session_id=sid, subsystem=ss, exc_info=True)
-        return {}
-    dupes: dict[str, dict] = {}
-    kept: list[str] = []  # survivors only — see the first-wins note in the docstring
-    for tid, label, cat in entries:
-        qv = vectors.get(label)
-        if qv is None:
-            kept.append(label)
-            continue
-        for other in prior + (kept if compare_within else []):
-            ov = vectors.get(other)
-            # No check to skip comparing an entry to itself — it isn't needed. `kept` only
-            # gets an entry added after it's confirmed unique, and `prior` was read before
-            # this batch existed, so self-comparison can't happen. (A previous version DID
-            # guard against this by comparing label text, which accidentally also skipped two
-            # genuinely different threats that happened to share identical labels — the
-            # strongest possible duplicate signal, silently ignored.)
-            if ov is None or len(ov) != len(qv):
-                continue
-            score = sum(x * y for x, y in zip(qv, ov)) / (norms[label] * norms[other])
-            if score >= drop_threshold:
-                dupes[tid] = {"reason": DuplicateReason.semantic_similarity, "score": score,
-                            "duplicate_of_threat_id": tid_of.get(other)}
-                log.info("threats.semantic_near_duplicate", session_id=sid, subsystem=ss,
-                        proposed=label, matched=other, category=cat or None,
-                        cosine=round(score, 4), threshold=drop_threshold)
-                break
-        else:
-            kept.append(label)
-    return dupes
 
 
 def _statement_of(scenario_json: str | None) -> str:
@@ -311,873 +197,7 @@ def _flag_cross_threat_similarity(report: dict, scenario: dict, other_texts: lis
             return
 
 
-def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_session: dict,
-            subsystem_id: int, stage: str, level: SubsystemLevel | None = None,
-            epoch: int | None = None, task_id: str | None = None,
-            correlation_id: str | None = None,
-            expected_type: type, temperature: float | None = None) -> tuple[Any, Provenance | None]:
-    
-    sid = scenario_session["SessionID"]
-    if level is not None and epoch is not None and task_id is not None:
-        # All three travel together: renew_lease needs every one of them, so guarding on
-        # `level` alone would hand it None for epoch/task_id on any caller that omitted them.
-        if not dal.renew_lease(sess, sid, subsystem_id, level, epoch, task_id):
-            log.warning("stage.lease_renewal_failed", session_id=sid,
-                        subsystem=subsystem_id, level=str(level))
-        if not dal.renew_lock_lease(sess, sid, subsystem_id, task_id):
-            log.debug("lock.lease_renewal_skipped", session_id=sid, subsystem=subsystem_id)
-    sess.commit()
-    # expected_type controls the LLM provider's JSON mode. Getting this wrong breaks things:
-    # "json_object" mode forces a top-level object, so the threats stage (which expects a
-    # list) would fail every call once JSON mode is on. This parameter is the single source
-    # of truth for which shape is expected.
-    text, prov = llm.chat(messages, temperature=temperature, expected_type=expected_type)
-    if prov is not None:
-        prov.prompt_version = prompts.PROMPT_VERSION
-    row = {
-        "LogID": guid(), "SessionID": scenario_session["SessionID"], "TenantID": scenario_session["TenantID"],
-        "EntityID": scenario_session["EntityID"], "UserID": scenario_session.get("UserID"),
-        "SubsystemID": subsystem_id, "Stage": stage, "PromptVersion": prompts.PROMPT_VERSION,
-        "Messages": json.dumps(messages),
-        "Prompt": "\n\n".join(f"[{msg['role']}]\n{msg.get('content') or ''}" for msg in messages),
-        "ResponseText": text,
-        "Model": prov.model if prov else None, "ModelVersion": prov.model_version if prov else None,
-        "CreatedAt": now(),
-        # Links this log row to one specific item (e.g. a plan ID) so audits can find the
-        # exact attempt without guessing by timestamp. Left as None for stage-level callers.
-        "CorrelationID": correlation_id,
-    }
-    try:
-        parsed = validation.parse_json(text, stage=stage, expected_type=expected_type)
-    except validation.LLMResponseParseError:
-        sess.rollback()
-        dal.insert_row(sess, m.Prompt_Log, {**row, "ParseSucceeded": False})
-        sess.commit()
-        log.warning("llm_response.parse_failed", session_id=scenario_session["SessionID"],
-                    subsystem=subsystem_id, stage=stage)
-        raise
-    dal.insert_row(sess, m.Prompt_Log, {**row, "ParseSucceeded": True})    
-    sess.commit()
-    return parsed, prov
 
-
-def _summarize_ai_call(p: Provenance | None) -> dict | None:
-    return None if p is None else {"model": p.model, "version": p.model_version,
-                                "params": p.params, "prompt_version": p.prompt_version}
-
-
-def _send_live_update(session_id: str, sse_type: SSEEventType, subsystem_id: int,
-        level: SubsystemLevel, status: StageStatus, epoch: int = _EPOCH) -> None:
-    bus.publish(session_id, {
-        "type": str(sse_type), "session_id": session_id, "subsystem_id": subsystem_id,
-        "stage": str(level), "status": str(status), "generation_epoch": epoch,
-        "ts": now().isoformat(),
-    })
-
-
-def set_up_progress_tracking(sess: Session, session_id: str, tenant_id: str, entity_id: str) -> None:
-    rows = [{
-        "StateID": guid(), "SessionID": session_id, "TenantID": tenant_id, "EntityID": str(entity_id),
-        "SubsystemID": ASSET_UNIT_ID, "Level": level, "Status": StageStatus.IDLE,
-        "GenerationEpoch": _EPOCH, "UpdatedAt": now(), "CreatedAt": now(),
-    } for level in (*_WORK_LEVELS, SubsystemLevel.LOCK)]
-    sess.execute(insert(m.Subsystem_Stage_State), rows)
-
-
-@overload
-def _safe_text(v: Any, default: str) -> str: ...
-@overload
-def _safe_text(v: Any, default: None) -> str | None: ...
-def _safe_text(v: Any, default: str | None) -> str | None:
-    """Overloaded so a non-None `default` is typed as returning `str`: callers slice the
-    result immediately (`[:300]`), which a `str | None` return would make a type error at
-    every call site rather than here, where the guarantee actually lives."""
-    if default is None:
-        return v if isinstance(v, str) else None
-    return grounding.ensure_text(v, default)
-
-
-def _build_threat_records(tid: str, sid: str, tenant: str, ss: int, ptype: str | None, pcat: str | None,
-                        pname: str | None, gr: grounding.GroundingResult, entity_id: str | None,
-                        user_id: str | None, generic_name: str | None = None,
-                        description: str | None = None,
-                        category_id: int | None = None) -> tuple[dict, dict]:
-    row = {
-        "ThreatID": tid, "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
-        "SubsystemID": ss,
-        "ThreatCategory": pcat, "ThreatType": ptype,
-        "ThreatName": pname,
-        # A generic (library-ready) version of ThreatName, saved so that later triage (when
-        # this threat is accepted, maybe days later) uses the AI's own wording instead of a
-        # rough text-stripping fallback. Cut to fit the column, so one overly long AI value
-        # can't fail the whole batch insert and lose every threat in the round.
-        "GenericName": generic_name[:500] if generic_name else None,
-        # Cut to the column width for the same reason GenericName is: one over-long AI value must
-        # not fail the whole batch insert and lose every threat in the round.
-        "Description": description[:200] if description else None,
-        # The category id grounding already resolved — stored so nothing downstream re-derives it
-        # from ThreatCategory text. NULL when the AI's category matched no master row.
-        "ThreatCategoryID": category_id,
-        # actor_ids rides alongside actors so consumers read ids instead of re-resolving names.
-        # Additive: grounding._actors_meta is the one parser, so stored_actors/validated_actors
-        # are untouched, and legacy blobs simply lack the key.
-        "ThreatActorsJSON": json.dumps({"actors": gr.actors, "actor_ids": gr.actor_ids,
-                                        "validated": gr.actors_validated}),
-        "LibraryThreatType": gr.library_type, "LibraryThreatName": gr.library_name,
-        "ThreatTypeID": gr.type_id, "ThreatCatalogueID": gr.catalogue_id,
-        # Immutable provenance, set once here (the ONLY threat-row writer): True <=> not in
-        # the catalogue at identification. Promotion stamps ThreatCatalogueID later but
-        # must not rewrite history by touching this.
-        "IsThreatAIGenerated": gr.catalogue_id is None,
-        # Same rule, type-level: True <=> the TYPE was not a library match at identification.
-        # A separate fact from the catalogue-level one above — promotion mints ThreatTypeID
-        # later but must not rewrite history by touching this either.
-        "IsThreatTypeAIGenerated": gr.type_id is None,
-        "GroundingStatus": gr.status, "GroundingScore": gr.score,
-        # WHICH cutoff produced GroundingStatus. Without it, a 78 graded `verified` under the
-        # untuned default 75.0 is indistinguishable from one graded under a measured 86.25 — so
-        # once a deployment finally calibrates, the threats decided on the wrong number are
-        # unfindable. Same provenance-as-a-column reasoning as Threat_Scenario_Control_Map's
-        # min_score_origin.
-        "GroundingThresholdOrigin": gr.threshold_origin,
-        "Superseded": 0, "CreatedAt": now(),
-    }
-    summary = {
-        "threat_id": tid, "grounding_status": str(gr.status),
-        # STRIDE category (Spoofing/Tampering/etc.), kept so the near-duplicate scan can
-        # compare threats only within the same category — needed because two genuinely
-        # different threats can still score higher on text similarity than real paraphrases
-        # do (see _semantic_duplicates). Same key name used by dal.active_threats.
-        "category": pcat,
-        "threat_type": ptype, "threat_name": pname,
-        "library_threat_type": gr.library_type, "library_threat_name": gr.library_name,
-        "threat_type_id": gr.type_id,
-        "catalogue_id": gr.catalogue_id,
-        "is_ai_generated": gr.catalogue_id is None,
-        "actors": gr.actors,
-    }
-    return row, summary
-
-
-def _duplicate_row(row: dict, reason: DuplicateReason, *,
-                    duplicate_of: str | None = None, score: float | None = None) -> dict:
-    """An Identified_Threat row, reshaped for Identified_Duplicate_Threat — same proposed
-    content, minus the library-grounding/scoring columns that table doesn't have, plus why it
-    was dropped and (when known) what it matched. Audit-only; never read by the pipeline."""
-    return {
-        "DuplicateThreatID": row["ThreatID"], "SessionID": row["SessionID"],
-        "TenantID": row["TenantID"], "EntityID": row["EntityID"], "UserID": row["UserID"],
-        "SubsystemID": row["SubsystemID"],
-        "ThreatCategory": row["ThreatCategory"], "ThreatType": row["ThreatType"],
-        "ThreatName": row["ThreatName"], "GenericName": row["GenericName"],
-        "ThreatActorsJSON": row["ThreatActorsJSON"],
-        "DuplicateOfThreatID": duplicate_of, "DuplicateReason": str(reason),
-        "SimilarityScore": score, "CreatedAt": row["CreatedAt"],
-    }
-
-
-def _asset_boundary_pattern(asset_name: str) -> re.Pattern | None:
-    """Build one regex pattern for matching/removing an asset name from text, used everywhere
-    this needs to happen. Uses lookarounds instead of \\b word boundaries because asset names
-    can start or end with non-word characters (like "(PGS)"). A plain substring match would
-    also match INSIDE unrelated words — asset name "CIS" once matched inside "decision",
-    corrupting text to "Loss of de ion integrity" and poisoning grounding, GenericName, and
-    triage downstream."""
-    # Handles three cases a plain literal match would miss — each one a real way the asset
-    # name used to leak through into GenericName and the shared library:
-    #   * trailing punctuation on the name ("ACME Corp.") not matching "ACME Corp systems"
-    #   * extra/missing whitespace ("Power  Plant" vs "Power Plant")
-    #   * a possessive right after the match ("Citizen Portal's credentials") leaving a
-    #     dangling "'s"
-    a = (asset_name or "").strip().rstrip(".,;:!")
-    if not a:
-        return None
-    body = r"\s+".join(re.escape(tok) for tok in a.split())
-    return re.compile(r"(?<!\w)" + body + r"(?:'s)?(?!\w)", re.IGNORECASE)
-
-def asset_agnostic_name(name: str | None, asset_name: str) -> str | None:
-    """Remove the asset name from a threat label. Returns None (never the original text) if
-    nothing but the asset name is left — returning the original would let an asset-specific
-    name slip through into the shared, cross-tenant threat library. Every caller already
-    handles None safely."""
-    if not name or not asset_name:
-        return name
-    pat = _asset_boundary_pattern(asset_name)
-    if pat:
-        # Also remove a preposition right before the asset name, so removing the name from
-        # the middle of a sentence doesn't leave it dangling: "Compromise of X leading to
-        # outage" used to become "Compromise of leading to outage" (the cleanup below only
-        # fixes trailing prepositions, not ones in the middle).
-        combined = re.compile(rf"(?:\b(?:{_ASSET_PREPOSITIONS})\s+)?" + pat.pattern, pat.flags)
-        stripped = combined.sub(" ", name)
-    else:
-        stripped = name
-    stripped = re.sub(r"\s+", " ", stripped).strip(" ,;:-.'")
-    stripped = re.sub(rf"\s+({_ASSET_PREPOSITIONS})$", "", stripped, flags=re.IGNORECASE)
-    return stripped or None
-
-
-def clean_library_name(name: str | None) -> str | None:
-    """Clean up a name so it's fit to enter the shared library, or return None if it isn't.
-    Rejects empty values, bracket/quote junk ('N/A', ['NA'], [], '"None"'), known filler
-    words, and anything without at least two real words. This matters because meaningless
-    text embeds far from anything in the library, making it the MOST likely junk to sneak
-    past auto-approval — the one path a human curator never reviews. Checked both when a
-    threat is first saved and again at auto-approve time, as a second safety net."""
-    if not name:
-        return None
-    core = re.sub(r"""[\[\]{}()<>'"`,;:._\-/\\]+""", " ", name)
-    core = re.sub(r"\s+", " ", core).strip()
-    if core.casefold() in _JUNK_NAME_TOKENS:
-        return None
-    if len([w for w in core.split() if any(ch.isalpha() for ch in w)]) < 2:
-        return None
-    # Return the name with only its wrapping junk removed, not the raw input as-is. It used
-    # to validate the cleaned-up `core` text but then return the untouched original, so
-    # '"Data exfiltration"' passed validation but got stored WITH the quotes — becoming the
-    # literal library entry text. Punctuation inside the name (like "e-mail" or "command &
-    # control") is left alone; only the outer wrapping is stripped.
-    display = re.sub(r"""^[\s\[\]{}()<>'"`]+|[\s\[\]{}()<>'"`]+$""", "", name)
-    display = display.strip(" ,;:.-")
-    return display or None
-
-def _generic_name_of(p: dict, asset_name: str) -> str | None:
-    """Get the library-ready name for a Stage-1 proposal. Prefers the AI's own
-    "generic_name" field, but only if it passes clean_library_name and doesn't contain the
-    asset name — we don't trust the prompt alone to enforce that. Falls back to stripping
-    the asset name out of the regular "name" field, which is also used by the near-duplicate
-    scan, so both stay consistent about what counts as asset-agnostic."""
-    pat = _asset_boundary_pattern(asset_name)
-    g = clean_library_name(_safe_text(p.get("generic_name"), None))
-    if g and pat and pat.search(g):
-        log.warning("threats.generic_name_leaks_asset", generic_name=g)
-        g = None
-    return g or asset_agnostic_name(_safe_text(p.get("name"), None), asset_name)
-
-
-def _description_of(p: dict, asset_name: str) -> str | None:
-    """Get the AI's threat description for a Stage-1 proposal, or None.
-
-    Same asset-leak guard as _generic_name_of, and for the same reason: this text is copied
-    verbatim into Threat_Catalogue.Description, a library shared across every tenant. Unlike a
-    name there is no generalized form to fall back to, so a description naming the asset is
-    DROPPED rather than salvaged — losing a sentence is recoverable, publishing one customer's
-    asset name to the others is not. No clean_library_name: a description is prose, never an
-    identity.
-    """
-    d = _safe_text(p.get("description"), None)
-    if not d or not d.strip():
-        return None
-    pat = _asset_boundary_pattern(asset_name)
-    if pat and pat.search(d):
-        log.warning("threats.description_leaks_asset", description=d)
-        return None
-    return d.strip()
-
-# Builds a dedup key for a threat: prefers the catalogue ID, then type ID + name, then falls
-# back to normalized type/name text. Used to catch duplicate threats both within a batch
-# and against threats already active in the session. The first rung is cat:{ThreatCatalogueID}
-# (back on the catalogue, 2026-08-28); core tables are recreated on deploy, so no mixed-era
-# hashes coexist.
-def _dedup_key(info: dict) -> str:
-
-    key_type = _normalize(info.get("threat_type") or "")
-    key_name = _normalize(info.get("threat_name") or "")
-    catalogue_id = info.get("catalogue_id")
-    if catalogue_id is not None:
-        return f"cat:{catalogue_id}"
-    type_id = info.get("threat_type_id")
-    if type_id is not None:
-        return f"type:{type_id}|{key_name}" if key_name else f"type:{type_id}"
-    if not key_type and not key_name:
-        return "txt:tid:" + str(info.get("threat_id"))
-    return "txt:" + key_type + "|" + key_name
-
-
-def _usable_proposal(p: object) -> bool:
-    """Is this one item from the LLM's JSON list safe to save?
-
-    We only checked that the response is a list overall — each item inside could still be
-    junk. This filters out three kinds of junk before they cause damage further downstream:
-
-    * Not a dict -> later code calling `.get()` on it crashes with the wrong kind of error,
-      which cancels the whole session instead of failing gracefully.
-    * Missing type/name -> there's nothing to match, score, or de-duplicate against, and it
-      would keep failing the same way on every retry with no way to fix it.
-    * Too long -> generating its embedding fails and takes down all the other threats found
-      in that same batch with it.
-    """
-    if not isinstance(p, dict):
-        return False
-    ptype = _safe_text(p.get("type"), "") or ""
-    pname = _safe_text(p.get("name"), "") or ""
-    return bool(ptype) and bool(pname) and len(ptype) + len(pname) <= get_settings().max_proposal_chars
-
-
-
-def _validate_candidates(sess: Session, llm: LLMClient, scenario_session: dict,
-                        subsystems: list[dict], asset_context: dict, candidates: list[dict],
-                        subsystem_id: int, epoch: int, task_id: str) -> tuple[list[dict], dict]:
-    """Batched LLM validation of library candidates — the validator half of Stage 1a.
-
-    Per candidate: RELEVANT | POTENTIALLY_RELEVANT | NOT_RELEVANT + a one-line justification.
-    NOT_RELEVANT is a HARD DROP (GAP-B): it removes the candidate before any scoring, never a
-    0.0 score term a retrieval score could outvote. Everything else FAILS OPEN — a missing or
-    unrecognized verdict, or a whole failed batch, degrades to POTENTIALLY_RELEVANT (kept):
-    a validator outage must weaken ranking, never silently shrink coverage. Verdicts are
-    fully reproducible from Prompt_Log (written by _ask_ai) plus the grounding_summary audit.
-    LLMSlotUnavailable propagates — the Celery retry resumes via the stage CAS as usual."""
-    s = get_settings()
-    verdicts: dict[int, dict] = {}
-    degraded = 0
-    for start in range(0, len(candidates), s.validator_batch_size):
-        batch = candidates[start:start + s.validator_batch_size]
-        messages = prompts.threat_validation_prompt(
-            scenario_session["AssetName"], asset_context, subsystems, batch)
-        # ONE retry before failing open. A malformed reply costs the WHOLE batch's verdicts
-        # (every candidate in it degrades to POTENTIALLY_RELEVANT), and the failure that
-        # prompted this was a one-off syntax slip — azure/gpt-5-mini emitting {"index:3", ...}
-        # in an otherwise well-formed 4,882-char reply. Re-asking is far cheaper than losing
-        # 20 verdicts. Bounded at ONE extra attempt: a model that malforms twice is not having
-        # a bad roll, and the fail-open path below is the correct answer for that.
-        # expected_type=dict is load-bearing, not cosmetic: it is what makes llm._chat_kwargs
-        # request provider-side JSON mode, which is what stops this class of slip at source.
-        parsed = None
-        for attempt in (1, 2):
-            try:
-                parsed, _prov = _ask_ai(sess, llm, messages, scenario_session=scenario_session,
-                                        subsystem_id=subsystem_id, stage="threat_validation",
-                                        level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id,
-                                        expected_type=dict,
-                                        temperature=s.threat_identification_temperature)
-                break
-            except LLMSlotUnavailable:
-                raise
-            except Exception:
-                sess.rollback()
-                if attempt == 1:
-                    log.warning("threat_validation.batch_retrying",
-                                session_id=scenario_session["SessionID"],
-                                batch_start=start, batch_size=len(batch), exc_info=True)
-                    continue
-                degraded += 1
-                log.warning("threat_validation.batch_failed_fail_open",
-                            session_id=scenario_session["SessionID"],
-                            batch_start=start, batch_size=len(batch), exc_info=True)
-        if parsed is None:
-            continue
-        # The wire shape is {"verdicts": [...]} — see threat_validation_prompt. A reply that
-        # parses as an object but omits the key (or hands back something that is not a list)
-        # is treated exactly like a malformed one: no verdicts, fail open, never a crash.
-        items = parsed.get("verdicts")
-        if not isinstance(items, list):
-            degraded += 1
-            log.warning("threat_validation.batch_missing_verdicts",
-                        session_id=scenario_session["SessionID"], batch_start=start,
-                        batch_size=len(batch), got=sorted(parsed)[:8])
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            idx = item.get("index")
-            if isinstance(idx, int) and 1 <= idx <= len(batch):
-                verdicts[start + idx - 1] = {
-                    "verdict": str(item.get("verdict") or "").strip().upper(),
-                    "justification": str(item.get("justification") or "")[:500]}
-    kept: list[dict] = []
-    dropped: list[dict] = []
-    for i, cand in enumerate(candidates):
-        v = verdicts.get(i) or {"verdict": "POTENTIALLY_RELEVANT", "justification": ""}
-        if v["verdict"] == "NOT_RELEVANT":
-            dropped.append({"catalogue_id": cand["catalogue_id"],
-                            "threat_name": cand["threat_name"],
-                            "justification": v["justification"]})
-            continue
-        if v["verdict"] not in ("RELEVANT", "POTENTIALLY_RELEVANT"):
-            v = {"verdict": "POTENTIALLY_RELEVANT", "justification": v["justification"]}
-        kept.append({**cand, "validator_verdict": v["verdict"],
-                     "validator_justification": v["justification"]})
-    return kept, {"candidates": len(candidates), "kept": len(kept),
-                  "dropped": dropped, "degraded_batches": degraded}
-
-
-def _build_retrieved_records(cand: dict, sid: str, tenant: str, ss: int,
-                            scenario_session: dict, assigned_category: str,
-                            category_id: int | None = None) -> tuple[dict, dict]:
-    """Identified_Threat row + pipeline summary for one VALIDATED library candidate.
-
-    The candidate IS the library row, so grounding is identity, not similarity:
-    verified, GroundingScore 100.0 (a real match confidence would imply a rerank that
-    never ran), master ids and names on every column, and the type's LINKED actors with
-    validated=True. Reuses _build_threat_records so the row shape cannot drift.
-
-    `assigned_category` is the STRIDE cell this threat was SELECTED to fill
-    (core.stride.assign), and it is what gets stored. It used to be `cand["categories"][0]`,
-    and that one piece of positional convenience is the entire "everything is Denial of
-    Service" bug: 74 of the 75 library rows are multi-category, the list arrived ordered by a
-    ThreatCategoryID that the seed numbers alphabetically, and DoS holds id 1 — so it won every
-    row it appeared on while Spoofing (5) and Tampering (6) won none. The caller now decides
-    which of a threat's genuine categories it is being used for, and passes it in. See
-    core/stride.py."""
-    gr = grounding.GroundingResult(
-        status=GroundingStatus.verified, type_id=cand["type_id"],
-        catalogue_id=cand["catalogue_id"], library_type=cand["type_name"],
-        library_name=cand["threat_name"], score=100.0,
-        actors=cand["actors"], actor_ids=cand.get("actor_ids") or [], actors_validated=True,
-        category_id=category_id,
-        # Library-first: this candidate IS a library row, matched by identity, so NO cutoff was
-        # ever consulted (the score above is a literal 100.0, not a rerank). An explicit marker
-        # rather than NULL — NULL means "written before this column existed", and folding these
-        # rows into that bucket makes it unreadable exactly when someone is trying to find which
-        # threats a wrong threshold judged.
-        threshold_origin="not_applicable")
-    pcat = (assigned_category or "")[:200]
-    row, summary = _build_threat_records(
-        guid(), sid, tenant, ss, cand["type_name"][:300], pcat, cand["threat_name"][:500],
-        gr, scenario_session["EntityID"], scenario_session.get("UserID"),
-        generic_name=cand["threat_name"],
-        # No description on this path. It used to be the catalogue row's own curated wording,
-        # but Threat_Catalogue.Description was removed as unused, so a library-sourced threat
-        # now carries NULL here while the generated path below still records the AI's.
-        category_id=category_id)
-    # Additive keys, ignored by _dedup_key/scoring: full multi-category membership for the
-    # coverage grid, plus retrieval/validator provenance for the audit trail.
-    summary["categories"] = cand.get("categories") or []
-    # Retrieved-vs-generated provenance for the audit tallies ("hybrid" = came from the
-    # register's ranked pool; generated threats carry no selection_source).
-    summary["selection_source"] = cand.get("selection_source") or "hybrid"
-    summary["retrieval_score"] = cand.get("retrieval_score")
-    summary["validator_verdict"] = cand.get("validator_verdict")
-    return row, summary
-
-
-def _gap_ask(shortfall: int) -> int:
-    """How many threats to REQUEST to reliably land `shortfall` NEW ones.
-
-    Generation loses proposals to dedup — the model re-proposes threats the session already
-    holds even though the exclusion list names every one of them. Asking for exactly the
-    shortfall therefore guarantees under-delivery; asking for a multiple of it absorbs the loss
-    inside the SAME single call.
-
-    Bounded below by `shortfall` so a factor of 1.0 disables the buffer rather than inverting it.
-    `gap_generation_buffer` is a setting so a deployment seeing shortfalls can raise it without a
-    code change — the right multiple depends on how repetitive the model is against that library.
-    """
-    return max(shortfall, math.ceil(shortfall * get_settings().gap_generation_buffer))
-
-
-def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, llm: LLMClient, task_id: str,
-                epoch: int = _EPOCH, categories: list[str] | None = None,
-                actor_examples: list[str] | None = None,
-                supersede: bool = True, exclude: list[str] | None = None,
-                prior_threats: list[dict] | None = None,
-                max_threats: int | None = None) -> tuple[list[dict], Provenance | None]:
-    # `exclude` is label text used to steer the prompt away from repeats. `prior_threats` is
-    # those same threats as full rows (with category), needed for the near-duplicate scan.
-    # The caller already has both, so passing them in costs no extra query.
-    sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
-    with trace_step("ASSET CONTEXT", sid, asset_context=asset_context,
-                    subsystems=subsystems):
-        pass          # input-only marker: the context is already built when find_threats runs
-    if not dal.claim_stage(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
-        return [], None
-    sess.commit()
-    _send_live_update(sid, SSEEventType.stage_started, ss, SubsystemLevel.THREATS, StageStatus.RUNNING, epoch)
-    tn = tuning.from_session(scenario_session)  # tuning settings frozen at session start, not live config
-    # `max_threats` override lets a caller (run_next_set's additive top-up) ask for exactly the
-    # shortfall it needs instead of the full per-asset cap — every other caller leaves this None
-    # and gets the original tn.max_threats_per_asset ceiling, unchanged.
-    if max_threats is None:
-        max_threats = tn.max_threats_per_asset
-    cats = categories if categories is not None else dal.active_category_names(sess)
-    # Phase 2b — the coverage grid's rows. A threat is recorded against the asset (ss) AND
-    # against every supporting system no tech_gate rules out; see
-    # threat_retrieval.attribute_to_subsystems for the rule and why it fails open. These extra
-    # rows are RECORDS: every dal reader of Identified_Threat is subsystem-scoped and scenario
-    # generation, scoring and accept all read the asset unit, so nothing downstream doubles up.
-    grid_subsystem_ids = threat_retrieval.all_subsystem_ids(subsystems)
-
-    # --- Stage 1a: LIBRARY-FIRST — deterministic retrieval, then LLM validation ---------
-    # The funnel selects candidate Threat_Catalogue rows (hybrid ranking over the whole
-    # active library) and the validator judges each one; generation below only fills the
-    # SHORTFALL. Any retrieval failure degrades to generation-only — the cold-start path.
-    try:
-        candidates = threat_retrieval.retrieve_library_threats(
-            sess, llm, subsystems, asset_context, session_id=sid)
-    except Exception:
-        sess.rollback()
-        log.warning("threat_retrieval.failed_generation_only", session_id=sid, exc_info=True)
-        candidates = []
-    validator_audit: dict = {}
-    if candidates:
-        with trace_step("LLM VALIDATOR", sid, candidates=len(candidates)) as _t:
-            candidates, validator_audit = _validate_candidates(
-                sess, llm, scenario_session, subsystems, asset_context, candidates,
-                ss, epoch, task_id)
-            _t.result(kept=len(candidates), audit=validator_audit)
-    # NOT_RELEVANT is documented as a HARD DROP (GAP-B) — but the drop only ever removed the
-    # candidate from Stage 1a's own list. Stage 1b's generator has no knowledge of this
-    # round's verdicts, so it can propose an equivalent threat that regrounds (via
-    # grounding.find_threat_in_library, below) back to the SAME catalogue row the validator
-    # just rejected — silently reversing a verdict the reviewer never sees questioned twice.
-    # Seeded here, checked at the regrounding site, so the hard drop actually holds for the
-    # whole round, not just Stage 1a's slice of it.
-    rejected_catalogue_ids = {d["catalogue_id"] for d in validator_audit.get("dropped", [])
-                            if d.get("catalogue_id") is not None}
-
-    if supersede:
-        # Every unit the fan-out below writes to, not just the asset: a stale subsystem row
-        # left active from the previous round would double-count on the grid and make a real
-        # gap read as covered — the exact failure the coverage matrix exists to prevent.
-        for unit in (ss, *grid_subsystem_ids):
-            dal.supersede(sess, m.Identified_Threat, sid, unit)
-    existing_identities = dal.active_identified_threat_identities(sess, sid, ss) if not supersede else {}
-    threats: list[dict] = []
-    rows: list[dict] = []
-    duplicates = 0
-    validator_reversals = 0
-    retrieved_near_dupes = 0
-    dup_rows: list[dict] = []  # Identified_Duplicate_Threat rows — audit-only, see _duplicate_row
-    retrieved_summaries: list[dict] = []
-    attribution: dict[str, list[int]] = {}  # ThreatID -> supporting systems it reaches
-
-    # --- STRIDE COVERAGE QUOTA -----------------------------------------------------------
-    # What the session ALREADY holds per category. An additive round (next-set, regen) must
-    # top up what is thin rather than restart at Spoofing, so the quota is computed against
-    # reality, not against an empty grid.
-    #
-    # Counted from the STORED category, one per threat — deliberately NOT from
-    # active_threat_grid_categories, which returns the full multi-category membership and would
-    # count a 3-category threat three times. That grid is the right unit for coverage
-    # accounting (does any threat answer this cell?) and the wrong one here, where a slot is
-    # what is being allocated. prior_threats is this same read, already done by the additive
-    # caller — reused rather than re-queried. Asset unit only: the subsystem rows are fan-out
-    # copies of these same threats (Phase 2b).
-    held: dict[str, int] = {}
-    if not supersede:
-        prior = prior_threats if prior_threats is not None else dal.active_threats(sess, sid, ss)
-        for t in prior:
-            c = t.get("category")
-            if c:
-                held[c] = held.get(c, 0) + 1
-    target = stride.allocate(max_threats, cats, existing=held)
-
-    # THE FIX. This loop used to walk `candidates` in retrieval-score order and stop at
-    # max_threats, which is category-blind: the cap filled with whatever ranked highest and
-    # the stored category was then read positionally off each row. Now the quota decides how
-    # many slots each category gets and assignment decides which candidate fills each slot —
-    # so selection and labelling are ONE decision and the spread is a property of the
-    # algorithm rather than something the prompt is asked to remember. Score still orders
-    # candidates WITHIN a category, so ranking keeps choosing which Spoofing threat wins the
-    # Spoofing slot; it just no longer decides how many Spoofing slots exist.
-    with trace_step("STRIDE QUOTA", sid, target=target, held=held,
-                    candidates=len(candidates)) as _t:
-        if target:
-            selected = stride.assign(candidates, target, lambda c: c.get("categories") or [])
-        else:
-            # No categories to allocate against — an UNSEEDED Threat_Category table, which
-            # dal.active_category_names documents as a supported state. Quota-driven selection
-            # would return nothing at all here (an empty quota selects zero candidates), so it
-            # degrades to the pre-quota behaviour: best-ranked first, up to the cap. Losing the
-            # spread on an unseeded DB is a weaker answer; returning no threats would be a
-            # silent outage, and this codebase never trades the second for the first.
-            # invariants._assert_stride_categories warns about this at boot.
-            log.warning("threats.quota_skipped_no_categories", session_id=sid, cap=max_threats)
-            selected = [(c, (c.get("categories") or [""])[0]) for c in candidates[:max_threats]]
-        _t.result(assigned=stride.achieved(selected), selected=len(selected))
-
-    # Resolve each STRIDE name to its id ONCE — six categories, so the memo makes this a
-    # handful of queries instead of one per candidate.
-    cat_id_memo: dict[str, int | None] = {}
-    for cand, assigned_category in selected:
-        if assigned_category not in cat_id_memo:
-            cat_id_memo[assigned_category] = grounding.find_category(sess, assigned_category)
-        row, summary = _build_retrieved_records(cand, sid, tenant, ss, scenario_session,
-                                                assigned_category,
-                                                category_id=cat_id_memo[assigned_category])
-        identity = dal.identity_hash(sid, ss, summary)
-        if identity in existing_identities:
-            # Already active on this session (an additive next-set round re-retrieving the
-            # library) — a no-op, not an audit-worthy duplicate.
-            continue
-        existing_identities[identity] = row["ThreatID"]
-        attribution[row["ThreatID"]] = cand.get("subsystem_ids") or []
-        rows.append(row)
-        threats.append(summary)
-        retrieved_summaries.append(summary)
-
-    # A retrieved LIBRARY candidate is checked against the exact identity hash of what's
-    # already active (existing_identities, above) but never against a PRIOR round's
-    # near-duplicate paraphrase: a prior round may have GENERATED a threat with different
-    # wording, or grounded to a related library row whose official name doesn't hash-match
-    # this round's, so identity_hash alone misses it. On the additive next-set path
-    # prior_threats carries exactly those rows, so scan retrieved candidates against them
-    # too. Retrieved-vs-retrieved stays exempt (compare_within=False): two distinct library
-    # rows surviving together is the curator's call, not this scan's.
-    if prior_threats and retrieved_summaries:
-        retrieved_dupes = _semantic_duplicates(llm, sid, ss, retrieved_summaries, prior_threats,
-                                                scenario_session["AssetName"],
-                                                threshold=tn.semantic_near_duplicate_threshold,
-                                                compare_within=False)
-        if retrieved_dupes:
-            retrieved_near_dupes = len(retrieved_dupes)
-            by_id = {r["ThreatID"]: r for r in rows}
-            dup_rows.extend(
-                _duplicate_row(by_id[tid], info["reason"],
-                            duplicate_of=info["duplicate_of_threat_id"], score=info["score"])
-                for tid, info in retrieved_dupes.items() if tid in by_id
-            )
-            rows = [r for r in rows if r["ThreatID"] not in retrieved_dupes]
-            threats = [t for t in threats if t["threat_id"] not in retrieved_dupes]
-            retrieved_summaries = [t for t in retrieved_summaries if t["threat_id"] not in retrieved_dupes]
-            log.info("threats.retrieved_semantic_duplicates_dropped", session_id=sid, subsystem=ss,
-                    dropped=retrieved_near_dupes)
-
-    # --- Stage 1b: GAP GENERATION — the LLM proposes only what the library did not fill.
-    shortfall = max_threats - len(rows)
-    proposals: list = []
-    prov: Provenance | None = None
-    if shortfall > 0:
-        exclude_all = list(exclude or []) + [
-            t["threat_name"] for t in retrieved_summaries if t.get("threat_name")]
-        # The per-category target for the SHORTFALL, allocated against what the session holds
-        # now (what it already had, plus what assignment just retrieved). That is what makes
-        # this a gap-filling ask: the categories the curated library could not supply are
-        # exactly the ones still thin, so they are the ones this quota names. Re-allocating
-        # rather than subtracting the original target is what keeps it correct when the
-        # shortfall grew because a retrieved row was dropped as a duplicate above.
-        have = dict(held)
-        for t in retrieved_summaries:
-            c = t.get("category")
-            if c:
-                have[c] = have.get(c, 0) + 1
-        # ASK FOR MORE THAN THE SHORTFALL. Generation used to ask for exactly `shortfall` and
-        # then drop proposals that duplicate what the session holds (the `identity` /
-        # validator_rejected continues in the consume loop below), with nothing refilling them —
-        # so find_threats(N) structurally returned fewer than N whenever the model repeated
-        # anything, and next-set's "give me 5" delivered 4.
-        #
-        # The consume loop already handles over-supply correctly: it skips duplicates and breaks
-        # at `len(rows) >= max_threats`, so a surplus costs nothing but the tokens to generate it
-        # and can never overshoot the caller's target. Sizing the ask HERE is what makes
-        # find_threats keep its promise — cascade._buffered_ask used to over-ask from OUTSIDE,
-        # which is why it collided with max_threats_per_asset, a per-call identification ceiling
-        # that has nothing to do with delivery.
-        gap_ask = _gap_ask(shortfall)
-        gap_quota = stride.allocate(gap_ask, cats, existing=have)
-        gap_gen_messages = prompts.threats_prompt(
-            scenario_session["AssetName"], asset_context, subsystems,
-            max_threats=gap_ask, categories=cats, exclude=exclude_all or None,
-            quota=gap_quota)
-        # `messages` is deliberately NOT traced: _ask_ai already persists the whole prompt to
-        # Prompt_Log, and dumping it again here would put the full asset context in a second
-        # place that has no retention policy.
-        with trace_step("GAP GENERATION", sid, shortfall=shortfall, gap_ask=gap_ask, categories=cats,
-                        exclude=exclude_all, prompt_messages=len(gap_gen_messages)) as _t:
-            proposals, prov = _ask_ai(sess, llm, gap_gen_messages,
-                                        scenario_session=scenario_session, subsystem_id=ss, stage="threats",
-                                        level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
-                                        temperature=get_settings().threat_identification_temperature)
-            # Filter untrusted LLM output once here (see _usable_proposal) rather than in every
-            # place that reads it below — that's both the smallest fix and the only one that
-            # covers every reader, including grounding.prime_query_embeddings.
-            raw_proposal_count = len(proposals)
-            usable = [p for p in proposals if _usable_proposal(p)]
-            if len(usable) != len(proposals):
-                log.warning("threats.proposals_dropped", session_id=sid,
-                            dropped=len(proposals) - len(usable), received=len(proposals))
-            proposals = usable
-            _t.result(raw_proposal_count=raw_proposal_count, usable_proposals=proposals)
-    else:
-        log.info("threats.generation_skipped_library_filled", session_id=sid, cap=max_threats)
-    grounding_cache: dict = {}
-    # Grounding and the identity fingerprint both run on the library-ready name: the AI's
-    # own generic_name if valid, otherwise a stripped-down fallback name (_generic_name_of).
-    to_ground = [{**p, "name": _generic_name_of(p, scenario_session["AssetName"])}
-                for p in proposals]  # safe: _usable_proposal already guaranteed these are all dicts
-    grounding.prime_query_embeddings(llm, to_ground, grounding_cache)
-    rows_before_generation = len(rows)
-    for p, gp in zip(proposals, to_ground):
-        if len(rows) >= max_threats:
-            # Reached the target with proposals to spare — the buffered ask working as intended,
-            # NOT an anomaly. This was a warning back when generation asked for exactly the
-            # shortfall, where a surplus meant the model ignored the count.
-            log.info("threats.gap_buffer_absorbed", session_id=sid,
-                    proposed=len(proposals), used=len(rows) - rows_before_generation,
-                    cap=max_threats)
-            break
-        
-        if not dal.renew_lease(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
-            log.warning("stage.lease_renewal_failed", session_id=sid, subsystem=ss, level=str(SubsystemLevel.THREATS))
-        sess.commit()
-        # Clip these values to fit their DB columns right here, not later when building the
-        # row: an over-long AI value would otherwise fail the whole batch insert (losing every
-        # threat in the round), and clipping afterward would make the stored value disagree
-        # with the identity hash computed from these same variables.
-        ptype = _safe_text(p.get("type"), "")[:300]
-        pcat = _safe_text(p.get("category"), "")[:200]
-        pname = _safe_text(p.get("name"), None)
-        if pname:
-            pname = pname[:500]
-        with trace_step("REGROUNDING", sid, proposal=p, generic_proposal=gp) as _t:
-            gr = grounding.find_threat_in_library(sess, llm, gp, cache=grounding_cache)
-            _t.result(grounding_result=gr)
-        tid = guid()
-        row, summary = _build_threat_records(tid, sid, tenant, ss, ptype, pcat, pname, gr,
-                                        scenario_session["EntityID"], scenario_session.get("UserID"),
-                                        generic_name=gp.get("name") if isinstance(gp, dict) else None,
-                                        description=_description_of(p, scenario_session["AssetName"]),
-                                        category_id=gr.category_id)
-        if gr.catalogue_id is not None and gr.catalogue_id in rejected_catalogue_ids:
-            # The hard drop, enforced a second time: this proposal regrounded to a catalogue
-            # row the validator already rejected for THIS asset this round. Recorded, not
-            # silently skipped — an operator reviewing why a threat is missing must be able
-            # to find it here rather than conclude the pipeline simply never considered it.
-            validator_reversals += 1
-            dup_rows.append(_duplicate_row(row, DuplicateReason.validator_rejected))
-            continue
-        identity = dal.identity_hash(sid, ss, summary)
-        if identity in existing_identities:
-            duplicates += 1
-            dup_rows.append(_duplicate_row(row, DuplicateReason.identity,
-                                        duplicate_of=existing_identities.get(identity)))
-            continue
-        existing_identities[identity] = tid
-        rows.append(row)
-        threats.append(summary)
-    with trace_step("REGROUNDING SUMMARY", sid,
-                    proposals_considered=len(proposals)) as _t:
-        _t.result(validator_reversals_blocked=validator_reversals,
-                identity_duplicates=duplicates,
-                threats_added=len(rows) - rows_before_generation)
-    # Run the near-duplicate check BEFORE inserting, so it can actually block bad rows — the
-    # exact-match check above only catches identical wording, so two threats phrased
-    # differently would both slip through and get generated (and billed) separately. Can be
-    # switched off without a deploy by setting semantic_near_duplicate_threshold to 1.0.
-    # GENERATED summaries only: retrieved threats are curated library rows whose distinctness
-    # the curator already vouched for — two similar register entries must both survive. The
-    # retrieved set rides as PRIORS instead, so a generated paraphrase of a library threat is
-    # dropped (and attributed to the library row it duplicates).
-    retrieved_ids = {t["threat_id"] for t in retrieved_summaries}
-    generated_summaries = [t for t in threats if t["threat_id"] not in retrieved_ids]
-    dupe_info = _semantic_duplicates(llm, sid, ss, generated_summaries,
-                                    (prior_threats or []) + retrieved_summaries,
-                                    scenario_session["AssetName"],
-                                    threshold=tn.semantic_near_duplicate_threshold)
-    near_dupes = len(dupe_info)
-    if dupe_info:
-        by_id = {r["ThreatID"]: r for r in rows}
-        dup_rows.extend(
-            _duplicate_row(by_id[tid], info["reason"],
-                        duplicate_of=info["duplicate_of_threat_id"], score=info["score"])
-            for tid, info in dupe_info.items() if tid in by_id
-        )
-        rows = [r for r in rows if r["ThreatID"] not in dupe_info]
-        threats = [t for t in threats if t["threat_id"] not in dupe_info]
-        log.info("threats.semantic_duplicates_dropped", session_id=sid, subsystem=ss,
-                dropped=near_dupes)
-    # Phase 2b fan-out. Built AFTER both dedup passes so a dropped threat is dropped on every
-    # unit at once — a subsystem copy of a superseded threat would be an orphan on the grid.
-    # The copies are records, not work: each gets its own ThreatID, and none is ever scored,
-    # scenario-generated or promoted, because every one of those paths reads the asset unit.
-    summaries_by_id = {t["threat_id"]: t for t in threats}
-    gen_attribution = threat_retrieval.attribute_to_subsystems(
-        subsystems,
-        [t["threat_type_id"] for t in threats
-        if t["threat_id"] not in retrieved_ids and t.get("threat_type_id") is not None])
-    fanout_rows: list[dict] = []
-    for row in rows:
-        t = summaries_by_id[row["ThreatID"]]
-        if row["ThreatID"] in retrieved_ids:
-            units = attribution.get(row["ThreatID"], [])
-        else:
-            # A generated threat that GROUNDED to a library type inherits that type's gates;
-            # one that grounded to nothing has no narrowing evidence at all, so it reaches
-            # everything. Same fail-open rule, applied to a weaker piece of evidence.
-            units = gen_attribution.get(t.get("threat_type_id"), grid_subsystem_ids)
-        for unit in units:
-            fanout_rows.append({**row, "ThreatID": guid(), "SubsystemID": unit})
-    if rows:
-        sess.execute(insert(m.Identified_Threat), rows + fanout_rows)
-    if not dal.finish_stage(sess, sid, ss, SubsystemLevel.THREATS, StageStatus.COMPLETE, epoch, task_id):
-        sess.rollback()
-        log.warning("stage.claim_lost", session_id=sid, subsystem=ss, stage="THREATS", epoch=epoch)
-        return [], None
-    # Coverage close-out (safety gate): which (subsystem x STRIDE) cells does the SESSION —
-    # not just this round — leave unanswered? Read live from the DB, after the insert above,
-    # rather than accumulated from `rows` alone: an additive round (next-set, regen) only
-    # inserts the few threats that are genuinely new, so a coverage computed from just that
-    # delta would describe the round, not the session, and could report a fully-covered
-    # session as almost entirely uncovered the moment a top-up added one threat.
-    # Multi-category memberships count for every category they carry. Logged AND recorded in
-    # the audit row — a gap must be visible, never silent.
-    # Provenance roll-up: how many threats each leg of the funnel contributed.
-    # A keyword-only round selected a materially different candidate set. Recorded here, not
-    # just logged, because after the fact a degraded run is otherwise indistinguishable from a
-    # clean one — the same reason _validate_candidates persists `degraded`.
-    ranking_degraded = any(c.get("ranking_degraded") for c in candidates)
-    selection_sources: dict[str, int] = {}
-    for t in retrieved_summaries:
-        key = t.get("selection_source") or "hybrid"
-        selection_sources[key] = selection_sources.get(key, 0) + 1
-    if len(threats) > len(retrieved_summaries):
-        selection_sources["generated"] = len(threats) - len(retrieved_summaries)
-
-    # The distribution this round actually produced, by STORED category — the number the
-    # "everything is Denial of Service" report was about. Recorded, not just logged, because
-    # the coverage grid below reads the FULL multi-category membership and therefore looked
-    # healthy the entire time every visible label said DoS. A skew has to be answerable from
-    # data afterwards, not from someone's impression of a report.
-    distribution = stride.achieved([(None, t["category"]) for t in threats if t.get("category")])
-    # TSG_COVERAGE_REPORTING_ENABLED, off by default (config.py) — an advisory-only completeness
-    # signal that never gates any action. While off, nothing below runs at all: no
-    # active_threat_grid_categories query, no coverage_report computation, no log line, and the
-    # audit row's DetailJSON simply omits "units"/"coverage" rather than storing them empty.
-    coverage_detail: dict[str, Any] = {}
-    if get_settings().coverage_reporting_enabled:
-        coverage_units = [ss, *grid_subsystem_ids]
-        with trace_step("COVERAGE", sid, unit_ids=coverage_units, categories=cats) as _t:
-            grid_records = dal.active_threat_grid_categories(sess, sid, coverage_units)
-            cov = coverage.coverage_report(coverage_units, cats, grid_records)
-            _t.result(grid_records=len(grid_records), coverage_report=cov)
-        if cov["unexplained"]:
-            log.warning("threats.coverage_gaps", session_id=sid, subsystem=ss,
-                        units=1 + len(grid_subsystem_ids),
-                        unexplained=cov["unexplained"], gaps=cov["gaps"][:12])
-        coverage_detail = {"units": coverage_units, "coverage": {**cov, "gaps": cov["gaps"][:50]}}
-    dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
-                    Stage=WorkflowStage.THREAT_IDENTIFICATION, SubsystemID=ss,
-                    EventType=AuditEventType.grounding_summary,
-                    DetailJSON=json.dumps({"count": len(threats),
-                                        "selection_sources": selection_sources,
-                                        "ranking_degraded": ranking_degraded,
-                                        "subsystem_records": len(fanout_rows),
-                                        "retrieved": len(retrieved_summaries),
-                                        "generated": len(threats) - len(retrieved_summaries),
-                                        "validator": validator_audit,
-                                        "identity_duplicates": duplicates,
-                                        "validator_reversals_blocked": validator_reversals,
-                                        "semantic_near_duplicates": near_dupes,
-                                        "retrieved_semantic_duplicates": retrieved_near_dupes,
-                                        "stride_target": target,
-                                        "stride_distribution": distribution,
-                                        **coverage_detail}))
-    sess.commit()
-    if dup_rows:
-        # Deliberately OUTSIDE the transaction above, in its own try/except: this is an
-        # audit-only table, and it must never be able to roll back or block the real threats
-        # just committed — e.g. a deployment that hasn't re-run TSG_Core.sql yet would
-        # otherwise lose an entire round's worth of legitimate threats over a missing table.
-        try:
-            sess.execute(insert(m.Identified_Duplicate_Threat), dup_rows)
-            sess.commit()
-        except Exception:
-            sess.rollback()
-            log.warning("threats.duplicate_audit_insert_failed", session_id=sid, subsystem=ss,
-                        exc_info=True)
-    _send_live_update(sid, SSEEventType.stage_completed, ss, SubsystemLevel.THREATS, StageStatus.COMPLETE, epoch)
-    log.info("stage.complete", session_id=sid, subsystem=ss, stage="THREATS", count=len(threats))
-    return threats, prov
 
 # Runs the moderation check on a scenario's three prose fields. Controls are no longer part
 # of the moderated text: the LLM stops proposing them (library-first redesign), and library
@@ -1189,78 +209,86 @@ def _moderation_report(scenario: dict) -> dict:
     return {"checked": r.checked, "flagged": r.flagged, "categories": r.categories, "error": r.error}
 
 
-def _intel_vocabulary(sess: Session, subsystems: list[dict], asset_context: dict) -> tuple[list[str], bool]:
-    """Build search terms for threat-intel lookups from the asset's tech inventory and
-    classification fields — never from the threat's own wording.
+def _intel_vocabulary(sess: Session, subsystems: list[dict], asset_context: dict) -> IntelTerms:
+    """Build the threat-intel search terms from the asset's inventory and classification —
+    never from the threat's own wording: threat names use generic business language
+    ("failure", "maintenance", "system") that matches everyday IT advisories, which is how a
+    power-plant search once pulled Cisco/Fortinet/SharePoint CVEs while the ICS advisories
+    were ignored.
 
-    Why not threat wording: threat names use generic business language ("failure",
-    "maintenance", "system"), which happens to match everyday IT advisories. That's how a
-    power plant search once pulled up Cisco/Fortinet/SharePoint CVEs while the relevant ICS
-    advisories were ignored. Product names ("Siemens", "SCADA", "Windows Server") match what
-    advisories actually talk about, so we use those instead.
-
-    Sector, sub-sector, and critical-service are added too, because they use the same fixed
-    vocabulary that OTX and CISA ICS advisories tag themselves with. They also save assets
-    whose whole tech inventory is just "Custom Application" / "NA" from producing zero terms.
-
-    Terms come from whatever fields the context layer already has — the same ones sent to the
-    LLM — with placeholders like "NA" or "Unknown" dropped via is_placeholder.
-
-    Returns (terms, is_ot). is_ot is true if ANY subsystem or the asset itself resolves to an
-    Operational Technology ctm_scan_category (via control_mapping.session_is_ot — DB-driven,
-    not text-pattern-matched), a deliberately loose check — one OT component is enough, so a
-    plant with a single IT historian still gets flagged for ICS advisories. If no terms are
-    found, the caller skips sending intel at all rather than sending a noisy, useless block."""
-    terms: list[str] = []
+    product: vendor / technology / platform names from _INTEL_TECH_FIELDS plus the asset's
+             operating_system, placeholders ("NA", "Unknown") dropped via is_placeholder.
+    scope:   canonical sector keys from sector / sub_sector / critical_service (fixed dropdown
+             values such as "Energy", "Power Transmission" → 'sector:energy') plus the
+             configured home country — matched by equality against each item's structured
+             scope_tags, so a sector word can never hit an unrelated title by coincidence.
+    categories: ctm_scan_category codes (IT / OT / ...) — DB-resolved, not text-matched; one OT
+             component anywhere is enough for ICS advisories to be drawn first."""
+    product: list[str] = []
     seen: set[str] = set()
 
     def _add(value: Any) -> None:
         for v in value if isinstance(value, (list, tuple)) else [value]:
             text = str(v).strip() if v is not None else ""
-            if text and not is_placeholder(text) and text.casefold() not in seen:
-                seen.add(text.casefold())
-                terms.append(text)
+            key = text.casefold()
+            if text and not is_placeholder(text) and key not in _GENERIC_INVENTORY_VALUES and key not in seen:
+                seen.add(key)
+                product.append(text)
 
     for sub in subsystems or []:
         for fld in _INTEL_TECH_FIELDS:
             _add(sub.get(fld))
-    # These come from fixed dropdown values ("Energy", "Power Generation"), not free text —
-    # matching the exact wording OTX and CISA ICS advisories use to tag themselves. Without
-    # this, an asset with a generic tech inventory like "Custom Application" would match
-    # nothing and silently get no intel block at all.
-    for fld in ("asset_type", "sector", "sub_sector", "critical_service"):
-        _add(asset_context.get(fld))
-    is_ot = control_mapping.session_is_ot(sess, subsystems, asset_context)
-    return terms, is_ot
+    _add(asset_context.get("operating_system"))
+    scope = intel.sector_keys([asset_context.get(k) for k in ("sector", "sub_sector", "critical_service")])
+    home = get_settings().intel_home_country
+    if home:
+        scope += intel.country_keys(home)
+    return IntelTerms(product=product, scope=scope,
+                      categories=control_mapping.session_category_codes(sess, subsystems, asset_context))
 
 
-def _fetch_intel(terms: list[str] | None, is_ot: bool,
-                actors: list[str] | None = None, limit: int | None = None) -> list[dict] | None:
+def _prefer_kinds(categories: set[str]) -> tuple[str, ...]:
+    """Which intel kind is drawn first, by asset category. OT anywhere wins: a plant with one
+    IT historian still wants ICS advisories first. Pure IT wants exploited CVEs first. The
+    non-technical categories (data, human roles, facilities, physical) have no CVE surface of
+    their own, so campaign reports lead."""
+    codes = {c.upper() for c in categories}
+    if "OT" in codes:
+        return ("ics_advisory", "cve", "pulse")
+    if "IT" in codes:
+        return ("cve", "pulse", "ics_advisory")
+    return ("pulse", "cve", "ics_advisory")
+
+
+def _fetch_intel(terms: IntelTerms | None, actors: list[str] | None = None,
+                limit: int | None = None) -> list[dict] | None:
     """Fetches threat-intel items to inject into the prompt; prompts._intel_block just
-    renders whatever this returns. If `terms` (from _intel_vocabulary) is empty, no intel
-    block is sent at all."""
+    renders whatever this returns. With no product AND no scope terms, no block is sent."""
     s = get_settings()
-    if not s.intel_enabled or not terms:
+    if not s.intel_enabled or terms is None or not (terms.product or terms.scope):
         return None
     if limit is None:
         limit = s.prompt_intel_limit
     try:
-        from app.intel.fetchers import query_intel
-
-        prefer = ("ics_advisory", "cve") if is_ot else ("cve",)
+        prefer = _prefer_kinds(terms.categories)
+        items = intel.query_intel(terms, prefer_kinds=prefer, limit=limit)
         actor_terms = [a for a in (actors or []) if a]
-        items = query_intel(terms + actor_terms, prefer_kinds=prefer, limit=limit)
         if actor_terms:
-            pulses = query_intel(actor_terms, prefer_kinds=("pulse",), limit=1, backfill=False)
+            # One reserved slot for a report ATTRIBUTED to this threat's actor (equality on the
+            # pulse's adversary — a role label like "Cybercriminal" matches nothing).
+            pulses = intel.query_actor_pulses(actor_terms, limit=1)
             if pulses:
                 seen = {(p["source"], p["external_id"]) for p in pulses}
                 items = pulses + [i for i in items
                                 if (i["source"], i["external_id"]) not in seen]
                 items = items[:limit]
         if items:
-            # log what was injected so we can measure later whether it was actually relevant
-            log.info("scenario.intel_injected", is_ot=is_ot,
-                    external_ids=[i.get("external_id") for i in items])
+            # Everything an audit needs to judge relevance without recomputing: the terms
+            # searched and, per item, WHICH tier admitted it.
+            log.info("scenario.intel_injected", prefer=prefer, product_terms=terms.product,
+                    scope_keys=terms.scope,
+                    items=[{"id": i.get("external_id"), "kind": i.get("kind"),
+                            "via": i.get("matched_via")} for i in items])
         return items or None
     except Exception:
         log.warning("scenario.intel_fetch_failed", exc_info=True)
@@ -1331,7 +359,7 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     # Fall back to an empty coverage when the caller doesn't have one yet.
     cov = coverage or _Coverage(vocab={}, frozen=None, others=None)
     # Intel is matched using the tech-inventory terms from coverage, never threat wording.
-    intel_items = _fetch_intel(cov.intel_terms, cov.intel_ot, actors, limit=tn.prompt_intel_limit)
+    intel_items = _fetch_intel(cov.intel_terms, actors, limit=tn.prompt_intel_limit)
     # The set of IDs the model was allowed to cite. Left as None (not an empty set) when no
     # intel was sent at all, so validation skips the citation check instead of failing every id.
     injected_intel_ids = ({str(i.get("external_id")) for i in intel_items if i.get("external_id")}
@@ -1473,10 +501,33 @@ def _scrub_model_output(scenario: dict, sid: str, threat_id: str | None) -> dict
         return scenario
 
 
+def _stamp_generation_span(started: datetime, step) -> tuple[datetime, datetime]:
+    """Close one scenario's generation span: record its seconds on the trace step and return
+    (started, finished) for the caller to carry to the row.
+
+    An EXPLICIT channel, on purpose. The span used to ride inside `report` and be popped out by
+    the row builder - which meant a scenario that FAILED, and so never produced a report, had no
+    span at all: the failure card published gen_seconds=null while the trace file recorded the
+    duration. The batch tuple now carries the span for every item, success or failure, and both
+    row builders take it as a required keyword - a call site that forgets it is a TypeError, not
+    a silent NULL. (scripts/test_pipeline_guards.py pins the three _generate_one_scenario call
+    sites; nothing here touches them.)
+
+    dal.now() (wall clock), not perf_counter: these are TIMESTAMPS, and their overlap across rows
+    is the whole point. Generation fans out scenario_generation_concurrency at a time, so several
+    scenarios legitimately share a start - recording both ends makes that visible in the data
+    instead of leaving it as a caveat about why per-scenario durations do not sum to the stage.
+    """
+    finished = now()
+    step.result(seconds=span_seconds(started, finished))
+    return started, finished
+
+
 def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, scenario: dict, report: dict,
                             epoch: int, entity_id: str | None, user_id: str | None, info: dict,
                             scenario_number: int = 1, replaces_scenario_id: str | None = None,
-                            source: str = "generated") -> dict:
+                            source: str = "generated", *,
+                            span: tuple[datetime, datetime]) -> dict:
 
     scenario = _scrub_model_output(scenario, sid, info.get("threat_id"))
     identity = dal.identity_hash(sid, ss, info)
@@ -1490,6 +541,10 @@ def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, s
         "IdentityHash": identity, "ScenarioNumber": scenario_number,
         "ReplacesScenarioID": replaces_scenario_id,
         "GenerationEpoch": epoch, "ErrorMessage": None, "CreatedAt": now(),
+        # The generation span, in its own columns and NOT in ValidationJSON: one copy of the
+        # fact. CreatedAt above is when this ROW WAS PERSISTED - the batch persists sequentially
+        # once every scenario has finished generating - so it is a different fact.
+        "GenStartedAt": span[0], "GenFinishedAt": span[1],
         # "library" = this text was written for another asset of the SAME profile and had its
         # system names swapped in; anything else was written for this asset. A reviewer signing
         # the register has to be able to tell, so it is persisted, never inferred.
@@ -1499,7 +554,8 @@ def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, s
 
 def _build_error_output_row(scoped_id: str, sid: str, tenant: str, ss: int, client_msg: str,
                             epoch: int, entity_id: str | None, user_id: str | None, info: dict,
-                            scenario_number: int = 1, replaces_scenario_id: str | None = None) -> dict:    
+                            scenario_number: int = 1, replaces_scenario_id: str | None = None,
+                            *, span: tuple[datetime, datetime]) -> dict:
     return {
         "ScenarioID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
         "SubsystemID": ss,
@@ -1510,6 +566,9 @@ def _build_error_output_row(scoped_id: str, sid: str, tenant: str, ss: int, clie
         "ReplacesScenarioID": replaces_scenario_id,
         "GenerationEpoch": epoch,
         "ErrorMessage": client_msg, "CreatedAt": now(),
+        # A failure has a span too - how long it burned before falling over is the most useful
+        # number a failure card can carry (a 120s timeout reads nothing like an instant reject).
+        "GenStartedAt": span[0], "GenFinishedAt": span[1],
     }
 
 
@@ -1653,11 +712,12 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
         scoped_rows.append(_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id))
         if scoped_id not in scenarios:
             continue
-        scenario, report = scenarios[scoped_id]
+        scenario, report, span = scenarios[scoped_id]
         number = target.scenario_number if target is not None else 1
         output_rows.append(_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
                                                     entity_id, user_id, enriched.get(sc.threat_id, {}),
-                                                    scenario_number=number, source="generated"))
+                                                    scenario_number=number, source="generated",
+                                                    span=span))
     if scoped_rows:
         sess.execute(insert(m.Scoped_Threat), scoped_rows)
     if output_rows:
@@ -1742,9 +802,9 @@ def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: 
         log.warning("scenario.entry_points_unavailable", session_id=sid, subsystem=ss,
                     subsystems=len(subsystems))
     fold = _fold_scenario_rows(dal.active_scenario_rows(sess, sid, ss))
-    intel_terms, intel_ot = _intel_vocabulary(sess, subsystems, asset_context)
+    intel_terms = _intel_vocabulary(sess, subsystems, asset_context)
     return _ScenarioBatch(base_ctx, enriched, deduped, pairs, scoped_count, fold, entry_vocab,
-                        intel_terms, intel_ot)
+                        intel_terms)
 
 
 def _retire_prior_card(sess: Session, sid: str, ss: int, info: dict) -> str | None:
@@ -1754,21 +814,22 @@ def _retire_prior_card(sess: Session, sid: str, ss: int, info: dict) -> str | No
 
 def _persist_full_run_failure(sess: Session, sid: str, ss: int, tenant: str, entity_id: str | None,
                             user_id: str | None, sc, scoped_id: str, info: dict,
-                            client_msg: str, epoch: int) -> None:
+                            client_msg: str, epoch: int, span: tuple[datetime, datetime]) -> None:
     retired_card = _retire_prior_card(sess, sid, ss, info)
     dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, {sc.threat_id})
     sess.execute(insert(m.Scoped_Threat),
                 [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
     sess.execute(insert(m.Threat_Scenario),
                 [_build_error_output_row(scoped_id, sid, tenant, ss, client_msg, epoch,
-                                        entity_id, user_id, info, replaces_scenario_id=retired_card)])
+                                        entity_id, user_id, info, replaces_scenario_id=retired_card,
+                                        span=span)])
     sess.commit()
 
 
 def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, entity_id: str | None,
                             user_id: str | None, sc, scoped_id: str, info: dict,
-                            scenario: dict, report: dict, epoch: int,
-                            source: str = "generated") -> None:
+                            scenario: dict, report: dict, epoch: int, *,
+                            span: tuple[datetime, datetime], source: str = "generated") -> None:
     retired_card = _retire_prior_card(sess, sid, ss, info)
     # Same as _persist_full_run_failure: retire any existing active Scoped_Threat row for this
     # threat before inserting a new one. This matters on a Celery retry — if attempt 1 failed
@@ -1780,16 +841,18 @@ def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, en
     sess.execute(insert(m.Threat_Scenario),
                 [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
                                             entity_id, user_id, info, replaces_scenario_id=retired_card,
-                                            source=source)])
+                                            source=source, span=span)])
     sess.commit()
 
 
 def _generate_scenario_batch(sess: Session, scenario_session: dict, base_ctx: dict, work: list,
                             enriched: dict, llm: LLMClient, task_id: str, epoch: int,
                             per_item: dict, session_factory) -> list[tuple]:
-    """Generate every scenario in `work`, returning (scoped_id, result_or_None, exc_or_None)
-    in the SAME order - the caller persists sequentially, so ordering, ScenarioNumber and
-    determinism are untouched by how the calls were dispatched.
+    """Generate every scenario in `work`, returning
+    (scoped_id, result_or_None, exc_or_None, (started, finished)) in the SAME order - the caller
+    persists sequentially, so ordering, ScenarioNumber and determinism are untouched by how the
+    calls were dispatched. The span is ALWAYS present: `started` is taken before the try, so a
+    failure is timed exactly like a success (see _stamp_generation_span).
 
     These calls are independent, so running them one at a time made a session's ~10 scenarios
     take ~10x one call for no reason. Same tokens either way; only wall-clock changes.
@@ -1806,31 +869,42 @@ def _generate_scenario_batch(sess: Session, scenario_session: dict, base_ctx: di
     # ponytail: ThreadPoolExecutor, not a new abstraction - llm.rerank_many already runs this
     # exact pattern under the same gevent worker, where threads are greenlets.
     """
+    sid = scenario_session["SessionID"]
     concurrency = min(get_settings().scenario_generation_concurrency, len(work))
     if session_factory is None or concurrency <= 1:
-        out = []
+        out: list[tuple] = []
         for sc, scoped_id, _target in work:
+            started = now()                # ABOVE the try: a failure still gets its span
             try:
-                out.append((scoped_id, _generate_one_scenario(
-                    sess, scenario_session, base_ctx, sc, enriched, llm, task_id, epoch,
-                    **per_item[scoped_id], correlation_id=scoped_id), None))
+                with trace_step("SCENARIO", sid, correlation_id=scoped_id,
+                                threat_id=sc.threat_id) as _t:
+                    result = _generate_one_scenario(
+                        sess, scenario_session, base_ctx, sc, enriched, llm, task_id, epoch,
+                        **per_item[scoped_id], correlation_id=scoped_id)
+                    span = _stamp_generation_span(started, _t)
+                out.append((scoped_id, result, None, span))
             except Exception as exc:  # noqa: BLE001 - [R8] captured per item, re-raised by the caller
-                out.append((scoped_id, None, exc))
+                out.append((scoped_id, None, exc, (started, now())))
         return out
 
     from concurrent.futures import ThreadPoolExecutor
 
     def _one(item):
         sc, scoped_id, _target = item
+        started = now()                    # ABOVE the try: a failure still gets its span
         try:
             # Own session, own transaction, closed before the result is handed back - nothing
             # from this greenlet is still open when the caller starts persisting.
-            with session_factory() as worker_sess:
-                return (scoped_id, _generate_one_scenario(
+            with session_factory() as worker_sess, \
+                    trace_step("SCENARIO", sid, correlation_id=scoped_id,
+                            threat_id=sc.threat_id) as _t:
+                result = _generate_one_scenario(
                     worker_sess, scenario_session, base_ctx, sc, enriched, llm, task_id, epoch,
-                    **per_item[scoped_id], correlation_id=scoped_id), None)
+                    **per_item[scoped_id], correlation_id=scoped_id)
+                span = _stamp_generation_span(started, _t)
+                return (scoped_id, result, None, span)
         except Exception as exc:  # noqa: BLE001 - [R8] same contract as the sequential branch
-            return (scoped_id, None, exc)
+            return (scoped_id, None, exc, (started, now()))
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         return list(pool.map(_one, work))   # map preserves input order
@@ -1848,13 +922,68 @@ def _flag_same_batch_duplicates(by_scoped: dict, identities: dict, ratio: float)
     costs nothing and needs no sampling.
     """
     fresh = [(identities[sc_id], str((res[0] or {}).get("scenario_statement") or ""))
-            for sc_id, (res, _exc) in by_scoped.items() if res is not None]
-    for sc_id, (res, _exc) in by_scoped.items():
+            for sc_id, (res, *_) in by_scoped.items() if res is not None]
+    for sc_id, (res, *_) in by_scoped.items():
         if res is None:
             continue
         others = [text for h, text in fresh if h != identities[sc_id]]
         if others:
             _flag_cross_threat_similarity(res[1], res[0], others, ratio)
+
+
+def _persist_batch_results(sess: Session, scenario_session: dict, work: list, by_scoped: dict,
+                           enriched: dict, epoch: int, task_id: str, *, targeted: bool
+                           ) -> tuple[list, list[str], set[str], dict, Exception | None, Exception | None]:
+    """Persist a generated batch SEQUENTIALLY, in the original order, on the caller's session.
+
+    Returns (provs, failures, failed_ids, scenarios, first_failure, slot_unavailable) for
+    write_scenarios to act on. Lifted out of write_scenarios unchanged so that the per-item
+    contract - including the span every item now carries - lives in one function of readable
+    size; the stage transition (finish_stage) and the control-mapping tail stay in the caller.
+    """
+    sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
+    entity_id, user_id = scenario_session["EntityID"], scenario_session.get("UserID")
+    provs: list[Provenance | None] = []
+    scenarios: dict[str, tuple[dict, dict, tuple[datetime, datetime]]] = {}
+    failures: list[str] = []
+    failed_ids: set[str] = set()  # threat ids whose GENERATION failed - never "rescored out"
+    first_failure: Exception | None = None
+    slot_unavailable: Exception | None = None
+    for sc, scoped_id, _target in work:
+        result, exc, span = by_scoped[scoped_id]
+        if exc is not None:
+            if isinstance(exc, LLMSlotUnavailable):
+                # Not a scenario failure: no capacity right now. Remembered and raised AFTER
+                # the successes are committed, so a starved call cannot throw away work that
+                # was already generated and already billed. Celery retries the stage and
+                # _begin_full_run_attempt's already_done skips whatever landed.
+                slot_unavailable = slot_unavailable or exc
+                continue
+            sess.rollback()
+            first_failure = first_failure or exc
+            failed_ids.add(sc.threat_id)
+            client_msg = _failure_client_message(exc)
+            failures.append(f"{enriched.get(sc.threat_id, {}).get('threat_name') or sc.threat_id}: {client_msg}")
+            log.warning("scenario.generation_failed", session_id=sid, subsystem=ss,
+                        threat_id=sc.threat_id, error=repr(exc))
+            if not targeted:
+                _persist_full_run_failure(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
+                                        enriched.get(sc.threat_id, {}), client_msg, epoch, span)
+            continue
+        scenario, report, prov = result
+        provs.append(prov)
+        if not targeted:
+            if not dal.renew_lease(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id):
+                sess.rollback()
+                log.warning("stage.claim_lost_midbatch", session_id=sid, subsystem=ss,
+                            stage="SCENARIOS", epoch=epoch, committed=len(provs) - 1)
+                break
+            _persist_full_run_scenario(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
+                                    enriched.get(sc.threat_id, {}), scenario, report, epoch,
+                                    span=span, source="generated")
+        else:
+            scenarios[scoped_id] = (scenario, report, span)
+    return provs, failures, failed_ids, scenarios, first_failure, slot_unavailable
 
 
 def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict], asset_context: dict, threats: list[dict],
@@ -1884,14 +1013,9 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     siblings_by_hash, entry_vocab = batch.fold.siblings_by_hash, batch.entry_vocab
     cross_pairs = list(batch.fold.cross_pairs)
 
-    provs: list[Provenance | None] = []
-    scenarios: dict[str, tuple[dict, dict]] = {}
     already_done: set[str] = set()
     if not targeted:
         already_done = _begin_full_run_attempt(sess, sid, ss, tenant, entity_id, user_id, pairs, epoch)
-    failures: list[str] = []
-    failed_ids: set[str] = set()  # threat ids whose GENERATION failed — never "rescored out"
-    first_failure: Exception | None = None
     work = [(sc, scoped_id, target) for sc, scoped_id, target in pairs
             if sc.selected and sc.threat_id not in already_done]
     identities = {scoped_id: dal.identity_hash(sid, ss, enriched.get(sc.threat_id, {}))
@@ -1914,55 +1038,20 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
                                 frozen=batch.fold.frozen_by_hash.get(identities[scoped_id]),
                                 others=[s for h, s in cross_pairs
                                         if h != identities[scoped_id]] or None,
-                                intel_terms=batch.intel_terms, intel_ot=batch.intel_ot),
+                                intel_terms=batch.intel_terms),
         }
         # correlation_id is passed as a LITERAL keyword at each call site, never through this
         # dict: scripts/test_pipeline_guards.py verifies the stamp by reading the AST, and a
         # value hidden inside **kwargs would silently retire that check.
     generated = _generate_scenario_batch(sess, scenario_session, base_ctx, work, enriched,
                                         llm, task_id, epoch, per_item, session_factory)
-    by_scoped = {sc_id: (res, exc) for sc_id, res, exc in generated}
+    by_scoped = {sc_id: (res, exc, span) for sc_id, res, exc, span in generated}
 
     ratio = tuning.from_session(scenario_session).sibling_similarity_ratio
     _flag_same_batch_duplicates(by_scoped, identities, ratio)
 
-    # Persist SEQUENTIALLY, in the original order, on the caller's session.
-    slot_unavailable: Exception | None = None
-    for sc, scoped_id, _target in work:
-        result, exc = by_scoped[scoped_id]
-        if exc is not None:
-            if isinstance(exc, LLMSlotUnavailable):
-                # Not a scenario failure: no capacity right now. Remembered and raised AFTER
-                # the successes are committed, so a starved call cannot throw away work that
-                # was already generated and already billed. Celery retries the stage and
-                # _begin_full_run_attempt's already_done skips whatever landed.
-                slot_unavailable = slot_unavailable or exc
-                continue
-            sess.rollback()
-            first_failure = first_failure or exc
-            failed_ids.add(sc.threat_id)
-            client_msg = _failure_client_message(exc)
-            failures.append(f"{enriched.get(sc.threat_id, {}).get('threat_name') or sc.threat_id}: {client_msg}")
-            log.warning("scenario.generation_failed", session_id=sid, subsystem=ss,
-                        threat_id=sc.threat_id, error=repr(exc))
-            if not targeted:
-                _persist_full_run_failure(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
-                                        enriched.get(sc.threat_id, {}), client_msg, epoch)
-            continue
-        scenario, report, prov = result
-        provs.append(prov)
-        if not targeted:
-            if not dal.renew_lease(sess, sid, ss, SubsystemLevel.SCENARIOS, epoch, task_id):
-                sess.rollback()
-                log.warning("stage.claim_lost_midbatch", session_id=sid, subsystem=ss,
-                            stage="SCENARIOS", epoch=epoch, committed=len(provs) - 1)
-                break
-            _persist_full_run_scenario(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
-                                    enriched.get(sc.threat_id, {}), scenario, report, epoch,
-                                    source="generated")
-        else:
-            scenarios[scoped_id] = (scenario, report)
-        cross_pairs.append((identities[scoped_id], str(scenario.get("scenario_statement") or "")))
+    provs, failures, failed_ids, scenarios, first_failure, slot_unavailable = _persist_batch_results(
+        sess, scenario_session, work, by_scoped, enriched, epoch, task_id, targeted=targeted)
 
     if failures and not provs and not already_done and first_failure is not None:
         raise first_failure
@@ -2061,7 +1150,7 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
         log.warning("variant.entry_points_ambiguous", session_id=sid, subsystem=ss, labels=ambiguous)
     # Variants skip _prepare_scenario_batch, so intel terms are resolved here instead using
     # the same shared helper — otherwise every variant would silently get no intel block.
-    intel_terms, intel_ot = _intel_vocabulary(sess, subsystems, asset_context)
+    intel_terms = _intel_vocabulary(sess, subsystems, asset_context)
     threats = dal.active_threats(sess, sid, ss)
     enriched = {t["threat_id"]: t for t in threats}
     base_ctx = prompts.build_base_context(scenario_session["AssetName"], asset_context, subsystems)
@@ -2092,15 +1181,19 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
         # worse than NULL because a wrong id reads as an answer.
         scoped_id = guid()
         try:
-            scenario, report, _prov = _generate_one_scenario(
-                sess, scenario_session, base_ctx, sc, enriched, llm, task_id, epoch,
-                sibling_texts=siblings_by_hash.get(item["identity_hash"]) or None,
-                coverage=_Coverage(
-                    vocab=entry_vocab,
-                    frozen=fold.frozen_by_hash.get(item["identity_hash"]),
-                    others=[s for h, s in cross_pairs if h != item["identity_hash"]] or None,
-                    intel_terms=intel_terms, intel_ot=intel_ot),
-                correlation_id=scoped_id)
+            with trace_step("SCENARIO", sid, correlation_id=scoped_id,
+                            variant_number=item["next_number"]) as _t:
+                _started = now()
+                scenario, report, _prov = _generate_one_scenario(
+                    sess, scenario_session, base_ctx, sc, enriched, llm, task_id, epoch,
+                    sibling_texts=siblings_by_hash.get(item["identity_hash"]) or None,
+                    coverage=_Coverage(
+                        vocab=entry_vocab,
+                        frozen=fold.frozen_by_hash.get(item["identity_hash"]),
+                        others=[s for h, s in cross_pairs if h != item["identity_hash"]] or None,
+                        intel_terms=intel_terms),
+                    correlation_id=scoped_id)
+                span = _stamp_generation_span(_started, _t)
         except LLMSlotUnavailable:
             sess.rollback()
             log.warning("variant.slots_exhausted", session_id=sid, subsystem=ss,
@@ -2117,7 +1210,8 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
             sess.execute(insert(m.Threat_Scenario),
                         [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
                                                     entity_id, user_id, info,
-                                                    scenario_number=item["next_number"])])
+                                                    scenario_number=item["next_number"],
+                                                    span=span)])
             sess.commit()
         except IntegrityError:
             sess.rollback()
@@ -2167,6 +1261,7 @@ def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, ex
     sess.rollback()
     sid = scenario_session["SessionID"]
     client_msg = _failure_client_message(exc)
+    _now = now()   # one instant for UpdatedAt and FinishedAt, as claim_stage/finish_stage do
     sess.execute(
         update(m.Subsystem_Stage_State)
         .where(m.Subsystem_Stage_State.SessionID == sid,
@@ -2174,7 +1269,11 @@ def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, ex
             m.Subsystem_Stage_State.Level.in_(list(_WORK_LEVELS)),
             m.Subsystem_Stage_State.GenerationEpoch == epoch,
             m.Subsystem_Stage_State.Status.in_([StageStatus.IDLE, StageStatus.RUNNING]))
-        .values(Status=StageStatus.ERROR, ErrorMessage=client_msg, LeaseExpiresAt=None, UpdatedAt=now())
+        # Runs in the worker at the moment of failure, so FinishedAt here is exact - unlike the
+        # reaper's HeartbeatAt lower bound. Every terminal write stamps an end; the static test in
+        # test_step_timings refuses one that does not.
+        .values(Status=StageStatus.ERROR, ErrorMessage=client_msg, LeaseExpiresAt=None,
+                UpdatedAt=_now, FinishedAt=_now)
     )
     detail = {"error": client_msg, "subsystem_id": subsystem_id}
     if extra:
@@ -2370,6 +1469,20 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
             else:
                 log.warning("pipeline.threats_not_complete_skipping_scenarios", session_id=session_id, task_id=task_id)
         except LLMSlotUnavailable:
+            raise
+        except TRANSIENT_INFRA_ERRORS as exc:
+            # The infrastructure hiccuped — the work is not wrong. Re-raise for Celery's
+            # autoretry (the stage CAS re-claims under the same task id); routing this
+            # into _record_failure would CANCEL the whole session over a transient
+            # deadlock/connection blip. The `finally` below still releases the lock, and
+            # decide_session_outcome is deliberately skipped.
+            log_transient_infra_retry(site="run_pipeline.asset_stage",
+                                    session_id=session_id, subsystem_id=ASSET_UNIT_ID,
+                                    exc=exc)
+            # The failed transaction must be cleared BEFORE the finally's release_lock
+            # runs SQL — otherwise PendingRollbackError replaces this exception mid-flight
+            # and Celery's autoretry (keyed on OperationalError) never fires.
+            sess.rollback()
             raise
         except Exception as exc:  # noqa: BLE001 — capture, don't swallow ([R8]); lock must still release in finally
             _record_failure(sess, scenario_session, ASSET_UNIT_ID, exc)

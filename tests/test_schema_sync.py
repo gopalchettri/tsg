@@ -53,17 +53,17 @@ _TYPES = (r"n?varchar|n?char|int|bigint|bit|datetime2?|float|real|decimal|numeri
         r"|uniqueidentifier|tinyint|smallint|date|time|money|n?text|varbinary")
 
 
-def _sql_text() -> str:
+def _sql_text(paths=None) -> str:
     """Every script concatenated, with `--` line comments stripped so a commented-out ALTER
-    cannot masquerade as deployed DDL."""
+    cannot masquerade as deployed DDL. Default corpus: the numbered handoff scripts."""
     joined = "\n".join(p.read_text(encoding="utf-8", errors="replace")
-                    for p in sorted(_SCRIPTS.glob("*.sql")))
+                    for p in (sorted(_SCRIPTS.glob("*.sql")) if paths is None else paths))
     return re.sub(r"--[^\n]*", "", joined)
 
 
-def _ddl_columns() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+def _ddl_columns(paths=None) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """(columns from CREATE TABLE, columns from guarded ALTER ... ADD), keyed by table."""
-    sql = _sql_text()
+    sql = _sql_text(paths)
     created: dict[str, set[str]] = {}
     for mt in re.finditer(r"CREATE\s+TABLE\s+(?:dbo\.)?\[?(\w+)\]?\s*\((.*?)\n\s*\)\s*;",
                         sql, re.S | re.I):
@@ -402,3 +402,75 @@ def test_every_sp_rename_actually_renames_something() -> None:
                 f"NOT reject this -- it creates an object literally named '{dst}', reachable "
                 f"only as [dbo].[{dst}]. The new name must be bare.")
 
+
+
+# ---------------------------------------------------------------------------
+# DROPPED COLUMNS NEVER RETURN. The one-directional guard above (models -> SQL) cannot see a
+# script that re-ADDS a column the model no longer maps, and the corpus above is deliberately
+# the numbered scripts only. Real incident: after Identified_Threat.Description was dropped, the
+# operator-run consolidated script eyshield_handoff/scripts/tsg_remediation_tables.sql still
+# CREATEd it and its #want reconciler re-ADDed it - run it and the column came straight back.
+# This scans every script an operator actually runs (the " copy" duplicates are kept on purpose
+# and never run, so they are excluded) for the three ways a column can come back.
+# ---------------------------------------------------------------------------
+_DROPPED_COLUMNS = {
+    ("Threat_Category", "SecurityObjective"),
+    ("Threat_Type", "Description"), ("Threat_Type", "SectorID"),
+    ("Threat_Catalogue", "Description"), ("Threat_Catalogue", "SectorID"),
+    ("Identified_Threat", "Description"),          # 2026-09-05
+}
+_CREATE_HEAD_RE = re.compile(r"CREATE\s+TABLE\s+(?:\[?dbo\]?\.)?\[?(\w+)\]?", re.I)
+_COLUMN_LINE_RE = re.compile(rf"^\s*\[?(\w+)\]?\s+\[?(?:{_TYPES})\b", re.I)
+_WANT_ROW_RE = re.compile(r"\(\s*'(\w+)'\s*,\s*'(\w+)'\s*,")
+
+
+def _run_scripts() -> list[Path]:
+    """What a DBA actually executes: the handoff package, its consolidated scripts/ folder, and
+    the standalone TSG_Migration_*.sql deltas."""
+    found = [*_SCRIPTS.glob("*.sql"), *(_SCRIPTS / "scripts").glob("*.sql"), *_SCRIPTS.parent.glob("*.sql")]
+    return sorted(p for p in found if " copy" not in p.name)
+
+
+def _created_columns_loose(sql: str) -> set[tuple[str, str]]:
+    """(table, column) for every column line inside any CREATE TABLE body, tolerant of the
+    [dbo].[Table] spelling and of bodies that end in ') ON [PRIMARY]' rather than ');'."""
+    out, table = set(), None
+    for line in sql.splitlines():
+        head = _CREATE_HEAD_RE.search(line)
+        if head:
+            table = head.group(1)
+            continue
+        if table is None:
+            continue
+        if line.strip().upper() == "GO" or line.lstrip().startswith(")"):
+            table = None
+            continue
+        col = _COLUMN_LINE_RE.match(line)
+        if col and col.group(1).upper() not in ("CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "INDEX"):
+            out.add((table, col.group(1)))
+    return out
+
+
+def _want_rows(sql: str) -> set[tuple[str, str]]:
+    """Rows of EVERY `INSERT INTO #want ... ;` block (the remediation script declares #want
+    twice). Anchoring on that header keeps the two-column @dead drop list and the guarded
+    DROP COLUMN statements from false-positiving."""
+    rows: set[tuple[str, str]] = set()
+    for block in re.findall(r"INSERT\s+INTO\s+#want\b(.*?);", sql, re.S | re.I):
+        rows |= set(_WANT_ROW_RE.findall(block))
+    return rows
+
+
+def test_dropped_columns_never_return() -> None:
+    paths = _run_scripts()
+    assert len(paths) >= 8, f"run-script corpus shrank to {len(paths)} - the globs have drifted"
+    sql = _sql_text(paths)
+    _, altered = _ddl_columns(paths)
+    created, want = _created_columns_loose(sql), _want_rows(sql)
+    assert ("Identified_Threat", "ThreatCategoryID") in want, "the #want parser found nothing - it has drifted"
+    back = sorted(f"{t}.{c}" for t, c in _DROPPED_COLUMNS
+                  if (t, c) in created or c in altered.get(t, set()) or (t, c) in want)
+    assert not back, (
+        "columns dropped from the product are re-created or re-added by a script an operator "
+        f"runs: {back}. Remove them from the CREATE body, the guarded ALTER and the #want list; "
+        "a drop must be a drop in every script.")

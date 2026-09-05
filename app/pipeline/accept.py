@@ -401,10 +401,13 @@ def _ensure_threat_data_still_active(sess: Session, session_id: str, good_subs: 
     cat_ids = {c for _, c in rows if c is not None}
 
     if type_ids:
+        # IsDeleted-only, not IsActive-gated: a type promote-to-library just minted starts
+        # IsActive=False (pending curator review, see dal.upsert_threat_type) and must still
+        # count as existing here, or accepting a session containing an already-promoted threat
+        # would wrongly 409 as MasterInactive. Only a hard-deleted type should trip this gate.
         active = {r[0] for r in sess.execute(
             select(m.Threat_Type.ThreatTypeID).where(
-                m.Threat_Type.ThreatTypeID.in_(type_ids),
-                m.Threat_Type.IsActive == True, m.Threat_Type.IsDeleted == False))}
+                m.Threat_Type.ThreatTypeID.in_(type_ids), m.Threat_Type.IsDeleted == False))}
         if type_ids - active:
             raise MasterInactive(f"Threat_Type inactive: {sorted(type_ids - active)}")
     if cat_ids:

@@ -112,10 +112,17 @@ class EmbeddingBusy(Exception):
 # L1 cache: one small dict per (model_id, group, kind), mapping text -> its vector.
 _L1: dict[tuple[str, str, str], dict[str, list[float]]] = {}
 
-# Matrix cache: one pre-normalized float32 matrix per (model_id, group, kind), so similarity
-# search doesn't re-pack vectors on every query. Value = (texts digest, normalized matrix,
-# row -> text-index map). A digest change triggers a rebuild; clear_cache() also drops this.
-_MATRIX: dict[tuple[str, str, str], tuple[str, Any, list[int]]] = {}
+# Matrix cache: pre-normalized float32 matrices per (model_id, group, kind), so similarity
+# search doesn't re-pack vectors on every query. Value = {texts-digest: (normalized matrix,
+# row -> text-index map)}, insertion-ordered and bounded to _MATRIX_SHAPES entries per key:
+# one group legitimately serves SEVERAL text-list shapes at once (threat_catalogue holds the
+# relevance gate's Top-K subset AND regrounding's full corpus), and the previous one-slot
+# design made those two evict each other on every single run — up to
+# threat_llm_max_generation full-matrix rebuilds per run that never warmed across runs.
+# clear_cache() drops whole keys, unchanged.
+_MATRIX: dict[tuple[str, str, str], dict[str, tuple[Any, list[int]]]] = {}
+#: Distinct text-list shapes kept warm per (model, group, kind); oldest evicted beyond this.
+_MATRIX_SHAPES = 4
 
 # Circuit breaker for _vector_store(): @lru_cache doesn't memoize exceptions, so without this
 # a Mongo outage retries the full connect handshake on every get_vectors() call. Once it fails,
@@ -328,9 +335,11 @@ def get_matrix(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: st
         return None
     digest = hashlib.sha256("\x1f".join(texts).encode()).hexdigest()
     key = (model_id, group, kind)
-    hit = _MATRIX.get(key)
-    if hit is not None and hit[0] == digest:
-        return hit[1], hit[2]
+    slot = _MATRIX.get(key)
+    if slot is not None:
+        hit = slot.get(digest)
+        if hit is not None:
+            return hit
     vecs = get_vectors(llm, texts, model_id=model_id, group=group, kind=kind)
     dim = len(vecs[texts[0]])
     rows, row_indexes = [], []
@@ -347,7 +356,10 @@ def get_matrix(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: st
     norms = _np.linalg.norm(mat, axis=1, keepdims=True)
     norms[norms == 0] = 1.0  # zero-magnitude rows stay all-zero -> cosine 0, hybrid_search.cosine's convention
     mat = mat / norms
-    _MATRIX[key] = (digest, mat, row_indexes)
+    slot = _MATRIX.setdefault(key, {})
+    slot[digest] = (mat, row_indexes)
+    while len(slot) > _MATRIX_SHAPES:  # insertion-ordered dict: oldest shape goes first
+        slot.pop(next(iter(slot)))
     return mat, row_indexes
 
 

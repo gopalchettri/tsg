@@ -137,10 +137,47 @@ GO
 -- that fails on existing duplicates (Msg 1505) would leave NO unique index at
 -- all. On a database still holding the old 3-column index, drop it by hand.
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Type'))
-CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName) WHERE IsActive = 1 AND IsDeleted = 0;
+CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName) WHERE IsDeleted = 0;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCatalogue_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Catalogue'))
-CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatName) WHERE IsActive = 1 AND IsDeleted = 0;
+CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatName) WHERE IsDeleted = 0;
+
+-- WIDEN UX_ThreatType_NaturalKey / UX_ThreatCatalogue_NaturalKey from WHERE IsActive = 1 AND
+-- IsDeleted = 0 to WHERE IsDeleted = 0 — 2026-09-04, promote-to-library IsActive=0 fix.
+-- ---------------------------------------------------------------------------
+-- Change 3 makes promote-to-library insert AI-authored rows as IsActive=0 (pending curator
+-- review, dal.upsert_threat_type/upsert_threat_catalogue). A FILTERED index only restricts rows
+-- that themselves satisfy its own predicate — an IsActive=0 insert never matched "WHERE
+-- IsActive=1", so the old index gave ZERO duplicate-name protection for every such insert, not
+-- just a rare concurrent race. Widening to IsDeleted=0 covers every live row regardless of review
+-- status. Guarded the same way as the CREATE above: never drop-then-recreate if that would
+-- immediately fail on an existing duplicate (Msg 1505) and leave the table with NO unique index —
+-- PRINT and skip instead, exactly like this file's other "never drop blind" guards.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey'
+        AND object_id = OBJECT_ID('dbo.Threat_Type') AND filter_definition LIKE '%IsActive%')
+BEGIN
+    IF NOT EXISTS (SELECT ThreatTypeName FROM Threat_Type WHERE IsDeleted = 0
+                GROUP BY ThreatTypeName HAVING COUNT(*) > 1)
+        BEGIN
+            DROP INDEX UX_ThreatType_NaturalKey ON Threat_Type;
+            CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON Threat_Type(ThreatTypeName) WHERE IsDeleted = 0;
+        END
+    ELSE
+        PRINT 'UX_ThreatType_NaturalKey NOT widened: duplicate ThreatTypeName rows exist among IsDeleted=0 rows. Resolve duplicates, then re-run.';
+END
+
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCatalogue_NaturalKey'
+        AND object_id = OBJECT_ID('dbo.Threat_Catalogue') AND filter_definition LIKE '%IsActive%')
+BEGIN
+    IF NOT EXISTS (SELECT ThreatName FROM Threat_Catalogue WHERE IsDeleted = 0
+                GROUP BY ThreatName HAVING COUNT(*) > 1)
+        BEGIN
+            DROP INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue;
+            CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatName) WHERE IsDeleted = 0;
+        END
+    ELSE
+        PRINT 'UX_ThreatCatalogue_NaturalKey NOT widened: duplicate ThreatName rows exist among IsDeleted=0 rows. Resolve duplicates, then re-run.';
+END
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
 CREATE UNIQUE INDEX UX_ThreatActor_NaturalKey ON Threat_Actor(ThreatActorName) WHERE IsActive = 1 AND IsDeleted = 0;
