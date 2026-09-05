@@ -160,7 +160,10 @@ POST /v1/sessions/{id}/scenarios/{scenario_id}/treatment-plan   api/treatment.py
         v
 run_treatment_generation                    pipeline/treatment.py
   ├─ prompts.treatment_prompt               pipeline/prompts.py:648-660
+  │    + TreatmentPlanGenerated: the reply schema, sent as strict Structured Outputs where the
+  │      model honours it (TSG_LLM_STRUCTURED_OUTPUT=auto|on|off), plain json_object elsewhere
   ├─ LLM call, touch_plan progress clock    pipeline/treatment.py:526-529
+  │    finish_reason=length -> LLMResponseTruncated (generation_failed, "ran out of output budget")
   ├─ _validate_plan  (advisory clamps only) pipeline/treatment.py:313-358
   ├─ control resolution against library      pipeline/treatment.py:384-393
   └─ COMPLETE | ERROR + TreatmentOutcomeReason

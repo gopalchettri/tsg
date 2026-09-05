@@ -761,7 +761,11 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
             sess, llm, messages, scenario_session=audit_ident,
             subsystem_id=ASSET_UNIT_ID, stage="treatment_plan",
             correlation_id=plan_id,  # stamps the Prompt_Log receipt for the evidence API
-            expected_type=dict, temperature=settings.treatment_temperature)
+            expected_type=dict, temperature=settings.treatment_temperature,
+            # The exact document shape, enforced provider-side where the model supports strict
+            # Structured Outputs (dev/Azure); plain JSON mode elsewhere. _validate_plan below
+            # stays as the server-side check either way.
+            response_schema=prompts.TreatmentPlanGenerated)
         # Inject FIRST, warn SECOND: _inject_reserved drops unresolved controls, and every
         # advisory below must describe the plan the reviewer actually sees — a Critical plan
         # whose only urgent control was dropped must WARN, not pass on the ghost of that row.

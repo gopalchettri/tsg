@@ -37,7 +37,14 @@ from app.pipeline import (
     scoping,
     validation,
 )
-from app.pipeline.llm import LLMClient, LLMSlotUnavailable, Provenance, moderate
+from app.pipeline.llm import (
+    LLMClient,
+    LLMRefusal,
+    LLMResponseTruncated,
+    LLMSlotUnavailable,
+    Provenance,
+    moderate,
+)
 
 # --- Structure pass: Stage-1 threat identification and the shared stage primitives live
 # --- in their own modules now. These RE-EXPORTS keep every external import path working
@@ -1243,6 +1250,14 @@ def _classify_llm_failure(exc: Exception) -> tuple[str, str]:
         # internal detail — the same reason treatment._classify_failure words its own parse
         # case in prose. The repr is still recorded server-side by _record_failure's log line.
         return "parse", "the model's reply was not usable JSON"
+    if isinstance(exc, LLMRefusal):
+        # Structured Outputs' refusal shape — a safety refusal, so the guardrail token: the one
+        # class a client must NOT auto-retry unchanged (treatment -> content_blocked).
+        return "guardrail", "content blocked by the model's safety refusal"
+    if isinstance(exc, LLMResponseTruncated):
+        # A budget failure, named as one. Generic token: treatment reports generation_failed,
+        # documented "retryable as-is" — true for a stochastic cut (a regenerate recovers).
+        return "generic", "the model ran out of output budget before finishing its reply"
     try:
         from litellm.exceptions import RejectedRequestError
     except ImportError:

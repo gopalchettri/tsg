@@ -61,6 +61,28 @@ class LLMSlotUnavailable(Exception):
     the whole stage via the same claim_stage CAS crash-redelivery uses."""
 
 
+class LLMResponseTruncated(Exception):
+    """The provider stopped at the output cap (finish_reason == "length"): the reply is cut off
+    or — on a reasoning model whose hidden thinking is charged against the same cap — entirely
+    EMPTY. Raised instead of returning the stump so the failure is named for what it is (a
+    budget), not misreported downstream as "the model wrote bad JSON". Carries the numbers the
+    operator needs to size TSG_LLM_MAX_OUTPUT_TOKENS / LLM_REASONING_EFFORT."""
+
+    def __init__(self, *, max_tokens: int | None, completion_tokens: int | None,
+                 reasoning_tokens: int | None):
+        self.max_tokens, self.completion_tokens, self.reasoning_tokens = (
+            max_tokens, completion_tokens, reasoning_tokens)
+        super().__init__(
+            f"the model hit its output cap (max_tokens={max_tokens}, "
+            f"completion_tokens={completion_tokens}, reasoning_tokens={reasoning_tokens})")
+
+
+class LLMRefusal(Exception):
+    """Structured Outputs' refusal shape: `message.refusal` set, `content` null. A safety
+    refusal, not a malformed reply — classified as a guardrail block (content_blocked, the one
+    reason a client must NOT auto-retry), never as invalid_plan."""
+
+
 @contextmanager
 def _provider_429_retryable():
     """Maps a provider-side rate limit onto LLMSlotUnavailable, so a 429 that survives litellm's
@@ -240,13 +262,24 @@ class Provenance:
     prompt_version: str = ""  # set by the pipeline caller (prompt + model provenance)
 
 
+def _usage_field(obj: Any, name: str) -> Any:
+    """Read one usage field off litellm's Usage object OR a plain dict (test stubs); None when
+    the provider sent no usage at all."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
 class LLMClient(Protocol):
     """Contract every AI client implements — the real `LiteLLMClient` below, or a test-only
     `StubLLMClient`. Pipeline code never checks which one it holds."""
 
     def chat(self, messages: list[dict], *, model: str | None = None,
             temperature: float | None = None,
-            expected_type: type | None = None) -> tuple[str, Provenance]:
+            expected_type: type | None = None,
+            response_schema: type | None = None) -> tuple[str, Provenance]:
         """Single chat completion; returns (text, Provenance) so callers can persist model+params
         without threading litellm-specific response shapes around. `temperature`, like `model`,
         is a per-call override — None means "use the configured default".
@@ -254,7 +287,11 @@ class LLMClient(Protocol):
         `expected_type` is the top-level JSON type the caller will parse (dict or list). It is
         what decides whether provider-side JSON mode is requested: `{"type":"json_object"}`
         forces an OBJECT, which is wrong for a caller expecting an array. Passing the parser's
-        own declaration here makes the two impossible to contradict."""
+        own declaration here makes the two impossible to contradict.
+
+        `response_schema` (optional, a Pydantic model class) is the exact reply shape — strict
+        Structured Outputs where the model is known to honour them, plain JSON mode elsewhere
+        (Settings.llm_structured_output). Only meaningful with expected_type=dict."""
         ...
 
     def embed(self, texts: Sequence[str], *, model: str | None = None, kind: str = "query") -> list[list[float]]:
@@ -325,9 +362,12 @@ class LiteLLMClient:
         self.s = settings or get_settings()
 
     def _chat_kwargs(self, model: str | None = None, temperature: float | None = None,
-                    expected_type: type | None = None) -> dict[str, Any]:
+                    expected_type: type | None = None,
+                    response_schema: type | None = None) -> dict[str, Any]:
         """Provider dispatch for chat(): azure_openai / openai / (default) litellm proxy, plus
-        the timeout+retry budget every call in this file shares."""
+        the timeout+retry budget every call in this file shares. Every branch returns through
+        _with_response_format, which needs the RESOLVED model name to decide json_schema vs
+        json_object — hence it runs last."""
         s = self.s
         common: dict[str, Any] = {"timeout": s.llm_timeout_seconds, "num_retries": s.llm_max_retries}
         # JSON mode is gated on the CALLER'S declared shape, not on the flag alone.
@@ -337,9 +377,8 @@ class LiteLLMClient:
         # LLMResponseParseError, and only in environments that enable the flag
         # (.env.prod.example does). Driving it from expected_type — the same value the parser
         # asserts on — makes the two impossible to disagree. expected_type=None (a caller with
-        # no JSON contract) also opts out.
-        if s.llm_json_mode and expected_type is dict:
-            common["response_format"] = {"type": "json_object"}
+        # no JSON contract) also opts out. Applied in _with_response_format, once the model is
+        # known.
         effective_temperature = temperature if temperature is not None else s.llm_temperature
         if effective_temperature is not None:
             common["temperature"] = effective_temperature
@@ -362,13 +401,15 @@ class LiteLLMClient:
             if model:  # Azure addresses a DEPLOYMENT, not a model name — a per-call model can't apply here
                 log.debug("llm.azure_ignores_per_call_model", requested=model,
                         deployment=s.azure_openai_deployment_name)
-            return {"model": f"azure/{s.azure_openai_deployment_name}", "api_base": s.azure_openai_endpoint,
-                    "api_key": s.azure_openai_api_key, "api_version": s.azure_openai_api_version, **common}
+            return self._with_response_format(
+                {"model": f"azure/{s.azure_openai_deployment_name}", "api_base": s.azure_openai_endpoint,
+                 "api_key": s.azure_openai_api_key, "api_version": s.azure_openai_api_version, **common},
+                expected_type, response_schema)
         if s.llm_provider == "openai":
             kw = {"model": model or s.inference_model, "api_key": s.openai_api_key, **common}
             if s.openai_base_url:
                 kw["api_base"] = s.openai_base_url
-            return kw
+            return self._with_response_format(kw, expected_type, response_schema)
         # default: litellm proxy. custom_llm_provider is required, not cosmetic: litellm's own
         # get_llm_provider() can't infer a provider from an arbitrary proxy-side model alias
         # (e.g. "glm-5") even with api_base set, and raises BadRequestError instead of guessing.
@@ -377,9 +418,41 @@ class LiteLLMClient:
             **_litellm_key_header(s), **common}
         if s.llm_guardrails:  # names pre-registered on the proxy itself — proxy-only, no direct-provider equivalent
             kw["guardrails"] = s.llm_guardrails
+        return self._with_response_format(kw, expected_type, response_schema)
+
+    def _with_response_format(self, kw: dict[str, Any], expected_type: type | None,
+                              response_schema: type | None) -> dict[str, Any]:
+        """Last step of _chat_kwargs. JSON mode is gated on the caller's declared shape (see the
+        comment there); WHICH form goes on the wire depends on the RESOLVED model:
+        - a declared schema, on a model known to honour it -> strict Structured Outputs (litellm
+          turns the Pydantic class into {"type":"json_schema","json_schema":{...,"strict":true}}
+          generically, before provider dispatch);
+        - otherwise -> {"type":"json_object"}, today's request — so a proxy alias whose upstream
+          knows only json_object (glm-5 / kimi-k2.5 native APIs document nothing else) never
+          sees a parameter it would 400 on."""
+        if self.s.llm_json_mode and expected_type is dict:
+            use_schema = response_schema is not None and self._schema_allowed(
+                kw["model"], kw.get("custom_llm_provider"))
+            kw["response_format"] = response_schema if use_schema else {"type": "json_object"}
         return kw
 
-    def chat(self, messages, *, model=None, temperature=None, expected_type=None):
+    def _schema_allowed(self, model: str, provider: str | None) -> bool:
+        """Settings.llm_structured_output: on/off are explicit; auto asks litellm's own model
+        table (True for azure/gpt-5-mini, False for an unknown proxy alias). Defensive on
+        purpose: the test-suite stubs litellm with a namespace that lacks the probe, and
+        "unknown" must land on the safe side — json_object."""
+        mode = self.s.llm_structured_output
+        if mode != "auto":
+            return mode == "on"
+        import litellm
+        probe = getattr(litellm, "supports_response_schema", None)
+        try:
+            return bool(probe(model=model, custom_llm_provider=provider)) if probe else False
+        except Exception:  # noqa: BLE001 — capability probe; "unknown" must land on json_object
+            return False
+
+    def chat(self, messages, *, model=None, temperature=None, expected_type=None,
+             response_schema=None):
         """One completion → (text, Provenance). litellm is imported locally so a stub-only test
         run never needs the package installed.
 
@@ -388,7 +461,10 @@ class LiteLLMClient:
         above that, purely as a net for pathological input (a document landing in a field that
         expected a short value).
 
-        `expected_type` drives provider-side JSON mode — see _chat_kwargs.
+        `expected_type` drives provider-side JSON mode — see _chat_kwargs; `response_schema`
+        picks strict Structured Outputs over plain JSON mode where the model allows it — see
+        _with_response_format. A reply stopped at the output cap raises LLMResponseTruncated; a
+        Structured Outputs refusal raises LLMRefusal — neither is ever returned as text.
         """
         import litellm
 
@@ -401,7 +477,7 @@ class LiteLLMClient:
                 "technology_used, incident_description, cii_asset_description)")
 
         _assert_no_db_keys(messages, self.s)
-        kwargs = self._chat_kwargs(model, temperature, expected_type)
+        kwargs = self._chat_kwargs(model, temperature, expected_type, response_schema)
         # THE trace hook for model calls, placed HERE rather than on tasks._ask_ai because two
         # callers bypass that wrapper entirely — grounding._paraphrase (threshold calibration,
         # run at worker boot) and this module's own selfcheck. One hook on the client covers
@@ -421,7 +497,8 @@ class LiteLLMClient:
         fallback_from = ""
         with trace_step("LLM CALL", None, model=kwargs.get("model"),
                         messages=len(messages), prompt_chars=total_chars,
-                        expected_type=getattr(expected_type, "__name__", None)) as _t:
+                        expected_type=getattr(expected_type, "__name__", None),
+                        response_schema=getattr(response_schema, "__name__", None)) as _t:
             with _llm_slot(self.s), _provider_429_retryable():
                 try:
                     resp = _complete(kwargs)
@@ -438,7 +515,7 @@ class LiteLLMClient:
                     log.warning("llm.fallback_model_used", primary=kwargs["model"], fallback=fb,
                                 error=f"{type(exc).__name__}: {exc}")
                     fallback_from = kwargs["model"]
-                    kwargs = self._chat_kwargs(fb, temperature, expected_type)
+                    kwargs = self._chat_kwargs(fb, temperature, expected_type, response_schema)
                     try:
                         resp = _complete(kwargs)
                     except Exception as fb_exc:
@@ -450,9 +527,31 @@ class LiteLLMClient:
                         log.warning("llm.fallback_also_failed", fallback=fb,
                                     error=f"{type(fb_exc).__name__}: {fb_exc}")
                         raise exc from fb_exc
+            choice = resp["choices"][0]
+            msg = choice["message"]
+            content = msg.get("content")
+            finish_reason = choice.get("finish_reason")
+            usage = resp.get("usage")
+            completion_tokens = _usage_field(usage, "completion_tokens")
+            reasoning_tokens = _usage_field(_usage_field(usage, "completion_tokens_details"),
+                                            "reasoning_tokens")
             _t.result(served_model=str(resp.get("model", "") or ""),
-                    response_chars=len(resp["choices"][0]["message"]["content"] or ""))
-        return resp["choices"][0]["message"]["content"], Provenance(
+                    response_chars=len(content or ""), finish_reason=finish_reason,
+                    completion_tokens=completion_tokens, reasoning_tokens=reasoning_tokens)
+            # A reply cut at the cap is a BUDGET failure, not a JSON one — and on a reasoning
+            # model it is usually an EMPTY string (the thinking spent the whole cap). Name it.
+            if finish_reason == "length":
+                raise LLMResponseTruncated(max_tokens=kwargs.get("max_tokens"),
+                                           completion_tokens=completion_tokens,
+                                           reasoning_tokens=reasoning_tokens)
+            # Structured Outputs' refusal shape: no content, a `refusal` string instead.
+            refusal = msg.get("refusal")
+            if not content and refusal:
+                raise LLMRefusal(str(refusal))
+        rf = kwargs.get("response_format")
+        rf_label = (None if rf is None
+                    else f"json_schema:{rf.__name__}" if rf is response_schema else "json_object")
+        return content, Provenance(
             model=kwargs["model"],
             # what the proxy ACTUALLY served (may be a dated snapshot / fallback of the
             # requested name), not just what we asked for.
@@ -462,6 +561,9 @@ class LiteLLMClient:
                 "timeout": self.s.llm_timeout_seconds,
                 "num_retries": self.s.llm_max_retries,
                 "json_mode": self.s.llm_json_mode,
+                # which JSON contract actually went on the wire for THIS call (see
+                # _with_response_format) — a receipt must say whether the schema was enforced.
+                **({"response_format": rf_label} if rf_label else {}),
                 # only recorded when actually pinned; read back from `kwargs` (the resolved
                 # value) rather than re-deriving _chat_kwargs' precedence a second time.
                 **({"temperature": kwargs["temperature"]} if "temperature" in kwargs else {}),

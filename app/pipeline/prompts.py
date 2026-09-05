@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict
+
 from app.core.config import get_settings
 from app.core.enums import ActionPriority, ControlCoverage, ControlType, YesNo
 from app.core.logging import get_logger
@@ -655,6 +657,54 @@ def variant_scenario_prompt(base_ctx: dict[str, Any], threat_type: str | None, t
     return scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
                         intel_items=intel_items, entry_points=entry_points, existing=recent,
                         category=category)
+
+
+class _GeneratedControl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    control_type: ControlType
+    control_name: str
+    description: str
+    priority: ActionPriority
+    control_code: str  # the library_mapped code verbatim; treatment resolves the id server-side
+
+
+class _GeneratedAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action_id: str
+    action: str
+    owner: str
+    priority: ActionPriority
+    dependencies: str
+    timeline: str  # ISO YYYY-MM-DD as the prompt demands; kept str (no `format:` keyword), _as_date parses it
+    success_criteria: str
+
+
+class _GeneratedControls(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    control_coverage: ControlCoverage
+    controls: list[_GeneratedControl]
+
+
+class TreatmentPlanGenerated(BaseModel):
+    """What the model MUST return for treatment_prompt — the strict Structured Outputs schema,
+    mirroring the FIELDS block one-to-one and built from the SAME enums as its vocabulary lines,
+    so the allowed words can never drift between the prose and the schema.
+
+    Deliberately NOT the served TreatmentPlanDocument (every field Any|None, extra="allow" — lax
+    so an old stored row can't 500 a GET): strict mode needs the opposite. And deliberately
+    WITHOUT treatment._RESERVED_PLAN_KEYS (treatment_plan, risk_identification_date, risk_owner,
+    impacted_business_division): those are stamped server-side and overwrite anything the model
+    says — a schema that REQUIRED them would force the model to invent a risk owner's name.
+    Lives in this file on purpose: PROMPT_VERSION hashes it, so a schema change bumps the
+    version stamped on every receipt — the schema IS part of the prompt contract."""
+    model_config = ConfigDict(extra="forbid")
+    title: str
+    controls_to_be_implemented: _GeneratedControls
+    remediation_action_plan: list[_GeneratedAction]
+    action_plan: str
+    mitigation_timeline: str
+    mitigation_owner: str
+    applicable_to_all_subsystems: YesNo
 
 
 def treatment_prompt(snapshot: dict[str, Any]) -> list[dict]:

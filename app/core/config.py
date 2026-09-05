@@ -235,11 +235,28 @@ class Settings(BaseSettings):
 
     # TSG_LLM_MAX_OUTPUT_TOKENS — cap on completion tokens per chat call (SDD §16.2 output-size
     # limit). None (default) = provider default. Sent as `max_tokens`; drop_params covers a
-    # provider that rejects it. Scenario/threat JSON fits comfortably in 4096.
+    # provider that rejects it. Scenario/threat JSON fits comfortably in 4096 — but on a
+    # REASONING model (gpt-5 family, glm-5 / kimi with thinking on) the cap INCLUDES the hidden
+    # thinking tokens (litellm sends it as max_completion_tokens for gpt-5), so 4096 can be spent
+    # entirely on thinking and come back as an EMPTY reply with finish_reason="length" — which
+    # chat() now raises as LLMResponseTruncated instead of handing downstream an empty string.
+    # A treatment plan is ~2k visible tokens: size this >= 16384 for those models, or pin
+    # LLM_REASONING_EFFORT=low.
     llm_max_output_tokens: int | None = Field(None, ge=256, le=32768)
 
     # LLM_JSON_MODE — ask the provider to guarantee valid JSON (not every provider supports it).
     llm_json_mode: bool = Field(False, validation_alias=AliasChoices("LLM_JSON_MODE", "TSG_LLM_JSON_MODE"))
+
+    # LLM_STRUCTURED_OUTPUT — how a caller-declared reply schema (chat(response_schema=...), the
+    # treatment plan today) is sent, under llm_json_mode. "auto": strict Structured Outputs
+    # (response_format json_schema, strict=true) only where litellm vouches for the resolved
+    # model — azure/gpt-5-mini yes; a proxy alias such as glm-5 / kimi-k2.5 no, their native APIs
+    # document only json_object and an upstream that knows only json_object 400s EVERY call — and
+    # plain json_object everywhere else, i.e. exactly today's request. "on": always send the
+    # schema (a proxy whose upstream is verified via /model/info supports_response_schema).
+    # "off": never. A caller with no schema is unaffected by this setting.
+    llm_structured_output: Literal["auto", "on", "off"] = Field(
+        "auto", validation_alias=AliasChoices("LLM_STRUCTURED_OUTPUT", "TSG_LLM_STRUCTURED_OUTPUT"))
 
     # LLM_TEMPERATURE — 0 = consistent, 2 = varied; unset = provider default.
     llm_temperature: float | None = Field(

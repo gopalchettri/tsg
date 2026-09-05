@@ -12,9 +12,10 @@ import types
 import httpx
 import openai
 import pytest
+from pydantic import BaseModel
 
 from app.core.config import Settings
-from app.pipeline.llm import LiteLLMClient, LLMSlotUnavailable
+from app.pipeline.llm import LiteLLMClient, LLMRefusal, LLMResponseTruncated, LLMSlotUnavailable
 
 _REQ = httpx.Request("POST", "http://proxy.test/v1/chat/completions")
 _OK = {"model": "served", "choices": [{"message": {"content": "hello"}}]}
@@ -191,3 +192,99 @@ def test_stage_lease_floor_doubles_with_active_fallback(monkeypatch):
     with pytest.raises(Exception, match="safe floor"):
         _settings(monkeypatch, TSG_LLM_TIMEOUT_SECONDS="180.0", TSG_LLM_MAX_RETRIES="3")
 
+
+
+# --- Structured Outputs: which JSON contract goes on the wire (llm._with_response_format) ---------
+class _Schema(BaseModel):
+    ok: bool
+
+
+def _json_settings(monkeypatch, **over) -> Settings:
+    return _settings(monkeypatch, TSG_LLM_JSON_MODE="true", **over)
+
+
+def test_declared_schema_is_sent_when_structured_output_on(monkeypatch):
+    """`on`: the Pydantic class itself is handed to litellm (which converts it to a strict
+    json_schema generically) — on the primary AND on the fallback re-call, so a fallback can
+    never quietly drop the contract. Provenance names the contract that ran."""
+    calls = _stub_litellm(monkeypatch, [_server_500(), _OK])
+    _, prov = LiteLLMClient(_json_settings(monkeypatch, TSG_LLM_STRUCTURED_OUTPUT="on")).chat(
+        _MSG, expected_type=dict, response_schema=_Schema)
+    primary, fallback = calls
+    assert primary["response_format"] is _Schema and fallback["response_format"] is _Schema
+    assert prov.params["response_format"] == "json_schema:_Schema"
+
+
+def test_auto_degrades_to_json_object_when_litellm_cannot_vouch(monkeypatch):
+    """The UAT shape — glm-5 -> kimi-k2.5 through the proxy, whose native APIs document only
+    json_object. The stub, like litellm's table for a proxy alias, cannot vouch for the model, so
+    `auto` sends exactly today's request on both calls."""
+    calls = _stub_litellm(monkeypatch, [_server_500(), _OK])
+    _, prov = LiteLLMClient(_json_settings(monkeypatch)).chat(
+        _MSG, expected_type=dict, response_schema=_Schema)
+    assert [c["response_format"] for c in calls] == [{"type": "json_object"}] * 2
+    assert prov.params["response_format"] == "json_object"
+
+
+def test_auto_sends_the_schema_when_litellm_vouches(monkeypatch):
+    calls = _stub_litellm(monkeypatch, [_OK])
+    sys.modules["litellm"].supports_response_schema = lambda model, custom_llm_provider=None: True
+    LiteLLMClient(_json_settings(monkeypatch)).chat(_MSG, expected_type=dict, response_schema=_Schema)
+    assert calls[0]["response_format"] is _Schema
+
+
+def test_structured_output_off_keeps_json_object(monkeypatch):
+    calls = _stub_litellm(monkeypatch, [_OK])
+    LiteLLMClient(_json_settings(monkeypatch, TSG_LLM_STRUCTURED_OUTPUT="off")).chat(
+        _MSG, expected_type=dict, response_schema=_Schema)
+    assert calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_no_declared_schema_is_todays_json_object_even_when_on(monkeypatch):
+    calls = _stub_litellm(monkeypatch, [_OK])
+    LiteLLMClient(_json_settings(monkeypatch, TSG_LLM_STRUCTURED_OUTPUT="on")).chat(
+        _MSG, expected_type=dict)
+    assert calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_json_mode_off_sends_no_response_format_even_with_a_schema(monkeypatch):
+    calls = _stub_litellm(monkeypatch, [_OK])
+    # BOTH alias names, explicitly: the dev .env enables JSON mode, and a real litellm import
+    # elsewhere in the session load_dotenv()s it into os.environ under the un-prefixed name,
+    # which AliasChoices consults first.
+    _, prov = LiteLLMClient(_settings(monkeypatch, LLM_JSON_MODE="false", TSG_LLM_JSON_MODE="false",
+                                      TSG_LLM_STRUCTURED_OUTPUT="on")).chat(
+        _MSG, expected_type=dict, response_schema=_Schema)
+    assert "response_format" not in calls[0] and "response_format" not in prov.params
+
+
+# --- finish_reason: a cap stop and a refusal are never returned as text -------------------------
+def _reply(content, finish_reason=None, *, refusal=None, usage=None) -> dict:
+    msg = {"content": content, **({"refusal": refusal} if refusal is not None else {})}
+    choice = {"message": msg, **({"finish_reason": finish_reason} if finish_reason else {})}
+    return {"model": "served", "choices": [choice], **({"usage": usage} if usage else {})}
+
+
+def test_length_stop_raises_truncated_with_the_numbers(monkeypatch):
+    """A reasoning model that spends the whole cap thinking returns EMPTY content with
+    finish_reason=length — a budget failure, raised as one (with the numbers), never handed
+    downstream as '' to be misreported as bad JSON."""
+    _stub_litellm(monkeypatch, [_reply("", "length", usage={
+        "completion_tokens": 4096, "completion_tokens_details": {"reasoning_tokens": 4096}})])
+    with pytest.raises(LLMResponseTruncated) as ei:
+        LiteLLMClient(_settings(monkeypatch, TSG_LLM_MAX_OUTPUT_TOKENS="4096")).chat(
+            _MSG, expected_type=dict)
+    assert (ei.value.max_tokens, ei.value.completion_tokens, ei.value.reasoning_tokens) == (4096, 4096, 4096)
+    assert "reasoning_tokens=4096" in str(ei.value)
+
+
+def test_refusal_raises_llm_refusal(monkeypatch):
+    _stub_litellm(monkeypatch, [_reply(None, "stop", refusal="I can't help with that.")])
+    with pytest.raises(LLMRefusal, match="can't help"):
+        LiteLLMClient(_settings(monkeypatch)).chat(_MSG, expected_type=dict)
+
+
+def test_stop_reply_with_usage_is_returned_unchanged(monkeypatch):
+    _stub_litellm(monkeypatch, [_reply("hello", "stop", usage={"completion_tokens": 12})])
+    text, _ = LiteLLMClient(_settings(monkeypatch)).chat(_MSG)
+    assert text == "hello"

@@ -34,7 +34,8 @@ from app.core.enums import (
 )
 from app.db import dal
 from app.db import models as m
-from app.pipeline import celery_app
+from app.pipeline import celery_app, prompts
+from app.pipeline import llm as llm_mod
 from app.pipeline import treatment as treatment_mod
 from app.sse import bus
 
@@ -47,7 +48,7 @@ def _engine():
     register_sqlite_json_value(engine)  # board + register routes use SQL Server's JSON_VALUE
     for table in (m.Scenario_Session, m.Threat_Scenario, m.Scoped_Threat,
                 m.Identified_Threat, m.Risk_Treatment_Plan, m.Scenario_Audit,
-                m.Threat_Scenario_Control_Map, m.Control_Library):
+                m.Threat_Scenario_Control_Map, m.Control_Library, m.Prompt_Log):
         table.__table__.create(engine)
     with engine.begin() as conn:
         # The MSSQL arbiter, recreated: SQLite supports partial unique indexes, and the ORM
@@ -715,3 +716,34 @@ def test_gate_text_covers_every_raisable_member():
 
 if __name__ == "__main__":
     print("run via pytest")
+
+
+def test_generation_declares_the_strict_plan_schema(monkeypatch):
+    """Route -> frozen snapshot -> prompt -> client, pinned end to end: the plan call hands the
+    client prompts.TreatmentPlanGenerated (llm._with_response_format then decides json_schema vs
+    json_object per model), still declares a dict reply, and a schema-shaped reply lands
+    COMPLETE with its own document — the receipt row included."""
+    from test_treatment_structured_output import sample_generated_plan
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    plan_id = _create(Session, monkeypatch).plan_id
+    generated = sample_generated_plan()
+    seen: dict = {}
+
+    class _RecordingLLM:
+        def chat(self, messages, **kw):
+            seen.update(kw)
+            return generated.model_dump_json(), llm_mod.Provenance(model="fake-model")
+
+    with Session() as s:
+        treatment_mod.run_treatment_generation(s, plan_id, _RecordingLLM(), "worker-task-1")
+        receipt = s.execute(select(m.Prompt_Log.__table__)
+                            .where(m.Prompt_Log.CorrelationID == plan_id)).mappings().one()
+    assert seen["response_schema"] is prompts.TreatmentPlanGenerated
+    assert seen["expected_type"] is dict
+    (row,) = _plans(Session)
+    assert row["Status"] == str(StageStatus.COMPLETE), row["ErrorMessage"]
+    assert json.loads(row["PlanJSON"])["title"] == generated.title
+    assert receipt["ParseSucceeded"] and receipt["Model"] == "fake-model"
