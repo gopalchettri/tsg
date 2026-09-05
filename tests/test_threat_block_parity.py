@@ -32,6 +32,13 @@ _ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime.now(UTC)
 
 
+def _dal_source() -> str:
+    """dal.py plus its treatment-plan slice (dal_treatment.py, split out 2026-09) — one text for
+    the source pins, so a select unpacking the shared list counts wherever it lives."""
+    return "".join((_ROOT / "app" / "db" / f).read_text(encoding="utf-8")
+                   for f in ("dal.py", "dal_treatment.py"))
+
+
 def _threat_cols(sel) -> set[str]:
     it = m.Identified_Threat.__table__
     return {c.name for c in sel.selected_columns if getattr(c, "table", None) is it}
@@ -44,7 +51,7 @@ def test_all_scenario_reads_select_the_one_shared_threat_column_list():
     assert _threat_cols(sessions_mod._scenario_select()) == canonical
     assert _threat_cols(dal._scenario_read_select()) == canonical
     # accepted_scenarios builds its select inline — pin at source that it unpacks the list.
-    src = (_ROOT / "app" / "db" / "dal.py").read_text(encoding="utf-8")
+    src = _dal_source()
     # 4, not 2: active_plan_row and entity_plan_rows joined the shared list in 2026-08. They
     # had hand-rolled a six-column subset, so the treatment plan answered null where
     # /results carried a value — the exact drift this list exists to prevent, in the two
@@ -169,15 +176,16 @@ def test_display_wording_coalesce_is_shared_and_prefers_the_curator():
     # STRONGER guarantee, because there is one builder rather than two call sites that have to
     # keep agreeing. Pinning the delegation is what keeps a future local re-implementation from
     # quietly reintroducing the wording split this test exists to prevent.
+    psrc = (_ROOT / "app" / "api" / "treatment_presenter.py").read_text(encoding="utf-8")
     tsrc = (_ROOT / "app" / "api" / "treatment.py").read_text(encoding="utf-8")
-    assert "_scenario_narrative(" in tsrc
-    assert "display_threat_names" not in tsrc, (
+    assert "_scenario_narrative(" in psrc  # the presenter moved out of treatment.py in 2026-09
+    assert "display_threat_names" not in psrc + tsrc, (
         "the plan presenter must DELEGATE the coalesce, not call it itself — two callers is how "
         "the two screens drifted apart in the first place")
     # Both plan selects now take the SHARED column list, so LibraryThreat* is no longer spelled
     # out here at all. That is the point: a hand-rolled subset is what let the plan response
     # answer null where /results carried a value.
-    dsrc = (_ROOT / "app" / "db" / "dal.py").read_text(encoding="utf-8")
+    dsrc = _dal_source()
     # Score/ScopeRank are on Scoped_Threat, so the shared list cannot carry them and each plan
     # select must add them explicitly. Missing, the plan's threat block answered null for two
     # fields /results populates — found by diffing the two blocks on a real row, not by reading.
