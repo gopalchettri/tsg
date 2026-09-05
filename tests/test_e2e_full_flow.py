@@ -67,6 +67,9 @@ def client(tmp_path, monkeypatch):
                 m.Threat_Type, m.Threat_Catalogue, m.ThreatType_ThreatActor_Map,
                 m.Threat_Catalogue_Category_Map, m.Control_Library,
                 m.Threat_Scenario_Control_Map,
+                # The treatment-plan lifecycle (2026-09): plans, control standards, actors, prompt log.
+                m.Risk_Treatment_Plan, m.Control_Standard, m.Control_Library_Standard_Map,
+                m.Threat_Actor, m.Prompt_Log,
                 # Platform-owned tables gather_asset_details() reads for session creation.
                 m.ctm_scan_entity, m.ctm_scan_entity_bu, m.onboarding_supporting_systems,
                 m.ctm_scan_entity_supporting_system, m.Config_Tuning):
@@ -350,3 +353,145 @@ def test_regenerate_over_real_http(client, monkeypatch):
     body = r.json()
     assert body["session_id"] == sid
     assert len(calls) == 1 and calls[0][0] == sid and calls[0][1] == [oid]
+
+
+# ───────────────────────── treatment-plan lifecycle over real HTTP ─────────────────────────
+
+def _complete_plan(plan_id: str) -> None:
+    """The worker's job, done through the app's OWN engine: enqueue is a no-op here (the seam this
+    file already uses for the pipeline), so the RUNNING row is finished by hand with a minimal
+    plan document — the same idiom test_treatment_plan_versions.py's _set_status uses."""
+    from sqlalchemy import update
+
+    from app.db.engine import db_session
+    with db_session() as s:
+        s.execute(update(m.Risk_Treatment_Plan).where(m.Risk_Treatment_Plan.PlanID == plan_id).values(
+            Status=str(StageStatus.COMPLETE), CompletedAt=_now(), UpdatedAt=_now(),
+            PlanJSON=json.dumps({"title": "E2E plan", "treatment_plan": "Mitigate",
+                                 "action_plan": "Harden remote access.", "applicable_to_all_subsystems": "No",
+                                 "controls_to_be_implemented": {"control_coverage": "gaps", "controls": []},
+                                 "mitigation_timeline": "2026-09-30", "mitigation_owner": "OT Security Team",
+                                 "risk_owner": "Head of OT Operations",
+                                 "impacted_business_division": "Water Ops"})))
+        s.commit()
+
+
+_PLAN_BODY = {
+    "existing_controls": ["annual patching"], "likelihood_rating": 4, "impact_rating": 5,
+    "final_risk_rating": 20, "risk_level": "Critical", "risk_identification_date": "2026-06-14T08:31:00Z",
+    "risk_owner": "Head of OT Operations", "impacted_business_division": "Water Ops",
+    "existing_controls_all_subsystems": "No",
+    "existing_controls_all_subsystems_justification": "IT systems only",
+    "mitigation_start_date": "2026-07-01", "mitigation_end_date": "2026-09-30",
+}
+
+
+def _wire(model) -> set[str]:
+    return {n for n, f in model.model_fields.items() if not f.exclude}
+
+
+def test_treatment_plan_lifecycle_over_real_http(client, monkeypatch):
+    """The whole remediation surface as one real-HTTP flow — the same journey the live E2E drives
+    against the running stack, minus the LLM: create -> complete -> regenerate -> history parity ->
+    board parity -> approve a HISTORICAL version -> 422/409 guard rails -> cancel mid-flight ->
+    regenerate + approve -> register -> audit trails -> evidence. Every response's key set is held
+    to its model's wire fields. Deterministic: enqueue is a no-op, so 'RUNNING' stays RUNNING until
+    the test completes the row itself, which makes the cancel path exact rather than a race."""
+    from conftest import register_sqlite_json_value
+
+    import app.api.treatment as treatment_api
+    from app.api import schemas as S
+    from app.db.engine import db_session, get_engine
+
+    register_sqlite_json_value(get_engine())  # board/register use SQL Server's JSON_VALUE
+    monkeypatch.setattr(treatment_api, "enqueue_treatment_plan", lambda *a, **k: None)
+    sid, oid, _tid = _seed_reviewable_session(client)
+    with db_session() as s:  # the seed leaves the asset context NULL; the plan prompt reads it
+        s.execute(m.Scenario_Session.__table__.update().where(m.Scenario_Session.SessionID == sid)
+                  .values(AssetContextJSON="{}"))
+        s.commit()
+    tp = f"/v1/sessions/{sid}/scenarios/{oid}/treatment-plan"
+
+    def keys(obj, model, label):
+        assert set(obj) == _wire(model), f"{label}: missing={sorted(_wire(model) - set(obj))} extra={sorted(set(obj) - _wire(model))}"
+
+    # accept, then create v1 and complete it
+    assert client.post(f"/v1/sessions/{sid}/accept", json={"mode": "all"}).status_code == 200
+    r = client.post(tp, json=_PLAN_BODY)
+    assert r.status_code == 202, r.text
+    v1 = r.json()["plan_id"]
+    assert client.get(tp + "/status").json()["status"] == "RUNNING"
+    _complete_plan(v1)
+    g1 = client.get(tp + "?include_superseded=true").json()
+    keys(g1, S.TreatmentPlanStatus, "plan")
+    assert g1["plan_id"] == v1 and g1["status"] == "COMPLETE" and g1["superseded"] == []
+    assert g1["created_by"] == USER and g1["controls_unavailable"] is False
+
+    # regenerate -> v2; the history entry must equal the active blocks and keep its own fields
+    r = client.post(tp + "/regenerate", json={})
+    assert r.status_code == 202, r.text
+    v2 = r.json()["plan_id"]
+    _complete_plan(v2)
+    g2 = client.get(tp + "?include_superseded=true").json()
+    assert g2["plan_id"] == v2 and [e["plan_id"] for e in g2["superseded"]] == [v1]
+    h1 = g2["superseded"][0]
+    keys(h1, S.TreatmentPlanStatus, "history entry")
+    for k in ("scenario", "threat", "actors", "controls"):
+        assert h1[k] == g2[k], k
+    assert h1["scenario"] is not None and h1["created_by"] == USER and h1["progress"] is None
+
+    # board: identical entry with the flag, null without
+    b = client.get(f"/v1/sessions/{sid}/treatment-plans?include_superseded=true").json()
+    keys(b, S.TreatmentBoard, "board")
+    [row] = b["plans"]
+    keys(row, S.TreatmentBoardRow, "board row")
+    assert row["superseded"] == [h1]
+    assert client.get(f"/v1/sessions/{sid}/treatment-plans").json()["plans"][0]["superseded"] is None
+
+    # approve the HISTORICAL v1 -> version switch; then the guard rails
+    r = client.post(tp + "/review", json={"decision": "approved", "plan_id": v1})
+    assert r.status_code == 200 and r.json()["plan_id"] == v1, r.text
+    keys(r.json(), S.TreatmentReviewResponse, "review")
+    g3 = client.get(tp + "?include_superseded=true").json()
+    assert g3["plan_id"] == v1 and g3["review_status"] == "approved"
+    assert [e["plan_id"] for e in g3["superseded"]] == [v2]
+    assert client.post(tp + "/review", json={"decision": "approved"}).status_code == 422
+    r = client.post(tp + "/review", json={"decision": "rejected", "plan_id": v2})
+    assert r.status_code == 409 and r.json()["details"]["reason"] == "version_not_active", r.text
+
+    # cancel while RUNNING (deterministic: nothing dequeues it)
+    v3 = client.post(tp + "/regenerate", json={}).json()["plan_id"]
+    r = client.post(tp + "/cancel")
+    assert r.status_code == 200, r.text
+    keys(r.json(), S.TreatmentCancelResponse, "cancel")
+    g4 = client.get(tp).json()
+    assert g4["plan_id"] == v3 and g4["status"] == "ERROR" and g4["reason"] == "cancelled"
+    assert g4["cancelled_by"] == USER
+
+    # regenerate -> v4, approve -> one clean active plan; history holds v1, v2, v3
+    v4 = client.post(tp + "/regenerate", json={}).json()["plan_id"]
+    _complete_plan(v4)
+    assert client.post(tp + "/review", json={"decision": "approved", "plan_id": v4}).status_code == 200
+    g5 = client.get(tp + "?include_superseded=true").json()
+    assert g5["plan_id"] == v4 and g5["review_status"] == "approved"
+    assert {e["plan_id"] for e in g5["superseded"]} == {v1, v2, v3}
+    e3 = next(e for e in g5["superseded"] if e["plan_id"] == v3)
+    assert e3["status"] == "ERROR" and e3["cancelled_by"] == USER  # history keeps its own facts
+
+    # register, audit trails, evidence
+    reg = client.get(f"/v1/entities/{ENTITY}/treatment-plans?include_plan=true").json()
+    keys(reg, S.TreatmentRegisterPage, "register")
+    [rr] = [x for x in reg["plans"] if x["scenario_id"] == oid]
+    keys(rr, S.TreatmentRegisterRow, "register row")
+    assert rr["plan_id"] == v4 and rr["controls_unavailable"] is False and rr["plan"]
+    au = client.get(tp + "/audit").json()
+    keys(au, S.TreatmentAuditTrail, "plan audit")
+    events = [e["event"] for e in au["events"]]
+    assert {"requested", "superseded", "reviewed", "version restored", "cancelled"} <= set(events), events
+    eau = client.get(f"/v1/entities/{ENTITY}/treatment-plans/audit").json()
+    keys(eau, S.TreatmentEntityAuditPage, "entity audit")
+    assert {v1, v2, v4} <= {(e.get("detail") or {}).get("plan_id") for e in eau["events"]}
+    ev = client.get(tp + f"/evidence?version={v1}")
+    assert ev.status_code == 200, ev.text
+    keys(ev.json(), S.TreatmentEvidence, "evidence")
+    assert ev.json()["plan_id"] == v1 and ev.json()["input_snapshot"]
