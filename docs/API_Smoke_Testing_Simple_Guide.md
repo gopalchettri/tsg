@@ -1686,6 +1686,7 @@ curl -s "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/
      "control_name": "Access Restriction For Change", "map_rank": 1, "score": 0.87,
      "standards": [{"standard_id": 4, "standard_name": "IEC 62443"}]}
   ],
+  "controls_unavailable": false,
   "risk_level": "Critical",
   "review_status": null,
   "reviewed_by": null,
@@ -1726,7 +1727,7 @@ curl -s "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/
 **How to test:**
 
 1. GET here on a `COMPLETE` scenario → `plan` is populated, `progress.overall` is `awaiting_review` (nobody's reviewed it yet).
-2. GET with `?include_superseded=true` after regenerating (Test 7c) → `superseded` is a non-empty array, newest first. Each entry is a FULL one: its own `plan`, review verdict, `created_by`, `cancelled_by`/`cancelled_at`, `warnings` and `moderation_flagged`, plus the same `scenario`/`threat`/`actors`/`controls` as the top level (those four are version-independent, so they are read once and repeated rather than re-queried per version). Only `progress` is `null` on them — a retired version is history, not a live lifecycle. Use these entries to pick which `plan_id` to adopt in Test 7f.
+2. GET with `?include_superseded=true` after regenerating (Test 7c) → `superseded` is a non-empty array, newest first. Each entry is a FULL one: its own `plan`, review verdict, `created_by`, `cancelled_by`/`cancelled_at`, `warnings` and `moderation_flagged`, plus the same `scenario`/`threat`/`actors`/`controls` as the top level (those four are version-independent, so they are read once and repeated rather than re-queried per version). Only `progress` is `null` on them — a retired version is history, not a live lifecycle. Use these entries to pick which `plan_id` to adopt in Test 7f. `controls_unavailable` is `false` on every entry on a healthy read; `true` means the control map could not be read this time — treat `controls` as unknown, not as a library gap.
 3. GET on a scenario that never had a plan requested → `404`.
 
 **Tables used:**
@@ -1784,10 +1785,12 @@ curl -s "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/
     {"scenario_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90", "scenario_title": "Ransomware via exposed RDP",
      "plan_id": "0f0e0d0c-0b0a-8988-8786-858483828180", "status": "COMPLETE", "risk_level": "Critical",
      "review_status": "approved", "error_message": null, "reason": null,
+     "plan": null, "superseded": null,
      "created_at": "2026-08-31T09:14:00", "completed_at": "2026-08-31T09:16:42"},
     {"scenario_id": "9f3c1e22-93a4-4f10-9a83-0f4c113b2a1e", "scenario_title": "Insider tampering with historian data",
      "plan_id": null, "status": null, "risk_level": null, "review_status": null,
-     "error_message": null, "reason": null, "created_at": null, "completed_at": null}
+     "error_message": null, "reason": null, "plan": null, "superseded": null,
+     "created_at": null, "completed_at": null}
   ]
 }
 ```
@@ -1798,7 +1801,8 @@ Note `progress` here is `RUNNING`/`generating`, not `COMPLETE`/`approved`, even 
 
 1. GET here with one scenario planned+approved, one accepted-but-not-yet-planned → matches the shape above.
 2. Add `?include_plan=true` → the first row's `plan` field fills in with the same trimmed object Test 7e serves; the second stays `null` (never requested).
-3. GET on a session with nothing accepted → `200`, `accepted_scenarios: 0`, `plans: []` — not a `404`.
+3. Add `?include_superseded=true` after a regenerate → each row's `superseded` lists its replaced versions: the SAME full entries Test 7e's GET serves (scenario/threat/actors/controls, `created_by`, `warnings`, `moderation_flagged`, `controls_unavailable`; `progress` null). Without the flag `superseded` is `null` and the board query is unchanged.
+4. GET on a session with nothing accepted → `200`, `accepted_scenarios: 0`, `plans: []` — not a `404`.
 
 **Tables used:**
 
@@ -2007,11 +2011,13 @@ curl -s -X GET "http://localhost:8000/v1/entities/78/treatment-plans?risk_level=
         "status": "COMPLETE", "risk_level": "Critical",
         "review_status": "approved", "reviewed_by": "qa-user",
         "error_message": null, "reason": null,
+        "scenario": null, "threat": null, "actors": [], "controls": [], "controls_unavailable": false,
+        "treatment_strategy": null, "risk_identification_date": null, "plan": null,
         "created_at": "2026-08-30T11:02:00", "completed_at": "2026-08-30T11:04:12"}
      ]}
 ```
 
-With `include_plan=true`, each row also carries `scenario`, `threat`, `actors`, `controls`, `treatment_strategy`, `risk_identification_date` and `plan` — the identical blocks the single-plan GET serves, so the register can never disagree with the per-plan screen about the same plan.
+Every key above is always present. With `include_plan=true`, `scenario`, `threat`, `actors`, `controls` (and `controls_unavailable` — `true` means the control map could not be read, not that the library has nothing), `treatment_strategy`, `risk_identification_date` and `plan` are populated instead of null/empty.
 
 **How to test:**
 

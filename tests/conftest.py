@@ -8,7 +8,32 @@ test must not bleed into the next -- so every cache is cleared both before and a
 """
 from __future__ import annotations
 
+import json
+
 import pytest
+
+
+def register_sqlite_json_value(engine) -> None:
+    """Give a SQLite test engine SQL Server's JSON_VALUE(blob, '$.path').
+
+    dal.session_plan_board and dal.entity_plan_rows extract the scenario title server-side with
+    JSON_VALUE; without this UDF the plan board and the register cannot execute against the
+    in-memory test engine at all — which is how the board went untested at route level. ONE shim,
+    here, rather than a copy per test file: a third copy is how two of them drift. ANY failure
+    returns NULL, which is what MSSQL's JSON_VALUE does for a bad path or blob."""
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _register(dbapi_conn, _record):
+        def json_value(blob, path):
+            try:
+                doc = json.loads(blob)
+                for key in path.lstrip("$.").split("."):
+                    doc = doc[key]
+                return doc
+            except Exception:  # noqa: BLE001 — UDF shim: any failure must be NULL, never raise
+                return None
+        dbapi_conn.create_function("json_value", 2, json_value)
 
 
 def _clear_process_caches() -> None:

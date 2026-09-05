@@ -1363,6 +1363,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       ]
     }
   ],
+  &quot;controls_unavailable&quot;: false,
   &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
   &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
   &quot;reviewed_at&quot;: &quot;2026-08-30T12:00:00&quot;,
@@ -1451,7 +1452,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   <div class="tables"><span class="tbl">Risk_Treatment_Plan</span><span class="tbl">Scenario_Audit</span></div>
   <details class="notes">
     <summary>Implementation notes &amp; error cases</summary>
-    <p>Omit plan_id (or pass the active version&#x27;s own id) to review the current plan — a re-review simply overwrites (latest wins). Pass a HISTORICAL plan_id (from GET ?include_superseded=true) with decision=&quot;approved&quot; to atomically make that version active AND approve it in one call; the same historical plan_id with decision=&quot;rejected&quot; is refused (409 version_not_active) since it&#x27;s already not the operative plan and rejecting it changes nothing. Only a COMPLETE plan is reviewable — reviewing a RUNNING or ERROR plan always 409s not_complete. plan_id is canonicalized/validated as a GUID at the schema boundary before any DB lookup.</p>
+    <p>plan_id is REQUIRED — a verdict always names the version it applies to, so a regeneration landing between the reviewer&#x27;s GET and this POST can never redirect it onto a plan nobody read; omitting it is a 422. Pass the ACTIVE version&#x27;s own id to review the current plan — a re-review simply overwrites (latest wins). Pass a HISTORICAL plan_id (from GET ?include_superseded=true) with decision=&quot;approved&quot; to atomically make that version active AND approve it in one call; the same historical plan_id with decision=&quot;rejected&quot; is refused (409 version_not_active) since it&#x27;s already not the operative plan and rejecting it changes nothing. Only a COMPLETE plan is reviewable — reviewing a RUNNING or ERROR plan always 409s not_complete. plan_id is canonicalized/validated as a GUID at the schema boundary before any DB lookup.</p>
     <p class="errs"><span class="lbl">Errors</span> 404 (&quot;no treatment plan has been requested for this scenario&quot;) if the scenario has no active plan at all; 404 (&quot;no such plan version for this scenario&quot;) if plan_id is given but doesn&#x27;t match any version&#x27;s id for this session+scenario; 409 version_not_active if a historical plan_id is rejected rather than approved; 409 generation_in_progress if a swap/regenerate raced the version-switch&#x27;s retire step; 409 not_complete if the target plan (active or named) isn&#x27;t COMPLETE; 422 if decision isn&#x27;t approved|rejected, comment exceeds 2000 chars, or plan_id isn&#x27;t a valid GUID.</p>
   </details>
 </article>
@@ -1656,6 +1657,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
               ]
             }
           ],
+          &quot;controls_unavailable&quot;: false,
           &quot;risk_level&quot;: &quot;&lt;risk_level&gt;&quot;,
           &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
           &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
@@ -1751,6 +1753,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
               ]
             }
           ],
+          &quot;controls_unavailable&quot;: false,
           &quot;risk_level&quot;: &quot;&lt;risk_level&gt;&quot;,
           &quot;review_status&quot;: &quot;&lt;review_status&gt;&quot;,
           &quot;reviewed_by&quot;: &quot;&lt;reviewed_by&gt;&quot;,
@@ -1874,6 +1877,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
           ]
         }
       ],
+      &quot;controls_unavailable&quot;: false,
       &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
       &quot;risk_identification_date&quot;: &quot;2026-08-30T12:00:00&quot;,
       &quot;plan&quot;: {},

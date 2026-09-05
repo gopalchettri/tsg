@@ -2574,6 +2574,14 @@ class TreatmentPlanStatus(ApiModel):
                     "ScenarioResult.controls. These are the controls the plan's gap analysis "
                     "reasons about, so showing them beside the plan is what lets a reviewer "
                     "check the analysis rather than take it on trust.")
+    controls_unavailable: bool = Field(
+        default=False,
+        description="true = the control mapping could NOT be read for this response (a transient "
+                    "database error), so `controls` is empty because we did not get to look — "
+                    "NOT because the library has nothing. Treat the list as unknown and retry; "
+                    "do not act on it as a library gap. Always false on a healthy response, so a "
+                    "client that ignores this field behaves exactly as before. Same flag and "
+                    "meaning as ScenarioResult.controls_unavailable.")
     risk_level: str | None = Field(
         default=None, description="The register risk level this plan was generated against (from the request).")
     review_status: str | None = Field(
@@ -2664,14 +2672,13 @@ class TreatmentBoardRow(ApiModel):
     superseded: list[TreatmentPlanStatus] | None = Field(
         default=None,
         description="Regeneration history — every replaced version of this scenario's plan, "
-                    "newest first, the same entries the single-plan GET serves under "
-                    "?include_superseded=true (full plan content, own status/review verdict, "
-                    "created_by, cancelled_*, warnings). The scenario/threat/actors/controls "
-                    "blocks are null/[] here — this board does not read them for its own rows "
-                    "either; use scenario_title, or the single-plan GET for the full blocks. "
-                    "Populated only with "
-                    "?include_superseded=true: null when not requested, [] when requested "
-                    "and never regenerated.")
+                    "newest first: the SAME full entries the single-plan GET serves under "
+                    "?include_superseded=true (own plan content, status, review verdict, "
+                    "created_by, cancelled_*, warnings, moderation_flagged, plus the "
+                    "version-independent scenario/threat/actors/controls blocks, read once per "
+                    "scenario and repeated). `progress` is null on every entry — history has no "
+                    "live lifecycle. Populated only with ?include_superseded=true: null when not "
+                    "requested, [] when requested and never regenerated.")
     created_at: datetime | None = Field(default=None)
     completed_at: datetime | None = Field(default=None)
 
@@ -2853,6 +2860,11 @@ class TreatmentRegisterRow(ApiModel):
         default_factory=list,
         description="Same block as TreatmentPlanStatus.controls. Populated only with "
                     "?include_plan=true.")
+    controls_unavailable: bool = Field(
+        default=False,
+        description="Same flag as TreatmentPlanStatus.controls_unavailable: true = the control "
+                    "mapping could not be read for this page, so `controls` is empty on every "
+                    "row because we did not get to look. Only meaningful with ?include_plan=true.")
     treatment_strategy: str | None = Field(
         default=None,
         description="Server-stamped 'Mitigate' — see TreatmentPlanStatus. Populated only with "

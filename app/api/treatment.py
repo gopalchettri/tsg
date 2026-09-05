@@ -48,6 +48,7 @@ from app.api.schemas import (
 from app.api.sessions import (
     _actor_block,
     _actor_ids_from_blobs,
+    _Controls,
     _controls_by_output,
     _scenario_narrative,
     _threat_block,
@@ -124,6 +125,14 @@ _VISIBLE_PLAN_KEYS = tuple(TreatmentPlanDocument.model_fields)
 #: silently stops matching its query is exactly the drift that left history rows blank.
 _SCENARIO_ECHO_KEYS = ("ScenarioJSON", "Score", "ScopeRank",
                        *(c.key for c in dal.scenario_threat_columns()))
+
+
+def _scenario_echo(row: RowMapping) -> dict:
+    """The version-independent columns of a row that carries the scenario/threat join, ready to
+    overlay UNDER a history row as `{**echo, **history_row}` — the history row's own keys win, so
+    per-version fields (created_by, cancelled_*, warnings, ...) are never clobbered. One helper
+    for the single-plan GET and the board so the two cannot disagree on what gets echoed."""
+    return {k: row[k] for k in _SCENARIO_ECHO_KEYS if k in row}
 
 
 def enqueue_treatment_plan(plan_id: str, entity_id: str, user_id: str | None) -> None:
@@ -390,8 +399,10 @@ def get_treatment_plan(session_id: str, scenario_id: str,
         actor_ids = _actor_ids_from_blobs(sess, [row.get("ThreatActorsJSON")])
         # One batched read for this scenario's controls — the same source /results uses, so the
         # two screens cannot disagree about which controls the scenario has.
-        _ctl = _controls_by_output(sess, [scenario_id])
-        controls = _ctl.by_output.get(scenario_id, [])
+        # The WHOLE read goes to the presenter — the list AND whether the read happened — and the
+        # presenter keys the lookup by the ROW's ScenarioID, not this URL parameter (which nothing
+        # canonicalises: an upper-case id used to render every block except an empty `controls`).
+        controls = _controls_by_output(sess, [scenario_id])
         older = None
         if include_superseded:
             # History rows carry no scenario/threat join — the scenario is version-independent,
@@ -400,7 +411,7 @@ def get_treatment_plan(session_id: str, scenario_id: str,
             # per-version fields — created_by, cancelled_*, warnings, moderation_flagged — are
             # never clobbered by the current version's. `controls` is the list already read
             # above: same scenario, so the same controls, at no extra query.
-            echo = {k: row[k] for k in _SCENARIO_ECHO_KEYS if k in row}
+            echo = _scenario_echo(row)
             # PlanID guard: two SELECTs under READ COMMITTED — a regeneration committing
             # between them would supersede the row just read as current, making it show up in
             # BOTH places on one response. Dropping it here keeps the reply self-consistent.
@@ -487,7 +498,7 @@ def _progress_of(rows: list[tuple[str | None, str | None, str | None]]) -> Treat
 
 def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
                           actor_ids: dict[str, int] | None = None,
-                          controls: list | None = None,
+                          controls: _Controls | None = None,
                           superseded_row: bool = False,
                         superseded: list[TreatmentPlanStatus] | None = None) -> TreatmentPlanStatus:
     """One plan row -> the wire model. Shared by the single-plan GET, the Excel export, the
@@ -495,17 +506,24 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
     two views can ever disagree — the guarantee the export used to buy by re-entering the GET
     per scenario, now held by construction. `stale_cutoff` is the CALLER's single instant
     (_present_status's contract): batch routes pass one cutoff for every row of a response.
-    Blob columns that feed only wire-hidden fields (ValidationJSON, ReviewComment — exclude=True
-    on the model) are read with .get: every batch query deliberately omits them, and only the
-    single-row active_plan_row still hauls them so the poll GET keeps its one-flag-unhide
-    contract."""
+    Blob columns are read with .get because not every feeding select carries them: ReviewComment
+    is wire-hidden (exclude=True) and only active_plan_row hauls it; ValidationJSON feeds the
+    wire-VISIBLE warnings/moderation_flagged and is selected wherever those are published
+    (active_plan_row, superseded_plan_rows) — the register omits it only because
+    TreatmentRegisterRow does not publish them.
+
+    `controls` is the WHOLE _controls_by_output result, never a pre-split list: it reports whether
+    the read happened (`unavailable`) beside what it found, and two callers used to keep the list
+    and drop the flag — so a transient DB error published `controls: []`, which the schema
+    documents as a genuine library-gap signal. Deriving list and flag HERE from one object means
+    no caller can separate them again."""
     status, error_message, reason = _present_status(
         row["Status"], row["ErrorMessage"], row["UpdatedAt"], stale_cutoff, row["ErrorReason"])
 
     plan = _visible_plan(row["PlanJSON"], row["PlanID"])
     # .get, not []: not every feeding select carries these. History rows (superseded_plan_rows)
-    # have no scenario/threat join of their own — the single-plan GET overlays the active row's
-    # copy before calling in, but the board does not, and a missing column must publish null
+    # have no scenario/threat join of their own — the routes overlay the scenario's single copy
+    # before calling in (_scenario_echo) — and a select that lacks a column must publish null
     # rather than KeyError the whole response.
     # THE SAME BUILDER /results USES, not a narrower local copy. This used to whitelist six
     # keys, so a reviewer approving a remediation plan saw strictly LESS about the scenario than
@@ -515,6 +533,9 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
     scenario = _scenario_narrative(row.get("ScenarioJSON"), row if row.get("ScenarioJSON") else None)
     validation = _safe_json_dict(row.get("ValidationJSON"), row["PlanID"]) or {}
     moderation = validation.get("moderation") or {}
+    # Keyed by the row's own ScenarioID — canonical from the GUID type, the same keys that
+    # _query_controls builds — never by a URL parameter a client may have sent in another case.
+    ctl_list = controls.by_output.get(str(row["ScenarioID"]), []) if controls else []
     return TreatmentPlanStatus(
         plan_id=row["PlanID"], session_id=row["SessionID"], scenario_id=row["ScenarioID"],
         status=status, treatment_strategy=row["TreatmentStrategy"],
@@ -531,7 +552,8 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
         # scenario/threat join at all) yields null/[] rather than raising KeyError.
         threat=_threat_block(row),
         actors=_actor_block(row, actor_ids),
-        controls=controls or [],
+        controls=ctl_list,
+        controls_unavailable=bool(controls and controls.unavailable),
         risk_level=row["RiskLevel"], review_status=row["ReviewStatus"],
         review_comment=row.get("ReviewComment"), reviewed_by=row["ReviewedBy"],
         reviewed_at=row["ReviewedAt"],
@@ -666,13 +688,24 @@ def get_treatment_board(session_id: str,
         stale_cutoff = treatment._stale_cutoff()
         # Whole-session history in ONE round trip, bucketed by scenario — the query's global
         # newest-first order keeps every bucket newest-first.
-        # One batched resolve for every row on the page — see get_treatment_plan.
-        actor_ids = _actor_ids_from_blobs(sess, [r.get("ThreatActorsJSON") for r in rows])
         history: dict[str, list[TreatmentPlanStatus]] = {}
         if include_superseded:
-            for h in dal.superseded_plan_rows(sess, session_id):
+            hist_rows = dal.superseded_plan_rows(sess, session_id)
+            # Only regenerated scenarios have history — typically a few of many — so the scenario
+            # echo, the actor resolve and the controls read are TARGETED at those ids rather than
+            # widened across the whole board: bytes scale with regenerations, not with the
+            # session. scenario_echo_rows is the canonical scenario select, so each history row
+            # gets the same `{**echo, **row}` overlay the single-plan GET applies and the two
+            # surfaces serve identical entries. All three helpers are no-query on an empty list.
+            ids = sorted({str(h["ScenarioID"]) for h in hist_rows})
+            echo_rows = dal.scenario_echo_rows(sess, session_id, ids)
+            echo = {str(e["ScenarioID"]): _scenario_echo(e) for e in echo_rows}
+            actor_ids = _actor_ids_from_blobs(sess, [e.get("ThreatActorsJSON") for e in echo_rows])
+            ctl = _controls_by_output(sess, ids)
+            for h in hist_rows:
                 history.setdefault(h["ScenarioID"], []).append(
-                    _plan_status_from_row(h, stale_cutoff, actor_ids, superseded_row=True))
+                    _plan_status_from_row({**echo.get(str(h["ScenarioID"]), {}), **h}, stale_cutoff,
+                                          actor_ids, ctl, superseded_row=True))
         plans = []
         for r in rows:
             # All three default to None together: a scenario with no plan yet leaves every one
@@ -869,15 +902,14 @@ def list_entity_treatment_plans(entity_id: str,
                      if include_plan else {})
         # ONE controls read for the whole page, never one per row — _controls_by_output takes a
         # list precisely so this cannot become an N+1 as the register grows.
-        page_controls = (_controls_by_output(sess, [str(r["ScenarioID"]) for r in rows]).by_output
-                         if include_plan else {})
+        page_controls = (_controls_by_output(sess, [str(r["ScenarioID"]) for r in rows])
+                         if include_plan else None)
         items = []
         for r in rows:
             if include_plan:
                 # The poll GET's own presenter renders the detail — one projection, two pages,
                 # so the register can never disagree with GET .../treatment-plan.
-                ps = _plan_status_from_row(r, stale_cutoff, actor_ids,
-                                           page_controls.get(str(r["ScenarioID"]), []))
+                ps = _plan_status_from_row(r, stale_cutoff, actor_ids, page_controls)
                 items.append(TreatmentRegisterRow(
                     plan_id=ps.plan_id, session_id=ps.session_id, scenario_id=ps.scenario_id,
                     asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
@@ -885,7 +917,8 @@ def list_entity_treatment_plans(entity_id: str,
                     review_status=ps.review_status, reviewed_by=ps.reviewed_by,
                     error_message=ps.error_message, reason=ps.reason,
                     scenario=ps.scenario, threat=ps.threat, actors=ps.actors,
-                    controls=ps.controls, treatment_strategy=ps.treatment_strategy,
+                    controls=ps.controls, controls_unavailable=ps.controls_unavailable,
+                    treatment_strategy=ps.treatment_strategy,
                     risk_identification_date=ps.risk_identification_date, plan=ps.plan,
                     created_at=ps.created_at, completed_at=ps.completed_at))
                 continue

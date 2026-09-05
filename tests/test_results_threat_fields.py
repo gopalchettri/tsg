@@ -26,7 +26,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
-from sqlalchemy import create_engine, event
+from conftest import register_sqlite_json_value
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.enums import ScenarioStatus, SessionStatus, StageStatus, SubsystemLevel
@@ -40,22 +41,7 @@ ENTITY = "86"
 
 def _engine():
     engine = create_engine("sqlite://")
-
-    # session_plan_board / other reads use SQL Server's JSON_VALUE; SQLite needs the shim to
-    # even load app.api.sessions' module-level query builders. Same UDF as
-    # test_accept_any_version.py's _engine, duplicated rather than imported so this file has no
-    # cross-file fixture coupling.
-    @event.listens_for(engine, "connect")
-    def _register_json_value(dbapi_conn, _record):
-        def json_value(blob, path):
-            try:
-                doc = json.loads(blob)
-                for key in path.lstrip("$.").split("."):
-                    doc = doc[key]
-                return doc
-            except Exception:  # noqa: BLE001 — SQLite UDF shim: ANY failure must return NULL
-                return None
-        dbapi_conn.create_function("json_value", 2, json_value)
+    register_sqlite_json_value(engine)  # SQL Server's JSON_VALUE for SQLite — conftest, ONE copy
 
     for table in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Scenario_Audit, m.Identified_Threat, m.Scoped_Threat, m.Threat_Type,

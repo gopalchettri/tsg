@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 
 from app.api import treatment as treatment_api
 from app.api.schemas import MappedControl
+from app.api.sessions import _Controls
 from app.db import models as m
 
 _NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC).replace(tzinfo=None)
@@ -37,6 +38,9 @@ _CONTROLS = [MappedControl(control_id=117, control_code="CII-CID-117",
                            domain="Continuous Monitoring",
                            control_name="Unauthorized Network Services",
                            map_rank=1, score=90.6, standards=[])]
+#: The WHOLE read, as _controls_by_output returns it and as the presenter now takes it — keyed by
+#: the canonical ScenarioID, with the did-the-read-happen flag beside the list.
+_CTL = _Controls({"scn-1": _CONTROLS}, False)
 
 #: The active row, as dal.active_plan_row selects it: plan columns PLUS the scenario/threat join.
 _ACTIVE_ROW = {
@@ -102,8 +106,8 @@ def _present(row, **kw):
 def test_the_overlay_gives_a_history_entry_the_same_scenario_blocks_as_the_active_plan():
     """The four version-independent blocks must MATCH — a reviewer comparing versions is looking
     at one scenario, and a null here is what made the history unusable as a version picker."""
-    active = _present(_ACTIVE_ROW, controls=_CONTROLS)
-    older = _present({**_echo(), **_HISTORY_ROW}, controls=_CONTROLS, superseded_row=True)
+    active = _present(_ACTIVE_ROW, controls=_CTL)
+    older = _present({**_echo(), **_HISTORY_ROW}, controls=_CTL, superseded_row=True)
 
     assert older.scenario is not None
     assert older.scenario.model_dump() == active.scenario.model_dump()
@@ -117,7 +121,7 @@ def test_the_overlay_gives_a_history_entry_the_same_scenario_blocks_as_the_activ
 def test_the_overlay_never_clobbers_the_history_rows_own_per_version_fields():
     """The regression that motivated the whole change: these describe THIS attempt and cannot be
     echoed. `{**echo, **row}` — the history row's keys win — is what keeps them its own."""
-    older = _present({**_echo(), **_HISTORY_ROW}, controls=_CONTROLS, superseded_row=True)
+    older = _present({**_echo(), **_HISTORY_ROW}, controls=_CTL, superseded_row=True)
 
     assert older.plan_id == "plan-old"                    # not the active row's id
     assert older.created_by == "someone-else"             # was null before the SELECT widened
@@ -133,9 +137,9 @@ def test_the_overlay_never_clobbers_the_history_rows_own_per_version_fields():
 def test_a_history_entry_reports_no_live_progress():
     """A retired version is history, not a lifecycle. Echoing the active plan's progress onto it
     would assert something false, so this stays null even under full parity."""
-    older = _present({**_echo(), **_HISTORY_ROW}, controls=_CONTROLS, superseded_row=True)
+    older = _present({**_echo(), **_HISTORY_ROW}, controls=_CTL, superseded_row=True)
     assert older.progress is None
-    assert _present(_ACTIVE_ROW, controls=_CONTROLS).progress is not None
+    assert _present(_ACTIVE_ROW, controls=_CTL).progress is not None
 
 
 def test_a_history_row_with_no_overlay_still_degrades_instead_of_raising():
@@ -169,3 +173,59 @@ def test_the_echo_carries_no_per_version_column():
                    "ErrorReason", "CreatedAt", "UpdatedAt", "CompletedAt"}
     overlap = per_version & set(treatment_api._SCENARIO_ECHO_KEYS)
     assert not overlap, f"per-version columns must never be echoed: {overlap}"
+
+
+def test_a_failed_controls_read_is_reported_not_disguised_as_a_library_gap():
+    """The presenter derives list AND flag from the one _Controls object, so no caller can keep
+    the list and drop the flag — the split that let a transient DB error publish `controls: []`,
+    which the schema documents as a genuine library-gap signal."""
+    ps = _present(_ACTIVE_ROW, controls=_Controls({}, True))
+    assert ps.controls == [] and ps.controls_unavailable is True
+
+    healthy = _present(_ACTIVE_ROW, controls=_CTL)
+    assert healthy.controls_unavailable is False and len(healthy.controls) == 1
+    # A caller with no controls read at all is a healthy empty, not a failure.
+    assert _present(_ACTIVE_ROW).controls_unavailable is False
+
+
+def test_controls_are_looked_up_by_the_rows_own_scenario_id_not_a_url_parameter():
+    """_query_controls keys by the DB row's canonical ScenarioID; so must the lookup. The single
+    GET used to key by the URL path parameter, which nothing canonicalises — an upper-case id
+    rendered every block except an empty `controls`."""
+    assert _present(_ACTIVE_ROW, controls=_Controls({"SCN-1": _CONTROLS}, False)).controls == []
+    assert _present(_ACTIVE_ROW, controls=_CTL).controls[0].control_code == "CII-CID-117"
+
+
+def test_every_plan_column_the_presenter_reads_is_in_the_shared_list():
+    """The recurrence guard for the drift that started all this. Two hand-maintained column lists
+    fed one presenter, and three schema changes reached one and missed the other. Every select
+    now unpacks dal.plan_presenter_columns(); this walks the presenter's source for each
+    row["X"] / row.get("X") and pins it to that list. Two exceptions, named: ScenarioJSON rides
+    the scenario join/echo, ReviewComment is wire-hidden and hauled by active_plan_row alone."""
+    import inspect
+    import re
+
+    from app.db import dal
+
+    src = inspect.getsource(treatment_api._plan_status_from_row)
+    reads = set(re.findall(r'row\[\"([A-Za-z]+)\"\]', src)) | set(re.findall(r'row\.get\(\"([A-Za-z]+)\"', src))
+    assert reads, "no row reads found — the regex no longer matches the presenter"
+    allowed = {c.key for c in dal.plan_presenter_columns()} | {"ScenarioJSON", "ReviewComment"}
+    assert reads <= allowed, (
+        f"the presenter reads columns no feeding select is guaranteed to carry: "
+        f"{sorted(reads - allowed)} — add them to dal.plan_presenter_columns()")
+
+
+def test_every_presenter_fed_select_unpacks_the_shared_list():
+    """Source pin, following the code wherever it lives: the module that defines active_plan_row
+    must unpack *plan_presenter_columns() exactly three times — active_plan_row,
+    superseded_plan_rows, entity_plan_rows (include_plan). plan_status_row deliberately does not
+    (the cheap poll), and a fourth hand-listed subset would show up here as a missing unpack."""
+    import inspect
+    import pathlib
+
+    from app.db import dal
+
+    src = pathlib.Path(inspect.getsourcefile(dal.active_plan_row)).read_text(encoding="utf-8")
+    assert src.count("*plan_presenter_columns()") == 3, (
+        "active_plan_row, superseded_plan_rows and entity_plan_rows must all unpack the one list")

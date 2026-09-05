@@ -13,7 +13,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, event, select
+from conftest import register_sqlite_json_value
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.enums import (
@@ -37,19 +38,7 @@ HASH_03 = "b" * 64  # an unrelated scenario
 
 def _engine():
     engine = create_engine("sqlite://")
-
-    # session_plan_board uses SQL Server's JSON_VALUE; give SQLite an equivalent.
-    @event.listens_for(engine, "connect")
-    def _register_json_value(dbapi_conn, _record):
-        def json_value(blob, path):
-            try:
-                doc = json.loads(blob)
-                for key in path.lstrip("$.").split("."):
-                    doc = doc[key]
-                return doc
-            except Exception:  # noqa: BLE001 — SQLite UDF shim: ANY failure must return NULL,
-                return None      # which is what MSSQL's JSON_VALUE does for a bad path/blob
-        dbapi_conn.create_function("json_value", 2, json_value)
+    register_sqlite_json_value(engine)  # SQL Server's JSON_VALUE for SQLite — conftest, ONE copy
 
     for table in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Scenario_Audit, m.Identified_Threat, m.Scoped_Threat, m.Threat_Type,

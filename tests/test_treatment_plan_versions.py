@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime
 
 import pytest
+from conftest import register_sqlite_json_value
 from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import create_engine, select, text, update
@@ -43,6 +44,7 @@ SESSION_ID = "5aa85f64-5717-4562-b3fc-2c963f66afa6"
 
 def _engine():
     engine = create_engine("sqlite://")
+    register_sqlite_json_value(engine)  # board + register routes use SQL Server's JSON_VALUE
     for table in (m.Scenario_Session, m.Threat_Scenario, m.Scoped_Threat,
                 m.Identified_Threat, m.Risk_Treatment_Plan, m.Scenario_Audit,
                 m.Threat_Scenario_Control_Map, m.Control_Library):
@@ -353,6 +355,85 @@ def test_history_entries_carry_the_scenario_and_their_own_generator(monkeypatch)
     assert older.created_by == "u1"                                   # who generated THAT version
     assert older.progress is None                                     # history has no live lifecycle
     assert resp.progress is not None                                  # the active plan still does
+    assert resp.controls_unavailable is False and older.controls_unavailable is False  # healthy read
+
+
+def test_a_failed_controls_read_is_flagged_on_the_plan_and_every_history_entry(monkeypatch):
+    """A transient controls-read error must SAY so, not render as `controls: []` — which the
+    schema documents as a genuine library gap a reviewer should act on. Same trick as
+    tests/test_results_threat_fields.py: blow up sessions._query_controls, which
+    _controls_by_output resolves from its own module at call time. Both plan surfaces that read
+    controls are checked, so neither can drop the flag on its own again."""
+    import app.api.sessions as sessions_mod
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    _two_complete_versions(Session, monkeypatch)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("transient database error while reading the control map")
+    monkeypatch.setattr(sessions_mod, "_query_controls", _boom)
+
+    resp = treatment_api.get_treatment_plan(SESSION_ID, SCENARIO_ID, include_superseded=True,
+                                            principal=_principal())
+    assert resp.controls == [] and resp.controls_unavailable is True
+    assert resp.superseded and all(e.controls_unavailable for e in resp.superseded)  # same read
+
+    board = treatment_api.get_treatment_board(SESSION_ID, include_plan=False,
+                                              include_superseded=True, principal=_principal())
+    assert all(e.controls_unavailable for e in board.plans[0].superseded)
+
+
+def test_board_history_entries_are_the_single_plan_gets_entries(monkeypatch):
+    """Under ?include_superseded=true the board's history entries are byte-for-byte the entries
+    the single-plan GET serves — scenario echoed once per scenario, own created_by, no live
+    progress. Without the flag the widened query never runs and `superseded` stays null."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    p1, p2 = _two_complete_versions(Session, monkeypatch)
+
+    single = treatment_api.get_treatment_plan(SESSION_ID, SCENARIO_ID, include_superseded=True,
+                                              principal=_principal())
+    board = treatment_api.get_treatment_board(SESSION_ID, include_plan=False,
+                                              include_superseded=True, principal=_principal())
+    [row] = board.plans
+    assert row.plan_id == p2 and [e.plan_id for e in row.superseded] == [p1]
+    older = row.superseded[0]
+    assert older.scenario is not None and older.created_by == "u1" and older.progress is None
+    assert older.model_dump() == single.superseded[0].model_dump()
+
+    bare = treatment_api.get_treatment_board(SESSION_ID, include_plan=False,
+                                             include_superseded=False, principal=_principal())
+    assert bare.plans[0].superseded is None
+
+
+def test_register_publishes_the_controls_flag_beside_the_list(monkeypatch):
+    """The third plan surface. ?include_plan=true renders through the same presenter and copies
+    controls AND controls_unavailable onto TreatmentRegisterRow — a dropped copy would default the
+    flag to false, exactly the silent regression the flag exists to prevent."""
+    import app.api.sessions as sessions_mod
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    _two_complete_versions(Session, monkeypatch)
+
+    def _page():
+        # Every filter is a Query() default on the route; a direct call must pass them all.
+        return treatment_api.list_entity_treatment_plans(
+            "86", status=None, review_status=None, risk_level=None, include_plan=True,
+            limit=100, offset=0, principal=_principal())
+
+    assert [r.controls_unavailable for r in _page().plans] == [False]
+
+    def _boom(*a, **kw):
+        raise RuntimeError("transient database error while reading the control map")
+    monkeypatch.setattr(sessions_mod, "_query_controls", _boom)
+    [row] = _page().plans
+    assert row.controls == [] and row.controls_unavailable is True
 
 
 def test_approve_historical_complete_swaps_atomically(monkeypatch):

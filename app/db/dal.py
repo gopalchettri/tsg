@@ -2415,6 +2415,24 @@ def soft_delete_library_row(sess: Session, model, pk_col, pk_value: int, user_id
 # acquire_lock refuses to run. Every conditional-UPDATE fence lives here; treatment.py and
 # api/treatment.py never build their own SQL.
 # ---------------------------------------------------------------------------
+def plan_presenter_columns():
+    """The plan-table columns api.treatment._plan_status_from_row reads — ONE list, unpacked by
+    every select that feeds it (active_plan_row, superseded_plan_rows, entity_plan_rows under
+    include_plan). Sibling of scenario_threat_columns(), for the same reason: the treatment
+    response used to be fed by two hand-maintained column lists, and three schema changes
+    (created_by, Cancelled*, warnings/moderation_flagged) each reached one and missed the other —
+    the presenter's defensive .get published null/false instead of raising, so superseded versions
+    reported wrong attribution and a clean moderation verdict for months. A test pins the
+    presenter's reads to this list: a row["New"] read without a column here fails the suite.
+    NOT used by plan_status_row — the cheap poll is deliberately narrow. ReviewComment is absent
+    on purpose: wire-hidden, hauled by active_plan_row alone."""
+    p = m.Risk_Treatment_Plan
+    return (p.PlanID, p.SessionID, p.ScenarioID, p.Status, p.TreatmentStrategy,
+            p.RiskIdentificationDate, p.PlanJSON, p.ValidationJSON, p.ErrorMessage, p.ErrorReason,
+            p.RiskLevel, p.ReviewStatus, p.ReviewedBy, p.ReviewedAt,
+            p.UserID, p.CancelledBy, p.CancelledAt, p.CreatedAt, p.UpdatedAt, p.CompletedAt)
+
+
 def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime,
                           plan_id: str | None = None) -> int:
     """Retire the scenario's active plan row so a new attempt can insert; returns rowcount. Matches
@@ -2564,14 +2582,11 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
     p, out = m.Risk_Treatment_Plan, m.Threat_Scenario
     st, it = m.Scoped_Threat, m.Identified_Threat
     return sess.execute(
-        select(p.PlanID, p.SessionID, p.ScenarioID, p.TenantID, p.EntityID, p.Status,
-            p.ActiveTaskID, p.TreatmentStrategy, p.RiskIdentificationDate, p.PlanJSON,
-            p.ValidationJSON, p.ErrorMessage, p.RiskLevel, p.ReviewStatus, p.ReviewComment,
-            p.ReviewedBy, p.ReviewedAt, p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt,
-            # UserID is the plan's GENERATOR — stored since the table existed and never selected,
-            # so no plan response could say who requested it. Cancelled* are today's new pair.
-            # All three ride this SELECT: no extra round trip.
-            p.UserID, p.CancelledAt, p.CancelledBy,
+        # THE shared presenter list (plan_presenter_columns) plus this select's route-only
+        # extras: TenantID/EntityID for audit rows, ActiveTaskID for the cancel fence, and
+        # ReviewComment — wire-hidden, hauled only here so the poll GET keeps its
+        # one-flag-unhide contract.
+        select(*plan_presenter_columns(), p.TenantID, p.EntityID, p.ActiveTaskID, p.ReviewComment,
                out.ScenarioJSON,
             # The threat's own identity — NOT part of the LLM's scenario JSON (same split as
             # sessions._build_scenario). OUTER for the same reason as _scenario_read_select:
@@ -2646,29 +2661,31 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
     must surface under status=ERROR and stay out of status=RUNNING. Branched in SQL, not
     post-filtered in Python, which would under-fill pages. ScenarioTitle comes from JSON_VALUE
     server-side rather than hauling every multi-KB blob; malformed JSON yields NULL.
-    `include_plan` widens the select to everything _plan_status_from_row reads (plan/scenario
-    blobs + the threat-identity joins, same set as active_plan_row) so the detailed register
+    `include_plan` widens the select to everything _plan_status_from_row reads —
+    plan_presenter_columns() plus the scenario/threat join — so the detailed register
     row is rendered by the poll GET's own presenter — a deliberate, opt-in haul
     (?include_plan=true), bounded by the page limit, and NOT redundant here: every register row
     is a different scenario. Off keeps today's byte-stable SQL."""
     p, ss, out = m.Risk_Treatment_Plan, m.Scenario_Session, m.Threat_Scenario
+    context = [ss.AssetName,
+               func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle")]
     cols = [p.PlanID, p.SessionID, p.ScenarioID, p.Status, p.RiskLevel, p.ReviewStatus,
             p.ReviewedBy, p.ReviewedAt, p.ErrorMessage, p.ErrorReason, p.CreatedAt, p.UpdatedAt,
-            p.CompletedAt, ss.AssetName,
-            func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle")]
+            p.CompletedAt, *context]
     joined = (p.__table__
               .join(ss, ss.SessionID == p.SessionID)
               .outerjoin(out, out.ScenarioID == p.ScenarioID))
     if include_plan:
         st, it = m.Scoped_Threat, m.Identified_Threat
-        # No ValidationJSON/ReviewComment: they feed only wire-hidden (exclude=True) fields —
-        # a blob per row for bytes nobody can see. The presenter reads them with .get.
-        # Same shared list as active_plan_row — the register's detail view and the poll GET
-        # render through ONE presenter, so a narrower subset here would make the same plan
-        # answer differently on two pages.
-        cols += [p.PlanJSON, p.TreatmentStrategy, p.RiskIdentificationDate,
-                 out.ScenarioJSON, *scenario_threat_columns(),
-                 st.Score, st.ScopeRank]   # Scoped_Threat, not in the shared list — see above
+        # The detail view renders through the poll GET's own presenter, so it selects THE shared
+        # presenter list — plan_presenter_columns() — not a hand-picked subset: two such subsets
+        # are how the treatment response drifted three times. That includes ValidationJSON
+        # (sub-KB) although TreatmentRegisterRow publishes no warnings today: structural parity
+        # beats a per-row micro-saving, and the field can be published later without a query
+        # change. ReviewComment stays out — wire-hidden, active_plan_row only. Same shared threat
+        # list as active_plan_row; Score/ScopeRank live on Scoped_Threat and are added explicitly.
+        cols = [*plan_presenter_columns(), *context,
+                out.ScenarioJSON, *scenario_threat_columns(), st.Score, st.ScopeRank]
         joined = (joined
                   .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                   .outerjoin(it, st.ThreatID == it.ThreatID))
@@ -2722,12 +2739,12 @@ def superseded_plan_rows(sess: Session, session_id: str,
     (api.treatment._SCENARIO_ECHO_KEYS), so a history row still publishes scenario/threat/actors —
     this query just does not pay for them N times.
 
-    Every PER-VERSION column IS selected, UserID/Cancelled*/ValidationJSON included: they describe
-    THIS attempt (who generated it, who stopped it, what validation said of it) and cannot be
-    echoed from the active row. They were absent for three schema changes and the presenter's
-    defensive .get published null/false rather than raising, so a superseded row reported
-    created_by=null and moderation_flagged=false whatever it had actually recorded. A new column
-    that feeds a wire field belongs HERE as well as in active_plan_row.
+    Selects THE shared presenter list, plan_presenter_columns(): every per-version column the
+    presenter reads (UserID/Cancelled*/ValidationJSON included — they describe THIS attempt and
+    cannot be echoed from the active row). This query used to hand-list its columns and missed
+    three schema changes; the presenter's defensive .get then published created_by=null and
+    moderation_flagged=false for versions that had recorded otherwise. One list, pinned by a
+    test, is what stops a fourth.
 
     InputSnapshotJSON stays excluded — tens of KB per version; that is the evidence endpoint's
     job. ReviewComment stays excluded — it is genuinely exclude=True on the model and never
@@ -2736,13 +2753,7 @@ def superseded_plan_rows(sess: Session, session_id: str,
         return []
     p = m.Risk_Treatment_Plan
     stmt = (
-        select(p.PlanID, p.SessionID, p.ScenarioID, p.Status, p.TreatmentStrategy,
-            p.RiskIdentificationDate, p.PlanJSON, p.ErrorMessage,
-            p.RiskLevel, p.ReviewStatus, p.ReviewedBy, p.ReviewedAt,
-            p.ErrorReason, p.CreatedAt, p.UpdatedAt, p.CompletedAt,
-            # Per-VERSION attribution and advisories: the same three active_plan_row selects,
-            # plus the validation blob behind warnings/moderation_flagged. Same row, no join.
-            p.UserID, p.CancelledAt, p.CancelledBy, p.ValidationJSON)
+        select(*plan_presenter_columns())
         # literal_execute renders `Superseded = 1` INLINE: SQL Server cannot match a
         # parameterized predicate against the filtered IX_TreatmentPlan_SessionHistory (the
         # cached plan must hold for every parameter value — FORCESEEK errors 8622 on the
@@ -2762,6 +2773,21 @@ def superseded_plan_rows(sess: Session, session_id: str,
         stmt = (stmt.join(out, out.ScenarioID == p.ScenarioID)
                     .where(accepted(out.Accepted)))
     return list(sess.execute(stmt).mappings().all())
+
+
+def scenario_echo_rows(sess: Session, session_id: str, scenario_ids: list[str]) -> list[RowMapping]:
+    """The version-independent scenario/threat blocks for a SET of scenarios — the board's echo
+    source under ?include_superseded=true. Targeted at the scenarios that actually have history
+    (typically a few of many), so the bytes hauled scale with regenerations, not with the board.
+    The canonical _scenario_read_select, so the echo is column-for-column what the single-plan
+    GET overlays from active_plan_row. Empty ids is a no-query []."""
+    if not scenario_ids:
+        return []
+    out = m.Threat_Scenario
+    return list(sess.execute(
+        _scenario_read_select().where(out.SessionID == session_id,
+                                      out.ScenarioID.in_(scenario_ids))
+    ).mappings().all())
 
 
 def plan_row_by_id(sess: Session, session_id: str, output_id: str, plan_id: str) -> RowMapping | None:
