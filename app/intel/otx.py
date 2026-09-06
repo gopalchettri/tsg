@@ -32,6 +32,9 @@ _STATUS_COLLECTION = "intel_feed_status"
 # the 120s socket timeout per try out of a budget the whole walk shares, and a skipped page
 # comes back on the next cycle anyway.
 _PAGE_ATTEMPTS = 2
+# Pause before the second attempt. Measured 2026-09-06: a 502/504 asked again 40-150ms
+# later is the same 502/504, so an instant retry never recovers anything.
+_RETRY_DELAY_SECONDS = 5
 
 
 def _names(items: Any, keys: tuple[str, ...] = ("display_name", "name", "id")) -> list[str]:
@@ -107,6 +110,7 @@ def fetch_page(s, page: int) -> tuple[list[dict], bool]:
             if attempt == _PAGE_ATTEMPTS:
                 raise
             log.warning("intel.otx_page_retry", page=page, attempt=attempt, exc_info=True)
+            time.sleep(_RETRY_DELAY_SECONDS)
     raise RuntimeError(f"otx page {page}: attempts exhausted")  # unreachable; satisfies typing
 
 
@@ -135,7 +139,7 @@ def _save_cursor(col, page: int) -> None:
 
 def _page_or_skip(s, page: int) -> tuple[list[dict], bool]:
     """fetch_page, except a page that fails every attempt is SKIPPED rather than aborting
-    the walk — OTX currently has one page that 504s on every request, and one bad page
+    the walk — OTX intermittently 502/504s its deeper, slower pages, and one bad page
     must not cost the entire cycle."""
     try:
         return fetch_page(s, page)

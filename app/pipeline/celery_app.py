@@ -744,10 +744,9 @@ def _publish_intel_job_event(job_id: str | None, state: CeleryJobState, **fields
     retry_backoff_max=300,
     retry_jitter=True,           # spread retries so five feeds can't sync into a thundering herd
     max_retries=3,
-    # Bounded so ONE execution can never outlive the `visibility_timeout` (3600s) above. Unlike
-    # the pipeline tasks this has no CAS fence: a redelivered copy just re-fetches and re-upserts,
-    # so two (then three, hourly) copies of one slow feed run concurrently. Real risk because
-    # fetch_ics_advisories issues up to 200 SEQUENTIAL requests with only per-socket timeouts.
+    # Bounded so ONE execution can never outlive the `visibility_timeout` (3600s) above. A
+    # per-feed job_lock in the body (TTL = time_limit) keeps a redelivered or double-clicked
+    # copy from walking the same feed alongside the first.
     soft_time_limit=600,         # raises SoftTimeLimitExceeded — refresh_one records it per feed
     time_limit=660,              # hard backstop if a fetch ignores the soft signal
 )
@@ -765,12 +764,25 @@ def intel_refresh_feed_task(self, feed: str) -> int:
     one case Celery's own autoretry wrapper will NOT retry again after this exception, so only
     THAT case is the real terminal FAILURE; every earlier attempt is a non-terminal RETRY hint,
     same distinction admin_embedding_action_task draws for LLMSlotUnavailable above."""
-    from app.intel.fetchers import refresh_one
+    from app.core.joblock import job_lock
+    from app.intel.fetchers import RefreshAlreadyRunning, refresh_one
+    from app.pipeline.llm import _slot_redis
 
     job_id = self.request.id
     _publish_intel_job_event(job_id, CeleryJobState.STARTED, feed=feed)
     try:
-        count = refresh_one(feed)
+        # The lock lives HERE, not in the route (it returns 202 before this runs). TTL is the
+        # hard time_limit, so a killed run can never hold a feed longer than it could have run.
+        # Fails open when Redis is down (core.joblock): this guards redundant OTX/CISA traffic
+        # and cursor clobbering, never correctness -- the upserts are idempotent.
+        with job_lock(f"tsg:intel-refresh:{feed}", ttl=self.time_limit,
+                    busy=RefreshAlreadyRunning(f"a refresh of {feed!r} is already running"),
+                    redis_factory=_slot_redis):
+            count = refresh_one(feed)
+    except RefreshAlreadyRunning as exc:
+        log.warning("intel.refresh_already_running", feed=feed)
+        _publish_intel_job_event(job_id, CeleryJobState.FAILURE, feed=feed, error=str(exc)[:500])
+        return 0
     except Exception as exc:
         state = CeleryJobState.FAILURE if self.request.retries >= self.max_retries else CeleryJobState.RETRY
         _publish_intel_job_event(job_id, state, feed=feed, error=str(exc)[:500])

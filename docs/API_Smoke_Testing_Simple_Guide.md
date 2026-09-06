@@ -3959,7 +3959,7 @@ No bodies. Valid feed names for command 3: `cisa_kev`, `cisa_ics`, `otx`, `urlha
 
 1. `GET /feeds` — every known feed is listed, *including switched-off ones*.
 2. `POST /feeds/refresh` → `202` with one job id **per enabled feed** — never a fixed 5; `otx` only shows up if an OTX key is configured, `taxii` only if a TAXII server is configured, `urlhaus` is off by default.
-3. `POST /feeds/cisa_kev/refresh` → `202` with a single job.
+3. `POST /feeds/cisa_kev/refresh` → `202` with a single job. Call it again while that job is still running → still `202`, but the second job ends at once as `FAILURE` with `already running` — only one refresh per feed runs at a time.
 4. `POST /feeds/phishtank/refresh` → `404` (not a feed TSG knows).
 5. `GET /feeds` again — `last_success_at` has moved forward.
 

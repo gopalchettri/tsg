@@ -144,7 +144,8 @@ def list_items(source: str | None = None,
                 "is enabled you get an empty map. Watch any job with the events endpoint, or re-read the feed "
                 "list.\n\n"
                 "**Watch out:** there is no scheduled refresh by default; this endpoint is the only way feeds "
-                "update unless an operator configures an interval."
+                "update unless an operator configures an interval. Only one refresh per feed runs at a time: "
+                "if a feed is still refreshing, its new job ends at once as `FAILURE` with `already running`."
             ))
 def refresh_all_feeds(request: Request,
                     principal: Principal = Depends(get_admin_principal)) -> IntelRefreshAccepted:
@@ -174,7 +175,8 @@ def refresh_all_feeds(request: Request,
                 "while the others succeed.\n\n"
                 "**What you get:** `202` with exactly one job id.\n\n"
                 "**Watch out:** a feed name TSG does not know returns `404`, and so does a known feed that is "
-                "currently switched off — the error says which."
+                "currently switched off — the error says which. If this feed is still refreshing from an "
+                "earlier call, the new job ends at once as `FAILURE` with `already running`."
             ))
 def refresh_feed(
     feed: Annotated[str, Path(

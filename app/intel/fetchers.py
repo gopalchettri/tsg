@@ -619,6 +619,11 @@ def _upsert_batch(col, docs: list[dict], now: datetime) -> None:
     ], ordered=False)
 
 
+class RefreshAlreadyRunning(Exception):
+    """Another refresh of this feed holds the per-feed lock (celery_app.intel_refresh_feed_task).
+    Terminal, never retried: burning the retry budget waiting for a lock helps nobody."""
+
+
 def refresh_one(feed: str) -> int:
     """Fetch ONE feed and upsert it into Mongo; returns the item count.
 
