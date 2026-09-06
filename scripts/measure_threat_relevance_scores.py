@@ -74,7 +74,11 @@ def main() -> int:
                 contexts.append((str(sid), asset_name,
                                 json.loads(subs_json or "[]"),
                                 json.loads(ctx_json or "{}")))
-            except Exception:
+            except (TypeError, ValueError):
+                # json.loads raises JSONDecodeError (a ValueError) on bad text and TypeError on
+                # a non-string column. Narrow, not bare: a bare `except` here would also swallow
+                # a DB or attribute error and silently under-report the sample this script exists
+                # to measure -- and it fails ruff's BLE001, which gates CI.
                 print(f"  ! session {sid}: unparseable stored context, skipped")
     if not contexts:
         print("Nothing to measure: no sessions with stored context. Run a session first.")

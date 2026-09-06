@@ -176,6 +176,54 @@ def control_itot_vocabulary(sess: Session) -> set[str]:
         if v and v.strip()}
 
 
+
+
+def resolve_asset_labels(sess: Session, category_ids: set[int],
+                        vocabulary: Callable[[], set[str]],
+                        *, log_event: str = "asset_labels.category_without_vocabulary") -> list[str] | None:
+    """Match a session's asset categories onto `vocabulary`; None means "apply no filter".
+
+    THE single implementation of a rule adopted after a real defect: an asset categorised
+    {Physical, IT} was silently narrowed to IT-only, so part of its nature stopped being
+    considered and nothing said so. The rule that replaced it, preserved exactly here:
+
+      * nothing is hardcoded to IT/OT -- categories are matched against the vocabulary the
+        consuming data ACTUALLY carries, so the rule widens by itself when that data grows;
+      * match by ctm_scan_category.code first, then by the "(CODE)" parenthetical inside the
+        name. Parenthesised, not substring: "IT" appears inside "FACILITIES";
+      * VOCABULARY-AWARE FAIL-OPEN -- if ANY category cannot be represented, return None and let
+        the caller filter nothing. A silently narrowed pool is the defect; an unfiltered one is
+        merely less precise.
+
+    Shared by the control-pool filter (control_mapping._resolve_control_labels) and the technique
+    reference (intel.technique_reference), so the two cannot drift into different answers for the
+    same session.
+
+    `vocabulary` is a FACTORY, not a set, and is called only after the category ids prove
+    non-empty. Taking a computed set instead made it every caller's job to remember not to build
+    it too early -- and both callers got that wrong: the control one queried Control_Library and
+    the technique one read Mongo, on sessions that had no categories to match at all. A factory
+    makes the cheap path cheap by construction."""
+    if not category_ids:
+        return None
+    resolved = vocabulary()
+    if not resolved:
+        return None
+    by_fold = {v.casefold(): v for v in resolved}
+    labels: set[str] = set()
+    for cat_id, code, name in sess.execute(
+            select(m.ctm_scan_category.id, m.ctm_scan_category.code, m.ctm_scan_category.name)
+            .where(m.ctm_scan_category.id.in_(sorted(category_ids)))):
+        matched = by_fold.get((code or "").strip().casefold())
+        if matched is None:
+            folded_name = (name or "").casefold()
+            matched = next((v for f, v in by_fold.items() if f"({f})" in folded_name), None)
+        if matched is None:
+            log.info(log_event, category_id=cat_id, code=code)
+            return None
+        labels.add(matched)
+    return sorted(labels)
+
 def get_control_candidates(sess: Session, itot_labels: list[str] | None) -> list[dict[str, Any]]:
     """Active Control_Library rows for Step-4 grounding (control_mapping.map_controls).
     `text` uses the same name+description expression the embedding cache was built from

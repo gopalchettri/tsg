@@ -139,3 +139,44 @@ def test_exhausted_outranks_running_and_complete_alike():
     an operator needs to see it now, not once the rest of the session finishes."""
     assert dal.control_mapping_progress(_FakeSession(6, 2, 1), "s") == str(ControlMappingStatus.ERROR)
     assert dal.control_mapping_progress(_FakeSession(6, 6, 1), "s") == str(ControlMappingStatus.ERROR)
+
+
+# --- last_regen / last_next_set are withheld while the subsystem lock is held ----------------
+# Found by a live run, first try, on BOTH routes. The regenerate endpoint documents its
+# completion signal as "poll GET /v1/sessions/{id} until progress.last_regen.epoch equals the
+# epoch you got back". But cascade.py commits the regeneration_completed audit row that field is
+# built from INSIDE `with _subsystem_lock(...)`, so the epoch became visible while the lock was
+# still held -- and the client's very next accept or next-set got
+# `409 regenerate_conflict: subsystem 0 is locked`. A published "you may proceed" that leads
+# straight to a 409 is worse than no signal: the client has no other field to poll, so it cannot
+# tell a real conflict from this race.
+
+_SESSION = {"SessionID": "ab14229c-0000-0000-0000-000000000000", "EntityID": "e1",
+            "AssetID": "7", "AssetName": "Widget Control System", "UserID": "u1",
+            "SessionStatus": "completed", "CurrentStage": "SCENARIOS",
+            "StageStatus": "AWAITING_DECISION", "ControlMapSeconds": None}
+_SUMMARY = {"epoch": 7, "outcome": "complete"}
+
+
+def _progress(monkeypatch, *, locked: bool):
+    monkeypatch.setattr(sessions_mod.dal, "stage_rows", lambda *a, **k: [])
+    monkeypatch.setattr(sessions_mod.dal, "has_undecided_scenarios", lambda *a, **k: False)
+    monkeypatch.setattr(sessions_mod.dal, "control_mapping_progress", lambda *a, **k: "COMPLETE")
+    monkeypatch.setattr(sessions_mod.dal, "latest_next_set_outcome", lambda *a, **k: dict(_SUMMARY))
+    monkeypatch.setattr(sessions_mod.dal, "latest_regen_outcome", lambda *a, **k: dict(_SUMMARY))
+    monkeypatch.setattr(sessions_mod.dal, "subsystem_lock_is_held", lambda *a, **k: locked)
+    return sessions_mod.build_board(None, dict(_SESSION))["progress"]
+
+
+def test_both_click_summaries_are_withheld_while_the_lock_is_held(monkeypatch):
+    progress = _progress(monkeypatch, locked=True)
+    assert progress["last_regen"] is None, "epoch published while the lock was still held"
+    assert progress["last_next_set"] is None, "epoch published while the lock was still held"
+
+
+def test_both_click_summaries_are_published_once_the_lock_clears(monkeypatch):
+    """The other half — a guard that only ever hides the field would be indistinguishable from
+    deleting it, and the epoch is the ONLY completion signal these two routes have."""
+    progress = _progress(monkeypatch, locked=False)
+    assert progress["last_regen"] == _SUMMARY
+    assert progress["last_next_set"] == _SUMMARY

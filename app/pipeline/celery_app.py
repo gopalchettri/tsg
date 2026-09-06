@@ -30,6 +30,7 @@ from celery.signals import (  # type: ignore[import-untyped]
 )
 
 from app.api.admin_jobs import (
+    FAMILY_EMBEDDINGS,
     FAMILY_INTEL,
     emb_job_channel_key,
     grounding_job_channel_key,
@@ -62,6 +63,31 @@ log = get_logger(__name__)
 # Bounded retry for _init_worker's verify_litellm_models() call — see its own comment below.
 # Lives in Settings.llm_verify_max_attempts / Settings.llm_verify_retry_backoff_seconds now
 # (defaults unchanged: 3 / 5.0).
+
+#: The two queues this app uses. DEFAULT_QUEUE carries everything a user waits on; ADMIN_QUEUE
+#: carries the heavy operator jobs listed in task_routes below. Named here, once, because five
+#: launch surfaces (start.ps1, two compose files, deploy.yaml, the handbook) and a test all have
+#: to agree on the spelling.
+def forking_a_patched_process(pool_module: str) -> bool:
+    """True only when BOTH conditions of the real hazard hold: the pool forks, AND gevent has
+    already patched this process.
+
+    Split out of _init_worker so it can be tested without booting a worker — reaching this line
+    for real costs a DB round trip, a transformer load and an LLM probe. It used to test the
+    pool alone, which was harmless while everything ran -P gevent and became a boot-killer the
+    moment the `admin` queue's worker started running -P prefork on the UNPATCHED celery_app:
+    a correctly configured worker refused at startup, with the API still accepting jobs for it.
+    """
+    if not pool_module.endswith("prefork"):
+        return False
+    from gevent import monkey
+
+    return bool(monkey.is_module_patched("socket"))
+
+
+DEFAULT_QUEUE = "celery"
+ADMIN_QUEUE = "admin"
+
 
 celery_app = Celery("tsg", broker=_s.celery_broker_url or _s.redis_url,
                     backend=_s.celery_result_backend or _s.redis_url)
@@ -115,6 +141,30 @@ celery_app.conf.update(
     # visibility_timeout" rule above cannot silently break if that timeout is retuned per
     # environment (defaults unchanged: 3300 / 3600). The two single-subsystem tasks override BOTH
     # with a much tighter budget — see next_set_task / regenerate_task.
+    # ---- QUEUE SPLIT -------------------------------------------------------------------
+    # These four are CPU- and memory-heavy operator jobs: a 51 MB STIX parse, ~900 local
+    # embeddings, a calibration sweep the route itself documents as 10-15 minutes. Sharing one
+    # queue with user-facing generation was measured doing real harm -- a technique rebuild
+    # dragged live generation from ~355s to 967s AND was itself killed at its 960s limit.
+    #
+    # They also want a DIFFERENT POOL. gevent is right for the LLM/DB waits that dominate
+    # generation and buys nothing for CPU-bound work; the admin worker runs prefork/solo at
+    # concurrency 1, which also caps memory to one heavy job at a time.
+    #
+    # Nothing about the API changes: apply_async reads the queue from here, and the status and
+    # event routes look jobs up by id (a Redis marker plus the result backend), neither of which
+    # is queue-aware. intel_refresh_feed deliberately STAYS on the default queue -- it is short
+    # and I/O-bound, exactly what gevent is for, and beat schedules its fan-out.
+    #
+    # A route added here without a worker subscribing to that queue is a silent black hole: the
+    # API returns 202 and the job never runs. tests/test_queue_routing.py pins the queue set
+    # against the launch commands, and /ready reports per queue, so that cannot go unnoticed.
+    task_routes={
+        "tsg.rebuild_technique_reference": {"queue": ADMIN_QUEUE},
+        "tsg.import_threat_library": {"queue": ADMIN_QUEUE},
+        "tsg.admin_embedding_action": {"queue": ADMIN_QUEUE},
+        "tsg.calibrate_grounding": {"queue": ADMIN_QUEUE},
+    },
     task_soft_time_limit=_s.broker_visibility_timeout_seconds - 300,
     task_time_limit=_s.broker_visibility_timeout_seconds,
     beat_schedule={                    # the reaper must run on a schedule in production
@@ -170,11 +220,19 @@ def _init_worker(sender=None, **_):
     # either: SystemExit is a BaseException, and the receiver dispatch catches it just the same.
     try:
         pool = getattr(getattr(sender, "pool_cls", None), "__module__", "")
-        if pool.endswith("prefork"):
+        # The hazard is prefork AFTER gevent has been patched -- forking a patched process gives
+        # every child a broken hub. It is NOT prefork itself. This used to test only the pool,
+        # which was harmless while every worker ran -P gevent, and became a boot-killer the
+        # moment the `admin` queue's worker started running -P prefork with the UNPATCHED
+        # celery_app: correct configuration, refused at startup, jobs accepted and never run.
+        # Ask the actual question.
+        if forking_a_patched_process(pool):
             raise RuntimeError(
-                "Celery worker started with the prefork pool, but app.pipeline.celery_worker has "
-                "already monkey-patched gevent — forking now yields a broken hub per child. "
-                "Launch with `-P gevent` (see start.ps1 / docker/compose.prod.yml)."
+                "Celery worker started with the prefork pool in a process where gevent is "
+                "already monkey-patched (-A app.pipeline.celery_worker) — forking now yields a "
+                "broken hub per child. Either launch with `-P gevent`, or use the unpatched "
+                "`-A app.pipeline.celery_app` for a prefork/solo worker (see the admin worker "
+                "in docker/compose.prod.yml)."
             )
         assert_security_posture()      # fail-closed: same auth guard as the API
         verify_startup(get_engine())   # fail-fast: same DB invariant guard as the API
@@ -719,6 +777,192 @@ def intel_refresh_feed_task(self, feed: str) -> int:
         raise
     _publish_intel_job_event(job_id, CeleryJobState.SUCCESS, feed=feed, item_count=count)
     return count
+
+
+@celery_app.task(
+    bind=True,
+    name="tsg.import_threat_library",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    max_retries=3,
+    soft_time_limit=900,   # ATLAS costs two hops and CAPEC-sized payloads parse slowly
+    time_limit=960,
+)
+def import_threat_library_task(self, source: str, dry_run: bool, activate: bool,
+                            max_actors: int, user_id: str | None) -> dict:
+    """Import ONE open-source threat library into the master tables.
+
+    A ThreatLibraryImportError is TERMINAL and returned, never raised: it means the request or
+    the fetched content is invalid, which no amount of retrying fixes, and `autoretry_for=
+    (Exception,)` above would otherwise burn three attempts on a permanent failure. Everything
+    else (a 5xx from GitHub, a dropped DB connection) DOES raise, so the retry policy applies —
+    the same split intel_refresh_feed_task draws between transient and terminal.
+
+    Never lets SystemExit escape: Celery reads one inside task code as a worker-shutdown signal,
+    so an invalid request could otherwise kill every in-flight job on this worker (see
+    app/intel/library_import.py's module docstring)."""
+    from app.core.joblock import job_lock
+    from app.db.engine import db_session
+    from app.intel.library_import import (
+        LOCK_TTL_SECONDS,
+        ImportAlreadyRunning,
+        ThreatLibraryImportError,
+        lock_key,
+        run_import,
+    )
+    from app.pipeline.llm import _slot_redis
+
+    job_id = self.request.id
+    _publish_intel_job_event(job_id, CeleryJobState.STARTED, source=source)
+    try:
+        # The lock lives HERE, not in the route: the route returns 202 and this runs later, so a
+        # lock taken and released during the request would guard nothing. Fails open when Redis
+        # is down (core.joblock) -- this guards redundant downloads and DB traffic, never
+        # correctness, since the upserts are first-writer either way.
+        with job_lock(lock_key(source), ttl=LOCK_TTL_SECONDS,
+                    busy=ImportAlreadyRunning(
+                        f"an import of {source!r} is already running"),
+                    redis_factory=_slot_redis), db_session() as sess:
+            result = run_import(sess, source, dry_run=dry_run, activate=activate,
+                                max_actors=max_actors, started_by=user_id)
+    except ThreatLibraryImportError as exc:
+        result = {"source": source, "dry_run": dry_run, "error": str(exc)[:2000]}
+        _publish_intel_job_event(job_id, CeleryJobState.FAILURE, source=source,
+                                error=result["error"])
+        return result
+    except Exception as exc:
+        state = CeleryJobState.FAILURE if self.request.retries >= self.max_retries else CeleryJobState.RETRY
+        _publish_intel_job_event(job_id, state, source=source, error=str(exc)[:500])
+        raise
+
+    # Vectors LAST, and only after activation: embeddings._catalogue_texts selects on
+    # tc.IsActive AND tt.IsActive (the warm set is deliberately the query set), so embedding
+    # before activating silently skips every imported row and still reports success. Chaining it
+    # here is what makes that ordering impossible to get wrong by hand. group=None covers
+    # threat_type, threat_catalogue and threat_actor in one job; `update` skips anything that
+    # already has a vector, so the extra groups cost nothing.
+    if not dry_run and not result.get("error"):
+        try:
+            embed = admin_embedding_action_task.apply_async(args=("update", None, None), shadow=(
+                f"embeddings update after {source} import · {dal.now():%Y-%m-%d %H:%M} UTC"))
+            mark_admin_job(embed.id, FAMILY_EMBEDDINGS, "embeddings update", user_id)
+            result["embedding_job_id"] = embed.id
+        except Exception:
+            log.warning("library_import.embedding_chain_failed", source=source, exc_info=True)
+            result["embedding_job_id"] = None
+
+    _publish_intel_job_event(job_id, CeleryJobState.SUCCESS, source=source,
+                            threats=result.get("threats"), actors=result.get("actors_upserted"))
+    return result
+
+
+#: How long the technique rebuild may spend warming embedding vectors, and in what batch size.
+#:
+#: THE BUDGET ARITHMETIC, because the old limits were sized for a job this one no longer is.
+#: 960s was chosen for "download and parse"; the embedding warm-up was added to the same task
+#: later and never accounted for, and that mismatch killed every rebuild. Three changes make
+#: 900/960 correct rather than merely unchanged:
+#:   1. the corpus is PUBLISHED BEFORE warming, so a kill can no longer discard it;
+#:   2. the sources are STREAMED, so build is ~15s measured (was a 51 MB whole-file parse);
+#:   3. warming self-limits to the budget below.
+#: Worst case is therefore ~615s of work (15 + 600) inside a 900s soft / 960s hard limit —
+#: real headroom, derived, not guessed. Raise the budget, not the limits, if warming needs
+#: longer; the limits only have to stay above it.
+#:
+#: On the `admin` queue's prefork pool the SOFT limit also fires for real. It silently never
+#: does on gevent, which is why the best-effort `except` around the warm-up never got to run.
+_TECHNIQUE_WARM_BUDGET_SECONDS = 600
+_TECHNIQUE_WARM_BATCH = 32
+
+
+@celery_app.task(
+    bind=True,
+    name="tsg.rebuild_technique_reference",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    max_retries=3,
+    soft_time_limit=900,
+    time_limit=960,
+)
+def rebuild_technique_reference_task(self, sources: list[str], user_id: str | None) -> dict:
+    """Rebuild the ATT&CK/CAPEC technique corpus scenario prompts consult.
+
+    Same terminal-vs-transient split as import_threat_library_task: a ThreatLibraryImportError
+    means the request or the fetched content is invalid, which retrying cannot fix, so it is
+    returned rather than raised.
+
+    PUBLISHES FIRST, then warms the embedding vectors within whatever time budget is left. The
+    warm-up still happens inside this job -- its cost and failures belong to an operator, not to
+    whichever user happens to trigger the first scenario after a rebuild -- but it can no longer
+    take the corpus down with it.
+
+    It used to warm BEFORE publishing, and that lost every rebuild on a CPU-only box. Three
+    facts compound: an uncached local embed measures 4-6.6s per passage here, so ~900 passages
+    need 60-99 minutes; `soft_time_limit` DOES NOT FIRE on the gevent pool, so the best-effort
+    `except` below never got a chance to run; and `time_limit` then hard-killed the task at 960s.
+    Because publish() came last, a corpus that had built correctly in 15 seconds was discarded
+    every single time -- the exact opposite of the "an un-warmed corpus still works" intent
+    stated below. Publishing first makes that intent true instead of aspirational."""
+    from app.intel.library_import import ThreatLibraryImportError
+    from app.intel.technique_reference import COLLECTION, build_entries, passage_text, publish
+
+    job_id = self.request.id
+    _publish_intel_job_event(job_id, CeleryJobState.STARTED, sources=sources)
+    try:
+        entries, skipped = build_entries(sources)
+    except ThreatLibraryImportError as exc:
+        result = {"sources": sources, "error": str(exc)[:2000]}
+        _publish_intel_job_event(job_id, CeleryJobState.FAILURE, error=result["error"])
+        return result
+    except Exception as exc:
+        state = CeleryJobState.FAILURE if self.request.retries >= self.max_retries else CeleryJobState.RETRY
+        _publish_intel_job_event(job_id, state, error=str(exc)[:500])
+        raise
+
+    # Durable FIRST: everything below is best-effort and must never risk the corpus.
+    built_at = dal.now()
+    total = publish(entries, built_at)
+
+    _publish_intel_job_event(job_id, CeleryJobState.STARTED, stage="embedding",
+                            total=len(entries))
+    warmed = None
+    try:
+        from app.core.config import get_settings as _gs
+        from app.pipeline.embeddings import get_vectors
+        from app.pipeline.llm import get_llm
+
+        limit = _gs().max_embed_chars
+        texts = [passage_text(e, limit) for e in entries]
+        # Warm in batches against a DEADLINE rather than in one call. The hard time limit is the
+        # only limit that fires on the gevent pool, and it kills the task outright -- so the work
+        # has to stop itself before then, or the job reports FAILURE for a rebuild that actually
+        # succeeded. Partial warming is a real outcome, reported as such in `warmed`.
+        deadline = time.monotonic() + _TECHNIQUE_WARM_BUDGET_SECONDS
+        llm, model_id = get_llm(), _gs().embedding_model
+        warmed = 0
+        for i in range(0, len(texts), _TECHNIQUE_WARM_BATCH):
+            if time.monotonic() > deadline:
+                log.warning("technique_reference.warm_budget_exhausted",
+                            warmed=warmed, total=len(texts))
+                break
+            batch = texts[i:i + _TECHNIQUE_WARM_BATCH]
+            get_vectors(llm, batch, model_id=model_id, group=COLLECTION, kind="passage")
+            warmed += len(batch)
+    except Exception:
+        # Best-effort: an un-warmed corpus still works, the first lookup just pays for the
+        # embedding. Never a reason to withhold a corpus that built correctly.
+        log.warning("technique_reference.warm_failed", exc_info=True)
+
+    result = {"sources": sources, "total": total, "warmed": warmed,
+            "skipped_count": len(skipped), "built_at": str(built_at)}
+    log.info("technique_reference.rebuilt", user_id=user_id, **{k: result[k]
+            for k in ("sources", "total", "skipped_count")})
+    _publish_intel_job_event(job_id, CeleryJobState.SUCCESS, total=total)
+    return result
 
 
 def dispatch_refresh(feeds: list[str], user_id: str | None) -> dict[str, str]:

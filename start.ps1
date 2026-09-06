@@ -353,10 +353,32 @@ function Start-InNewWindow {
 # AND a durable file, and never clobbers a previous run's evidence.
 # ponytail: no rotation -- logs/ grows unbounded; add size-capped rotation if it ever matters.
 $workerLog = Join-Path $logsDir 'celery.log'
-$celeryCmd = "& '$venvPython' -m celery -A app.pipeline.celery_worker.celery_app worker -P gevent -c $Concurrency -l info -n tsg-worker-${PID}@%h 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$workerLog' -Append"
+# -Q celery is LOAD-BEARING. Without it this worker keeps consuming the `admin` queue too and
+# the split in celery_app.py::task_routes achieves nothing.
+$celeryCmd = "& '$venvPython' -m celery -A app.pipeline.celery_worker.celery_app worker -Q celery -P gevent -c $Concurrency -l info -n tsg-worker-${PID}@%h 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$workerLog' -Append"
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
-                  -InnerCommand $celeryCmd -WindowTitle 'tsg-celery'
+                -InnerCommand $celeryCmd -WindowTitle 'tsg-celery'
 Write-Host "Celery worker starting in a new window (title: tsg-celery)..." -ForegroundColor Green
+
+# ---------------------------------------------------------------------------
+# 3b. Celery ADMIN worker (new window) -- the heavy operator jobs
+# ---------------------------------------------------------------------------
+# Separate worker for the `admin` queue (celery_app.py::task_routes): technique rebuild, library
+# import, embeddings, grounding calibration. Measured reason: a rebuild sharing the default queue
+# dragged live generation from ~355s to 967s and was itself killed at its time limit.
+#
+# -P solo, not gevent, and concurrency 1: this work is CPU-bound (a 51 MB STIX parse, ~900 local
+# embeddings), which greenlets do nothing for, and one-at-a-time caps memory to a single heavy
+# job. solo rather than prefork because prefork's fork() semantics are unavailable on Windows;
+# the containers use prefork -c 1 (docker/compose.prod.yml).
+# NOTE solo also means the SOFT time limit works here, unlike the gevent pool where it silently
+# never fires -- which is what let a rebuild be hard-killed mid-flight.
+# -A targets celery_app, NOT celery_worker: celery_worker monkey-patches for gevent BEFORE any import; with a non-gevent pool there is no hub to drive those patched calls and the worker hangs in boot (observed: stops after 'mingle: sync complete', never reaches ready). Use the UNPATCHED app instead -- same reason beat uses it.
+$adminLog = Join-Path $logsDir 'celery-admin.log'
+$adminCmd = "& '$venvPython' -m celery -A app.pipeline.celery_app.celery_app worker -Q admin -P solo -l info -n tsg-admin-${PID}@%h 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$adminLog' -Append"
+Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
+                -InnerCommand $adminCmd -WindowTitle 'tsg-celery-admin'
+Write-Host "Celery ADMIN worker starting in a new window (title: tsg-celery-admin)..." -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
 # 4. Celery beat (new window) -- default scheduler; fires the reaper every 60s
@@ -383,7 +405,7 @@ if ((Test-Path $beatScheduleDat) -and (Get-Item $beatScheduleDat).Length -eq 0) 
 $beatLog = Join-Path $logsDir 'beat.log'
 $beatCmd = "& '$venvPython' -m celery -A app.pipeline.celery_app.celery_app beat -l info 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$beatLog' -Append"
 Start-InNewWindow -WorkDir $ProjectRoot -VenvActivate $venvActivate `
-                  -InnerCommand $beatCmd -WindowTitle 'tsg-beat'
+                -InnerCommand $beatCmd -WindowTitle 'tsg-beat'
 Write-Host "Celery beat starting in a new window (title: tsg-beat)..." -ForegroundColor Green
 
 # ---------------------------------------------------------------------------

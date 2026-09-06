@@ -51,8 +51,10 @@ services:
     # app/pipeline/celery_app.py, 50 is ALSO the most messages this worker may reserve from
     # the queue — it can no longer hoard 4x that while others sit idle. Tune -c to LLM
     # capacity; remember each extra replica adds another 50 parallel slots on the same queue.
+    # -Q celery is LOAD-BEARING: without it this worker also drains the `admin` queue and the
+    # split in celery_app.py::task_routes does nothing.
     command: ["celery", "-A", "app.pipeline.celery_worker.celery_app", "worker",
-              "-P", "gevent", "-c", "50", "-l", "info"]
+              "-Q", "celery", "-P", "gevent", "-c", "50", "-l", "info"]
     env_file: [../.env.uat]   # UAT and production share one file (.env.prod.example documents it)
     depends_on:
       redis: { condition: service_healthy }
@@ -93,6 +95,35 @@ services:
       # you switch a provider back to `local`.
       - "${EMBEDDING_MODEL_HOST:-./docker}:/models/e5:ro"
       - "${RERANKER_MODEL_HOST:-./docker}:/models/reranker:ro"
+
+  # The heavy operator jobs, off the queue users wait on. Routed here by
+  # app/pipeline/celery_app.py::task_routes: technique rebuild, library import, embeddings,
+  # grounding calibration. Measured reason for the split: a rebuild sharing the default queue
+  # dragged live generation from ~355s to 967s and was itself killed at its time limit.
+  #
+  # -P prefork -c 1, NOT gevent -c 50. This work is CPU-bound (a 51 MB STIX parse, ~900 local
+  # embeddings) and greenlets do nothing for CPU; one at a time also caps memory to a single
+  # heavy job. prefork additionally makes Celery's SOFT time limit work -- on the gevent pool it
+  # silently never fires, which is what let a rebuild be hard-killed instead of stopping early.
+  #
+  # If this service is absent, the API still returns 202 for those jobs and they never run.
+  # /ready reports `workers_admin` for exactly that reason.
+  worker-admin:
+    image: tsg:latest
+    restart: unless-stopped
+    # -A celery_app, NOT celery_worker: celery_worker monkey-patches for gevent BEFORE any import; with a non-gevent pool there is no hub to drive those patched calls and the worker hangs in boot (observed: stops after 'mingle: sync complete', never reaches ready). Use the UNPATCHED app instead -- same reason beat uses it.
+    command: ["celery", "-A", "app.pipeline.celery_app.celery_app", "worker",
+              "-Q", "admin", "-P", "prefork", "-c", "1", "-l", "info"]
+    env_file: [../.env.uat]
+    depends_on:
+      redis: { condition: service_healthy }
+    stop_grace_period: 300s
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.pipeline.celery_app.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 240s
 
   beat:
     image: tsg:latest

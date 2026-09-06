@@ -36,7 +36,21 @@ router = APIRouter(
 log = get_logger(__name__)
 
 
-@router.post("", status_code=201, response_model=ApiClientCreated)
+@router.post("", status_code=201, response_model=ApiClientCreated,
+            summary="Create an API key",
+            description=(
+                "Generates a new API key. Every entity-scoped and admin endpoint needs one, so this is where "
+                "they come from. The two health probes need no authentication at all, and these three "
+                "key-management routes authenticate on the admin key alone.\n\n"
+                "**Auth:** the admin key, plus `X-User-Id` for attribution — that one is recorded as the "
+                "creator and is a `400`, not a `401`, if blank.\n\n"
+                "**This response is the only time the secret is ever shown.** Only a hash of it is stored, so "
+                "there is no recovery path. Copy it now; if it is lost, revoke this client and create "
+                "another.\n\n"
+                "**Field limits:** `client_id` 1-100 characters and must be unique, `name` 1-200, `module` "
+                "1-50. A key only authenticates for its own module.\n\n"
+                "**To rotate a key:** create the replacement first, then revoke the old one."
+            ))
 def create_api_client(
     body: CreateApiClientBody,
     x_user_id: str = Header(default="", alias="X-User-Id"),
@@ -60,14 +74,32 @@ def create_api_client(
     return ApiClientCreated(client_id=body.client_id, module=body.module, secret=secret)
 
 
-@router.get("", response_model=list[ApiClientInfo])
+@router.get("", response_model=list[ApiClientInfo],
+            summary="List API keys",
+            description=(
+                "Every API client with its metadata, newest first: who created it, whether it is still "
+                "active, and who revoked it.\n\n"
+                "**Auth:** the admin key only. No `X-User-Id` is needed, because this is a read.\n\n"
+                "**Filter:** add `?module=` to narrow to one module.\n\n"
+                "Secrets and their hashes are never returned by this or any other endpoint."
+            ))
 def list_api_clients(module: str | None = Query(default=None)) -> list[ApiClientInfo]:
     """List API clients — metadata only, never the hash or secret. Optional `?module=` filter."""
     with db_session() as sess:
         return [ApiClientInfo(**row) for row in dal.list_api_clients(sess, module)]
 
 
-@router.post("/{client_id}/revoke", status_code=200, response_model=ApiClientRevoked)
+@router.post("/{client_id}/revoke", status_code=200, response_model=ApiClientRevoked,
+            summary="Revoke an API key",
+            description=(
+                "Turns off one API client. The key stops authenticating on its very next use.\n\n"
+                "**Auth:** the admin key, plus `X-User-Id` for attribution — recorded as who revoked it, and "
+                "a `400` if blank.\n\n"
+                "**Watch out:** there is no un-revoke and no update endpoint. Rotating a key means creating a "
+                "new one and revoking the old one. Revoking twice, or revoking a client that never existed, "
+                "both return `404` because neither finds an active client to act on.\n\n"
+                "This is a soft delete: the row and its history stay in the table permanently."
+            ))
 def revoke_api_client(
     client_id: str,
     x_user_id: str = Header(default="", alias="X-User-Id"),

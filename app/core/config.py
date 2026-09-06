@@ -957,6 +957,37 @@ def assert_security_posture(settings: Settings | None = None) -> None:
                 "so keys are server-side only — never shipped to a browser or mobile client.")
 
 
+# Startup check that the INSTALLED sse_starlette can actually accept the arguments this code
+# passes. A too-old release does not fail at import and does not fail at boot -- it fails at
+# REQUEST time, as an opaque 500 on every SSE route, while /ready still reports every dependency
+# "ok". That is exactly how an API process launched with the wrong interpreter (global
+# site-packages instead of the project venv) served sse_starlette 3.0.3 against code written for
+# >=3.4.6: all three admin job streams (embeddings, grounding calibration, threat-intel refresh)
+# 500'd on `shutdown_grace_period`, and nothing anywhere said so.
+#
+# Asserted as a CAPABILITY, not a version string: this names the keyword arguments
+# admin_sse.admin_job_event_stream and sessions.session_events actually pass, so it cannot drift
+# from the floor pinned in pyproject.toml the way a hardcoded version comparison would.
+def assert_sse_library_supports_our_calls(response_cls=None) -> None:
+    import inspect
+
+    if response_cls is None:
+        from sse_starlette.sse import EventSourceResponse as response_cls
+    required = {"ping", "ping_message_factory", "send_timeout", "shutdown_grace_period"}
+    have = set(inspect.signature(response_cls.__init__).parameters)
+    missing = sorted(required - have)
+    if missing:
+        import sse_starlette
+        raise RuntimeError(
+            f"the installed sse_starlette "
+            f"({getattr(sse_starlette, '__version__', 'unknown')} at "
+            f"{getattr(sse_starlette, '__file__', '?')}) does not accept "
+            f"{', '.join(missing)} on EventSourceResponse. Every SSE route would return 500 at "
+            f"request time while /ready still reported healthy. pyproject pins "
+            f"sse-starlette>=3.4.6 -- this process is almost certainly running against the wrong "
+            f"interpreter's site-packages (check sys.prefix), not the project venv.")
+
+
 # Startup check that graceful SSE shutdown still works: sse_starlette finds the running uvicorn
 # Server by introspecting the live SIGTERM handler, which only works when uvicorn's Server.serve()
 # drives this process. Run the SAME introspection at boot so a drift to another worker class

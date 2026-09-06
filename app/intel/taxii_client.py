@@ -68,4 +68,8 @@ def fetch_collection_bundle(source: str) -> dict[str, Any]:
     returns the same {'objects': [...]} shape as the GitHub STIX bundle download,
     so the importer's adapters work identically on either path."""
     collection_id = MITRE_COLLECTIONS[source]
-    return {"objects": list(iter_objects(MITRE_TAXII_ROOT, collection_id))}
+    # NOT list(): iter_objects already pages lazily, and materialising it here would rebuild the
+    # whole-bundle-in-memory profile that streaming removed from the GitHub download path.
+    # technique_reference._stix_patterns accepts a dict whose "objects" is an iterator, so the
+    # advertised {"objects": [...]} shape still works for every adapter.
+    return {"objects": iter_objects(MITRE_TAXII_ROOT, collection_id)}

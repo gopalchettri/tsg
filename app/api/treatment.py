@@ -129,7 +129,25 @@ def enqueue_treatment_plan(plan_id: str, entity_id: str, user_id: str | None) ->
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan", status_code=202,
             response_model=TreatmentPlanAccepted,
-            responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES)
+            responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES,
+            summary="Request a remediation plan",
+            description=(
+                "Asks the AI to write the FIRST remediation plan for one accepted scenario.\n\n"
+                "**Before you call:** the scenario must be accepted. This endpoint is first-generation only — "
+                "if any plan already exists for the scenario, whatever its state, this fails with "
+                "`plan_already_exists` and you must use the regenerate endpoint instead.\n\n"
+                "**What to send:** your risk register's own scoring data. TSG stores none of it, so it "
+                "travels in this body and is frozen into the plan. Five fields are required: "
+                "`existing_controls` (may be an empty list, but the key must be present), "
+                "`likelihood_rating`, `impact_rating`, `final_risk_rating` and `risk_level`.\n\n"
+                "**What you get:** `202` with a `plan_id`. Queued, not written — poll the status endpoint "
+                "until `progress.overall` leaves `generating`.\n\n"
+                "**If the queue is unreachable you get `503`, and a plan row has ALREADY been created** and "
+                "parked in error. Retrying this endpoint then fails with `plan_already_exists`; the way back "
+                "is the regenerate endpoint.\n\n"
+                "Other limits worth knowing: `existing_controls` takes at most 50 entries of at most 500 "
+                "characters each, and the two mitigation dates must be sent together, end on or after start."
+            ))
 def post_treatment_plan(session_id: str, scenario_id: str, body: TreatmentPlanBody,
                         principal: Principal = Depends(get_principal)) -> TreatmentPlanAccepted:
     """FIRST generation of the Mitigate treatment plan for one ACCEPTED scenario. The register's
@@ -151,7 +169,21 @@ def post_treatment_plan(session_id: str, scenario_id: str, body: TreatmentPlanBo
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/regenerate",
             status_code=202, response_model=TreatmentPlanAccepted,
-            responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES)
+            responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES,
+            summary="Regenerate a remediation plan",
+            description=(
+                "Creates a new version of a plan that already exists. Every version after the first is minted "
+                "here — the request endpoint refuses once any plan exists.\n\n"
+                "**Before you call:** a plan must already have been requested for this scenario, and the "
+                "scenario must still be accepted. Send a literal empty object `{}` as the body; any key at "
+                "all is rejected.\n\n"
+                "**You do not resend your risk data.** It is reused from the snapshot frozen at the first "
+                "request. Only the scenario and control half is rebuilt against whatever they are now.\n\n"
+                "**What you get:** `202` with a NEW `plan_id`. The previous version is retired, not deleted, "
+                "and remains readable. Calling again while a regeneration is still running fails with "
+                "`generation_in_progress`. A `503` means the queue was unreachable and the new version is "
+                "parked in error — another regenerate is the way back."
+            ))
 def post_regenerate_treatment_plan(session_id: str, scenario_id: str, body: TreatmentPlanRegenerateBody,
                                 principal: Principal = Depends(get_principal)) -> TreatmentPlanAccepted:
     """Regenerate the plan: retire the ACTIVE version, generate a new one. The register risk data
@@ -304,7 +336,18 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
 
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/status",
             response_model=TreatmentPlanStatusSummary,
-            summary="Remediation plan status (cheap poll)")
+            summary="Check a remediation plan's status",
+            description=(
+                "The cheap poll: lifecycle and review state only, with no plan content, scenario or threat "
+                "attached.\n\n"
+                "**Call it:** on a timer after requesting or regenerating a plan, until `progress.overall` "
+                "leaves `generating`. Switch to the full plan endpoint once you actually need the content — "
+                "polling that one instead re-downloads the whole document every tick.\n\n"
+                "**Switch your UI on `progress.overall`:** `generating` shows a spinner, `awaiting_review` "
+                "offers Review, `rejected` offers Regenerate, `approved` is done, `error` offers Retry.\n\n"
+                "**Watch out:** a `404` here is not an error. It means no plan was ever requested for this "
+                "scenario, which is the 'pending' state — show a Generate button."
+            ))
 def get_treatment_plan_status(session_id: str, scenario_id: str,
                             principal: Principal = Depends(get_principal)
                             ) -> TreatmentPlanStatusSummary:
@@ -344,7 +387,19 @@ def get_treatment_plan_status(session_id: str, scenario_id: str,
 
 
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan",
-            response_model=TreatmentPlanStatus)
+            response_model=TreatmentPlanStatus,
+            summary="Read a remediation plan",
+            description=(
+                "The plan itself: the recommended controls, the numbered action list with owners and target "
+                "dates, and the timeline — plus the scenario, threat, adversaries and mapped controls, so a "
+                "reviewer never has to cross-reference another screen.\n\n"
+                "**Call it:** once the status reads `COMPLETE`. It also works while running or after a "
+                "failure, where `plan` is simply null.\n\n"
+                "**History:** add `?include_superseded=true` to also get every version you regenerated away, "
+                "newest first. Each is a full entry with its own plan and review verdict.\n\n"
+                "**Watch out:** check `warnings` before treating a completed plan as ready to act on. A plan "
+                "can complete with an empty action list and a warning saying so."
+            ))
 def get_treatment_plan(session_id: str, scenario_id: str,
                     include_superseded: bool = Query(
                         False, description="Also return every regenerated-away version of "
@@ -419,7 +474,22 @@ _EVENT_LABELS = {
 }
 
 
-@router.get("/sessions/{session_id}/treatment-plans", response_model=TreatmentBoard)
+@router.get("/sessions/{session_id}/treatment-plans", response_model=TreatmentBoard,
+            summary="List a session's remediation plans",
+            description=(
+                "Every accepted scenario in the session with its plan state, in one call. This replaces "
+                "polling each scenario separately.\n\n"
+                "**Call it:** any time, including on a session with nothing accepted — that returns `200` "
+                "with an empty list, never a `404`.\n\n"
+                "**Reading the result:** a scenario with no plan yet has `plan_id`, `status` and the rest all "
+                "null together, which is your Generate state. They are never partially filled.\n\n"
+                "**Watch out:** the session-level `progress` can read `generating` even when every plan you "
+                "can see is finished and approved. An accepted scenario with no plan requested at all counts "
+                "as generation still outstanding, which is correct — otherwise your UI would stop offering "
+                "Generate while a risk had no plan.\n\n"
+                "Add `?include_plan=true` for each plan's content and `?include_superseded=true` for version "
+                "history."
+            ))
 def get_treatment_board(session_id: str,
                         include_plan: bool = Query(
                             False, description="Also return each plan's content — the "
@@ -495,7 +565,18 @@ def get_treatment_board(session_id: str,
 
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/cancel",
-            response_model=TreatmentCancelResponse, responses=_CONFLICT_RESPONSES)
+            response_model=TreatmentCancelResponse, responses=_CONFLICT_RESPONSES,
+            summary="Cancel a running plan generation",
+            description=(
+                "The stop button: immediately marks a generation that is still running as failed, instead of "
+                "waiting out the staleness timeout after a mistaken click.\n\n"
+                "**Before you call:** the plan must genuinely still be running. If it already finished, or "
+                "the worker's own completion beat you by a moment, you get a conflict rather than a silent "
+                "no-op.\n\n"
+                "**What happens:** the plan row is never deleted. Cancelling marks it failed but does NOT "
+                "abort the AI call already in flight — that call runs to completion and is still billed, its "
+                "result simply discarded. Recover by regenerating."
+            ))
 def post_cancel_treatment_plan(session_id: str, scenario_id: str,
                             principal: Principal = Depends(get_principal)) -> TreatmentCancelResponse:
     """The stop button: flip a RUNNING generation to ERROR right now, instead of waiting out
@@ -530,7 +611,22 @@ def post_cancel_treatment_plan(session_id: str, scenario_id: str,
 
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/review",
-            response_model=TreatmentReviewResponse, responses=_CONFLICT_RESPONSES)
+            response_model=TreatmentReviewResponse, responses=_CONFLICT_RESPONSES,
+            summary="Approve or decline a remediation plan",
+            description=(
+                "Records a human's verdict on a plan. This is the decision a regulator would ask to see.\n\n"
+                "**Before you call:** the plan version you are deciding on must be complete.\n\n"
+                "**`plan_id` is required and names the version you actually read.** This is deliberate: "
+                "without it, a regeneration landing between your read and this call could move your verdict "
+                "onto a plan nobody looked at. Omitting it is a `422`.\n\n"
+                "**Switching versions:** passing an OLD version's `plan_id` with `approved` makes that "
+                "version current again and approves it, in one step. Passing an old id with `rejected` is "
+                "refused — it is already not the active plan, and doing it while a fresh regeneration is "
+                "still running is refused with `generation_in_progress`. A `plan_id` that is not a version of "
+                "this scenario at all is a `404`.\n\n"
+                "`reviewed_by` always comes from your `X-User-Id` header; there is no reviewer field in the "
+                "body, so nobody can review as someone else. Re-reviewing overwrites the previous verdict."
+            ))
 def post_review_treatment_plan(session_id: str, scenario_id: str, body: TreatmentReviewBody,
                             principal: Principal = Depends(get_principal)) -> TreatmentReviewResponse:
     """Record the human adoption decision. `plan_id` is REQUIRED — a verdict always names the
@@ -621,7 +717,20 @@ def post_review_treatment_plan(session_id: str, scenario_id: str, body: Treatmen
                                 reviewed_by=principal.user_id, reviewed_at=reviewed_at)
 
 
-@router.get("/entities/{entity_id}/treatment-plans", response_model=TreatmentRegisterPage)
+@router.get("/entities/{entity_id}/treatment-plans", response_model=TreatmentRegisterPage,
+            summary="List an entity's remediation plans",
+            description=(
+                "Each scenario's CURRENT plan version across every session and asset for one entity, newest "
+                "first. This is the page that answers 'which Critical risks still have no approved plan?'. "
+                "Versions you regenerated away are not listed here — read those per scenario with "
+                "`?include_superseded=true`.\n\n"
+                "**Before you call:** the `entity_id` in the path must match your `X-Entity-Id` header.\n\n"
+                "**Filters:** `status` (`RUNNING`, `COMPLETE`, `ERROR`), `review_status` (`approved`, "
+                "`rejected`), `risk_level` (`Low`, `Medium`, `High`, `Critical`), plus `limit` (max 500) and "
+                "`offset`.\n\n"
+                "By default each row carries lifecycle fields only. Add `?include_plan=true` to also get the "
+                "plan content and the scenario and threat behind it."
+            ))
 def list_entity_treatment_plans(entity_id: str,
                                 # Enum-typed, not str: an unrecognized value used to bind straight
                                 # into the WHERE and return an empty page, which reads as "no such
@@ -692,7 +801,18 @@ def list_entity_treatment_plans(entity_id: str,
 
 
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/audit",
-            response_model=TreatmentAuditTrail)
+            response_model=TreatmentAuditTrail,
+            summary="Read one scenario's plan history",
+            description=(
+                "Every remediation-plan event for one scenario, across all its versions, oldest first: who "
+                "requested each plan, how each generation ended, cancellations, review verdicts and version "
+                "switches.\n\n"
+                "**Call it:** when investigating a declined plan, answering an audit request, or working out "
+                "why a plan looks the way it does.\n\n"
+                "**Watch out:** a `404` means no plan was ever requested for this scenario. Events recorded "
+                "before per-scenario stamping shipped carry no scenario id and do not appear here — the "
+                "entity-wide feed still returns them."
+            ))
 def get_treatment_plan_audit(session_id: str, scenario_id: str,
                             principal: Principal = Depends(get_principal)) -> TreatmentAuditTrail:
     """One scenario's plan life story across ALL versions, oldest first: requested (by whom),
@@ -724,7 +844,17 @@ def get_treatment_plan_audit(session_id: str, scenario_id: str,
 
 
 @router.get("/entities/{entity_id}/treatment-plans/audit",
-            response_model=TreatmentEntityAuditPage)
+            response_model=TreatmentEntityAuditPage,
+            summary="Read an entity's plan activity",
+            description=(
+                "Every remediation-plan action across the whole entity, newest first. This is the compliance "
+                "export.\n\n"
+                "**Before you call:** the `entity_id` in the path must match your `X-Entity-Id` header.\n\n"
+                "**Filters:** `from` and `to` bound the time window and accept any UTC offset, `user_id` "
+                "narrows to one person, and `limit` (max 1000) with `offset` pages the result.\n\n"
+                "Unlike the per-scenario trail, every event here carries its `session_id`, because one page "
+                "mixes events from many sessions."
+            ))
 def list_entity_treatment_audit(entity_id: str,
                                 since: datetime | None = Query(None, alias="from"),
                                 until: datetime | None = Query(None, alias="to"),
@@ -751,7 +881,20 @@ def list_entity_treatment_audit(entity_id: str,
 
 
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/evidence",
-            response_model=TreatmentEvidence)
+            response_model=TreatmentEvidence,
+            summary="Get a plan version's evidence bundle",
+            description=(
+                "The receipt for one plan version: the exact frozen input the AI was given, the validation "
+                "and moderation record, and every raw AI prompt and response.\n\n"
+                "**Required:** the `version` query parameter, naming the exact `plan_id` to inspect. A "
+                "version you replaced long ago is fine — evidence survives regeneration.\n\n"
+                "**Call it:** when a plan is challenged, or to work out why one generation produced a "
+                "different answer from another.\n\n"
+                "**Watch out:** `status` here is the raw stored value, deliberately not reinterpreted. A plan "
+                "the status endpoint presents as timed-out may still read `RUNNING` here, because an audit "
+                "record must not be rewritten at read time. An old plan can legitimately return an empty "
+                "attempt list if it predates prompt linking."
+            ))
 def get_treatment_plan_evidence(session_id: str, scenario_id: str,
                                 version: str = Query(..., description="The plan_id of the version to inspect (superseded versions allowed)."),
                                 principal: Principal = Depends(get_principal)) -> TreatmentEvidence:

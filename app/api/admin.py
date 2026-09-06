@@ -101,7 +101,16 @@ def _enqueue(action: str, body: EmbeddingActionBody, user_id: str | None) -> Emb
     return EmbeddingJobAccepted(job_id=task.id)
 
 
-@router.post("/create", response_model=EmbeddingJobAccepted, status_code=202)
+@router.post("/create", response_model=EmbeddingJobAccepted, status_code=202,
+            summary="Embed specific library names",
+            description=(
+                "Computes AI vectors for the exact names you list, so they become matchable.\n\n"
+                "**When to use:** you inserted rows straight into SQL, bypassing the app. Normal library "
+                "editing refreshes vectors automatically and needs none of this.\n\n"
+                "**Both `group` and `names` are required** — 'create' means embed exactly these. At most 50 "
+                "names per call. Anything that already has a vector is skipped, so calling twice is harmless.\n\n"
+                "**What you get:** `202` with a `job_id`. Poll the status endpoint or stream the events one."
+            ))
 def create(body: EmbeddingActionBody, request: Request,
         principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobAccepted:
     """Fingerprint specific NEW item(s) you name — for right after a threat is added."""
@@ -112,7 +121,19 @@ def create(body: EmbeddingActionBody, request: Request,
     return accepted
 
 
-@router.post("/update", response_model=EmbeddingJobAccepted, status_code=202)
+@router.post("/update", response_model=EmbeddingJobAccepted, status_code=202,
+            summary="Fill in any missing vectors",
+            description=(
+                "Embeds anything that has no vector yet and skips everything that does. This is the safe "
+                "default — when you are unsure which action you need, use this one.\n\n"
+                "**When to use:** a fresh environment where nothing has vectors yet, or after rows were added "
+                "behind the app's back.\n\n"
+                "**Body:** an empty `{}` checks every group. Add `group` to limit it to one. Re-running costs "
+                "nothing extra. `names` is accepted but IGNORED by this action — use create or recreate when "
+                "you need to target specific names.\n\n"
+                "**Watch out:** this never deletes or rewrites an existing vector. If the underlying text "
+                "changed, use recreate instead — update will leave the stale vector in place."
+            ))
 def update(body: EmbeddingActionBody, request: Request,
         principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobAccepted:
     """Whole-group sync: embed whatever's missing across every active row (`group=None` =
@@ -123,7 +144,18 @@ def update(body: EmbeddingActionBody, request: Request,
     return accepted
 
 
-@router.post("/recreate", response_model=EmbeddingJobAccepted, status_code=202)
+@router.post("/recreate", response_model=EmbeddingJobAccepted, status_code=202,
+            summary="Rebuild vectors from scratch",
+            description=(
+                "Deletes the existing vectors and computes fresh ones in a single step.\n\n"
+                "**When to use:** the source text changed behind the app's back (a typo fixed directly in "
+                "SQL), or you switched embedding models and every stored vector is now from the old one.\n\n"
+                "**Body:** `group` is optional, but you almost always want it. **Omitting it rebuilds EVERY "
+                "group**, deleting and re-embedding the entire cache, which is slow and costs real AI calls. "
+                "`names` still requires an explicit `group`.\n\n"
+                "**Why not update:** update only adds what is missing. After a model switch it would leave "
+                "the old model's vectors alongside the new ones, giving you two sets for the same items."
+            ))
 def recreate(body: EmbeddingActionBody, request: Request,
         principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobAccepted:
     """Wipe a group's (or named items') cached vectors, then re-embed them from scratch."""
@@ -133,7 +165,17 @@ def recreate(body: EmbeddingActionBody, request: Request,
     return accepted
 
 
-@router.post("/delete", response_model=EmbeddingJobAccepted, status_code=202)
+@router.post("/delete", response_model=EmbeddingJobAccepted, status_code=202,
+            summary="Remove vectors permanently",
+            description=(
+                "Deletes vectors and does not recompute anything.\n\n"
+                "**When to use:** a row was hard-deleted straight in SQL and its vector is now an orphan that "
+                "nothing will ever clean up.\n\n"
+                "**Body:** `group` is required, optionally narrowed by `names`. A bare `{}` is rejected on "
+                "purpose so nobody wipes the whole cache by accident, and `names` without `group` is rejected "
+                "too.\n\n"
+                "**Watch out:** this touches the vector store only. Your SQL tables are never changed."
+            ))
 def delete(body: EmbeddingActionBody, request: Request,
         principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobAccepted:
     """Wipe a group's (or named items') cached vectors — no re-embed.
@@ -149,7 +191,19 @@ def delete(body: EmbeddingActionBody, request: Request,
     return accepted
 
 
-@router.get("/status/{job_id}", response_model=EmbeddingJobStatus)
+@router.get("/status/{job_id}", response_model=EmbeddingJobStatus,
+            summary="Check an embedding job",
+            description=(
+                "Reports how a queued embedding job is going.\n\n"
+                "**Call it:** every few seconds after any of the four embedding actions, until `state` stops "
+                "being `PENDING`, `STARTED` or `RETRY`. `RETRY` is NOT finished — the job hit a transient "
+                "problem and is queued to run again.\n\n"
+                "**Reading the result:** all four fields are always present. `rows_processed` and "
+                "`vectors_deleted` are keyed by group and stay null until the job finishes; `error` is filled "
+                "in only on failure.\n\n"
+                "**Watch out:** job ids expire with the result backend, roughly an hour, after which this "
+                "returns `404`. Requires the admin key plus a valid client key and user id."
+            ))
 def get_status(job_id: str, _principal: Principal = Depends(get_admin_principal)) -> EmbeddingJobStatus:
     """Polls Celery's AsyncResult for a job one of the four routes above queued.
 
@@ -174,7 +228,21 @@ def get_status(job_id: str, _principal: Principal = Depends(get_admin_principal)
 @router.get("/events/{job_id}",
             responses={200: {"model": EmbeddingJobEvent, "content": {"text/event-stream": {}},
                         "description": "SSE stream; each `data:` line is one EmbeddingJobEvent."}}
-                    | UNAVAILABLE_RESPONSES)
+                    | UNAVAILABLE_RESPONSES,
+            summary="Stream an embedding job",
+            description=(
+                "Pushes an embedding job's progress live instead of you polling, and closes itself once the "
+                "job finishes.\n\n"
+                "**Worth using for:** rebuilding the control library, the one action slow enough to watch.\n\n"
+                "**What arrives:** a snapshot of the job's current state immediately on connect, then a frame "
+                "per group as the worker completes it, plus heartbeats. A retry frame can appear and does not "
+                "close the stream.\n\n"
+                "**Watch out:** connecting to a job that already finished gives you one terminal frame and an "
+                "immediate close — earlier progress is never replayed. A terminal snapshot does carry the "
+                "final counts or the error; what it never carries is the per-group progress fields, which "
+                "only a running worker publishes. A browser's built-in `EventSource` cannot be used, because "
+                "this needs custom headers."
+            ))
 async def job_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE stream for one queued embedding action: a state snapshot on connect (a late
     subscriber to a finished job gets the terminal state immediately and the stream closes),
@@ -214,7 +282,17 @@ grounding_router = APIRouter(
 )
 
 
-@grounding_router.get("/threshold", response_model=GroundingThresholdResponse)
+@grounding_router.get("/threshold", response_model=GroundingThresholdResponse,
+            summary="Get the current matching threshold",
+            description=(
+                "Reports the similarity cutoff the AI is grounding threats against right now, and where that "
+                "number came from. Read-only and cheap — safe to poll from a dashboard.\n\n"
+                "**`origin` is the field that matters.** `calibrated` means it was measured for exactly the "
+                "embedding and reranker models running now, and can be trusted. `env_pinned` means it came "
+                "from configuration because nothing has been calibrated for this model pair. `static_default` "
+                "means it is the built-in fallback, tuned for a different model pair, and is provisional.\n\n"
+                "**What to do:** if `origin` is anything but `calibrated`, run a calibration sweep."
+            ))
 def get_threshold(_principal: Principal = Depends(get_admin_principal)) -> GroundingThresholdResponse:
     """The match cutoff in force RIGHT NOW, with its provenance.
 
@@ -241,7 +319,22 @@ class CalibrationConflict(Exception):
         self.run_id = run_id
 
 
-@grounding_router.post("/calibrate", response_model=GroundingCalibrationAccepted, status_code=202)
+@grounding_router.post("/calibrate", response_model=GroundingCalibrationAccepted, status_code=202,
+            summary="Measure a new matching threshold",
+            description=(
+                "Starts a sweep that measures the right similarity cutoff for the embedding and reranker "
+                "models running right now. This is the only way to start one through the API, and nothing "
+                "queues one automatically, because a sweep is long and makes real AI calls. An operator can "
+                "also run the same sweep from a maintenance script.\n\n"
+                "**When to use:** the threshold endpoint reports anything other than `calibrated`, you "
+                "swapped a model, or you curated the threat library and want a tighter number.\n\n"
+                "**Body is optional.** Omitting it, or sending `{}`, is the same as `{\"force\": false}`.\n\n"
+                "**Watch out:** without `force`, a model pair that already has a successful run finishes "
+                "almost immediately reporting `already_calibrated` — the measurement never runs and no AI "
+                "calls are made. Send `force: true` to genuinely re-measure. A second sweep for the same pair "
+                "while one is running is refused.\n\n"
+                "**What you get:** `202` with a `job_id` for polling and a permanent `run_id` for the ledger."
+            ))
 def calibrate(request: Request, body: GroundingCalibrationBody | None = None,
             principal: Principal = Depends(get_admin_principal)) -> GroundingCalibrationAccepted:
     """Start a calibration sweep for the current embedding+reranker pair; returns 202 + a job_id.
@@ -317,7 +410,19 @@ def _attach_job_id(run_id: str, job_id: str) -> None:
                     exc_info=True)
 
 
-@grounding_router.get("/calibrations", response_model=GroundingCalibrationHistory)
+@grounding_router.get("/calibrations", response_model=GroundingCalibrationHistory,
+            summary="List calibration history",
+            description=(
+                "Every calibration run, newest first, with who started it, when, and how it ended.\n\n"
+                "**Call it:** to audit who last calibrated, or to check a model pair's history before "
+                "deciding whether to run another sweep. `limit` defaults to 50 and caps at 200.\n\n"
+                "**The five outcomes:** `running` (in flight), `success` (measured and stored), `no_signal` "
+                "(ran, but no cutoff beat chance for this model pair — a finding, not a crash), `skipped` "
+                "(declined to re-measure because one already existed), `failed`.\n\n"
+                "**Watch out:** `started_by` is the user id the caller claimed and is not verified, since "
+                "admin routes share one key. `started_by_client` is the API client it actually authenticated "
+                "as, and that half is verified."
+            ))
 def list_calibrations(limit: int = Query(default=50, ge=1, le=200),
                     _principal: Principal = Depends(get_admin_principal)) -> GroundingCalibrationHistory:
     """Calibration history, newest first — who ran it, when, and whether it passed.
@@ -351,7 +456,20 @@ def _to_calibration_run(row) -> GroundingCalibrationRun:
         error=grounding.settled_error(row))
 
 
-@grounding_router.get("/calibrate/status/{job_id}", response_model=GroundingCalibrationStatus)
+@grounding_router.get("/calibrate/status/{job_id}", response_model=GroundingCalibrationStatus,
+            summary="Check a calibration sweep",
+            description=(
+                "Reports how a calibration sweep is going, and its measurement once it finishes.\n\n"
+                "**Call it:** in a loop after starting a sweep, until `state` stops being `PENDING`, "
+                "`STARTED` or `RETRY`.\n\n"
+                "**Reading the result:** all thirteen fields are always present, with nulls for whatever does "
+                "not apply yet. `quality` tells you whether to trust `match_th` — 1.0 is perfect separation, "
+                "0.0 is no better than chance.\n\n"
+                "**Watch out:** `SUCCESS` with a null `match_th` is a real, meaningful outcome, not a bug. It "
+                "means the sweep ran and found that no cutoff separates real matches from impostors under "
+                "this model pair. Late polls still work after the job id expires, because this falls back to "
+                "the permanent ledger."
+            ))
 def get_calibration_status(job_id: str,
                         _principal: Principal = Depends(get_admin_principal)) -> GroundingCalibrationStatus:
     """Polls one sweep's outcome — Celery's AsyncResult while it lives, the LEDGER after it dies.
@@ -413,7 +531,20 @@ def _status_from_row(row) -> GroundingCalibrationStatus:
 @grounding_router.get("/calibrate/events/{job_id}",
             responses={200: {"model": GroundingJobEvent, "content": {"text/event-stream": {}},
                         "description": "SSE stream; each `data:` line is one GroundingJobEvent."}}
-                    | UNAVAILABLE_RESPONSES)
+                    | UNAVAILABLE_RESPONSES,
+            summary="Stream a calibration sweep",
+            description=(
+                "Pushes a calibration sweep's progress live, which beats polling for a job that runs 10-15 "
+                "minutes.\n\n"
+                "**What arrives:** a state snapshot immediately on connect, then progress ticks showing which "
+                "phase is running and how far through it is, then a final frame carrying the measurement. "
+                "Heartbeats keep the line alive in between.\n\n"
+                "**Watch out:** the stream closes itself on success, failure or revocation. Connecting after "
+                "the job finished gives you that terminal frame at once with no replay of the progress. "
+                "Unlike the status endpoint, this stream has NO permanent fallback: once the job marker "
+                "expires you get `404` here even though the status endpoint still answers from the ledger. A "
+                "browser's built-in `EventSource` cannot be used, because this needs custom headers."
+            ))
 async def calibration_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE stream for one calibration sweep: a state snapshot on connect, then the worker's live
     `grounding_job_update` hints — STARTED, then phase/done/total ticks as the negatives and

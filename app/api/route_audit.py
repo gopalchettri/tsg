@@ -98,6 +98,16 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("POST", "/v1/tsg/threat-intel/feeds/refresh"): require_admin,
     ("POST", "/v1/tsg/threat-intel/feeds/{feed}/refresh"): require_admin,
     ("GET", "/v1/tsg/threat-intel/feeds/events/{job_id}"): require_admin,
+    # Open-source threat-library import (app/api/threat_intel.py) — admin-key gated, writes the
+    # cross-tenant Threat_* master tables, so entity scoping does not apply here either.
+    ("POST", "/v1/tsg/threat-intel/library/import/{source}"): require_admin,
+    ("GET", "/v1/tsg/threat-intel/library/import/status/{job_id}"): require_admin,
+    ("GET", "/v1/tsg/threat-intel/library/import/events/{job_id}"): require_admin,
+    # ATT&CK/CAPEC technique reference corpus (app/api/threat_intel.py) — admin-key gated,
+    # cross-tenant reference data shared by every entity's scenario prompts.
+    ("POST", "/v1/tsg/threat-intel/techniques/rebuild"): require_admin,
+    ("GET", "/v1/tsg/threat-intel/techniques"): require_admin,
+    ("GET", "/v1/tsg/threat-intel/techniques/events/{job_id}"): require_admin,
 }
 
 

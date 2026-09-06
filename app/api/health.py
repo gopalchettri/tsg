@@ -22,7 +22,16 @@ router = APIRouter(tags=["Health"])
 logger = get_logger(__name__)
 
 
-@router.get("/health", response_model=LivenessReport)
+@router.get("/health", response_model=LivenessReport,
+            summary="Liveness check",
+            description=(
+                "Answers one question: is this process running? Always `200` while the app is up.\n\n"
+                "**Use it for:** an orchestrator's liveness probe, deciding whether to restart the process.\n\n"
+                "**It deliberately checks nothing else.** No database, no cache, no queue — a dependency "
+                "being down is not a reason to restart a healthy process. Use the readiness endpoint for "
+                "that.\n\n"
+                "No authentication required."
+            ))
 def healthz() -> LivenessReport:
     """Liveness probe — returns 200 unconditionally, does not check DB reachability (that's readyz's job)."""
     return LivenessReport(status="ok")
@@ -88,25 +97,58 @@ def _check_mongo() -> bool | None:
         return False
 
 
-def _check_workers() -> bool:
+def _check_workers() -> dict[str, bool]:
     """Broadcast ping for live Celery workers over the broker. ADVISORY ONLY — reported in
     the payload and logs but never fails readiness: with no workers the API still serves
     every synchronous route and queued jobs simply wait, so evicting API pods here would
-    turn a delay into a full outage. Monitoring alerts on checks.workers / the log events.
-    limit=1 returns on the first reply, so the healthy path never waits out the timeout."""
+    turn a delay into a full outage. Monitoring alerts on checks.workers_<queue> / the log
+    events. Returns one entry PER ROUTED QUEUE -- see the note on active_queues below for
+    why a single any()-style answer is not good enough once tasks are routed."""
     try:
-        from app.pipeline.celery_app import celery_app  # local import, same pattern as redis/pymongo above
+        from app.pipeline.celery_app import (  # local import, same pattern as redis/pymongo above
+            ADMIN_QUEUE,
+            DEFAULT_QUEUE,
+            celery_app,
+        )
 
-        if celery_app.control.ping(timeout=1.0, limit=1):
-            return True
-        logger.warning("readyz.workers_absent")
-        return False
+        # NOT ping(limit=1). That returns on the FIRST worker to answer, which was fine while
+        # one worker consumed everything -- but the app now routes heavy operator jobs to the
+        # `admin` queue (celery_app.task_routes), and a healthy pipeline worker answering first
+        # would mask a dead admin worker. The API would keep returning 202 for rebuilds and
+        # imports that then never run: a silent black hole, which is strictly worse than the
+        # slow-but-visible behaviour the queue split replaced.
+        #
+        # active_queues() asks every worker WHICH queues it consumes, so each queue is reported
+        # on its own evidence.
+        consumed: set[str] = set()
+        for queues in (celery_app.control.inspect(timeout=1.0).active_queues() or {}).values():
+            consumed.update(q["name"] for q in queues or ())
+        missing = {DEFAULT_QUEUE, ADMIN_QUEUE} - consumed
+        if missing:
+            logger.warning("readyz.queue_unconsumed", missing=sorted(missing),
+                           consumed=sorted(consumed))
+        return {DEFAULT_QUEUE: DEFAULT_QUEUE in consumed, ADMIN_QUEUE: ADMIN_QUEUE in consumed}
     except Exception:
         logger.exception("readyz.workers_check_failed")
-        return False
+        return {DEFAULT_QUEUE: False, ADMIN_QUEUE: False}
 
 
-@router.get("/ready", response_model=ReadinessReport)
+@router.get("/ready", response_model=ReadinessReport,
+            summary="Readiness check",
+            description=(
+                "Answers a different question from liveness: can this process actually serve traffic? It "
+                "pings the database, the cache, the document store where used, and looks for a live "
+                "background worker.\n\n"
+                "**Use it for:** an orchestrator's readiness probe, and as your first check when you suspect "
+                "a dependency is down.\n\n"
+                "**Reading the result:** `200` with `ready` when healthy, `503` with `not_ready` naming the "
+                "failed dependency otherwise. A `skipped` entry is normal, not a failure — on `mongo` it "
+                "means this deployment's embedding cache is not backed by Mongo.\n\n"
+                "**Watch out:** the worker check is advisory. It is reported for visibility but never turns "
+                "the response into a `503` on its own, because the API still serves every immediate request "
+                "with no workers; queued jobs simply wait.\n\n"
+                "Failures never leak exception details. No authentication required."
+            ))
 def readyz():
     """Readiness probe — checks every dependency this app actually needs. Any one of
     them being unreachable (except Mongo when this deployment doesn't use it) returns
@@ -123,11 +165,18 @@ def readyz():
         redis_f = pool.submit(_check_redis)
         mongo_f = pool.submit(_check_mongo)
         workers_f = pool.submit(_check_workers)
+        per_queue = workers_f.result()
         results = {"database": db_f.result(), "redis": redis_f.result(), "mongo": mongo_f.result(),
-                "workers": workers_f.result()}
+                "workers": any(per_queue.values())}
+        # One key per queue, so "the admin worker is down" is a distinct, visible answer rather
+        # than being averaged away by a healthy pipeline worker. `checks` is a mapping precisely
+        # so the dependency set can vary (see ReadinessReport) -- these are additive keys, and
+        # `workers` keeps its old meaning for anything already reading it.
+        results.update({f"workers_{queue}": ok for queue, ok in per_queue.items()})
     checks = {name: ("skipped" if ok is None else "ok" if ok else "error") for name, ok in results.items()}
     # workers excluded on purpose — advisory, see _check_workers
-    failing = [name for name, ok in results.items() if ok is False and name != "workers"]
+    failing = [name for name, ok in results.items()
+               if ok is False and not name.startswith("workers")]
     if failing:
         logger.warning("readyz.not_ready", failing=failing)
         # A plain JSONResponse, NOT a raise: this body is the ReadinessReport shape, not the

@@ -41,7 +41,11 @@ sqlcmd -S <server> -d <database> -i "scripts/eyshield_handoff/4. Control_library
 sqlcmd -S <server> -d <database> -i "scripts/eyshield_handoff/5. Seed_to_Control_library.sql"  # 30 standards, 1288 controls
 
 uvicorn app.main:app                                 # API (runs INV checks at boot)
-celery -A app.pipeline.celery_worker.celery_app worker -P gevent -l info
+celery -A app.pipeline.celery_worker.celery_app worker -Q celery -P gevent -l info
+# ...and a SECOND worker for the `admin` queue. Without -Q on the line above, the pipeline
+# worker also drains `admin` and a 51 MB technique rebuild lands on the queue users wait on.
+# -A celery_app (not celery_worker): the latter monkey-patches gevent and hangs a solo pool.
+celery -A app.pipeline.celery_app.celery_app worker -Q admin -P solo -l info
 celery -A app.pipeline.celery_app.celery_app beat -l info   # reaper (M2 wires the schedule)
 ```
 

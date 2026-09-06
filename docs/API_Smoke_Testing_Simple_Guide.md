@@ -1,7 +1,10 @@
 # TSG API Smoke Testing Guide — Simple Version (for QA)
 
-> Plain-English rewrite of [API_Smoke_Testing_Guide.md](API_Smoke_Testing_Guide.md).
-> Same tests, same facts, same SQL. **If the two documents ever disagree, the original wins.**
+> **The source code is the authority.** Every request and response below was read out of
+> the Pydantic models in `app/api/schemas.py` and `app/api/schemas_treatment.py`, and the
+> routes out of `app/api/*.py`. If this guide and the code ever disagree, the code wins and
+> this guide is the bug. `tests/test_docs_track_the_schema.py` pins the treatment-plan
+> examples to their models so that drift fails a test instead of misleading you silently.
 
 Every test below is one **card** with the same layout, so you always know where to look:
 
@@ -53,6 +56,12 @@ to the engine before a long trip. Not a deep test of everything. Budget: **~4 ho
 | **P2 — if time permits** | 8–9 | Live progress feed + "what was accepted?" lookup | ~1 h |
 | **P3 — skip if rushed** | 10–16 | Admin tools + health checks | ~0.75 h |
 
+**Coverage:** the app registers 48 routes and this guide has a card for 47 of them. The
+one deliberate omission is `GET /dev/sse-test` — a developer helper page that is mounted
+only when `app_env` is `local`/`dev` (`app/main.py`), is hidden from `/openapi.json`
+(`include_in_schema=False`), takes no auth, and serves a static HTML file
+(`app/static/sse_test.html`). It has no JSON contract, so there is nothing to smoke-test.
+
 You will create **two sessions**: **Session A** for Tests 1–6 (the whole journey),
 and **Session B** only so Test 7 has something to cancel (Session A is already
 finished after Test 6 — you can't cancel a finished order).
@@ -97,12 +106,141 @@ Every failed call returns a body shaped like this:
 errors are just `error_code` + `message`. "Expect 409 `accept_conflict`" means:
 HTTP 409, and the body's `error_code` is `"accept_conflict"`.
 
+The two you will hit most often, in full. A missing or wrong auth header:
+
+```json
+401 {"error_code": "unauthorized", "message": "unauthorized"}
+```
+
+A malformed body — `details.errors` is FastAPI's own per-field report, with its internal
+`ctx` key stripped, so every entry carries exactly `type`, `loc`, `msg` and `input`:
+
+```json
+422 {
+  "error_code": "validation_error",
+  "message": "validation error",
+  "details": {
+    "errors": [
+      {"type": "missing", "loc": ["body", "asset_id"], "msg": "Field required", "input": {"entity_id": "78"}}
+    ]
+  }
+}
+```
+
+One error never uses this envelope: a request body over 16 MB is refused by middleware
+that runs *before* the error handlers, so it returns
+`413 {"error_code": "payload_too_large", "message": "request body exceeds the 16777216 byte limit"}`
+with no `details` key at all.
+
 ### The four rules that explain most "weird" behavior
 
 1. **`202` means "working on it", not "done."** Only the board (Test 2) tells you it finished.
-2. **Nothing is ever deleted.** Replaced scenarios get `Superseded=1`; always filter `Superseded=0` in your SQL. Library rows get `IsDeleted=1`.
+2. **Nothing is ever deleted.** Replaced scenarios get `Superseded=1`; filter `Superseded=0` in your SQL — **except when you also care about accepted rows**, because an accepted scenario keeps its decision even after a later regenerate supersedes it, and `GET /results` deliberately still returns it (Test 3). For those queries the predicate is `(Superseded=0 OR Accepted=1)`. Library rows get `IsDeleted=1`.
 3. **The reaper acts alone.** Sessions can change state with no API call — that's the janitor, not a bug.
 4. **Two identity columns in the logbook** (`Scenario_Audit`): `ActorUserID` names who's accountable, but it's only set on rows a human actually caused — `session_started`, `review_decision`, an explicit cancel, a library promotion — where it carries your `X-User-Id`. `ActorType` says who performed the action (`user` = a person called the API, `system` = a background worker). On every row the pipeline writes on its own, `ActorUserID` is **`NULL`** and `ActorType='system'` — the app deliberately stopped stamping the session owner's name onto worker-written rows, because a timeline reading `you / you / you / you` end to end couldn't tell which of those rows you actually caused. A `NULL` `ActorUserID` is information ("the pipeline did this"), not a gap.
+
+---
+
+## Part 1b — Implementation Sequence (build in this order)
+
+Part 4 onward tests each API on its own. This part is the **order to call them in**, for
+whoever is wiring up a client. Each step names what to send, what to keep from the reply, and
+the one field that says it is safe to move on.
+
+**The rule that catches everyone:** the obvious-looking fields lie about readiness.
+`session_status` reads `completed` the moment generation finishes, long before a human has
+decided anything, and `current_stage` then stays `REVIEW` forever. The field that answers
+"does a human still owe a decision" is `progress.overall`, and nothing else.
+
+**No field is ever omitted.** No route in this app trims empty values, so every reply carries
+every field its model declares, with `null` or `[]` standing in for whatever does not apply. A
+key you do not see in a real reply is a key that does not exist — treat its absence as a bug
+report, not as "the server left it out this time". This is why the examples in this guide are
+full-length even when most of the values are `null`.
+
+### A. Session lifecycle (Tests 1–7a, 9–9b)
+
+| # | Call | Send | Keep from the reply | Gate before the next step |
+|---|---|---|---|---|
+| 1 | `POST /v1/sessions` | asset, entity, supporting systems | `session_id` | HTTP `202`. Send `Idempotency-Key` if your caller can retry |
+| 2 | `GET /v1/sessions/{session_id}` | — | `progress.overall`, `progress.controls` | `overall` is `awaiting_review`. Poll every 5–10 s, or open the stream (§D) |
+| 3 | `GET /v1/sessions/{session_id}/results` | — | every `scenario_id` | `controls_mapped` is `true` on the cards you intend to render |
+| 4 | `POST .../regenerate/scenarios` *(optional)* | `scenario_ids` | `epoch` | `progress.last_regen.epoch` equals the epoch you got back |
+| 5 | `POST .../scenarios/next-set` *(optional)* | no body | `epoch` | `progress.last_next_set.epoch` equals it — then read `.outcome` |
+| 6 | `POST .../accept` and/or `POST .../scenarios/reject` | `mode` (+ ids), or `scenario_ids` | `accepted_count` / `rejected_count` | both are repeatable and decide per scenario; neither ends the session |
+| 7 | `POST .../scenarios/{scenario_id}/promote-to-library` *(optional)* | no body | `created_count` | the scenario must already be accepted |
+| 8 | `GET .../audit` | filters | — | read-only, callable any time |
+
+Two things that are **not** steps in this flow. `POST .../cancel` only works while
+`session_status` is `active`, so it is a "stop it before generation finishes" action, never a
+way to walk away from a review. And `GET .../accepted-scenarios` plus the cross-session reads
+(`/v1/users/{user_id}/scenarios`, `/v1/entities/{entity_id}/scenarios`) are downstream feeds —
+call them whenever you need them, in no particular order.
+
+### B. Treatment plans (Tests 7b–7l)
+
+These routes exist only when the risk module is switched on. With it off the paths are a bare
+`404` with **no error body at all** — that is FastAPI saying "no such route", not the app
+saying "feature disabled".
+
+| # | Call | Send | Keep from the reply | Gate before the next step |
+|---|---|---|---|---|
+| 1 | accept the scenario (§A step 6) | — | `scenario_id` | the scenario reads `accepted: true`, or step 2 refuses |
+| 2 | `POST .../treatment-plan` | the register's risk data, 12 keys | `plan_id` | HTTP `202`. **First generation only** — a second call is `409 plan_already_exists` |
+| 3 | `GET .../treatment-plan/status` | — | `progress.overall` | it leaves `generating`. Poll here, not step 4 |
+| 4 | `GET .../treatment-plan` | — | `plan` | `status` is `COMPLETE` |
+| 5 | `POST .../treatment-plan/review` | `decision` **and** `plan_id` | `review_status` | `plan_id` is required and names the version you actually read |
+
+Every version after the first is minted by `POST .../treatment-plan/regenerate` with a literal
+`{}` body, never by calling step 2 again. Read the board
+(`GET /v1/sessions/{session_id}/treatment-plans`) instead of polling step 3 once per scenario,
+and the register (`GET /v1/entities/{entity_id}/treatment-plans`) when the question spans
+sessions. Cancel, evidence and the two audit trails are independent of this order.
+
+### C. Admin (Tests 10–10f, 13–13b, 16a–16c)
+
+1. **`POST /v1/tsg/api-clients`** — mint the `X-API-Key` that every other section needs. The
+   secret appears in this one response and is never recoverable; only its SHA-256 hash is
+   stored. Do this first or nothing else authenticates.
+2. **`POST /v1/tsg/threat-library/embeddings/update`** — only when SQL master data changed
+   behind the app's back. Then poll `GET .../embeddings/status/{job_id}` or watch
+   `GET .../embeddings/events/{job_id}`.
+3. **`GET /v1/tsg/grounding/threshold`** — if `origin` is anything but `calibrated`, run
+   `POST /v1/tsg/grounding/calibrate` once for the current model pair, then re-read it.
+4. **`GET /v1/tsg/threat-intel/feeds`** — refresh only the feeds that read stale or errored.
+
+None of these scope to an entity, so they take `X-Admin-Key` plus `X-API-Key` and `X-User-Id`,
+and never `X-Entity-Id`. The API-client routes are the exception: `X-Admin-Key` alone, plus
+`X-User-Id` on create and revoke for attribution.
+
+### D. Polling versus watching the live stream
+
+Every background job publishes live events **and** writes a durable field. The event is
+best-effort and is **never replayed**, so a dropped connection loses it in silence. The durable
+field survives. Watch the event so the UI feels immediate; confirm on the field before you
+call anything finished.
+
+| What finished | Durable field to confirm on | Live event | Why the event alone is not enough |
+|---|---|---|---|
+| Session generation | `progress.overall` on the board | `session_entered_review` | a client that reconnects after it fired has no way to learn that it did |
+| "Give me more" | `progress.last_next_set.epoch` | `next_set_result` | the event cannot tell your click apart from a colleague's in another tab |
+| "Redo this one" | `progress.last_regen.epoch` | `regen_result` | the event carries no `epoch` at all, so there is nothing on it to match |
+| Treatment plan | `GET .../treatment-plan/status` | `treatment_plan_result` | several failure paths never publish the event, and a review verdict never does |
+| Admin job | `GET .../status/{job_id}` | `embedding_`/`grounding_`/`intel_job_update` | job ids expire with the Celery result backend, roughly an hour |
+
+Two constraints on any stream in this app. A browser's native `EventSource` **cannot** be used
+anywhere here, because every stream needs custom auth headers and `EventSource` cannot set
+them — drive it with `fetch()` and a `ReadableStream` reader instead. And all SSE routes share
+one process-wide concurrency cap, so an admin stream left open counts against session streams;
+past the cap you get `503 sse_capacity_exceeded` with a `Retry-After` header before the stream
+opens.
+
+### E. Generate your client from the spec, not from this guide
+
+`/openapi.json` publishes every model, every enum and every event payload described here.
+Generate your types from it, so a renamed status or a new reason code becomes a compile error
+instead of a silent mismatch months later. Use this guide for the ordering and the reasoning
+above, which a schema cannot express.
 
 ---
 
@@ -153,7 +291,7 @@ curl -s -X POST "http://localhost:8000/v1/sessions" \
   -d '{"entity_id": "78", "asset_id": 103, "service_id": 335, "subsector_id": 111, "supporting_system_id": [321, 322, 323, 324]}'
 ```
 
-### 3. Admin key (Tests 10–15 only)
+### 3. Admin key (Tests 10–13b and 16a–16c)
 
 Admin routes gated by `require_admin` (`app/api/deps.py`) need only:
 
@@ -168,8 +306,9 @@ One exception: **provisioning or revoking an API key**
 (`POST /v1/tsg/api-clients`, `POST .../{client_id}/revoke`) additionally
 requires `X-User-Id` — not for authentication, but for attribution (it's
 written to `CreatedBy`/`RevokedBy`); the route returns `400` without it. A
-few other admin routes (grounding calibration, embeddings) use a different
-dependency, `get_admin_principal`, which layers `X-API-Key` + `X-User-Id` on
+few other admin routes — embeddings, grounding calibration **and threat intel**, i.e. every
+admin route except the three API-client ones — use a different dependency,
+`get_admin_principal`, which layers `X-API-Key` + `X-User-Id` on
 top of the router's `X-Admin-Key` gate — if `X-Admin-Key` alone gets you a
 `401` on some admin route, check whether that route needs those two as well.
 
@@ -401,7 +540,12 @@ curl -s -X POST "http://localhost:8000/v1/sessions" \
 2. Poll Test 2 and confirm the pipeline starts running.
 3. Idempotency ("safe to send twice"):
    - Re-send the same body with header `Idempotency-Key: my-key-1` → `200` with the SAME session id (not a new `202`).
-   - Send `Idempotency-Key: my-key-1` again with a DIFFERENT body → `409 idempotency_key_conflict`.
+   - Send `Idempotency-Key: my-key-1` again with a **different `asset_id`** → `409 idempotency_key_conflict`.
+   - **Only `asset_id` is compared.** `reserve_idempotency_key_or_get_existing` returns
+     `conflict = row["AssetID"] != asset_id` and looks at nothing else, so re-using the key with
+     the same asset but a changed `service_id`, `subsector_id` or `supporting_system_id` gives you
+     `200` and the ORIGINAL session — your new values are silently ignored, not applied. Vary
+     `asset_id` if you want to see the 409.
 
 **Tables used:**
 
@@ -437,9 +581,13 @@ FROM Prompt_Log WHERE SessionID='<sid>' ORDER BY CreatedAt;
 | `supporting_system_id` is empty, has more than 50 ids, or repeats an id | `422` |
 | Missing or blank `X-API-Key`, `X-User-Id`, `X-Entity-Id`, or `X-Tenant-Id` | `401 unauthorized` |
 | Use an asset the entity doesn't own | `403 forbidden` |
-| Create again while Session A is still active for the same asset | `409 active_session_exists` |
-| Same `Idempotency-Key` + different body | `409 idempotency_key_conflict` |
-| Same `Idempotency-Key` + same body | `200` returning the original session (NOT a new `202`) |
+| Name an asset that has no supporting systems on record, or a `sector_id`/`subsector_id` that doesn't exist | `404 not_found` — the message names which |
+| Create again while Session A is still active for the same asset | `409 active_session_exists` (`details.active_session_id`) |
+| The app is already at its configured active-session cap, globally or for your entity | `503 capacity_exceeded` with a `Retry-After` header |
+| The tuning rulebook (`Config_Tuning`) has been edited into a state that breaks the scoring invariants | `422 unprocessable_entity` carrying the curated reason. Surfaced here on purpose rather than minting a session under broken arithmetic — it is a config problem, not a request problem |
+| The Celery broker is unreachable when the session is queued | `503 service_unavailable` — and the session that was just written is **cancelled for you** before the error returns, so start a fresh call rather than polling the id you never received |
+| Same `Idempotency-Key` + a different `asset_id` | `409 idempotency_key_conflict` (`details.existing_session_id` names the original) |
+| Same `Idempotency-Key` + the same `asset_id`, any other field changed | `200` returning the original session (NOT a new `202`); the changed fields are ignored |
 
 **Pass if:** you got `202` with a valid UUID, and Test 2 shows the pipeline running.
 
@@ -481,6 +629,7 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6"
     "scenarios": "COMPLETE",
     "overall": "awaiting_review",
     "controls": "COMPLETE",
+    "timings": {"threats": 34.21, "scenarios": 42.03, "controls": 604.12},
     "error_message": {},
     "last_next_set": null,
     "last_regen": null,
@@ -489,7 +638,14 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6"
 }
 ```
 
-`current_stage="REVIEW"` + `progress.overall="awaiting_review"` = **"the AI is done — a human must decide now."** That's the state Tests 3–6 wait for. **This is a real behavior change to watch for:** the API no longer ever publishes `AWAITING_DECISION` on the wire — internally the DB still parks the SCENARIOS stage at `SCENARIOS_AWAITING_DECISION`, but both the top-level `stage_status` and `progress.scenarios` are translated to `COMPLETE` for publication (generation genuinely IS finished at that point). The one field that tells you a human still owes a decision is `progress.overall`. `progress.controls` is a separate roll-up of Step-4 control mapping (`PENDING`/`RUNNING`/`COMPLETE`) — it's the longest step in the pipeline, so scenarios can appear before their controls do; wait for it to read `COMPLETE` before treating a card's `controls` list as final. `progress.error_message` is a dict now (keyed by `"threats"`/`"scenarios"`), not a single string — empty `{}` on a clean board. `progress.coverage` stays `null` unless coverage reporting is enabled (off by default). (There is no `supporting_systems` array — the pipeline works on the whole asset, so `asset_id`/`asset_name` are stated once and one `progress` object holds the stage statuses.)
+`current_stage="REVIEW"` + `progress.overall="awaiting_review"` = **"the AI is done — a human must decide now."** That's the state Tests 3–6 wait for. **This is a real behavior change to watch for:** the API no longer ever publishes `AWAITING_DECISION` on the wire — internally the DB still parks the SCENARIOS stage at `SCENARIOS_AWAITING_DECISION`, but both the top-level `stage_status` and `progress.scenarios` are translated to `COMPLETE` for publication (generation genuinely IS finished at that point). The one field that tells you a human still owes a decision is `progress.overall`. `progress.controls` is a separate roll-up of Step-4 control mapping (`PENDING`/`RUNNING`/`COMPLETE`) — it's the longest step in the pipeline, so scenarios can appear before their controls do; wait for it to read `COMPLETE` before treating a card's `controls` list as final. `progress.error_message` is a dict now (keyed by `"threats"`/`"scenarios"`), not a single string — empty `{}` on a clean board. `progress.timings` says how long each step took, in seconds, keyed by step — read it
+straight off the board instead of timing your own polls. Three rules go with it: a step has
+**no key at all** until it finishes (a missing key means "not measured", never zero); the
+whole object is `null` both on a session that ran before timings were recorded AND on one that
+has only just started — `build_board` ends with `return timings or None`, so it is never `{}`; and `threats`/`scenarios` are non-overlapping wall-clock spans
+while `controls` overlaps neither — control mapping is the tail of generation, and it is
+routinely the longest step of the three.
+`progress.coverage` stays `null` unless coverage reporting is enabled (off by default). (There is no `supporting_systems` array — the pipeline works on the whole asset, so `asset_id`/`asset_name` are stated once and one `progress` object holds the stage statuses.)
 
 **Tables used:**
 
@@ -497,6 +653,8 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6"
 |---|---|---|
 | `Scenario_Session` | Read | session status |
 | `Subsystem_Stage_State` | Read | stage statuses (`_LOCK` row excluded from the board) |
+| `Threat_Scenario` | Read | whether any scenario is still undecided (drives `progress.overall`) and how many have controls mapped (drives `progress.controls`) |
+| `Scenario_Audit` | Read | the newest `next_set_outcome` / `regeneration_completed` rows, which ARE `last_next_set` / `last_regen` |
 
 This API writes nothing.
 
@@ -551,6 +709,7 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6/
     "scenarios": "COMPLETE",
     "overall": "awaiting_review",
     "controls": "COMPLETE",
+    "timings": {"threats": 34.21, "scenarios": 42.03, "controls": 604.12},
     "error_message": {},
     "last_next_set": null,
     "last_regen": null,
@@ -616,9 +775,14 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6/
      "validation_errors": [],
      "generation_epoch": 1,
      "scenario_number": 1,
+     "gen_started_at": "2026-08-31T09:16:02",
+     "gen_finished_at": "2026-08-31T09:16:44",
+     "gen_seconds": 42.03,
      "scenario_source": "generated",
      "controls_unavailable": false,
      "controls_mapped": true,
+     "controls_mapping_exhausted": false,
+     "controls_mapping_exhaustion_reason": null,
      "replaced_scenarios": []}
   ]
 }
@@ -669,9 +833,20 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6/
 - **Without the flag nothing changes.** Every card's `replaced_scenarios` is `[]`.
 - Only ever returns scenarios from **this** session.
 
-**Order is deterministic (this changed from what older docs said):** `scenarios[]` is
-sorted by threat, then `scenario_number`, then `scenario_id` — added specifically so a
-session being polled mid-generation never reshuffles rows between calls. Still match
+**What the list actually contains — three queries, not one.** `/results` runs a first SELECT for
+the ACTIVE rows (`Superseded=0`), then one for rows with `Accepted=1`, then one for rows with a
+`RejectedAt`, and **appends** whatever the earlier passes missed. Neither decision query filters
+on `Superseded`, on purpose: a decision is a human fact on the record, so the version a reviewer
+accepted OR declined must never vanish from the default view just because a later regenerate
+superseded it. Consequence for your SQL and your client: the response can legitimately contain
+superseded rows and can be LONGER than the number of current scenarios, and the array is **not**
+globally sorted — each pass is ordered by threat, then `scenario_number`, then `scenario_id`, but
+the appended decided rows sit after all the active ones. Tell them apart by `accepted` and
+`rejected_at`.
+
+**Within the active half the order is deterministic** — sorted by threat, then `scenario_number`,
+then `scenario_id`, added specifically so a session being polled mid-generation never reshuffles
+rows between calls. Still match
 scenarios by `scenario_id`, never by position: a regenerate or "generate next set" click
 inserts fresh rows, which shifts where existing cards fall in the sorted list even
 though their relative order never does.
@@ -696,6 +871,10 @@ though their relative order never does.
   `suggested_controls` / `unmatched_suggestions` fields are **gone**. A library
   gap is reported the same way as before, just with one fewer list: an empty
   `controls` once `controls_mapped` is `true`.
+- `gen_started_at` / `gen_finished_at` / `gen_seconds` are that ONE scenario's own
+  generation clock. Three fields rather than one because generation runs several scenarios
+  at once, so a batch shares a `gen_started_at` — which is what explains durations that
+  look like they overlap. All three are `null` on scenarios written before timings existed.
 - `generation_epoch` is 1 on a first run; Tests 4–5 create higher numbers.
 - `scenario_number` is the scenario's **slot** for its threat. One threat can
   own more than one scenario (slots 1, 2, …), and a regenerate (Test 4) writes
@@ -733,17 +912,23 @@ not missing. Only trust `moderation_flagged` once `moderation_checked` is `true`
 | Table | Read/Write | What happens |
 |---|---|---|
 | `Scenario_Session` | Read | session + auth check |
-| `Identified_Threat`, `Scoped_Threat`, `Threat_Scenario` | Read | the chain, filtered `Superseded=0` |
-| `Threat_Scenario_Control_Map` | Read | the mapped `controls` on each card |
+| `Subsystem_Stage_State`, `Scenario_Audit` | Read | this route embeds the whole board, so it runs `build_board` and therefore Test 2's reads as well |
+| `Identified_Threat`, `Scoped_Threat`, `Threat_Scenario` | Read | the chain — active rows, plus accepted rows regardless of `Superseded` (see above) |
+| `Threat_Scenario_Control_Map`, `Control_Library` | Read | the mapped `controls` on each card |
+| `Control_Library_Standard_Map`, `Control_Standard` | Read | the `standards[]` inside each control |
+| `Threat_Actor` | Read | actor names, on the legacy-name fallback path |
 
 This API writes nothing.
 
-**Verify in the database** — row count must equal the length of `scenarios[]`:
+**Verify in the database** — row count must equal the length of `scenarios[]`. Note the
+predicate: **not** `Superseded=0` alone. The endpoint returns active rows PLUS any accepted row
+even when superseded, so a `Superseded=0`-only query under-counts as soon as somebody accepts a
+scenario and then regenerates it:
 
 ```sql
-SELECT ScenarioID, SubsystemID, Accepted, GenerationEpoch, ScenarioJSON, ValidationJSON
+SELECT ScenarioID, SubsystemID, Accepted, Superseded, GenerationEpoch, ScenarioJSON, ValidationJSON
 FROM Threat_Scenario
-WHERE SessionID='<sid>' AND Superseded=0   -- active rows only!
+WHERE SessionID='<sid>' AND (Superseded=0 OR Accepted=1 OR RejectedAt IS NOT NULL)
 ORDER BY GenerationEpoch;
 ```
 
@@ -792,10 +977,17 @@ curl -s -X POST "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963
 3. Re-run Test 3 and check: the named scenario's text **changed**, it now has a **new `scenario_id`**, its `generation_epoch` is **higher**, and every sibling is **unchanged**.
 4. If also running Test 8 (SSE): watch for a `regen_result` event naming the replaced ids as `requested_scenario_ids` and the replacements as `new_scenario_ids` — not `requested_output_ids`/`new_output_ids`; those field names never existed on the wire.
 
-**The count never changes: 5 scenarios in → 5 scenarios out.** Regenerate
+**The count normally does not change: 5 scenarios in → 5 scenarios out.** Regenerate
 **replaces**; only Test 5 (next-set) grows the list. The database will hold 6
-rows — the retired original keeps `Superseded=1`, and the API only returns
-active rows by default.
+rows — the retired original keeps `Superseded=1`, and `/results` returns the live one.
+
+**The one case where the count DOES grow — regenerating a scenario you had already accepted.**
+`/results` returns active rows *plus* accepted rows regardless of `Superseded` (Test 3), so the
+accepted old version stays on the list beside its replacement and you count 6, not 5. That is
+correct rather than a duplicate: an accept is a decision on record and must not disappear
+because somebody regenerated afterwards. Tell the two apart by `accepted` — the retired one
+reads `accepted: true`, the fresh one `accepted: false`. If you want the count to stay at 5,
+regenerate before accepting, not after.
 
 **Three things can happen — and two of them look like "nothing happened".**
 All three leave you with the same number of scenarios, so check this table
@@ -813,8 +1005,8 @@ before reporting a bug:
 > place, because that scenario still occupies the slot.
 
 **The old `scenario_id` is not "dead" the way it used to be.** Re-run Test 3
-(which returns only active/current rows by default) and you'll see the fresh
-id. But unlike the old app, naming the RETIRED `scenario_id` in a later
+(which returns the active rows, plus any accepted row) and you'll see the fresh
+id — alongside the retired one, if you had already accepted it. But unlike the old app, naming the RETIRED `scenario_id` in a later
 accept no longer 404s: `Accepted` is now deliberately decoupled from
 `Superseded` — `AcceptBody.scenario_ids` may name **any** version of a
 scenario, current or superseded, and the named version becomes the accepted
@@ -835,11 +1027,12 @@ you can name several ids in one call, each replacing only its own.
 
 | Table | Read/Write | What happens |
 |---|---|---|
-| `Scenario_Session` | — | **not touched at all.** Regeneration rewrites scenarios that already exist, so it must neither re-reserve the asset (that would block a fresh session on the same asset) nor move the session off REVIEW — the session stays parked at REVIEW/AWAITING_DECISION throughout, because a human is still deciding. |
+| `Scenario_Session` | Read (rare write) | Read for the auth and review-gate checks. **Never re-reserved and never moved off REVIEW** on the normal path: regeneration rewrites scenarios that already exist, so re-reserving the asset would block a fresh session on it, and the session stays parked at REVIEW/AWAITING_DECISION while a human is deciding. The one exception is the recovery branch inside the gate — if the previous run was abandoned by a dead worker, it finalises that session row (status→completed, stage→REVIEW) before letting you through. |
 | `Subsystem_Stage_State` | Write (sync) | SCENARIOS level reset to a new epoch, back to IDLE |
 | `Scoped_Threat`, `Threat_Scenario` | Write (worker) | old row superseded, new row inserted |
 | `Prompt_Log`, `Scenario_Audit` | Write (worker) | AI call + `regeneration_completed` logbook row |
-| Master tables, `Identified_Threat` | — | **never touched** by this API |
+| `Identified_Threat` | Read (worker) | the session's sibling threats, read to rank the regenerated one. Never written by this route |
+| Master library tables | — | **never touched** by this API |
 
 **Verify in the database:**
 
@@ -860,10 +1053,11 @@ WHERE SessionID='<sid>' AND EventType='regeneration_completed';
 | You do this | App must answer |
 |---|---|
 | Call while session is NOT at REVIEW (still cooking) | `409 regenerate_conflict` |
-| Unknown, malformed, or already-superseded `scenario_id` | `409 regenerate_conflict` (`details.reason: "output_not_found_or_superseded"`) |
+| Unknown or already-superseded `scenario_id` | `409 regenerate_conflict` (`details.reason: "output_not_found_or_superseded"`) |
+| A `scenario_id` that is not a valid GUID | `422 validation_error` — **not** the 409 above. `RegenerateScenariosBody` canonicalizes the ids, so a malformed one is rejected by the schema and never reaches the lookup |
 | Empty list, or more than 50 ids | `422` |
-| Unknown `session_id` | `404` (checked before entity scope, so a session outside your `X-Entity-Id` also reads `404`, never `403` — no existence leak) |
-| Session belongs to a different entity than your `X-Entity-Id` | `403 forbidden` |
+| Unknown `session_id` | `404 not_found` |
+| Session belongs to a different entity than your `X-Entity-Id` | `403 forbidden`. The session row is loaded first and the entity compared afterwards, so an existing session outside your entity is a `403`, never a `404` |
 
 **Pass if:** only the named scenario changed; the session stays at REVIEW; the replacement row has a higher epoch.
 
@@ -1039,11 +1233,17 @@ been decided", read `progress.overall` on Test 2 (`awaiting_review` until
 every scenario has a decision, `complete` once they all do) — not
 `current_stage`.
 
-**This is the one place a human decision is recorded.** Accept writes
-`review_decision` (with `Decision` = `accept` / `partial` / `reject`, matching
-your `mode`) plus a per-scenario `scenario_accepted` row for each id that
-actually changed, both attributed to you with `ActorType='user'` — see
-Test 7a for how to read the trail back.
+**This is the one place a human decision is recorded — in three event types, not two.**
+A successful accept writes, all attributed to you with `ActorType='user'`:
+
+1. `scenarios_accepted` — session-scoped. **Skipped entirely when `mode: "none"`**, because
+   nothing was flipped.
+2. `review_decision` — session-scoped, carrying `Decision` = `accept` / `partial` / `reject` to
+   match your `mode`. Always written.
+3. one `scenario_accepted` row per id that actually changed.
+
+Both session-scoped rows land in the same commit; the guide's Part 3a table lists all three.
+See Test 7a for how to read the trail back.
 
 **Library promotion is no longer a side effect of accept.** In the current
 app, accepting a scenario never touches the master threat library by itself —
@@ -1061,8 +1261,9 @@ verify it — that table does not exist in the current schema at all.
 |---|---|---|
 | `Threat_Scenario` | Write | chosen rows get `Accepted=1`, `AcceptedAt`/`AcceptedBy` |
 | `Subsystem_Stage_State` | Write (transient) | `_LOCK` row held for the call's duration, then released |
-| `Scenario_Audit` | Write | the decision, attributed to you |
-| `Scenario_Session` | — | **not touched** — see the callout above; the session was already `completed` by generation before this call ran |
+| `Scenario_Audit` | Write | the three events above, attributed to you |
+| `Identified_Threat`, `Threat_Type`, `Threat_Catalogue` | Read | the liveness gate behind `master_inactive` |
+| `Scenario_Session` | Read | loaded for the auth and review-gate checks, but **never written** — see the callout above; the session was already `completed` by generation before this call ran |
 | `Prompt_Log` | — | **no row** — accept makes no AI call |
 
 **Verify in the database:**
@@ -1077,7 +1278,7 @@ SELECT SessionStatus, CurrentStage, CompletedAt FROM Scenario_Session WHERE Sess
 -- The human decision, recorded (Decision = accept / partial / reject):
 SELECT EventType, Decision, ActorUserID, ActorType, CreatedAt
 FROM Scenario_Audit WHERE SessionID='<sid>'
-  AND EventType IN ('review_decision','scenario_accepted');
+  AND EventType IN ('review_decision','scenarios_accepted','scenario_accepted');
 ```
 
 **Must-fail checks:**
@@ -1090,7 +1291,7 @@ FROM Scenario_Audit WHERE SessionID='<sid>'
 | Accept after a worker died/hung with no live lease, and automatic recovery couldn't park the session at REVIEW | `409 accept_conflict` (`details.reason: "generation_abandoned"`) — not retryable; cancel and start a new session |
 | A `scenario_id` naming two different versions of the same scenario, or one that conflicts with a version already accepted on this session | `409 accept_conflict` (`details.reason: "duplicate_identity"`) |
 | A `scenario_id` that isn't a decidable scenario of THIS session | `404 not_found` — and **nothing is accepted**, even the ids that were fine |
-| A master threat type/catalogue was deactivated meanwhile | `409 master_inactive` |
+| A master threat type/catalogue was **soft-deleted** (`IsDeleted=1`) meanwhile | `409 master_inactive`. This gate is `IsDeleted`-only **by design**: setting `IsActive=0` does NOT trip it. A threat that `promote-to-library` (Test 9b) just minted starts `IsActive=0` pending curator review, and accepting a session containing it has to keep working. A tester who merely deactivates a row and expects a 409 will get a 200 |
 
 **Reading that 404.** It names every bad id and why, so you don't have to hunt:
 
@@ -1323,7 +1524,7 @@ curl -s -G "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66af
      "decision": null, "detail": {}},
     {"audit_id": "3c4d5e6f-7081-90aa-9bac-9d9e9fa0a1a2", "at": "2026-08-31T09:10:47Z",
      "event": "regeneration_completed", "subject_type": "session", "scenario_id": null, "plan_id": null,
-     "actor_user_id": "qa-user", "actor_type": "user", "stage": null, "subsystem_id": 0,
+     "actor_user_id": null, "actor_type": "system", "stage": "SCENARIO_GENERATION", "subsystem_id": 0,
      "decision": null,
      "detail": {"target_ids": ["9f8e7d6c-5b4a-3928-1706-f5e4d3c2b1a0"],
                 "requested_ids": ["6ba7b810-9dad-11d1-80b4-00c04fd430c8"],
@@ -1354,8 +1555,10 @@ curl -s -G "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66af
    filters. You should see, in order: `session_started`, per-subsystem
    generation rows, `entered_review`, the `regeneration_completed` row from
    Test 4, a `next_set_outcome` row from Test 5, the `scenario_accepted` +
-   `review_decision` pair from Test 6, and a `scenario_rejected` row from
-   Test 6a.
+   `scenarios_accepted` + `review_decision` **trio** from Test 6, and a
+   `scenario_rejected` row from Test 6a. Note `regeneration_completed` comes back
+   `actor_user_id: null` / `actor_type: "system"` — the worker writes it, not you, even
+   though you clicked the button.
 2. Filter to one scenario with `?scenario_id=<id>` — only that scenario's own rows come back, never another scenario's.
 3. Filter to one event type with `?event=scenario_rejected` (repeat `event=` for more than one type).
 4. Filter to a time window with `since`/`until` (UTC), or to one human with `actor=qa-user` — `actor_user_id` is null on every pipeline-written row, so filtering by actor is how you isolate what a PERSON did versus what the system did.
@@ -1398,9 +1601,9 @@ is exactly step 6 above.
 ---
 ## Part 4b — Remediation / Treatment Plans (P1 if the risk module is enabled)
 
-This whole area — all eleven routes in `app/api/treatment.py` — only exists if the risk module is turned on. `Settings.risk_module_enabled` (`app/core/config.py:248-249`, env var `RISK_MODULE_ENABLED` / `TSG_RISK_MODULE_ENABLED`, default **`False`**) gates whether `app/main.py` even mounts the router at all: `app/main.py:149-151` reads `if get_settings().risk_module_enabled: app.include_router(treatment_router)`. With the flag off, every path under this section is a plain 404 by *absence* — no route registered, no entry in `/openapi.json`, zero handler code running — not a 403, not a "feature disabled" error body. Before testing anything below, confirm the flag is on in the environment you're pointed at (ask ops, or just try `POST .../treatment-plan` once and see whether you get a 404 with no `error_code` body at all, which is FastAPI's own "no such route" page, vs. a real `ErrorResponse` envelope). The generator here is the **Mitigate** strategy only (`TreatmentStrategy.mitigate`, `app/core/enums.py:491-494`) — there's no strategy field on the wire, it's stamped server-side. And TSG reads **no risk-module tables** to build a plan: the register's own risk-scoring data (ratings, dates, existing controls) travels *in the request body* on first generation (`app/api/treatment.py:8-9`); TSG supplies only its own scenario/threat/controls context.
+This whole area — all eleven routes in `app/api/treatment.py` — only exists if the risk module is turned on. `Settings.risk_module_enabled` (`app/core/config.py`, env var `RISK_MODULE_ENABLED` / `TSG_RISK_MODULE_ENABLED`, default **`False`**) gates whether `app/main.py` even mounts the router at all: `app/main.py`'s router block reads `if get_settings().risk_module_enabled: app.include_router(treatment_router)`. With the flag off, every path under this section is a plain 404 by *absence* — no route registered, no entry in `/openapi.json`, zero handler code running — not a 403, not a "feature disabled" error body. Before testing anything below, confirm the flag is on in the environment you're pointed at (ask ops, or just try `POST .../treatment-plan` once and see whether you get a 404 with no `error_code` body at all, which is FastAPI's own "no such route" page, vs. a real `ErrorResponse` envelope). The generator here is the **Mitigate** strategy only (`TreatmentStrategy.mitigate` in `app/core/enums.py`) — there's no strategy field on the wire, it's stamped server-side. And TSG reads **no risk-module tables** to build a plan: the register's own risk-scoring data (ratings, dates, existing controls) travels *in the request body* on first generation (see the module docstring of `app/api/treatment.py`); TSG supplies only its own scenario/threat/controls context.
 
-Auth is the same header set as every other route in this guide — **not** the old `X-Dev-Entities`/`X-Dev-User` pair, which no longer exist anywhere in this app. `get_principal` (`app/api/deps.py:86-129`) requires `X-API-Key`, `X-User-Id`, `X-Entity-Id`, `X-Tenant-Id`, all non-blank, or `401 unauthorized`; `X-Entity-Id` must equal the session's own `EntityID` (checked inside `get_authorized_session`, called first thing in every handler below) or `403 EntityForbidden` — and a session that doesn't exist at all 404s *before* that check runs, so an out-of-scope session id 404s rather than 403ing (no existence leak). Running-example values used throughout this section: `entity_id = "78"`, `user_id = "qa-user"`, `HOST = http://localhost:8000`. The session/scenario ids below (`5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e` / `1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90`) are the literal example values baked into `TreatmentPlanAccepted`/`TreatmentPlanStatus` in `app/api/schemas.py` — substitute your own session's accepted `scenario_id` (from Test 3 / Test 6) when you actually run these.
+Auth is the same header set as every other route in this guide — **not** the old `X-Dev-Entities`/`X-Dev-User` pair, which no longer exist anywhere in this app. `get_principal` (`app/api/deps.py`) requires `X-API-Key`, `X-User-Id`, `X-Entity-Id`, `X-Tenant-Id`, all non-blank, or `401 unauthorized`; `X-Entity-Id` must equal the session's own `EntityID` (checked inside `get_authorized_session`, called first thing in every handler below) or `403 forbidden` (the wire `error_code`; `EntityForbidden` is only the Python exception class name) — and a session that doesn't exist at all 404s *before* that check runs, so an out-of-scope session id 404s rather than 403ing (no existence leak). Running-example values used throughout this section: `entity_id = "78"`, `user_id = "qa-user"`, `HOST = http://localhost:8000`. The session/scenario ids below (`5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e` / `1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90`) are the literal example values baked into `TreatmentPlanAccepted`/`TreatmentPlanStatus` in `app/api/schemas_treatment.py` (the treatment models live there, not in `schemas.py`, which only re-exports them) — substitute your own session's accepted `scenario_id` (from Test 3 / Test 6) when you actually run these.
 
 ---
 
@@ -1438,7 +1641,34 @@ curl -s -X POST "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c1
   }'
 ```
 
-`TreatmentPlanBody` (`app/api/schemas.py:2243-2270`) is `extra="forbid"` — these 12 keys are the ONLY ones accepted; anything else (including the retired `timeline_start_date`/`timeline_end_date`, or `user_id`/`strategy`/`user_note`) 422s naming it. Only `risk_level` is truly required — every other field may be omitted, and an empty string on an optional field is silently treated as "not provided" (`_blank_is_absent`, schemas.py:2313-2332), not a validation error. `mitigation_start_date`/`mitigation_end_date` must be given together or not at all, and end must not precede start (schemas.py:2334-2340).
+`TreatmentPlanBody` (`app/api/schemas_treatment.py`) is `extra="forbid"` — these 12 keys are the
+ONLY ones accepted; anything else (including the retired `timeline_start_date`/`timeline_end_date`,
+or `user_id`/`strategy`/`user_note`) 422s naming it.
+
+**Five of the twelve are required**, not one: `existing_controls`, `likelihood_rating`,
+`impact_rating`, `final_risk_rating` and `risk_level` are all declared with no default, so
+omitting any of them is a `422` with `type: "missing"`. `existing_controls` may be `[]` — a risk
+with no controls is legitimate — but the key itself must be present.
+
+| Field | Required | Bounds |
+|---|---|---|
+| `existing_controls` | yes (may be `[]`) | at most 50 entries, each ≤ 500 chars. Blank entries and duplicates are silently dropped, order preserved |
+| `likelihood_rating` | yes | integer 1–5 |
+| `impact_rating` | yes | integer 1–5 |
+| `final_risk_rating` | yes | integer 1–25 (the 5×5 matrix). Taken as-is, never re-derived |
+| `risk_level` | yes | `Low` \| `Medium` \| `High` \| `Critical`. `""` here is a genuine 422 |
+| `risk_identification_date` | no | datetime, normalized to UTC |
+| `risk_owner` | no | ≤ 200 chars |
+| `impacted_business_division` | no | ≤ 200 chars |
+| `existing_controls_all_subsystems` | no | `Yes` \| `No` |
+| `existing_controls_all_subsystems_justification` | no | ≤ 1000 chars |
+| `mitigation_start_date` | no | `YYYY-MM-DD` |
+| `mitigation_end_date` | no | `YYYY-MM-DD` |
+
+On the seven OPTIONAL fields an empty string is silently treated as "not provided"
+(`_blank_is_absent`), not a validation error — `risk_level` is deliberately excluded from that
+rule precisely because it is required. `mitigation_start_date`/`mitigation_end_date` must be
+given together or not at all, and end must not precede start.
 
 **Output (complete response):**
 
@@ -1484,10 +1714,11 @@ FROM Risk_Treatment_Plan WHERE ScenarioID='<scenario_id>' AND Superseded=0;
 |---|---|
 | Scenario's `Accepted` flag isn't 1 | `409 treatment_conflict`, `details.reason="scenario_not_accepted"` — "treatment plans are generated for accepted scenarios only" |
 | ANY plan already exists for this scenario (RUNNING, COMPLETE, or ERROR) | `409 treatment_conflict`, `details.reason="plan_already_exists"` — "...use POST .../treatment-plan/regenerate to create a new version" |
+| **Two concurrent first-creates** for the same scenario | the loser gets `409 treatment_conflict`, `details.reason="generation_in_progress"` — not `plan_already_exists`. The filtered unique index `UX_TreatmentPlan_ActiveScenario` is the arbiter, not the preceding SELECT, so this can never be a false positive |
 | A rating out of range, mismatched mitigation dates, or any key outside the 12 | `422` (`errors[].type=="extra_forbidden"` for an unknown key) |
 | `scenario_id` isn't a scenario of THIS session | `404 not_found` — "scenario not found in this session" |
 | `session_id` doesn't exist | `404 not_found` |
-| `X-Entity-Id` doesn't own the session | `403` `EntityForbidden` |
+| `X-Entity-Id` doesn't own the session | `403 forbidden` |
 | Celery broker unreachable when enqueuing | `503` — the row is already committed and parked `ERROR`/`enqueue_failed`; regenerate to retry |
 
 **Pass if:** `202` with `status: "RUNNING"`, a `Superseded=0` row appears immediately, and a repeat POST before regenerating 409s `plan_already_exists`.
@@ -1515,7 +1746,7 @@ curl -s -X POST "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c1
   -d '{}'
 ```
 
-`TreatmentPlanRegenerateBody` (`app/api/schemas.py:2371-2388`) is `extra="forbid"` with **zero declared fields** — the old `user_note` steering key was removed; sending it, or any key, 422s. Sending no body at all typically fails JSON parsing before the model even runs, so send `{}` explicitly.
+`TreatmentPlanRegenerateBody` (`app/api/schemas_treatment.py`) is `extra="forbid"` with **zero declared fields** — the old `user_note` steering key was removed; sending it, or any key, 422s. Sending no body at all typically fails JSON parsing before the model even runs, so send `{}` explicitly.
 
 **Output (complete response):**
 
@@ -1537,7 +1768,7 @@ Same `TreatmentPlanAccepted` shape as 7b, but a **new** `plan_id` — the old on
 3. Re-run the DB check below: the old row shows `Superseded=1`, the new one `Superseded=0`.
 4. POST again immediately (before the new generation finishes) → `409 generation_in_progress`.
 
-**Environment quirk:** if this scenario has **never** had a plan requested at all, you get `404 not_found` ("no treatment plan has been requested for this scenario") here — not `409 scenario_not_accepted`, even if the scenario also happens to be unaccepted. The baseline lookup runs *before* the accept check on purpose (`app/api/treatment.py:188-199`, comment "ORDER MATTERS"), matching what the old two-transaction design enforced.
+**Environment quirk:** if this scenario has **never** had a plan requested at all, you get `404 not_found` ("no treatment plan has been requested for this scenario") here — not `409 scenario_not_accepted`, even if the scenario also happens to be unaccepted. The baseline lookup runs *before* the accept check on purpose (`app/api/treatment.py`, the comment marked "ORDER MATTERS"), matching what the old two-transaction design enforced.
 
 **Tables used:** same set as Test 7b's write path (`Risk_Treatment_Plan`, `Scenario_Audit`, plus the same `Threat_Scenario`/`Scoped_Threat`/`Identified_Threat`/`Threat_Scenario_Control_Map`/`Control_Library*` reads) — the only difference is the retire-then-insert instead of a bare insert, and `Scenario_Audit` still gets a `treatment_plan_requested` row (not a distinct "regenerated" event type).
 
@@ -1625,7 +1856,7 @@ FROM Risk_Treatment_Plan WHERE SessionID='<session_id>' AND ScenarioID='<scenari
 |---|---|
 | No plan has ever been requested for this scenario | `404 not_found` — treat this as the `pending` state, not an error |
 | `scenario_id` not a scenario of this session, or `session_id` unknown | `404 not_found` |
-| `X-Entity-Id` doesn't own the session | `403` `EntityForbidden` |
+| `X-Entity-Id` doesn't own the session | `403 forbidden` |
 
 **Pass if:** the poll tracks the same lifecycle Test 7e shows, without ever hauling `plan`/`scenario`/`threat` content.
 
@@ -1709,6 +1940,16 @@ curl -s "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/
          "domain": "Configuration Management"}
       ]
     },
+    "remediation_action_plan": [
+      {"action_id": "A1", "action": "Disable direct RDP exposure at the perimeter firewall.",
+       "owner": "OT Security Team", "priority": "Critical", "dependencies": "None",
+       "timeline": "2026-08-15",
+       "success_criteria": "No inbound 3389 permitted from any untrusted zone."},
+      {"action_id": "A2", "action": "Enforce MFA on every remote-access account.",
+       "owner": "IAM Team", "priority": "High", "dependencies": "A1",
+       "timeline": "2026-09-28",
+       "success_criteria": "100% of remote accounts enrolled and verified."}
+    ],
     "mitigation_timeline": "2026-09-28",
     "mitigation_owner": "OT Security Team",
     "risk_owner": "Head of OT Operations",
@@ -1722,7 +1963,26 @@ curl -s "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/
 }
 ```
 
-**Environment quirk:** `review_comment` is declared on `TreatmentPlanStatus` but marked `exclude=True` — populated in the DB, **never** on the wire (`app/api/schemas.py:2511`). Same for `created_at`/`completed_at` (2568-2569) — a "presentation trim" applied 06-Aug-2026, still in effect. Don't be surprised when the model description mentions a field the JSON never shows.
+`plan` carries exactly the ten keys of `TreatmentPlanDocument` that the stored document
+actually has — `treatment_presenter._VISIBLE_PLAN_KEYS` is derived from that model, so the
+projection cannot drift from it. `remediation_action_plan` is the one to check first: it is
+the numbered work itself, each row `{action_id, action, owner, priority, dependencies,
+timeline, success_criteria}`, and generation refuses a plan whose
+`remediation_action_plan` is **missing or not a list of objects**
+(`TreatmentPlanInvalid: LLM plan is missing required table 'remediation_action_plan'`). An
+**empty** array is NOT refused: the plan still reaches `COMPLETE`, carrying
+`remediation_action_plan is empty — the prompt mandates at least one action...` in `warnings`.
+So check `warnings` before treating a `COMPLETE` plan as actionable.
+`action_plan` is the prose roll-up of those same rows, `mitigation_timeline` the latest date
+among them. The prompt demands an absolute date for every `timeline`, but that is **not enforced**: a
+non-date value is first tried as a duration ("30 days") and, failing that, recorded as a
+warning — never rejected. A prose or duration `timeline` can therefore survive into a
+`COMPLETE` plan, so validate it client-side rather than assuming a date. `priority` is drawn from
+`Critical`/`High`/`Medium`/`Low`; a value outside that set is recorded in `warnings` rather
+than rejected. Note the stored `risk_identification_date` is trimmed out of `plan` — it is
+published as the sibling field of the same name instead, never in both places.
+
+**Environment quirk:** `review_comment` is declared on `TreatmentPlanStatus` but marked `exclude=True` — populated in the DB, **never** on the wire. Same for `created_at`/`completed_at` — all three are `exclude=True` on `TreatmentPlanStatus` in `app/api/schemas_treatment.py` — a "presentation trim" applied 06-Aug-2026, still in effect. Don't be surprised when the model description mentions a field the JSON never shows.
 
 **How to test:**
 
@@ -1736,6 +1996,9 @@ curl -s "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/
 |---|---|---|
 | `Risk_Treatment_Plan` | Read | the active (`Superseded=0`) row, plus history rows if `?include_superseded=true` |
 | `Threat_Scenario`, `Scoped_Threat`, `Identified_Threat` | Read | the `scenario`/`threat` blocks, same builder `/results` uses |
+| `Threat_Scenario_Control_Map`, `Control_Library` | Read | the `controls` block — a failed read is what sets `controls_unavailable: true` |
+| `Control_Library_Standard_Map`, `Control_Standard` | Read | the `standards[]` inside each control |
+| `Threat_Actor` | Read | the `actors` block, on the legacy-name fallback path |
 
 **Verify in the database:**
 
@@ -1749,7 +2012,7 @@ FROM Risk_Treatment_Plan WHERE ScenarioID='<scenario_id>' AND Superseded=0;
 | You do this | App must answer |
 |---|---|
 | No plan has ever been requested for this scenario | `404 not_found` — "no treatment plan has been requested for this scenario" |
-| `X-Entity-Id` doesn't own the session | `403` `EntityForbidden` |
+| `X-Entity-Id` doesn't own the session | `403 forbidden` |
 
 **Pass if:** `plan` matches what 7b/7c's generation produced, `progress` agrees with what Test 7d showed for the same plan, and `?include_superseded=true` surfaces every regenerated-away version after Test 7c.
 
@@ -1825,7 +2088,7 @@ WHERE ts.SessionID = '<session_id>' AND ts.Accepted = 1;
 | You do this | App must answer |
 |---|---|
 | `session_id` doesn't exist | `404 not_found` |
-| `X-Entity-Id` doesn't own the session | `403` `EntityForbidden` |
+| `X-Entity-Id` doesn't own the session | `403 forbidden` |
 
 There is deliberately **no** 404 for "no accepted scenarios" or "no plans" — those are just empty results, not error conditions.
 
@@ -1966,6 +2229,7 @@ ORDER BY CreatedAt;
 | No plan has ever been requested for this scenario | `404 not_found` |
 | `plan_id` names a version that doesn't belong to this scenario at all | `404 not_found` — "no such plan version for this scenario" |
 | Active plan is still `RUNNING` or ended `ERROR` (not `COMPLETE`) | `409 treatment_conflict` — `details.reason: "not_complete"` |
+| A **historical** `plan_id` you tried to approve is itself not `COMPLETE` | `409 treatment_conflict` — `details.reason: "not_complete"` as well. The reinstate is CAS-fenced on `(Superseded=1, Status=COMPLETE)`, and a miss rolls the retire back, so the active version is left exactly as it was |
 | Historical `plan_id` + `decision: "rejected"` | `409 treatment_conflict` — `details.reason: "version_not_active"` (it's already not the plan; rejecting it means nothing) |
 | Historical `plan_id` while a fresh regeneration is `RUNNING` | `409 treatment_conflict` — `details.reason: "generation_in_progress"` |
 
@@ -2031,7 +2295,9 @@ Every key above is always present. With `include_plan=true`, `scenario`, `threat
 | Table | Read/Write | What happens |
 |---|---|---|
 | `Risk_Treatment_Plan` | Read | the register's rows, filtered/paged |
-| `Threat_Scenario`, `Identified_Threat` | Read | only when `include_plan=true` — the scenario/threat blocks |
+| `Scenario_Session` | Read | **always** — inner-joined; it is the `EntityID` authorization filter and the source of `asset_name` |
+| `Threat_Scenario` | Read | **always** — outer-joined; supplies `scenario_title`, which the default `include_plan=false` response already shows |
+| `Scoped_Threat`, `Identified_Threat` | Read | only when `include_plan=true` — the `scenario`/`threat` blocks |
 
 **Verify in the database:**
 
@@ -2307,7 +2573,7 @@ line, then a blank line (the blank line ends one event):
 
 ```
 event: reconcile
-data: {"type":"reconcile","session_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6","entity_id":"78","asset_id":103,"asset_name":"CAD Platform","user_id":"qa-user","session_status":"active","current_stage":"THREAT_IDENTIFICATION","stage_status":"RUNNING","progress":{"threats":"RUNNING","scenarios":"IDLE","controls":"PENDING","overall":"in_progress","error_message":{},"last_next_set":null,"last_regen":null,"coverage":null}}
+data: {"type":"reconcile","session_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6","entity_id":"78","asset_id":103,"asset_name":"CAD Platform","user_id":"qa-user","session_status":"active","current_stage":"THREAT_IDENTIFICATION","stage_status":"RUNNING","progress":{"threats":"RUNNING","scenarios":"IDLE","overall":"in_progress","controls":"PENDING","error_message":{},"timings":{},"last_next_set":null,"last_regen":null,"coverage":null}}
 
 event: stage_completed
 data: {"type":"stage_completed","session_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6","subsystem_id":0,"stage":"THREATS","status":"COMPLETE","generation_epoch":1,"ts":"2026-08-31T09:15:02.118427+00:00"}
@@ -2335,8 +2601,33 @@ data: {"type":"heartbeat","session_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6","t
 | `next_set_result` | A "give me more" click finished | yes |
 | `regen_result` | A "redo this one" click finished | yes |
 | `treatment_plan_result` | One treatment plan reached a committed `COMPLETE`/`ERROR` — keyed by `scenario_id`, ADVISORY only (a dead worker, an autoretry, or a plain review verdict never publish one; keep a slow backstop poll of `GET .../treatment-plans`) | no — no `subsystem_id`, matches on `scenario_id` |
-| `error` | A stage failed, or the whole session died | **both** — an explicit `scope` field (`"stage"`/`"session"`) says which, rather than inferring it from whether `subsystem_id` is present |
+| `error` | A stage failed, or the whole session died | **both** — a `scope` field (`"stage"`/`"session"`) normally says which, so you never have to infer it from whether `subsystem_id` is present. One exception below |
+| `session_cancelled` | Someone called `POST .../cancel` on this session (Test 7) | no — session-wide |
+| `session_accepted` | An accept committed (Test 6); carries `status: "completed"` | no — session-wide |
+| `scenarios_rejected` | A reject committed (Test 6a); carries `rejected_count` | no — session-wide |
 | `heartbeat` | Periodically, proving the line is alive | no |
+
+**Three things about this table that will bite a strict client.**
+
+1. **Three event types are real but undeclared.** `session_cancelled` (from the cancel
+   handler in `app/api/sessions.py`), `session_accepted` and `scenarios_rejected` (both from
+   `app/pipeline/accept.py`) are all published on the session channel, so a Test 8 subscriber
+   receives them. None of the three is a member of the `SSEEventType` enum, and none is in the
+   route's declared response union — so they will NOT appear in types generated from
+   `/openapi.json`, yet they arrive. Make your event switch tolerate an unrecognized `type`
+   instead of throwing; do not treat the generated union as exhaustive.
+2. **`error` from the reaper carries no `scope`.** The worker sets `scope` on the errors it
+   publishes, but the background reaper's three publishes (lease expired, lock reclaimed,
+   session reaped) omit the key entirely. `scope` is therefore optional on the wire: treat a
+   missing one as "unknown", never default it to `"session"`.
+3. **Epoch is on fewer events than you would expect, under two different names.** Only
+   `stage_started`, `stage_completed`, `subsystem_started`, `session_entered_review` and the
+   stage-scope `error` carry one, and they spell it **`generation_epoch`**. `next_set_result`
+   carries one spelled **`epoch`**. Everything else carries none at all: `regen_result`,
+   `treatment_plan_result`, the session-scope `error`, every reaper-published `error`, and the
+   three undeclared events above. So there is nothing on a `regen_result` to match against your
+   own click — which is exactly why Test 4 tells you to confirm on `progress.last_regen.epoch`
+   from the board, a durable field that survives a dropped connection.
 
 `embedding_job_update`/`grounding_job_update`/`intel_job_update` also exist on `SSEEventType` but
 are **admin-scope only** — published on a per-job admin channel, never on a session channel — so
@@ -2433,6 +2724,9 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6/
   "completed_at": "2026-08-31T10:02:11+00:00",
   "scenarios": [
     {"scenario_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+     "accepted_by": "qa-user", "accepted_at": "2026-08-31T10:01:40+00:00",
+     "rejected_by": null, "rejected_at": null,
+     "controls_unavailable": false,
      "subsystem_id": 0,
      "scenario": {"threat_category": "Spoofing",
                   "threat_type": "Credential phishing",
@@ -2459,10 +2753,7 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6/
                    "domain": "Identification & Authentication",
                    "control_name": "Multi-Factor Authentication", "map_rank": 1, "score": 93.0,
                    "standards": [{"standard_id": 3, "standard_name": "NIST SP 800-53 Rev. 5"},
-                                 {"standard_id": 7, "standard_name": "ISO 27001:2022"}]}],
-     "accepted_by": "qa-user", "accepted_at": "2026-08-31T10:01:40+00:00",
-     "rejected_by": null, "rejected_at": null,
-     "controls_unavailable": false}
+                                 {"standard_id": 7, "standard_name": "ISO 27001:2022"}]}]}
   ]
 }
 ```
@@ -2484,6 +2775,8 @@ are mutually exclusive per scenario.)
 | `Scenario_Session` | Read | the named session + auth check (same check as every other session route) |
 | `Threat_Scenario` ⟕ `Scoped_Threat` ⟕ `Identified_Threat` | Read | rows with `Accepted=1` — **no `Superseded` filter**: an accepted scenario's flag is independent of which generation produced it |
 | `Threat_Scenario_Control_Map` ⨝ `Control_Library` | Read | mapped controls for those scenarios, one batch query |
+| `Control_Library_Standard_Map` ⨝ `Control_Standard` | Read | the `standards[]` inside each control |
+| `Threat_Actor` | Read | actor names, on the legacy-name fallback path |
 
 This API writes nothing.
 
@@ -2502,7 +2795,7 @@ SELECT o.ScenarioID, o.SubsystemID, o.Accepted, o.AcceptedAt, o.AcceptedBy,
 FROM Threat_Scenario o
 LEFT JOIN Scoped_Threat s ON o.ScopedThreatID = s.ScopedThreatID
 LEFT JOIN Identified_Threat i ON s.ThreatID = i.ThreatID
-WHERE o.SessionID='<sid>' AND o.Accepted = 1
+WHERE o.SessionID='<sid>' AND o.Accepted = 1 AND o.IdentityHash IS NOT NULL
 ORDER BY i.ThreatID, o.ScenarioNumber, o.ScenarioID;
 ```
 
@@ -2627,8 +2920,15 @@ These APIs write nothing.
 | Item route without `user_id` | `422 validation_error` |
 | `limit=501`, `offset=-1`, or `status=bogus` | `422 validation_error` |
 
+**One exception to `include_superseded`, and it is deliberate.** With `status=accepted` the
+recency filter is skipped entirely, so an accepted-but-superseded scenario comes back even
+without the flag — same reasoning as Test 3's second query: the version a human accepted must
+never be hidden by a later regeneration. For every other `status`, superseded rows stay hidden
+until you ask for them.
+
 **Pass if:** the lists never contain another entity's rows, never contain
-failure cards, and hide superseded rows unless you ask for them.
+failure cards, and hide superseded rows unless you ask for them — or unless you asked for
+`status=accepted`, where an accepted older version is always returned.
 
 ---
 
@@ -2637,8 +2937,8 @@ failure cards, and hide superseded rows unless you ask for them.
 | | |
 |---|---|
 | **API** | `POST /v1/sessions/{session_id}/scenarios/{scenario_id}/promote-to-library`, `response_model=LibraryPromotionResponse`, `409` conflicts share the same `ErrorResponse` envelope as accept/reject/regenerate |
-| **Why does this API exist?** | Threat identification either RETRIEVES a threat already in the curated library (`grounding_status: "verified"`) or, when nothing matched well, has the model PROPOSE a new one (`grounding_status: "unverified"`). A proposed threat is scenario-specific and would otherwise disappear with the session — this is the only write path that adds it to `Threat_Type`/`Threat_Catalogue` (plus its category and actor links) so a future session on a similar asset profile retrieves it directly instead of the model reinventing it from scratch. |
-| **What does it do?** | Promotes ONE already-accepted scenario's threat type and threat. Nothing is duplicated: each item comes back `inserted` (a new master row) or `existing` (reused), so calling it twice creates nothing and returns the same ids. Controls are only reported here, never written — a mapped control is already curated `Control_Library` master data. |
+| **Why does this API exist?** | Threat identification either RETRIEVES a threat already in the curated library (`grounding_status: "verified"`) or, when nothing matched well, has the model PROPOSE a new one (`grounding_status: "unverified"`). A proposed threat is scenario-specific and would otherwise disappear with the session — this is the only write path that adds it to `Threat_Type`/`Threat_Catalogue` (plus its category and actor links) so a future session on a similar asset profile can retrieve it instead of the model reinventing it from scratch. **Promotion does not make it retrievable on its own:** newly inserted rows are minted `IsActive=0`, pending curator review, and library retrieval filters `IsActive=1`. A curator has to activate the row before any session can match it. |
+| **What does it do?** | Promotes ONE already-accepted scenario's threat type and threat. Nothing is duplicated: each item comes back `inserted` (a new master row), `existing` (reused), or `failed` (an actor with no stored id, a soft-deleted actor, or a link that did not take — the call still returns `200`, with `success: false` and an `error` on that item). Calling it twice creates nothing and returns the same ids. Controls are only reported here, never written — a mapped control is already curated `Control_Library` master data. |
 | **When do you call it?** | After Test 6 accepts a scenario. Anyone holding `session_id` + `scenario_id` in their entity scope may call it — not owner-restricted, same posture as accept/reject. |
 
 **Input (complete request):** no body.
@@ -2686,9 +2986,10 @@ calling this twice on the same scenario — that's a `200`, not an error.)
 | Table | Read/Write | What happens |
 |---|---|---|
 | `Threat_Scenario` ⟕ `Scoped_Threat` ⟕ `Identified_Threat` | Read | loads the accepted scenario and the threat it was generated from — the promotion gate (`Status=complete`, `Accepted=1`, not superseded) |
-| `Threat_Type`, `Threat_Category` | Read/Write | resolves the threat's type, inserting one only if nothing matches by name |
+| `Threat_Type` | Read/Write | resolves the threat's type, inserting one only if nothing matches by name. An inserted row is minted `IsActive=0` (pending curation) |
 | `Threat_Catalogue`, `Threat_Catalogue_Category_Map` | Read/Write | resolves the threat itself and its category link, same insert-if-new rule |
-| `Threat_Actor`, `ThreatType_ThreatActor_Map` | Read/Write | links the threat's already-stored actors to the type — never creates a new actor (the AI never invents an adversary) |
+| `Threat_Actor` | Read | the threat's already-stored actors. **Never written** — the AI never invents an adversary |
+| `ThreatType_ThreatActor_Map` | Read/Write | links those actors to the type |
 | `Identified_Threat` | Write | stamps the resolved `ThreatTypeID`/`ThreatCatalogueID` back onto the source threat row, fenced on `Superseded = 0` |
 | `Threat_Scenario_Control_Map`, `Control_Library` | Read | controls already mapped to this scenario, reported read-only |
 | `Scenario_Audit` | Write | one `library_promoted` row: who, when, and the per-item outcome |
@@ -2894,7 +3195,10 @@ vectors — it never deletes anything. It would compute the new model's vectors
 but leave the old model's vectors in Mongo too: two sets for the same items.
 `recreate` = delete + re-embed as one step, so only fresh vectors remain.
 
-Rule: `names` is only allowed together with `group`.
+Rule: `names` is only allowed together with `group` — enforced on `create`, `recreate` and
+`delete`. `update` is the exception: it runs no such check and **ignores `names` entirely**, so
+`{"names": [...]}` on `update` is accepted and then silently does a full missing-vector sweep.
+Use `create` when you mean "embed exactly these".
 
 #### Action 4 — `delete`: "Remove vectors, and do NOT recompute anything"
 
@@ -2914,8 +3218,11 @@ Nothing will ever clean it up on its own.
 
 Rules that protect you:
 
-- A bare `{}` is **rejected** (`422`) on purpose — so nobody wipes the whole
-  cache by accident. You must give `group` and/or `names`.
+- A bare `{}` is **rejected** (`422 admin_validation_error`) on purpose — so nobody wipes the
+  whole cache by accident.
+- `names` **without** `group` is also rejected (`422 admin_validation_error`, "names requires a
+  specific group") — exactly like `recreate`. So `delete` effectively always needs `group`,
+  optionally narrowed by `names`.
 - Unlike `recreate`, nothing is recomputed afterwards. `delete` is for vectors
   that should be gone and STAY gone.
 - It only touches Mongo — the SQL master tables are never changed.
@@ -2930,22 +3237,23 @@ being `PENDING`/`STARTED`.
 (no body — in Swagger, paste the `job_id` into the path field; same three
 headers as every action above)
 
-**Responses you can get** (the count/error fields stay `null` until the job
-finishes — only `state` is meaningful before then; `rows_processed` and
-`vectors_deleted` are each keyed **by group**, never a single bare number):
+**Responses you can get.** All four keys are present on every reply — the counts and
+`error` are `null` until they apply, never absent, so only `state` is meaningful before the
+job finishes. `rows_processed` and `vectors_deleted` are each keyed **by group**, never a
+single bare number:
 
 ```json
 // still working (state mirrors Celery's own AsyncResult states: PENDING, STARTED, ...)
-200 {"state": "STARTED"}
+200 {"rows_processed": null, "vectors_deleted": null, "state": "STARTED", "error": null}
 
 // finished — create/update/recreate report counts per group
-200 {"state": "SUCCESS", "rows_processed": {"threat_type": 27, "threat_catalogue": 75, "control_library": 1288}, "vectors_deleted": null, "error": null}
+200 {"rows_processed": {"threat_type": 27, "threat_catalogue": 75, "control_library": 1288}, "vectors_deleted": null, "state": "SUCCESS", "error": null}
 
 // finished — a delete job reports removals per group instead
-200 {"state": "SUCCESS", "rows_processed": null, "vectors_deleted": {"threat_type": 75}, "error": null}
+200 {"rows_processed": null, "vectors_deleted": {"threat_type": 75}, "state": "SUCCESS", "error": null}
 
 // failed — the error names the exact problem
-200 {"state": "FAILURE", "error": "name matched nothing in group 'threat_type': 'Spofing'"}
+200 {"rows_processed": null, "vectors_deleted": null, "state": "FAILURE", "error": "name matched nothing in group 'threat_type': 'Spofing'"}
 ```
 
 #### One full curl example (the pattern is identical for all four actions)
@@ -2967,7 +3275,7 @@ curl -s "http://localhost:8000/v1/tsg/threat-library/embeddings/status/<job_id>"
 | `update` | nothing — `{}` is valid | — |
 | `create` | `group` **and** `names` | omit either |
 | `recreate` | `group` (`names` optional) | send `names` without `group` |
-| `delete` | `group` and/or `names` | send a bare `{}` |
+| `delete` | `group` (`names` optional) | send a bare `{}`, **or** send `names` without `group` |
 
 `names`, whenever sent, is capped at 50 entries — over that is a plain
 `422 validation_error` (the generic field-validation one, not
@@ -3067,7 +3375,8 @@ of this job's story.)
 |---|---|---|
 | `embedding_job_update` | Immediately on connect — a snapshot of the job's state right now (re-reads the same `AsyncResult` Test 10's `status/{job_id}` polls) | `state` always; if already terminal: `rows_processed`/`vectors_deleted` (SUCCESS) or `error` (FAILURE) — same shape as the status endpoint |
 | `embedding_job_update` | The worker picked the job up and started running it | `action` (`create`\|`update`\|`recreate`\|`delete`) |
-| `embedding_job_update` | The worker finished one group, mid-sweep (only on a multi-group call, e.g. `update` with no `group`) | `action`, `group`, `rows` (rows processed for that one group) |
+| `embedding_job_update` | The worker finished one group. Fires once **per group processed, including a single-group call** — so the worked `recreate` on `control_library` below produces one | `action`, `group`, `rows` (rows processed for that one group) |
+| `embedding_job_update` | An `LLMSlotUnavailable` autoretry was scheduled — **non-terminal**, the stream stays open and the job will run again | `state: "RETRY"`, `action`, `error` |
 | `embedding_job_update` | Terminal — the job finished; the stream ends right after this frame | `action`, plus `rows_processed`/`vectors_deleted` (SUCCESS) or `error` (FAILURE) |
 | `heartbeat` | Periodically, proving the line is alive | `job_id`, `ts` |
 
@@ -3196,8 +3505,8 @@ curl -s "http://localhost:8000/v1/tsg/grounding/threshold" \
 SELECT TOP 1 RunID, Status, EmbeddingModel, RerankerModel, MatchTh, Quality, FinishedAt
 FROM Grounding_Calibration_Run
 WHERE EmbeddingModel = 'multilingual-e5-large' AND RerankerModel = 'bge-reranker-v2-m3'
-  AND Status = 'success'
-ORDER BY FinishedAt DESC;
+  AND Status = 'success' AND MatchTh IS NOT NULL
+ORDER BY StartedAt DESC;
 -- If origin came back "env_pinned" or "static_default" instead, this query returns no rows
 -- for the current model pair — nothing has ever been calibrated for it.
 ```
@@ -3247,9 +3556,13 @@ The body is optional — omitting it entirely, or sending `{}`, behaves the same
 `run_id` is `Grounding_Calibration_Run.RunID` — permanent, and what `GET /calibrations`
 reports. Poll either Test 10e or watch Test 10f for the outcome.
 
-**Without `force`, a pair that already has a successful run is a safe no-op** — the sweep
-still runs but reports `skipped: "already_calibrated"` rather than re-measuring. Send
-`force: true` to overwrite it deliberately (e.g. after curating the library).
+**Without `force`, a pair that already has a successful run is a safe no-op** — and the sweep
+does **not** run. The task looks up the newest successful run, closes its own ledger row as
+`skipped`, publishes `SUCCESS` with `skipped: "already_calibrated"` and returns *before*
+`grounding.calibrate` is ever called: no paraphrases, no LLM spend, no phase ticks, and it
+finishes in seconds rather than 10-15 minutes. Send `force: true` to genuinely re-measure (e.g.
+after curating the library). Note the ledger records this as `skipped`, never `success` — a
+calibration that did not happen must not read as one.
 
 **Why a `409` and not a queued-behind-it retry?** The ledger row is opened BEFORE the task is
 queued, and a unique index (`UX_GroundingCalibration_Running`, filtered on `Status='running'`)
@@ -3395,15 +3708,23 @@ curl -s "http://localhost:8000/v1/tsg/grounding/calibrate/status/6ba7b810-9dad-1
 
 **Responses you can get:**
 
+Every reply carries all thirteen keys, in this order, with `null` standing in for whatever
+does not yet apply — nothing is ever omitted:
+
 ```json
 // still measuring — a worker has picked it up
-200 {"state": "STARTED"}
+200
+{
+  "state": "STARTED", "match_th": null, "quality": null, "negatives": null,
+  "positives": null, "highest_negative": null, "lowest_positive": null,
+  "near_duplicates": [], "run_id": null, "embedding_model": null,
+  "reranker_model": null, "skipped": null, "error": null
+}
 
 // finished — a real cutoff was found
 200
 {
   "state": "SUCCESS",
-  "run_id": "0f8fad5b-d9cb-469f-a165-70867728950e",
   "match_th": 86.25,
   "quality": 0.94,
   "negatives": 100,
@@ -3411,6 +3732,7 @@ curl -s "http://localhost:8000/v1/tsg/grounding/calibrate/status/6ba7b810-9dad-1
   "highest_negative": 99.5,
   "lowest_positive": 71.2,
   "near_duplicates": [],
+  "run_id": "0f8fad5b-d9cb-469f-a165-70867728950e",
   "embedding_model": "multilingual-e5-large",
   "reranker_model": "bge-reranker-v2-m3",
   "skipped": null,
@@ -3418,14 +3740,42 @@ curl -s "http://localhost:8000/v1/tsg/grounding/calibrate/status/6ba7b810-9dad-1
 }
 
 // finished — no cutoff beat chance for this model pair (still SUCCESS, not a failure)
-200 {"state": "SUCCESS", "run_id": "...", "match_th": null, "quality": null, "skipped": null, "error": null}
+200
+{
+  "state": "SUCCESS", "match_th": null, "quality": null, "negatives": 100,
+  "positives": 200, "highest_negative": 99.5, "lowest_positive": 71.2,
+  "near_duplicates": [], "run_id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+  "embedding_model": "multilingual-e5-large", "reranker_model": "bge-reranker-v2-m3",
+  "skipped": null, "error": null
+}
 
 // finished — declined to re-measure (a successful run already existed and force wasn't set)
-200 {"state": "SUCCESS", "run_id": "...", "skipped": "already_calibrated", "match_th": 86.25, "error": null}
+200
+{
+  "state": "SUCCESS", "match_th": 86.25, "quality": null, "negatives": null,
+  "positives": null, "highest_negative": null, "lowest_positive": null,
+  "near_duplicates": [], "run_id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+  "embedding_model": "multilingual-e5-large", "reranker_model": "bge-reranker-v2-m3",
+  "skipped": "already_calibrated", "error": null
+}
 
 // failed
-200 {"state": "FAILURE", "error": "..."}
+200
+{
+  "state": "FAILURE", "match_th": null, "quality": null, "negatives": null,
+  "positives": null, "highest_negative": null, "lowest_positive": null,
+  "near_duplicates": [], "run_id": null, "embedding_model": null,
+  "reranker_model": null, "skipped": null,
+  "error": "LLMSlotUnavailable: no slot for the paraphrase batch after 3 retries"
+}
 ```
+
+**A FAILURE reply looks different depending on WHICH source answered it**, and the two are
+mutually exclusive — do not expect a blend of the two. While the Celery job marker is still
+alive (roughly the first hour) the reply comes from `AsyncResult` and carries only `state` and
+`error`; `run_id`, `embedding_model` and `reranker_model` are all `null`, as above. Once the
+marker expires the ledger fallback answers instead, and that reply carries `run_id` **and** both
+model names, because those columns are written when the row is created.
 
 `state == "SUCCESS"` with `match_th: null` is a real, meaningful outcome, not a bug: the
 sweep ran and genuinely found that no cutoff separates real matches from impostors better
@@ -3531,6 +3881,7 @@ event's `match_th`/`quality`/`error` match the ledger row it names.
 |---|---|
 | Missing/wrong `X-Admin-Key`, or missing `X-API-Key`/`X-User-Id` | `401`, rejected before the stream opens |
 | Unknown or fully-expired `job_id` | `404`, rejected before the stream opens |
+| The process is already at its SSE concurrency cap (shared by every SSE route, session streams included) | `503 sse_capacity_exceeded` with a `Retry-After` header, rejected before the stream opens |
 
 **Pass if:** the snapshot event arrives immediately, progress ticks match what Test 10e shows
 mid-sweep, the stream closes itself on the terminal event, and heartbeats keep coming while
@@ -3549,8 +3900,13 @@ it's still open.
 
 **Auth:** every route on this router carries the router-level admin gate — `X-Admin-Key` must exactly match the server's configured admin key — plus `get_admin_principal`: `X-API-Key` (a valid, hashed client key) and `X-User-Id` (required, non-blank — it becomes the audited actor in logs and the Celery shadow label). `X-Entity-Id` is not read at all here (no admin route scopes to an entity); `X-Tenant-Id` is accepted and bound to the log context if sent, but never required and never read by any admin handler — the intel cache is shared, cross-tenant data.
 
-**Prerequisites:** the scheduled (daily) path needs `TSG_INTEL_ENABLED=true`
-and `celery beat` running. The refresh endpoints here work regardless of the schedule.
+**Prerequisites.** The refresh endpoints below work on their own and need no scheduler. There
+is **no scheduled refresh at all by default**: the beat entry is registered only when
+`TSG_INTEL_REFRESH_INTERVAL_SECONDS > 0`, which defaults to `0` (and values between 1 and 899
+are rejected outright), so you also need `celery beat` running and an interval of at least 900.
+Nothing is "daily" unless you set `86400`. **`TSG_INTEL_ENABLED` does not gate any of this** —
+despite the name, it controls only whether intel is injected into the AI's prompts, and never
+whether feeds refresh.
 
 **Input (complete requests):**
 
@@ -3675,6 +4031,14 @@ curl -s "http://localhost:8000/v1/tsg/threat-intel/items?source=otx&limit=50&off
 
 No body. `source` is optional — one of `cisa_kev`, `cisa_ics`, `otx`, `urlhaus`, `taxii`; omit it for every feed interleaved. `limit` defaults to 50 (1–500), `offset` defaults to 0.
 
+Four of the fourteen fields are sparse by source, not optional on the wire — every item
+carries all fourteen. `scope_tags` holds canonical scope keys the source tagged
+(`sector:energy`, `country:united arab emirates`) and is what the prompt's scope tier
+matches on by equality. `summary` is the source's own one-line summary and is emitted into
+the prompt for CISA-authored kinds only. `severity` is the max CVSS base score, published
+by ICS advisories only. `cwes` lists the weakness ids the source names. An OTX pulse
+legitimately shows `[]`/`""`/`null` for all four.
+
 **Output (complete response):**
 
 ```json
@@ -3689,7 +4053,11 @@ No body. `source` is optional — one of `cisa_kev`, `cisa_ics`, `otx`, `urlhaus
       "url": "https://otx.alienvault.com/pulse/6a6c1a2b3c4d5e6f7a8b9c0d",
       "tags": ["armored likho", "stealer"],
       "fetched_at": "2026-08-31T07:44:27Z",
-      "published_at": "2026-08-30T21:10:00Z"
+      "published_at": "2026-08-30T21:10:00Z",
+      "scope_tags": [],
+      "summary": "",
+      "severity": null,
+      "cwes": []
     },
     {
       "source": "cisa_kev", "kind": "cve",
@@ -3700,7 +4068,11 @@ No body. `source` is optional — one of `cisa_kev`, `cisa_ics`, `otx`, `urlhaus
       "url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
       "tags": [],
       "fetched_at": "2026-08-31T03:00:00Z",
-      "published_at": "2026-08-29T00:00:00Z"
+      "published_at": "2026-08-29T00:00:00Z",
+      "scope_tags": ["sector:energy", "country:united arab emirates"],
+      "summary": "Improper authentication in Example Corp Gateway allows remote takeover.",
+      "severity": 9.8,
+      "cwes": ["CWE-287"]
     }
   ],
   "total": 1655,
@@ -3783,10 +4155,16 @@ The first frame is always a connect-time snapshot read straight from the Celery 
 | `PENDING` | connect-time snapshot only — queued, not yet picked up by a worker | no | — |
 | `STARTED` | snapshot if a worker is already running it; otherwise a live event once one picks it up | snapshot: no · live: yes | — |
 | `RETRY` | live only — a transient fetch error; autoretry **will** run again (non-terminal, stream stays open) | yes | `error` |
-| `SUCCESS` | terminal — the refresh finished | yes | `item_count` |
-| `FAILURE` | terminal — retries exhausted | yes | `error` |
+| `SUCCESS` | terminal — the refresh finished | **live: yes · snapshot: no** | `item_count` |
+| `FAILURE` | terminal — retries exhausted | **live: yes · snapshot: no** | `error` |
 
 `item_count` and `error` are present only on the event that actually carries them for that `state` — there's no `null` placeholder for the field that doesn't apply.
+
+**`feed` is absent on every connect-time snapshot, terminal ones included.** The snapshot is
+built from Celery's result backend, which knows the state and the result payload but not which
+feed the job was for. So the "connect to an already-finished job" case in step 2 below gives you
+a `SUCCESS` frame with `item_count` and **no `feed`**. Only frames the worker itself published
+while running carry `feed`.
 
 **How to test:**
 
@@ -3999,6 +4377,8 @@ path — revoke this client and create a new one.
 2. Repeat with the same `client_id` → `409 Conflict` ("client_id '...' already exists").
 3. Omit `X-User-Id` (or send it blank) → `400` ("X-User-Id header is required").
 4. Omit or send a wrong `X-Admin-Key` → `401`.
+5. Violate a length bound → plain `422 validation_error`: `client_id` is 1–100 chars, `name`
+   1–200, `module` 1–50. All three are required.
 
 **Verify in the database:**
 
@@ -4141,19 +4521,25 @@ client that doesn't exist) both return a clean `404` instead of a 500.
 ### The four rules (again — they explain most "weird" behavior)
 
 1. **`202` = "working on it", not "done."** Only the board (Test 2) says it finished.
-2. **Nothing is ever deleted.** Filter `Superseded=0` for scenarios; `IsDeleted=0` for library rows.
+2. **Nothing is ever deleted.** Filter `Superseded=0` for scenarios — but `(Superseded=0 OR Accepted=1)` whenever accepted rows matter, since an accept survives a later regenerate (Test 3). `IsDeleted=0` for library rows.
 3. **The reaper acts alone.** State changes with no API call = the janitor, not a bug.
 4. **`ActorUserID` = who's accountable, `ActorType` = who pressed the button — but only on rows a human actually caused.** Everything the pipeline writes on its own has `ActorUserID = NULL` and `ActorType = 'system'`. A `NULL` here is information ("the pipeline did this"), not a gap.
 
 ### Error code quick reference
 
-Verified against every exception handler in `app/api/errors.py` — this is the complete list, not a sample.
+Verified against every exception handler in `app/api/errors.py`, the one error raised ahead of
+them by middleware, and the codes derived from a bare `HTTPException` status — this is the
+complete list, not a sample. The derived ones (`bad_request`, `conflict`, `method_not_allowed`,
+`service_unavailable`) come from the HTTP status phrase rather than a typed handler, so they
+never carry `details`.
 
 | error_code | HTTP | When you'll see it |
 |---|---|---|
 | `unauthorized` | 401 | bad, missing, or expired `X-API-Key` / `X-Admin-Key` |
-| `forbidden` | 403 | authenticated, but not entitled to this entity's data |
+| `forbidden` | 403 | authenticated, but not entitled to this entity's data. This is the wire value; `EntityForbidden` is only the Python class name |
+| `bad_request` | 400 | creating or revoking an API client without `X-User-Id`. Note it is a `400`, not a `401` — the header is for attribution there, not authentication |
 | `not_found` | 404 | unknown session / scenario / job / client id, or a row you can't see |
+| `method_not_allowed` | 405 | right path, wrong verb. Derived from the HTTP status itself, and the reply carries an `Allow` header naming the verbs that do work |
 | `active_session_exists` | 409 | creating a second session for an asset that already has one active (`details.active_session_id`) |
 | `idempotency_key_conflict` | 409 | reusing an `Idempotency-Key` with a different body |
 | `regenerate_conflict` | 409 | regenerate/next-set at the wrong stage, or on a bad `scenario_id` (`details.reason`) |
@@ -4163,9 +4549,12 @@ Verified against every exception handler in `app/api/errors.py` — this is the 
 | `treatment_conflict` | 409 | any treatment-plan gate refusal (`details.reason` is a `TreatmentGateReason`) |
 | `embedding_busy` | 409 | a concurrent admin recreate/delete already holds this embedding group's lock |
 | `calibration_running` | 409 | a grounding calibration for this model pair is already running (`details.run_id`) |
+| `conflict` | 409 | creating an API client whose `client_id` already exists. Status-derived, so no `details` — distinct from the typed 409s above |
 | `admin_validation_error` | 422 | a structurally-valid but business-rule-invalid admin body |
-| `validation_error` | 422 | plain request-shape validation failure (missing/malformed field) |
+| `validation_error` | 422 | plain request-shape validation failure (missing/malformed field); `details.errors` lists every offending field |
+| `payload_too_large` | 413 | request body over 16 MB. Raised by `BodySizeLimitMiddleware` **before** the error handlers run, so it is the one error that never carries a `details` key. A chunked upload with no declared length slips past it |
 | `capacity_exceeded` / `llm_slot_unavailable` / `sse_capacity_exceeded` | 503 | the pipeline, the LLM slot pool, or the SSE stream pool is at its configured limit — retry after the `Retry-After` header |
+| `service_unavailable` | 503 | a dependency the handler needed was unreachable: the Celery broker when enqueuing a session, regeneration or treatment plan, or the intel store on `GET /v1/tsg/threat-intel/items`. Status-derived, so no `details` and **no `Retry-After`**, unlike the three above |
 | `internal_error` | 500 | unhandled exception — always logged server-side with a `request_id` you can grep for |
 
 Two error codes from earlier guides no longer exist: `library_conflict` (belonged to the manual-editing API, which is gone — see "What happened to Tests 11, 12, 14 and 15?") and `reject_conflict` (reject reuses `accept_conflict`, it never had its own code).
@@ -4177,7 +4566,8 @@ Two error codes from earlier guides no longer exist: `library_conflict` (belonge
 | 1–9b (everything under `/v1/sessions`, `/v1/users`, `/v1/entities/{id}/scenarios`) | `X-API-Key` + `X-User-Id` + `X-Entity-Id` + `X-Tenant-Id` (all four, via `get_principal`) |
 | 7b–7l (treatment plans) | Same four — treatment routes sit on the same `/v1` auth, gated additionally by `settings.risk_module_enabled` |
 | 10, 10a (embeddings), 10b–10f (grounding), 13/13a/13b (intel) | `X-Admin-Key` (router-level) **plus** `X-API-Key` + `X-User-Id` (`get_admin_principal`) — no `X-Entity-Id` needed |
-| 16a–16c (API clients) | `X-Admin-Key` (router-level) **plus** `X-User-Id` only |
+| 16a, 16c (create / revoke an API client) | `X-Admin-Key` (router-level) **plus** `X-User-Id`, which is for attribution, not authentication — blank gives `400`, not `401` |
+| 16b (list API clients) | `X-Admin-Key` only — it is a read, and takes no `X-User-Id` at all |
 | 16 (health) | none |
 
 ### Results checklist (fill in as you go)

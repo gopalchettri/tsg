@@ -411,6 +411,23 @@ def accepted(col) -> Any:
     return and_(col == bindparam("acc", 1, literal_execute=True), hash_col.is_not(None))
 
 
+def rejected(col) -> Any:
+    """`RejectedAt IS NOT NULL` — the reject-side twin of `accepted()`.
+
+    Why it exists: a human decision must not vanish because somebody regenerated afterwards.
+    `/results` already re-adds the ACCEPTED row for exactly that reason; a rejection is the same
+    kind of fact, and its absence was the asymmetry — a declined scenario silently dropped out of
+    the default view the moment it was superseded, while an accepted one stayed.
+
+    No `literal_execute` dance here, unlike active()/accepted(): `IS NOT NULL` carries no
+    parameter at all, so the predicate is already constant and matches
+    IX_Scenario_RejectedDecision (`WHERE RejectedAt IS NOT NULL`) without help. That index is
+    REQUIRED — Threat_Scenario has no unfiltered SessionID index, so without it this seek
+    degrades into the polled-endpoint table scan _ancestry's docstring outlaws.
+    See scripts/TSG_Migration_RejectedDecisionIndex.sql."""
+    return col.is_not(None)
+
+
 def session_active() -> Any:
     """`SessionStatus = 'active'` rendered INLINE — the SessionStatus analog of `active()`: the
     same cached-plan rule means a parameterized `SessionStatus = @P` can never match the filtered
@@ -1993,6 +2010,25 @@ def control_mapping_progress(sess: Session, session_id: str) -> str:
     return str(ControlMappingStatus.COMPLETE if mapped >= total else ControlMappingStatus.RUNNING)
 
 
+def subsystem_lock_is_held(sess: Session, session_id: str, subsystem_id: int) -> bool:
+    """True while a regenerate / accept / next-set still holds this subsystem's mutex.
+
+    Exists because the two "what did my click do?" board fields are published from audit rows
+    that cascade.py commits INSIDE `with _subsystem_lock(...)` -- so the epoch a client is told
+    to poll for became visible while the lock was still held, and the client's very next call
+    got `409 ... is locked`. The published signal has to mean "done AND you may act", so
+    build_board suppresses both summaries while this returns True. Same LOCK row the write side
+    checks (sessions.py::_do_next_set, accept.py), read-only.
+    """
+    return sess.execute(
+        select(m.Subsystem_Stage_State.Status).where(
+            m.Subsystem_Stage_State.SessionID == session_id,
+            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK,
+        )
+    ).scalar() == StageStatus.RUNNING
+
+
 def latest_regen_outcome(sess: Session, session_id: str, subsystem_id: int) -> dict | None:
     """DetailJSON of the newest `regeneration_completed` audit row, backing
     SessionProgress.last_regen — the durable mirror of the SSE `regen_result` event, same
@@ -2034,10 +2070,11 @@ def _find_active_id_by_norm_name(sess: Session, model, pk_col, name_col, name: s
     """The single implementation behind the three by-normalized-name lookups.
 
     The comparison runs in PYTHON, not SQL: MSSQL has no equivalent of the NFKD fold or the
-    letter/digit split, so this reads the active rows and folds them in memory. Affordable
-    because these tables are curated and small (27 types, 9 actors seeded)
-    and because it runs only on the path that is about to CREATE a master row — a threat whose
-    id generation already resolved never reaches here.
+    letter/digit split, so this reads the live rows and folds them in memory. It runs only on the
+    path that is about to CREATE a master row — a threat whose id generation already resolved
+    never reaches here — and only over Threat_Type / Threat_Actor, its two callers below.
+    (Threat_Catalogue is NOT read here: find_catalogue_id_by_norm_name handles it, scoped to a
+    single type.)
 
     Returns an id ONLY on an unambiguous single match — same contract as
     find_active_type_id_by_name: if two active rows already share a normalized name (possible on
@@ -2098,13 +2135,26 @@ def find_actor_id_by_norm_name(sess: Session, name: str) -> int | None:
         sess, m.Threat_Actor, m.Threat_Actor.ThreatActorID, m.Threat_Actor.ThreatActorName, name)
 def upsert_threat_type(sess: Session, name: str, category_id: int | None,
                     source: str = "ai_auto_promoted",
-                    created_by: str | None = None) -> tuple[int, bool]:
+                    created_by: str | None = None,
+                    is_active: bool = False) -> tuple[int, bool]:
     """Insert-if-not-exists on `UX_ThreatType_NaturalKey`; returns (winning ThreatTypeID, created).
 
     `source`/`created_by` are FIRST-WRITER provenance: the collision branch never writes Updated*,
     because re-asserting a row is not an edit. No sector: SectorID is unmapped (sector logic
     removed 2026-08, user instruction), and no description: Threat_Type.Description was
-    removed as unused."""
+    removed as unused.
+
+    `is_active` is the ROW'S VISIBILITY POLICY, and it belongs to the caller because the two
+    callers want opposite things. Default False (unchanged): an AI promotion is not yet
+    curator-reviewed, so it must not be trusted as ground truth by grounding/matching, which
+    filter IsActive=True. A CURATED bulk import (app/intel/library_import.py) passes True —
+    those rows are published library content, and inserting them pending would add threats
+    retrieval can never return while reporting success. Hardcoding False here forced every such
+    caller into an INSERT-then-UPDATE dance; stating intent at the insert removes that class of
+    bug rather than making each caller remember to undo it.
+
+    Note this only governs rows this call CREATES. An existing row keeps its own IsActive: the
+    upsert is first-writer, so an import must never flip a curator's pending row to live."""
     # Bound to ThreatTypeName's real column width (Unicode(300)) before the INSERT: an over-long
     # name raises DataError, NOT the IntegrityError caught here, so it would abort the whole
     # accept-session transaction.
@@ -2120,11 +2170,11 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None,
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Type).values(
                 ThreatTypeName=name, ThreatCategoryID=category_id,
-                # PENDING, not live: an AI-promoted type is not yet curator-reviewed, so it must
-                # not be trusted as ground truth for future grounding/matching (which filters to
-                # IsActive=True). threat_type_active/find_type_id_by_norm_name read IsDeleted only,
-                # so this row still counts as "exists" for promote's own reuse/idempotency.
-                IsActive=False, IsDeleted=False, Source=source,
+                # Caller-declared visibility (see the docstring): False = PENDING, the default
+                # for an AI promotion awaiting curator review; True = a curated import's
+                # published row. threat_type_active/find_type_id_by_norm_name read IsDeleted only,
+                # so a pending row still counts as "exists" for promote's own reuse/idempotency.
+                IsActive=is_active, IsDeleted=False, Source=source,
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res), True
     except IntegrityError:
@@ -2145,7 +2195,8 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None,
 
 def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
                             source: str = "promote-api",
-                            created_by: str | None = None) -> tuple[int, bool]:
+                            created_by: str | None = None,
+                            is_active: bool = False) -> tuple[int, bool]:
     """Insert-if-not-exists on Threat_Catalogue; returns (winning ThreatCatalogueID, created).
 
     NAME-ONLY collision recovery, mirroring upsert_threat_type exactly: the recovery predicate
@@ -2155,16 +2206,19 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
     (find_catalogue_id_by_norm_name, type-scoped); this function only mints. No sector —
     SectorID stays unmapped and NULL (sector logic removed 2026-08, user instruction), and no
     description — Threat_Catalogue.Description was removed as unused, so the promoted row now
-    carries its name alone."""
+    carries its name alone.
+
+    `is_active`: see upsert_threat_type — same caller-declared visibility policy, same default,
+    and the same rule that an EXISTING row keeps whatever IsActive it already had."""
     name = name[:500]
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Catalogue).values(
                 ThreatTypeID=type_id, ThreatName=name,
-                # PENDING, not live — see upsert_threat_type's matching comment: not yet
-                # curator-reviewed, invisible to grounding/matching until approved, but still
-                # counts as "exists" for promote's own reuse via IsDeleted-only checks.
-                IsActive=False, IsDeleted=False, Source=source,
+                # Caller-declared visibility — see upsert_threat_type's matching comment. A
+                # pending row is invisible to grounding/matching until approved, but still counts
+                # as "exists" for promote's own reuse via IsDeleted-only checks.
+                IsActive=is_active, IsDeleted=False, Source=source,
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res), True
     except IntegrityError:

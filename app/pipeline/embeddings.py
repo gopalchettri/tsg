@@ -14,7 +14,6 @@ cold-start latency becomes a real problem.
 from __future__ import annotations
 
 import hashlib
-import threading
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -22,8 +21,6 @@ from functools import lru_cache
 from types import ModuleType
 from typing import Any
 
-from redis.exceptions import LockNotOwnedError
-from redis.lock import Lock
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -36,6 +33,7 @@ except ImportError:  # pragma: no cover — exercised only in numpy-less deploym
     _np = None
 
 from app.core.config import get_settings
+from app.core.joblock import job_lock
 from app.core.logging import get_logger
 from app.db import models as m
 from app.db.dal import now
@@ -537,64 +535,22 @@ def _active_names(sess: Session, table, name_col) -> list[str]:
                 limit=limit, skipped=len(oversized), samples=oversized[:3])
     return names
 
-def _renew_group_lock_loop(lock: Lock, interval: float, stop_event: threading.Event) -> None:
-    """Refreshes the group lock's TTL every `interval` seconds, so a slow embed call doesn't
-    outlive the lock's fixed TTL and have it expire mid-operation. Same idea as llm.py's
-    _heartbeat_loop.
-
-    Runs on a separate thread from the one that called lock.acquire() — thread_local=False on
-    the Lock (see _group_lock) is what lets this thread see the same ownership token.
-    """
-    while not stop_event.wait(interval):
-        try:
-            lock.extend(lock.timeout, replace_ttl=True)  # reset to the full TTL, not additive
-        except LockNotOwnedError:  # a stale timeout already let a different caller acquire
-            pass
-        except Exception:
-            log.warning("embeddings.group_lock_renewal_failed", exc_info=True)
-
-
 @contextmanager
 def _group_lock(group: str):
-    """Serializes recreate_group/delete_group per group via a Redis lock. Without it, two
-    concurrent admin calls on the same group would both wipe then both re-embed (redundant
-    paid LLM calls) — the second caller gets EmbeddingBusy (409) instead of racing.
+    """Serializes recreate_group/delete_group per group. Without it, two concurrent admin calls
+    on the same group would both wipe then both re-embed (redundant paid LLM calls) -- the second
+    caller gets EmbeddingBusy (409) instead of racing.
 
-    Fails open if Redis is unreachable, same as the LLM-slot limiter: this only guards against
-    redundant cost, not correctness, so availability wins.
+    The mechanics (ownership token, heartbeat renewal, release ordering, fail-open on an
+    unreachable Redis) now live in app/core/joblock.py, extracted so the library-import path uses
+    the SAME implementation instead of a second copy that would drift. This wrapper keeps the key
+    prefix, TTL setting and EmbeddingBusy contract it always had.
     """
-    ttl = get_settings().embedding_group_lock_ttl_seconds  # must stay int — redis-py rejects a float for ex=/EXPIRE
-    key = f"tsg:embed-lock:{group}"
-    try:
-        # thread_local=False: the heartbeat thread below must see the same ownership token the
-        # acquiring thread set, or every renewal tick raises LockNotOwnedError.
-        lock = Lock(_slot_redis(), key, timeout=ttl, thread_local=False)
-        acquired = lock.acquire(blocking=False)
-    except Exception:
-        log.warning("embeddings.group_lock_redis_unavailable_fail_open", group=group, exc_info=True)
+    with job_lock(f"tsg:embed-lock:{group}",
+                ttl=get_settings().embedding_group_lock_ttl_seconds,  # int: redis-py rejects a float for ex=
+                busy=EmbeddingBusy(f"group {group!r} is already being recreated/deleted"),
+                redis_factory=lambda: _slot_redis()):
         yield
-        return
-    if not acquired:
-        raise EmbeddingBusy(f"group {group!r} is already being recreated/deleted")
-    stop_event = threading.Event()
-    # plain threading.Thread, not gevent.spawn — same portability reasoning as llm.py's _llm_slot
-    hb_thread = threading.Thread(
-        target=_renew_group_lock_loop, args=(lock, ttl / 3, stop_event),
-        daemon=True)
-    hb_thread.start()
-    try:
-        yield
-    finally:
-        # stop the renewal thread before releasing — otherwise an in-flight renewal tick
-        # could re-extend a lock we just released
-        stop_event.set()
-        hb_thread.join(timeout=ttl)
-        try:
-            lock.release()
-        except LockNotOwnedError:  # already lost ownership to a stale-timeout retry
-            pass
-        except Exception:  # best-effort release; the TTL is the backstop
-            log.warning("embeddings.group_lock_release_failed", group=group, exc_info=True)
 
 
 class EmbeddingGroupsFailed(Exception):

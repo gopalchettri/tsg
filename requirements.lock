@@ -92,6 +92,8 @@ greenlet==3.5.5
     #   sqlalchemy
 gunicorn==26.2.0
     # via tsg (pyproject.toml)
+ijson==3.5.1
+    # via -r requirements.txt
 h11==0.16.0
     # via
     #   httpcore

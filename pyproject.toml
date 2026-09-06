@@ -17,6 +17,14 @@ dependencies = [
   "pyjwt[crypto]>=2.13.0",     # resource-server JWT validation only 
   "litellm>=1.95.0",
   "pymongo>=4.17.0",
+  "ijson>=3.4",             # streaming JSON: ATT&CK is 51MB and grows; see app/intel/library_import.py
+  # Declared because app/ imports them DIRECTLY, not merely because something else pulls them
+  # in. They arrive today via fastapi (starlette, anyio) and litellm (openai), so nothing is
+  # installed that was not already there -- but an undeclared transitive import breaks the day
+  # the parent drops it, and that is the same failure class as the missing ijson above.
+  "starlette>=0.47",          # app/core/middleware.py, app/api/errors.py, admin_sse.py
+  "anyio>=4.0",               # app/sse/bus.py
+  "openai>=1.0",              # app/pipeline/llm.py (strict-schema conversion)
   "structlog>=26.1.0",
   "flower>=2.0.1",
   # prometheus-client removed: it was declared but never imported, and no /metrics route exists

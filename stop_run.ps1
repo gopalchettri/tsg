@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     Delegates the actual killing to stop.ps1 -- which takes down the tsg-api /
-    tsg-celery / tsg-beat process trees -- then VERIFIES they are gone. stop.ps1
+    tsg-celery / tsg-celery-admin / tsg-beat process trees -- then VERIFIES they
+    are gone. stop.ps1
     fires taskkill and prints "Done." without checking anything, so a survivor
     (a child that outlived its wrapper, a uvicorn still holding the port) would
     be reported as a clean stop and only surface as a confusing "port in use" on
@@ -58,7 +59,15 @@ $relevantProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
 $verifyTargets = [ordered]@{
     'tsg-api'    = @("'tsg-api'")
     'tsg-celery' = @("'tsg-celery'", 'celery_worker.celery_app worker')
+    # Mirror of stop.ps1's $targets: the admin-queue worker matches neither the tsg-celery
+    # window ('tsg-celery-admin' has no trailing quote after tsg-celery) nor celery_worker
+    # (it runs celery_app). Without it, a surviving admin worker would pass this verification
+    # unnoticed. '-Q admin' is unique to it.
+    'tsg-celery-admin' = @("'tsg-celery-admin'", '-Q admin')
     'tsg-beat'   = @("'tsg-beat'", 'celery_app.celery_app beat')
+    # stop.ps1 kills Flower but this verification list never checked for it, so a surviving
+    # Flower passed the check silently. Mirror stop.ps1's own $targets exactly.
+    'tsg-flower' = @("'tsg-flower'", 'celery_app.celery_app flower')
 }
 foreach ($label in $verifyTargets.Keys) {
     $matches = $verifyTargets[$label]
@@ -84,5 +93,5 @@ if ($stragglers) {
     throw "Stop incomplete (see above). Kill the listed PIDs by hand, then re-run."
 }
 
-Write-Host "  no tsg-api / tsg-celery / tsg-beat processes left; port $Port free." -ForegroundColor Green
+Write-Host "  no tsg-api / tsg-celery / tsg-celery-admin / tsg-beat processes left; port $Port free." -ForegroundColor Green
 Write-Host "  native services (Memurai / MongoDB / MSSQL`$SQLEXPRESS) left running by design." -ForegroundColor DarkGray

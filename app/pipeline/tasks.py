@@ -129,6 +129,8 @@ class _ScenarioBatch(NamedTuple):
     fold: _ScenarioFold
     entry_vocab: dict
     intel_terms: IntelTerms
+    # Resolved once per batch beside intel_terms; None = no asset preference.
+    technique_labels: list[str] | None = None
 
 class _Coverage(NamedTuple):
     vocab: dict
@@ -137,6 +139,9 @@ class _Coverage(NamedTuple):
     # Intel search terms from _intel_vocabulary. Defaults to None so old callers that don't
     # pass this still work — missing terms just mean "no intel block", not a crash.
     intel_terms: IntelTerms | None = None
+    # Technique families suiting this asset (_technique_asset_labels). None = no asset
+    # preference, which is also what the resolver returns for a partly representable asset.
+    technique_labels: list[str] | None = None
 
 
 def _flag_sibling_similarity(report: dict, scenario: dict, sibling_texts: list[tuple[int, str]],
@@ -301,6 +306,65 @@ def _fetch_intel(terms: IntelTerms | None, actors: list[str] | None = None,
         log.warning("scenario.intel_fetch_failed", exc_info=True)
         return None
 
+
+def _fetch_techniques(llm, threat_type: str | None, threat_name: str | None,
+                    category: str | None, *, asset_labels: list[str] | None = None,
+                    limit: int = 4) -> list[dict] | None:
+    """Published ATT&CK/CAPEC techniques nearest THIS threat, for prompts._technique_block.
+
+    Keyed on the threat, not the asset — that is the whole reason this corpus is separate from
+    the intel feed, whose product/scope tiers can never match a technique (see
+    app/intel/technique_reference's module docstring).
+
+    `asset_labels` is a SET of technique families, resolved once per batch by
+    _technique_asset_labels through the same rule the control filter uses. None means no asset
+    preference -- including the case where the asset's nature is only partly representable, which
+    must NOT narrow (see that helper). The STRIDE mask applies regardless.
+
+    Fail-open exactly like _fetch_intel: any failure returns None, no block is emitted, and the
+    prompt is byte-for-byte the pre-feature one."""
+    query = " ".join(p for p in (threat_type, threat_name) if p).strip()
+    if not query:
+        return None
+    try:
+        from app.intel.technique_reference import lookup
+
+        items = lookup(llm, query, stride=category, asset_labels=asset_labels, k=limit)
+        if items:
+            log.info("scenario.technique_reference_injected", threat_type=threat_type,
+                    stride=category, asset_labels=asset_labels,
+                    items=[i.get("id") for i in items])
+        return items or None
+    except Exception:
+        log.warning("scenario.technique_fetch_failed", exc_info=True)
+        return None
+
+def _technique_asset_labels(sess: Session, subsystems: list[dict], asset_context: dict) -> list[str] | None:
+    """Which technique families suit this session's asset, or None for "no preference".
+
+    Resolved through grounding.resolve_asset_labels -- the SAME rule the control-pool filter
+    uses -- against the vocabulary the technique corpus actually carries. That matters: the rule
+    returns None whenever any of the session's categories cannot be represented, so an asset that
+    is OT *and* Physical is never silently narrowed to OT-only. Narrowing on a partly
+    representable asset is a documented past defect, not a hypothetical, and hardcoding "OT" here
+    would have reintroduced it.
+
+    Computed ONCE per scenario batch and carried on _Coverage beside intel_terms, not per threat:
+    it costs a category query plus a corpus read."""
+    try:
+        from app.intel.technique_reference import corpus_vocabulary
+        from app.pipeline import grounding, threat_retrieval
+
+        return grounding.resolve_asset_labels(
+            sess,
+            threat_retrieval.session_category_ids(subsystems, asset_context),
+            corpus_vocabulary,
+            log_event="scenario.technique_category_without_vocabulary_no_filter")
+    except Exception:
+        log.warning("scenario.technique_labels_failed", exc_info=True)
+        return None
+
+
 def _ground_entry_points(scenario: dict, vocab: dict[str, int],
                         frozen: list[int] | None = None) -> None:
     """Resolves the AI's two returned lists against `vocab`, attaching real ids and enforcing
@@ -367,6 +431,8 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     cov = coverage or _Coverage(vocab={}, frozen=None, others=None)
     # Intel is matched using the tech-inventory terms from coverage, never threat wording.
     intel_items = _fetch_intel(cov.intel_terms, actors, limit=tn.prompt_intel_limit)
+    technique_items = _fetch_techniques(llm, threat_type, threat_name, category,
+                                        asset_labels=cov.technique_labels)
     # The set of IDs the model was allowed to cite. Left as None (not an empty set) when no
     # intel was sent at all, so validation skips the citation check instead of failing every id.
     injected_intel_ids = ({str(i.get("external_id")) for i in intel_items if i.get("external_id")}
@@ -374,14 +440,17 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     entry_labels = sorted(cov.vocab) if cov.vocab else None
     if sibling_texts:
         messages = prompts.variant_scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
-                                                intel_items=intel_items, existing=sibling_texts,
+                                                intel_items=intel_items,
+                                                technique_items=technique_items,
+                                                existing=sibling_texts,
                                                 entry_points=entry_labels,
                                                 sibling_k=tn.variant_sibling_prompt_k,
                                                 category=category)
     else:
         messages = prompts.scenario_prompt(base_ctx, threat_type, threat_name, actors=actors,
-                                        intel_items=intel_items, entry_points=entry_labels,
-                                        category=category)
+                                        intel_items=intel_items,
+                                        technique_items=technique_items,
+                                        entry_points=entry_labels, category=category)
     scenario, prov = _ask_ai(sess, llm, messages,
                             scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID, stage="scenario",
                             level=SubsystemLevel.SCENARIOS, epoch=epoch, task_id=task_id, expected_type=dict,
@@ -810,8 +879,9 @@ def _prepare_scenario_batch(sess: Session, sid: str, ss: int, scenario_session: 
                     subsystems=len(subsystems))
     fold = _fold_scenario_rows(dal.active_scenario_rows(sess, sid, ss))
     intel_terms = _intel_vocabulary(sess, subsystems, asset_context)
+    technique_labels = _technique_asset_labels(sess, subsystems, asset_context)
     return _ScenarioBatch(base_ctx, enriched, deduped, pairs, scoped_count, fold, entry_vocab,
-                        intel_terms)
+                        intel_terms, technique_labels)
 
 
 def _retire_prior_card(sess: Session, sid: str, ss: int, info: dict) -> str | None:
@@ -1045,7 +1115,8 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
                                 frozen=batch.fold.frozen_by_hash.get(identities[scoped_id]),
                                 others=[s for h, s in cross_pairs
                                         if h != identities[scoped_id]] or None,
-                                intel_terms=batch.intel_terms),
+                                intel_terms=batch.intel_terms,
+                                technique_labels=batch.technique_labels),
         }
         # correlation_id is passed as a LITERAL keyword at each call site, never through this
         # dict: scripts/test_pipeline_guards.py verifies the stamp by reading the AST, and a
@@ -1158,6 +1229,7 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
     # Variants skip _prepare_scenario_batch, so intel terms are resolved here instead using
     # the same shared helper — otherwise every variant would silently get no intel block.
     intel_terms = _intel_vocabulary(sess, subsystems, asset_context)
+    technique_labels = _technique_asset_labels(sess, subsystems, asset_context)
     threats = dal.active_threats(sess, sid, ss)
     enriched = {t["threat_id"]: t for t in threats}
     base_ctx = prompts.build_base_context(scenario_session["AssetName"], asset_context, subsystems)
@@ -1198,7 +1270,8 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
                         vocab=entry_vocab,
                         frozen=fold.frozen_by_hash.get(item["identity_hash"]),
                         others=[s for h, s in cross_pairs if h != item["identity_hash"]] or None,
-                        intel_terms=intel_terms),
+                        intel_terms=intel_terms,
+                        technique_labels=technique_labels),
                     correlation_id=scoped_id)
                 span = _stamp_generation_span(_started, _t)
         except LLMSlotUnavailable:

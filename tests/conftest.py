@@ -41,6 +41,7 @@ def _clear_process_caches() -> None:
     from app.core.config import get_settings
     from app.db import dal
     from app.db.engine import _sessionmaker, get_engine
+    from app.intel import technique_reference
     from app.pipeline import embeddings
     from app.sse import bus
 
@@ -53,6 +54,11 @@ def _clear_process_caches() -> None:
     embeddings._vector_store.cache_clear()
     embeddings._breaker_open_until = 0.0
     dal._clear_scope_type_entity_cache()
+    # technique_reference caches the WHOLE corpus in module globals for the life of the process.
+    # Left uncleared, one test that loads it decides what every later test sees: the corpus
+    # tests passed alone and failed in a full run the moment the live Mongo corpus stopped being
+    # empty. Same reason as every clear above -- process-lifetime state is not test state.
+    technique_reference._invalidate_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -71,6 +77,15 @@ def _no_external_embedding_store(monkeypatch):
     loses a race with a get_settings() cache rebuild. _store_if_healthy is the single seam both
     the L2 read and write tiers go through, and None is its first-class "store unavailable"
     answer, so this disables L2 without touching any other embedding behaviour."""
+    from app.intel import technique_reference
     from app.pipeline import embeddings
 
     monkeypatch.setattr(embeddings, "_store_if_healthy", lambda: None)
+    # technique_reference has its OWN _store_if_healthy over a different Mongo collection, and
+    # it was never covered by the stub above. That went unnoticed only while the live corpus
+    # happened to be empty: the moment a real rebuild published 900 documents, ten
+    # control-mapping tests started reading them, embedding them for real (the suite went from
+    # ~85s to ~500s) and failing. The rule is the one already stated above -- tests must NEVER
+    # reach a real Mongo store -- so it has to cover every seam that opens one, not just the
+    # first one that caused trouble.
+    monkeypatch.setattr(technique_reference, "_store_if_healthy", lambda name=None: None)

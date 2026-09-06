@@ -561,3 +561,28 @@ is healthy resilience; a flood means the main model is struggling.
 *This handbook encodes the verified deployment plan (3 adversarial review rounds, 46 findings
 resolved). The order of Parts B→C→D is deliberate and load-bearing: version-tag first,
 settings second, "latest" last — do not rearrange it.*
+
+## Two Celery workers, not one
+
+Heavy operator jobs run on a dedicated `admin` queue, separate from the queue users wait on.
+Routed in `app/pipeline/celery_app.py::task_routes`: technique rebuild, library import,
+embeddings actions, grounding calibration.
+
+**Why:** measured, not theoretical — a technique rebuild sharing the default queue dragged live
+scenario generation from ~355s to 967s, and was itself killed at its time limit.
+
+| Deployment | Command | Pool | Why |
+|---|---|---|---|
+| `celery-worker` | `-Q celery --pool=gevent --concurrency=10` | gevent | I/O-bound LLM/DB waits |
+| `celery-worker-admin` | `-Q admin --pool=prefork --concurrency=1` | prefork | CPU-bound parsing and local embedding; one at a time bounds memory |
+
+**`-Q celery` on the existing worker is load-bearing.** Without it that worker also drains the
+`admin` queue and the split does nothing.
+
+**If `celery-worker-admin` is not deployed**, the API still returns `202` for those four
+operations and they never run — no error, no timeout. `GET /ready` publishes `workers_admin`
+for exactly this reason; alert on it. `tests/test_queue_routing.py` fails the build if any
+launch surface (this file, `start.ps1`, either compose file, `deploy.yaml`) loses a consumer.
+
+Nothing about the API changes: these jobs are still started only through their existing
+endpoints, and the status/events routes look jobs up by id, which is queue-agnostic.

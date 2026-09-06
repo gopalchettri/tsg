@@ -43,4 +43,9 @@ uvicorn app.main:app --reload --port 8000
 # resolves to whatever global Python is on PATH -- which has celery but no gevent,
 # and dies with "ModuleNotFoundError: No module named 'gevent'" in celery_worker.py.
 # Activate (step 2) first, or call the venv's own exe explicitly:
-.venv\Scripts\celery.exe -A app.pipeline.celery_worker.celery_app worker -P gevent -c 50 -l info
+.venv\Scripts\celery.exe -A app.pipeline.celery_worker.celery_app worker -Q celery -P gevent -c 50 -l info
+
+# Second worker, for the `admin` queue (technique rebuild / library import / embeddings /
+# grounding calibration). Without -Q above, the pipeline worker drains this queue too.
+# -A celery_app, NOT celery_worker: gevent monkey-patching hangs a solo pool at boot.
+.venv\Scripts\celery.exe -A app.pipeline.celery_app.celery_app worker -Q admin -P solo -l info

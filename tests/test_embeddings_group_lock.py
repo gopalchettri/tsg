@@ -1,5 +1,12 @@
 """_group_lock's swap from a hand-rolled Redis SET/EXPIRE lock to redis.lock.Lock.
 
+The lock mechanics moved to app/core/joblock.py so the library-import path could reuse ONE
+implementation instead of a second copy that drifts; embeddings._group_lock is now a thin wrapper
+keeping its key prefix, TTL setting and EmbeddingBusy contract. These tests therefore patch
+joblock.log and assert joblock.* event names -- the BEHAVIOUR under test (fail-open, heartbeat
+ownership, logged-not-swallowed) is unchanged, only where it is implemented. embeddings._slot_redis
+is still the patch target, because the wrapper resolves it per call.
+
 No fakeredis dependency and no live Redis exists anywhere else in this suite (every other
 Redis-touching test either sets max_concurrent_llm_calls=0 to no-op _llm_slot, or monkeypatches
 it away entirely) -- so this pins the 3 correctness requirements the swap could silently get
@@ -26,6 +33,7 @@ import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.lock import Lock
 
+from app.core import joblock
 from app.core.config import get_settings
 from app.pipeline import embeddings
 
@@ -127,14 +135,14 @@ def test_fails_open_when_redis_is_unreachable(monkeypatch):
     warnings = []
     monkeypatch.setattr(embeddings, "_slot_redis",
                         lambda: (_ for _ in ()).throw(RedisConnectionError("no route to host")))
-    monkeypatch.setattr(embeddings.log, "warning", lambda event, **kw: warnings.append(event))
+    monkeypatch.setattr(joblock.log, "warning", lambda event, **kw: warnings.append(event))
 
     ran = False
     with embeddings._group_lock("g1"):
         ran = True
 
     assert ran  # the caller's body still runs -- availability wins over the guard
-    assert warnings == ["embeddings.group_lock_redis_unavailable_fail_open"]
+    assert warnings == ["joblock.redis_unavailable_fail_open"]
 
 
 def test_heartbeat_thread_extends_a_lock_it_did_not_itself_acquire(monkeypatch):
@@ -145,7 +153,7 @@ def test_heartbeat_thread_extends_a_lock_it_did_not_itself_acquire(monkeypatch):
     fake = _FakeRedis()
     warnings = []
     monkeypatch.setattr(embeddings, "_slot_redis", lambda: fake)
-    monkeypatch.setattr(embeddings.log, "warning", lambda event, **kw: warnings.append(event))
+    monkeypatch.setattr(joblock.log, "warning", lambda event, **kw: warnings.append(event))
 
     s = get_settings()
     key = _KEY.format("g2")
@@ -171,7 +179,7 @@ def test_lost_ownership_mid_hold_degrades_gracefully(monkeypatch):
     fake = _FakeRedis()
     warnings = []
     monkeypatch.setattr(embeddings, "_slot_redis", lambda: fake)
-    monkeypatch.setattr(embeddings.log, "warning", lambda event, **kw: warnings.append(event))
+    monkeypatch.setattr(joblock.log, "warning", lambda event, **kw: warnings.append(event))
 
     s = get_settings()
     with pytest.MonkeyPatch.context() as mp:
@@ -190,7 +198,7 @@ def test_second_concurrent_acquire_on_the_same_group_raises_embedding_busy(monke
     second, concurrent call, so this is the only test that actually exercises that path."""
     fake = _FakeRedis()
     monkeypatch.setattr(embeddings, "_slot_redis", lambda: fake)
-    monkeypatch.setattr(embeddings.log, "warning", lambda event, **kw: None)
+    monkeypatch.setattr(joblock.log, "warning", lambda event, **kw: None)
 
     with embeddings._group_lock("g4"):
         with pytest.raises(embeddings.EmbeddingBusy):
@@ -206,7 +214,7 @@ def test_unexpected_error_during_renewal_is_logged_not_swallowed(monkeypatch):
     fake = _FakeRedis()
     warnings = []
     monkeypatch.setattr(embeddings, "_slot_redis", lambda: fake)
-    monkeypatch.setattr(embeddings.log, "warning", lambda event, **kw: warnings.append(event))
+    monkeypatch.setattr(joblock.log, "warning", lambda event, **kw: warnings.append(event))
     monkeypatch.setattr(fake, "_run_extend",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
 
@@ -216,7 +224,7 @@ def test_unexpected_error_during_renewal_is_logged_not_swallowed(monkeypatch):
         with embeddings._group_lock("g5"):
             time.sleep(0.5)  # >= 1 heartbeat tick at interval = ttl/3 ~= 0.33s
 
-    assert "embeddings.group_lock_renewal_failed" in warnings
+    assert "joblock.renewal_failed" in warnings
 
 
 def test_unexpected_error_during_release_is_logged_not_swallowed(monkeypatch):
@@ -224,7 +232,7 @@ def test_unexpected_error_during_release_is_logged_not_swallowed(monkeypatch):
     fake = _FakeRedis()
     warnings = []
     monkeypatch.setattr(embeddings, "_slot_redis", lambda: fake)
-    monkeypatch.setattr(embeddings.log, "warning", lambda event, **kw: warnings.append(event))
+    monkeypatch.setattr(joblock.log, "warning", lambda event, **kw: warnings.append(event))
 
     s = get_settings()
     with pytest.MonkeyPatch.context() as mp:
@@ -235,4 +243,4 @@ def test_unexpected_error_during_release_is_logged_not_swallowed(monkeypatch):
             monkeypatch.setattr(fake, "_run_release",
                                 lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
 
-    assert warnings == ["embeddings.group_lock_release_failed"]
+    assert warnings == ["joblock.release_failed"]

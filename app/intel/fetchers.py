@@ -79,23 +79,23 @@ class IntelTerms(NamedTuple):
     categories: set[str]
 
 
-# ponytail: static synonym map; move to Config_Tuning if sectors churn. Keys are canonical
+# static synonym map; move to Config_Tuning if sectors churn. Keys are canonical
 # sector names; values are how CISA (16 official sectors), OTX `industries`, and the asset
 # context's sector/sub_sector/critical_service dropdowns spell them.
 _SECTOR_SYNONYMS: dict[str, tuple[str, ...]] = {
     "energy": ("energy", "electricity", "power", "power generation", "power transmission",
-               "power distribution", "utilities", "utility", "oil and gas", "oil & gas", "oil",
-               "gas", "petroleum", "nuclear", "renewables", "smart grid"),
+            "power distribution", "utilities", "utility", "oil and gas", "oil & gas", "oil",
+            "gas", "petroleum", "nuclear", "renewables", "smart grid"),
     "water": ("water", "water and wastewater", "water and wastewater systems", "wastewater",
-              "desalination"),
+            "desalination"),
     "healthcare": ("healthcare", "healthcare and public health", "health", "hospital", "hospitals",
-                   "medical", "pharmaceutical"),
+                "medical", "pharmaceutical"),
     "financial": ("financial", "financial services", "finance", "banking", "banks", "insurance"),
     "government": ("government", "government facilities", "government services",
-                   "government services and facilities", "public sector", "defense",
-                   "defense industrial base", "defence", "military"),
+                "government services and facilities", "public sector", "defense",
+                "defense industrial base", "defence", "military"),
     "transportation": ("transportation", "transportation systems", "transport", "aviation",
-                       "airline", "airlines", "maritime", "rail", "railway", "logistics", "shipping"),
+                    "airline", "airlines", "maritime", "rail", "railway", "logistics", "shipping"),
     "chemical": ("chemical", "chemicals"),
     "manufacturing": ("manufacturing", "critical manufacturing", "industrial", "automotive"),
     "communications": ("communications", "telecommunications", "telecom", "telecoms"),
@@ -107,7 +107,7 @@ _SECTOR_SYNONYMS: dict[str, tuple[str, ...]] = {
     "education": ("education", "academic", "universities"),
 }
 _SECTOR_RX = {key: re.compile(r"\b(?:" + "|".join(re.escape(a) for a in sorted(aliases, key=len, reverse=True))
-                              + r")\b", re.I) for key, aliases in _SECTOR_SYNONYMS.items()}
+                            + r")\b", re.I) for key, aliases in _SECTOR_SYNONYMS.items()}
 # Countries with no discriminating power — an advisory "deployed Worldwide" says nothing.
 _GLOBAL_COUNTRY_WORDS = frozenset({"worldwide", "global", "international", "multiple", "various"})
 
@@ -352,7 +352,10 @@ def kev_docs(data: dict) -> list[dict]:
     every KEV doc used to share. Vendor and product become tags so a product term in the
     asset's inventory matches on structure, not only on the title's wording."""
     docs = []
-    for v in data.get("vulnerabilities", []):
+    # dict = the whole catalogue (the pure-normalizer contract its tests rely on); anything
+    # else = the streamed "vulnerabilities" entries. One body, both callers.
+    vulns = data.get("vulnerabilities", []) if isinstance(data, dict) else data
+    for v in vulns:
         cve = v.get("cveID", "")
         vendor = (v.get("vendorProject") or "").strip()
         product = (v.get("product") or "").strip()
@@ -376,10 +379,17 @@ def kev_docs(data: dict) -> list[dict]:
 
 
 def fetch_kev(s, meta: dict | None = None) -> list[dict]:
-    data = json.loads(_get(s.intel_kev_url))
+    """Streamed: the catalogue is ~2 MB today and CISA adds to it every week, so it is read one
+    vulnerability at a time rather than parsed whole. `catalogVersion`/`dateReleased` precede
+    the array in CISA's layout and are picked off the same pass -- one download, both answers."""
+    from app.intel.library_import import stream_json_array_capturing
+
+    header: dict = {}
+    docs = kev_docs(stream_json_array_capturing(
+        s.intel_kev_url, "vulnerabilities.item", {"catalogVersion", "dateReleased"}, header))
     if meta is not None:
-        meta["source_version"] = data.get("catalogVersion") or data.get("dateReleased")
-    return kev_docs(data)
+        meta["source_version"] = header.get("catalogVersion") or header.get("dateReleased")
+    return docs
 
 
 # changes.csv paths look like "2026/icsa-26-244-06.json" (or icsma- for medical advisories).

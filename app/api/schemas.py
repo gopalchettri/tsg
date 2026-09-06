@@ -213,9 +213,12 @@ class AcceptBody(ApiModel):
 
     mode: Literal["all", "none", "subset"] = Field(
         description=(
-            "Required. 'all' = accept every generated scenario; 'none' = accept nothing "
-            "(the session still completes, terminally — [R8]); 'subset' = accept only the "
-            "scenarios named in scenario_ids."
+            "Required. 'all' = accept every currently active scenario; 'subset' = accept only "
+            "the scenarios named in scenario_ids; 'none' = accept nothing. "
+            "'none' DECIDES NOTHING: it records that a reviewer looked and took nothing, but "
+            "every scenario stays undecided and progress.overall stays `awaiting_review`. It is "
+            "not a way to close a session — to decline scenarios, use POST "
+            "/v1/sessions/{session_id}/scenarios/reject."
         )
     )
     scenario_ids: list[str] | None = Field(
@@ -1713,8 +1716,10 @@ class AcceptedScenariosResponse(ApiModel):
     user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     session_id: str = Field(description="The session id from the URL path (echoed back).")
     completed_at: datetime | None = Field(
-        description="UTC timestamp the session was completed. Null if the session hasn't completed yet "
-                    "(scenarios == [] in that case, since acceptance only happens at completion)."
+        description="UTC timestamp GENERATION finished, stamped when the session reached the "
+                    "review barrier — NOT when anyone accepted anything. So a session nobody has "
+                    "reviewed yet normally has a non-null completed_at with scenarios == []. "
+                    "Null only while generation is still running, or if the session was cancelled."
     )
     scenarios: list[AcceptedScenario] = Field(description="Accepted scenarios for this session (whichever version was accepted — possibly one a regeneration superseded).")
 
@@ -1927,7 +1932,10 @@ class IntelJobEvent(ApiModel):
     type: Literal["intel_job_update"]
     job_id: str
     state: str = Field(description="Celery state name: PENDING/STARTED/SUCCESS/FAILURE/RETRY.")
-    feed: str = Field(description="Which feed this event is about — always present.")
+    feed: str = Field(description="Which feed this event is about. Present on every event the "
+                                  "WORKER publishes; the connect-time snapshot is built from the "
+                                  "job result and carries no feed, so a client that connects to "
+                                  "an already-finished job sees a terminal event without it.")
     item_count: int | None = Field(default=None, description="Present only on the SUCCESS event.")
     error: str | None = Field(default=None, description="Present only on FAILURE/RETRY.")
 
@@ -1974,6 +1982,98 @@ class IntelItemsResponse(ApiModel):
     total: int = Field(description="Total items matching the filter, across all pages.")
     limit: int = Field(description="Page size used for this response.")
     offset: int = Field(description="Offset used for this response.")
+
+
+class TechniqueRebuildBody(ApiModel):
+    """Body for POST /v1/tsg/threat-intel/techniques/rebuild."""
+    model_config = ConfigDict(json_schema_extra={
+        "example": {"sources": ["attack", "attack_ics"]}})
+
+    sources: list[str] | None = Field(
+        default=None,
+        description="Which reference sources to build from: any of `attack` (ATT&CK Enterprise), "
+                    "`attack_ics` (ATT&CK ICS), `capec`. Omit for all three.")
+
+
+class TechniqueRebuildAccepted(ApiModel):
+    """202 response — the rebuild runs in the background."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}})
+
+    job_id: str = Field(description="Poll it on .../techniques/events/{job_id}, or read "
+                                    "GET .../techniques once it finishes.")
+
+
+class TechniqueCorpusStatus(ApiModel):
+    """What the technique corpus currently holds. `total: 0` means scenarios are running WITHOUT
+    the reference block — nothing is broken (the prompt is byte-identical to the pre-feature one)
+    but scenario quality is lower, and this is how that is visible rather than guessed at."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "total": 812, "available": True,
+        "by_source": {"mitre_attack": 214, "mitre_attack_ics": 79, "capec": 519},
+        "by_stride": {"Tampering": 301, "Information Disclosure": 174},
+        "built_at": "2026-09-06T10:22:00Z",
+        "sample": [{"id": "T0831", "name": "Manipulation of Control",
+                    "stride": ["Tampering"], "applies_to": ["OT"]}]}})
+
+    total: int = Field(description="Documents in the live corpus. 0 = no rebuild has run yet.")
+    available: bool = Field(
+        description="False when the corpus store is unreachable, which is distinct from an "
+                    "empty corpus: both yield total 0, only one is a fault.")
+    by_source: dict[str, int] = Field(description="Document count per source tag.")
+    by_stride: dict[str, int] = Field(description="Document count per STRIDE category.")
+    built_at: Any | None = Field(default=None, description="When the live corpus was published.")
+    sample: list[dict[str, Any]] = Field(default_factory=list,
+                                        description="A few entries, to eyeball the shape.")
+
+
+class LibraryImportBody(ApiModel):
+    """Body for POST /v1/tsg/threat-intel/library/import/{source}."""
+    model_config = ConfigDict(json_schema_extra={"example": {"dry_run": True}})
+
+    dry_run: bool = Field(
+        default=False,
+        description="Report what the import WOULD do and write nothing. Use this first: the "
+                    "response carries the counts and a sample of the rows that would be created.")
+    activate: bool = Field(
+        default=True,
+        description="Set IsActive=1 on the rows this run creates. Leave true unless a curator "
+                    "will review them first — the DAL inserts master rows PENDING, and "
+                    "retrieval only ever searches active rows, so an import left inactive is "
+                    "invisible to threat identification.")
+    max_actors: int = Field(
+        default=40, ge=1, le=500,
+        description="misp_actors only: cap on how many CII-relevant actors to import.")
+
+
+class LibraryImportAccepted(ApiModel):
+    """202 response — the import runs in the background."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}})
+
+    job_id: str = Field(description="Poll .../library/import/status/{job_id} or stream "
+                                    ".../library/import/events/{job_id}.")
+
+
+class LibraryImportStatus(ApiModel):
+    """Polled result of a queued library import. `state` mirrors Celery's AsyncResult.state;
+    `result` is null until the job finishes. `extra="allow"` on the result because the payload
+    differs by source shape — catalogue sources report types/threats/activated_*, misp_actors
+    reports actors_found/actors_upserted."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "state": "SUCCESS",
+        "result": {"source": "emb3d", "dry_run": False, "types": 4, "threats": 121,
+                   "before_count": 0, "after_count": 121, "new_category_links": 187,
+                   "activated_types": 4, "activated_threats": 121, "skipped_count": 9,
+                   "embedding_job_id": "0f8fad5b-d9cb-469f-a165-70867728950e"}}})
+
+    job_id: str = Field(description="The job this status is for.")
+    state: CeleryJobState = Field(
+        description="Job's current state, mirrors Celery's AsyncResult.state — see CeleryJobState.")
+    result: dict[str, Any] | None = Field(
+        default=None,
+        description="The import's own report once finished, else null. Carries `error` instead "
+                    "of counts when the content or the request was invalid.")
 
 
 class EmbeddingJobAccepted(ApiModel):

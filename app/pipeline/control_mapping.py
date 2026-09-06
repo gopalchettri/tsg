@@ -6,6 +6,7 @@ library and stores the highest-scoring matches — the LLM never proposes contro
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
@@ -46,67 +47,43 @@ def session_is_ot(sess: Session, subsystems: list[dict] | None, asset_context: d
 def session_category_codes(sess: Session, subsystems: list[dict] | None, asset_context: dict) -> set[str]:
     """The session's ctm_scan_category CODES ('IT', 'OT', 'DATA_INFO', 'HUMAN_ROLE', 'FAC_LOC',
     'PHY_INFRA'), resolved from the asset's and every subsystem's category id. A row with no
-    code but a recognizable "(OT)"/"(IT)" name still counts — same tolerance session_is_ot
-    always had. Consumed by session_is_ot and by tasks._fetch_intel's prefer-order."""
+    code but a recognizable "(OT)"/"(IT)" name still counts - same tolerance session_is_ot
+    always had. Consumed by session_is_ot and by tasks._fetch_intel's prefer-order.
+
+    Code and name marker are UNIONED, not tried in order: a row coded 'OT_LEGACY' but named
+    "Operational Technology (OT)" is still OT, and this helper must not be narrower than the
+    name-reading check it replaced. The marker is matched PARENTHESISED, never as a substring -
+    "OT" also appears inside "PROTOTYPE"."""
     ids = threat_retrieval.session_category_ids(subsystems, asset_context)
     if not ids:
         return set()
-    out: set[str] = set()
+    codes: set[str] = set()
     for code, name in sess.execute(
             select(m.ctm_scan_category.code, m.ctm_scan_category.name)
             .where(m.ctm_scan_category.id.in_(sorted(ids)))):
-        c = (code or "").strip().upper()
-        if c:
-            out.add(c)
-        # The name's "(OT)"/"(IT)" marker counts REGARDLESS of the code: a row coded OT_LEGACY
-        # but named "Operational Technology (OT)" is still OT — session_is_ot always read the
-        # name, and this must not be narrower than it was.
-        n = (name or "").casefold()
-        if "(ot)" in n:
-            out.add("OT")
-        if "(it)" in n:
-            out.add("IT")
-    return out
+        cleaned = (code or "").strip().upper()
+        if cleaned:
+            codes.add(cleaned)
+        codes.update(marker.upper() for marker in re.findall(r"\(([A-Za-z_]+)\)", name or ""))
+    return codes
 
 
 def _resolve_control_labels(sess: Session, asset_context: dict,
                             subsystems: list[dict] | None) -> list[str] | None:
     """The DATA-DRIVEN control-pool filter (G5): the ITOT labels matching ANY of the session's
-    asset categories — the same union rule the threat filter uses. None = no filter.
+    asset categories - the same union rule the threat filter uses. None = no filter.
 
-    Nothing is hardcoded to IT/OT. Each session category (ctm_scan_category rows behind the
-    asset's and every subsystem's asset_type_id) is matched against the labels the control
-    library ACTUALLY carries (grounding.control_itot_vocabulary): by code equality first, then
-    by the "(CODE)" parenthetical in the category name — word-boundary-safe, unlike substring
-    matching ("IT" appears inside "FACILITIES").
-
-    Vocabulary-aware fail-open: if ANY session category matches no label — today that is every
-    category except IT/OT, because the library carries only those two — the filter is not
-    applied at all. Part of the asset's nature cannot be represented, and a silently narrowed
-    pool is exactly the audited {Physical, IT}->IT-only defect this replaces. When eyshield
-    labels controls for the other ctm_scan_category kinds, the same rule narrows to their
-    union with no code change."""
-    ids = threat_retrieval.session_category_ids(subsystems, asset_context)
-    if not ids:
-        return None
-    vocab = grounding.control_itot_vocabulary(sess)
-    if not vocab:
-        return None
-    by_fold = {v.casefold(): v for v in vocab}
-    labels: set[str] = set()
-    for cat_id, code, name in sess.execute(
-            select(m.ctm_scan_category.id, m.ctm_scan_category.code, m.ctm_scan_category.name)
-            .where(m.ctm_scan_category.id.in_(sorted(ids)))):
-        matched = by_fold.get((code or "").strip().casefold())
-        if matched is None:
-            folded_name = (name or "").casefold()
-            matched = next((v for f, v in by_fold.items() if f"({f})" in folded_name), None)
-        if matched is None:
-            log.info("controls.category_without_vocabulary_no_filter",
-                    category_id=cat_id, code=code)
-            return None
-        labels.add(matched)
-    return sorted(labels)
+    The rule itself now lives in grounding.resolve_asset_labels, shared with the technique
+    reference so the two cannot drift into different answers for one session. Nothing is
+    hardcoded to IT/OT: each session category is matched against the labels the control library
+    ACTUALLY carries (grounding.control_itot_vocabulary), and if ANY category matches no label
+    the filter is not applied at all - a silently narrowed pool is exactly the audited
+    {Physical, IT}->IT-only defect this replaces."""
+    return grounding.resolve_asset_labels(
+        sess,
+        threat_retrieval.session_category_ids(subsystems, asset_context),
+        lambda: grounding.control_itot_vocabulary(sess),
+        log_event="controls.category_without_vocabulary_no_filter")
 
 
 def _min_score(sess: Session, llm: LLMClient, s) -> grounding.Threshold:

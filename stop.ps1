@@ -3,7 +3,7 @@
     Stop the local TSG stack started by .\start.ps1.
 
 .DESCRIPTION
-    Finds the tsg-api / tsg-celery / tsg-beat launcher windows and kills each
+    Finds the tsg-api / tsg-celery / tsg-celery-admin / tsg-beat launcher windows and kills each
     one's full process tree (taskkill /T), so the celery/uvicorn child process
     goes down with its wrapper window, not just the window itself. Matches by
     command line (via WMI), not window title -- MainWindowTitle is only
@@ -60,6 +60,12 @@ $relevantProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
 $targets = [ordered]@{
     'tsg-api'    = @("'tsg-api'")
     'tsg-celery' = @("'tsg-celery'", 'celery_worker.celery_app worker')
+    # The admin-queue worker (start.ps1 3b). It escapes BOTH patterns above: its window is
+    # 'tsg-celery-admin' (the tsg-celery match needs the trailing quote, 'tsg-celery'), and it
+    # runs celery_app.celery_app (not celery_worker), so before this entry it survived every
+    # stop -- the exact Flower bug noted below. '-Q admin' is unique: the main worker is -Q
+    # celery, beat has no -Q, so it cannot collide.
+    'tsg-celery-admin' = @("'tsg-celery-admin'", '-Q admin')
     'tsg-beat'   = @("'tsg-beat'", 'celery_app.celery_app beat')
     # Flower had NO entry here, so it survived every stop.ps1 and kept running indefinitely --
     # found still up (with a stale-venv python child) after a stop reported "Done." Only the

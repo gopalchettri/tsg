@@ -182,6 +182,10 @@ spec:
             - -A
             - app.pipeline.celery_worker:celery_app
             - worker
+            # LOAD-BEARING: without -Q this worker also drains the `admin` queue and the split
+            # in app/pipeline/celery_app.py::task_routes achieves nothing.
+            - -Q
+            - celery
             - --loglevel=INFO
             # gevent concurrency is GREENLETS, not CPU cores. This work is almost entirely spent
             # waiting on network I/O to the LLM proxy, so 2 was a hard ceiling of two in-flight
@@ -225,6 +229,96 @@ spec:
               # namespace quota (steady-state limits 4.5 + 1 surge = 5.5 of 6).
               cpu: "1"
               memory: "3Gi"
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - "sleep 10"
+
+---
+# Heavy operator jobs, kept off the queue users wait on. Routed here by
+# app/pipeline/celery_app.py::task_routes: technique rebuild, library import, embeddings,
+# grounding calibration. Measured reason for the split: a technique rebuild sharing the default
+# queue dragged live scenario generation from ~355s to 967s, and was itself killed at its limit.
+#
+# Every difference from celery-worker above is deliberate:
+#   * --pool=prefork --concurrency=1 — this work is CPU-bound (a 51 MB STIX parse, ~900 local
+#     embeddings). Greenlets do nothing for CPU, and one-at-a-time bounds memory to a single
+#     heavy job. prefork also makes Celery's SOFT time limit actually fire; on the gevent pool it
+#     silently never does, which is what let a rebuild be hard-killed instead of stopping early.
+#   * replicas: 1 with strategy Recreate — these are rare and operator-triggered, and several are
+#     unsafe to run twice at once (grounding calibration already refuses a second sweep with 409).
+#     Recreate prevents a rollout briefly running two.
+#   * more memory, burstier CPU — it parses large documents and loads the embedding model.
+#
+# IF THIS DEPLOYMENT IS MISSING the API still returns 202 for those jobs and they never run.
+# /ready publishes `workers_admin` for exactly that reason — see app/api/health.py.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker-admin
+  namespace: ai-threatgen
+  labels:
+    app: tsg-api
+    component: celery-admin
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tsg-api
+      component: celery-admin
+  template:
+    metadata:
+      labels:
+        app: tsg-api
+        component: celery-admin
+    spec:
+      hostAliases:
+        - ip: "10.231.255.253"
+          hostnames:
+            - "llmapi.govai.ae"
+      terminationGracePeriodSeconds: 740
+      imagePullSecrets:
+        - name: quay-pull
+      containers:
+        - name: celery-worker-admin
+          image: quay-quay-registry.apps.dda-desc-az1-01.desccii.local/dda-desc/tsg-api:latest
+          imagePullPolicy: Always
+          command:
+            - celery
+            - -A
+            # celery_app, NOT celery_worker: celery_worker monkey-patches for gevent BEFORE any import; with a non-gevent pool there is no hub to drive those patched calls and the worker hangs in boot (observed: stops after 'mingle: sync complete', never reaches ready). Use the UNPATCHED app instead -- same reason beat uses it.
+            - app.pipeline.celery_app:celery_app
+            - worker
+            - -Q
+            - admin
+            - --loglevel=INFO
+            - --concurrency=1
+            - --prefetch-multiplier=1
+            - --soft-time-limit=3300
+            - --time-limit=3600
+            - --pool=prefork
+          env:
+            - name: HTTP_PROXY
+              value: "http://10.61.192.2:8080"
+            - name: HTTPS_PROXY
+              value: "http://10.61.192.2:8080"
+          envFrom:
+            - configMapRef:
+                name: tsg-api-config
+            - secretRef:
+                name: tsg-api-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
           lifecycle:
             preStop:
               exec:

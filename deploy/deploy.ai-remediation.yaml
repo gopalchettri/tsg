@@ -86,6 +86,14 @@ spec:
             - -A
             - app.pipeline.celery_worker:celery_app
             - worker
+            # LOAD-BEARING, and easy to miss in THIS file: these pods consume the SAME external
+            # Redis broker as ai-threatgen (see the header), so without -Q they also drain the
+            # `admin` queue -- and a 51 MB technique rebuild would land on a pipeline pod here
+            # even though ai-threatgen's split is correct. No admin worker belongs in this file:
+            # this is pipeline CAPACITY, and one celery-worker-admin (deploy.yaml) already
+            # serves the shared broker.
+            - -Q
+            - celery
             - --loglevel=INFO
             # Keep IDENTICAL to deploy.yaml's worker: mixed concurrency across the fleet makes
             # queue-wait metrics unreadable.

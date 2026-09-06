@@ -951,6 +951,15 @@ CREATE INDEX IX_Scenario_SessionSubActive ON Threat_Scenario(SessionID, Subsyste
 -- Backs dal.active_scenario_rows. Not covering ScenarioJSON on purpose — that column holds
 -- the whole scenario, so including it would duplicate the table into the index.
 
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Scenario_RejectedDecision' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+CREATE INDEX IX_Scenario_RejectedDecision ON Threat_Scenario(SessionID) WHERE RejectedAt IS NOT NULL;
+-- Backs the reject-side seek in GET /sessions/{id}/results, which re-adds a DECIDED scenario
+-- even after a regeneration superseded it — the accepted row was always re-added, the declined
+-- one was not, and that asymmetry hid what a reviewer had already turned down. Threat_Scenario
+-- has no unfiltered SessionID index, so without this the seek degrades to a table scan on a
+-- POLLED endpoint. Performance only: deliberately NOT in invariants.REQUIRED_INDEXES nor in
+-- 6. TSG_Verify.sql, so a database that has not run it still boots and still passes verify.
+
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_SessionSubEvent' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
 CREATE INDEX IX_ScenarioAudit_SessionSubEvent ON Scenario_Audit(SessionID, SubsystemID, EventType, CreatedAt DESC);
 

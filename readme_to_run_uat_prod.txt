@@ -119,7 +119,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 2>&1 | ForEach-Object { $_.ToStr
 # another directory silently runs a FOREIGN python -- this checkout's code on sys.path, the
 # other venv's site-packages loaded. Naming the interpreter cannot resolve anywhere but here.
 $env:TSG_ENV_FILE=".env.uat"     # this terminal too
-python -m celery -A app.pipeline.celery_worker.celery_app worker -P gevent -c 50 -l info 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath logs\celery.log -Append
+python -m celery -A app.pipeline.celery_worker.celery_app worker -Q celery -P gevent -c 50 -l info 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath logs\celery.log -Append
+
+# Second worker for the `admin` queue. -Q above is load-bearing: without it this worker
+# also drains `admin` and heavy operator jobs compete with user-facing generation.
+# -A celery_app, NOT celery_worker (same reason the note below gives for beat).
+python -m celery -A app.pipeline.celery_app.celery_app worker -Q admin -P solo -l info 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath logs\celery-admin.log -Append
 
 # Beat -- the reaper that cleans up abandoned sessions (separate terminal):
 $env:TSG_ENV_FILE=".env.uat"     # this terminal too

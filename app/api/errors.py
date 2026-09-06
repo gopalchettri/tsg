@@ -25,6 +25,7 @@ from app.db.dal import (
     RegenerateConflict,
     SessionConflict,
 )
+from app.intel.library_import import ImportAlreadyRunning
 from app.pipeline import cascade
 from app.pipeline.accept import AcceptConflict, MasterInactive
 from app.pipeline.embeddings import EmbeddingBusy
@@ -149,6 +150,17 @@ async def _handle_embedding_busy(_: Request, exc: EmbeddingBusy):
     return JSONResponse(status_code=409, content=_env("embedding_busy", str(exc)))
 
 
+async def _handle_import_already_running(_: Request, exc: ImportAlreadyRunning):
+    """A library import of this same source is already in flight -> 409.
+
+    Raised by the route's ADVISORY probe, so unlike _handle_calibration_conflict (which fires on a
+    database refusal) this one CAN miss a race: two requests can both pass the probe. That is
+    fine, and deliberate -- the authoritative guard is the lock the Celery task itself acquires,
+    which turns the loser into a terminal 'already running' job result. This handler exists to
+    make the common case a fast, honest 409 instead of a 202 that quietly does nothing."""
+    return JSONResponse(status_code=409, content=_env("import_already_running", str(exc)))
+
+
 async def _handle_calibration_conflict(_: Request, exc: CalibrationConflict):
     """A grounding calibration for this model pair is already running -> 409.
 
@@ -231,6 +243,7 @@ def register_error_handlers(app: FastAPI) -> None:
     app.exception_handler(RegenerateConflict)(_handle_regenerate_conflict)
     app.exception_handler(CancelConflict)(_handle_cancel_conflict)
     app.exception_handler(EmbeddingBusy)(_handle_embedding_busy)
+    app.exception_handler(ImportAlreadyRunning)(_handle_import_already_running)
     app.exception_handler(CalibrationConflict)(_handle_calibration_conflict)
     app.exception_handler(AdminValidationError)(_handle_admin_validation_error)
     app.exception_handler(RequestValidationError)(_handle_validation_error)

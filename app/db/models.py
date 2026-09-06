@@ -474,7 +474,7 @@ class Threat_Type(Base):
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
     # Provenance: 'functional_team_excel' (curated) | 'ai_auto_promoted' | an import tag
-    # (threat_library_import.SOURCE_TAGS) | 'manual' (CRUD API). Added by a separate ALTER
+    # (intel.library_import.SOURCE_TAGS) | 'manual' (CRUD API). Added by a separate ALTER
     # further down scripts/Threat_library.sql, not this table's own CREATE block (which also
     # lives there, moved from scripts/TSG_Core.sql 2026-08-04) — see test_schema_sync's
     # _COLUMN_DEPLOYED_SEPARATELY.

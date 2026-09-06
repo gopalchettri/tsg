@@ -141,3 +141,40 @@ def test_intel_refresh_is_scheduled_only_by_an_explicit_interval():
         assert entry == {"task": "tsg.intel_refresh_all", "schedule": interval}
     else:
         assert entry is None
+
+
+# --- The installed-dependency guard -------------------------------------------------------
+# Found live: the API on :8000 had been launched with the GLOBAL interpreter instead of the
+# project venv, so it served sse_starlette 3.0.3 against code written for >=3.4.6. Nothing
+# noticed. Import succeeded, boot succeeded, /ready reported database/redis/mongo/workers all
+# "ok" -- and all three admin job streams (embeddings, grounding calibration, threat-intel
+# refresh) returned an opaque 500 on EVERY request, because EventSourceResponse.__init__ had no
+# `shutdown_grace_period` parameter. A version-pin in pyproject.toml cannot catch that: the
+# wrong interpreter never reads it. Only the running process can answer the question.
+
+
+class _OldEventSourceResponse:
+    """Stands in for sse_starlette < 3.4: no ping_message_factory, send_timeout or
+    shutdown_grace_period."""
+
+    def __init__(self, content, status_code=200, headers=None, media_type=None, ping=None):
+        pass
+
+
+def test_too_old_sse_starlette_refuses_to_boot():
+    with pytest.raises(RuntimeError, match="shutdown_grace_period"):
+        cfg.assert_sse_library_supports_our_calls(_OldEventSourceResponse)
+
+
+def test_the_error_names_the_wrong_interpreter_as_the_likely_cause():
+    """The failure mode is a mis-launched process, not a bad pin -- so the message has to point
+    the reader at sys.prefix. Told "unexpected keyword argument" alone, the natural (and wrong)
+    conclusion is that the code is broken."""
+    with pytest.raises(RuntimeError, match="interpreter"):
+        cfg.assert_sse_library_supports_our_calls(_OldEventSourceResponse)
+
+
+def test_the_installed_sse_starlette_actually_satisfies_the_guard():
+    """The other half: the guard must pass against what this environment really has, or it is a
+    tripwire that only ever cries wolf."""
+    cfg.assert_sse_library_supports_our_calls()

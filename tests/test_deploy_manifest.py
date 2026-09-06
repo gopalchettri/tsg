@@ -33,7 +33,11 @@ def _containers(dep: dict) -> list[dict]:
 
 
 def test_manifest_parses_and_has_the_expected_workloads() -> None:
-    assert set(_deployments()) == {"tsg-api", "celery-worker", "tsg-beat"}
+    # celery-worker-admin consumes the `admin` queue (celery_app.py::task_routes). It is a
+    # SEPARATE workload on purpose: its jobs are CPU-bound and were measured dragging live
+    # generation from ~355s to 967s when they shared the default queue. If it disappears from
+    # this manifest, the API accepts those jobs and they never run.
+    assert set(_deployments()) == {"tsg-api", "celery-worker", "celery-worker-admin", "tsg-beat"}
 
 
 # --- probes -------------------------------------------------------------------------------------

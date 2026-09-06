@@ -81,6 +81,10 @@ def board(monkeypatch):
                             lambda *a, **k: "COMPLETE")
         monkeypatch.setattr(api_sessions.dal, "latest_next_set_outcome", lambda *a, **k: None)
         monkeypatch.setattr(api_sessions.dal, "latest_regen_outcome", lambda *a, **k: None)
+        # build_board also asks whether the asset-unit LOCK is held, to decide whether the two
+        # "what did my click do?" summaries are safe to publish yet. Irrelevant to timings, so
+        # stub it like the rest — this fixture passes sess=None on purpose.
+        monkeypatch.setattr(api_sessions.dal, "subsystem_lock_is_held", lambda *a, **k: False)
         session = {"SessionID": "ab14229c-0000-0000-0000-000000000000", "EntityID": "e1",
                    "AssetID": "7", "AssetName": "Widget Control System", "UserID": "u1",
                    "SessionStatus": "active", "CurrentStage": "SCENARIOS",

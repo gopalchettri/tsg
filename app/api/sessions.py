@@ -100,8 +100,9 @@ scenarios_router = APIRouter(prefix="/v1", tags=["Scenarios"])
 #: Hard cap on ancestry-walk hops in GET /results. Each hop is one sequential round trip
 #: (it needs the previous hop's ids), so an unbounded walk lets one heavily-regenerated
 #: scenario add round trips to a polled endpoint. A hop is one REGENERATION of a single
-#: scenario, so 25 is far past any real review workflow; beyond it the chain truncates and
-#: logs rather than growing without limit.
+#: scenario, so this cap is far past any real review workflow; beyond it the chain truncates
+#: and logs rather than growing without limit. Stated as the constant, never as a literal in
+#: prose — the comment said "25" for a while after the value moved to 100.
 _MAX_ANCESTRY_HOPS = 100
 
 
@@ -145,7 +146,19 @@ def get_overall_status(threats: str, scenarios: str, session_status: str,
     # The `undecided` half is what the earlier stage-only version got wrong. Without it this
     # branch fires for a FULLY REVIEWED session as well — the stage never leaves the barrier —
     # so "nobody has reviewed this" and "every scenario accepted" reported the same value.
-    if scenarios == StageStatus.AWAITING_DECISION and undecided:
+    # `session_status == completed` is load-bearing, not belt-and-braces. The SCENARIOS stage
+    # reaches AWAITING_DECISION as soon as the scenario rows are written, but the SESSION is only
+    # moved to completed/REVIEW later, by tasks._send_to_review, once control mapping finishes —
+    # the longest step in the pipeline. Without this conjunct the board reported `awaiting_review`
+    # for that whole window while every decision endpoint refused with
+    # `409 accept_conflict / generation_in_progress`, because accept's gate reads the SESSION and
+    # this rollup read only the stage. A live run caught it: overall said "a human must decide"
+    # for ~3 minutes while the API rejected every decision. A UI switching on this field — which
+    # is exactly what its own documentation instructs — showed a Review button that could not
+    # work. The two now agree by construction: this field never claims a decision is possible
+    # before the endpoint that takes it would accept one.
+    if (scenarios == StageStatus.AWAITING_DECISION and undecided
+            and session_status == SessionStatus.completed):
         return SubsystemProgress.awaiting_review
     if session_status == SessionStatus.completed:
         return SubsystemProgress.complete
@@ -204,10 +217,12 @@ def _wire_stage_status(status: str) -> str:
     repeats "SCENARIOS" inside a field already called `scenarios`, while the published OpenAPI
     example has always said AWAITING_DECISION, so docs and wire already disagreed.
 
-    The review barrier is NOT lost, but it moved: `overall` no longer reports `awaiting_review`
-    (operator decision — it reports `complete` too), so the surviving signal is the explicit
-    boolean `progress.awaiting_decision`. A client asking "is generation done" reads this field;
-    a client asking "does a human still owe a decision" reads `awaiting_decision`. Internally
+    The review barrier is NOT lost, but it moved OFF this field: `overall` carries it instead,
+    reporting `awaiting_review` while any active scenario is undecided and `complete` once every
+    one has been decided (get_overall_status + dal.has_undecided_scenarios). There is no
+    `progress.awaiting_decision` boolean — an earlier draft proposed one and it was never built,
+    so do not go looking for it. A client asking "is generation done" reads this field; a client
+    asking "does a human still owe a decision" reads `progress.overall`. Internally
     nothing moves — Subsystem_Stage_State keeps SCENARIOS_AWAITING_DECISION,
     which every claim, sweep predicate and stage_settled_at_epoch check still keys on. Changing
     the stored value would silently reopen the review barrier.
@@ -280,6 +295,8 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
     undecided = (sc == StageStatus.AWAITING_DECISION
                  and dal.has_undecided_scenarios(sess, scenario_session["SessionID"]))
     overall = str(get_overall_status(t, sc, scenario_session["SessionStatus"], undecided=undecided))
+    # Read once, used by both "what did my click do?" summaries below.
+    _unit_locked = dal.subsystem_lock_is_held(sess, scenario_session["SessionID"], ASSET_UNIT_ID)
     return {
         "session_id": scenario_session["SessionID"], "entity_id": scenario_session["EntityID"],
         "asset_id": int(scenario_session["AssetID"]), "asset_name": scenario_session["AssetName"],
@@ -308,13 +325,25 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
             # replay (app/sse/bus.py), so a polling client — or one whose stream dropped — has
             # only this. Because build_board also feeds the SSE reconnect-reconcile snapshot, a
             # client that missed the event learns the outcome the moment it reconnects.
-            "last_next_set": dal.latest_next_set_outcome(sess, scenario_session["SessionID"],
-                                                        ASSET_UNIT_ID),
+            # Both summaries are WITHHELD while the subsystem lock is held. cascade.py commits
+            # the regeneration_completed / next_set_outcome audit rows INSIDE
+            # `with _subsystem_lock(...)`, so without this the epoch a client is explicitly told
+            # to poll for ("confirm your click landed by polling until last_regen.epoch equals
+            # the epoch you got back") became visible while the lock was still held -- and the
+            # client's very next accept or next-set got `409 subsystem N is locked`. Observed
+            # live, first try, on both routes. The published signal must mean "done AND you may
+            # act", so it is not published until acting would actually succeed.
+            # Trade-off, deliberately taken: while a NEW regen runs, the PREVIOUS one's summary
+            # reads null rather than stale-but-complete. A client polling for its own epoch is
+            # unaffected (it is waiting for a match either way), and a null that becomes correct
+            # beats a value that invites a 409.
+            "last_next_set": None if _unit_locked else dal.latest_next_set_outcome(
+                sess, scenario_session["SessionID"], ASSET_UNIT_ID),
             # Plan item 3: same durable-mirror rationale as last_next_set above, for
             # /regenerate/scenarios instead of /scenarios/next-set — built from the
             # regeneration_completed audit row (app/pipeline/cascade.py::_stage_regen_audit).
-            "last_regen": dal.latest_regen_outcome(sess, scenario_session["SessionID"],
-                                                    ASSET_UNIT_ID),
+            "last_regen": None if _unit_locked else dal.latest_regen_outcome(
+                sess, scenario_session["SessionID"], ASSET_UNIT_ID),
             # ADDITIVE: a new key, unlike the error_message reshape above — an old client that
             # ignores it behaves exactly as before. It must not be ignored by a client that
             # SIGNS OFF assessments, though: coverage.complete=false means threats were not
@@ -375,7 +404,22 @@ def _build_session_row(sid: str, tenant: str, body: CreateSessionBody, ctx: dict
 
 # --- endpoints ---
 @router.post("/sessions", status_code=202, response_model=CreateSessionResponse,
-            responses=UNAVAILABLE_RESPONSES)
+            responses=UNAVAILABLE_RESPONSES,
+            summary="Start a threat-generation run",
+            description=(
+                "Starts a new AI run for one asset and returns immediately with a `session_id`.\n\n"
+                "**Before you call:** the asset must have no other active session — one run per asset at a "
+                "time. `entity_id` in the body must match your `X-Entity-Id` header.\n\n"
+                "**What you get:** `202` with a `session_id`. This means queued, NOT finished — generation "
+                "takes several minutes. Poll `GET /v1/sessions/{session_id}` until `progress.overall` reads "
+                "`awaiting_review`, or stream `GET /v1/sessions/{session_id}/events`.\n\n"
+                "**Watch out:** send an `Idempotency-Key` header if your caller might retry. Re-sending the "
+                "same key returns `200` with the original session instead of creating a second one. Only "
+                "`asset_id` is compared, so a retry with the same asset but different options returns the "
+                "ORIGINAL session and silently ignores your new values. Re-using that key with a DIFFERENT "
+                "`asset_id` is `409 idempotency_key_conflict`, and starting a second session while one is "
+                "still active for the asset is `409 active_session_exists`."
+            ))
 def create_session(
     body: CreateSessionBody, principal: Principal = Depends(get_principal),
     # max_length matches IdempotencyKey nvarchar(200): unbounded, an over-long key is caught only
@@ -441,7 +485,22 @@ def create_session(
     return CreateSessionResponse(session_id=sid, user_id=principal.user_id)
 
 
-@router.get("/sessions/{session_id}", response_model=SessionBoard)
+@router.get("/sessions/{session_id}", response_model=SessionBoard,
+            summary="Check a session's progress",
+            description=(
+                "The status board for one session: what stage it is at and whether a human is still needed.\n\n"
+                "**Call it:** repeatedly after creating a session, every 5-10 seconds.\n\n"
+                "**The field that matters is `progress.overall`.** It is the only one that tracks the human "
+                "side: `pending` (queued), `in_progress` (AI working), `awaiting_review` (AI done, someone "
+                "must accept or reject), `complete` (every scenario decided), `error`, `cancelled`.\n\n"
+                "**Watch out:** `session_status` reads `completed` as soon as the AI stops writing, long "
+                "before anyone has reviewed anything, and `current_stage` then stays `REVIEW` forever. "
+                "Neither means the session is finished. Use `progress.overall`.\n\n"
+                "`progress.controls` is separate and finishes last, so scenarios appear before their mapped "
+                "controls do. Wait for it to read `COMPLETE` before treating a scenario's control list as "
+                "final. `ERROR` there is terminal, not a stage to wait through — mapping gave up after its "
+                "attempt limit and nothing retries it automatically."
+            ))
 def get_session(session_id: str, principal: Principal = Depends(get_principal)) -> SessionBoard:
     """Status-board poll endpoint — same rollup logic the SSE reconnect uses,
     so polling and streaming clients never disagree on subsystem state."""
@@ -541,7 +600,24 @@ def _ancestry(sess: Session, sid: str, scenarios: list[dict]) -> dict[str, list[
     return {s["ScenarioID"]: _from(s["ReplacesScenarioID"], s["ScenarioID"]) for s in scenarios}
 
 
-@router.get("/sessions/{session_id}/results", response_model=SessionResults)
+@router.get("/sessions/{session_id}/results", response_model=SessionResults,
+            summary="Read the generated scenarios",
+            description=(
+                "Every scenario generated for this session, each with its threat, its adversaries and its "
+                "mapped security controls.\n\n"
+                "**Before you call:** wait until `progress.overall` reads `awaiting_review`. Calling earlier "
+                "returns a short but perfectly valid-looking list, which is how a half-finished run gets "
+                "mistaken for a finished one.\n\n"
+                "**What you get:** the active scenarios, PLUS any scenario a human already DECIDED — accepted "
+                "or rejected — even if a later regeneration replaced it. A decision is never hidden by a "
+                "regeneration that came after it, so the list can legitimately contain superseded rows and "
+                "can be longer than the number of current scenarios. Tell them apart by `accepted` and "
+                "`rejected_at`. Match scenarios by `scenario_id`, never by position.\n\n"
+                "**Watch out:** a scenario with `scenario: null` is a failure card — generation failed for "
+                "that one threat. It cannot be accepted; regenerate it instead. Add `?include_replaced=true` "
+                "to see the older versions a regeneration replaced, nested inside the scenario that replaced "
+                "them."
+            ))
 def get_results(
     session_id: str,
     include_replaced: bool = Query(
@@ -589,9 +665,17 @@ def get_results(
             _scenario_select().where(out.SessionID == sid, dal.active(out.Superseded))
         ).mappings()]
         seen_scenario_ids = {s["ScenarioID"] for s in scenarios}
-        scenarios += [dict(r) for r in sess.execute(
-            _scenario_select().where(out.SessionID == sid, dal.accepted(out.Accepted))
-        ).mappings() if r["ScenarioID"] not in seen_scenario_ids]
+        # THREE statements, one per filtered index — same reasoning as the two above, extended to
+        # the reject side. A DECIDED row (accepted or rejected) is a human fact on the record, and
+        # a later regeneration must not erase it from the default view. Rejections were the
+        # asymmetry: an accepted row survived being superseded, a declined one silently vanished,
+        # so a reviewer could not see what had already been turned down. Each seek is near-free
+        # until a decision actually happens.
+        for decided in (dal.accepted(out.Accepted), dal.rejected(out.RejectedAt)):
+            scenarios += [dict(r) for r in sess.execute(
+                _scenario_select().where(out.SessionID == sid, decided)
+            ).mappings() if r["ScenarioID"] not in seen_scenario_ids]
+            seen_scenario_ids = {s["ScenarioID"] for s in scenarios}
         # Only needed to fetch and order the retired bodies, so a polled /results issues no
         # ancestry query at all — however deep the session's regeneration history runs.
         chains = _ancestry(sess, sid, scenarios) if include_replaced else {}
@@ -959,7 +1043,24 @@ def _subset_from_accept_body(body: AcceptBody) -> list[str] | None:
 _CONFLICT_RESPONSES: dict[int | str, dict] = {409: {"model": ErrorResponse, "description": "Conflict — see details.reason."}}
 
 
-@router.post("/sessions/{session_id}/accept", response_model=AcceptResponse, responses=_CONFLICT_RESPONSES)
+@router.post("/sessions/{session_id}/accept", response_model=AcceptResponse, responses=_CONFLICT_RESPONSES,
+            summary="Accept scenarios",
+            description=(
+                "Records a reviewer's decision to keep scenarios. Each accepted scenario is stamped with who "
+                "accepted it and when.\n\n"
+                "**Before you call:** the session must have reached the review point. In practice that means "
+                "`progress.overall` reads `awaiting_review`.\n\n"
+                "**Three modes.** `all` accepts every current scenario. `subset` accepts only the ids you "
+                "list. `none` accepts nothing.\n\n"
+                "**Watch out:** `mode: \"none\"` decides NOTHING. It returns `200` with `accepted_count: 0` and "
+                "leaves every scenario pending, so the session stays at `awaiting_review`. It is not a way to "
+                "dismiss a session — to discard everything, use the reject endpoint instead.\n\n"
+                "Repeatable. Accepting the same ids twice succeeds again and never changes who decided first. "
+                "Accepting does not end the session; scenarios you leave undecided stay decidable on a later "
+                "visit.\n\n"
+                "Accepting a scenario you already declined is refused with `404` and the reason "
+                "`already_rejected`. The two decisions are mutually exclusive per scenario."
+            ))
 def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depends(get_principal)) -> AcceptResponse:
     """Records an accept decision on all or a subset of this session's scenarios. Repeatable:
     the session was already completed when generation finished, so scenarios left undecided stay
@@ -974,7 +1075,21 @@ def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depend
 
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/promote-to-library",
-            response_model=LibraryPromotionResponse, responses=_CONFLICT_RESPONSES)
+            response_model=LibraryPromotionResponse, responses=_CONFLICT_RESPONSES,
+            summary="Add a scenario's threat to the library",
+            description=(
+                "Copies one accepted scenario's threat type and threat into the shared threat library, so a "
+                "future session on a similar asset can match it instead of the AI reinventing it.\n\n"
+                "**Before you call:** the scenario must be accepted AND still be the current version. An "
+                "accepted scenario that a later regeneration replaced is refused, even though it is still "
+                "listed in the results. No request body.\n\n"
+                "**What you get:** each item comes back `inserted` (new), `existing` (reused) or `failed`. "
+                "Calling twice creates nothing and returns `created_count: 0` with everything `existing`.\n\n"
+                "**Watch out:** promoting does not make the threat matchable yet. New library rows are "
+                "created inactive, pending curator review, and matching only considers active rows. A curator "
+                "has to approve it before any session can retrieve it.\n\n"
+                "Controls are reported here but never written — they are already curated library data."
+            ))
 def post_promote_to_library(session_id: str, scenario_id: str,
                             principal: Principal = Depends(get_principal)) -> LibraryPromotionResponse:
     """Add this ACCEPTED scenario's threat type and threat to the library — Threat_Type for a
@@ -1015,7 +1130,20 @@ def post_promote_to_library(session_id: str, scenario_id: str,
 
 
 @router.post("/sessions/{session_id}/scenarios/reject", response_model=RejectResponse,
-            responses=_CONFLICT_RESPONSES)
+            responses=_CONFLICT_RESPONSES,
+            summary="Decline scenarios",
+            description=(
+                "Records a reviewer's decision to decline scenarios. Nothing is deleted — the scenario keeps "
+                "its content and stays visible in the results.\n\n"
+                "**Why it exists:** a scenario nobody has looked at and one a reviewer declined must not read "
+                "the same on a risk register. Accept can only say yes or not-yet; this is how you say no.\n\n"
+                "**Before you call:** same review point as accept.\n\n"
+                "**Watch out:** accept and reject are mutually exclusive per scenario. Rejecting one you "
+                "already accepted fails with `404` and the reason `already_accepted`. There is no un-reject — "
+                "to get a fresh scenario in that slot, regenerate it.\n\n"
+                "Declining counts as deciding, so rejecting the last undecided scenario moves "
+                "`progress.overall` to `complete`. Repeatable, and it never overwrites who declined first."
+            ))
 def post_reject_scenarios(session_id: str, body: RejectBody,
                         principal: Principal = Depends(get_principal)) -> RejectResponse:
     """Explicitly decline scenarios, recording who declined them and when.
@@ -1129,7 +1257,25 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
 
 
 @router.post("/sessions/{session_id}/regenerate/scenarios", status_code=202, response_model=RegenerateResponse,
-            responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES)
+            responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES,
+            summary="Rewrite specific scenarios",
+            description=(
+                "Rewrites only the scenarios you name and leaves their siblings untouched.\n\n"
+                "**Before you call:** the session must be at the review point, and the ids must be current "
+                "scenarios of this session.\n\n"
+                "**What you get:** `202` with an `epoch`. Queued, not finished. Confirm your click landed by "
+                "polling `GET /v1/sessions/{session_id}` until `progress.last_regen.epoch` equals the epoch "
+                "you got back. Do not rely on the live event for this — it carries no epoch.\n\n"
+                "**If every target fails, that epoch is never published at all.** Watch `progress.scenarios` "
+                "and `progress.error_message` alongside it, or a failed rewrite will leave you polling "
+                "forever.\n\n"
+                "**Watch out:** the count normally stays the same, because this replaces rather than adds. "
+                "The exception is regenerating a scenario you had already accepted: the accepted version "
+                "stays in the results beside its replacement, so you will count one more. Tell them apart by "
+                "`accepted`.\n\n"
+                "There is no free-text steering field. If the AI fails on a rewrite, your original scenario "
+                "is kept rather than destroyed."
+            ))
 def post_regenerate_scenarios(session_id: str, body: RegenerateScenariosBody,
                             principal: Principal = Depends(get_principal)) -> RegenerateResponse:
     """Rebuild one or more scenarios' narratives only — siblings untouched (scenarios 1, 2). Scoped
@@ -1212,7 +1358,23 @@ def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> Re
 
 
 @router.post("/sessions/{session_id}/scenarios/next-set", status_code=202, response_model=RegenerateResponse,
-            responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES)
+            responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES,
+            summary="Generate more scenarios",
+            description=(
+                "Asks the AI for another batch of brand-new scenarios for the same asset. It adds; it never "
+                "replaces. No request body.\n\n"
+                "**Before you call:** the session must be at the review point.\n\n"
+                "**What you get:** `202` with an `epoch`. Poll `GET /v1/sessions/{session_id}` until "
+                "`progress.last_next_set.epoch` equals it, then read `progress.last_next_set.outcome`: "
+                "`complete` means the full batch landed, `partial_retryable` means some generations failed "
+                "and clicking again retries them, `exhausted` means nothing further exists for this asset and "
+                "you should stop.\n\n"
+                "**Watch out:** this briefly re-claims the asset while it runs, so a status poll mid-click "
+                "can show `session_status` back at `active`. That is expected, and if someone else claims the "
+                "asset during that window you get `409 regenerate_conflict` with the reason `asset_busy`, "
+                "which is transient — retry it. A short result is not automatically a bug; `exhausted` is a "
+                "correct final answer."
+            ))
 def post_next_set_scenarios(session_id: str, principal: Principal = Depends(get_principal)) -> RegenerateResponse:
     """Generate the next set of scenarios — 5 more unique threat scenarios that accumulate onto the
     existing ones for the session's asset, never superseding a prior batch. No request body: the
@@ -1222,7 +1384,19 @@ def post_next_set_scenarios(session_id: str, principal: Principal = Depends(get_
     return _do_next_set(session_id, principal, ASSET_UNIT_ID)
 
 
-@router.post("/sessions/{session_id}/cancel", response_model=CancelResponse)
+@router.post("/sessions/{session_id}/cancel", response_model=CancelResponse,
+            summary="Cancel a session",
+            description=(
+                "Aborts a session that is still generating, and frees its asset so a new session can start.\n\n"
+                "**Before you call:** the session must still be `active`. Once generation reaches the review "
+                "point the session is `completed` and cancel is refused with `409 cancel_conflict` — there is "
+                "no way to cancel a session sitting in front of a reviewer, even an untouched one. The one "
+                "exception is while a 'generate more' run is in flight, which briefly makes the session "
+                "active again.\n\n"
+                "**Watch out:** this does not stop the background work immediately. In-flight tasks notice on "
+                "their own next check, so right after cancelling you may still see a stage running. That is "
+                "expected."
+            ))
 def post_cancel(session_id: str, principal: Principal = Depends(get_principal)) -> CancelResponse:
     """Marks the session cancelled and audit-logs the actor; in-flight pipeline/regen
     tasks observe the status change on their own next CAS rather than being interrupted."""
@@ -1367,7 +1541,20 @@ _EVENT_STREAM_RESPONSES: dict[int | str, dict] = {
 
 
 @router.get("/sessions/{session_id}/events",
-            responses=_EVENT_STREAM_RESPONSES | UNAVAILABLE_RESPONSES)
+            responses=_EVENT_STREAM_RESPONSES | UNAVAILABLE_RESPONSES,
+            summary="Stream live session progress",
+            description=(
+                "Keeps a connection open and pushes session events as they happen, instead of you polling.\n\n"
+                "**How to connect:** send `Accept: text/event-stream` with the same auth headers as every "
+                "other route. A browser's built-in `EventSource` CANNOT be used here, because it cannot send "
+                "custom headers — drive it with `fetch()` and a stream reader.\n\n"
+                "**What arrives:** a `reconcile` event immediately with the full current board, then stage "
+                "and result events as work completes, plus periodic heartbeats.\n\n"
+                "**Watch out:** events are best-effort and are never replayed, so a dropped connection loses "
+                "them silently. Always confirm anything important against the status board, which is durable. "
+                "Some events that genuinely arrive are not listed in the generated schema, so make your event "
+                "handler tolerate an unknown `type` rather than throwing."
+            ))
 async def session_events(session_id: str, principal: Principal = Depends(get_principal)):
     """SSE stream : sends the current board as a `reconcile` event before
     subscribing to live deltas, so a client that (re)connects mid-session never has to
@@ -1467,7 +1654,19 @@ def _audit_event(row: dict) -> SessionAuditEvent:
         detail=detail)
 
 
-@router.get("/sessions/{session_id}/audit", response_model=SessionAuditPage)
+@router.get("/sessions/{session_id}/audit", response_model=SessionAuditPage,
+            summary="Read a session's history",
+            description=(
+                "The session's step-by-step history, oldest first: who did what, to what, and when.\n\n"
+                "**Call it:** any time. This is a plain read and is not gated by session state.\n\n"
+                "**Filters:** `scenario_id` for one scenario's rows, `event` (repeatable) for specific event "
+                "types, `actor` for one person, `since`/`until` for a time window, `limit` (max 500) and "
+                "`offset` for paging.\n\n"
+                "**Reading the result:** `actor_user_id` is filled in only on steps a human actually "
+                "triggered. It is `null` with `actor_type: \"system\"` on everything the pipeline did by "
+                "itself. A null there means the pipeline did it, not that data is missing — filtering by "
+                "`actor` is how you isolate what a person did."
+            ))
 def get_session_audit(
     session_id: str,
     scenario_id: str | None = Query(default=None, description="Only steps concerning this scenario."),
@@ -1500,7 +1699,17 @@ def get_session_audit(
     return SessionAuditPage(session_id=session_id, limit=limit, offset=offset, events=events)
 
 
-@router.get("/sessions/{session_id}/accepted-scenarios", response_model=AcceptedScenariosResponse)
+@router.get("/sessions/{session_id}/accepted-scenarios", response_model=AcceptedScenariosResponse,
+            summary="List a session's accepted scenarios",
+            description=(
+                "Only the scenarios a reviewer accepted for this session — the clean feed for a risk register "
+                "or downstream GRC tool. Drafts, declined and undecided scenarios never appear.\n\n"
+                "**Call it:** any time the session exists, typically right after accepting.\n\n"
+                "**Watch out:** a session nobody has reviewed yet returns `200` with an empty list — a valid "
+                "answer, not an error. `completed_at` is stamped when GENERATION finished, not when anyone "
+                "reviewed, so it is usually already set. It is null only while generation is still running, "
+                "or if the session was cancelled."
+            ))
 def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_principal)) -> AcceptedScenariosResponse:
     """Returns the accepted, non-superseded scenarios for this session."""
     with db_session() as sess:
@@ -1587,7 +1796,19 @@ def _list_scenarios(entity_ids: set[str], user_id: str | None, status: str | Non
                                     unavailable=controls.unavailable) for r in rows]
 
 
-@scenarios_router.get("/users/{user_id}/scenarios", response_model=list[ScenarioListItem])
+@scenarios_router.get("/users/{user_id}/scenarios", response_model=list[ScenarioListItem],
+            summary="List scenarios by user",
+            description=(
+                "Every completed scenario one user created, across all their sessions, newest first. "
+                "Scenarios whose generation failed never appear here.\n\n"
+                "**Scoping:** results are always narrowed to your own authorized entity, whichever user you "
+                "ask about.\n\n"
+                "**Filters:** `status` accepts `active`, `completed` or `cancelled` (the owning session's "
+                "state) or `accepted` (only what a human kept). `include_superseded=true` also returns "
+                "replaced versions. `limit` (max 500) and `offset` page the result.\n\n"
+                "**Watch out:** `status=accepted` always returns accepted scenarios even if they were later "
+                "replaced, regardless of `include_superseded`. An empty list is a valid `200`."
+            ))
 def list_user_scenarios(
     user_id: str = Path(max_length=200, description="Session owner to list scenarios for. "
                         "A filter, not an identity claim — see below."),
@@ -1604,7 +1825,16 @@ def list_user_scenarios(
     return _list_scenarios(principal.entities, user_id, status, include_superseded, limit, offset)
 
 
-@scenarios_router.get("/entities/{entity_id}/scenarios", response_model=list[ScenarioListItem])
+@scenarios_router.get("/entities/{entity_id}/scenarios", response_model=list[ScenarioListItem],
+            summary="List scenarios by entity",
+            description=(
+                "Every completed scenario belonging to one entity, across all users and sessions, newest "
+                "first. Scenarios whose generation failed never appear here.\n\n"
+                "**Before you call:** the `entity_id` in the path must match your `X-Entity-Id` header. "
+                "Asking about another entity returns `403`.\n\n"
+                "Same filters as the per-user list: `status`, `include_superseded`, `limit`, `offset`. An "
+                "empty list is a valid `200`."
+            ))
 def list_entity_scenarios(
     entity_id: str = Path(max_length=200, description="Entity to list scenarios for. "
                         "Must be in the caller's authorized set."),
@@ -1620,7 +1850,16 @@ def list_entity_scenarios(
     return _list_scenarios({str(entity_id)}, None, status, include_superseded, limit, offset)
 
 
-@scenarios_router.get("/sessions/{session_id}/scenarios/{scenario_id}", response_model=ScenarioListItem)
+@scenarios_router.get("/sessions/{session_id}/scenarios/{scenario_id}", response_model=ScenarioListItem,
+            summary="Fetch one scenario",
+            description=(
+                "One specific scenario by id, with its threat, adversaries and mapped controls.\n\n"
+                "**Required:** the `user_id` query parameter, which must be the session's owner. Omitting it "
+                "is a `422`; giving the wrong one is a `404`.\n\n"
+                "**Watch out:** every scenario-id miss returns `404` — unknown, belonging to another session, "
+                "or not a GUID at all. A session id is different: one that exists but belongs to another "
+                "entity returns `403`."
+            ))
 def get_scenario(
     session_id: str,
     scenario_id: str,
