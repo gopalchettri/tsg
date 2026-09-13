@@ -236,3 +236,50 @@ def test_prompt_states_the_per_category_binding():
         categories=["Repudiation"], canonical_types={"Repudiation": ["Data/Telemetry Abuse"]}))
     assert "category you assign" in body
     assert "NOT interchangeable" in body
+
+
+# --- The query count, pinned ---------------------------------------------------------------
+# canonical_types_for used to call find_category + get_possible_types PER CATEGORY: two round
+# trips each, twelve for a STRIDE run, once per gap round. Correct, and fine at six categories
+# -- but this is the one function written for a library of thousands, so it is the wrong place
+# to leave a count that grows with the input. _types_by_category asks once for all of them.
+
+
+def _count_selects(sess, fn) -> int:
+    from sqlalchemy import event
+
+    n = 0
+
+    def _tick(conn, cursor, statement, *a):
+        nonlocal n
+        if statement.lstrip().upper().startswith("SELECT"):
+            n += 1
+
+    engine = sess.get_bind()
+    event.listen(engine, "before_cursor_execute", _tick)
+    try:
+        fn()
+    finally:
+        event.remove(engine, "before_cursor_execute", _tick)
+    return n
+
+
+def test_the_query_count_does_not_grow_with_the_number_of_categories():
+    """CONSTANT, not merely small. cap is high enough that nothing overflows, so this counts the
+    vocabulary lookup alone and no embedding work."""
+    sess = _session([(i, f"Type {i}", SPOOFING if i % 2 else TAMPERING) for i in range(1, 9)])
+    one = _count_selects(sess, lambda: grounding.canonical_types_for(
+        sess, _StubLLM(), ["Spoofing"], [], "asset text", 50))
+    two = _count_selects(sess, lambda: grounding.canonical_types_for(
+        sess, _StubLLM(), ["Spoofing", "Tampering"], [], "asset text", 50))
+    assert one == two, f"query count grew with categories: {one} -> {two}"
+    assert two <= 3, f"expected 3 (categories, own-category types, mapped types), got {two}"
+
+
+def test_both_categories_still_get_their_own_types():
+    """The batching must not smear one category's vocabulary across another -- the exact failure
+    the None-category guard exists to prevent, reachable a second way through a bad GROUP BY."""
+    sess = _session([(1, "Alpha", SPOOFING), (2, "Beta", SPOOFING), (3, "Gamma", TAMPERING)])
+    out = grounding.canonical_types_for(
+        sess, _StubLLM(), ["Spoofing", "Tampering"], [], "asset text", 50)
+    assert out == {"Spoofing": ["Alpha", "Beta"], "Tampering": ["Gamma"]}

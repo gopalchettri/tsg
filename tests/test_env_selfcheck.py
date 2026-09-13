@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.core.config import Settings
 from app.core.env_selfcheck import DEPLOYMENT_POSTURE, POSTURE_FILE, check
 
 
@@ -164,3 +165,44 @@ def test_the_real_env_uat_matches_every_decision():
     if not (root / POSTURE_FILE).exists():
         return
     assert _posture_hits(root) == []
+
+
+def test_a_spelling_variant_of_the_decided_value_PASSES(tmp_path: Path):
+    """The values are compared as the APPLICATION parses them, not as text.
+
+    `False`, `0` and `no` are every bit as off as `false`, and `120` is the same number as
+    `120.0`. Flagging them would make this checker reject files the app accepts -- and a tool
+    that cries wolf gets skipped, which costs far more than it ever catches.
+    """
+    for variant in ("False", "FALSE", "0", "no"):
+        _write_posture(tmp_path, TSG_CONTROL_MAP_SWEEP_ENABLED=variant)
+        assert _posture_hits(tmp_path) == [], variant
+    _write_posture(tmp_path, TSG_LLM_TIMEOUT_SECONDS="120")
+    assert _posture_hits(tmp_path) == []
+
+
+def test_the_wrong_value_still_fails_however_it_is_spelled(tmp_path: Path):
+    """The other half. Loosening the comparison must not loosen the VERDICT -- `True`, `1` and
+    `yes` are the state this deployment decided against."""
+    for variant in ("true", "True", "1", "yes"):
+        _write_posture(tmp_path, TSG_CONTROL_MAP_SWEEP_ENABLED=variant)
+        assert any("control_map_sweep_enabled" in h for h in _posture_hits(tmp_path)), variant
+
+
+def test_a_value_that_cannot_be_parsed_says_so(tmp_path: Path):
+    """Coercion failure must not swallow the finding -- an unparseable value IS the finding, and
+    the message has to say which kind of problem it is or the reader chases the wrong one."""
+    _write_posture(tmp_path, TSG_LLM_MAX_RETRIES="abc")
+    hits = _posture_hits(tmp_path)
+    assert any("llm_max_retries" in h and "does not parse" in h for h in hits), hits
+
+
+def test_every_declared_setting_name_is_real():
+    """Both declaration tables index Settings.model_fields directly, so a renamed setting makes
+    the checker die with a KeyError -- taking all 147 findings it had already collected with it.
+    A rename should fail HERE, in CI, not at the moment someone runs the tool."""
+    from app.core.env_selfcheck import DERIVED_SETTINGS
+
+    real = set(Settings.model_fields)
+    assert not set(DEPLOYMENT_POSTURE) - real, "DEPLOYMENT_POSTURE names a setting that is gone"
+    assert not set(DERIVED_SETTINGS) - real, "DERIVED_SETTINGS names a setting that is gone"

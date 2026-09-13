@@ -445,6 +445,58 @@ def nearest_library_actors(sess: Session, llm: LLMClient, query: str,
     return [pairs[i] for i, _score in ranked]
 
 
+def _types_by_category(sess: Session, categories: list[str]) -> dict[str, list[str]]:
+    """{category as the caller spelled it: [ThreatTypeName, ...]} in THREE queries, not 2N.
+
+    find_category + get_possible_types per category is 2 round trips each — 12 for a STRIDE run.
+    Correct, and the shape every other caller needs, but this is the one place that asks for
+    ALL the categories at once, and the one function written for a library of thousands. So it
+    asks once. Both are left untouched for their one-at-a-time callers.
+
+    Same two doors get_possible_types documents: a type qualifies by its OWN ThreatCategoryID or
+    via the category MAP ([A2]). A category that resolves to nothing is simply ABSENT from the
+    result — never mapped to "every type", which is what get_possible_types(sess, None) returns
+    and which would advertise the whole vocabulary as belonging to that one cell.
+    """
+    wanted = {c.strip().lower(): c for c in categories if (c or "").strip()}
+    if not wanted:
+        return {}
+    cat = m.Threat_Category
+    rows = sess.execute(
+        select(cat.ThreatCategoryID, func.lower(cat.ThreatCategoryName),
+               func.lower(cat.ThreatCategoryCode))
+        .where(cat.IsActive == True, cat.IsDeleted == False,
+               or_(func.lower(cat.ThreatCategoryName).in_(wanted),
+                   func.lower(cat.ThreatCategoryCode).in_(wanted)))
+        .order_by(cat.ThreatCategoryID)).all()
+    # First ID wins, matching find_category's own `.order_by(ThreatCategoryID).first()`.
+    ids: dict[str, int] = {}
+    for cid, name, code in rows:
+        for key in (name, code):
+            if key in wanted and key not in ids:
+                ids[key] = cid
+    if not ids:
+        return {}
+
+    tt, tc, cmap = m.Threat_Type, m.Threat_Catalogue, m.Threat_Catalogue_Category_Map
+    active = (tt.IsActive == True, tt.IsDeleted == False)
+    # Door 1: the type's own default category. Door 2: the catalogue map.
+    by_cid: dict[int, dict[int, str]] = {cid: {} for cid in ids.values()}
+    own = select(tt.ThreatCategoryID, tt.ThreatTypeID, tt.ThreatTypeName).where(
+        *active, tt.ThreatCategoryID.in_(set(ids.values())))
+    mapped = (select(cmap.ThreatCategoryID, tt.ThreatTypeID, tt.ThreatTypeName)
+              .join(tc, tc.ThreatTypeID == tt.ThreatTypeID)
+              .join(cmap, cmap.ThreatCatalogueID == tc.ThreatCatalogueID)
+              .where(*active, tc.IsActive == True, tc.IsDeleted == False,
+                     cmap.ThreatCategoryID.in_(set(ids.values()))))
+    for query in (own, mapped):
+        for cid, tid, name in sess.execute(query).all():
+            by_cid[cid][tid] = name     # dict dedupes the overlap between the two doors
+    # Sorted by ThreatTypeID, the deterministic order get_possible_types also guarantees.
+    return {wanted[key]: [n for _, n in sorted(by_cid[cid].items())]
+            for key, cid in ids.items() if by_cid[cid]}
+
+
 def canonical_types_for(sess: Session, llm: LLMClient, categories: list[str],
                         retrieved: list[dict[str, Any]], query: str,
                         cap: int) -> dict[str, list[str]]:
@@ -480,47 +532,50 @@ def canonical_types_for(sess: Session, llm: LLMClient, categories: list[str],
     used: Counter[str] = Counter(t["library_threat_type"] for t in (retrieved or [])
                                  if t.get("library_threat_type"))
     s = get_settings()
-    out: dict[str, list[str]] = {}
+    # An unresolvable category is simply ABSENT here — never mapped to the whole vocabulary,
+    # which is what get_possible_types(sess, None) would have returned ([R6] fallback) and would
+    # advertise every type as belonging to that one cell.
+    by_category = _types_by_category(sess, categories)
+    out = {c: names for c, names in by_category.items() if len(names) <= cap}
+    overflow = {c: names for c, names in by_category.items() if len(names) > cap}
+    if not overflow:                     # today's 27-row library: no ranking runs at all
+        return out
+
+    # Both embeds hoisted out of the per-category loop, and reached only once something actually
+    # overflows. The query text is identical for every category, and the type-name vectors are
+    # one lookup for the UNION — a type listed under two categories was previously fetched twice.
     query_vec: list[float] | None = None
-    embedded = False
-    for c in categories:
-        # NEVER pass None through. get_possible_types(sess, None) returns EVERY active type
-        # ([R6] fallback), so an unresolvable category would advertise the whole vocabulary as
-        # if it belonged to that one cell — strictly worse than supplying nothing for it.
-        cid = find_category(sess, c)
-        if cid is None:
-            continue
-        names = [r["ThreatTypeName"] for r in get_possible_types(sess, cid)]
-        if not names:
-            continue
-        if len(names) <= cap:
-            out[c] = names
-            continue
-        if not embedded:  # one query embed per call, and only once something actually overflows
-            embedded = True
-            try:
-                qv = llm.embed([query], kind="query")
-                query_vec = qv[0] if len(qv) == 1 else None
-            except Exception:  # ranking degrades to keyword-only; the pass must not die for it
-                log.warning("canonical_types.query_embed_failed", session_query=query[:80],
-                            exc_info=True)
-        out[c] = _fuse_type_ranks(llm, names, used, query, query_vec, s, cap)
+    try:
+        qv = llm.embed([query], kind="query")
+        query_vec = qv[0] if len(qv) == 1 else None
+    except Exception:  # ranking degrades to keyword-only; the pass must not die for it
+        log.warning("canonical_types.query_embed_failed", session_query=query[:80], exc_info=True)
+    every_name = sorted({n for names in overflow.values() for n in names})
+    vecs: dict[str, list[float]] = {}
+    try:
+        vecs = embeddings.get_vectors(llm, every_name, model_id=s.embedding_model,
+                                      group="threat_type", kind="passage")
+    except Exception:  # keyword leg still ranks — see nearest_library_actors' limitation note
+        log.warning("canonical_types.type_vectors_failed_keyword_only", exc_info=True)
+
+    for c, names in overflow.items():
+        out[c] = _fuse_type_ranks(names, used, query, query_vec, vecs, cap)
     return out
 
 
-def _fuse_type_ranks(llm: LLMClient, names: list[str], used: Counter[str], query: str,
-                     query_vec: list[float] | None, s: Settings, cap: int) -> list[str]:
-    """RRF over (usage among retrieved) and (name similarity). See canonical_types_for."""
+def _fuse_type_ranks(names: list[str], used: Counter[str], query: str,
+                     query_vec: list[float] | None, vecs: dict[str, list[float]],
+                     cap: int) -> list[str]:
+    """RRF over (usage among retrieved) and (name similarity). See canonical_types_for.
+
+    Takes `vecs` rather than fetching them: this runs once per OVERFLOWING category, and the
+    caller looks the whole union up in one go. An empty dict is the degraded keyword-only path,
+    which the caller has already logged.
+    """
     by_usage = [i for i in sorted(range(len(names)), key=lambda i: (-used[names[i]], i))
                 if used[names[i]]]  # a type nobody used must not VOTE, same rule as BM25 zeros
-    candidates: list[dict[str, Any]] = [{"text": n, "name": n, "vector": None} for n in names]
-    try:
-        vecs = embeddings.get_vectors(llm, names, model_id=s.embedding_model,
-                                      group="threat_type", kind="passage")
-        for cand in candidates:
-            cand["vector"] = vecs.get(cand["text"])
-    except Exception:  # keyword leg still ranks — see nearest_library_actors' limitation note
-        log.warning("canonical_types.type_vectors_failed_keyword_only", exc_info=True)
+    candidates: list[dict[str, Any]] = [{"text": n, "name": n, "vector": vecs.get(n)}
+                                        for n in names]
     by_words = [i for i, _score in hybrid_search.hybrid_match(query, candidates,
                                                               query_vec=query_vec)]
     fused = hybrid_search.rrf_fuse([by_usage, by_words])
