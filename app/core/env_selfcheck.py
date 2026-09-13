@@ -68,6 +68,15 @@ def _live_keys(text: str) -> set[str]:
     return set(_LIVE_KEY_RE.findall(text))
 
 
+#: A `stringData:` entry in a generated Secret — two-space indent, uppercase key. Deliberately
+#: uppercase-anchored so the `metadata:` block's `name:`/`namespace:` are not read as settings.
+_SECRET_KEY_RE = re.compile(r"^  ([A-Z][A-Z0-9_]*)\s*:", re.MULTILINE)
+
+
+def _secret_keys(text: str) -> set[str]:
+    return set(_SECRET_KEY_RE.findall(text))
+
+
 def _entry_present(text: str, names: set[str]) -> bool:
     return any(re.search(rf"^\s*#?\s*{re.escape(n)}\s*=", text, re.MULTILINE) for n in names)
 
@@ -113,6 +122,24 @@ def check(root: Path) -> tuple[list[str], list[Path]]:
                         f"{path.name}: derived setting `{fname}` is a LIVE line ({hit}=…) — "
                         "pinning disables its derivation; comment it out with a LEAVE UNSET "
                         "note")
+    # THE SECRET IS THE FILE THAT ACTUALLY REACHES THE CLUSTER, and the reverse check above
+    # could not see it: it globs `.env*`, and the generated Secret lives in deploy/. Five removed
+    # features had left their env vars behind there — TSG_VALIDATOR_BATCH_SIZE outlived the LLM
+    # validator itself — and `extra="ignore"` discarded all five in every pod, silently, forever.
+    # Exactly the defect the reverse check exists for, one directory over.
+    # Both these files are gitignored, so CI and fresh clones simply have nothing to scan.
+    for path in sorted((root / "deploy").glob("*.yaml")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        # Only OUR Secret. `deploy/` also holds celery-exporter-secrets, whose CE_BROKER_URL is
+        # read by a different image entirely — flagging it would train the reader to ignore this
+        # check. `name: tsg-api-secrets` is hardcoded in the generator's HEADER, so this scopes
+        # itself: any new namespace's copy is covered the day it is generated.
+        if "name: tsg-api-secrets" not in text:
+            continue
+        for key in sorted(_secret_keys(text) - known):
+            problems.append(f"deploy/{path.name}: `{key}` is set but matches NO setting — "
+                            "extra='ignore' means EVERY POD discards it; delete it from the env "
+                            "file it was generated from")
     return problems, files
 
 
