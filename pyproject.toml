@@ -25,6 +25,9 @@ dependencies = [
   "starlette>=0.47",          # app/core/middleware.py, app/api/errors.py, admin_sse.py
   "anyio>=4.0",               # app/sse/bus.py
   "openai>=1.0",              # app/pipeline/llm.py (strict-schema conversion)
+  "python-dotenv>=1.0",       # app/core/env_selfcheck.py — the SAME parser the Secret
+                              # generator uses, so a value this check approves and the
+                              # generator emits cannot disagree. Arrives via pydantic-settings.
   "structlog>=26.1.0",
   "flower>=2.0.1",
   # prometheus-client removed: it was declared but never imported, and no /metrics route exists

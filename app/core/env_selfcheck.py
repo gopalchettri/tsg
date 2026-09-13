@@ -26,6 +26,7 @@ import re
 import sys
 from pathlib import Path
 
+from dotenv import dotenv_values
 from pydantic import AliasChoices
 
 from app.core.config import Settings
@@ -44,6 +45,31 @@ DERIVED_SETTINGS: tuple[str, ...] = (
     # mapped scenarios came back empty. Pinning it is now the CORRECT posture, so warning that a
     # live line "disables its derivation" would push an operator straight back into that bug.
 )
+
+#: The env file this deployment TESTS and derives its Secret from (scripts/gen_secret_from_env.py
+#: defaults to the same file), hence the only one whose values reach production.
+POSTURE_FILE = ".env.uat"
+
+#: Values THIS deployment has DECIDED, each with the evidence that decided it.
+#:
+#: WHY A LIST IN SOURCE. Everything else here checks that a setting is PRESENT and SPELLED right;
+#: nothing could see a setting that is present, correctly spelled and simply WRONG. That gap cost
+#: a real instruction: `control_map_sweep_enabled` was set to false, a later alias change rewrote
+#: the line carrying the DOCUMENTED DEFAULT instead of the operator's value, and because .env* is
+#: gitignored there was no diff, no history and no review to catch it. For an untracked file an
+#: assertion about the value is the only possible detection.
+#:
+#: The precedent is deliberate: gen_secret_from_env.py already declares its cluster deltas "in one
+#: reviewed place" rather than trusting them to memory. These six were decided from a 1,271s
+#: production trace, so changing one should cost a reviewed edit, not a stray keystroke.
+DEPLOYMENT_POSTURE: dict[str, tuple[str, str]] = {
+    "control_map_sweep_enabled":    ("false", "operator decision, given twice"),
+    "canonical_types_per_category": ("0", "dark until the kimi swap is verified in production"),
+    "inference_model":              ("kimi-k2.5", "glm-5 took 967s on production input; kimi 4.7s"),
+    "inference_fallback_model":     ("glm-5", "safety net; reversed from primary"),
+    "llm_max_retries":              ("1", "= 2 attempts; the nested SDK loop reached ~16"),
+    "llm_timeout_seconds":          ("120.0", "sized for the glm-5 FALLBACK, not for kimi"),
+}
 
 
 def _expected_names(field_name: str, field) -> set[str]:
@@ -88,6 +114,30 @@ def _live_line(text: str, names: set[str]) -> str | None:
     return None
 
 
+def _posture_problems(path: Path, fields) -> list[str]:
+    """Every DECIDED value must be present, live and exact in the tested source.
+
+    ABSENT IS A FAILURE, not a pass: control_map_sweep_enabled defaults to True, so deleting the
+    line re-enables the sweep exactly as silently as overwriting it did.
+
+    dotenv_values rather than a regex, because it is what the generator reads — a value this
+    check approves and the generator emits differently would be worse than no check at all.
+    """
+    values = {k.upper(): v for k, v in dotenv_values(path).items() if v is not None}
+    problems = []
+    for fname, (want, why) in DEPLOYMENT_POSTURE.items():
+        got = next((values[n] for n in
+                    {x.upper() for x in _expected_names(fname, fields[fname])} if n in values),
+                   None)
+        if got is None:
+            problems.append(f"{path.name}: `{fname}` is unset — this deployment decided "
+                            f"`{want}` ({why}); the code default silently applies instead")
+        elif got.strip() != want:
+            problems.append(f"{path.name}: `{fname}` is `{got.strip()}` but this deployment "
+                            f"decided `{want}` ({why})")
+    return problems
+
+
 def check(root: Path) -> tuple[list[str], list[Path]]:
     """→ (problems, files checked). Pure so the verification suite can call it directly."""
     files = sorted(p for p in root.glob(".env*") if p.is_file())
@@ -109,6 +159,8 @@ def check(root: Path) -> tuple[list[str], list[Path]]:
         for key in sorted(_live_keys(text) - known):
             problems.append(f"{path.name}: `{key}` is set but matches NO setting — extra='ignore' "
                             "means it is silently discarded (check the TSG_ prefix / spelling)")
+        if path.name == POSTURE_FILE:
+            problems += _posture_problems(path, fields)
         for fname, f in fields.items():
             names = _expected_names(fname, f)
             if not _entry_present(text, names):

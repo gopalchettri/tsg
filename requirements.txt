@@ -22,6 +22,7 @@ ijson>=3.4
 starlette>=0.47
 anyio>=4.0
 openai>=1.0
+python-dotenv>=1.0
 structlog>=26.1.0
 flower>=2.0.1
 httpx>=0.28.1

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.core.env_selfcheck import check
+from app.core.env_selfcheck import DEPLOYMENT_POSTURE, POSTURE_FILE, check
 
 
 def _reverse_hits(root: Path) -> list[str]:
@@ -96,3 +96,71 @@ def test_the_repos_own_secrets_carry_no_dead_keys():
     if not (root / "deploy" / "secrets.yaml").exists():
         return
     assert _secret_hits(root) == []
+
+
+# --- DEPLOYMENT_POSTURE: the value nobody was checking ------------------------------------
+# The three checks above all ask "is this setting PRESENT and SPELLED right?". None could see a
+# setting that is present, correctly spelled and simply WRONG -- and that gap swallowed a real
+# instruction. control_map_sweep_enabled was set to false; a later alias change rewrote the line
+# carrying the DOCUMENTED DEFAULT instead of the operator's value. .env* is gitignored, so there
+# was no diff, no history and no review. For an untracked file, asserting the value is the only
+# detection there is.
+
+def _posture_hits(root: Path) -> list[str]:
+    return [p for p in check(root)[0] if "this deployment" in p]
+
+
+def _write_posture(root: Path, **override: str) -> None:
+    """A POSTURE_FILE satisfying every decided value, minus/plus whatever the test changes.
+
+    Built FROM the table rather than hardcoding the six values, so adding a decision does not
+    silently leave these tests asserting a stale one."""
+    vals = {f"TSG_{k.upper()}": v for k, (v, _) in DEPLOYMENT_POSTURE.items()}
+    vals.update(override)
+    (root / POSTURE_FILE).write_text(
+        "".join(f"{k}={v}\n" for k, v in vals.items() if v is not None), encoding="utf-8")
+
+
+def test_a_decided_value_set_wrong_is_flagged(tmp_path: Path):
+    """THE regression: the sweep switch reading true when this deployment decided false."""
+    _write_posture(tmp_path, TSG_CONTROL_MAP_SWEEP_ENABLED="true")
+    hits = _posture_hits(tmp_path)
+    assert any("control_map_sweep_enabled" in h and "`true`" in h for h in hits), hits
+    assert len(hits) == 1, f"only the wrong one should fire: {hits}"
+
+
+def test_a_decided_value_left_UNSET_is_also_flagged(tmp_path: Path):
+    """Absent is not a pass. control_map_sweep_enabled defaults to True, so DELETING the line
+    re-enables the sweep exactly as silently as overwriting it did."""
+    _write_posture(tmp_path, TSG_CONTROL_MAP_SWEEP_ENABLED=None)
+    assert any("control_map_sweep_enabled" in h and "unset" in h for h in _posture_hits(tmp_path))
+
+
+def test_the_decided_values_pass(tmp_path: Path):
+    _write_posture(tmp_path)
+    assert _posture_hits(tmp_path) == []
+
+
+def test_an_inline_comment_does_not_defeat_the_comparison(tmp_path: Path):
+    """.env.uat really does carry `TSG_LLM_MAX_RETRIES=1 # 1 here mean 2 attemts`. Comparing the
+    raw line would read the comment as part of the value and fail a correct file."""
+    want = DEPLOYMENT_POSTURE["llm_max_retries"][0]
+    _write_posture(tmp_path, TSG_LLM_MAX_RETRIES=f"{want}   # 1 here mean 2 attempts")
+    assert _posture_hits(tmp_path) == []
+
+
+def test_the_operators_own_env_is_not_policed(tmp_path: Path):
+    """Only POSTURE_FILE is checked -- it is the tested source the Secret derives from. A
+    developer's .env pins whatever their machine needs, the same exemption DERIVED_SETTINGS
+    already grants it."""
+    _write_posture(tmp_path)
+    (tmp_path / ".env").write_text("TSG_CONTROL_MAP_SWEEP_ENABLED=true\n", encoding="utf-8")
+    assert _posture_hits(tmp_path) == []
+
+
+def test_the_real_env_uat_matches_every_decision():
+    """Regression guard on the actual deployed source. Skips where it is absent (gitignored)."""
+    root = Path(__file__).resolve().parents[1]
+    if not (root / POSTURE_FILE).exists():
+        return
+    assert _posture_hits(root) == []
