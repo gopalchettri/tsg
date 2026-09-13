@@ -289,7 +289,7 @@ COMMENTS: dict[str, str] = {
     """,
     "LLM_TEMPERATURE": """
         How much the AI is allowed to vary its wording. 0 gives the most consistent answers, 2
-        the most varied. Leave empty to use the provider's own default.
+        the most varied. To use the provider's own default, COMMENT THE LINE OUT. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.
     """,
     "TSG_LLM_JSON_MODE": """
         Ask the AI service to guarantee the reply is valid JSON, rather than hoping the model
@@ -299,8 +299,8 @@ COMMENTS: dict[str, str] = {
         whole batch's processing time.
     """,
     "LLM_REASONING_EFFORT": """
-        How much hidden "thinking" the AI does before answering: low, medium or high. Leave
-        empty for the provider's default.
+        How much hidden "thinking" the AI does before answering: low, medium or high. For the
+        provider's default, COMMENT THE LINE OUT. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.
 
         This matters for glm-5, which spends around 5,000 hidden thinking tokens to produce
         one paragraph — roughly 95% of its total time, and the reason the old timeout kept
@@ -308,8 +308,8 @@ COMMENTS: dict[str, str] = {
         kimi does no hidden thinking at all, so the setting does nothing for it.
     """,
     "TSG_LLM_MAX_OUTPUT_TOKENS": """
-        The largest reply the AI may produce, between 256 and 32768. Leave empty for the
-        provider's default.
+        The largest reply the AI may produce, between 256 and 32768. For the provider's
+        default, COMMENT THE LINE OUT. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.
 
         Careful on a thinking model: the limit COUNTS the hidden thinking as well as the
         visible answer. Set it too low and the model can spend the whole allowance thinking
@@ -334,7 +334,7 @@ COMMENTS: dict[str, str] = {
     """,
     "LLM_GUARDRAILS": """
         Names of extra safety filters the gateway should run on every AI call, separated by
-        commas. Leave empty for none. The names must already exist in the gateway's own setup.
+        commas. For none, COMMENT THE LINE OUT — the names must already exist in the gateway's own setup. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.
     """,
     "THREAT_IDENTIFICATION_TEMPERATURE": """
         How much the AI may vary its wording when identifying threats. 0 keeps it repeatable,
@@ -627,8 +627,8 @@ COMMENTS: dict[str, str] = {
         at 55, a threat scoring 60 passes and one scoring 52 is dropped.
     """,
     "TSG_SCOPING_TOP_N": """
-        Keep only the best N threats after scoring. Leave it empty for no cap, which is the
-        default — every threat that passed the threshold gets a scenario.
+        Keep only the best N threats after scoring. For no cap — the default, where every
+        threat that passed the threshold gets a scenario — COMMENT THE LINE OUT. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.
 
         Nothing is thrown away when you do set it: the rest are banked and can still be served
         later by asking for the next set.
@@ -677,7 +677,7 @@ COMMENTS: dict[str, str] = {
     "TSG_CONTROL_MAP_MIN_SCORE": """
         The score out of 100 a control must reach to be attached to a scenario.
 
-        PIN IT, do not leave it empty. Left unset it inherits the threat-matching threshold,
+        PIN IT to a real number. Left unset it inherits the threat-matching threshold,
         which was measured comparing one short label against another. Control matching
         compares a whole scenario paragraph against a control label, which scores lower by
         nature. That mismatch once dropped every match and published empty control lists that
@@ -719,8 +719,8 @@ COMMENTS: dict[str, str] = {
         How long a treatment plan marked as in-progress is believed before it is treated as
         abandoned.
 
-        LEAVE THIS EMPTY. It works itself out from the AI timeout and retry settings, so it
-        follows real timings automatically. Pinning a number means it stops tracking them.
+        COMMENT THE LINE OUT. It works itself out from the AI timeout and retry settings, so it follows real
+        timings automatically. Pinning a number means it stops tracking them. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.
     """,
     "TSG_TREATMENT_FREE_TEXT_CAP": """
         The longest a single free-text field supplied from the user interface may be when a
@@ -821,17 +821,17 @@ COMMENTS: dict[str, str] = {
     "TSG_REAPER_STALE_GRACE_SECONDS": """
         How long to wait past a step's lease before deciding the worker holding it is dead.
 
-        LEAVE THIS EMPTY — do not copy the value from another environment. It must stay at or
+        COMMENT THE LINE OUT — and do not copy a value from another environment. It must stay at or
         above this environment's real lease time, which is worked out from the AI timeout and
         retry settings. Too short and the sweeper takes work away from a worker that is still
-        running it perfectly well, and the same step gets done twice.
+        running it perfectly well, and the same step gets done twice. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.
     """,
     "TSG_STAGE_LEASE_SECONDS": """
         How long one pipeline step may hold its claim before another worker may take it over.
 
-        LEAVE THIS EMPTY. It works itself out from the AI timeout multiplied by the attempts
+        COMMENT THE LINE OUT. It works itself out from the AI timeout multiplied by the attempts
         allowed, doubled to cover the fallback model. The app refuses to start if you pin a
-        value too small for those settings, because that guarantees work is stolen mid-flight.
+        value too small for those settings, because that guarantees work is stolen mid-flight. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.
     """,
     "TSG_STAGE_MAX_ATTEMPTS": """
         How many times one pipeline step may be retried before it is given up on. Stops a step
@@ -847,9 +847,9 @@ COMMENTS: dict[str, str] = {
     "TSG_SUBSYSTEM_TASK_SOFT_LIMIT_SECONDS": """
         How long one subsystem's background job may run before it is asked to stop.
 
-        LEAVE THIS EMPTY. It works itself out from the step lease, capped at 90% of the queue
+        COMMENT THE LINE OUT. It works itself out from the step lease, capped at 90% of the queue
         redelivery timeout above. A fixed number cannot be right in both development and
-        production, because the AI timeouts it depends on differ between them.
+        production, because the AI timeouts it depends on differ between them. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.
     """,
     "TSG_REAPER_SQL_IN_CHUNK_SIZE": """
         How many session ids the cleanup sweep puts into one database query. Kept well below

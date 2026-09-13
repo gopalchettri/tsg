@@ -107,6 +107,17 @@ def test_the_repos_own_secrets_carry_no_dead_keys():
 # was no diff, no history and no review. For an untracked file, asserting the value is the only
 # detection there is.
 
+#: The sweep switch is the worked example in these tests, but its DECIDED value is an operator
+#: choice that has already flipped once — and hardcoding it here made three tests invert the day
+#: it did. Derive both the matching spellings and the opposite ones from the table itself, so a
+#: future decision change moves the tests with it instead of breaking them.
+_SWEEP = "control_map_sweep_enabled"
+_DECIDED = DEPLOYMENT_POSTURE[_SWEEP][0]
+_TRUEISH, _FALSEISH = ["true", "True", "TRUE", "1", "yes"], ["false", "False", "FALSE", "0", "no"]
+_SAME = _TRUEISH if _DECIDED == "true" else _FALSEISH
+_OPPOSITE = _FALSEISH if _DECIDED == "true" else _TRUEISH
+
+
 def _posture_hits(root: Path) -> list[str]:
     return [p for p in check(root)[0] if "this deployment" in p]
 
@@ -124,9 +135,10 @@ def _write_posture(root: Path, **override: str) -> None:
 
 def test_a_decided_value_set_wrong_is_flagged(tmp_path: Path):
     """THE regression: the sweep switch reading true when this deployment decided false."""
-    _write_posture(tmp_path, TSG_CONTROL_MAP_SWEEP_ENABLED="true")
+    wrong = _OPPOSITE[0]
+    _write_posture(tmp_path, TSG_CONTROL_MAP_SWEEP_ENABLED=wrong)
     hits = _posture_hits(tmp_path)
-    assert any("control_map_sweep_enabled" in h and "`true`" in h for h in hits), hits
+    assert any(_SWEEP in h and f"`{wrong}`" in h for h in hits), hits
     assert len(hits) == 1, f"only the wrong one should fire: {hits}"
 
 
@@ -174,7 +186,7 @@ def test_a_spelling_variant_of_the_decided_value_PASSES(tmp_path: Path):
     `120.0`. Flagging them would make this checker reject files the app accepts -- and a tool
     that cries wolf gets skipped, which costs far more than it ever catches.
     """
-    for variant in ("False", "FALSE", "0", "no"):
+    for variant in _SAME:
         _write_posture(tmp_path, TSG_CONTROL_MAP_SWEEP_ENABLED=variant)
         assert _posture_hits(tmp_path) == [], variant
     _write_posture(tmp_path, TSG_LLM_TIMEOUT_SECONDS="120")
@@ -184,9 +196,9 @@ def test_a_spelling_variant_of_the_decided_value_PASSES(tmp_path: Path):
 def test_the_wrong_value_still_fails_however_it_is_spelled(tmp_path: Path):
     """The other half. Loosening the comparison must not loosen the VERDICT -- `True`, `1` and
     `yes` are the state this deployment decided against."""
-    for variant in ("true", "True", "1", "yes"):
+    for variant in _OPPOSITE:
         _write_posture(tmp_path, TSG_CONTROL_MAP_SWEEP_ENABLED=variant)
-        assert any("control_map_sweep_enabled" in h for h in _posture_hits(tmp_path)), variant
+        assert any(_SWEEP in h for h in _posture_hits(tmp_path)), variant
 
 
 def test_a_value_that_cannot_be_parsed_says_so(tmp_path: Path):
@@ -206,3 +218,53 @@ def test_every_declared_setting_name_is_real():
     real = set(Settings.model_fields)
     assert not set(DEPLOYMENT_POSTURE) - real, "DEPLOYMENT_POSTURE names a setting that is gone"
     assert not set(DERIVED_SETTINGS) - real, "DERIVED_SETTINGS names a setting that is gone"
+
+
+# --- A blank value is NOT "unset" -----------------------------------------------------------
+# pydantic-settings decides unset by whether the key is ABSENT. `KEY=` with nothing after it is a
+# SUPPLIED empty string, which then has to survive type validation: fine for a str, fatal for an
+# int/float/Literal/list. The env comments said "leave empty" for both kinds, so an operator
+# following that advice on two derived numbers took .env down. Eleven settings carried that
+# wording. Rewording them was the fix; this is what stops the next one drifting back.
+
+
+def _empty_hits(root: Path) -> list[str]:
+    return [p for p in check(root)[0] if "EMPTY value" in p]
+
+
+def test_a_blank_numeric_setting_is_reported(tmp_path: Path):
+    """THE regression: `TSG_STAGE_LEASE_SECONDS=` cannot parse, so the app will not start."""
+    (tmp_path / ".env.uat").write_text(
+        "TSG_STAGE_LEASE_SECONDS=\nTSG_REAPER_STALE_GRACE_SECONDS=\n", encoding="utf-8")
+    hits = _empty_hits(tmp_path)
+    assert any("stage_lease_seconds" in h for h in hits), hits
+    assert any("reaper_stale_grace_seconds" in h for h in hits), hits
+
+
+def test_a_blank_STRING_setting_is_left_alone(tmp_path: Path):
+    """The other half, and the reason this cannot just flag every blank line: for a string,
+    empty IS a legitimate value and the comments correctly say so."""
+    (tmp_path / ".env.uat").write_text(
+        "TSG_OPENAI_BASE_URL=\nTSG_INFERENCE_FALLBACK_MODEL=\nTSG_FLOWER_BASIC_AUTH=\n",
+        encoding="utf-8")
+    assert _empty_hits(tmp_path) == []
+
+
+def test_a_commented_out_setting_is_not_a_blank_value(tmp_path: Path):
+    """The FIX must not read as a new problem — commenting the line out is the correct state."""
+    (tmp_path / ".env.uat").write_text("# TSG_STAGE_LEASE_SECONDS=\n", encoding="utf-8")
+    assert _empty_hits(tmp_path) == []
+
+
+def test_the_message_says_what_to_do_about_it():
+    """"cannot parse" alone sends the reader looking for a valid number to type. The action is
+    to REMOVE the line, and the message has to say so or the fix is a second wrong guess."""
+    root = Path(__file__).resolve().parents[1]
+    hits = _empty_hits(root)
+    if hits:                              # only asserts when there is something to assert on
+        assert all("Comment the line out" in h for h in hits)
+
+
+def test_the_repos_own_env_files_have_no_blank_unparseable_values():
+    """Regression guard on the real files. Both .env and .env.uat were broken this way."""
+    assert _empty_hits(Path(__file__).resolve().parents[1]) == []

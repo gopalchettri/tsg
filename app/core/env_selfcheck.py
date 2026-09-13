@@ -71,11 +71,14 @@ POSTURE_FILE = ".env.uat"
 #: "false" and "False" are the same decision. tests/test_env_selfcheck.py pins every key here to
 #: a real Settings field, so a rename fails CI instead of crashing the checker.
 DEPLOYMENT_POSTURE: dict[str, tuple[str, str]] = {
-    "control_map_sweep_enabled":    ("false", "operator decision, given twice"),
+    "control_map_sweep_enabled":    ("true", "operator decision, reversing the earlier off: "
+                                             "the control-map retry queue keeps its consumer"),
     "canonical_types_per_category": ("0", "dark until the kimi swap is verified in production"),
     "inference_model":              ("kimi-k2.5", "glm-5 took 967s on production input; kimi 4.7s"),
     "inference_fallback_model":     ("glm-5", "safety net; reversed from primary"),
-    "llm_max_retries":              ("1", "= 2 attempts; the nested SDK loop reached ~16"),
+    "llm_max_retries":              ("2", "= 3 attempts per model; 720s worst case for the "
+                                          "kimi->glm-5 chain at a 120s timeout, and the nested "
+                                          "SDK loop that once reached ~16 is pinned to 0"),
     "llm_timeout_seconds":          ("120.0", "sized for the glm-5 FALLBACK, not for kimi"),
 }
 
@@ -147,6 +150,37 @@ def _derived_problems(fname: str, live: set[str],
             problems.append(f"{fname}: derived setting `{field}` is a LIVE line ({hit[0]}=…) — "
                             "pinning disables its derivation; comment it out with a LEAVE UNSET "
                             "note")
+    return problems
+
+
+def _empty_value_problems(fname: str, text: str, fields,
+                          names_by_field: dict[str, set[str]]) -> list[str]:
+    """A live `KEY=` with NOTHING after it is a SUPPLIED empty string, not "unset".
+
+    pydantic-settings decides unset by whether the key is ABSENT. A present-but-blank key is a
+    value of "", which then has to survive type validation — fine for a str, fatal for an int,
+    float, Literal or list. The env comments said "leave empty" for both kinds, so an operator
+    following that advice on stage_lease_seconds and reaper_stale_grace_seconds took BOTH env
+    files down at once: the app cannot parse "" as a number and refuses to boot.
+
+    Eleven settings carried that same wording. Rewording them is the fix; this is what stops the
+    next one drifting back, and it costs one parse per blank line.
+    """
+    blank = {k.upper() for k, v in dotenv_values(stream=io.StringIO(text)).items() if v == ""}
+    if not blank:
+        return []
+    problems = []
+    for field, names in names_by_field.items():
+        hit = sorted(names & blank)
+        if not hit:
+            continue
+        try:
+            TypeAdapter(fields[field].annotation).validate_strings("")
+        except ValidationError:
+            problems.append(
+                f"{fname}: `{hit[0]}=` is set to an EMPTY value, which `{field}` cannot parse — "
+                "the app will NOT START. Comment the line out to leave the setting unset; a "
+                "blank value is not the same as an absent one.")
     return problems
 
 
@@ -234,6 +268,7 @@ def check(root: Path) -> tuple[list[str], list[Path]]:
         text = path.read_text(encoding="utf-8", errors="replace")
         live, documented = _scan(text)
         problems += _reverse_problems(path.name, live, known)
+        problems += _empty_value_problems(path.name, text, fields, names_by_field)
         if path.name == POSTURE_FILE:
             problems += _posture_problems(path.name, text, fields, names_by_field)
         problems += _missing_entry_problems(path.name, documented, names_by_field)

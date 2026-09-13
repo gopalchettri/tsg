@@ -561,6 +561,12 @@ def test_production_scale_request_caps_gap_ask_and_reports_partial_honestly(monk
     captured: dict = {}
     real_prompt = tasks.prompts.threats_prompt
 
+    # PIN the ceiling this test asserts on. It used to read whatever the developer's .env
+    # happened to say and hardcode 15 as the answer — green on a machine whose .env matched the
+    # code default, red on one that tunes it (this repo's own .env sets 12). A test that names a
+    # number has to own that number.
+    monkeypatch.setattr(get_settings(), "threat_llm_max_generation", 15)
+
     def _capture(*a, **kw):
         if kw.get("quota") is not None:
             captured.update(kw)
