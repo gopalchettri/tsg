@@ -64,7 +64,7 @@ def plan_presenter_columns():
 
 
 def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime,
-                          plan_id: str | None = None) -> int:
+                        plan_id: str | None = None) -> int:
     """Retire the scenario's active plan row so a new attempt can insert; returns rowcount. Matches
     only replaceable rows: finished, or a RUNNING claim stalled before `stale_cutoff`. A FRESH
     RUNNING row matches nothing, so the insert hits UX_TreatmentPlan_ActiveScenario → 409.
@@ -75,12 +75,12 @@ def supersede_active_plan(sess: Session, output_id: str, stale_cutoff: datetime,
     (rowcount 0 → the caller 409s) instead of retiring, and acting on, the wrong version."""
     p = m.Risk_Treatment_Plan
     where = [p.ScenarioID == output_id, active(p.Superseded),
-             or_(p.Status.in_([StageStatus.COMPLETE, StageStatus.ERROR]),
-                 and_(p.Status == StageStatus.RUNNING, p.UpdatedAt < stale_cutoff))]
+            or_(p.Status.in_([StageStatus.COMPLETE, StageStatus.ERROR]),
+                and_(p.Status == StageStatus.RUNNING, p.UpdatedAt < stale_cutoff))]
     if plan_id is not None:
         where.append(p.PlanID == plan_id)
     return execute_dml(sess, update(p).where(*where)
-                       .values(Superseded=1, UpdatedAt=now())).rowcount
+                    .values(Superseded=1, UpdatedAt=now())).rowcount
 
 
 def active_plan_baseline(sess: Session, session_id: str, output_id: str) -> RowMapping | None:
@@ -317,8 +317,8 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
         cols = [*plan_presenter_columns(), *context,
                 out.ScenarioJSON, *scenario_threat_columns(), st.Score, st.ScopeRank]
         joined = (joined
-                  .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
-                  .outerjoin(it, st.ThreatID == it.ThreatID))
+                .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
+                .outerjoin(it, st.ThreatID == it.ThreatID))
     stmt = (
         select(*cols)
         .select_from(joined)
@@ -355,7 +355,7 @@ def plan_history_rows(sess: Session, session_id: str, output_id: str) -> list[Ro
 
 
 def superseded_plan_rows(sess: Session, session_id: str,
-                         output_id: str | None = None) -> list[RowMapping]:
+                        output_id: str | None = None) -> list[RowMapping]:
     """The regeneration history behind the poll GET's ?include_superseded=true: every RETIRED
     version of one scenario's plan — or, with output_id=None, of the WHOLE session in one round
     trip (the board's ?include_superseded=true; global newest-first order keeps each scenario's

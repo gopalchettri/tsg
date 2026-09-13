@@ -184,7 +184,7 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
                     "next set first",
                     reason="nothing_to_accept")
 
-        # ponytail: no complete_session here. Generation already completed the session at its
+        # no complete_session here. Generation already completed the session at its
         # review barrier (tasks._send_to_review), which is what frees the asset. Completing it
         # again would be wrong twice over: the CAS is fenced on SessionStatus == active and would
         # fail on every call, and "the session is over" is no longer what an accept means — each
