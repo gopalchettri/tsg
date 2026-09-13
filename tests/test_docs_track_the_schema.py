@@ -174,3 +174,159 @@ def test_word_guidebook_agrees_with_the_html_on(sentinel):
     assert h == d, f"{sentinel!r}: HTML has {h}, Word has {d} — the Word guidebook is out of date"
     if sentinel == "Omit plan_id":
         assert h == 0, "the review section still says plan_id may be omitted"
+
+
+# ---------------------------------------------------------------------------------------------
+# The same pin, widened from four endpoints to EVERY endpoint.
+#
+# The four pins above cover treatment-plan responses only. The guide documents ~47 more, and
+# until this test every one of those example responses was hand-typed with nothing checking it.
+# That is not hypothetical: an audit of this guide found 34 defects, and six endpoints were added
+# in one commit without the guide noticing at all. A doc that is only spot-checked drifts back.
+#
+# Compares KEY SETS, never values, and only complains about keys the model cannot produce —
+# a missing key is often deliberate abbreviation in a long example, an INVENTED key never is.
+# ---------------------------------------------------------------------------------------------
+
+_API_ROW = re.compile(r"\|\s*\*\*APIs?\*\*\s*\|(.+?)\n", re.S)
+_ENDPOINT = re.compile(r"`(GET|POST|PUT|PATCH|DELETE)\s+(/[^`\s?]+)")
+_JSON_BLOCK = re.compile(r"```json\s*\n(?:(\d{3})\s+)?(.*?)```", re.S)
+
+
+@pytest.fixture(scope="module")
+def openapi_spec():
+    """The spec with the risk module ON.
+
+    It is flag-gated OFF by default, so without this the eleven treatment routes are simply
+    absent and their cards would be skipped in silence — the failure mode this test exists to
+    prevent, reproduced inside the test itself.
+    """
+    import os
+
+    from app.core.config import get_settings
+    from app.main import create_app
+
+    previous = os.environ.get("TSG_RISK_MODULE_ENABLED")
+    os.environ["TSG_RISK_MODULE_ENABLED"] = "true"
+    get_settings.cache_clear()
+    try:
+        yield create_app().openapi()
+    finally:
+        if previous is None:
+            os.environ.pop("TSG_RISK_MODULE_ENABLED", None)
+        else:
+            os.environ["TSG_RISK_MODULE_ENABLED"] = previous
+        get_settings.cache_clear()
+
+
+def _resolve(schema: dict, components: dict, depth: int = 0):
+    if depth > 8 or not isinstance(schema, dict):
+        return None
+    if "$ref" in schema:
+        return _resolve(components.get(schema["$ref"].rsplit("/", 1)[-1], {}), components, depth + 1)
+    if schema.get("type") == "array":
+        return _resolve(schema.get("items", {}), components, depth + 1)
+    for key in ("anyOf", "oneOf", "allOf"):
+        for alt in schema.get(key, []):
+            if alt.get("type") == "null":
+                continue
+            got = _resolve(alt, components, depth + 1)
+            if got:
+                return got
+    return schema if schema.get("properties") else None
+
+
+_OPEN = object()   # this scope sets extra="allow" — undeclared keys are legitimate here
+
+
+def _model_keys(schema: dict, components: dict, depth: int = 0) -> dict:
+    """Key set at each nested path. `extra="allow"` scopes are marked _OPEN and never checked.
+
+    ScenarioNarrative relies on that: scenario_title/scenario_statement/risk_statement are
+    model-authored strings passed through undeclared on purpose, and the guide documents them
+    correctly. Without honouring it, this test fails the guide for being right.
+    """
+    out: dict = {}
+    obj = _resolve(schema, components)
+    if not obj or depth > 4:
+        return out
+    props = obj.get("properties", {})
+    out[""] = _OPEN if obj.get("additionalProperties") is True else set(props)
+    for name, sub in props.items():
+        for path, keys in _model_keys(sub, components, depth + 1).items():
+            key = f"{name}.{path}".rstrip(".")
+            if out.get(key) is _OPEN:
+                continue
+            out[key] = _OPEN if keys is _OPEN else (out.get(key) or set()) | keys
+    return out
+
+
+def _example_keys(value, prefix: str = "") -> dict:
+    out: dict = {}
+    if isinstance(value, dict):
+        out.setdefault(prefix, set()).update(value)
+        for k, v in value.items():
+            for p, keys in _example_keys(v, f"{prefix}.{k}".lstrip(".")).items():
+                out.setdefault(p, set()).update(keys)
+    elif isinstance(value, list):
+        for item in value:
+            for p, keys in _example_keys(item, prefix).items():
+                out.setdefault(p, set()).update(keys)
+    return out
+
+
+def test_every_documented_response_matches_its_model(openapi_spec):
+    components = openapi_spec.get("components", {}).get("schemas", {})
+    problems, checked = [], 0
+
+    for card in re.split(r"^### Test ", _MD.read_text(encoding="utf-8"), flags=re.M)[1:]:
+        title = card.split("\n", 1)[0].strip()[:52]
+        row = _API_ROW.search(card)
+        if not row:
+            continue
+        expected = None
+        for method, path in _ENDPOINT.findall(row.group(1)):
+            op = openapi_spec["paths"].get(path, {}).get(method.lower())
+            if not op:
+                continue
+            for code in ("200", "201", "202"):
+                body = op.get("responses", {}).get(code, {}).get("content", {}).get(
+                    "application/json")
+                if body and body.get("schema"):
+                    keys = _model_keys(body["schema"], components)
+                    if keys.get("") and keys.get("") is not _OPEN:
+                        expected = keys
+                    break
+            if expected:
+                break
+        if not expected:
+            continue                      # SSE streams and placeholder paths have no JSON model
+
+        for status, raw in _JSON_BLOCK.findall(card):
+            if status and status not in ("200", "201", "202"):
+                continue
+            try:
+                payload = json.loads(raw.strip())
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, (dict, list)):
+                continue
+            actual = _example_keys(payload)
+            if not actual.get(""):
+                continue
+            checked += 1
+            for scope, keys in sorted(actual.items()):
+                known = expected.get(scope)
+                if known is None or known is _OPEN:
+                    continue
+                invented = keys - known
+                if invented:
+                    problems.append(
+                        f"Test {title} at {scope or '(top level)'}: {sorted(invented)}")
+
+    assert checked >= 25, (
+        f"only {checked} response examples were checked — the guide's card format probably "
+        "changed and this test is now silently covering almost nothing")
+    assert not problems, (
+        "guide response examples contain keys their model cannot produce:\n  "
+        + "\n  ".join(problems))

@@ -20,6 +20,10 @@ passing runs):
   A  which .env actually loaded          - config.py reads ".env" only; a file named .env.uat is
                                             NOT auto-loaded, so UAT can silently run dev settings
   B  SQL Server + GUID matching          - the uppercase-GUID bug was MSSQL collation semantics
+  B2 DB schema invariants               - the same guard the API and workers run at boot. A
+                                            missing index is otherwise discovered only as a
+                                            container that will not start (UAT 2026-09-07:
+                                            UX_ThreatCatalogue_NaturalKey, Msg 1505 duplicates)
   C  Redis + INTEGER lock TTL            - redis-py rejects float ex=/EXPIRE; a float TTL made the
                                             admin mutex silently never engage in production
   D  MongoDB + threshold store           - vector cache and calibrated thresholds live here
@@ -116,6 +120,16 @@ def main() -> int:
         with db_session() as sess:
             sess.execute(text("SELECT 1"))
         return "connected"
+
+    @check("DB schema invariants (the guard the API and workers run at boot)")
+    def _schema():
+        from app.db.engine import get_engine
+        from app.db.invariants import verify_startup
+
+        # THE boot guard itself, not a re-implementation: whatever main.py and the worker
+        # refuse to start without, this refuses to pass. Read-only.
+        verify_startup(get_engine())
+        return "every boot invariant satisfied"
 
     @check("SQL Server matches an UPPERCASE GUID (the original 409 bug)")
     def _guid():

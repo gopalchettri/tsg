@@ -321,6 +321,31 @@ def _litellm_key_header(s: Settings) -> dict[str, Any]:
     return {"extra_headers": {s.litellm_api_key_header: s.litellm_api_key}}
 
 
+def _litellm_call_budget(s: Settings) -> dict[str, Any]:
+    """The timeout + retry budget EVERY outbound litellm SDK call shares.
+
+    `max_retries` is NOT redundant with `num_retries`. `num_retries` is litellm's OWN loop; the
+    OpenAI client it builds underneath keeps a SEPARATE one (`openai.py` assigns
+    `client.max_retries`) that nothing here reached, so the two MULTIPLIED. A production run spent
+    723s - 4x the 180s timeout - inside a SINGLE litellm attempt, and 1268s on one scenario before
+    the fallback fired, while `llm_max_retries` read "3". Pinning it to 0 makes `llm_max_retries`
+    the WHOLE retry budget, which is what its name has always claimed. litellm classifies it as a
+    client param, never a provider one (utils.PROVIDER_UNVALIDATED_PARAMS), so it is never sent to
+    the gateway as an API field.
+
+    ONE function rather than the pair repeated per call site: chat, embed, rerank and the boot
+    probe each carried `timeout=..., num_retries=...` under a "same bounds as chat" comment, and
+    that comment silently stopped being true the moment chat gained a third key. Shared, the four
+    cannot drift apart again.
+
+    Returns a FRESH dict every call, deliberately: `_chat_kwargs` treats the result as its
+    own `common` and mutates it (temperature, drop_params, stream, reasoning_effort,
+    max_tokens). Hoisting this to a module-level constant would look like an optimisation
+    and would leak one call's params into the next.
+    """
+    return {"timeout": s.llm_timeout_seconds, "num_retries": s.llm_max_retries, "max_retries": 0}
+
+
 def _litellm_http_headers(s: Settings) -> dict[str, str]:
     """Same dual-header reasoning as _litellm_key_header, for this file's own httpx calls."""
     headers = {"Authorization": f"Bearer {s.litellm_api_key}"}
@@ -369,7 +394,7 @@ class LiteLLMClient:
         _with_response_format, which needs the RESOLVED model name to decide json_schema vs
         json_object — hence it runs last."""
         s = self.s
-        common: dict[str, Any] = {"timeout": s.llm_timeout_seconds, "num_retries": s.llm_max_retries}
+        common: dict[str, Any] = _litellm_call_budget(s)
         # JSON mode is gated on the CALLER'S declared shape, not on the flag alone.
         # `{"type":"json_object"}` forces a top-level OBJECT. find_threats and
         # grounding._paraphrase both parse a top-level ARRAY, so sending it there instructs the
@@ -675,7 +700,7 @@ class LiteLLMClient:
             model=model, input=texts, custom_llm_provider="litellm_proxy",  # see _chat_kwargs
             api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
             **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
-            timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
+            **_litellm_call_budget(self.s),  # same bounds as chat, from one source
         )
         # `data` MAY come back out of input order, so vectors are PLACED by their own `index`,
         # never appended in arrival order — identical posture to rerank() below.
@@ -720,7 +745,7 @@ class LiteLLMClient:
                 custom_llm_provider="litellm_proxy",  # see _chat_kwargs
                 api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
                 **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
-                timeout=self.s.llm_timeout_seconds, num_retries=self.s.llm_max_retries,  # same bounds as chat
+                **_litellm_call_budget(self.s),  # same bounds as chat, from one source
             )
         by_index = {r["index"]: float(r["relevance_score"]) * 100.0 for r in resp["results"]}
         missing = [i for i in range(len(docs)) if i not in by_index]
@@ -864,6 +889,16 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
     Without it, a worker behind a broken internal proxy hangs right here at boot.
     """
     s = settings or get_settings()
+    # The EFFECTIVE attempt budget, read off the same dict that configures every call — so it
+    # cannot disagree with reality the way a comment can. It exists because `llm_max_retries=1`
+    # means two very different things: 2 attempts with `max_retries: 0` deployed, and ~8 without
+    # it (litellm's 2 outer attempts x the OpenAI SDK's own ~4 inner tries). Nothing in the
+    # config distinguishes those, and a config-only rollout lands silently on the second.
+    # `sdk_max_retries` missing or non-zero in this line = the cap is NOT in effect.
+    _budget = _litellm_call_budget(s)
+    log.info("llm.retry_budget", attempts=_budget["num_retries"] + 1,
+             num_retries=_budget["num_retries"], sdk_max_retries=_budget["max_retries"],
+             timeout_seconds=_budget["timeout"])
     _ensure_litellm_proxy_bypassed(s)
     if s.llm_provider != "litellm_proxy":  # direct providers have no registration check below
         # openai-direct pins the model so a configured fallback cannot mask a broken primary
@@ -1014,7 +1049,7 @@ def _verify_embedding_dimensions(s: Settings) -> None:
                 custom_llm_provider="litellm_proxy",  # see _chat_kwargs
                 api_base=s.litellm_base_url, api_key=s.litellm_api_key,
                 **_litellm_key_header(s),  # gateway-safe alternate auth header, when configured
-                timeout=s.llm_timeout_seconds, num_retries=s.llm_max_retries,
+                **_litellm_call_budget(s),
             )
     except LLMSlotUnavailable:
         # Must stay itself so celery_app._init_worker's boot-retry still backs off — same

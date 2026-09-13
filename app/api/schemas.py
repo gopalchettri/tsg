@@ -1932,10 +1932,14 @@ class IntelJobEvent(ApiModel):
     type: Literal["intel_job_update"]
     job_id: str
     state: str = Field(description="Celery state name: PENDING/STARTED/SUCCESS/FAILURE/RETRY.")
-    feed: str = Field(description="Which feed this event is about. Present on every event the "
-                                  "WORKER publishes; the connect-time snapshot is built from the "
-                                  "job result and carries no feed, so a client that connects to "
-                                  "an already-finished job sees a terminal event without it.")
+    feed: str | None = Field(
+        default=None,
+        description="Which feed this event is about — present ONLY on frames the worker "
+                    "publishes for a FEED REFRESH. Optional, not required, for two reasons a "
+                    "client will hit: the connect-time snapshot is built from the job result and "
+                    "carries no feed at all, and this same event model is the declared shape for "
+                    "the library-import and technique-rebuild streams, whose frames carry "
+                    "`source` or `sources` instead. Never assume it is set.")
     item_count: int | None = Field(default=None, description="Present only on the SUCCESS event.")
     error: str | None = Field(default=None, description="Present only on FAILURE/RETRY.")
 
@@ -2064,7 +2068,8 @@ class LibraryImportStatus(ApiModel):
         "job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "state": "SUCCESS",
         "result": {"source": "emb3d", "dry_run": False, "types": 4, "threats": 121,
                    "before_count": 0, "after_count": 121, "new_category_links": 187,
-                   "activated_types": 4, "activated_threats": 121, "skipped_count": 9,
+                   "types_created": 4, "threats_created": 121, "activate": True,
+                   "sample": ["Firmware tampering"], "skipped_count": 9,
                    "embedding_job_id": "0f8fad5b-d9cb-469f-a165-70867728950e"}}})
 
     job_id: str = Field(description="The job this status is for.")

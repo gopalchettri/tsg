@@ -57,6 +57,17 @@ def _expected_names(field_name: str, field) -> set[str]:
     return names
 
 
+#: A LIVE `NAME=` line. Uppercase-only, and the `=` must follow the name immediately, so prose
+#: like "# lease = timeout x (retries+1)" or "# EMBEDDING/RERANKER_PROVIDER=x" is not mistaken
+#: for a setting. Commented lines are deliberately NOT matched: a commented unknown name does
+#: nothing, while a LIVE one is silently discarded — only the second is a defect.
+_LIVE_KEY_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]*)\s*=", re.MULTILINE)
+
+
+def _live_keys(text: str) -> set[str]:
+    return set(_LIVE_KEY_RE.findall(text))
+
+
 def _entry_present(text: str, names: set[str]) -> bool:
     return any(re.search(rf"^\s*#?\s*{re.escape(n)}\s*=", text, re.MULTILINE) for n in names)
 
@@ -75,8 +86,20 @@ def check(root: Path) -> tuple[list[str], list[Path]]:
         return [f"no .env* files found under {root}"], []
     problems: list[str] = []
     fields = Settings.model_fields
+    # Every spelling any field accepts, upper-cased — pydantic matches env names
+    # case-insensitively. Built from the model, so a new AliasChoices cannot desynchronise it.
+    known = {n.upper() for fname, f in fields.items() for n in _expected_names(fname, f)}
     for path in files:
         text = path.read_text(encoding="utf-8", errors="replace")
+        # REVERSE check. The loop below asks "is every FIELD documented?"; this asks "does every
+        # LIVE line correspond to a field?" — the direction nothing covered. extra="ignore"
+        # (config.py) drops an unrecognised name with no error and no log, so a wrongly-prefixed
+        # variable reverts to its default silently. That is not hypothetical: the sibling pair
+        # CONTROL_MAP_SWEEP_ENABLED / _INTERVAL_SECONDS accepted different spellings, so an
+        # operator copying the first style onto the second lost the interval and never knew.
+        for key in sorted(_live_keys(text) - known):
+            problems.append(f"{path.name}: `{key}` is set but matches NO setting — extra='ignore' "
+                            "means it is silently discarded (check the TSG_ prefix / spelling)")
         for fname, f in fields.items():
             names = _expected_names(fname, f)
             if not _entry_present(text, names):

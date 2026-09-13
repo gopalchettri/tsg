@@ -1887,7 +1887,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey'
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCatalogue_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Catalogue'))
     CREATE UNIQUE NONCLUSTERED INDEX [UX_ThreatCatalogue_NaturalKey] ON [dbo].[Threat_Catalogue] ([ThreatName])
-        WHERE [IsActive] = 1 AND [IsDeleted] = 0;
+        WHERE [IsDeleted] = 0;   -- widened 2026-09-04; see '2. Threat_library.sql'
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
     CREATE UNIQUE NONCLUSTERED INDEX [UX_ThreatActor_NaturalKey] ON [dbo].[Threat_Actor] ([ThreatActorName])

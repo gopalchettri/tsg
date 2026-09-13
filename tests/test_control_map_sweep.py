@@ -19,10 +19,11 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.enums import ControlMappingStatus, ScenarioStatus, StageStatus, SubsystemLevel
 from app.db import models as m
 from app.pipeline import cascade, control_mapping, grounding
@@ -269,3 +270,15 @@ def test_a_row_past_its_budget_stops_stalling_a_healthy_row_across_ticks(monkeyp
         assert cascade.run_control_map_sweep(s, _FakeLLM()) == [healthy]
         assert _mapped(s, healthy_out)[0] == 2, "the healthy session must still be mapped"
         assert _mapped(s, stuck_out) == (0, None), "the exhausted one is skipped, not retried"
+
+
+def test_sweep_interval_of_zero_is_rejected_not_treated_as_off():
+    """A Celery beat `schedule` is seconds-BETWEEN-runs, so 0 does not mean "off" — it means
+    "run continuously", hammering the DB/LLM on every beat tick. TSG_CONTROL_MAP_SWEEP_ENABLED is
+    the only supported off-switch; 0 (or negative) must fail fast at Settings load instead of
+    silently becoming a busy-loop in production."""
+    with pytest.raises(ValueError):
+        Settings(control_map_sweep_interval_seconds=0)
+    with pytest.raises(ValueError):
+        Settings(control_map_sweep_interval_seconds=-1)
+    assert Settings(control_map_sweep_interval_seconds=60).control_map_sweep_interval_seconds == 60

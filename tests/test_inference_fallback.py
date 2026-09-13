@@ -12,10 +12,10 @@ import types
 import httpx
 import openai
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings
-from app.pipeline.llm import LiteLLMClient, LLMRefusal, LLMResponseTruncated, LLMSlotUnavailable
+from app.pipeline.llm import LiteLLMClient, LLMRefusal, LLMResponseTruncated, LLMSlotUnavailable, _litellm_call_budget
 
 _REQ = httpx.Request("POST", "http://proxy.test/v1/chat/completions")
 _OK = {"model": "served", "choices": [{"message": {"content": "hello"}}]}
@@ -288,3 +288,66 @@ def test_stop_reply_with_usage_is_returned_unchanged(monkeypatch):
     _stub_litellm(monkeypatch, [_reply("hello", "stop", usage={"completion_tokens": 12})])
     text, _ = LiteLLMClient(_settings(monkeypatch)).chat(_MSG)
     assert text == "hello"
+
+
+# --- retry budget ---------------------------------------------------------------------------
+def test_sdk_retry_loop_is_capped_so_llm_max_retries_is_the_whole_budget(monkeypatch):
+    """`num_retries` alone bounded NOTHING. It is litellm's own loop, and the OpenAI client it
+    builds underneath keeps a SEPARATE one that no setting here reached — so the two multiplied.
+    A production scenario burned 1268s across ~16 attempts while `llm_max_retries` read "3", and
+    the first litellm attempt alone spent 723s (4x the 180s timeout) inside its inner loop.
+
+    `max_retries=0` is what makes `llm_max_retries` mean what its name says: with 1, exactly two
+    attempts reach the provider."""
+    calls = _stub_litellm(monkeypatch, [_OK])
+    s = _settings(monkeypatch, TSG_LLM_MAX_RETRIES="1", TSG_LLM_TIMEOUT_SECONDS="120.0")
+    LiteLLMClient(s).chat(_MSG)
+    assert calls[0]["max_retries"] == 0, "SDK retry loop uncapped — the two loops multiply again"
+    assert calls[0]["num_retries"] == 1
+    # The same budget embed(), rerank() and the boot probe spread — asserted here because a
+    # per-site copy is exactly how they drifted apart in the first place.
+    assert _litellm_call_budget(s) == {"timeout": 120.0, "num_retries": 1, "max_retries": 0}
+
+
+def test_total_attempts_is_exactly_llm_max_retries_plus_one(monkeypatch):
+    """The operator asked for "1 or 2 attempts, configurable". This is the assertion that the
+    single knob delivers it — total = setting + 1, with no hidden multiplier.
+
+    Read off what actually goes on the wire rather than off the settings object: the dict is what
+    we ASK for, and the pinned inner loop is what makes the ask true."""
+    for retries, expected_attempts in ((0, 1), (1, 2), (3, 4)):
+        calls = _stub_litellm(monkeypatch, [_OK])
+        s = _settings(monkeypatch, TSG_LLM_MAX_RETRIES=str(retries),
+                      TSG_INFERENCE_FALLBACK_MODEL="")
+        LiteLLMClient(s).chat(_MSG)
+        kw = calls[0]
+        assert kw["num_retries"] + 1 == expected_attempts, f"retries={retries}"
+        # ...and the inner loop is pinned, so num_retries is the WHOLE budget, not the outer half.
+        assert kw["max_retries"] == 0, f"SDK loop uncapped at retries={retries} — budget multiplies"
+
+
+def test_retry_setting_is_bounded():
+    """Unbounded, this multiplies with llm_timeout_seconds: 10 retries at 120s is 22 minutes per
+    model before the fallback even starts — the exact shape of the incident this work came from."""
+    Settings(_env_file=None, llm_max_retries=0)   # 1 attempt, legal
+    Settings(_env_file=None, llm_max_retries=3)   # the ceiling
+    for bad in (10, -1):
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, llm_max_retries=bad)
+
+
+def test_no_litellm_site_rebuilds_the_retry_budget_by_hand():
+    """chat, embed, rerank and the boot probe each carried `timeout=..., num_retries=...` under a
+    "same bounds as chat" comment. Fixing only chat left that comment a lie at three sites and the
+    inner loop live on every embedding and rerank. They share `_litellm_call_budget` now; this
+    fails the moment a fifth site hand-rolls the pair again.
+
+    A source assertion rather than a behavioural one on purpose: the failure mode is a NEW call
+    site nobody wrote a test for, which no amount of exercising the existing four can catch."""
+    import app.pipeline.llm as llm_mod
+
+    src = open(llm_mod.__file__, encoding="utf-8").read()
+    hand_rolled = [ln.strip() for ln in src.splitlines()
+                   if "num_retries=" in ln and "llm_max_retries" in ln]
+    assert not hand_rolled, f"use _litellm_call_budget(s) instead: {hand_rolled}"
+

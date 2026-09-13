@@ -270,18 +270,37 @@ def _is_ip_or_local(host: str) -> bool:
         return False
 
 
+def guard_url(url: str, *, what: str = "feed fetch") -> None:
+    """Refuse any URL that must never be fetched. THE check — first hop and redirects alike.
+
+    It used to live only inside _RedirectPolicy.redirect_request, which by construction never
+    sees the FIRST hop. So the initial URL went unchecked, and every one of these comes from
+    configuration (intel_kev_url, intel_urlhaus_url, intel_otx_url, the TAXII server list, and
+    the library-import sources) — a typo or a tampered env could point a worker at
+    169.254.169.254 or an internal service, and no size cap or redirect handler would have
+    stopped it. Splitting the rule across "first hop" and "later hops" is what made the gap
+    invisible, so there is now one function and no second copy to drift.
+
+    Raises ValueError; app/intel/library_import.py translates it to its own domain error.
+    """
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if parts.scheme != "https":
+        raise ValueError(f"{what} refused: non-https target {url!r}")
+    if _is_ip_or_local(host):
+        raise ValueError(f"{what} refused: IP-literal or loopback host {host!r}")
+    if host not in allowed_feed_hosts():
+        raise ValueError(f"{what} refused: host {host!r} not an allowed feed host")
+
+
 class _RedirectPolicy(urllib.request.HTTPRedirectHandler):
     """A hijacked upstream (or DNS/BGP interference) that answers 302 must not steer the worker
     to an arbitrary host with the OTX key still attached. Only https, only known feed hosts,
     never an IP literal; on a cross-host hop every header but User-Agent is dropped."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        target = urllib.parse.urlsplit(newurl)
-        host = target.hostname or ""
-        if target.scheme != "https":
-            raise ValueError(f"feed redirect refused: non-https target {newurl!r}")
-        if _is_ip_or_local(host) or host not in allowed_feed_hosts():
-            raise ValueError(f"feed redirect refused: host {host!r} not an allowed feed host")
+        guard_url(newurl, what="feed redirect")
+        host = urllib.parse.urlsplit(newurl).hostname or ""
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None and (urllib.parse.urlsplit(req.full_url).hostname or "") != host:
             ua = req.get_header("User-agent")
@@ -303,6 +322,7 @@ def _get(url: str, headers: dict[str, str] | None = None, timeout: int = 120) ->
     failing on it turns "hostile or broken upstream" into an ordinary feed error that
     `refresh_one` records against that one feed, rather than an OOM that takes the worker with it.
     The total-duration half of the bound is the task's `soft_time_limit` (see celery_app.py)."""
+    guard_url(url)   # the FIRST hop — _RedirectPolicy below only ever sees later ones
     req = urllib.request.Request(url, headers={"User-Agent": "TSG-intel/1.0", **(headers or {})})
     with _opener().open(req, timeout=timeout) as resp:
         body = resp.read(_MAX_FETCH_BYTES + 1)

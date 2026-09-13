@@ -268,11 +268,20 @@ def threats_prompt(asset_name: str, asset_context: dict[str, Any], subsystems: l
         listed = "; ".join(f"{cat}: {', '.join(types)}" for cat, types in canonical_types.items()
                             if cat in cats and types)
         if listed:
+            # "for the category you assign" is load-bearing, not padding. Stage 1 chooses the
+            # CATEGORY as well as the type, so without it the model takes a type from one
+            # category's list and files the threat under another — and grounding, which resolves
+            # types within the assigned category, then reports a curated type as AI-invented.
+            # _reconcile_proposal_categories repairs that case; this sentence is what stops it
+            # happening. Prompt alone would be unenforceable, repair alone would leave the model
+            # producing incoherent pairs we quietly patch — both, or neither works.
             canonical_type_note = (
-                " A canonical type vocabulary is supplied per category — " + listed + ". When a "
-                "listed type fits, use it EXACTLY as given; never rename, paraphrase or create a "
-                "synonym of it. Only write a new, concise, generic, technology-independent type "
-                "of your own when nothing listed genuinely fits.")
+                " A canonical type vocabulary is supplied per category — " + listed + ". Take the "
+                "type from the list belonging to the category you assign to that same threat: "
+                "these lists are per-category and are NOT interchangeable. When a listed type "
+                "fits, use it EXACTLY as given; never rename, paraphrase or create a synonym of "
+                "it. Only write a new, concise, generic, technology-independent type of your own "
+                "when nothing listed for that category genuinely fits.")
 
     # RULE 1's coverage clause. The soft branch is the original text: it asks the model to
     # spread across categories and leaves it to judge how. That judgement is exactly what

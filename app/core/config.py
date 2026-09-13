@@ -231,7 +231,13 @@ class Settings(BaseSettings):
     # TSG_LLM_TIMEOUT_SECONDS / TSG_LLM_MAX_RETRIES — per-call timeout and retry cap. NOTE:
     # these feed the stage-lease/treatment-staleness derivation (_derive_stage_lease_seconds).
     llm_timeout_seconds: float = 90.0
-    llm_max_retries: int = 3
+    # TOTAL attempts = this + 1, and that is now literally true: llm._litellm_call_budget pins the
+    # OpenAI SDK's own retry loop to 0, so this is the whole budget rather than the outer half of a
+    # nested pair (a real run reached ~16 attempts and 1268s on one scenario while this read "3").
+    # Bounded because the cost is multiplicative with llm_timeout_seconds: at 120s, 3 -> 4 attempts
+    # -> 480s per model, and the fallback model gets its own budget on top. 0 is legal and means a
+    # single attempt with no retry. The boot line llm.retry_budget reports the effective number.
+    llm_max_retries: int = Field(3, ge=0, le=3)
 
     # TSG_LLM_MAX_OUTPUT_TOKENS — cap on completion tokens per chat call (SDD §16.2 output-size
     # limit). None (default) = provider default. Sent as `max_tokens`; drop_params covers a
@@ -365,6 +371,18 @@ class Settings(BaseSettings):
     # gap-generation call, applied after the gap_generation_buffer multiplier. Keeps the LLM
     # fallback bounded whatever the gap arithmetic says.
     threat_llm_max_generation: int = Field(15, ge=1)
+    # TSG_CANONICAL_TYPES_PER_CATEGORY — how many real Threat_Type names the gap-generation
+    # prompt lists per category, so the model reuses curated wording instead of inventing a
+    # synonym that then fails the rerank and costs the threat its curated actors. Capped
+    # because the model must CHOOSE from the list: 27 types today, thousands later, and a
+    # language model does not pick reliably out of hundreds. Selection is
+    # grounding.canonical_types_for (usage among retrieved threats, RRF-fused with name
+    # similarity) — NOT first-N-by-id, which would send the same N for every asset forever.
+    # 15 matches control_map_shortlist_k rather than inventing a third nearby width, and errs
+    # wide on purpose: a cap that excludes the RIGHT type is worse than no cap, because the
+    # model is then shown a list and told those were the options.
+    # 0 = OFF: no vocabulary sentence, prompt identical to before the feature existed.
+    canonical_types_per_category: int = Field(15, ge=0)
 
     # --- 11. Controls mapping (Step 4) ------------------------------------------------
 
@@ -385,8 +403,23 @@ class Settings(BaseSettings):
 
     # TSG_CONTROL_MAP_SWEEP_INTERVAL_SECONDS — retry-queue drain cadence (tsg.map_controls_sweep
     # is the "next run" for outputs mapping deliberately left unstamped). Ticking faster than
-    # stage_lease_seconds buys nothing.
-    control_map_sweep_interval_seconds: float = 300.0
+    # stage_lease_seconds buys nothing. MUST be > 0 — a Celery beat "schedule" is seconds-between-
+    # runs, so 0 does not mean "off", it means "run continuously" (a busy-loop hammering the DB/LLM
+    # on every beat tick). Use TSG_CONTROL_MAP_SWEEP_ENABLED=false to turn the sweep off instead.
+    control_map_sweep_interval_seconds: float = Field(300.0, gt=0)
+    # TSG_CONTROL_MAP_SWEEP_ENABLED — on/off switch for the beat-scheduled retry sweep
+    # (tsg.map_controls_sweep). Off = the beat entry is not registered at all — outputs left
+    # unstamped by map_controls' "leave it for the next run" paths simply never get a next run
+    # until this is turned back on. There is NO API route that drains the queue: an earlier
+    # version of this comment promised one ("or the endpoint is called directly/manually") and
+    # none exists — the only manual path is
+    #   celery -A app.pipeline.celery_app.celery_app call tsg.map_controls_sweep
+    # on a worker host. celery_app._init_worker warns at boot whenever this is off, because a
+    # comment is the wrong place to keep a fact an operator needs while reading logs.
+    # No unprefixed alias, deliberately: its sibling control_map_sweep_interval_seconds has
+    # none, so accepting a bare CONTROL_MAP_SWEEP_ENABLED here taught operators a spelling that
+    # SILENTLY fails on the interval (extra="ignore"). Both now follow env_prefix="TSG_".
+    control_map_sweep_enabled: bool = True
 
     # TSG_CONTROL_MAP_MAX_ATTEMPTS — HARD CUTOFF, by explicit owner instruction: once a scenario
     # reaches this many mapping attempts without a ControlsMappedAt stamp, it is permanently

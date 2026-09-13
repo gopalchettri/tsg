@@ -1,27 +1,6 @@
-# TSG API Smoke Testing Guide — Simple Version (for QA)
+# TSG API Guide
 
-> **The source code is the authority.** Every request and response below was read out of
-> the Pydantic models in `app/api/schemas.py` and `app/api/schemas_treatment.py`, and the
-> routes out of `app/api/*.py`. If this guide and the code ever disagree, the code wins and
-> this guide is the bug. `tests/test_docs_track_the_schema.py` pins the treatment-plan
-> examples to their models so that drift fails a test instead of misleading you silently.
-
-Every test below is one **card** with the same layout, so you always know where to look:
-
-| Card section | Answers |
-|---|---|
-| Why does this API exist? | Why the app needs it (the rationale) |
-| What does it do? | Plain-English behaviour |
-| When do you call it? | Preconditions — what must be true first |
-| Input / Output | The complete request and response payloads |
-| Tables used | Which DB tables it reads and writes |
-| Verify in the database | Copy-paste SQL to confirm the API told the truth |
-| Must-fail checks | Wrong calls and the exact error each must return |
-| Pass if | The one-line pass criterion |
-
----
-
-## Part 1 — The Big Picture (read this first)
+## Part 1 — The Big Picture
 
 ### What is TSG?
 
@@ -32,18 +11,6 @@ TSG is an app that uses AI to find security risks. You give it an **asset**
 - **Scenarios** — short stories describing *how* each bad thing could happen.
 
 A human then reads the scenarios and **accepts** the good ones.
-
-### What is a "session"?
-
-Think of a session like a **restaurant order**:
-
-1. **You place the order** → "AI, study asset 100 and find its risks." (Test 1)
-2. **The kitchen cooks** → the AI works in the background — this takes time. (Test 2 is you checking)
-3. **You taste the food** → you read the threats and scenarios it made. (Test 3)
-4. **You give feedback** → "redo this one" (Test 4), "give me more" (Test 5).
-5. **The order closes** → you accept (Test 6) or cancel (Test 7). The session is finished forever.
-
-One session = one complete order, from start to finish.
 
 ### What is a "smoke test"?
 
@@ -56,11 +23,6 @@ to the engine before a long trip. Not a deep test of everything. Budget: **~4 ho
 | **P2 — if time permits** | 8–9 | Live progress feed + "what was accepted?" lookup | ~1 h |
 | **P3 — skip if rushed** | 10–16 | Admin tools + health checks | ~0.75 h |
 
-**Coverage:** the app registers 48 routes and this guide has a card for 47 of them. The
-one deliberate omission is `GET /dev/sse-test` — a developer helper page that is mounted
-only when `app_env` is `local`/`dev` (`app/main.py`), is hidden from `/openapi.json`
-(`include_in_schema=False`), takes no auth, and serves a static HTML file
-(`app/static/sse_test.html`). It has no JSON contract, so there is nothing to smoke-test.
 
 You will create **two sessions**: **Session A** for Tests 1–6 (the whole journey),
 and **Session B** only so Test 7 has something to cancel (Session A is already
@@ -71,7 +33,7 @@ finished after Test 6 — you can't cancel a finished order).
 | Word | Plain meaning |
 |---|---|
 | `session_id` | The order number. You get it in Test 1 and use it in every other test. |
-| `scenario_id` | The ID of ONE scenario card. Needed to say "redo THIS one" or "accept THIS one". (This column used to be called `output_id`/`OutputID` — it's `scenario_id` everywhere now, in the JSON and in `Scenario_Audit.ScenarioID`.) |
+| `scenario_id` | The ID of ONE scenario card. Needed to say "redo THIS one" or "accept THIS one".  — it's `scenario_id` in the JSON and in `Scenario_Audit.ScenarioID`.) |
 | **Stage** | Which step of cooking the order is at (`SCENARIO_GENERATION` = AI writing, `REVIEW` = waiting for you). A finished session now stays at `REVIEW` — `APPROVED` is a historical value old sessions carry; nothing writes it any more, because scenarios are decided individually instead of the whole session flipping to "done" at once. |
 | `AWAITING_DECISION` | "The AI is finished. A human must decide now." Most tests wait for this state. |
 | `generation_epoch` | A batch counter. First batch = 1, next batch = 2, … Highest number = newest. |
@@ -126,37 +88,10 @@ A malformed body — `details.errors` is FastAPI's own per-field report, with it
   }
 }
 ```
-
-One error never uses this envelope: a request body over 16 MB is refused by middleware
-that runs *before* the error handlers, so it returns
-`413 {"error_code": "payload_too_large", "message": "request body exceeds the 16777216 byte limit"}`
-with no `details` key at all.
-
-### The four rules that explain most "weird" behavior
-
-1. **`202` means "working on it", not "done."** Only the board (Test 2) tells you it finished.
-2. **Nothing is ever deleted.** Replaced scenarios get `Superseded=1`; filter `Superseded=0` in your SQL — **except when you also care about accepted rows**, because an accepted scenario keeps its decision even after a later regenerate supersedes it, and `GET /results` deliberately still returns it (Test 3). For those queries the predicate is `(Superseded=0 OR Accepted=1)`. Library rows get `IsDeleted=1`.
-3. **The reaper acts alone.** Sessions can change state with no API call — that's the janitor, not a bug.
-4. **Two identity columns in the logbook** (`Scenario_Audit`): `ActorUserID` names who's accountable, but it's only set on rows a human actually caused — `session_started`, `review_decision`, an explicit cancel, a library promotion — where it carries your `X-User-Id`. `ActorType` says who performed the action (`user` = a person called the API, `system` = a background worker). On every row the pipeline writes on its own, `ActorUserID` is **`NULL`** and `ActorType='system'` — the app deliberately stopped stamping the session owner's name onto worker-written rows, because a timeline reading `you / you / you / you` end to end couldn't tell which of those rows you actually caused. A `NULL` `ActorUserID` is information ("the pipeline did this"), not a gap.
-
 ---
 
-## Part 1b — Implementation Sequence (build in this order)
+## Part 1b — Implementation Sequence
 
-Part 4 onward tests each API on its own. This part is the **order to call them in**, for
-whoever is wiring up a client. Each step names what to send, what to keep from the reply, and
-the one field that says it is safe to move on.
-
-**The rule that catches everyone:** the obvious-looking fields lie about readiness.
-`session_status` reads `completed` the moment generation finishes, long before a human has
-decided anything, and `current_stage` then stays `REVIEW` forever. The field that answers
-"does a human still owe a decision" is `progress.overall`, and nothing else.
-
-**No field is ever omitted.** No route in this app trims empty values, so every reply carries
-every field its model declares, with `null` or `[]` standing in for whatever does not apply. A
-key you do not see in a real reply is a key that does not exist — treat its absence as a bug
-report, not as "the server left it out this time". This is why the examples in this guide are
-full-length even when most of the values are `null`.
 
 ### A. Session lifecycle (Tests 1–7a, 9–9b)
 
@@ -185,7 +120,7 @@ saying "feature disabled".
 
 | # | Call | Send | Keep from the reply | Gate before the next step |
 |---|---|---|---|---|
-| 1 | accept the scenario (§A step 6) | — | `scenario_id` | the scenario reads `accepted: true`, or step 2 refuses |
+| 1 | accept the scenario (A step 6) | — | `scenario_id` | the scenario reads `accepted: true`, or step 2 refuses |
 | 2 | `POST .../treatment-plan` | the register's risk data, 12 keys | `plan_id` | HTTP `202`. **First generation only** — a second call is `409 plan_already_exists` |
 | 3 | `GET .../treatment-plan/status` | — | `progress.overall` | it leaves `generating`. Poll here, not step 4 |
 | 4 | `GET .../treatment-plan` | — | `plan` | `status` is `COMPLETE` |
@@ -235,13 +170,6 @@ one process-wide concurrency cap, so an admin stream left open counts against se
 past the cap you get `503 sse_capacity_exceeded` with a `Retry-After` header before the stream
 opens.
 
-### E. Generate your client from the spec, not from this guide
-
-`/openapi.json` publishes every model, every enum and every event payload described here.
-Generate your types from it, so a renamed status or a new reason code becomes a compile error
-instead of a silent mismatch months later. Use this guide for the ordering and the reasoning
-above, which a schema cannot express.
-
 ---
 
 ## Part 2 — Setup (do once before testing)
@@ -258,11 +186,6 @@ If this fails, nothing else will work. Fix it first.
 
 ### 2. Authenticate (there is no dev-mode shortcut any more)
 
-Earlier versions of this app had a dev-mode auth bypass (`TSG_AUTH_DEV_MODE`,
-headers `X-Dev-Entities`/`X-Dev-User`). **That is gone.** The setting no longer
-exists at all — `app/core/config.py` explicitly notes the old
-`jwt_*`/`auth_dev_mode` settings are retired. Every call now authenticates
-with real headers, checked by `get_principal` in `app/api/deps.py`:
 
 | Header | What it carries | Missing/blank it → |
 |---|---|---|
@@ -295,33 +218,18 @@ curl -s -X POST "http://localhost:8000/v1/sessions" \
 
 Admin routes gated by `require_admin` (`app/api/deps.py`) need only:
 
-- header `X-Admin-Key: <value of TSG_ADMIN_API_KEY>` — for local dev, copy it
-  from `tsg/.env` (it's a secret, deliberately not printed here)
+- header `X-Admin-Key: <value of TSG_ADMIN_API_KEY>` — shared separately.
 
 Missing or wrong `X-Admin-Key` → `401`. Unlike the session APIs above, these
 routes do **not** need `X-API-Key`/`X-Entity-Id`/`X-Tenant-Id` — they work on
 shared cross-tenant data, not any one company's.
 
-One exception: **provisioning or revoking an API key**
-(`POST /v1/tsg/api-clients`, `POST .../{client_id}/revoke`) additionally
-requires `X-User-Id` — not for authentication, but for attribution (it's
-written to `CreatedBy`/`RevokedBy`); the route returns `400` without it. A
-few other admin routes — embeddings, grounding calibration **and threat intel**, i.e. every
-admin route except the three API-client ones — use a different dependency,
-`get_admin_principal`, which layers `X-API-Key` + `X-User-Id` on
-top of the router's `X-Admin-Key` gate — if `X-Admin-Key` alone gets you a
-`401` on some admin route, check whether that route needs those two as well.
 
-Set the key once for the copy-paste commands below:
-
-```bash
-export TSG_ADMIN_API_KEY="<copy the value from tsg/.env>"
-```
 
 ### 4. The running example
 
 All tests use: entity (company) **`"78"`**, asset **`103`**, service
-**`335`**, sub-sector **`111`**, and supporting systems
+**`335`**, sector **`11`**,  sub-sector **`111`**, and supporting systems
 **`[321, 322, 323, 324]`** — note that's a JSON **array** of ids, not a
 single number: `supporting_system_id` takes 1–50 subsystem ids (see
 `CreateSessionBody` in `app/api/schemas.py`). The acting user is
@@ -397,17 +305,7 @@ row the pipeline wrote unattended (`subsystem_advanced`, `grounding_summary`,
 `scoping_complete`, `controls_mapped`, `generation_complete`,
 `entered_review`, `regeneration_completed`, `stage_error`, and an
 auto-triggered `session_cancelled`), `ActorUserID` is `NULL` and
-`ActorType='system'` — **not** the session owner's name. An earlier version of
-this table used to back-fill the session owner's username onto every
-worker-written row, on the theory that a `NULL` "reads as missing" — the cost
-was a timeline that read `you / you / you / you` end to end with no way to
-tell which of those rows you actually caused. That back-fill was removed
-specifically so `ActorUserID = NULL` reliably means "the pipeline did this,"
-with `ActorType` stating that outright rather than you having to infer it.
-
-`ActorType` is `NULL` only on old rows written before the column existed.
-Those are deliberately never back-filled — rewriting an append-only ledger
-would falsify records that were true when written.
+`ActorType='system'` — **not** the session owner's name.
 
 ### Which test writes which events
 
@@ -1599,15 +1497,14 @@ is exactly step 6 above.
 **Pass if:** events come back oldest-first, every row names its subject, each filter narrows correctly, and the count/order matches the raw `Scenario_Audit` query for the same session.
 
 ---
-## Part 4b — Remediation / Treatment Plans (P1 if the risk module is enabled)
+## Part 4b — Remediation / Treatment Plans 
 
-This whole area — all eleven routes in `app/api/treatment.py` — only exists if the risk module is turned on. `Settings.risk_module_enabled` (`app/core/config.py`, env var `RISK_MODULE_ENABLED` / `TSG_RISK_MODULE_ENABLED`, default **`False`**) gates whether `app/main.py` even mounts the router at all: `app/main.py`'s router block reads `if get_settings().risk_module_enabled: app.include_router(treatment_router)`. With the flag off, every path under this section is a plain 404 by *absence* — no route registered, no entry in `/openapi.json`, zero handler code running — not a 403, not a "feature disabled" error body. Before testing anything below, confirm the flag is on in the environment you're pointed at (ask ops, or just try `POST .../treatment-plan` once and see whether you get a 404 with no `error_code` body at all, which is FastAPI's own "no such route" page, vs. a real `ErrorResponse` envelope). The generator here is the **Mitigate** strategy only (`TreatmentStrategy.mitigate` in `app/core/enums.py`) — there's no strategy field on the wire, it's stamped server-side. And TSG reads **no risk-module tables** to build a plan: the register's own risk-scoring data (ratings, dates, existing controls) travels *in the request body* on first generation (see the module docstring of `app/api/treatment.py`); TSG supplies only its own scenario/threat/controls context.
 
-Auth is the same header set as every other route in this guide — **not** the old `X-Dev-Entities`/`X-Dev-User` pair, which no longer exist anywhere in this app. `get_principal` (`app/api/deps.py`) requires `X-API-Key`, `X-User-Id`, `X-Entity-Id`, `X-Tenant-Id`, all non-blank, or `401 unauthorized`; `X-Entity-Id` must equal the session's own `EntityID` (checked inside `get_authorized_session`, called first thing in every handler below) or `403 forbidden` (the wire `error_code`; `EntityForbidden` is only the Python exception class name) — and a session that doesn't exist at all 404s *before* that check runs, so an out-of-scope session id 404s rather than 403ing (no existence leak). Running-example values used throughout this section: `entity_id = "78"`, `user_id = "qa-user"`, `HOST = http://localhost:8000`. The session/scenario ids below (`5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e` / `1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90`) are the literal example values baked into `TreatmentPlanAccepted`/`TreatmentPlanStatus` in `app/api/schemas_treatment.py` (the treatment models live there, not in `schemas.py`, which only re-exports them) — substitute your own session's accepted `scenario_id` (from Test 3 / Test 6) when you actually run these.
+Auth is the same header set as every other route in this guide — *requires `X-API-Key`, `X-User-Id`, `X-Entity-Id`, `X-Tenant-Id`.
 
 ---
 
-### Test 7b — Request a Treatment Plan ("Order the fix")
+### Test 7b — Request a Treatment Plan 
 
 | | |
 |---|---|
@@ -1641,9 +1538,6 @@ curl -s -X POST "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c1
   }'
 ```
 
-`TreatmentPlanBody` (`app/api/schemas_treatment.py`) is `extra="forbid"` — these 12 keys are the
-ONLY ones accepted; anything else (including the retired `timeline_start_date`/`timeline_end_date`,
-or `user_id`/`strategy`/`user_note`) 422s naming it.
 
 **Five of the twelve are required**, not one: `existing_controls`, `likelihood_rating`,
 `impact_rating`, `final_risk_rating` and `risk_level` are all declared with no default, so
@@ -1666,7 +1560,7 @@ with no controls is legitimate — but the key itself must be present.
 | `mitigation_end_date` | no | `YYYY-MM-DD` |
 
 On the seven OPTIONAL fields an empty string is silently treated as "not provided"
-(`_blank_is_absent`), not a validation error — `risk_level` is deliberately excluded from that
+(`_blank_is_absent`), not a validation error — `risk_level` is excluded from that
 rule precisely because it is required. `mitigation_start_date`/`mitigation_end_date` must be
 given together or not at all, and end must not precede start.
 
@@ -1768,7 +1662,7 @@ Same `TreatmentPlanAccepted` shape as 7b, but a **new** `plan_id` — the old on
 3. Re-run the DB check below: the old row shows `Superseded=1`, the new one `Superseded=0`.
 4. POST again immediately (before the new generation finishes) → `409 generation_in_progress`.
 
-**Environment quirk:** if this scenario has **never** had a plan requested at all, you get `404 not_found` ("no treatment plan has been requested for this scenario") here — not `409 scenario_not_accepted`, even if the scenario also happens to be unaccepted. The baseline lookup runs *before* the accept check on purpose (`app/api/treatment.py`, the comment marked "ORDER MATTERS"), matching what the old two-transaction design enforced.
+**Environment quirk:** if this scenario has **never** had a plan requested at all, you get `404 not_found` ("no treatment plan has been requested for this scenario") here — not `409 scenario_not_accepted`, even if the scenario also happens to be unaccepted. The baseline lookup runs *before* the accept check on purpose, the comment marked "ORDER MATTERS"), matching what the old two-transaction design enforced.
 
 **Tables used:** same set as Test 7b's write path (`Risk_Treatment_Plan`, `Scenario_Audit`, plus the same `Threat_Scenario`/`Scoped_Threat`/`Identified_Threat`/`Threat_Scenario_Control_Map`/`Control_Library*` reads) — the only difference is the retire-then-insert instead of a bare insert, and `Scenario_Audit` still gets a `treatment_plan_requested` row (not a distinct "regenerated" event type).
 
@@ -1981,8 +1875,6 @@ warning — never rejected. A prose or duration `timeline` can therefore survive
 `Critical`/`High`/`Medium`/`Low`; a value outside that set is recorded in `warnings` rather
 than rejected. Note the stored `risk_identification_date` is trimmed out of `plan` — it is
 published as the sibling field of the same name instead, never in both places.
-
-**Environment quirk:** `review_comment` is declared on `TreatmentPlanStatus` but marked `exclude=True` — populated in the DB, **never** on the wire. Same for `created_at`/`completed_at` — all three are `exclude=True` on `TreatmentPlanStatus` in `app/api/schemas_treatment.py` — a "presentation trim" applied 06-Aug-2026, still in effect. Don't be surprised when the model description mentions a field the JSON never shows.
 
 **How to test:**
 
@@ -2999,7 +2891,7 @@ calling this twice on the same scenario — that's a `200`, not an error.)
 ```sql
 -- the new/reused library rows this call touched:
 SELECT ThreatTypeID, ThreatTypeName, ThreatCategoryID FROM Threat_Type WHERE ThreatTypeID=<type_id>;
-SELECT ThreatCatalogueID, ThreatCatalogueName, ThreatTypeID FROM Threat_Catalogue WHERE ThreatCatalogueID=<catalogue_id>;
+SELECT ThreatCatalogueID, ThreatName, ThreatTypeID FROM Threat_Catalogue WHERE ThreatCatalogueID=<catalogue_id>;
 
 -- the audit trail this call always writes:
 SELECT AuditID, EventType, ActorUserID, CreatedAt, DetailJSON FROM Scenario_Audit
@@ -3081,27 +2973,21 @@ one "is it done yet?" poll.
 this whole router requires **two independent checks**, both on every request —
 missing either one is a `401`:
 
-1. `X-Admin-Key` — a shared secret, checked against `TSG_ADMIN_API_KEY`. Gates
-   the entire embeddings router; there is no dev-mode bypass for it.
-2. `X-API-Key` **and** `X-User-Id` — the same client-key auth every other
-   endpoint in this guide uses (`X-API-Key` is verified against a stored
-   `API_Client` secret hash; `X-User-Id` is the acting identity that lands in
-   the audit log line). `X-Entity-Id` is **not** needed here — admin routes
-   touch shared, cross-tenant master data, so there is no entity to scope to.
-   `X-Tenant-Id` is accepted if you send it (bound into the log context) but
-   never required.
+1. `X-Admin-Key` — shared separately.
+2. `X-API-Key` - shared separately **and** `X-User-Id` — the same client-key auth every other
+   endpoint in this guide.
+3.`X-Tenant-Id`
 
-There is no `X-Dev-Entities` / `X-Dev-User` dev-mode header pair — that mode
-does not exist in this build.
 
 #### Calling these from Swagger (instead of curl)
 
 1. Open **`http://localhost:8000/docs`** in a browser (FastAPI's built-in Swagger UI).
 2. Find the endpoint, click it, then click **Try it out**.
 3. Every admin endpoint lists its headers as editable parameter fields. Fill in **all three**:
-   - `X-Admin-Key` → the value of `TSG_ADMIN_API_KEY` (copy from `tsg/.env`)
-   - `X-API-Key` → `<X-API-Key>` (any valid, active API client key — admin routes don't scope by client)
+   - `X-Admin-Key` → the value of `TSG_ADMIN_API_KEY` 
+   - `X-API-Key` → `<X-API-Key>`
    - `X-User-Id` → `qa-user`
+   - 'X-Tenant-Id'
 4. Paste the JSON body from the action you want (below) into the request-body box.
 5. Click **Execute** — the response appears right underneath.
 
@@ -4199,12 +4085,366 @@ use tsg_embeddings; db.intel_feed_status.findOne({ feed: "cisa_kev" });
 
 ---
 
+### Test 13c — Import an Open-Source Threat Library ("Stock the shelves")
+
+| | |
+|---|---|
+| **API** | `POST /v1/tsg/threat-intel/library/import/{source}` |
+| **Why does this API exist?** | The threat library is what grounding matches against. An empty library means every AI-proposed threat looks novel. This bulk-loads a curated public source instead of hand-entering hundreds of rows. |
+| **What does it do?** | Downloads one open-source library, then inserts anything new into `Threat_Type`/`Threat_Catalogue` (or `Threat_Actor` for `misp_actors`). |
+| **When do you call it?** | Setting up an environment, or picking up a new release of a source. |
+
+**Before you call:** for a REAL (non-dry-run) `pytm`, `emb3d` or `atlas` import, the STRIDE
+rows the source's records map to must already exist in `Threat_Category` (run
+`3. Seed_to_Threat_library.sql`). Without them the job fails terminally with
+`STRIDE categories missing from Threat_Category`.
+
+That gate does **not** apply to everything: a `dry_run` returns before reaching it, and a
+`misp_actors` import never touches `Threat_Category` at all. Both succeed against an unseeded
+category table. And only the categories a source actually references are required — `pytm` and
+`emb3d` never map to Repudiation, so they import fine without that row.
+
+**Input (complete request)** — `{source}` is one of `pytm`, `emb3d`, `atlas`, `misp_actors`:
+
+```bash
+curl -s -X POST "http://localhost:8000/v1/tsg/threat-intel/library/import/emb3d" \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: <X-Admin-Key>" -H "X-API-Key: <X-API-Key>" -H "X-User-Id: qa-user" \
+  -d '{"dry_run": false, "activate": true}'
+```
+
+| Body field | Default | Meaning |
+|---|---|---|
+| `dry_run` | `false` | Count what WOULD change and write nothing |
+| `activate` | `true` | Insert rows as active. `false` inserts them invisible to matching. **`Threat_Type`/`Threat_Catalogue` only** — `misp_actors` ignores it and always inserts actors active |
+| `max_actors` | `40` | 1-500. **`misp_actors` only** |
+
+**Output (complete response):**
+
+```json
+202 {"job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}
+```
+
+**`202` means queued, not imported.** Poll Test 13d.
+
+**How to test:**
+
+1. Run with `dry_run: true` first and read the counts — nothing is written.
+2. Run it for real, poll 13d to `SUCCESS`, then confirm `result.error` is absent.
+3. Run the identical call again. It is idempotent: nothing new is created.
+
+**Tables used:**
+
+| Table | Read/Write | What happens |
+|---|---|---|
+| `Threat_Category` | Read | the STRIDE gate above |
+| `Threat_Type`, `Threat_Catalogue` | Read + Insert | first-writer upserts; existing rows are never rewritten |
+| `Threat_Catalogue_Category_Map` | Insert | the STRIDE link per threat |
+| `Threat_Actor` | Insert | `misp_actors` only |
+
+**Verify in the database:**
+
+```sql
+SELECT Source, COUNT(*) FROM Threat_Catalogue GROUP BY Source;
+SELECT TOP 10 ThreatName, Source, IsActive FROM Threat_Catalogue ORDER BY ThreatCatalogueID DESC;
+```
+
+**Must-fail checks:**
+
+| You do this | App must answer |
+|---|---|
+| A `{source}` outside the four names | `422 admin_validation_error` |
+| `max_actors` on any source but `misp_actors` | `422 admin_validation_error` — **even when the value equals the default 40**, because the check is on whether you SET it |
+| `max_actors` 0 or 501 | `422 validation_error` |
+| An import of the SAME source already running | `409 import_already_running` |
+| Missing `X-Admin-Key`, `X-API-Key` or `X-User-Id` | `401 unauthorized` |
+
+**Three traps worth knowing.**
+
+- **A `202` does not mean the import was valid, and the two failure kinds look different.**
+  A CONTENT failure — unparseable or mismatched data, a bad source URL, the missing-STRIDE gate —
+  is RETURNED rather than raised, so it finishes as Celery state `SUCCESS` with `result.error`
+  set. Always read `result.error`, never just `state`. A TRANSPORT failure — an HTTP 5xx, a
+  timeout, a dropped database connection — is raised instead, retries three times, and ends as a
+  genuine `FAILURE` with no `result.error`.
+- **This job runs on the `admin` queue, not `celery`.** A deployment running only `-Q celery`
+  leaves it `PENDING` forever after a successful `202`.
+- **It is not destructive.** Re-importing adds nothing, rewrites no provenance, and never
+  re-activates a row a curator switched off. `activate: false` inserts rows that matching
+  cannot see.
+
+A successful non-dry run also queues an embedding refresh and returns its id as
+`result.embedding_job_id` — poll it at **Test 10**'s status endpoint, or stream it with Test 10a.
+
+**Pass if:** the job reaches `SUCCESS` with no `result.error`, the catalogue count grew, and a
+second identical run creates nothing.
+
+---
+
+### Test 13d — Check a Library Import ("Did the delivery arrive?")
+
+| | |
+|---|---|
+| **API** | `GET /v1/tsg/threat-intel/library/import/status/{job_id}` |
+| **Why does this API exist?** | Test 13c returns immediately. This is how you learn whether the import worked and what it changed. |
+| **What does it do?** | Reports one import's state and, once finished, its counts or its error. |
+| **When do you call it?** | On a timer after 13c. |
+
+**Input (complete request):**
+
+```bash
+curl -s "http://localhost:8000/v1/tsg/threat-intel/library/import/status/6ba7b810-9dad-11d1-80b4-00c04fd430c8" \
+  -H "X-Admin-Key: <X-Admin-Key>" -H "X-API-Key: <X-API-Key>" -H "X-User-Id: qa-user"
+```
+
+**Output (complete response):**
+
+```json
+200 {"job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+     "state": "SUCCESS",
+     "result": {"source": "emb3d", "dry_run": false, "types": 4, "threats": 121,
+                "types_created": 4, "threats_created": 121, "new_category_links": 187,
+                "before_count": 0, "after_count": 121, "activate": true,
+                "sample": ["Firmware tampering", "Bus sniffing"],
+                "skipped_count": 9, "skipped": ["row 12: no STRIDE mapping"],
+                "embedding_job_id": "0f8fad5b-d9cb-469f-a165-70867728950e"}}
+```
+
+`sample` and `skipped` are each capped at 50 entries. A run that found nothing usable also carries
+a `warning`. `embedding_job_id` appears only on a real run — a dry run has no such key.
+
+`result` is `null` until the job finishes. Keep polling while `state` is `PENDING`, `STARTED` or
+`RETRY` — **`RETRY` is not finished.**
+
+**Tables used:** none. This reads Redis only — the job marker and the result backend.
+
+**Must-fail checks:**
+
+| You do this | App must answer |
+|---|---|
+| Unknown or expired `job_id` | `404 not_found` |
+| A `job_id` from a different job family | `404 not_found` |
+| Missing any of the three headers | `401 unauthorized` |
+
+**Watch out:** job ids expire with the result backend, roughly an hour. A `404` after that means
+the record aged out, not that the import failed. And a `misp_actors` import returns a different
+shape: `actors_found` / `actors_upserted` instead of the type and threat counts.
+
+**Pass if:** the job reaches a terminal state and `result` matches what the database shows.
+
+---
+
+### Test 13e — Stream a Library Import ("Watch it land")
+
+| | |
+|---|---|
+| **API** | `GET /v1/tsg/threat-intel/library/import/events/{job_id}` (header `Accept: text/event-stream`) |
+| **Why does this API exist?** | An import can run for minutes. This pushes progress instead of you polling 13d in a loop. |
+| **What does it do?** | Sends the job's current state immediately, then every state change, then closes when it finishes. |
+| **When do you call it?** | Right after 13c, with the `job_id` it returned. |
+
+**Input (complete request):**
+
+```bash
+curl -N -H "Accept: text/event-stream" \
+  -H "X-Admin-Key: <X-Admin-Key>" -H "X-API-Key: <X-API-Key>" -H "X-User-Id: qa-user" \
+  "http://localhost:8000/v1/tsg/threat-intel/library/import/events/6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+```
+
+**Output (what the wire actually looks like):**
+
+```
+event: intel_job_update
+data: {"type":"intel_job_update","job_id":"6ba7b810-...","state":"STARTED","source":"emb3d"}
+
+event: intel_job_update
+data: {"type":"intel_job_update","job_id":"6ba7b810-...","state":"SUCCESS","source":"emb3d","threats":121}
+
+event: heartbeat
+data: {"type":"heartbeat","job_id":"6ba7b810-...","ts":"2026-09-07T09:19:14+00:00"}
+```
+
+**Tables used:** none — Redis pub/sub plus one result-backend read on connect.
+
+**Must-fail checks:**
+
+| You do this | App must answer |
+|---|---|
+| Unknown or expired `job_id` | `404 not_found`, before the stream opens |
+| The process is at its SSE concurrency cap (shared by every SSE route) | `503 sse_capacity_exceeded` with `Retry-After` |
+| Missing any of the three headers | `401 unauthorized` |
+
+**Watch out:** `SUCCESS`, `FAILURE` and `REVOKED` close the stream; `RETRY` does not. Connecting
+after the job finished gives you one terminal frame and an immediate close, with no replay. And a
+browser's built-in `EventSource` cannot be used here, because it cannot send these headers.
+
+**Pass if:** a frame arrives on connect and the stream closes on a terminal state.
+
+**Do not require the final frame to match 13d.** On a clean run they agree. On a terminal import
+error they disagree by design: the worker publishes `FAILURE` to the stream and then RETURNS, so
+13d sees a task that completed and reports `SUCCESS` with `result.error`. Same outcome, two
+honest descriptions of it.
+
+---
+
+### Test 13f — Rebuild the Technique Corpus ("Restock the attack playbook")
+
+| | |
+|---|---|
+| **API** | `POST /v1/tsg/threat-intel/techniques/rebuild` |
+| **Why does this API exist?** | Scenario writing consults an ATT&CK/CAPEC corpus for HOW a class of attack actually works. Nothing populates it automatically, so without this the corpus is empty and scenarios lose that grounding. |
+| **What does it do?** | Downloads the named sources, builds the corpus, publishes it, then warms its vectors. |
+| **When do you call it?** | Once to populate an environment, then again per MITRE release, roughly twice a year. |
+
+**Input (complete request):**
+
+```bash
+curl -s -X POST "http://localhost:8000/v1/tsg/threat-intel/techniques/rebuild" \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: <X-Admin-Key>" -H "X-API-Key: <X-API-Key>" -H "X-User-Id: qa-user" \
+  -d '{"sources": ["attack", "attack_ics", "capec"]}'
+```
+
+`sources` accepts `attack`, `attack_ics` and `capec`. Omitting it means all three.
+
+**Output (complete response):**
+
+```json
+202 {"job_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8"}
+```
+
+**How to test:**
+
+1. Call it, then watch Test 13h or poll until it finishes.
+2. Call Test 13g and confirm `total` is non-zero and `by_source` names each source you asked for.
+
+**Tables used:** none. This is MongoDB only — it stages the new corpus, then renames it over the
+live one in a single atomic step, then warms the vector cache.
+
+**Must-fail checks:**
+
+| You do this | App must answer |
+|---|---|
+| Any name outside the three | `422 admin_validation_error`, naming the offenders |
+| Missing body | `422 validation_error` |
+| Missing any of the three headers | `401 unauthorized` |
+
+**Three traps.**
+
+- **`{"sources": []}` means all three, not none.** An empty list is treated as "unspecified".
+- **There is no `409` here.** Unlike the import, nothing stops two rebuilds running at once. The
+  protection is that publishing is atomic, so they cannot interleave into a half-built corpus.
+- **A failed rebuild leaves the previous corpus completely intact.** It is destructive only on
+  success, where it fully replaces rather than merges.
+
+Vector warming happens after publishing, within a time budget, so `warmed` may be partial. That is
+a reported outcome, not a failure.
+
+**Pass if:** the job finishes, Test 13g reports a non-zero `total`, and a failed run leaves the
+old corpus readable.
+
+---
+
+### Test 13g — Check the Technique Corpus ("What's on the shelf?")
+
+| | |
+|---|---|
+| **API** | `GET /v1/tsg/threat-intel/techniques` |
+| **Why does this API exist?** | One call to answer "is technique grounding actually working here?" — the usual reason a scenario looks thin. |
+| **What does it do?** | Reports how many techniques are live, broken down by source and by STRIDE category. |
+| **When do you call it?** | After 13f, and any time scenario quality is questioned. |
+
+**Input (complete request)** — no path params, no query params, no body:
+
+```bash
+curl -s "http://localhost:8000/v1/tsg/threat-intel/techniques" \
+  -H "X-Admin-Key: <X-Admin-Key>" -H "X-API-Key: <X-API-Key>" -H "X-User-Id: qa-user"
+```
+
+**Output (complete response):**
+
+```json
+200 {"total": 812, "available": true,
+     "by_source": {"mitre_attack": 214, "mitre_attack_ics": 79, "capec": 519},
+     "by_stride": {"Tampering": 301, "Information Disclosure": 174},
+     "built_at": "2026-09-06T10:22:00Z",
+     "sample": [{"id": "T0831", "name": "Manipulation of Control",
+                 "stride": ["Tampering"], "applies_to": ["OT"]}]}
+```
+
+**Tables used:** none. One read of the MongoDB corpus collection.
+
+**Must-fail checks:**
+
+| You do this | App must answer |
+|---|---|
+| Missing any of the three headers | `401 unauthorized` |
+
+**The one thing to get right: this endpoint never returns `503`.** If the corpus store is
+unreachable you get `200` with `available: false`. So check the field, not the status code.
+`total: 0` with `available: true` is also a real state and means no rebuild has run yet — scenarios
+still work, just without technique grounding.
+
+**Pass if:** after a rebuild, `available` is `true` and `total` is non-zero.
+
+---
+
+### Test 13h — Stream a Technique Rebuild ("Watch the restock")
+
+| | |
+|---|---|
+| **API** | `GET /v1/tsg/threat-intel/techniques/events/{job_id}` (header `Accept: text/event-stream`) |
+| **Why does this API exist?** | A rebuild downloads tens of megabytes and then warms vectors. Polling tells you very little for a long time. |
+| **What does it do?** | Pushes the rebuild's state changes live and closes when it finishes. |
+| **When do you call it?** | Right after 13f, with the `job_id` it returned. |
+
+**Input (complete request):**
+
+```bash
+curl -N -H "Accept: text/event-stream" \
+  -H "X-Admin-Key: <X-Admin-Key>" -H "X-API-Key: <X-API-Key>" -H "X-User-Id: qa-user" \
+  "http://localhost:8000/v1/tsg/threat-intel/techniques/events/6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+```
+
+**Output (what the wire actually looks like):**
+
+```
+event: intel_job_update
+data: {"type":"intel_job_update","job_id":"6ba7b810-...","state":"STARTED","sources":["attack","capec"]}
+
+event: intel_job_update
+data: {"type":"intel_job_update","job_id":"6ba7b810-...","state":"STARTED","stage":"embedding","total":812}
+
+event: intel_job_update
+data: {"type":"intel_job_update","job_id":"6ba7b810-...","state":"SUCCESS","total":812}
+```
+
+**Tables used:** none — Redis pub/sub plus one result-backend read on connect.
+
+**Must-fail checks:** identical to Test 13e — `404 not_found` on an unknown or expired `job_id`,
+`503 sse_capacity_exceeded` at the shared SSE cap, `401 unauthorized` without the three headers.
+
+**The frame that confuses everyone:** a SECOND `STARTED` arrives carrying `stage: "embedding"`.
+That is not a restart. The corpus has been published by then and the job has moved on to warming
+its vectors. The stream stays open through it.
+
+**Pass if:** both `STARTED` frames arrive in order, the stream closes on a terminal state, and
+Test 13g then reports the new `total`.
+
+---
+
 ### What happened to Tests 11, 12, 14 and 15?
 
 If you used an earlier version of this guide: those four tests walked through APIs for
 importing threat-intel sources, checking library inventory, and hand-editing threat/control
-library rows with PATCH and DELETE. **Those APIs are gone.** There is no import endpoint, no
-inventory endpoint, and — checked directly against the source, not assumed —
+library rows with PATCH and DELETE.
+
+**The import capability is back, in a different shape** — see Tests 13c-13e above. It is now a
+queued job per source rather than a synchronous call, it only ever inserts, and it can never edit
+or delete an existing row.
+
+The **hand-editing** APIs are still gone, and so is the inventory endpoint. Checked directly
+against the source rather than assumed, there are still
 **zero PATCH, PUT or DELETE routes anywhere in the app**:
 
 ```bash
@@ -4565,7 +4805,7 @@ Two error codes from earlier guides no longer exist: `library_conflict` (belonge
 |---|---|
 | 1–9b (everything under `/v1/sessions`, `/v1/users`, `/v1/entities/{id}/scenarios`) | `X-API-Key` + `X-User-Id` + `X-Entity-Id` + `X-Tenant-Id` (all four, via `get_principal`) |
 | 7b–7l (treatment plans) | Same four — treatment routes sit on the same `/v1` auth, gated additionally by `settings.risk_module_enabled` |
-| 10, 10a (embeddings), 10b–10f (grounding), 13/13a/13b (intel) | `X-Admin-Key` (router-level) **plus** `X-API-Key` + `X-User-Id` (`get_admin_principal`) — no `X-Entity-Id` needed |
+| 10, 10a (embeddings), 10b–10f (grounding), 13/13a/13b and 13c-13h (intel) | `X-Admin-Key` (router-level) **plus** `X-API-Key` + `X-User-Id` (`get_admin_principal`) — no `X-Entity-Id` needed |
 | 16a, 16c (create / revoke an API client) | `X-Admin-Key` (router-level) **plus** `X-User-Id`, which is for attribution, not authentication — blank gives `400`, not `401` |
 | 16b (list API clients) | `X-Admin-Key` only — it is a read, and takes no `X-User-Id` at all |
 | 16 (health) | none |
@@ -4608,6 +4848,12 @@ Two error codes from earlier guides no longer exist: `library_conflict` (belonge
 | 13 | Threat Intel Feeds | P3 | | |
 | 13a | List Live Intel Items | P3 | | |
 | 13b | Feed Refresh Live Stream | P3 | | |
+| 13c | Import an Open-Source Threat Library | P3 | | |
+| 13d | Check a Library Import | P3 | | |
+| 13e | Stream a Library Import | P3 | | |
+| 13f | Rebuild the Technique Corpus | P3 | | |
+| 13g | Check the Technique Corpus | P3 | | |
+| 13h | Stream a Technique Rebuild | P3 | | |
 | 16 | Health Checks (`/health`, `/ready`, incl. degraded) | P3 | | |
 | 16a | Create an API Client | P3 | | |
 | 16b | List API Clients | P3 | | |

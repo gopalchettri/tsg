@@ -371,8 +371,9 @@ _TECH_REBUILD_DESC = (
     "(roughly twice a year). Not a scheduled job.\n\n"
     "**Atomic:** the new corpus is staged and renamed over the live one, so a rebuild that fails "
     "or is killed leaves the previous corpus completely intact - never a half-populated one.\n\n"
-    "**Vectors are warmed before publishing**, so the first scenario after a rebuild is not the "
-    "request that pays for embedding ~800 passages.\n\n"
+    "**Publishing comes first, then vectors are warmed** within a time budget, so `warmed` "
+    "in the result may be partial - a reported outcome, not a failure. The corpus is "
+    "usable as soon as it is published.\n\n"
     "**What you get:** `202` with a `job_id`; stream it, or just read GET .../techniques after."
 )
 
@@ -409,8 +410,23 @@ def rebuild_techniques(body: TechniqueRebuildBody, request: Request,
     return TechniqueRebuildAccepted(job_id=task.id)
 
 
+_TECH_EVENTS_DESC = (
+    "Pushes one technique-REBUILD job's progress live, instead of polling for it.\n\n"
+    "**Call it:** right after the rebuild endpoint, using the `job_id` it returned. Send "
+    "`Accept: text/event-stream`; a browser's built-in `EventSource` cannot be used here, "
+    "because it cannot send the admin headers.\n\n"
+    "**What arrives:** the job's current state immediately on connect, even for a job that "
+    "has already finished, then each state change, plus heartbeats.\n\n"
+    "**Watch out:** a SECOND `STARTED` frame arrives carrying `stage: embedding`. That is NOT "
+    "a restart - the corpus is already published by then and the job has moved on to warming "
+    "its vectors. `SUCCESS`, `FAILURE` and `REVOKED` close the stream; `RETRY` does not."
+)
+
+
 @router.get("/techniques", response_model=TechniqueCorpusStatus,
-            responses=UNAVAILABLE_RESPONSES,
+            # No UNAVAILABLE_RESPONSES: this route CANNOT return 503. An unreachable
+            # corpus store answers 200 with available=false (technique_stats swallows it),
+            # so declaring a 503 published a status code the handler has no path to.
             summary="Check the technique corpus", description=_TECH_STATUS_DESC)
 def technique_corpus(_principal: Principal = Depends(get_admin_principal)) -> TechniqueCorpusStatus:
     """Live corpus counts. Never raises on an unreachable store: it reports available=false, so a
@@ -422,7 +438,7 @@ def technique_corpus(_principal: Principal = Depends(get_admin_principal)) -> Te
             responses={200: {"model": IntelJobEvent, "content": {"text/event-stream": {}},
                         "description": "SSE stream; each `data:` line is one IntelJobEvent."}}
                     | UNAVAILABLE_RESPONSES,
-            summary="Stream a technique rebuild", description=_IMPORT_EVENTS_DESC)
+            summary="Stream a technique rebuild", description=_TECH_EVENTS_DESC)
 async def technique_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE for one rebuild job - same contract and channel as the import and feed streams."""
     return await admin_job_event_stream(

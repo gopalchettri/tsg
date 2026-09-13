@@ -227,9 +227,15 @@ def _assert_indexes(engine: Engine) -> None:
     missing = [ix for ix in by_name if ix not in present]
     if missing:
         raise StartupInvariantError(
-            "missing required indexes (re-run scripts/eyshield_handoff/'1. TSG_Core.sql' and "
-            "'2. Threat_library.sql'; for UX_GroundingCalibration_Running alone, "
-            f"scripts/TSG_Migration_GroundingCalibration.sql): {missing}"
+            f"missing required indexes: {missing}. Which script creates which: the library "
+            "natural keys (Type/Catalogue/Actor/Category) come from scripts/eyshield_handoff/"
+            "'2. Threat_library.sql', the session and pipeline ones from '1. TSG_Core.sql', "
+            "the control ones from '4. Control_library.sql'; UX_GroundingCalibration_Running "
+            "from scripts/TSG_Migration_GroundingCalibration.sql, and "
+            "UX_ThreatCatalogue_NaturalKey from scripts/TSG_Migration_CatalogueNaturalKey.sql. "
+            "A UNIQUE index still absent AFTER its script ran usually means the table holds "
+            "duplicate live rows: the CREATE terminated with Msg 1505 and the guard left no "
+            "index rather than dropping one. Check for duplicates before re-running."
         )
     mismatched = [ix for ix, (table, cols) in by_name.items()
                 if present[ix]["table"] != table or present[ix]["columns"] != cols]

@@ -143,6 +143,44 @@ def test_intel_refresh_is_scheduled_only_by_an_explicit_interval():
         assert entry is None
 
 
+def test_beat_gates_are_pinned_on_both_sides():
+    """Both gated entries, in BOTH states.
+
+    The previous version read the LIVE setting and branched on it, so under the default (enabled)
+    the `assert entry is None` arm never executed in CI — an off-branch regression would have
+    shipped silently, and off is precisely the state about to be relied on across four
+    environments. `_build_beat_schedule` exists so both arms are reachable without reloading
+    celery_app, which would re-register every task."""
+    from app.core.config import Settings
+    from app.pipeline.celery_app import _build_beat_schedule
+
+    on = _build_beat_schedule(Settings(_env_file=None, control_map_sweep_enabled=True,
+                                       control_map_sweep_interval_seconds=300.0,
+                                       intel_refresh_interval_seconds=86400))
+    off = _build_beat_schedule(Settings(_env_file=None, control_map_sweep_enabled=False,
+                                        intel_refresh_interval_seconds=0))
+
+    assert on["map-controls-sweep"] == {"task": "tsg.map_controls_sweep", "schedule": 300.0}
+    assert "map-controls-sweep" not in off
+    assert on["intel-refresh"] == {"task": "tsg.intel_refresh_all", "schedule": 86400}
+    assert "intel-refresh" not in off
+    # An ungated entry must survive both ways — a gate must never take the reaper with it.
+    for schedule in (on, off):
+        assert schedule["reap-stuck-sessions"]["task"] == "tsg.reap"
+        assert schedule["operational-self-check"]["task"] == "tsg.self_check"
+
+
+def test_live_beat_schedule_is_the_builders_output():
+    """Ties the pure builder to the real Celery config. Without this the test above could pin a
+    function nothing actually uses — the failure mode that let canonical_types sit dead in this
+    same codebase until it was found by accident."""
+    from app.core.config import get_settings
+    from app.pipeline import celery_app
+
+    assert celery_app.celery_app.conf.beat_schedule == \
+        celery_app._build_beat_schedule(get_settings())
+
+
 # --- The installed-dependency guard -------------------------------------------------------
 # Found live: the API on :8000 had been launched with the GLOBAL interpreter instead of the
 # project venv, so it served sse_starlette 3.0.3 against code written for >=3.4.6. Nothing

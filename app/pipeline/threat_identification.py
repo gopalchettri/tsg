@@ -33,6 +33,7 @@ from app.core.enums import (
     WorkflowStage,
 )
 from app.core.logging import get_logger
+from app.core.naming import normalize_name
 from app.core.tracing import trace_step
 from app.db import dal
 from app.db import models as m
@@ -317,6 +318,57 @@ def _usable_category(p: dict, cats: list[str]) -> bool:
         return True
     c = _safe_text(p.get("category"), "") or ""
     return c.strip().casefold() in {x.strip().casefold() for x in cats}
+
+
+def _reconcile_proposal_categories(proposals: list, canonical: dict[str, list[str]],
+                                    sid: str) -> int:
+    """Point a proposal at the category whose vocabulary its TYPE actually came from.
+
+    THE CAUSE, not the symptom. threats_prompt supplies the type vocabulary PER CATEGORY, but
+    Stage 1 lets the model choose the category too — so it can take "Data/Telemetry Abuse" from
+    the Repudiation list and file the threat under Tampering. grounding.find_threat_in_library
+    then resolves types for TAMPERING, does not find it, and stamps type_id=None: a curated
+    type, used verbatim exactly as instructed, recorded as AI-invented. The threat also loses
+    that type's curated actors, because those hang off a VERIFIED type.
+
+    Repairing it at the grounding end would be a patch on the symptom — grounding is handed a
+    (category, type) pair and cannot know which list the string came from. This function is
+    the only place that knows, so it is the only place the mismatch can be RESOLVED rather
+    than merely detected. Mutates in place and returns how many moved, because the caller's
+    trace already carries the proposals.
+
+    Three deliberate refusals to move:
+
+    * EXACT normalized equality only. A fuzzy match here would silently relabel a threat's
+      STRIDE category on a near-miss, and the category drives the coverage quota — the same
+      reason _usable_category validates rather than guesses.
+    * A type offered under TWO categories proves nothing about which one the model meant, so
+      it is recorded as ambiguous and never moves anything.
+    * The model's own category must be one we SUPPLIED a list for. Where we supplied none
+      (a category with no curated types) borrowing another cell's label is not evidence of
+      mislabelling, and moving it would silently vacate coverage we explicitly asked for.
+    """
+    if not canonical:
+        return 0
+    # type -> the single category that offered it; None once a second category also offers it.
+    owner: dict[str, str | None] = {}
+    for cat, names in canonical.items():
+        for n in names:
+            key = normalize_name(n)
+            owner[key] = None if key in owner else cat
+    moved = 0
+    for p in proposals:
+        cat = _safe_text(p.get("category"), "") or ""
+        typ = _safe_text(p.get("type"), "") or ""
+        if not cat or not typ or cat not in canonical:
+            continue
+        home = owner.get(normalize_name(typ))
+        if home and home != cat:
+            log.info("threats.proposal_category_reconciled", session_id=sid,
+                     threat_type=typ, wrote=cat, moved_to=home)
+            p["category"] = home
+            moved += 1
+    return moved
 
 
 def _build_retrieved_records(cand: dict, sid: str, tenant: str, ss: int,
@@ -668,10 +720,25 @@ def _generate_gap_proposals(r: _IdentificationRound, sess: Session, llm: LLMClie
     # selection trims any surplus, so over-supply costs tokens only.
     gap_ask = min(_gap_ask(gap_need), s_cfg.threat_llm_max_generation)
     gap_quota = stride.allocate(gap_ask, cats, existing=have)
+    # Hold the model to CURATED type wording where the library has some. Without this a
+    # proposal invents a synonym, the rerank scores it short of the cutoff, and the threat
+    # lands type_id=None — which also costs it the type's curated actors (a verified type
+    # draws from ThreatType_ThreatActor_Map; an unverified one falls back to
+    # nearest_library_actors with actors_validated=False).
+    # Ranked against THIS asset rather than sent wholesale — see canonical_types_for; the
+    # vocabulary is 27 rows today and is expected to reach thousands.
+    # build_queries is reused deliberately: its asset-level query is the SAME text retrieval
+    # already ranked the catalogue with, so both stages answer "what suits this asset" the
+    # same way instead of drifting apart on two hand-rolled descriptors.
+    _retrieval_queries = threat_retrieval.build_queries(subsystems, asset_context)
+    canonical = grounding.canonical_types_for(
+        sess, llm, cats, r.retrieved_summaries,
+        _retrieval_queries[-1] if _retrieval_queries else "",
+        s_cfg.canonical_types_per_category)
     gap_gen_messages = prompts.threats_prompt(
         scenario_session["AssetName"], asset_context, subsystems,
         max_threats=gap_ask, categories=cats, exclude=exclude_all or None,
-        quota=gap_quota)
+        canonical_types=canonical or None, quota=gap_quota)
     proposals: list = []
     prov: Provenance | None = None
     llm_failed = False
@@ -701,13 +768,19 @@ def _generate_gap_proposals(r: _IdentificationRound, sess: Session, llm: LLMClie
         # place that reads it below — the only spot that covers every reader, including
         # grounding.prime_query_embeddings.
         raw_proposal_count = len(proposals)
+        # BEFORE the category filter, and before grounding: a proposal whose type came from a
+        # different category's supplied list is repaired here, where the vocabulary we handed
+        # the model is still in scope. Nothing downstream can tell a mislabelled category from
+        # a genuinely novel type.
+        reconciled = _reconcile_proposal_categories(proposals, canonical, sid)
         usable = [p for p in proposals if _usable_proposal(p) and _usable_category(p, cats)]
         if len(usable) != len(proposals):
             log.warning("threats.proposals_dropped", session_id=sid,
                         dropped=len(proposals) - len(usable), received=len(proposals))
         proposals = usable
         _t.result(raw_proposal_count=raw_proposal_count, usable_proposals=proposals,
-                llm_failed=llm_failed)
+                canonical_types={c: len(v) for c, v in canonical.items()},
+                reconciled=reconciled, llm_failed=llm_failed)
     return _GapGenerationResult(proposals, prov, llm_failed, gap_ask)
 
 

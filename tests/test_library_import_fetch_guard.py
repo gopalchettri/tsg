@@ -127,3 +127,48 @@ def test_a_cross_host_redirect_drops_every_header_but_user_agent():
     assert new is not None
     assert new.get_header("User-agent") == "TSG"
     assert new.get_header("X-secret") is None, "headers must not survive a cross-host hop"
+
+
+# ---------------------------------------------------------------- the structural guarantee
+# The ORIGINAL cause was not a missing check; it was WHERE the check lived. It sat inside
+# _RedirectPolicy.redirect_request, which by construction only ever sees redirect targets — so
+# the first hop of every fetch was unchecked, invisibly, and fetchers._get went years that way.
+# Splitting a security rule across "first hop" and "later hops" is what made the gap unnoticeable.
+# There is now one guard_url; this asserts every door actually opens through it.
+
+_FETCH_MODULES = [Path(li.__file__), Path(li.__file__).with_name("fetchers.py")]
+
+
+def _opens_a_socket(fn: ast.AST) -> bool:
+    for n in ast.walk(fn):
+        if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
+            continue
+        if n.func.attr == "urlopen":
+            return True
+        # _opener().open(req, ...)
+        if (n.func.attr == "open" and isinstance(n.func.value, ast.Call)
+                and getattr(n.func.value.func, "id", "") == "_opener"):
+            return True
+    return False
+
+
+def _calls_guard(fn: ast.AST) -> bool:
+    return any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "guard_url"
+            for n in ast.walk(fn))
+
+
+@pytest.mark.parametrize("module", _FETCH_MODULES, ids=lambda p: p.name)
+def test_every_function_that_opens_a_url_validates_it_first(module):
+    tree = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
+    offenders = [
+        f"{module.name}:{fn.lineno} {fn.name}()"
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and _opens_a_socket(fn) and not _calls_guard(fn)
+    ]
+    assert not offenders, (
+        "these open a URL without calling fetchers.guard_url first:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nEvery outbound fetch must validate scheme, host and IP-literal BEFORE connecting. "
+        "The first hop is not covered by _RedirectPolicy — that only sees redirect targets, "
+        "which is exactly how fetchers._get went unchecked.")

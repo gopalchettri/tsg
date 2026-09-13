@@ -13,6 +13,7 @@ and never re-identifies. The asset-embedded name itself never enters the library
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -87,7 +88,7 @@ def pick_worse_of_two(a: GroundingStatus, b: GroundingStatus) -> GroundingStatus
 
 
 def find_category(sess: Session, proposed: str) -> int | None:
-    """Case-insensitive match against a real category name/code. [R6] `None`
+    """Case-insensitive match against a real category name/code. `None`
     means nothing matched — callers treat that as "search every category",
     not as an error.
     """
@@ -132,7 +133,7 @@ def get_possible_types(sess: Session, category_id: int | None) -> list[dict[str,
         m.Threat_Type.IsDeleted == False,
     )
     if category_id is not None:  # else fall back to searching all categories ([R6])
-        # [A2]: the category MAP can admit a type whose own default category differs.
+        # the category MAP can admit a type whose own default category differs.
         mapped_type_ids = (
             select(m.Threat_Catalogue.ThreatTypeID)
             .join(m.Threat_Catalogue_Category_Map,
@@ -442,6 +443,95 @@ def nearest_library_actors(sess: Session, llm: LLMClient, query: str,
         log.warning("actors.nearest_embed_failed_keyword_only", exc_info=True)
     ranked = hybrid_search.hybrid_match(query, candidates, query_vec=query_vec, top_n=top_n)
     return [pairs[i] for i, _score in ranked]
+
+
+def canonical_types_for(sess: Session, llm: LLMClient, categories: list[str],
+                        retrieved: list[dict[str, Any]], query: str,
+                        cap: int) -> dict[str, list[str]]:
+    """Per-category Threat_Type vocabulary for prompts.threats_prompt, narrowed to `cap`.
+
+    WHY A CAP. The model has to CHOOSE from this list, and a language model does not pick
+    reliably out of hundreds of options — nor is the prompt free. Threat_Type holds 27 rows
+    today and is expected to hold thousands; "send them all" is right only for the first of
+    those. Note the cap already bites at 27: the seed puts 17 types under Spoofing alone.
+
+    WHY TWO SIGNALS, FUSED — neither survives that growth alone:
+      * USAGE — how often a type appears among the catalogue threats ALREADY RETRIEVED for
+        this asset. Direct evidence from the curated library about what applies to an asset
+        like this one, and free: those rows are already in memory. Empty when retrieval was
+        thin, which is exactly when a gap round is most likely to run.
+      * NAME SIMILARITY — always available, but weak alone: Threat_Type has no description
+        column, so this compares a 3-word label against an asset paragraph. Same weakness
+        nearest_library_actors documents above for actor names.
+    rrf_fuse because a count (12) and a cosine (0.34) are incomparable as NUMBERS but not as
+    RANKS — the identical reason hybrid_search fuses BM25 with cosine instead of calibrating
+    one against the other.
+
+    A cap over ONE unreliable signal degenerates into "the same N every time", which is the
+    failure the cap exists to prevent — so the fusion is the point, not a refinement.
+
+    `cap <= 0` disables the feature: returns {}, and threats_prompt then renders exactly what
+    it rendered before this existed. That is the escape hatch, no deploy required.
+    """
+    if cap <= 0 or not categories:
+        return {}
+    # library_threat_type, not threat_type: the former is the CURATED name and is None on an
+    # AI-generated row, so this counts only threats that genuinely matched the library.
+    used: Counter[str] = Counter(t["library_threat_type"] for t in (retrieved or [])
+                                 if t.get("library_threat_type"))
+    s = get_settings()
+    out: dict[str, list[str]] = {}
+    query_vec: list[float] | None = None
+    embedded = False
+    for c in categories:
+        # NEVER pass None through. get_possible_types(sess, None) returns EVERY active type
+        # ([R6] fallback), so an unresolvable category would advertise the whole vocabulary as
+        # if it belonged to that one cell — strictly worse than supplying nothing for it.
+        cid = find_category(sess, c)
+        if cid is None:
+            continue
+        names = [r["ThreatTypeName"] for r in get_possible_types(sess, cid)]
+        if not names:
+            continue
+        if len(names) <= cap:
+            out[c] = names
+            continue
+        if not embedded:  # one query embed per call, and only once something actually overflows
+            embedded = True
+            try:
+                qv = llm.embed([query], kind="query")
+                query_vec = qv[0] if len(qv) == 1 else None
+            except Exception:  # ranking degrades to keyword-only; the pass must not die for it
+                log.warning("canonical_types.query_embed_failed", session_query=query[:80],
+                            exc_info=True)
+        out[c] = _fuse_type_ranks(llm, names, used, query, query_vec, s, cap)
+    return out
+
+
+def _fuse_type_ranks(llm: LLMClient, names: list[str], used: Counter[str], query: str,
+                     query_vec: list[float] | None, s: Settings, cap: int) -> list[str]:
+    """RRF over (usage among retrieved) and (name similarity). See canonical_types_for."""
+    by_usage = [i for i in sorted(range(len(names)), key=lambda i: (-used[names[i]], i))
+                if used[names[i]]]  # a type nobody used must not VOTE, same rule as BM25 zeros
+    candidates: list[dict[str, Any]] = [{"text": n, "name": n, "vector": None} for n in names]
+    try:
+        vecs = embeddings.get_vectors(llm, names, model_id=s.embedding_model,
+                                      group="threat_type", kind="passage")
+        for cand in candidates:
+            cand["vector"] = vecs.get(cand["text"])
+    except Exception:  # keyword leg still ranks — see nearest_library_actors' limitation note
+        log.warning("canonical_types.type_vectors_failed_keyword_only", exc_info=True)
+    by_words = [i for i, _score in hybrid_search.hybrid_match(query, candidates,
+                                                              query_vec=query_vec)]
+    fused = hybrid_search.rrf_fuse([by_usage, by_words])
+    if not fused:
+        # Both legs silent: nothing retrieved used these types AND the text legs scored zero
+        # (embeds down, and BM25 finds no shared token between a 3-word label and the asset
+        # prose — the documented actor-path failure). Fall back to the deterministic
+        # ThreatTypeID order get_possible_types already guarantees rather than returning [],
+        # which would drop the category out of the vocabulary entirely.
+        return names[:cap]
+    return [names[i] for i in sorted(fused, key=lambda i: (-fused[i], i))[:cap]]
 
 
 def _shortlist_candidates(qv: list[float], rows: list[dict[str, Any]], name_vecs: dict[str, list[float]],

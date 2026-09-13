@@ -37,7 +37,7 @@ from app.api.admin_jobs import (
     intel_job_channel_key,
     mark_admin_job,
 )
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.enums import (
     CeleryJobState,
     RegenGranularity,
@@ -59,6 +59,40 @@ from app.sse import bus
 
 _s = get_settings()
 log = get_logger(__name__)
+
+
+def _build_beat_schedule(s: Settings) -> dict[str, dict]:
+    """Beat entries for THIS settings object.
+
+    A FUNCTION, not the inline dict this used to be, purely so both sides of every gate are
+    testable. `beat_schedule` is built at import against the module-global `_s`, so a test could
+    only reach the disabled branch by reloading this module — which re-registers every task. The
+    sweep gate was therefore pinned only in whichever state the ambient environment happened to
+    be in, leaving `assert entry is None` dead in CI. TWO entries are gated, and both had it.
+
+    Pure on purpose: no logging, no side effects, so a test can call it with any Settings.
+    """
+    schedule: dict[str, dict] = {
+        # the reaper must run on a schedule in production
+        "reap-stuck-sessions": {"task": "tsg.reap", "schedule": s.reaper_interval_seconds},
+        "operational-self-check": {"task": "tsg.self_check",
+                                   "schedule": s.self_check_interval_seconds},
+    }
+    # THE consumer of the control-mapping retry queue — without it, map_controls' three
+    # "leave it for the next run" paths have no next run. See cascade.run_control_map_sweep.
+    # Gated by TSG_CONTROL_MAP_SWEEP_ENABLED (default on) — off removes the beat entry entirely,
+    # and _init_worker warns about it, because there is no API route to drain the queue by hand.
+    if s.control_map_sweep_enabled:
+        schedule["map-controls-sweep"] = {"task": "tsg.map_controls_sweep",
+                                          "schedule": s.control_map_sweep_interval_seconds}
+    # threat-intel refresh is scheduled ONLY when TSG_INTEL_REFRESH_INTERVAL_SECONDS > 0
+    # (SDD §33: configured source refresh runs on a scheduler). At 0 — the default — it stays
+    # admin-triggered via POST /v1/tsg/threat-intel/feeds/refresh. Either path fans out
+    # through dispatch_refresh below, so beat and the API label and track jobs identically.
+    if s.intel_refresh_interval_seconds > 0:
+        schedule["intel-refresh"] = {"task": "tsg.intel_refresh_all",
+                                     "schedule": s.intel_refresh_interval_seconds}
+    return schedule
 
 # Bounded retry for _init_worker's verify_litellm_models() call — see its own comment below.
 # Lives in Settings.llm_verify_max_attempts / Settings.llm_verify_retry_backoff_seconds now
@@ -167,21 +201,7 @@ celery_app.conf.update(
     },
     task_soft_time_limit=_s.broker_visibility_timeout_seconds - 300,
     task_time_limit=_s.broker_visibility_timeout_seconds,
-    beat_schedule={                    # the reaper must run on a schedule in production
-        "reap-stuck-sessions": {"task": "tsg.reap", "schedule": _s.reaper_interval_seconds},
-        # THE consumer of the control-mapping retry queue — without it, map_controls' three
-        # "leave it for the next run" paths have no next run. See cascade.run_control_map_sweep.
-        "map-controls-sweep": {"task": "tsg.map_controls_sweep",
-                            "schedule": _s.control_map_sweep_interval_seconds},
-        "operational-self-check": {"task": "tsg.self_check", "schedule": _s.self_check_interval_seconds},
-        # threat-intel refresh is scheduled ONLY when TSG_INTEL_REFRESH_INTERVAL_SECONDS > 0
-        # (SDD §33: configured source refresh runs on a scheduler). At 0 — the default — it stays
-        # admin-triggered via POST /v1/tsg/threat-intel/feeds/refresh. Either path fans out
-        # through dispatch_refresh below, so beat and the API label and track jobs identically.
-        **({"intel-refresh": {"task": "tsg.intel_refresh_all",
-                              "schedule": _s.intel_refresh_interval_seconds}}
-           if _s.intel_refresh_interval_seconds > 0 else {}),
-    },
+    beat_schedule=_build_beat_schedule(_s),
 )
 
 
@@ -200,6 +220,20 @@ def _init_worker(sender=None, **_):
     from app.core.config import assert_security_posture
     from app.db.engine import get_engine
     from app.db.invariants import verify_startup
+
+    # The retry queue has NO consumer while this is off, and — unlike every other disabled
+    # feature here — no API route can drain it by hand. Announced at boot rather than left to a
+    # config comment: a comment is read by whoever opens config.py, this is read by whoever is
+    # looking at the logs when scenarios turn up with empty control lists. The manual command is
+    # spelled out because it is the only recovery path that actually exists.
+    if not _s.control_map_sweep_enabled:
+        log.warning(
+            "control_map.sweep_disabled",
+            note="map_controls' 'leave it for the next run' paths now have NO next run: outputs "
+                 "left unstamped stay unmapped and publish as controls: [], which the API "
+                 "documents as a genuine library gap rather than an error. No API route drains "
+                 "the queue. Manual: celery -A app.pipeline.celery_app.celery_app call "
+                 "tsg.map_controls_sweep")
     from app.pipeline.llm import log_litellm_key_info, verify_litellm_models
     from app.pipeline.local_models import validate_local_models
 

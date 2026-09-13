@@ -30,6 +30,7 @@ import contextlib
 import itertools
 import json
 import re
+import urllib.request
 from collections.abc import Iterator
 from typing import Any
 
@@ -319,27 +320,20 @@ def _open(url: str, *, timeout: int = _FETCH_TIMEOUT_S):
     metadata) or an internal service. urllib also follows redirects blindly, so even a pinned
     https URL can be walked somewhere else by a hijacked upstream answering 302.
 
-    Reuses app.intel.fetchers' policy rather than restating it -- one allowlist, one redirect
-    handler, no second copy to drift. Note this checks the INITIAL url as well, which
-    fetchers._get does not: there only redirect targets are policed.
+    Delegates to fetchers.guard_url -- THE single rule, applied to first hop and redirects
+    alike. It deliberately does not restate the checks: an earlier version of this function did,
+    and a second copy of a security rule is a copy that drifts.
 
     Imported lazily so this module does not pull fetchers (and pymongo with it) at import time.
     """
-    import urllib.parse
+    from app.intel.fetchers import _opener, guard_url
 
-    from app.intel.fetchers import _is_ip_or_local, _opener, allowed_feed_hosts
-
-    parts = urllib.parse.urlsplit(url)
-    host = parts.hostname or ""
-    if parts.scheme != "https":
-        raise ThreatLibraryImportError(f"refusing a non-https source URL: {url!r}")
-    if _is_ip_or_local(host):
-        raise ThreatLibraryImportError(
-            f"refusing an IP-literal or loopback source host: {host!r}")
-    if host not in allowed_feed_hosts():
-        raise ThreatLibraryImportError(
-            f"source host {host!r} is not an allowed feed host -- add it to the allowlist "
-            "(fetchers._BUILTIN_FEED_HOSTS) rather than loosening this check")
+    try:
+        guard_url(url, what="import source")
+    except ValueError as exc:
+        # Translated so an operator's bad TSG_LIBRARY_*_URL answers 422 like every other
+        # invalid-input path, rather than surfacing as a 500.
+        raise ThreatLibraryImportError(str(exc)) from exc
     req = urllib.request.Request(url, headers={"User-Agent": "TSG-library-import/1.0"})
     return _opener().open(req, timeout=timeout)
 

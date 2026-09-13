@@ -131,7 +131,8 @@ BEGIN
         BEGIN TRAN;
             DROP INDEX UX_ThreatCatalogue_NaturalKey ON dbo.Threat_Catalogue;
             CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON dbo.Threat_Catalogue(ThreatName)
-                WHERE IsActive = 1 AND IsDeleted = 0;
+                WHERE IsDeleted = 0;   -- widened 2026-09-04: promote inserts IsActive=0, which
+                                       -- the old IsActive=1 filter left entirely unprotected
         COMMIT;
         INSERT #nk (Target, Status, Detail) VALUES (N'Threat_Catalogue', N'FIXED',
             N'UX_ThreatCatalogue_NaturalKey narrowed to (ThreatName) WHERE IsActive = 1 AND IsDeleted = 0.');
