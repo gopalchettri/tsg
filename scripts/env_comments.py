@@ -1,0 +1,995 @@
+"""Plain-English description of every setting, in one place.
+
+Read by scripts/apply_env_comments.py, which writes these above the matching line in .env,
+.env.uat, .env.example and .env.prod.example. Change a description HERE, run the applier, and
+all four files update — hand-editing four copies is what let them drift apart before.
+
+Keys are the ENV SPELLING as it appears in the files (TSG_DB_POOL_SIZE, APP_ENV), not the
+lowercase Settings field name. Nothing under app/ imports this; it affects no route, no setting
+and no behaviour — dotenv ignores comments entirely.
+
+HOUSE STYLE, so the four files read as one voice:
+  * First sentence says what the setting DOES, in words someone new to the project understands.
+  * Then, only where it genuinely applies, when to change it and what goes wrong if you get it
+    wrong. Every warning here was learned the hard way; keep them, just say them plainly.
+  * No function names, no class names, no file paths, no unexplained abbreviations.
+  * A blank line starts a new paragraph. A line starting with two spaces is kept exactly as
+    written — that is how a command or an example keeps its own layout.
+"""
+from __future__ import annotations
+
+COMMENTS: dict[str, str] = {
+
+    # --- Core app identity -----------------------------------------------------------------
+    "TSG_APPLICATION_NAME": """
+        The product name shown at the top of the API documentation page (/docs). Cosmetic.
+    """,
+    "TSG_APPLICATION_VERSION": """
+        Version number shown on the API documentation page (/docs). Cosmetic — it does not
+        affect behaviour and nothing checks it against the code.
+    """,
+    "TSG_APPLICATION_DESCRIPTION": """
+        One-line summary shown under the title on the API documentation page. Cosmetic.
+    """,
+    "APP_ENV": """
+        Which kind of environment this is: local, dev, staging or prod. This is not just a
+        label — it decides whether test-only routes are switched on and how strict the
+        start-up safety checks are.
+
+        Set it to prod anywhere real. Leaving it at dev on a shared server turns off four
+        protections at once, including sending raw error details back to callers.
+    """,
+    "TSG_API_MODULE": """
+        Which product module this deployment is. An API key only works for the module it was
+        issued for, so a key from another module is rejected even if it is otherwise valid.
+    """,
+    "TSG_TENANT_ID": """
+        The customer or organisation this installation serves. One installation serves one
+        tenant; the value is stamped onto the data it creates.
+    """,
+    "LOG_LEVEL": """
+        How much detail goes into the logs: DEBUG, INFO, WARNING, ERROR or CRITICAL. DEBUG is
+        very noisy — useful when chasing a problem, expensive to leave on.
+    """,
+
+    # --- Step tracing ----------------------------------------------------------------------
+    "TRACE_SINKS": """
+        Where the detailed per-step trace is written. A comma-separated list of:
+
+          console   readable blocks printed in the worker window
+          log       mixed into the normal logs, so it reaches the central log system
+          file      written to trace files on disk (see the next two settings)
+
+        Leave it empty to switch tracing off completely.
+
+        This one is read once when the app starts, so changing it while the app is running has
+        no effect — restart to apply.
+    """,
+    "TRACE_DIR": """
+        The folder the trace files are written to. A relative path is measured from the
+        project folder, not from wherever you happened to launch the app — the start script
+        opens three windows from three different places, so anything else would scatter the
+        files.
+    """,
+    "TRACE_MAX_BYTES": """
+        How large one trace file may grow before a fresh one is started.
+
+        This limit applies to EACH process separately. The web server, the background worker
+        and the scheduler all write at the same time, and sharing one file breaks rotation. So
+        the disk you need is: number of processes x this size x the number of old files kept.
+    """,
+    "TRACE_BACKUPS": """
+        How many old trace files to keep after a new one is started. Older ones are deleted.
+        Together with the size limit above, this is what caps the disk space tracing can use.
+    """,
+    "LOG_FILE": """
+        Also write every log line — not just traces — to a file, so a log collector can pick
+        it up.
+
+        Leave this OFF in Docker or Kubernetes. Files disappear with the container, and those
+        platforms already collect and rotate what the app prints to the screen.
+    """,
+
+    # --- Database ----------------------------------------------------------------------
+    "TSG_DB_DSN": """
+        The connection string for the main SQL Server database. Required — the app refuses to
+        start without it, on purpose, rather than running against nothing.
+    """,
+    "TSG_DB_POOL_SIZE": """
+        How many database connections one process keeps open and reuses.
+
+        Size it against the worker's concurrency: a worker handling 10 jobs at once can never
+        use more than 10 connections, so a bigger pool just idles. The number that actually
+        threatens the database is this multiplied by the number of processes. At 50 plus 10
+        overflow, the planned setup reached 660 connections to a single SQL Server; at 15 plus
+        5 it is about 220. Recalculate if either the pool or the process count changes.
+    """,
+    "TSG_DB_MAX_OVERFLOW": """
+        Extra database connections that may be opened temporarily when the pool above is full.
+        Counts towards the database's connection limit, so include it in that calculation.
+    """,
+    "TSG_DB_POOL_TIMEOUT": """
+        How many seconds a request waits for a free database connection before giving up.
+        Hitting this means the pool is too small for the load, not that the timeout is wrong.
+    """,
+    "TSG_DB_CONNECT_TIMEOUT_SECONDS": """
+        How many seconds to wait when opening a NEW database connection (network plus login)
+        before treating the database as unreachable.
+    """,
+    "TSG_DB_STATEMENT_TIMEOUT_SECONDS": """
+        How many seconds a single database query may run before it is cancelled. Stops one bad
+        query holding a connection open indefinitely.
+    """,
+
+    # --- Redis and background jobs -------------------------------------------------------
+    "TSG_REDIS_URL": """
+        The main Redis server. Used for live progress updates, for limiting how many AI calls
+        run at once, and for locking during embedding work.
+
+        Background job traffic is deliberately kept out of this space by pointing the two
+        settings below at different Redis databases. If those are left empty, everything
+        shares this one.
+    """,
+    "TSG_REDIS_CELERY_BROKER_URL": """
+        Where background jobs are queued. Leave empty to use the main Redis above; set it to a
+        different Redis database number to keep job traffic separate from live progress data.
+    """,
+    "TSG_REDIS_CELERY_RESULT_BACKEND": """
+        Where the results of finished background jobs are stored. Leave empty to use the main
+        Redis above.
+    """,
+    "TSG_RESULT_EXPIRES_SECONDS": """
+        How long a finished background job's result is kept before Redis deletes it. Long
+        enough to read it back; short enough that old results do not fill memory.
+    """,
+
+    # --- MongoDB -----------------------------------------------------------------------
+    "TSG_MONGO_URL": """
+        Connection string for MongoDB, which stores the cached embeddings and the calibrated
+        matching thresholds.
+
+        It must end with directConnection=true. This is a single standalone MongoDB, not a
+        cluster. Without that flag the driver connects once, then tries to re-dial the server
+        using internal hostnames this network cannot resolve. What follows is quiet and
+        expensive: saving thresholds silently does nothing, so the slow calibration step runs
+        again and is thrown away every single time a worker starts.
+    """,
+    "TSG_MONGO_DB": """
+        Which MongoDB database to use. Give each environment its own, so UAT's cached
+        embeddings and calibrated thresholds can never be read as production's.
+    """,
+    "TSG_MONGO_CONNECT_TIMEOUT_MS": """
+        How long to wait when connecting to MongoDB, in MILLISECONDS (not seconds).
+    """,
+    "TSG_MONGO_BREAKER_COOLDOWN_SECONDS": """
+        After MongoDB fails, how long to stop trying before attempting it again. Prevents a
+        dead database from being hammered by every request.
+    """,
+    "EMBEDDING_STORE": """
+        Where computed embeddings are cached: mongo or memory.
+
+        mongo survives restarts, so the expensive embedding work is done once. memory is lost
+        on every restart. If MongoDB cannot be reached the app falls back to memory by itself.
+    """,
+
+    # --- Authentication and security -----------------------------------------------------
+    "TSG_ADMIN_API_KEY": """
+        The password for every admin route, sent as the X-Admin-Key header. REQUIRED: while it
+        is empty every admin route refuses access.
+
+        Generate a new one with:
+
+          python -c "import secrets; print(secrets.token_hex(32))"
+    """,
+    "TSG_VERIFY_MEMBERSHIP": """
+        When true, also check that the calling user is really assigned to the entity they are
+        asking about, instead of accepting the pair on trust. Turn it on anywhere real.
+    """,
+    "TSG_ALLOW_REMOTE_IN_DEV": """
+        Lets a dev-mode app connect to a database or Redis that is not on this machine.
+        Normally that combination is blocked at start-up, because it means dev-level
+        protections are running against shared, real data.
+
+        Setting this true switches off four safeguards at once: full error text is returned to
+        callers, a test-only page is exposed, the check that an active API client exists is
+        skipped, and the membership warning is suppressed. Only set it to state deliberately
+        that you are developing against shared infrastructure.
+    """,
+    "TSG_FLOWER_BASIC_AUTH": """
+        Username and password for the Flower dashboard, which shows background job activity.
+
+        Not used by the application itself — the start script and the container setup read it.
+        Leave it empty and the dashboard has no password at all.
+    """,
+
+    # --- Which AI service -----------------------------------------------------------------
+    "LLM_PROVIDER": """
+        Which service the AI calls go to: litellm_proxy, azure_openai or openai.
+
+        Changing this also changes the default provider for embeddings and reranking, unless
+        those are set explicitly further down — which here they are.
+    """,
+    "AZURE_OPENAI_API_KEY": """
+        The key this app sends to Azure OpenAI to prove it is allowed to make AI calls. Only used
+        when the AI provider is azure_openai; ignored otherwise.
+    """,
+    "AZURE_OPENAI_ENDPOINT": """
+        The Azure OpenAI address to call, for example https://your-resource.openai.azure.com.
+        Read only when the provider is azure_openai.
+    """,
+    "AZURE_OPENAI_DEPLOYMENT_NAME": """
+        The name you gave the model deployment inside Azure. This is your own deployment name,
+        not the model's name. Read only when the provider is azure_openai.
+    """,
+    "AZURE_OPENAI_API_VERSION": """
+        Which version of the Azure OpenAI interface to use. Read only when the provider is
+        azure_openai.
+    """,
+    "TSG_LITELLM_BASE_URL": """
+        The address of the litellm gateway that forwards AI calls. Read only when the provider
+        is litellm_proxy.
+    """,
+    "TSG_LITELLM_API_KEY": """
+        The key this app sends to the litellm gateway to prove it is allowed to make AI calls.
+        Only used when the AI provider is litellm_proxy.
+    """,
+    "TSG_LITELLM_BYPASS_PROXY": """
+        Whether AI traffic should ignore the machine's HTTP proxy settings.
+
+        true (the default) suits a machine that reaches the gateway directly. Set it false
+        only where the network forces everything through a corporate proxy — inside the
+        cluster, for example, where the gateway is reachable no other way. Getting this
+        backwards means the app cannot reach the AI service at all.
+    """,
+    "LITELLM_API_KEY_HEADER": """
+        The header name the litellm gateway expects the key in, if it is not the standard one.
+        Leave empty unless the gateway has been set up differently.
+    """,
+    "OPENAI_API_KEY": """
+        Key for calling OpenAI directly. Ignored when the provider is azure_openai or
+        litellm_proxy.
+    """,
+    "TSG_OPENAI_BASE_URL": """
+        A different address to send OpenAI-style calls to. Leave empty for the standard one.
+    """,
+
+    # --- Which model, and how patiently to wait ------------------------------------------
+    "TSG_INFERENCE_MODEL": """
+        The AI model that writes threats and scenarios.
+
+        kimi-k2.5, and that was measured rather than guessed. Given the exact same production
+        input, glm-5 took 967 seconds while kimi took 4.7 seconds, and both answers passed
+        every quality check the pipeline applies. Almost all of glm-5's time went on hidden
+        internal reasoning that nobody ever reads.
+    """,
+    "TSG_INFERENCE_FALLBACK_MODEL": """
+        A second AI model to try when the first one fails in a way worth retrying — a timeout,
+        a rate limit, or a server error. The retry happens once, immediately, without
+        re-queuing the job.
+
+        This is handled entirely by this application; the gateway team does not need to
+        configure anything. Leave it empty to disable falling back.
+    """,
+    "TSG_LLM_TIMEOUT_SECONDS": """
+        How long to wait for one AI reply before giving up.
+
+        Size this for the FALLBACK model, not the fast one — the timeout applies to both.
+        kimi answers in about 5 seconds, glm-5 in 55 to 99. Tightening it towards kimi's speed
+        would leave the glm-5 fallback unable to finish at all, turning every small kimi
+        hiccup into a hard failure instead of a recovered scenario.
+    """,
+    "TSG_LLM_MAX_RETRIES": """
+        How many times to retry one AI call. Total attempts = this number plus one, so 1 means
+        two attempts.
+
+        That is now literally true, which it was not before: the underlying library had a
+        second, hidden retry loop of its own that no setting here could reach, and the two
+        multiplied. One real run made about 16 attempts and spent 1,268 seconds on a single
+        scenario while this setting read "3". Both loops are now controlled by this one value.
+    """,
+    "LLM_TEMPERATURE": """
+        How much the AI is allowed to vary its wording. 0 gives the most consistent answers, 2
+        the most varied. Leave empty to use the provider's own default.
+    """,
+    "TSG_LLM_JSON_MODE": """
+        Ask the AI service to guarantee the reply is valid JSON, rather than hoping the model
+        formats it correctly.
+
+        Both models in use support this. Worth having on: a single unreadable reply wastes the
+        whole batch's processing time.
+    """,
+    "LLM_REASONING_EFFORT": """
+        How much hidden "thinking" the AI does before answering: low, medium or high. Leave
+        empty for the provider's default.
+
+        This matters for glm-5, which spends around 5,000 hidden thinking tokens to produce
+        one paragraph — roughly 95% of its total time, and the reason the old timeout kept
+        being overrun. It is only the fallback model now, so this setting bounds that path.
+        kimi does no hidden thinking at all, so the setting does nothing for it.
+    """,
+    "TSG_LLM_MAX_OUTPUT_TOKENS": """
+        The largest reply the AI may produce, between 256 and 32768. Leave empty for the
+        provider's default.
+
+        Careful on a thinking model: the limit COUNTS the hidden thinking as well as the
+        visible answer. Set it too low and the model can spend the whole allowance thinking
+        and return an empty reply, which the pipeline can only record as a failure. If you
+        must set it, keep it at 16384 or above and keep the thinking effort above on low.
+    """,
+    "TSG_LLM_STRUCTURED_OUTPUT": """
+        Whether to ask the AI service to enforce an exact reply format for the calls that
+        declare one (currently the treatment plan): auto, on or off.
+
+        auto uses it only where the library confirms the model supports it. The models behind
+        the gateway do not advertise support, so in practice auto leaves their requests
+        unchanged. on forces it, and will fail against a model that cannot do it.
+    """,
+    "LLM_MODERATION_ENABLED": """
+        Turn on the gateway's own content-safety checking for AI calls. Works only through the
+        litellm gateway. Off by default.
+    """,
+    "LLM_MODERATION_MODEL": """
+        Which model the gateway uses to run its content-safety check on AI calls. Only used when
+        that checking is switched on. Leave empty for the gateway's own default.
+    """,
+    "LLM_GUARDRAILS": """
+        Names of extra safety filters the gateway should run on every AI call, separated by
+        commas. Leave empty for none. The names must already exist in the gateway's own setup.
+    """,
+    "THREAT_IDENTIFICATION_TEMPERATURE": """
+        How much the AI may vary its wording when identifying threats. 0 keeps it repeatable,
+        which is what you want for a step whose output is compared against the library.
+    """,
+    "SCENARIO_GENERATION_TEMPERATURE": """
+        How much the AI may vary its wording when writing scenarios. Deliberately NOT pinned
+        to 0: the same call is used to generate alternative versions of a scenario, and at 0
+        those alternatives come out nearly identical.
+    """,
+
+    # --- Limiting how many AI calls run at once ------------------------------------------
+    "TSG_MAX_CONCURRENT_LLM_CALLS": """
+        The most AI calls allowed to run at the same time across every worker. 0 switches the
+        limit off.
+
+        0 is deliberate here. The AI serving software already queues work it cannot take yet,
+        and it does that better than this limit can: a queued request eventually gets served,
+        whereas a call blocked by this limit waits, gives up, and fails the whole step. Only
+        turn it on where the AI service genuinely has no queue of its own.
+    """,
+    "TSG_LLM_SLOT_WAIT_TIMEOUT_SECONDS": """
+        When the limit above is on and all slots are taken, how long a call waits for one
+        before giving up and retrying the step later.
+    """,
+    "TSG_LLM_SLOT_HEARTBEAT_SECONDS": """
+        When the limit on simultaneous AI calls is on, how often a running call signals that it is
+        still working, so its slot is not taken away from it as abandoned.
+    """,
+    "TSG_LLM_SLOT_STALE_AFTER_SECONDS": """
+        How long without a signal before a held slot is assumed to belong to a crashed process
+        and is freed. Keep it comfortably above the heartbeat above, or live calls get their
+        slots taken away.
+    """,
+    "TSG_LLM_SLOT_REDIS_TIMEOUT_SECONDS": """
+        How long the bookkeeping behind the AI call limit waits for Redis before giving up on it.
+        Keeps a slow Redis from stalling every AI call in the system.
+    """,
+    "TSG_LLM_SLOT_POLL_SECONDS": """
+        When the limit on simultaneous AI calls is on and a call is queued, how often it looks
+        again to see whether a slot has freed up.
+    """,
+    "TSG_LLM_SLOT_POLL_JITTER_SECONDS": """
+        A small random amount added to each re-check above, so that many waiting calls do not
+        all wake at the same instant and stampede the moment one slot frees up.
+    """,
+    "TSG_LLM_SLOTS_WARN_RATIO": """
+        Log a warning once this fraction of the slots is in use — 0.8 means at 80% full. An
+        early sign that the limit is about to start blocking work.
+    """,
+    "TSG_LLM_VERIFY_MAX_ATTEMPTS": """
+        How many times to retry the check that confirms the AI's reply is usable, before
+        giving up on that reply.
+    """,
+    "TSG_LLM_VERIFY_RETRY_BACKOFF_SECONDS": """
+        How long to wait between attempts when re-checking that an AI reply is usable.
+    """,
+
+    # --- Embeddings and reranking ---------------------------------------------------------
+    "TSG_EMBEDDING_PROVIDER": """
+        Where embeddings are computed: local (on this machine) or through the AI gateway.
+
+        Set it explicitly. Left empty it quietly follows whatever the main AI provider is, so
+        changing that one setting would silently move embedding work too.
+    """,
+    "RERANKER_PROVIDER": """
+        Where reranking is computed: local (on this machine) or through the AI gateway. Same
+        rule as embeddings above — set it explicitly rather than letting it follow.
+
+        This choice dominates matching speed. On the gateway a comparison takes about 16
+        milliseconds; running locally on a processor it takes about 2.5 seconds. Expect
+        noticeably slower sessions on local.
+    """,
+    "TSG_EMBEDDING_MODEL": """
+        Which model turns text into vectors for similarity search. On a local provider this is
+        a folder path; through the gateway it is the model's name there.
+
+        Changing it invalidates every cached vector and every calibrated threshold, because
+        both were measured against the old model. Re-run the embedding refresh and the
+        calibration afterwards.
+    """,
+    "TSG_EMBEDDING_DIMENSIONS": """
+        How many numbers are in one vector. This MUST match the model set above.
+
+        The app checks it against the real provider when it starts and refuses to boot on a
+        mismatch, rather than filling the cache with vectors that can never be compared.
+    """,
+    "TSG_RERANKER_MODEL": """
+        Which model does the precise second-pass comparison, after the fast vector search has
+        produced a shortlist. Slower and more accurate than the vector step, which is why it
+        only ever sees a shortlist.
+    """,
+    "EMBEDDING_PREFIX_STYLE": """
+        Whether to put "query:" and "passage:" in front of text before embedding it. Some
+        models are trained to expect that and score worse without it; others are not.
+
+        auto decides from the model name. Set it to none to switch the prefixes off.
+    """,
+    "TSG_EMBEDDING_BATCH_SIZE": """
+        How many pieces of text are sent in one request to the embedding service.
+
+        This is the provider's own per-request limit, not a preference. The start-up check
+        sends exactly this many and refuses to boot if the provider rejects the size, so
+        raising it beyond what the provider accepts stops the app rather than speeding it up.
+    """,
+    "TSG_EMBEDDING_CONCURRENCY": """
+        How many embedding batches are in flight at the same time. 1 sends them one after
+        another.
+
+        Raising it overlaps the network waiting rather than doing more work: at a typical 300
+        milliseconds per request, 4 was measured about 3.4 times faster and 8 about 5.6 times.
+        Keep an eye on the provider's rate limit before going high.
+    """,
+    "TSG_MAX_EMBED_CHARS": """
+        The longest piece of text that will be sent for embedding. A safety limit against one
+        enormous input, not a tuning knob.
+    """,
+    "TSG_MAX_CHAT_CHARS": """
+        The longest prompt that will be sent to the AI. A safety limit against one enormous
+        input, not a tuning knob.
+    """,
+    "TSG_LOCAL_MODEL_CACHE_SIZE": """
+        How many locally-run models to keep loaded in memory at once. Each one costs memory;
+        reloading one costs time. Only matters when a provider above is set to local.
+    """,
+    "TSG_LOCAL_MODEL_THREADPOOL_SIZE": """
+        How many real operating-system threads are available for running local models. Local
+        model work blocks, so it cannot share the lightweight threads the rest of the app uses.
+    """,
+    "TSG_RERANK_CONCURRENCY": """
+        How many reranking requests to send to the gateway at the same time. Ignored by a
+        local reranker, which batches internally instead.
+    """,
+
+    # --- Accepting new sessions -----------------------------------------------------------
+    "TSG_MAX_ACTIVE_SESSIONS": """
+        The most sessions allowed to run at once across the whole system. 0 means no limit.
+        Beyond this, new session requests are refused rather than queued.
+    """,
+    "TSG_MAX_ACTIVE_SESSIONS_PER_ENTITY": """
+        The most sessions one customer may run at once. 0 means no limit — which lets a single
+        customer take every slot the system-wide limit above allows. Set it to bound the
+        damage one busy tenant can do to everyone else.
+    """,
+    "TSG_ACTIVE_SESSIONS_WARN_RATIO": """
+        Log a warning once this fraction of the session limit is in use — 0.9 means at 90%.
+    """,
+    "TSG_POOL_UTILIZATION_WARN_RATIO": """
+        Log a warning once this fraction of the database connection pool is in use. An early
+        sign that requests are about to start waiting for a free connection.
+    """,
+    "TSG_CAPACITY_RETRY_AFTER_SECONDS": """
+        When a request is refused because the system is full, how many seconds to tell the
+        caller to wait before trying again. Sent back in the standard Retry-After header.
+    """,
+
+    # --- Step 1: finding the threats ------------------------------------------------------
+    "TSG_SCENARIO_GENERATION_CONCURRENCY": """
+        How many scenarios the AI writes at the same time. 1 = one after another.
+
+        Higher is faster but puts more load on the AI service. If calls start failing, lower
+        this first.
+    """,
+    "TSG_THREAT_RETRIEVAL_TOP_K": """
+        How many candidate threats are pulled from the library for the precise scorer to look
+        at, per search. Bigger means a better chance of finding the right one, and more work.
+    """,
+    "TSG_THREAT_RELEVANCE_THRESHOLD": """
+        The score out of 100 a library threat must reach to be used as a proper match.
+
+        Below it, a candidate can still be used to make up the requested number, but it is
+        flagged as a weaker fill rather than a real match. The requested count is always met;
+        this setting only decides how the results are labelled.
+
+        Measure it on this environment before pinning a value:
+
+          python scripts/measure_threat_relevance_scores.py
+    """,
+    "TSG_THREAT_LLM_MAX_GENERATION": """
+        The most threats the AI may be asked to invent in one go, when the library did not
+        supply enough. A hard ceiling that applies no matter what the shortfall arithmetic
+        works out to.
+    """,
+    "TSG_CANONICAL_TYPES_PER_CATEGORY": """
+        How many of your real threat-type names to show the AI when it has to invent a new
+        threat, so it reuses your wording instead of making up a synonym. 0 switches this off.
+
+        It matters because a made-up synonym fails to match the library, and the threat then
+        loses the attackers that are linked to the proper type. The list is ranked against the
+        asset being assessed rather than sent whole, because a model does not choose reliably
+        from hundreds of options.
+    """,
+    "TSG_MAX_THREATS_PER_ASSET": """
+        The most threats the AI may propose in one identification call. Asking for the "next
+        set" later can add more, so this is a per-call limit, not a total.
+    """,
+    "TSG_MAX_ACTORS_PER_THREAT": """
+        The most attacker names accepted from one threat. Anything beyond this is dropped.
+    """,
+    "TSG_MAX_PROPOSAL_CHARS": """
+        The longest a proposed threat may be — its type and its name added together — before
+        it is rejected as unusable.
+
+        It must not be larger than the embedding character limit, or a proposal could be
+        accepted here and then be too long to match against the library. The app checks this
+        at start-up.
+    """,
+    "TSG_SEMANTIC_NEAR_DUPLICATE_THRESHOLD": """
+        How similar two threats must be, from 0 to 1, before the second is treated as the
+        first one reworded and dropped.
+
+        For example "Firmware tampering" and "Tampering of firmware" score about 0.99.
+
+        This number is specific to the embedding model in use. Re-measure it if that changes.
+    """,
+    "TSG_SEMANTIC_CROSS_CATEGORY_THRESHOLD": """
+        The same idea, but for two threats filed under DIFFERENT categories — which catches
+        the same threat pasted twice under two labels.
+
+        It has to be stricter than the setting above, because genuinely different categories
+        naturally score high against each other; the measured trap sits at 0.969, so stay
+        above that.
+    """,
+    "TSG_COVERAGE_REPORTING_ENABLED": """
+        Work out and report how complete a session's coverage is. Advisory only — it never
+        blocks or changes anything.
+
+        Off means nothing is calculated, logged or stored at all, not merely hidden from the
+        API response.
+    """,
+
+    # --- Step 2: matching against the library --------------------------------------------
+    "SEMANTIC_MATCH_THRESHOLD": """
+        First stage of matching, from 0 to 1. Every library entry is compared to the proposed
+        threat as a vector; anything below this score is discarded and the rest become
+        candidates for the slower, more accurate stage.
+
+        Fast and rough on purpose — its job is to cut thousands of entries down to a handful.
+    """,
+    "TSG_GROUNDING_SHORTLIST_K": """
+        Second stage: how many of the surviving candidates go on to the precise scorer. The
+        precise scorer is much slower, so this cap is what keeps matching affordable.
+    """,
+    "TSG_GROUNDING_MATCH_THRESHOLD": """
+        Final stage, a score out of 100: at or above this, the proposed threat is treated as
+        the same as the library entry it matched.
+
+        MEASURE this for the embedding and reranking models this environment actually runs.
+        Do not trust the default or the automatic calibration — calibration cannot produce a
+        sound answer against a library that already contains near-duplicate entries.
+    """,
+    "TSG_NEAR_DUPLICATE_SCORE": """
+        During calibration, two LIBRARY entries scoring at or above this against each other
+        are reported as needing curation — they are probably the same threat entered twice.
+
+        It reports; it does not stop the calibration.
+    """,
+    "TSG_CALIBRATION_SAMPLE_SIZE": """
+        How many library entries the calibration run samples.
+
+        Cost grows roughly in step with this: 100 samples measured about 106 seconds of local
+        reranking plus about 100 charged AI calls.
+    """,
+    "TSG_CALIBRATION_PARAPHRASES_PER_NAME": """
+        How many reworded versions of each sampled entry the AI produces during calibration.
+        These are what the thresholds are measured against.
+    """,
+    "TSG_CALIBRATION_STALE_AFTER_SECONDS": """
+        How long a calibration marked "running" is believed before it is treated as abandoned.
+
+        A run takes minutes, so "running" alone cannot mean "still going" — a worker killed
+        halfway would otherwise leave that mark in place forever and block every later run.
+    """,
+
+    # --- Step 3: scoring and picking which threats get scenarios --------------------------
+    "TSG_BASE_SCORE": """
+        The score every identified threat starts with, before the scoping rules add or take
+        away points.
+
+        This one can also be overridden per session in the Config_Tuning table, with no
+        restart — the next session picks up the new value.
+    """,
+    "TSG_DEFAULT_RULE_WEIGHT": """
+        Scoping rules add or remove points from a threat's score to decide whether it is worth
+        writing a scenario for. This is how many points a rule contributes when the rule itself
+        does not specify an amount.
+    """,
+    "TSG_SCOPING_SCORE_THRESHOLD": """
+        The score a threat needs to survive scoping and go on to get a scenario. For example
+        at 55, a threat scoring 60 passes and one scoring 52 is dropped.
+    """,
+    "TSG_SCOPING_TOP_N": """
+        Keep only the best N threats after scoring. Leave it empty for no cap, which is the
+        default — every threat that passed the threshold gets a scenario.
+
+        Nothing is thrown away when you do set it: the rest are banked and can still be served
+        later by asking for the next set.
+    """,
+
+    # --- Step 4: writing the scenarios ----------------------------------------------------
+    "TSG_PROMPT_INTEL_LIMIT": """
+        How many threat-intelligence advisories are added to each scenario prompt.
+
+        Costs money on every scenario: raising it makes every AI call longer.
+    """,
+    "TSG_INTEL_MIN_TERM_LENGTH": """
+        The shortest word, in characters, allowed to take part in the intelligence keyword
+        search. Shorter words match almost anything and only add noise.
+    """,
+    "TSG_NEXT_SET_SIZE": """
+        How many extra scenarios are produced each time someone asks for the next set. The
+        first run makes one scenario per selected threat; each further click adds this many.
+    """,
+    "TSG_COVERAGE_ATTEMPT_SLACK": """
+        How many extra attempts a threat gets beyond its coverage target. For example a threat
+        with 3 plausible entry points would produce at most 3 + 2 = 5 scenarios.
+    """,
+    "TSG_EXCLUSIONS_CHAR_BUDGET": """
+        How many characters may be spent listing already-used threat names in the prompt, so
+        the AI does not repeat them.
+
+        Lower it to send fewer names and keep the prompt small; the trade is a higher chance
+        of a repeat slipping through.
+    """,
+    "TSG_VARIANT_SIBLING_PROMPT_K": """
+        How many existing scenarios for the same threat are quoted back to the AI when asking
+        for a different one, so it can see what already exists and avoid repeating it.
+
+        This affects only what the AI is shown. The duplicate detector looks at all of them
+        regardless.
+    """,
+    "TSG_SIBLING_SIMILARITY_RATIO": """
+        How alike two scenarios must be, from 0 to 1, before the newer one is flagged to the
+        reviewer as nearly the same.
+
+        A warning only — the scenario is still kept.
+    """,
+
+    # --- Step 5: matching controls to scenarios -------------------------------------------
+    "TSG_CONTROL_MAP_MIN_SCORE": """
+        The score out of 100 a control must reach to be attached to a scenario.
+
+        PIN IT, do not leave it empty. Left unset it inherits the threat-matching threshold,
+        which was measured comparing one short label against another. Control matching
+        compares a whole scenario paragraph against a control label, which scores lower by
+        nature. That mismatch once dropped every match and published empty control lists that
+        the API reported as a genuine gap in the library — 7 of 13 scenarios came back with
+        nothing.
+
+        Measure it for this environment:
+
+          python scripts/measure_control_map_scores.py
+    """,
+    "TSG_CONTROL_MAP_TOP_K": """
+        The most controls kept for one scenario. Fewer may be kept; the list is never padded
+        out to reach this number.
+    """,
+    "TSG_CONTROL_MAP_SHORTLIST_K": """
+        How many controls go to the precise scorer for each scenario.
+
+        Not the same thing as the threat-matching shortlist, and deliberately different. The
+        cheap first pass is only there to avoid scoring the entire control library, so this
+        can be generous — but every extra control is real work for the slow stage.
+    """,
+
+    # --- Step 6: accepting scenarios into the library -------------------------------------
+    "TSG_ACCEPT_NAMED_IN_MESSAGE": """
+        When a bulk accept partly fails, how many of the offending scenarios to name
+        individually in the error message. The rest are summarised as a count.
+    """,
+
+    # --- Step 7: treatment plans ----------------------------------------------------------
+    "TSG_RISK_MODULE_ENABLED": """
+        Turn the treatment-plan feature on. Off means those routes do not exist at all — they
+        return "not found" rather than "not allowed".
+    """,
+    "TSG_TREATMENT_TEMPERATURE": """
+        How much the AI may vary its wording when writing a treatment plan. 0 gives the same
+        plan for the same inputs every time.
+    """,
+    "TSG_TREATMENT_STALE_SECONDS": """
+        How long a treatment plan marked as in-progress is believed before it is treated as
+        abandoned.
+
+        LEAVE THIS EMPTY. It works itself out from the AI timeout and retry settings, so it
+        follows real timings automatically. Pinning a number means it stops tracking them.
+    """,
+    "TSG_TREATMENT_FREE_TEXT_CAP": """
+        The longest a single free-text field supplied from the user interface may be when a
+        treatment plan is saved. Anything longer is cut.
+    """,
+
+    # --- Threat intelligence feeds --------------------------------------------------------
+    "TSG_INTEL_ENABLED": """
+        Use public threat-intelligence feeds to enrich generated scenarios. The feeds are
+        cached in MongoDB and read from there when building prompts.
+    """,
+    "OTX_API_KEY": """
+        Your AlienVault OTX key. Simply having a value here switches the OTX feed on; leave it
+        empty to leave that feed off.
+    """,
+    "TSG_INTEL_KEV_ENABLED": """
+        Use the US government's Known Exploited Vulnerabilities list. Public, no key needed.
+    """,
+    "TSG_INTEL_KEV_URL": """
+        Where that list is downloaded from. Change it only if the publisher moves the file.
+    """,
+    "TSG_INTEL_ICS_ADVISORIES_ENABLED": """
+        Use the US government's industrial control system advisories. Public, no key needed.
+    """,
+    "TSG_INTEL_ICS_ADVISORIES_URL": """
+        Where those advisories are downloaded from. This points at the official mirror on
+        purpose: the publisher's own address blocks anything that is not a web browser.
+    """,
+    "TSG_INTEL_URLHAUS_ENABLED": """
+        Use the URLhaus feed of known malicious web addresses. Off by default; opt in.
+    """,
+    "TSG_INTEL_URLHAUS_URL": """
+        The web address the URLhaus malicious-address feed is downloaded from. Only used when
+        that feed is switched on.
+    """,
+    "TSG_INTEL_OTX_URL": """
+        The web address the OTX threat-intelligence reports are downloaded from. Only used when an
+        OTX key is set.
+    """,
+    "TSG_INTEL_OTX_FRESH_PAGES": """
+        How many pages of the newest OTX reports to re-read on EVERY run.
+
+        The rest is walked through slowly with a saved position. Without this, a brand-new
+        report would wait roughly nine days for that slow walk to come back around to it.
+    """,
+    "TSG_INTEL_OTX_MAX_PAGES": """
+        A safety limit on how many pages one OTX walk will read. There are about 178 real
+        pages today, so this is headroom, not a target.
+    """,
+    "TSG_INTEL_OTX_PAGE_SIZE": """
+        How many reports OTX returns per page. 50 is OTX's own maximum — asking for more is
+        ignored by them.
+    """,
+    "TSG_INTEL_OTX_SYNC_SECONDS": """
+        How long one OTX sync may run before stopping and saving its position, to be continued
+        next time.
+
+        Keep it well under the background job's own 600-second limit, or the job is killed
+        before it can save where it got to.
+    """,
+    "TSG_INTEL_TAXII_SERVERS": """
+        Extra intelligence sources that speak the TAXII 2.1 standard, given as a JSON list of
+        objects with "label", "url" and "collection". Leave empty for none.
+    """,
+    "TSG_INTEL_TTL_DAYS": """
+        How long to keep an intelligence item after the feed that supplied it has DROPPED it.
+        Items still present in a feed never expire.
+    """,
+    "TSG_INTEL_REFRESH_INTERVAL_SECONDS": """
+        How often the feeds refresh themselves automatically. 0 = never, 86400 = once a day.
+
+        The scheduler must read the same settings as the workers, or the schedule quietly
+        differs from what the API reports it to be.
+    """,
+    "TSG_INTEL_STALE_AFTER_SECONDS": """
+        How old a feed's data may get before it is reported as stale and raises a warning.
+        172800 seconds is 48 hours — two missed daily refreshes.
+    """,
+    "TSG_INTEL_HOME_COUNTRY": """
+        Your country, used to spot intelligence that names it as a target.
+
+        Matched by exact text, so it must be the full name — "United Arab Emirates", not a
+        two-letter code. Empty means no country matching happens at all.
+    """,
+
+    # --- Recovering from crashes ----------------------------------------------------------
+    "TSG_ADMIN_EMBEDDING_MAX_RETRIES": """
+        How many times an admin embedding job retries when no AI slot is free. 0 means fail at
+        the first shortage.
+
+        Bounded deliberately. Normal pipeline work retries without a fixed limit and is capped
+        elsewhere; admin jobs should not queue forever.
+    """,
+    "TSG_REAPER_INTERVAL_SECONDS": """
+        How often to sweep for sessions left behind by a crashed worker, and how long an
+        untouched session must sit before it counts as abandoned.
+    """,
+    "TSG_REAPER_STALE_GRACE_SECONDS": """
+        How long to wait past a step's lease before deciding the worker holding it is dead.
+
+        LEAVE THIS EMPTY — do not copy the value from another environment. It must stay at or
+        above this environment's real lease time, which is worked out from the AI timeout and
+        retry settings. Too short and the sweeper takes work away from a worker that is still
+        running it perfectly well, and the same step gets done twice.
+    """,
+    "TSG_STAGE_LEASE_SECONDS": """
+        How long one pipeline step may hold its claim before another worker may take it over.
+
+        LEAVE THIS EMPTY. It works itself out from the AI timeout multiplied by the attempts
+        allowed, doubled to cover the fallback model. The app refuses to start if you pin a
+        value too small for those settings, because that guarantees work is stolen mid-flight.
+    """,
+    "TSG_STAGE_MAX_ATTEMPTS": """
+        How many times one pipeline step may be retried before it is given up on. Stops a step
+        that always fails from being retried forever.
+    """,
+    "TSG_BROKER_VISIBILITY_TIMEOUT_SECONDS": """
+        How long a job from a genuinely dead worker sits before it is handed to another one.
+
+        It is also the hard ceiling for every job time limit: past this the queue hands the
+        job out again regardless, so any limit set above it does nothing except let the same
+        work run twice at once.
+    """,
+    "TSG_SUBSYSTEM_TASK_SOFT_LIMIT_SECONDS": """
+        How long one subsystem's background job may run before it is asked to stop.
+
+        LEAVE THIS EMPTY. It works itself out from the step lease, capped at 90% of the queue
+        redelivery timeout above. A fixed number cannot be right in both development and
+        production, because the AI timeouts it depends on differ between them.
+    """,
+    "TSG_REAPER_SQL_IN_CHUNK_SIZE": """
+        How many session ids the cleanup sweep puts into one database query. Kept well below
+        SQL Server's own limit of about 2,100 values per query, which it would otherwise hit
+        on a large backlog and fail.
+    """,
+    "TSG_EMBEDDING_GROUP_LOCK_TTL_SECONDS": """
+        How long one worker may hold the lock that stops two workers rebuilding the same
+        embedding cache at the same time.
+
+        Must be a whole number — Redis rejects a fractional value here.
+    """,
+
+    # --- Live progress updates in the browser ---------------------------------------------
+    "TSG_SSE_MAX_CONCURRENT_STREAMS": """
+        The most browsers that may watch live progress at once. This sizes both the shared
+        pool of Redis listeners and the limit on open progress streams, so it is the single
+        number that decides how many viewers the system supports.
+    """,
+    "TSG_SSE_PING_SECONDS": """
+        How often to send a small "still here" message down an open progress stream, so
+        proxies and browsers do not close it for being idle.
+
+        Do not set 0 — that floods the connection. A negative value effectively disables it.
+    """,
+    "TSG_SSE_PUBLISH_TIMEOUT_SECONDS": """
+        How long to wait when publishing one progress event before giving up on it. Keeps a
+        slow Redis from holding up the pipeline work that produced the event.
+    """,
+    "TSG_SSE_SEND_TIMEOUT_SECONDS": """
+        How long a browser may fail to read from its progress stream before the connection is
+        force-closed. Stops one stalled viewer holding a stream slot indefinitely.
+    """,
+    "TSG_SSE_SHUTDOWN_GRACE_SECONDS": """
+        How long to keep delivering progress events while the app is shutting down, so viewers
+        see the last messages rather than a dropped connection.
+
+        Keep it under the web server's own shutdown grace period, or the server kills the
+        process mid-drain and the effort is wasted.
+    """,
+    "TSG_SSE_SUBSCRIBE_CONNECT_TIMEOUT_SECONDS": """
+        How long to wait when connecting to Redis to start listening for progress events.
+    """,
+    "TSG_SSE_SUBSCRIBER_HEALTH_CHECK_INTERVAL_SECONDS": """
+        How often to check that a Redis listener is still alive, so a silently dead connection
+        is replaced instead of leaving viewers waiting for events that will never arrive.
+    """,
+    "TSG_SSE_SUBSCRIBER_SOCKET_TIMEOUT_SECONDS": """
+        How long a Redis listener waits for data before treating the connection as broken.
+    """,
+    "TSG_SSE_BREAKER_COOLDOWN_SECONDS": """
+        After publishing progress events fails, how long to stop trying before attempting
+        again. Stops a dead Redis being retried on every single event.
+    """,
+
+    # --- Routine health warnings ----------------------------------------------------------
+    "TSG_SELF_CHECK_INTERVAL_SECONDS": """
+        How often the background health sweep runs and logs warnings about anything that looks
+        wrong. It only reports; it changes nothing.
+    """,
+    "TSG_TEMPDB_VERSION_STORE_WARN_MB": """
+        Warn when SQL Server's temporary workspace grows past this many megabytes. Usually
+        means a long transaction is holding old row versions and preventing cleanup.
+    """,
+    "TSG_TEMPDB_LONG_TXN_WARN_SECONDS": """
+        Warn when a database transaction has been open this long. Long transactions are the
+        usual cause of the workspace growth warned about above.
+    """,
+
+    # --- Web requests from browsers -------------------------------------------------------
+    "TSG_CORS_ALLOWED_ORIGINS": """
+        Which websites' JavaScript may read responses from this API, as a comma-separated list
+        of addresses.
+
+        A wildcard lets any site read them. Narrow it down outside development. Note this does
+        not weaken the API key check — it controls what a browser is allowed to do with a
+        response, not who may call.
+    """,
+
+    # --- The control-mapping retry sweep --------------------------------------------------
+    "TSG_CONTROL_MAP_SWEEP_INTERVAL_SECONDS": """
+        How often to retry scenarios whose control matching did not finish the first time.
+
+        Must be greater than 0. To switch the sweep off, use the on/off setting below rather
+        than putting 0 here. Running it more often than the step lease gains nothing, because
+        the sweep skips anything settled within one lease.
+    """,
+    "TSG_CONTROL_MAP_SWEEP_ENABLED": """
+        Whether that retry sweep runs at all, independent of the interval above.
+
+        With it off, the retry queue has no consumer: a scenario whose control matching failed
+        stays unmatched and is published with an empty control list, which the API presents as
+        a genuine gap in the control library rather than an error. Drain it by hand with:
+
+          celery -A app.pipeline.celery_app.celery_app call tsg.map_controls_sweep
+    """,
+    "TSG_CONTROL_MAP_MAX_ATTEMPTS": """
+        How many times control matching may be retried for one scenario before it is given up
+        on permanently.
+
+        A hard cut-off: past this the scenario is never retried again, even if whatever caused
+        the failure is later fixed. Recovering it then needs the scenario regenerated or the
+        matching re-run by hand.
+    """,
+    "TSG_GAP_GENERATION_BUFFER": """
+        How many extra threats to ask the AI for when the library did not supply enough,
+        expressed as a multiplier.
+
+        Some of what comes back duplicates what is already there and is thrown away, so asking
+        for exactly the shortfall reliably comes up short. 2.0 asks for twice as many, which
+        absorbs a 50% repeat rate. Raise it if asking for more still returns too few.
+    """,
+
+    # --- Infrastructure-only, not read by the application ---------------------------------
+    "EMBEDDING_MODEL_HOST": """
+        The address of the embedding service, used by the container setup when it starts one.
+        Not read by the application itself.
+    """,
+    "RERANKER_MODEL_HOST": """
+        The address of the reranking service, used by the container setup when it starts one.
+        Not read by the application itself.
+    """,
+}
+
+#: The same setting spelled without the TSG_ prefix. Both spellings are accepted, different
+#: files happen to use different ones, and the same description belongs above either — writing
+#: it twice is how two copies of one explanation start disagreeing.
+_ALIASES = (
+    ("TSG_ADMIN_API_KEY", "ADMIN_API_KEY"),
+    ("TSG_FLOWER_BASIC_AUTH", "FLOWER_BASIC_AUTH"),
+    ("TSG_REDIS_CELERY_BROKER_URL", "CELERY_BROKER_URL"),
+    ("TSG_REDIS_CELERY_RESULT_BACKEND", "CELERY_RESULT_BACKEND"),
+    ("TSG_LLM_JSON_MODE", "LLM_JSON_MODE"),
+    ("TSG_EMBEDDING_PROVIDER", "EMBEDDING_PROVIDER"),
+    ("TSG_EMBEDDING_MODEL", "EMBEDDING_MODEL"),
+    ("TSG_EMBEDDING_DIMENSIONS", "EMBEDDING_DIMENSIONS"),
+    ("TSG_RERANKER_MODEL", "RERANKER_MODEL"),
+    ("TSG_RISK_MODULE_ENABLED", "RISK_MODULE_ENABLED"),
+    ("TSG_TREATMENT_TEMPERATURE", "TREATMENT_TEMPERATURE"),
+    ("TSG_TREATMENT_STALE_SECONDS", "TREATMENT_STALE_SECONDS"),
+)
+for _prefixed, _bare in _ALIASES:
+    COMMENTS[_bare] = COMMENTS[_prefixed]
