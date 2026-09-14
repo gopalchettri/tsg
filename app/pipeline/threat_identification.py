@@ -320,6 +320,40 @@ def _usable_category(p: dict, cats: list[str]) -> bool:
     return c.strip().casefold() in {x.strip().casefold() for x in cats}
 
 
+#: Longest rejected category value carried into a log line, and how many distinct ones. This is
+#: MODEL OUTPUT going into logs — bounded so a confused model cannot flood them.
+_REJECTED_CATEGORY_CHARS, _REJECTED_CATEGORY_CAP = 40, 6
+
+
+def _classify_rejections(proposals: list, cats: list[str]) -> tuple[list, dict[str, int], list[str]]:
+    """→ (usable proposals, reason -> count, the offending category names).
+
+    WHY THIS RETURNS REASONS. Two validators reject for four different causes — not a dict, no
+    type/name, too long, unknown category — and the caller used to merge them into a single
+    `dropped=N`. The code knows exactly which fired and threw that away one line later, so an
+    operator saw work vanish with nothing to act on.
+
+    The category NAMES are the actionable half. _usable_category's docstring warns that an
+    invented category "would silently fall outside every quota, coverage and distribution
+    computation"; a count says a threat was lost, the name says WHICH seventh category the model
+    keeps reaching for — a curator signal, not just a debugging one.
+
+    Pure, so the classification is testable without driving a whole gap-generation round.
+    """
+    usable, reasons, offenders = [], {}, set()
+    for p in proposals:
+        if not _usable_proposal(p):
+            reason = "malformed"
+        elif not _usable_category(p, cats):
+            reason = "unknown_category"
+            offenders.add((_safe_text(p.get("category"), "") or "")[:_REJECTED_CATEGORY_CHARS])
+        else:
+            usable.append(p)
+            continue
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return usable, reasons, sorted(o for o in offenders if o)[:_REJECTED_CATEGORY_CAP]
+
+
 def _reconcile_proposal_categories(proposals: list, canonical: dict[str, list[str]],
                                     sid: str) -> int:
     """Point a proposal at the category whose vocabulary its TYPE actually came from.
@@ -773,10 +807,11 @@ def _generate_gap_proposals(r: _IdentificationRound, sess: Session, llm: LLMClie
         # the model is still in scope. Nothing downstream can tell a mislabelled category from
         # a genuinely novel type.
         reconciled = _reconcile_proposal_categories(proposals, canonical, sid)
-        usable = [p for p in proposals if _usable_proposal(p) and _usable_category(p, cats)]
-        if len(usable) != len(proposals):
+        usable, reasons, rejected_categories = _classify_rejections(proposals, cats)
+        if reasons:
             log.warning("threats.proposals_dropped", session_id=sid,
-                        dropped=len(proposals) - len(usable), received=len(proposals))
+                        dropped=len(proposals) - len(usable), received=len(proposals),
+                        reasons=reasons, rejected_categories=rejected_categories)
         proposals = usable
         _t.result(raw_proposal_count=raw_proposal_count, usable_proposals=proposals,
                 canonical_types={c: len(v) for c, v in canonical.items()},

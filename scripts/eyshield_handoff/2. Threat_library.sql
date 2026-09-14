@@ -23,7 +23,6 @@ IF OBJECT_ID('dbo.Threat_Category', 'U') IS NULL
 CREATE TABLE Threat_Category (
     ThreatCategoryID    int            NOT NULL CONSTRAINT PK_Threat_Category PRIMARY KEY,
     ThreatCategoryName  nvarchar(200)  NOT NULL,
-    ThreatCategoryCode  nvarchar(100)   NULL,
     IsActive            bit            NOT NULL,
     IsDeleted           bit            NOT NULL,
     CreatedAt           datetime2      NULL,
@@ -268,10 +267,6 @@ SELECT 'Threat_Catalogue_Category_Map', OBJECT_ID('dbo.Threat_Catalogue_Category
 -- variable-length, so the headroom costs nothing. Each guarded on the CURRENT
 -- width, so re-running is a no-op.
 
-IF OBJECT_ID('dbo.Threat_Category', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Threat_Category', 'ThreatCategoryCode') IS NOT NULL
-    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Category'), 'ThreatCategoryCode', 'CharMaxLen') < 100
-    ALTER TABLE Threat_Category ALTER COLUMN ThreatCategoryCode nvarchar(100) NULL;
 IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Actor', 'Source') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Actor'), 'Source', 'CharMaxLen') < 100

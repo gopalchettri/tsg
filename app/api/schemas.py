@@ -2174,21 +2174,18 @@ class ThreatCategoryCreate(ApiModel):
     fixed and externally numbered. Deriving MAX+1 server-side would race two concurrent creates
     onto the same id, so the caller owns the choice."""
     model_config = ConfigDict(json_schema_extra={"example": {
-        "threat_category_id": 7, "threat_category_name": "Elevation of Privilege",
-        "threat_category_code": "EOP"}})
+        "threat_category_id": 7, "threat_category_name": "Elevation of Privilege"}})
 
     threat_category_id: int = Field(ge=1, description="Primary key. Required — this table's PK is not auto-generated.")
     threat_category_name: str = Field(min_length=1, max_length=200, description="Display name, e.g. 'Elevation of Privilege'.")
-    threat_category_code: str | None = Field(default=None, max_length=20, description="Short code, e.g. 'EOP'.")
     is_active: bool = Field(default=True, description="Set false to create the row already disabled.")
 
 
 class ThreatCategoryUpdate(ApiModel):
     """Partial update — send only what changes. At least one field is required."""
-    model_config = ConfigDict(json_schema_extra={"example": {"threat_category_code": "EOP"}})
+    model_config = ConfigDict(json_schema_extra={"example": {"threat_category_name": "Elevation of Privilege"}})
 
     threat_category_name: str | None = Field(default=None, min_length=1, max_length=200)
-    threat_category_code: str | None = Field(default=None, max_length=20)
     is_active: bool | None = Field(default=None, description="Disable without deleting. Re-enabling can 409 on a name clash.")
 
 
@@ -2196,7 +2193,6 @@ class ThreatCategoryRow(LibraryRowAudit):
     """One Threat_Category row as returned by the CRUD endpoints."""
     threat_category_id: int = Field(description="Primary key.")
     threat_category_name: str = Field(description="Display name.")
-    threat_category_code: str | None = Field(default=None, description="Short code.")
 
 
 class ThreatTypeCreate(ApiModel):

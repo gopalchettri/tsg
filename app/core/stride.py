@@ -59,7 +59,7 @@ def in_stride_order(names: Iterable[str]) -> list[str]:
 
 
 def allocate(n: int, categories: Iterable[str] | None = None,
-             existing: Mapping[str, int] | None = None) -> dict[str, int]:
+            existing: Mapping[str, int] | None = None) -> dict[str, int]:
     """The target shape for n threats: category -> how many slots it gets.
 
     Round-robin in canonical order, so the count alone decides the spread:
@@ -82,7 +82,7 @@ def allocate(n: int, categories: Iterable[str] | None = None,
 
 
 def assign(candidates: Sequence[T], quota: Mapping[str, int],
-           categories_of: Callable[[T], Iterable[str]]) -> list[tuple[T, str]]:
+        categories_of: Callable[[T], Iterable[str]]) -> list[tuple[T, str]]:
     """Fill each quota slot with a candidate that genuinely carries that category.
 
     Returns (candidate, assigned_category) pairs; the assigned category is what the caller
@@ -114,7 +114,7 @@ def assign(candidates: Sequence[T], quota: Mapping[str, int],
 
     def first_eligible(cat: str) -> int | None:
         return next((i for i in range(len(candidates))
-                     if i not in used and cat in cats_at(i)), None)
+                    if i not in used and cat in cats_at(i)), None)
 
     while len(out) < total:
         progressed = False

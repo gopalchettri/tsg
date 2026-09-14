@@ -31,6 +31,9 @@ ruff>=0.16.1
 taxii2-client>=2.3
 tenacity>=9.1.4
 pyyaml>=6.0.3
+gunicorn>=22.0 
+pytest>=8.2
+openpyxl>=3.1.5
 sentence-transformers>=5.0   # 5.x for get_embedding_dimension() — see local_models.py::_embedder
 
 # Optional extras (pyproject.toml's [project.optional-dependencies]) — install

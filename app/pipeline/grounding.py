@@ -100,10 +100,7 @@ def find_category(sess: Session, proposed: str) -> int | None:
         .where(
             m.Threat_Category.IsActive == True,
             m.Threat_Category.IsDeleted == False,
-            or_(
-                func.lower(m.Threat_Category.ThreatCategoryName) == p,
-                func.lower(m.Threat_Category.ThreatCategoryCode) == p,
-            ),
+            func.lower(m.Threat_Category.ThreatCategoryName) == p,
         )
         .order_by(m.Threat_Category.ThreatCategoryID)
     ).first()
@@ -463,18 +460,15 @@ def _types_by_category(sess: Session, categories: list[str]) -> dict[str, list[s
         return {}
     cat = m.Threat_Category
     rows = sess.execute(
-        select(cat.ThreatCategoryID, func.lower(cat.ThreatCategoryName),
-               func.lower(cat.ThreatCategoryCode))
+        select(cat.ThreatCategoryID, func.lower(cat.ThreatCategoryName))
         .where(cat.IsActive == True, cat.IsDeleted == False,
-               or_(func.lower(cat.ThreatCategoryName).in_(wanted),
-                   func.lower(cat.ThreatCategoryCode).in_(wanted)))
+               func.lower(cat.ThreatCategoryName).in_(wanted))
         .order_by(cat.ThreatCategoryID)).all()
     # First ID wins, matching find_category's own `.order_by(ThreatCategoryID).first()`.
     ids: dict[str, int] = {}
-    for cid, name, code in rows:
-        for key in (name, code):
-            if key in wanted and key not in ids:
-                ids[key] = cid
+    for cid, name in rows:
+        if name in wanted and name not in ids:
+            ids[name] = cid
     if not ids:
         return {}
 

@@ -26,9 +26,6 @@ SET ANSI_NULLS ON;
 -- app/core/stride.py owns the canonical sequence; every reference below resolves
 -- a category BY NAME for the same reason.
 --
--- ThreatCategoryCode carries the STRIDE letter so the order is legible in the
--- data. Written as idempotent UPDATEs so an already-seeded database picks them
--- up on the next run; the column is nullable and no code reads it.
 IF NOT EXISTS (SELECT 1 FROM Threat_Category WHERE ThreatCategoryName = N'Denial of Service')
     INSERT INTO Threat_Category (ThreatCategoryID, ThreatCategoryName, IsActive, IsDeleted) VALUES (1, N'Denial of Service', 1, 0);
 IF NOT EXISTS (SELECT 1 FROM Threat_Category WHERE ThreatCategoryName = N'Elevation of Privilege')
@@ -44,12 +41,6 @@ IF NOT EXISTS (SELECT 1 FROM Threat_Category WHERE ThreatCategoryName = N'Tamper
 
 -- STRIDE letters, matched by name so they land correctly whatever ids a database
 -- holds. Documentation in the data; no code reads it.
-UPDATE Threat_Category SET ThreatCategoryCode = N'S' WHERE ThreatCategoryName = N'Spoofing'               AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'S');
-UPDATE Threat_Category SET ThreatCategoryCode = N'T' WHERE ThreatCategoryName = N'Tampering'              AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'T');
-UPDATE Threat_Category SET ThreatCategoryCode = N'R' WHERE ThreatCategoryName = N'Repudiation'            AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'R');
-UPDATE Threat_Category SET ThreatCategoryCode = N'I' WHERE ThreatCategoryName = N'Information Disclosure' AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'I');
-UPDATE Threat_Category SET ThreatCategoryCode = N'D' WHERE ThreatCategoryName = N'Denial of Service'      AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'D');
-UPDATE Threat_Category SET ThreatCategoryCode = N'E' WHERE ThreatCategoryName = N'Elevation of Privilege' AND (ThreatCategoryCode IS NULL OR ThreatCategoryCode <> N'E');
 
 -- 2. Threat_Type (27)
 IF NOT EXISTS (SELECT 1 FROM Threat_Type WHERE ThreatTypeName = N'AI Abuse')

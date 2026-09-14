@@ -455,7 +455,6 @@ class Threat_Category(Base):
     # Server rejects (Msg 8106) -> 500 on every create. SQLite has no such logic, so CI can't see it.
     ThreatCategoryID: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     ThreatCategoryName: Mapped[str] = mapped_column(Unicode(200))
-    ThreatCategoryCode: Mapped[str | None] = mapped_column(Unicode(100))
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
