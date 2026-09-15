@@ -404,9 +404,12 @@ _EMB_NAME = os.environ.get("TSG_SMOKE_EMB_NAME", "")
 # vary ONE field and still be a valid request in every other respect.
 _PLAN_BODY: dict[str, Any] = {
     "existing_controls": ["network segmentation"],
-    "likelihood_rating": 3,
-    "impact_rating": 4,
-    "final_risk_rating": 12,
+    # Decimals on purpose: the ratings take 0-100 to 4 places, and a whole-number-only smoke
+    # body would never exercise that. 3.5 x 4.25 = 14.875 exactly, so this also clears the
+    # register-consistency advisory rather than merely being accepted.
+    "likelihood_rating": 3.5,
+    "impact_rating": 4.25,
+    "final_risk_rating": 14.875,
     "risk_level": "High",
 }
 
@@ -1084,9 +1087,13 @@ def phase4(r: Runner, other_key: str) -> dict[str, Any]:
                            headers=r.entity_headers(), json=dict(_PLAN_BODY)), 409)
 
         def plan_body_bounds_are_422() -> None:
-            for bad in ({**_PLAN_BODY, "likelihood_rating": 6},
-                        {**_PLAN_BODY, "impact_rating": 0},
-                        {**_PLAN_BODY, "final_risk_rating": 26},
+            # These probed the retired 5x5 caps (6 / 0 / 26 are all VALID on the 0-100 scale
+            # now, and 0 is a legal score), so each was re-pointed at a rule that still exists —
+            # upper bound, lower bound, precision — rather than deleted, which would have left
+            # the widened field with no negative coverage at all.
+            for bad in ({**_PLAN_BODY, "likelihood_rating": 101},     # le=100
+                        {**_PLAN_BODY, "impact_rating": -1},          # ge=0
+                        {**_PLAN_BODY, "final_risk_rating": "4.12345"},  # decimal_places=4
                         {**_PLAN_BODY, "strategy": "avoid"},          # extra="forbid"
                         {k: v for k, v in _PLAN_BODY.items() if k != "risk_level"}):
                 r.expect(r.req("POST", f"/v1/sessions/{psid}/scenarios/{psc}/treatment-plan",

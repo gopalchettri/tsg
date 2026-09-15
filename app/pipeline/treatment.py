@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import select
@@ -269,9 +270,15 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
 
     # Register-consistency advisories — flag, never block: the register owns its numbers, but
     # a contradiction the model will cite verbatim (rule 6) must reach the reviewer's warnings.
-    _lr, _ir, _fr = (risk_input.get("likelihood_rating"), risk_input.get("impact_rating"),
-                    risk_input.get("final_risk_rating"))
-    if None not in (_lr, _ir, _fr) and _fr != _lr * _ir:
+    # Normalized ONCE here and reused for the snapshot below — see _dec. Comparing at _fr's OWN
+    # scale (quantize) rather than exactly: two 4-dp scores multiply to up to 8 dp, which the
+    # register cannot express, so an exact != would flag every correctly-rounded decimal plan.
+    # quantize cannot overflow: the schema caps every score at 100, so the product is at most
+    # 10000.0000 (9 digits) against Decimal's 28-digit context — hence no try/except here.
+    _lr, _ir, _fr = (_dec(risk_input.get("likelihood_rating")),
+                    _dec(risk_input.get("impact_rating")),
+                    _dec(risk_input.get("final_risk_rating")))
+    if None not in (_lr, _ir, _fr) and _fr != (_lr * _ir).quantize(_fr, rounding=ROUND_HALF_UP):
         warnings.append(f"final_risk_rating {_fr} does not equal likelihood x impact "
                         f"({_lr}x{_ir}={_lr * _ir}); register values taken as-is")
     if (_lr, _ir, _fr) == (None, None, None) and risk_input.get("risk_level") is None:
@@ -323,9 +330,13 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
                 if risk_input.get("existing_controls_all_subsystems") is not None else None,
         },
         "risk_assessment": {
-            "likelihood_rating": risk_input.get("likelihood_rating"),
-            "impact_rating": risk_input.get("impact_rating"),
-            "final_risk_rating": risk_input.get("final_risk_rating"),
+            # _num, not the raw value: regenerate rebuilds risk_input from this very blob and
+            # never re-enters the schema, so storing whatever shape arrived would let a bad one
+            # re-enter the baseline on every later regeneration. Normalizing on the way OUT too
+            # heals it instead, and is idempotent, so the stored bytes survive the round trip.
+            "likelihood_rating": _num(_lr),
+            "impact_rating": _num(_ir),
+            "final_risk_rating": _num(_fr),
             "risk_level": risk_input.get("risk_level"),
             "impacted_business_division": redact(risk_input.get("impacted_business_division")),
             # The window the ENTIRE assessment must complete within (request pair, validated
@@ -369,6 +380,37 @@ def _as_date(v: Any):
         except ValueError:
             return None
     return None
+
+
+def _dec(v: Any) -> Decimal | None:
+    """A Decimal from an int, float, Decimal or numeric string — None if it is none of those.
+
+    The numeric twin of _as_date above, and for the same reason: api/treatment.py dumps the body
+    with mode="json", which serializes pydantic's Decimal fields to STRINGS, while regenerate feeds
+    back whatever JSON the snapshot holds (int on legacy rows, float on newer ones). Normalizing
+    every accepted shape HERE — rather than making one producer emit a tidier type — is what stops
+    a future caller reintroducing the bug by choosing a different dump mode.
+
+    str() FIRST: Decimal(3.3) is 3.2999999999999998…, Decimal('3.3') is exactly 3.3. Returning None
+    on a malformed legacy blob is deliberate — it folds into build_treatment_input's existing
+    "no scores" guard instead of adding a branch, and instead of raising inside a POST.
+    """
+    try:
+        return Decimal(str(v))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _num(d: Decimal | None) -> int | float | None:
+    """A Decimal back to a JSON-native number for the snapshot — int when integral.
+
+    The int branch is not tidiness: prompts.treatment_prompt rule 6 orders the model to cite
+    final_risk_rating VERBATIM, so storing 20.0 where every previous row stored 20 would silently
+    reword every plan an all-integer register generates.
+    """
+    if d is None:
+        return None
+    return int(d) if d == d.to_integral_value() else float(d)
 
 
 def _assessment_window(risk_input: dict[str, Any]) -> dict[str, Any] | None:

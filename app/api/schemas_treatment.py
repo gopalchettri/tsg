@@ -8,9 +8,10 @@ ThreatResult, ThreatActorRef, _canonical_guid) stay in schemas.py and are import
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
-from typing import Any, Literal
+from decimal import Decimal
+from typing import Annotated, Any, Literal
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, WithJsonSchema, field_validator, model_validator
 
 from app.api.schemas import (  # shared helpers stay in the parent
     _MAX_BATCH,
@@ -58,6 +59,24 @@ class TreatmentPlanDocument(ApiModel):
     impacted_business_division: Any | None = None
 
 
+# The register's three scores. Decimal, never float: pipeline.treatment multiplies these for the
+# consistency advisory, and in binary float 3.3 * 3.3 is 10.889999999999999 — a warning against a
+# register that is exact. ge=0/le=100 is the register's own domain limit (the old 1-5/1-25 5x5
+# matrix caps are retired); it ALSO makes the advisory's quantize() unable to overflow Decimal's
+# 28-digit context, so that arithmetic needs no try/except. decimal_places is a CEILING, so whole
+# numbers and 1-3 places still validate — every integer payload sent before this change is
+# unaffected. No max_digits: le=100 caps magnitude and decimal_places caps precision, so it would
+# only restate both.
+#
+# WithJsonSchema is load-bearing, not cosmetic: a bare Decimal publishes as
+# anyOf[{number}, {string, pattern:…}], which generates a `number | string` union in every client.
+# We publish the plain number. Deliberately NO multipleOf: 0.0001 — the standards-correct spelling
+# of "4 places", but JS validators compute 20.25 % 0.0001 as 9.99e-05 and would reject valid
+# 2-place input; the ceiling is enforced server-side (422 decimal_max_places) and documented below.
+_RATING = Annotated[Decimal, Field(ge=0, le=100, decimal_places=4),
+                    WithJsonSchema({"type": "number", "minimum": 0, "maximum": 100,
+                                    "examples": [0, 4, 4.25, 87.5]})]
+
 # --- Risk Treatment Plan generation (app/api/treatment.py, docs/RISK_TREATMENT_PLAN_SDD.md §5) ---
 class TreatmentPlanBody(ApiModel):
     """POST .../scenarios/{scenario_id}/treatment-plan — the register's risk data, sent by the
@@ -79,8 +98,10 @@ class TreatmentPlanBody(ApiModel):
     # Rejection renders as the standard 422 envelope with errors[].type == "extra_forbidden".
     model_config = ConfigDict(extra="forbid", json_schema_extra={"example": {
         "existing_controls": ["annual patching", "network firewall"],
-        "likelihood_rating": 4, "impact_rating": 5,
-        "final_risk_rating": 20, "risk_level": "Critical",
+        # Decimals on purpose: the published example is where integrators learn the field accepts
+        # them. 4.5 x 4.7 = 21.15 exactly, so the example also passes the consistency advisory.
+        "likelihood_rating": 4.5, "impact_rating": 4.7,
+        "final_risk_rating": 21.15, "risk_level": "Critical",
         "risk_identification_date": "2026-06-14T08:31:00Z",
         "risk_owner": "Head of OT Operations",
         "impacted_business_division": "Water Treatment Operations",
@@ -94,11 +115,13 @@ class TreatmentPlanBody(ApiModel):
                      "be [] (a risk with no controls), but the key must be present. The AI's "
                      "recommended controls are the scenario-identified controls NOT covered by "
                      "this list."))
-    likelihood_rating: int = Field(ge=1, le=5, description="Register likelihood, 1-5.")
-    impact_rating: int = Field(ge=1, le=5, description="Register impact, 1-5.")
-    final_risk_rating: int = Field(
-        ge=1, le=25,
-        description="Register final risk rating, 1-25 (5x5 matrix). Taken as-is; never re-derived.")
+    likelihood_rating: _RATING = Field(
+        description="Register likelihood, 0-100, up to 4 decimal places.")
+    impact_rating: _RATING = Field(
+        description="Register impact, 0-100, up to 4 decimal places.")
+    final_risk_rating: _RATING = Field(
+        description=("Register final risk rating, 0-100, up to 4 decimal places. Taken as-is; "
+                     "never re-derived."))
     risk_level: RiskLevel = Field(description="Register risk level: Low | Medium | High | Critical.")
     risk_identification_date: datetime | None = Field(
         default=None,

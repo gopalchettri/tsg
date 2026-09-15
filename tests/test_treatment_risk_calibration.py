@@ -259,3 +259,177 @@ def test_legacy_snapshot_with_no_scores_is_flagged_uncalibrated():
     snap = build_treatment_input(_StubSess(), _SESSION_ROW, _SCENARIO_ROW,
                                  {"existing_controls": []})
     assert any("NOT risk-calibrated" in w for w in snap["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Layer 3 — decimal ratings (0-100, at most 4 places)
+#
+# The scores were `int` capped to a 5x5 matrix until 2026-09. Widening them to Decimal put three
+# things at risk, and each has a pin below:
+#   * the consistency advisory multiplies the scores, so a binary float would make 3.3 x 3.3
+#     10.889999999999999 and flag a register that is exact;
+#   * two 4-dp scores multiply to up to 8 dp, which final_risk_rating cannot express, so an exact
+#     != would flag every correctly-rounded decimal register;
+#   * pydantic serializes Decimal to a JSON *string*, and regenerate rebuilds risk_input from the
+#     stored snapshot WITHOUT re-entering the schema — so a string stored once would be re-read,
+#     re-stored, and re-fed to the model forever.
+# ---------------------------------------------------------------------------
+_BASE = {"existing_controls": [], "risk_level": "Critical"}
+
+
+def _snap(**ratings):
+    from app.pipeline.treatment import build_treatment_input
+    return build_treatment_input(_StubSess(), _SESSION_ROW, _SCENARIO_ROW, {**_BASE, **ratings})
+
+
+def _disagrees(snap) -> bool:
+    return any("does not equal likelihood x impact" in w for w in snap["warnings"])
+
+
+def test_decimal_register_that_reconciles_is_not_flagged():
+    """2 dp, exact: 4.5 x 4.7 is 21.15 and nothing about that is inconsistent."""
+    assert not _disagrees(_snap(likelihood_rating=4.5, impact_rating=4.7,
+                                final_risk_rating=21.15))
+
+
+def test_rounded_product_is_not_flagged():
+    """3.33 x 3.33 is 11.0889 — the register can only store 11.09, and rounding its OWN product
+    is not a contradiction. Compared at final_risk_rating's own scale for exactly this reason;
+    an exact != flagged every decimal register that rounded correctly."""
+    assert not _disagrees(_snap(likelihood_rating=3.33, impact_rating=3.33,
+                                final_risk_rating=11.09))
+
+
+def test_float_repr_noise_is_not_flagged():
+    """The reason these are Decimal and not float: in binary, 3.3 * 3.3 is 10.889999999999999,
+    so a float pipeline flags a register that is exactly right."""
+    assert not _disagrees(_snap(likelihood_rating=3.3, impact_rating=3.3,
+                                final_risk_rating=10.89))
+
+
+def test_off_matrix_scale_is_accepted_and_reconciles():
+    """The 5x5 caps are retired: a 0-100 register must pass, not 422 and not warn."""
+    snap = _snap(likelihood_rating=10, impact_rating=10, final_risk_rating=100)
+    assert not _disagrees(snap)
+    assert snap["risk_assessment"]["final_risk_rating"] == 100
+
+
+def test_zero_is_a_valid_score_and_reconciles():
+    """Zero is acceptable (ge=0), and 0 x 5 = 0 is consistent. The classic value that slips past
+    a truthiness guard and then misbehaves downstream."""
+    snap = _snap(likelihood_rating=0, impact_rating=5, final_risk_rating=0)
+    assert not _disagrees(snap)
+    assert snap["risk_assessment"]["likelihood_rating"] == 0
+
+
+def test_genuine_mismatch_is_still_flagged_with_decimals():
+    """The rounding tolerance must not silence a real contradiction — 4.5 x 4.7 is 21.15, not 25."""
+    assert _disagrees(_snap(likelihood_rating=4.5, impact_rating=4.7, final_risk_rating=25))
+
+
+def test_snapshot_stores_json_numbers_even_when_fed_strings():
+    """THE root-cause pin. pydantic dumps Decimal as a STRING, and regenerate replays the stored
+    snapshot without re-validating it, so a string reaching the blob would be re-read and
+    re-stored forever (and "4" * "5" is a TypeError, i.e. a 500 on regenerate).
+
+    Fixing this at the producer would cover POST only. Normalizing at THIS funnel covers both
+    doors — so feeding strings in must yield numbers out. Delete _num and this test fails."""
+    snap = _snap(likelihood_rating="4.0000", impact_rating="5", final_risk_rating="20.0000")
+    stored = snap["risk_assessment"]
+    for key in ("likelihood_rating", "impact_rating", "final_risk_rating"):
+        assert isinstance(stored[key], (int, float)), f"{key} stored as {type(stored[key])}"
+        assert not isinstance(stored[key], str)
+    # …and healed to their canonical form, not merely cast.
+    assert (stored["likelihood_rating"], stored["impact_rating"],
+            stored["final_risk_rating"]) == (4, 5, 20)
+
+
+def test_whole_numbers_stay_whole():
+    """prompts rule 6 has the model cite final_risk_rating VERBATIM, so 20 must not become 20.0 —
+    that would silently reword every plan an all-integer register has ever produced."""
+    stored = _snap(likelihood_rating=4, impact_rating=5,
+                   final_risk_rating=20)["risk_assessment"]
+    assert repr(stored["final_risk_rating"]) == "20"
+
+
+def test_rating_normalization_is_idempotent():
+    """regen_risk_input_from_snapshot replays the stored block, so build -> store -> build must
+    not drift; the snapshot's docstring already relies on the stored bytes surviving a round trip."""
+    first = _snap(likelihood_rating=4.5, impact_rating="4.70",
+                  final_risk_rating=21.15)["risk_assessment"]
+    second = _snap(likelihood_rating=first["likelihood_rating"],
+                   impact_rating=first["impact_rating"],
+                   final_risk_rating=first["final_risk_rating"])["risk_assessment"]
+    keys = ("likelihood_rating", "impact_rating", "final_risk_rating")
+    assert [first[k] for k in keys] == [second[k] for k in keys] == [4.5, 4.7, 21.15]
+
+
+def test_corrupt_rating_degrades_to_uncalibrated_rather_than_raising():
+    """A malformed legacy blob must not 500 a POST. _dec returns None, which folds into the
+    existing 'no scores' guard rather than adding a branch."""
+    snap = _snap(likelihood_rating="not-a-number", impact_rating=None, final_risk_rating=[])
+    assert not _disagrees(snap)
+    assert snap["risk_assessment"]["likelihood_rating"] is None
+
+
+# --- the schema boundary: rejected values must never reach the pipeline at all ---
+
+def test_schema_bounds_reject_outside_0_to_100_and_over_4_places():
+    import pytest
+    from pydantic import ValidationError
+
+    from app.api.schemas_treatment import TreatmentPlanBody
+
+    def body(**over):
+        return {"existing_controls": [], "risk_level": "Critical", "likelihood_rating": 4,
+                "impact_rating": 5, "final_risk_rating": 20, **over}
+
+    # Accepted: both ends of the range, and every precision up to the ceiling.
+    for ok in (0, "0.0000", "0.0001", 4, 4.25, "87.6543", "99.9999", 100):
+        TreatmentPlanBody(**body(final_risk_rating=ok))
+    # Rejected at the boundary — never absorbed downstream.
+    for bad in (-1, "-0.0001", "100.0001", 101, "1e20", "4.12345", None, ""):
+        with pytest.raises(ValidationError):
+            TreatmentPlanBody(**body(final_risk_rating=bad))
+    # …and still required.
+    with pytest.raises(ValidationError):
+        TreatmentPlanBody(**{k: v for k, v in body().items() if k != "final_risk_rating"})
+
+
+def test_full_wire_round_trip_post_then_regenerate_keeps_numbers():
+    """The whole data path, end to end, exactly as the two routes drive it:
+
+        TreatmentPlanBody -> model_dump(mode="json")   (api/treatment.py:165 — Decimal -> STRING)
+          -> build_treatment_input                     (the shared funnel)
+          -> json.dumps(..., default=str)              (api/treatment.py:281 — what is stored)
+          -> json.loads                                (what /regenerate reads back)
+          -> regen_risk_input_from_snapshot            (NO schema revalidation on this path)
+          -> build_treatment_input                     (the second generation)
+
+    This is the sequence that 500s if normalization sits on the producer instead of the funnel:
+    the stored value would be the string "3.5", and regenerate would evaluate "3.5" * "4.25".
+    It also pins that a regeneration does not drift the register's numbers.
+    """
+    import json
+
+    from app.api.schemas_treatment import TreatmentPlanBody
+    from app.pipeline.treatment import build_treatment_input, regen_risk_input_from_snapshot
+
+    body = TreatmentPlanBody(existing_controls=["network segmentation"], risk_level="High",
+                             likelihood_rating=3.5, impact_rating=4.25,
+                             final_risk_rating=14.875)          # 3.5 x 4.25 = 14.875 exactly
+    # Pydantic really does hand the pipeline strings — if this ever stops being true the funnel
+    # still copes, but the assertion documents why the funnel has to.
+    dumped = body.model_dump(mode="json")
+    assert isinstance(dumped["final_risk_rating"], str)
+
+    first = build_treatment_input(_StubSess(), _SESSION_ROW, _SCENARIO_ROW, dumped)
+    stored = json.loads(json.dumps(first, default=str))         # the InputSnapshotJSON bytes
+    assert stored["risk_assessment"]["final_risk_rating"] == 14.875
+    assert not isinstance(stored["risk_assessment"]["final_risk_rating"], str)
+    assert not _disagrees(first)
+
+    second = build_treatment_input(_StubSess(), _SESSION_ROW, _SCENARIO_ROW,
+                                   regen_risk_input_from_snapshot(stored))
+    assert second["risk_assessment"] == first["risk_assessment"]
+    assert not _disagrees(second)

@@ -1524,9 +1524,9 @@ curl -s -X POST "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c1
   -H "X-Tenant-Id: <X-Tenant-Id>" \
   -d '{
     "existing_controls": ["annual patching", "network firewall"],
-    "likelihood_rating": 4,
-    "impact_rating": 5,
-    "final_risk_rating": 20,
+    "likelihood_rating": 4.5,
+    "impact_rating": 4.7,
+    "final_risk_rating": 21.15,
     "risk_level": "Critical",
     "risk_identification_date": "2026-06-14T08:31:00Z",
     "risk_owner": "Head of OT Operations",
@@ -1547,9 +1547,9 @@ with no controls is legitimate — but the key itself must be present.
 | Field | Required | Bounds |
 |---|---|---|
 | `existing_controls` | yes (may be `[]`) | at most 50 entries, each ≤ 500 chars. Blank entries and duplicates are silently dropped, order preserved |
-| `likelihood_rating` | yes | integer 1–5 |
-| `impact_rating` | yes | integer 1–5 |
-| `final_risk_rating` | yes | integer 1–25 (the 5×5 matrix). Taken as-is, never re-derived |
+| `likelihood_rating` | yes | number 0–100, at most 4 decimal places (`4`, `4.25` and `0` are all valid) |
+| `impact_rating` | yes | number 0–100, at most 4 decimal places |
+| `final_risk_rating` | yes | number 0–100, at most 4 decimal places. Taken as-is, never re-derived |
 | `risk_level` | yes | `Low` \| `Medium` \| `High` \| `Critical`. `""` here is a genuine 422 |
 | `risk_identification_date` | no | datetime, normalized to UTC |
 | `risk_owner` | no | ≤ 200 chars |
