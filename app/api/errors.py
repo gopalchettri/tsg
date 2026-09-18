@@ -3,10 +3,12 @@ and a status-code mapping registered on the FastAPI app.
 """
 from __future__ import annotations
 
+from decimal import Decimal
 from http import HTTPStatus
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -183,8 +185,13 @@ async def _handle_validation_error(_: Request, exc: RequestValidationError):
     `ctx` is dropped: `exc.errors()` embeds a raw exception instance under `ctx.error` whenever a
     custom `@field_validator` raises ValueError — not JSON-serializable, so passing errors
     through raw 500s on exactly the custom-validator errors this handler exists to report. `msg`
-    already repeats the content."""
-    errors = [{k: v for k, v in e.items() if k != "ctx"} for e in exc.errors()]
+    already repeats the content.
+
+    jsonable_encoder, Decimal -> str: routes on ExactNumberRoute (app/api/exact_json.py) hand the
+    schema Decimals, so a rejected rating's `input` is one — JSONResponse cannot serialize it (a
+    500 on exactly the 422 it was reporting), and str echoes the digits the client sent."""
+    errors = jsonable_encoder([{k: v for k, v in e.items() if k != "ctx"} for e in exc.errors()],
+                              custom_encoder={Decimal: str})
     return JSONResponse(status_code=422, content=_env("validation_error", "request validation failed",
                                                     errors=errors))
 

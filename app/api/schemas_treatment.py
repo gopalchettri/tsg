@@ -61,21 +61,26 @@ class TreatmentPlanDocument(ApiModel):
 
 # The register's three scores. Decimal, never float: pipeline.treatment multiplies these for the
 # consistency advisory, and in binary float 3.3 * 3.3 is 10.889999999999999 — a warning against a
-# register that is exact. ge=0/le=100 is the register's own domain limit (the old 1-5/1-25 5x5
-# matrix caps are retired); it ALSO makes the advisory's quantize() unable to overflow Decimal's
-# 28-digit context, so that arithmetic needs no try/except. decimal_places is a CEILING, so whole
-# numbers and 1-3 places still validate — every integer payload sent before this change is
-# unaffected. No max_digits: le=100 caps magnitude and decimal_places caps precision, so it would
-# only restate both.
+# register that is exact. The register has no upper value (0 and up; the old 5x5 and 0-100 caps
+# are retired). max_digits=15 is not a domain limit, it is the EXACTNESS limit: the snapshot stores
+# a decimal as a JSON float (pipeline.treatment._num), and the model is told to cite it verbatim —
+# a float holds 15 significant digits exactly and no more (a JS client's number likewise), so a
+# 16th digit could be stored as a different number. With decimal_places=4 that leaves 11 digits
+# before the point: the largest score is 99,999,999,999.9999. Beyond that is a 422 naming the
+# rule, never a silent change. decimal_places is a CEILING, so whole numbers and 1-3 places still
+# validate. The route reads the literal digits (app/api/exact_json.py) — without that, json.loads
+# rounded to a float BEFORE this rule ran, and it judged a number the client never sent.
 #
 # WithJsonSchema is load-bearing, not cosmetic: a bare Decimal publishes as
 # anyOf[{number}, {string, pattern:…}], which generates a `number | string` union in every client.
 # We publish the plain number. Deliberately NO multipleOf: 0.0001 — the standards-correct spelling
 # of "4 places", but JS validators compute 20.25 % 0.0001 as 9.99e-05 and would reject valid
 # 2-place input; the ceiling is enforced server-side (422 decimal_max_places) and documented below.
-_RATING = Annotated[Decimal, Field(ge=0, le=100, decimal_places=4),
-                    WithJsonSchema({"type": "number", "minimum": 0, "maximum": 100,
-                                    "examples": [0, 4, 4.25, 87.5]})]
+_RATING = Annotated[Decimal, Field(ge=0, max_digits=15, decimal_places=4),
+                    WithJsonSchema({"type": "number", "minimum": 0, "maximum": 99999999999.9999,
+                                    "examples": [0, 4, 4.25, 87.5, 4000]})]
+_RATING_RULE = ("0 or more, up to 4 decimal places and 15 digits in total "
+                "(largest 99999999999.9999)")
 
 # --- Risk Treatment Plan generation (app/api/treatment.py, docs/RISK_TREATMENT_PLAN_SDD.md §5) ---
 class TreatmentPlanBody(ApiModel):
@@ -115,13 +120,10 @@ class TreatmentPlanBody(ApiModel):
                      "be [] (a risk with no controls), but the key must be present. The AI's "
                      "recommended controls are the scenario-identified controls NOT covered by "
                      "this list."))
-    likelihood_rating: _RATING = Field(
-        description="Register likelihood, 0-100, up to 4 decimal places.")
-    impact_rating: _RATING = Field(
-        description="Register impact, 0-100, up to 4 decimal places.")
+    likelihood_rating: _RATING = Field(description=f"Register likelihood, {_RATING_RULE}.")
+    impact_rating: _RATING = Field(description=f"Register impact, {_RATING_RULE}.")
     final_risk_rating: _RATING = Field(
-        description=("Register final risk rating, 0-100, up to 4 decimal places. Taken as-is; "
-                     "never re-derived."))
+        description=f"Register final risk rating, {_RATING_RULE}. Taken as-is; never re-derived.")
     risk_level: RiskLevel = Field(description="Register risk level: Low | Medium | High | Critical.")
     risk_identification_date: datetime | None = Field(
         default=None,

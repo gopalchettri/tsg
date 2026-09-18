@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import MAX_PREC, ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from typing import Any
 
 from sqlalchemy import select
@@ -331,15 +331,19 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
     # Normalized ONCE here and reused for the snapshot below — see _dec. Comparing at _fr's OWN
     # scale (quantize) rather than exactly: two 4-dp scores multiply to up to 8 dp, which the
     # register cannot express, so an exact != would flag every correctly-rounded decimal plan.
-    # quantize cannot overflow, for TWO reasons that must both hold: the schema caps every score at
-    # 100 (the product is at most 10000.0000, 9 digits, against a 28-digit context), and _dec gives
-    # every value a canonical scale, so no caller-chosen exponent becomes the comparison scale.
+    # MAX_PREC: multiply and quantize are exact operations, so in this context the product is never
+    # rounded and quantize can never overflow — whatever size the schema allows. (The default
+    # 28-digit context rounded two 11-digit scores' 30-digit product before comparing.)
     _lr, _ir, _fr = (_dec(risk_input.get("likelihood_rating")),
                     _dec(risk_input.get("impact_rating")),
                     _dec(risk_input.get("final_risk_rating")))
-    if None not in (_lr, _ir, _fr) and _fr != (_lr * _ir).quantize(_fr, rounding=ROUND_HALF_UP):
-        warnings.append(f"final_risk_rating {_fr} does not equal likelihood x impact "
-                        f"({_lr}x{_ir}={_lr * _ir}); register values taken as-is")
+    if None not in (_lr, _ir, _fr):
+        with localcontext(prec=MAX_PREC):
+            _product = _lr * _ir
+            _mismatch = _fr != _product.quantize(_fr, rounding=ROUND_HALF_UP)
+        if _mismatch:
+            warnings.append(f"final_risk_rating {_fr} does not equal likelihood x impact "
+                            f"({_lr}x{_ir}={_product}); register values taken as-is")
     if (_lr, _ir, _fr) == (None, None, None) and risk_input.get("risk_level") is None:
         warnings.append("risk_assessment carries no register scores (legacy snapshot) — "
                         "the plan is NOT risk-calibrated")
@@ -476,6 +480,9 @@ def _num(d: Decimal | None) -> int | float | None:
     The int branch is not tidiness: prompts.treatment_prompt rule 6 orders the model to cite
     final_risk_rating VERBATIM, so storing 20.0 where every previous row stored 20 would silently
     reword every plan an all-integer register generates.
+
+    float is exact ONLY because the schema caps a rating at 15 significant digits (a float's exact
+    limit — see schemas_treatment._RATING); raise that cap and this silently stores other numbers.
     """
     if d is None:
         return None

@@ -1547,9 +1547,9 @@ with no controls is legitimate — but the key itself must be present.
 | Field | Required | Bounds |
 |---|---|---|
 | `existing_controls` | yes (may be `[]`) | at most 50 entries, each ≤ 500 chars. Blank entries and duplicates are silently dropped, order preserved |
-| `likelihood_rating` | yes | number 0–100, at most 4 decimal places (`4`, `4.25` and `0` are all valid) |
-| `impact_rating` | yes | number 0–100, at most 4 decimal places |
-| `final_risk_rating` | yes | number 0–100, at most 4 decimal places. Taken as-is, never re-derived |
+| `likelihood_rating` | yes | number 0 or more — no 100 cap — at most 4 decimal places and 15 digits in total, so the largest is `99999999999.9999` (`0`, `4.25` and `4000` are all valid). Stored exactly as sent; a value with more digits is a 422, never rounded |
+| `impact_rating` | yes | same rule as `likelihood_rating` |
+| `final_risk_rating` | yes | same rule as `likelihood_rating`. Taken as-is, never re-derived |
 | `risk_level` | yes | `Low` \| `Medium` \| `High` \| `Critical`. `""` here is a genuine 422 |
 | `risk_identification_date` | no | datetime, normalized to UTC |
 | `risk_owner` | no | ≤ 200 chars |

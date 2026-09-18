@@ -417,6 +417,13 @@ def test_treatment_plan_lifecycle_over_real_http(client, monkeypatch):
 
     # accept, then create v1 and complete it
     assert client.post(f"/v1/sessions/{sid}/accept", json={"mode": "all"}).status_code == 200
+    # The literal digits reach the schema (app/api/exact_json.py). A float-parsing front door
+    # rounded this to 4.1234 and returned 202 — a stored number the client never sent.
+    raw = json.dumps({**_PLAN_BODY, "final_risk_rating": "@"}).replace('"@"', "4.1234000000000000001")
+    r = client.post(tp, content=raw, headers={"content-type": "application/json"})
+    assert r.status_code == 422, r.text
+    err = r.json()["details"]["errors"][0]
+    assert (err["type"], err["input"]) == ("decimal_max_digits", "4.1234000000000000001")
     r = client.post(tp, json=_PLAN_BODY)
     assert r.status_code == 202, r.text
     v1 = r.json()["plan_id"]

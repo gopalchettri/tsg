@@ -262,7 +262,7 @@ def test_legacy_snapshot_with_no_scores_is_flagged_uncalibrated():
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — decimal ratings (0-100, at most 4 places)
+# Layer 3 — decimal ratings (0 and up, at most 4 places and 15 digits)
 #
 # The scores were `int` capped to a 5x5 matrix until 2026-09. Widening them to Decimal put three
 # things at risk, and each has a pin below:
@@ -308,10 +308,12 @@ def test_float_repr_noise_is_not_flagged():
 
 
 def test_off_matrix_scale_is_accepted_and_reconciles():
-    """The 5x5 caps are retired: a 0-100 register must pass, not 422 and not warn."""
-    snap = _snap(likelihood_rating=10, impact_rating=10, final_risk_rating=100)
-    assert not _disagrees(snap)
-    assert snap["risk_assessment"]["final_risk_rating"] == 100
+    """The 5x5 and 0-100 caps are retired: a register on any scale must pass, not 422 and not
+    warn — 50 x 80 = 4000 is the team's own example of a score above the old ceiling."""
+    for lr, ir, fr in ((10, 10, 100), (50, 80, 4000)):
+        snap = _snap(likelihood_rating=lr, impact_rating=ir, final_risk_rating=fr)
+        assert not _disagrees(snap)
+        assert snap["risk_assessment"]["final_risk_rating"] == fr
 
 
 def test_zero_is_a_valid_score_and_reconciles():
@@ -374,7 +376,7 @@ def test_corrupt_rating_degrades_to_uncalibrated_rather_than_raising():
 
 # --- the schema boundary: rejected values must never reach the pipeline at all ---
 
-def test_schema_bounds_reject_outside_0_to_100_and_over_4_places():
+def test_schema_bounds_reject_negative_over_4_places_and_over_15_digits():
     import pytest
     from pydantic import ValidationError
 
@@ -384,11 +386,14 @@ def test_schema_bounds_reject_outside_0_to_100_and_over_4_places():
         return {"existing_controls": [], "risk_level": "Critical", "likelihood_rating": 4,
                 "impact_rating": 5, "final_risk_rating": 20, **over}
 
-    # Accepted: both ends of the range, and every precision up to the ceiling.
-    for ok in (0, "0.0000", "0.0001", 4, 4.25, "87.6543", "99.9999", 100):
+    # Accepted: zero, every precision up to 4 places, and no 100 cap — up to the 15-digit ceiling.
+    for ok in (0, "0.0000", "0.0001", 4, 4.25, "87.6543", 100, "100.0001", 101, 150, 4000,
+               "99999999999", "99999999999.9999"):
         TreatmentPlanBody(**body(final_risk_rating=ok))
-    # Rejected at the boundary — never absorbed downstream.
-    for bad in (-1, "-0.0001", "100.0001", 101, "1e20", "4.12345", None, ""):
+    # Rejected at the boundary — never absorbed downstream. The two 16+-digit values are the ones
+    # a float would have stored as a DIFFERENT number (…9997 -> …9998; …0001 -> 4.1234).
+    for bad in (-1, "-0.0001", "4.12345", "100000000000", "999999999999.9997",
+                "4.1234000000000000001", "1e20", None, ""):
         with pytest.raises(ValidationError):
             TreatmentPlanBody(**body(final_risk_rating=bad))
     # …and still required.
@@ -433,3 +438,35 @@ def test_full_wire_round_trip_post_then_regenerate_keeps_numbers():
                                    regen_risk_input_from_snapshot(stored))
     assert second["risk_assessment"] == first["risk_assessment"]
     assert not _disagrees(second)
+
+
+def test_every_accepted_rating_is_stored_and_replayed_exactly():
+    """The value the client sent is the value stored, shown to the model, and replayed by
+    /regenerate — at the 15-digit ceiling too. The snapshot keeps decimals as JSON floats (_num),
+    exact only up to 15 significant digits; raise the schema cap past that and this fails, where
+    before it silently stored 999999999999.9997 as 999999999999.9998."""
+    import json
+
+    from app.api.schemas_treatment import TreatmentPlanBody
+    from app.pipeline.treatment import build_treatment_input, regen_risk_input_from_snapshot
+
+    for sent in ("99999999999.9999", "12345678901.2345", "0.0001", "99999999999"):
+        body = TreatmentPlanBody(existing_controls=[], risk_level="High", likelihood_rating=sent,
+                                 impact_rating=1, final_risk_rating=sent)   # sent x 1 = sent
+        first = build_treatment_input(_StubSess(), _SESSION_ROW, _SCENARIO_ROW,
+                                      body.model_dump(mode="json"))
+        blob = json.dumps(first, default=str)                      # the InputSnapshotJSON bytes
+        assert f'"final_risk_rating": {sent}' in blob, sent        # the literal digits, stored
+        stored = json.loads(blob)
+        second = build_treatment_input(_StubSess(), _SESSION_ROW, _SCENARIO_ROW,
+                                       regen_risk_input_from_snapshot(stored))
+        assert json.dumps(second["risk_assessment"]) == json.dumps(first["risk_assessment"]), sent
+        assert not _disagrees(first) and not _disagrees(second), sent
+
+
+def test_consistency_check_multiplies_exactly_at_the_ceiling():
+    """Two ceiling scores multiply to 30 digits; the default 28-digit context rounded the product
+    (to ...0000.000000) before comparing — the MAX_PREC context keeps every digit, and never raises."""
+    snap = _snap(likelihood_rating="99999999999.9999", impact_rating="99999999999.9999",
+                 final_risk_rating=1)
+    assert any("=9999999999999980000000.00000001)" in w for w in snap["warnings"]), snap["warnings"]

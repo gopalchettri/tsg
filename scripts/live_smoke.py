@@ -404,7 +404,7 @@ _EMB_NAME = os.environ.get("TSG_SMOKE_EMB_NAME", "")
 # vary ONE field and still be a valid request in every other respect.
 _PLAN_BODY: dict[str, Any] = {
     "existing_controls": ["network segmentation"],
-    # Decimals on purpose: the ratings take 0-100 to 4 places, and a whole-number-only smoke
+    # Decimals on purpose: the ratings take up to 4 places, and a whole-number-only smoke
     # body would never exercise that. 3.5 x 4.25 = 14.875 exactly, so this also clears the
     # register-consistency advisory rather than merely being accepted.
     "likelihood_rating": 3.5,
@@ -1087,11 +1087,11 @@ def phase4(r: Runner, other_key: str) -> dict[str, Any]:
                            headers=r.entity_headers(), json=dict(_PLAN_BODY)), 409)
 
         def plan_body_bounds_are_422() -> None:
-            # These probed the retired 5x5 caps (6 / 0 / 26 are all VALID on the 0-100 scale
-            # now, and 0 is a legal score), so each was re-pointed at a rule that still exists —
-            # upper bound, lower bound, precision — rather than deleted, which would have left
-            # the widened field with no negative coverage at all.
-            for bad in ({**_PLAN_BODY, "likelihood_rating": 101},     # le=100
+            # These probed the retired 5x5 and 0-100 caps (6 / 26 / 101 are all VALID now, and 0
+            # is a legal score), so each was re-pointed at a rule that still exists — digit
+            # ceiling, lower bound, precision — rather than deleted, which would have left the
+            # widened field with no negative coverage at all.
+            for bad in ({**_PLAN_BODY, "likelihood_rating": 100000000000},  # max_digits=15
                         {**_PLAN_BODY, "impact_rating": -1},          # ge=0
                         {**_PLAN_BODY, "final_risk_rating": "4.12345"},  # decimal_places=4
                         {**_PLAN_BODY, "strategy": "avoid"},          # extra="forbid"
@@ -1099,6 +1099,14 @@ def phase4(r: Runner, other_key: str) -> dict[str, Any]:
                 r.expect(r.req("POST", f"/v1/sessions/{psid}/scenarios/{psc}/treatment-plan",
                                headers=r.entity_headers(), json=bad), 422,
                          f"body {sorted(bad)}")
+            # Raw bytes: a Python float cannot carry these digits, so json= would send 4.1234.
+            # The server must read the literal (app/api/exact_json.py) and 422 it, not round it
+            # to 4.1234 and store a number the client never sent.
+            raw = json.dumps({**_PLAN_BODY, "final_risk_rating": "@"}).replace(
+                '"@"', "4.1234000000000000001")
+            r.expect(r.req("POST", f"/v1/sessions/{psid}/scenarios/{psc}/treatment-plan",
+                           headers={**r.entity_headers(), "content-type": "application/json"},
+                           content=raw), 422, "21-digit rating must not be rounded")
 
         r.check(P, "GET .../treatment-plan -> 200", plan_get, needs="plan_board")
         r.check(P, "GET .../treatment-plan/status -> 200", plan_status, needs="plan_board")

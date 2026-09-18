@@ -22,6 +22,7 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import Principal, get_principal
+from app.api.exact_json import ExactNumberRoute
 from app.api.schemas import (
     UNAVAILABLE_RESPONSES,
     ErrorResponse,
@@ -85,7 +86,9 @@ from app.pipeline.tasks import ASSET_UNIT_ID
 
 log = get_logger(__name__)
 
-router = APIRouter(prefix="/v1", tags=["Remediation Plans"])
+# ExactNumberRoute: the register's ratings must reach the schema as the client wrote them, not as
+# the nearest binary float — see app/api/exact_json.py.
+router = APIRouter(prefix="/v1", tags=["Remediation Plans"], route_class=ExactNumberRoute)
 
 # Same declaration idea as sessions._CONFLICT_RESPONSES: typing the 409 puts
 # TreatmentGateReason into /openapi.json so the UI can generate the reason codes.
