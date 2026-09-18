@@ -156,45 +156,49 @@ def _library_controls(sess: Session, scenario_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def _snapshot_control_names(snapshot: dict[str, Any]) -> dict[str, str]:
-    """{control_code: control_name} for a stored snapshot's library-mapped controls, in order — the
-    replaced version's controls, handed to build_treatment_input on regenerate."""
+def _snapshot_controls(snapshot: dict[str, Any]) -> dict[str, tuple[str, int | None]]:
+    """{control_code: (control_name, control_library_id)} for a stored snapshot's library-mapped
+    controls, in order — the replaced version's controls, handed to build_treatment_input on
+    regenerate. The id travels with the code because a retired control's code may be reused by a
+    new library row (UX_Control_Library_Code is filtered on IsActive=1 AND IsDeleted=0)."""
     mapped = (snapshot.get("existing_controls") or {}).get("library_mapped") or []
-    return {c["control_code"]: c.get("control_name") or ""
+    return {c["control_code"]: (c.get("control_name") or "", c.get("control_library_id"))
             for c in mapped if isinstance(c, dict) and c.get("control_code")}
 
 
-def _dropped_control_warnings(sess: Session, previous: dict[str, str],
+def _dropped_control_warnings(sess: Session, previous: dict[str, tuple[str, int | None]],
                               library_mapped: list[dict[str, Any]]) -> list[str]:
     """One warning per control the previous version carried that this one does not, saying WHY.
 
-    A scenario's control map does not change between plan versions, so a drop almost always means
-    the control was retired in Control_Library — _library_controls filters IsActive/IsDeleted, which
-    is correct (a withdrawn control must not be recommended) but was silent. The reason is read
-    rather than assumed, so a genuinely re-mapped scenario is not misreported as a retirement.
-    Degrades to a generic reason if that read fails: a warning must never fail the POST."""
+    WHICH controls dropped is decided by CODE, so a scenario re-mapped from one library row to
+    another carrying the same code is not reported. WHY is read by the exact ControlLibraryID the
+    previous version stored: looking it up by code was ambiguous once a retired code had been
+    reused by a new active row, and returned whichever row came back last. A legacy snapshot with
+    no id is reported without a reason rather than a guessed one. One read, only when something
+    dropped. Degrades to a generic reason if that read fails: a warning must never fail the POST."""
     current = {c.get("control_code") for c in library_mapped}
     dropped = [code for code in previous if code not in current]
     if not dropped:
         return []
+    ids = [previous[code][1] for code in dropped if previous[code][1] is not None]
     lib = m.Control_Library
     try:
-        state = {r.ControlCode: r for r in sess.execute(
-            select(lib.ControlCode, lib.IsActive, lib.IsDeleted)
-            .where(lib.ControlCode.in_(dropped))).all()}
+        state = {r.ControlLibraryID: r for r in sess.execute(
+            select(lib.ControlLibraryID, lib.IsActive, lib.IsDeleted)
+            .where(lib.ControlLibraryID.in_(ids))).all()} if ids else {}
     except Exception:
         sess.rollback()  # read-only point in the POST, same as the _library_controls fallback
         log.warning("treatment.dropped_control_reason_failed", exc_info=True)
         state = None
     out = []
     for code in dropped:
-        label = f"{code} ({previous[code]})" if previous[code] else code
-        row = state.get(code) if state is not None else None
-        if state is None:
+        name, control_id = previous[code]
+        label = f"{code} ({name})" if name else code
+        if state is None or control_id is None:
             why = "is no longer available"
-        elif row is None:
+        elif control_id not in state:
             why = "is no longer in the control library"
-        elif not row.IsActive or row.IsDeleted:
+        elif not state[control_id].IsActive or state[control_id].IsDeleted:
             why = "has been retired from the control library"
         else:
             why = "is no longer mapped to this scenario"
@@ -254,7 +258,8 @@ def regen_risk_input_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
                         risk_input: dict[str, Any],
-                        previous_controls: dict[str, str] | None = None) -> dict[str, Any]:
+                        previous_controls: dict[str, tuple[str, int | None]] | None = None,
+                        ) -> dict[str, Any]:
     """The frozen LLM context, persisted verbatim as InputSnapshotJSON.
 
     `risk_input` is the validated TreatmentPlanBody as a dict — the register's half of the
@@ -326,8 +331,9 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
     # Normalized ONCE here and reused for the snapshot below — see _dec. Comparing at _fr's OWN
     # scale (quantize) rather than exactly: two 4-dp scores multiply to up to 8 dp, which the
     # register cannot express, so an exact != would flag every correctly-rounded decimal plan.
-    # quantize cannot overflow: the schema caps every score at 100, so the product is at most
-    # 10000.0000 (9 digits) against Decimal's 28-digit context — hence no try/except here.
+    # quantize cannot overflow, for TWO reasons that must both hold: the schema caps every score at
+    # 100 (the product is at most 10000.0000, 9 digits, against a 28-digit context), and _dec gives
+    # every value a canonical scale, so no caller-chosen exponent becomes the comparison scale.
     _lr, _ir, _fr = (_dec(risk_input.get("likelihood_rating")),
                     _dec(risk_input.get("impact_rating")),
                     _dec(risk_input.get("final_risk_rating")))
@@ -449,7 +455,17 @@ def _dec(v: Any) -> Decimal | None:
     "no scores" guard instead of adding a branch, and instead of raising inside a POST.
     """
     try:
-        return Decimal(str(v))
+        d = Decimal(str(v))
+        if not d.is_finite():
+            return None
+        # Canonical scale, taken from the VALUE and never from how the caller spelled it. pydantic
+        # keeps a string Decimal's exponent, so "0E+5", "1E+1" and "20.00" all reach here as
+        # written, and the consistency check below compares at _fr's OWN scale: "1E+1" silently
+        # hid a 10.56 mismatch that "10" reports, and "0E+1000000" made quantize() raise (a 500).
+        # Integral values get scale 0; the rest drop trailing zeros. quantize(1) on an integral
+        # value, NOT normalize() - normalize turns 20 into 2E+1, which would compare to the
+        # nearest ten. A corrupt huge exponent overflows here and becomes None, like any junk.
+        return d.quantize(Decimal(1)) if d == d.to_integral_value() else d.normalize()
     except (InvalidOperation, ValueError, TypeError):
         return None
 

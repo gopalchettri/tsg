@@ -1850,6 +1850,17 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveIdentit
         WHERE [Superseded] = 0;
 GO
 
+/* One active scenario per scoped threat - the database twin of invariants.ACTIVE_UNIQUE, which
+   was otherwise checked only at boot. Duplicate check first so an existing bad row fails with a
+   message that says what is wrong, not a bare Msg 1505. */
+IF EXISTS (SELECT 1 FROM Threat_Scenario WHERE Superseded = 0
+           GROUP BY SessionID, ScopedThreatID HAVING COUNT(*) > 1)
+    THROW 50001, 'Cannot create UX_Scenario_ActiveScoped: at least one (SessionID, ScopedThreatID) has more than one active Threat_Scenario row. Resolve the duplicates first - the application would also refuse to boot against this data.', 1;
+ELSE IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveScoped' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+    CREATE UNIQUE NONCLUSTERED INDEX [UX_Scenario_ActiveScoped] ON [dbo].[Threat_Scenario] ([SessionID], [ScopedThreatID])
+        WHERE [Superseded] = 0;
+GO
+
 /* One ACCEPTED version per identity. Separate from the index above: a reviewer
    may accept an older version, so "current" and "accepted" are not the same row. */
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveAccepted' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
@@ -2064,6 +2075,7 @@ required_index(idx, tbl) AS (
         ('IX_Session_Active',                      'Scenario_Session'),
         ('IX_Session_EntityUser',                  'Scenario_Session'),
         ('UX_Scenario_ActiveIdentity',             'Threat_Scenario'),
+        ('UX_Scenario_ActiveScoped',               'Threat_Scenario'),
         ('UX_Scenario_ActiveAccepted',             'Threat_Scenario'),
         ('IX_Scenario_SessionSubActive',           'Threat_Scenario'),
         ('UX_SubsystemStageState_SessionSubLevel', 'Subsystem_Stage_State'),

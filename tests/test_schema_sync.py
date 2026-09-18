@@ -474,3 +474,33 @@ def test_dropped_columns_never_return() -> None:
         "columns dropped from the product are re-created or re-added by a script an operator "
         f"runs: {back}. Remove them from the CREATE body, the guarded ALTER and the #want list; "
         "a drop must be a drop in every script.")
+
+
+# ---------------------------------------------------------------------------
+# THE CONSOLIDATED SCRIPT BUILDS AND VERIFIES EVERY BOOT INDEX. Real incident: UX_Scenario_ActiveScoped
+# was added to the numbered scripts, the verify script and REQUIRED_INDEXES, but not to the operator-run
+# scripts/tsg_remediation_tables.sql. A database built from it could not boot the new code, and nothing
+# noticed, because the index checks above read only the numbered scripts.
+# ---------------------------------------------------------------------------
+_CONSOLIDATED = _SCRIPTS / "scripts" / "tsg_remediation_tables.sql"
+_CREATE_INDEX_RE = re.compile(
+    r"CREATE\s+(?:UNIQUE\s+)?(?:NONCLUSTERED\s+)?INDEX\s+\[?(\w+)\]?\s+ON\s+"
+    r"(?:\[?dbo\]?\.)?\[?(\w+)\]?\s*\(([^)]*)\)", re.I)
+
+
+def test_consolidated_script_builds_and_verifies_every_boot_index() -> None:
+    from app.db.invariants import REQUIRED_INDEXES
+    sql = _CONSOLIDATED.read_text(encoding="utf-8")
+    created = {m.group(1): (m.group(2), tuple(c.strip(" []") for c in m.group(3).split(",")))
+               for m in _CREATE_INDEX_RE.finditer(sql)}
+    start = sql.index("required_index(idx, tbl) AS (")
+    verified = {name for name, _ in re.findall(r"\(\s*'(\w+)'\s*,\s*'(\w+)'\s*\)",
+                                               sql[start:sql.index(") v(", start)])}
+    problems = []
+    for name, table, cols in REQUIRED_INDEXES:
+        if created.get(name) != (table, tuple(cols)):
+            problems.append(f"{name}: not created as {table}{tuple(cols)} (found {created.get(name)})")
+        if name not in verified:
+            problems.append(f"{name}: missing from the script's required_index check")
+    assert not problems, ("a database built from tsg_remediation_tables.sql would not boot:\n  "
+                          + "\n  ".join(problems))

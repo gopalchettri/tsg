@@ -221,7 +221,7 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
         get_authorized_session(sess, session_id, principal)
 
         fence_plan_id: str | None = None
-        previous_controls: dict[str, str] | None = None
+        previous_controls: dict[str, tuple[str, int | None]] | None = None
         if not first_generation:
             # ORDER MATTERS: this runs BEFORE the accept gate below, matching what the old
             # two-transaction split enforced — a scenario with no plan at all 404s even when it is
@@ -234,7 +234,7 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
             risk_input = treatment.regen_risk_input_from_snapshot(prev_snapshot)
             # The controls the version being replaced carried, so the new version can name any
             # that dropped and say why (treatment._dropped_control_warnings).
-            previous_controls = treatment._snapshot_control_names(prev_snapshot)
+            previous_controls = treatment._snapshot_controls(prev_snapshot)
             risk_level = base["RiskLevel"]
             risk_identification_date = base["RiskIdentificationDate"]
             fence_plan_id = str(base["PlanID"])

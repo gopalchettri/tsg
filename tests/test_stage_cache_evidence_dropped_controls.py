@@ -58,11 +58,11 @@ class _RowsSess:
         return SimpleNamespace(all=lambda: self.rows)
 
 
-def _lib(code: str, active: bool = True, deleted: bool = False) -> SimpleNamespace:
-    return SimpleNamespace(ControlCode=code, IsActive=active, IsDeleted=deleted)
+def _lib(control_id: int, active: bool = True, deleted: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(ControlLibraryID=control_id, IsActive=active, IsDeleted=deleted)
 
 
-_PREV = {"CII-001": "MFA for admin accounts", "CII-002": "Network segmentation"}
+_PREV = {"CII-001": ("MFA for admin accounts", 1), "CII-002": ("Network segmentation", 2)}
 _CUR = [{"control_code": "CII-002", "control_name": "Network segmentation"}]
 _SESSION_ROW = {"AssetName": "Historian", "AssetContextJSON": None, "SubsystemsJSON": None}
 _SCENARIO_ROW = {"ScenarioID": "s-1", "ThreatCategory": None, "ThreatType": "Tampering",
@@ -81,9 +81,9 @@ def test_nothing_dropped_means_no_warning() -> None:
 
 
 @pytest.mark.parametrize("row, reason", [
-    (_lib("CII-001", active=False), "has been retired from the control library"),
-    (_lib("CII-001", deleted=True), "has been retired from the control library"),
-    (_lib("CII-001"), "is no longer mapped to this scenario"),
+    (_lib(1, active=False), "has been retired from the control library"),
+    (_lib(1, deleted=True), "has been retired from the control library"),
+    (_lib(1), "is no longer mapped to this scenario"),
     (None, "is no longer in the control library"),
 ])
 def test_a_dropped_control_is_named_with_its_real_reason(row, reason) -> None:
@@ -99,18 +99,32 @@ def test_a_failed_reason_lookup_still_warns_and_never_raises() -> None:
     assert sess.rolled_back
 
 
-def test_snapshot_control_names_keeps_order_and_skips_malformed_entries() -> None:
+def test_a_retired_code_reused_by_a_new_row_is_still_reported_retired() -> None:
+    """UX_Control_Library_Code lets a retired control's code be reused. Looking the reason up by CODE
+    returned whichever of the two rows came back last; by the stored id it is exact."""
+    rows = [_lib(1, active=False), _lib(5)]          # id 1 retired, id 5 active, same code
+    out = treatment._dropped_control_warnings(_RowsSess(rows), _PREV, _CUR)
+    assert out == [_msg("has been retired from the control library")]
+
+
+def test_a_legacy_snapshot_without_an_id_gets_no_guessed_reason() -> None:
+    legacy = {"CII-001": ("MFA for admin accounts", None), "CII-002": ("Network segmentation", 2)}
+    out = treatment._dropped_control_warnings(_RowsSess([_lib(1, active=False)]), legacy, _CUR)
+    assert out == [_msg("is no longer available")]
+
+
+def test_snapshot_controls_keeps_order_ids_and_skips_malformed_entries() -> None:
     snap = {"existing_controls": {"library_mapped": [
-        {"control_code": "B", "control_name": "Bee"}, "junk", {"control_name": "no code"},
-        {"control_code": "A", "control_name": None}]}}
-    assert list(treatment._snapshot_control_names(snap).items()) == [("B", "Bee"), ("A", "")]
-    assert treatment._snapshot_control_names({}) == {}
+        {"control_code": "B", "control_name": "Bee", "control_library_id": 7}, "junk",
+        {"control_name": "no code"}, {"control_code": "A", "control_name": None}]}}
+    assert list(treatment._snapshot_controls(snap).items()) == [("B", ("Bee", 7)), ("A", ("", None))]
+    assert treatment._snapshot_controls({}) == {}
 
 
 def test_regenerate_snapshot_carries_the_warning(monkeypatch) -> None:
     monkeypatch.setattr(treatment, "_library_controls", lambda sess, sid: list(_CUR))
     snap = treatment.build_treatment_input(
-        _RowsSess([_lib("CII-001", active=False)]), _SESSION_ROW, _SCENARIO_ROW,
+        _RowsSess([_lib(1, active=False)]), _SESSION_ROW, _SCENARIO_ROW,
         {"existing_controls": [], "risk_level": "High"}, previous_controls=_PREV)
     assert _msg("has been retired from the control library") in snap["warnings"]
 
@@ -121,6 +135,43 @@ def test_first_generation_is_unchanged(monkeypatch) -> None:
     snap = treatment.build_treatment_input(
         _RowsSess(), _SESSION_ROW, _SCENARIO_ROW, {"existing_controls": [], "risk_level": "High"})
     assert not any("previous version" in w for w in snap["warnings"])
+
+
+# ---------------------------------------------------------------------------------------------
+# Ratings — the consistency check compares on the VALUE, never on how the client spelled it
+# ---------------------------------------------------------------------------------------------
+
+def _warns_through_the_schema(monkeypatch, likelihood, impact, final) -> bool:
+    """The real path: TreatmentPlanBody -> model_dump(mode="json") -> build_treatment_input."""
+    from app.api.schemas_treatment import TreatmentPlanBody
+
+    monkeypatch.setattr(treatment, "_library_controls", lambda sess, sid: [])
+    body = TreatmentPlanBody(existing_controls=[], risk_level="High", likelihood_rating=likelihood,
+                             impact_rating=impact, final_risk_rating=final).model_dump(mode="json")
+    snap = treatment.build_treatment_input(_RowsSess(), _SESSION_ROW, _SCENARIO_ROW, body)
+    return any("does not equal likelihood x impact" in w for w in snap["warnings"])
+
+
+def test_a_huge_exponent_zero_neither_crashes_nor_hides_the_mismatch(monkeypatch) -> None:
+    """'0E+1000000' is a valid 0 to the schema; quantize() on its exponent raised -> a 500."""
+    assert _warns_through_the_schema(monkeypatch, 4, 5, "0E+1000000")
+
+
+def test_an_exponent_spelled_zero_still_reports_the_mismatch(monkeypatch) -> None:
+    """'0E+5' used to become the comparison scale: 4x5 rounded to hundred-thousands equals 0."""
+    assert _warns_through_the_schema(monkeypatch, 4, 5, "0E+5")
+
+
+def test_the_same_value_warns_the_same_however_it_is_spelled(monkeypatch) -> None:
+    """2.4 x 4.4 = 10.56 against 10: '1E+1' hid it, '10' reported it."""
+    assert _warns_through_the_schema(monkeypatch, "2.4", "4.4", "1E+1")
+    assert _warns_through_the_schema(monkeypatch, "2.4", "4.4", "10")
+
+
+def test_trailing_zeros_do_not_change_the_verdict(monkeypatch) -> None:
+    """First generation (literal '21.150') and regenerate (stored 21.15) must agree."""
+    assert (_warns_through_the_schema(monkeypatch, "4.5", "4.7", "21.150")
+            == _warns_through_the_schema(monkeypatch, "4.5", "4.7", "21.15"))
 
 
 # ---------------------------------------------------------------------------------------------

@@ -28,6 +28,8 @@
      message instead of a cryptic index error. A deployment that boots today cannot have any: the
      startup check already refuses to boot on one.
 
+   sqlcmd: pass -b, or sqlcmd exits 0 even after an error and CI/deploy tooling reads success.
+
    ORDER: run this BEFORE deploying the new application code. The app asserts its indexes at
    startup and will refuse to boot against an un-migrated database — by design, so the failure
    lands at deploy time rather than at runtime.
@@ -37,18 +39,20 @@ SET NOCOUNT ON;
 SET QUOTED_IDENTIFIER ON;
 GO
 
+-- ONE batch on purpose. THROW aborts only its own batch, so a check in a batch of its own let the
+-- CREATE below run anyway (a bare Msg 1505) and the script then printed success with exit code 0.
 IF EXISTS (SELECT 1 FROM Threat_Scenario
            WHERE Superseded = 0
            GROUP BY SessionID, ScopedThreatID
            HAVING COUNT(*) > 1)
-BEGIN
-    ;THROW 50001, 'Cannot create UX_Scenario_ActiveScoped: at least one (SessionID, ScopedThreatID) has more than one active Threat_Scenario row. Resolve the duplicates first - the application would also refuse to boot against this data.', 1;
-END
+    THROW 50001, 'Cannot create UX_Scenario_ActiveScoped: at least one (SessionID, ScopedThreatID) has more than one active Threat_Scenario row. Resolve the duplicates first - the application would also refuse to boot against this data.', 1;
+ELSE IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveScoped' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+    CREATE UNIQUE INDEX UX_Scenario_ActiveScoped ON Threat_Scenario(SessionID, ScopedThreatID) WHERE Superseded = 0;
 GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveScoped' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
-CREATE UNIQUE INDEX UX_Scenario_ActiveScoped ON Threat_Scenario(SessionID, ScopedThreatID) WHERE Superseded = 0;
-GO
-
-PRINT 'UX_Scenario_ActiveScoped present.';
+-- Report the OUTCOME, not the attempt: success is printed only if the index really exists.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveScoped' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+    PRINT 'UX_Scenario_ActiveScoped present.';
+ELSE
+    THROW 50002, 'UX_Scenario_ActiveScoped was NOT created - see the error above. Do not deploy the application.', 1;
 GO
