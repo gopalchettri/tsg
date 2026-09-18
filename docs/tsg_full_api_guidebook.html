@@ -1534,7 +1534,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   <p class="auth"><span class="lbl">Auth</span> get_principal: X-API-Key, X-User-Id, X-Entity-Id (must equal the session&#x27;s EntityID or 403), X-Tenant-Id.</p>
   <div class="blk">
     <h3>Request</h3>
-    <pre>none — required query param `version` (the plan_id of the version to inspect) instead of a body, e.g. ?version=0f0e0d0c-0b0a-4988-8786-858483828180</pre>
+    <pre>none — required query param `plan_id` (the plan version to inspect) instead of a body, e.g. ?plan_id=0f0e0d0c-0b0a-4988-8786-858483828180</pre>
   </div>
   <div class="blk">
     <h3>Response <span class="status">200 (404 if no such plan version exists for this scenario)</span></h3>

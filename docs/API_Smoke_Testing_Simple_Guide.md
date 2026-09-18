@@ -2374,7 +2374,7 @@ ORDER BY CreatedAt DESC;
 **Input (complete request)** — `version` is required and names the exact `plan_id` to inspect (a superseded version is fine):
 
 ```bash
-curl -s -X GET "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/scenarios/1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90/treatment-plan/evidence?version=0f0e0d0c-0b0a-8988-8786-858483828180" \
+curl -s -X GET "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/scenarios/1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90/treatment-plan/evidence?plan_id=0f0e0d0c-0b0a-8988-8786-858483828180" \
   -H "X-API-Key: <X-API-Key>" -H "X-User-Id: qa-user" \
   -H "X-Entity-Id: 78" -H "X-Tenant-Id: <X-Tenant-Id>"
 ```
@@ -2401,7 +2401,7 @@ curl -s -X GET "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c11
 **How to test:**
 
 1. Pull the evidence for the CURRENT `plan_id` — `status` should read `COMPLETE`, `attempts` non-empty.
-2. Regenerate the plan, then pull evidence again with `?version=<old-plan-id>` — it must still return the OLD snapshot/attempts untouched.
+2. Regenerate the plan, then pull evidence again with `?plan_id=<old-plan-id>` — it must still return the OLD snapshot/attempts untouched.
 3. Compare `input_snapshot.existing_controls` against what you sent in the original POST body — must match exactly (frozen, never re-derived).
 
 **Tables used:**

@@ -26,10 +26,17 @@ log = get_logger(__name__)
 # unique PER TABLE only, so a name-only check would pass on an index that ended up on the wrong
 # table or lost a column.
 REQUIRED_INDEXES = [
-    # One active session per asset / one active scenario per scoped threat. Stops
-    # duplicate "current" rows from a retried or racing request.
+    # One active session per asset. Stops duplicate "current" rows from a retried or racing request.
     ("UX_Session_ActiveAsset", "Scenario_Session", ("EntityID", "AssetID")),
+    # One active scenario per threat IDENTITY and ScenarioNumber (the double-click guard). NOT the
+    # per-scoped-threat rule — this index is keyed on IdentityHash, so it never enforced that one.
     ("UX_Scenario_ActiveIdentity", "Threat_Scenario", ("SessionID", "IdentityHash", "ScenarioNumber")),
+    # One active scenario per SCOPED THREAT — the database twin of ACTIVE_UNIQUE below. That rule
+    # used to be checked only here at startup, with no index behind it: a duplicate committed
+    # silently and the service refused to boot at the NEXT restart, far from its cause. This index
+    # rejects it at write time instead. (An earlier comment here claimed the identity index above
+    # enforced "one active scenario per scoped threat"; it never did, which is how the gap hid.)
+    ("UX_Scenario_ActiveScoped", "Threat_Scenario", ("SessionID", "ScopedThreatID")),
     # One ACCEPTED version per scenario identity. Accepted is decoupled from Superseded (an
     # older, superseded version may be the accepted one), so the active-identity index above
     # no longer implies this — filtered WHERE Accepted = 1.

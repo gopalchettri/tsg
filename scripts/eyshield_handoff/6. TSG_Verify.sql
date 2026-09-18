@@ -66,7 +66,7 @@ SELECT 'Tables', 'PASS', N'All 23 TSG tables present', N'Nothing missing.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Tables');
 
 -- ---------------------------------------------------------------------------
--- 2. THE 13 INDEXES THE APPLICATION ASSERTS AT BOOT
+-- 2. THE 14 INDEXES THE APPLICATION ASSERTS AT BOOT
 -- ---------------------------------------------------------------------------
 -- Not performance indexes: each enforces a correctness rule. The application
 -- checks all thirteen at every start and REFUSES TO BOOT if one is missing, on
@@ -75,6 +75,7 @@ DECLARE @req_indexes TABLE (IndexName sysname, TableName sysname, Cols nvarchar(
 INSERT INTO @req_indexes (IndexName, TableName, Cols) VALUES
     (N'UX_Session_ActiveAsset', N'Scenario_Session', N'EntityID,AssetID'),
     (N'UX_Scenario_ActiveIdentity', N'Threat_Scenario', N'SessionID,IdentityHash,ScenarioNumber'),
+    (N'UX_Scenario_ActiveScoped', N'Threat_Scenario', N'SessionID,ScopedThreatID'),
     (N'UX_Scenario_ActiveAccepted', N'Threat_Scenario', N'SessionID,IdentityHash,ScenarioNumber'),
     (N'UX_ThreatType_NaturalKey', N'Threat_Type', N'ThreatTypeName'),
     (N'UX_ThreatCatalogue_NaturalKey', N'Threat_Catalogue', N'ThreatName'),
@@ -132,7 +133,7 @@ CROSS APPLY (
 WHERE actual.ColList <> r.Cols;
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Indexes', 'PASS', N'All 13 boot-asserted indexes present, unique and correct',
+SELECT 'Indexes', 'PASS', N'All 14 boot-asserted indexes present, unique and correct',
        N'The application''s startup index check will pass.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Indexes');
 

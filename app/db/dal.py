@@ -627,7 +627,10 @@ def claim_stage(
     Claimable: IDLE/ERROR, or a row THIS task left RUNNING (a mid-flight retry resumes), under
     `stage_max_attempts`. COMPLETE/AWAITING_DECISION is NOT re-claimable, so a redelivery of a
     finished stage is a true no-op. Paired with `finish_stage`, fenced on the same (epoch,
-    task_id). Does NOT check `_LOCK` ownership — see `write_scenarios`' `require_lock`."""
+    task_id). Does NOT check `_LOCK` ownership — see `write_scenarios`' `require_lock`.
+
+    SIDE EFFECT on a won claim: advances the session's CurrentStage/StageStatus display cache to
+    the stage just claimed — see `_sync_session_stage`."""
     s = get_settings()
     _now = now()  # one instant for lease/heartbeat/updated — three now() calls drift apart
     res = execute_dml(
@@ -664,6 +667,8 @@ def claim_stage(
         )
     )
     won = res.rowcount == 1
+    if won:
+        _sync_session_stage(sess, session_id, level)
     # Stage transitions are THE choke point for tracing the pipeline's skeleton: every stage of
     # every path — full run, regenerate and next-set alike — passes through claim_stage and
     # finish_stage, so two hooks here cover what would otherwise need a hook per stage scattered
@@ -673,6 +678,51 @@ def claim_stage(
                     epoch=epoch, task_id=task_id) as _t:
         _t.result(won=won)
     return won
+
+
+#: The session-level stage each work level corresponds to, in pipeline order. `_LOCK` is a mutex
+#: row, not a work stage, so it has no entry.
+_LEVEL_STAGE = {
+    SubsystemLevel.THREATS: WorkflowStage.THREAT_IDENTIFICATION,
+    SubsystemLevel.SCENARIOS: WorkflowStage.SCENARIO_GENERATION,
+}
+_STAGE_ORDER = [WorkflowStage.THREAT_IDENTIFICATION, WorkflowStage.SCENARIO_GENERATION]
+
+
+def _sync_session_stage(sess: Session, session_id: str, level: SubsystemLevel) -> None:
+    """Advance Scenario_Session.CurrentStage/StageStatus to the stage just claimed.
+
+    Those two columns are a display cache — Subsystem_Stage_State is the authority — and they were
+    written at only four points: creation (THREAT_IDENTIFICATION/IDLE), next-set's reserve, the
+    review barrier, and cancel. So between creation and review a first run ALWAYS read
+    THREAT_IDENTIFICATION/IDLE, however far it had got: GET /v1/sessions/{id} published a wrong stage
+    for the whole run, and the review gate's refusal named the wrong one ("session not at REVIEW
+    yet (stage=THREAT_IDENTIFICATION, status=IDLE)" while controls were being mapped). Hooked into
+    claim_stage because every stage of every path starts there.
+
+    Forward-only and idempotent: it only moves an ACTIVE session that has not yet passed the target
+    stage, so it can never rewind a session, touch REVIEW/AWAITING_DECISION (the only pair the review
+    gate opens on, so a completed session's gate stays open during a regenerate), or resurrect a
+    CANCELLED one. The values match what reserve_session already writes for next-set.
+
+    Runs in a savepoint: this is a display cache, and failing to update it must never cost the
+    stage claim it rides on."""
+    stage = _LEVEL_STAGE.get(level)
+    if stage is None:
+        return
+    not_past = _STAGE_ORDER[:_STAGE_ORDER.index(stage) + 1]
+    try:
+        with sess.begin_nested():
+            execute_dml(
+                sess,
+                update(m.Scenario_Session)
+                .where(m.Scenario_Session.SessionID == session_id,
+                       m.Scenario_Session.SessionStatus == SessionStatus.active,
+                       m.Scenario_Session.CurrentStage.in_(not_past))
+                .values(CurrentStage=stage, StageStatus=StageStatus.RUNNING, UpdatedAt=now()))
+    except Exception:  # noqa: BLE001 — cache only; the claim above already succeeded
+        log.warning("stage.session_cache_sync_failed", session_id=session_id,
+                    level=str(level), exc_info=True)
 
 
 def stage_attempt_count(

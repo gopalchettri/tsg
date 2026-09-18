@@ -491,7 +491,7 @@ def test_treatment_plan_lifecycle_over_real_http(client, monkeypatch):
     eau = client.get(f"/v1/entities/{ENTITY}/treatment-plans/audit").json()
     keys(eau, S.TreatmentEntityAuditPage, "entity audit")
     assert {v1, v2, v4} <= {(e.get("detail") or {}).get("plan_id") for e in eau["events"]}
-    ev = client.get(tp + f"/evidence?version={v1}")
+    ev = client.get(tp + f"/evidence?plan_id={v1}")
     assert ev.status_code == 200, ev.text
     keys(ev.json(), S.TreatmentEvidence, "evidence")
     assert ev.json()["plan_id"] == v1 and ev.json()["input_snapshot"]

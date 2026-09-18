@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import Principal, get_principal
@@ -220,6 +221,7 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
         get_authorized_session(sess, session_id, principal)
 
         fence_plan_id: str | None = None
+        previous_controls: dict[str, str] | None = None
         if not first_generation:
             # ORDER MATTERS: this runs BEFORE the accept gate below, matching what the old
             # two-transaction split enforced — a scenario with no plan at all 404s even when it is
@@ -228,8 +230,11 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
             base = dal.active_plan_baseline(sess, session_id, scenario_id)
             if base is None:
                 raise dal.NotFoundError("no treatment plan has been requested for this scenario")
-            risk_input = treatment.regen_risk_input_from_snapshot(
-                treatment._loads(base["InputSnapshotJSON"], {}))
+            prev_snapshot = treatment._loads(base["InputSnapshotJSON"], {})
+            risk_input = treatment.regen_risk_input_from_snapshot(prev_snapshot)
+            # The controls the version being replaced carried, so the new version can name any
+            # that dropped and say why (treatment._dropped_control_warnings).
+            previous_controls = treatment._snapshot_control_names(prev_snapshot)
             risk_level = base["RiskLevel"]
             risk_identification_date = base["RiskIdentificationDate"]
             fence_plan_id = str(base["PlanID"])
@@ -256,7 +261,7 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
         # active version's frozen snapshot on regenerate) — no external reads. The
         # session-entity check above (get_authorized_session) is THE authorization boundary.
         snapshot = treatment.build_treatment_input(
-            sess, dict(session_row), dict(scn), risk_input)
+            sess, dict(session_row), dict(scn), risk_input, previous_controls=previous_controls)
 
         plan_id = dal.guid()
         stale_cutoff = treatment._stale_cutoff()
@@ -880,14 +885,32 @@ def list_entity_treatment_audit(entity_id: str,
                                     events=events)
 
 
+def _evidence_plan_id(plan_id: str | None, version: str | None) -> str:
+    """`plan_id` is the canonical name; `version` is its deprecated alias. The endpoint used to take
+    only `version`, which reads as a version NUMBER — callers sent 1 or 2 and got a 404 for a value
+    that is really a plan_id (it happened during this endpoint's own live testing). Exactly one is
+    required; sending both is fine only if they agree. Raised as RequestValidationError so the 422
+    envelope is identical to every other validation failure."""
+    if plan_id and version and plan_id != version:
+        raise RequestValidationError([{
+            "type": "value_error", "loc": ("query", "plan_id"),
+            "msg": "plan_id and version were both sent and disagree; send only plan_id",
+            "input": {"plan_id": plan_id, "version": version}}])
+    target = plan_id or version
+    if not target:
+        raise RequestValidationError([{
+            "type": "missing", "loc": ("query", "plan_id"), "msg": "Field required", "input": None}])
+    return target
+
+
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/evidence",
             response_model=TreatmentEvidence,
             summary="Get a plan version's evidence bundle",
             description=(
                 "The receipt for one plan version: the exact frozen input the AI was given, the validation "
                 "and moderation record, and every raw AI prompt and response.\n\n"
-                "**Required:** the `version` query parameter, naming the exact `plan_id` to inspect. A "
-                "version you replaced long ago is fine — evidence survives regeneration.\n\n"
+                "**Required:** the `plan_id` query parameter, naming the exact plan version to inspect. A "
+                "version you replaced long ago is fine — evidence survives regeneration. `version` is still accepted as a deprecated alias of `plan_id`.\n\n"
                 "**Call it:** when a plan is challenged, or to work out why one generation produced a "
                 "different answer from another.\n\n"
                 "**Watch out:** `status` here is the raw stored value, deliberately not reinterpreted. A plan "
@@ -896,7 +919,8 @@ def list_entity_treatment_audit(entity_id: str,
                 "attempt list if it predates prompt linking."
             ))
 def get_treatment_plan_evidence(session_id: str, scenario_id: str,
-                                version: str = Query(..., description="The plan_id of the version to inspect (superseded versions allowed)."),
+                                plan_id: str | None = Query(None, description="The plan_id of the version to inspect (superseded versions allowed)."),
+                                version: str | None = Query(None, deprecated=True, description="Deprecated alias of plan_id, kept so existing callers keep working. Send plan_id."),
                                 principal: Principal = Depends(get_principal)) -> TreatmentEvidence:
     """The reproducibility bundle for ONE plan version: the frozen input snapshot (exactly
     what the AI was given), the validation/moderation record, and every AI-call receipt —
@@ -907,7 +931,7 @@ def get_treatment_plan_evidence(session_id: str, scenario_id: str,
     poll GET presents it as timed out."""
     with db_session() as sess:
         get_authorized_session(sess, session_id, principal)
-        row = dal.plan_row_by_id(sess, session_id, scenario_id, version)
+        row = dal.plan_row_by_id(sess, session_id, scenario_id, _evidence_plan_id(plan_id, version))
         if row is None:
             raise dal.NotFoundError("no such plan version for this scenario")
         attempts = [TreatmentEvidenceAttempt(

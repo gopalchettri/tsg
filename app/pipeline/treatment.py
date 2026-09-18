@@ -156,6 +156,52 @@ def _library_controls(sess: Session, scenario_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def _snapshot_control_names(snapshot: dict[str, Any]) -> dict[str, str]:
+    """{control_code: control_name} for a stored snapshot's library-mapped controls, in order — the
+    replaced version's controls, handed to build_treatment_input on regenerate."""
+    mapped = (snapshot.get("existing_controls") or {}).get("library_mapped") or []
+    return {c["control_code"]: c.get("control_name") or ""
+            for c in mapped if isinstance(c, dict) and c.get("control_code")}
+
+
+def _dropped_control_warnings(sess: Session, previous: dict[str, str],
+                              library_mapped: list[dict[str, Any]]) -> list[str]:
+    """One warning per control the previous version carried that this one does not, saying WHY.
+
+    A scenario's control map does not change between plan versions, so a drop almost always means
+    the control was retired in Control_Library — _library_controls filters IsActive/IsDeleted, which
+    is correct (a withdrawn control must not be recommended) but was silent. The reason is read
+    rather than assumed, so a genuinely re-mapped scenario is not misreported as a retirement.
+    Degrades to a generic reason if that read fails: a warning must never fail the POST."""
+    current = {c.get("control_code") for c in library_mapped}
+    dropped = [code for code in previous if code not in current]
+    if not dropped:
+        return []
+    lib = m.Control_Library
+    try:
+        state = {r.ControlCode: r for r in sess.execute(
+            select(lib.ControlCode, lib.IsActive, lib.IsDeleted)
+            .where(lib.ControlCode.in_(dropped))).all()}
+    except Exception:
+        sess.rollback()  # read-only point in the POST, same as the _library_controls fallback
+        log.warning("treatment.dropped_control_reason_failed", exc_info=True)
+        state = None
+    out = []
+    for code in dropped:
+        label = f"{code} ({previous[code]})" if previous[code] else code
+        row = state.get(code) if state is not None else None
+        if state is None:
+            why = "is no longer available"
+        elif row is None:
+            why = "is no longer in the control library"
+        elif not row.IsActive or row.IsDeleted:
+            why = "has been retired from the control library"
+        else:
+            why = "is no longer mapped to this scenario"
+        out.append(f"control {label} was in the previous version but {why} — omitted from this version")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Snapshot builder (POST time)
 # ---------------------------------------------------------------------------
@@ -207,7 +253,8 @@ def regen_risk_input_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
-                        risk_input: dict[str, Any]) -> dict[str, Any]:
+                        risk_input: dict[str, Any],
+                        previous_controls: dict[str, str] | None = None) -> dict[str, Any]:
     """The frozen LLM context, persisted verbatim as InputSnapshotJSON.
 
     `risk_input` is the validated TreatmentPlanBody as a dict — the register's half of the
@@ -267,6 +314,12 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
         warnings.append("library control lookup failed — plan generated without mapped controls")
     if not library_mapped and not lookup_failed:
         warnings.append("no library-mapped controls for this scenario (Step-4 map is empty)")
+    # Regenerate only (`previous_controls` is the replaced version's list): name every control that
+    # version carried and this one does not. The empty-map warning above only covers "all of them";
+    # a PARTIAL drop used to be silent, so a reviewer comparing versions saw a control vanish with
+    # no reason given.
+    if previous_controls and not lookup_failed:
+        warnings.extend(_dropped_control_warnings(sess, previous_controls, library_mapped))
 
     # Register-consistency advisories — flag, never block: the register owns its numbers, but
     # a contradiction the model will cite verbatim (rule 6) must reach the reviewer's warnings.

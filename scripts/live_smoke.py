@@ -1077,7 +1077,7 @@ def phase4(r: Runner, other_key: str) -> dict[str, Any]:
 
         def plan_evidence() -> None:
             r.expect(r.req("GET", f"/v1/sessions/{psid}/scenarios/{psc}/treatment-plan/evidence",
-                           params={"version": fx["plan_id"]}, headers=r.entity_headers()), 200)
+                           params={"plan_id": fx["plan_id"]}, headers=r.entity_headers()), 200)
 
         def plan_duplicate_is_409() -> None:
             # A COMPLETE, valid body on purpose: with a body that fails validation this would

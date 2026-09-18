@@ -907,6 +907,14 @@ IF EXISTS (SELECT 1 FROM sys.indexes i
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveIdentity' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
 CREATE UNIQUE INDEX UX_Scenario_ActiveIdentity ON Threat_Scenario(SessionID, IdentityHash, ScenarioNumber) WHERE Superseded = 0;
 
+-- One active scenario per scoped threat — the database-level twin of invariants.ACTIVE_UNIQUE.
+-- Every scenario writer mints a fresh Scoped_Threat row alongside its scenario (ScopedThreatID is
+-- that table's primary key), so a correct write never fires this. It exists to reject a BAD write
+-- at write time: before it, the startup check was the only guard, so a duplicate landed silently
+-- and the service then refused to boot at the next restart, far from the change that caused it.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveScoped' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+CREATE UNIQUE INDEX UX_Scenario_ActiveScoped ON Threat_Scenario(SessionID, ScopedThreatID) WHERE Superseded = 0;
+
 -- One ACCEPTED scenario per (session, threat identity, ScenarioNumber). Accepted
 -- is decoupled from Superseded, so the index above does not imply this rule.
 -- IdentityHash IS NOT NULL because a NULL hash means identity unknown, and SQL
