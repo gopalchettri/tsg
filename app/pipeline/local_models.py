@@ -22,6 +22,13 @@ from app.core.logging import get_logger
 
 log = get_logger(__name__)
 
+# Set BEFORE torch can load (this module is the only one that loads it, lazily, through
+# sentence-transformers): no second (Rust/rayon) tokenizer thread pool competing with torch's for
+# the same cores. setdefault: an operator's explicit value wins.
+# ponytail: OpenMP's KMP_BLOCKTIME is deliberately left at its default. Setting it to 0 was
+# measured (19 Sep): no throughput gain at one job x 6 threads, and model loading 45 s vs 27 s.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 #: Project root - app/pipeline/local_models.py -> app/pipeline -> app -> <root>. Same idiom as
 #: tracing._ROOT and env_selfcheck: a RELATIVE model path resolves against this, never the CWD.
 _ROOT = Path(__file__).resolve().parents[2]
@@ -47,7 +54,12 @@ def _model_pool():
     torch jobs queued there made every NEW socket connection (DB, Redis, Mongo, HTTP) wait behind
     them — ~18 s measured on 18 Sep, which also delayed the reaper's own work. A separate pool also
     makes the setting a real cap: it used to set hub.threadpool.size, which gevent grows back to
-    its maxsize (10) on demand, so it never limited anything."""
+    its maxsize (10) on demand, so it never limited anything.
+
+    Default size 1: one model job at a time. Measured 19 Sep, one job at a time with the whole
+    thread budget does the same work as two sharing it, and finishes each job twice as fast. It
+    also rules out two OS threads driving torch's OpenMP runtime, or using the same model object,
+    at once. A live run stalled for 10+ minutes with two jobs in flight."""
     from gevent.threadpool import ThreadPool
 
     return ThreadPool(get_settings().local_model_threadpool_size)
@@ -74,22 +86,33 @@ def _available_cpus() -> int:
     return os.cpu_count() or 1
 
 
-def _cap_torch_threads() -> None:
-    """Give each concurrent model job of THIS process an equal share of the CPUs it may use:
-    pool size x torch threads <= available CPUs. Unset, torch took ~all cores per job — 16 jobs x
-    10 threads on a 12-core box on 18 Sep; measured on 19 Sep, one job fell from 7.3 cores used to
-    5.6 at 6 threads for ~5% more wall time. The budget is per process: the admin worker (one job
-    at a time) takes its own share on top, and the tokenizer's own threads are not counted.
-    Called on the thread that runs the job, because torch's intra-op thread count is per-thread
-    under OpenMP.
+def _torch_threads() -> int:
+    """Threads per model job: this process's jobs share HALF the CPUs it may use. The other half
+    is for the event loop and for a second model-running worker on the same host (the admin worker
+    warms corpora while the pipeline worker serves runs). Unset, torch took ~all cores per job:
+    16 jobs x 10 threads on a 12-core box on 18 Sep."""
+    return max(1, _available_cpus() // (2 * get_settings().local_model_threadpool_size))
 
-    Uses torch only if it is ALREADY loaded: torch is sentence-transformers' dependency, not
-    this module's, and it is loaded by the first model load — which the worker does at boot
-    (validate_local_models(warm=True)) before any job runs. Not loaded means nothing to cap."""
+
+_torch_threads_set = False
+
+
+def _set_torch_threads_once() -> None:
+    """Set torch's thread count ONCE per process, before any job runs — on the thread that loaded
+    the models at boot (validate_local_models). That is torch's documented use: it keeps the value
+    process-wide and each pool thread adopts it on its first operation.
+
+    Never per job. It used to be set at the start of every job, from the pool threads, while
+    another job could be mid-computation; that bought nothing (the value never changed) and sat
+    in the middle of a live stall. Does nothing while torch is not loaded (the proxy path)."""
+    global _torch_threads_set
     torch = sys.modules.get("torch")
-    if torch is not None:
-        torch.set_num_threads(
-            max(1, _available_cpus() // get_settings().local_model_threadpool_size))
+    if torch is None or _torch_threads_set:
+        return
+    torch.set_num_threads(_torch_threads())
+    _torch_threads_set = True
+    log.info("local.torch_threads", threads=_torch_threads(),
+             jobs_at_once=get_settings().local_model_threadpool_size)
 
 
 def _offload(fn: Callable):
@@ -108,13 +131,9 @@ def _offload(fn: Callable):
     except ImportError:
         pass
 
-    def _job():
-        _cap_torch_threads()
-        return fn()
-
     if patched:
-        return _model_pool().apply(_job)  # fn's own errors propagate unchanged
-    return _job()
+        return _model_pool().apply(fn)  # fn's own errors propagate unchanged
+    return fn()
 
 
 @lru_cache(maxsize=get_settings().local_model_cache_size)
@@ -246,6 +265,7 @@ def validate_local_models(settings: Settings | None = None, *, warm: bool) -> No
                 raise RuntimeError(f"EMBEDDING_DIMENSIONS={s.embedding_dimensions} but model reports {dim}")
         if s.reranker_provider == "local":
             _reranker(reranker_path)
+        _set_torch_threads_once()   # torch is loaded now, and no job has run yet
 
 
 if __name__ == "__main__":  # self-check: offload returns the same values (inline path here)

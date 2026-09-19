@@ -343,11 +343,11 @@ class Settings(BaseSettings):
     # TSG_LOCAL_MODEL_CACHE_SIZE — loaded local models kept in memory.
     local_model_cache_size: int = 4
     # TSG_LOCAL_MODEL_THREADPOOL_SIZE — how many local model jobs (embed/rerank) one worker process
-    # runs at once, on their own native threads (never gevent's hub pool, which DNS uses). Each job
-    # gets (CPUs available to the process, container limit included) // this many torch threads,
-    # so one process's jobs never exceed its CPUs: 2 on a 12-core box = 2 jobs x 6 threads.
-    # Separate worker processes each take their own share. Raise it for more jobs, each slower.
-    local_model_threadpool_size: int = Field(2, ge=1, le=64)
+    # runs at once, on their own native thread(s) (never gevent's hub pool, which DNS uses). The
+    # jobs share half the CPUs the process may use (container limit included); the thread count
+    # is set once at boot. 1 (default) = one job at a time with that whole share: measured as fast
+    # overall as 2, with each job done twice as soon, and it never has two threads inside torch.
+    local_model_threadpool_size: int = Field(1, ge=1, le=64)
 
     # --- 10. Matching & grounding ---------------------------------------------------
 

@@ -53,14 +53,77 @@ def test_saturated_model_pool_leaves_the_resolver_pool_free(pooled) -> None:
         hub_pool.maxsize = old_max
 
 
-def test_each_job_gets_an_equal_share_of_the_cores(monkeypatch) -> None:
-    """pool size x torch threads <= CPUs, applied on the thread that runs the job."""
+def _fake_torch(monkeypatch) -> list[int]:
     calls: list[int] = []
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(set_num_threads=calls.append))
+    monkeypatch.setattr(local_models, "_torch_threads_set", False)
+    return calls
+
+
+def test_a_model_job_never_touches_torch_threads(monkeypatch, pooled) -> None:
+    """THE REGRESSION (19 Sep): every job set torch's thread count from its pool thread, while the
+    other job could be mid-computation, and a live control-mapping step stalled for 10+ minutes.
+    A job now runs the model call and nothing else, on the pool and inline alike."""
+    calls = _fake_torch(monkeypatch)
+    assert local_models._offload(lambda: "pooled") == "pooled"
+    monkeypatch.setattr(__import__("gevent").monkey, "is_module_patched", lambda name: False)
+    assert local_models._offload(lambda: "inline") == "inline"
+    assert calls == []
+
+
+def _local_settings(tmp_path) -> SimpleNamespace:
+    return SimpleNamespace(embedding_provider="local", reranker_provider="local",
+                           embedding_model=str(tmp_path), reranker_model=str(tmp_path),
+                           embedding_prefix_style="e5", embedding_dimensions=3)
+
+
+def test_torch_threads_are_set_once_at_boot(monkeypatch, tmp_path) -> None:
+    """Once per process, on the thread that loads the models, before any job — torch's own rule."""
+    calls = _fake_torch(monkeypatch)
     monkeypatch.setattr(local_models, "_available_cpus", lambda: 12)
-    assert local_models._offload(lambda: "ok") == "ok"
-    size = get_settings().local_model_threadpool_size
-    assert calls == [max(1, 12 // size)]
+    monkeypatch.setattr(local_models, "_require_sentence_transformers_installed", lambda: None)
+    monkeypatch.setattr(local_models, "_embedder",
+                        lambda path: SimpleNamespace(get_embedding_dimension=lambda: 3))
+    monkeypatch.setattr(local_models, "_reranker", lambda path: object())
+    local_models.validate_local_models(_local_settings(tmp_path), warm=True)
+    local_models.validate_local_models(_local_settings(tmp_path), warm=True)   # a second boot call
+    assert calls == [12 // (2 * get_settings().local_model_threadpool_size)]
+
+
+def test_the_api_never_sets_torch_threads(monkeypatch, tmp_path) -> None:
+    """warm=False (the API) loads no model, so it has no torch thread count to set."""
+    calls = _fake_torch(monkeypatch)
+    local_models.validate_local_models(_local_settings(tmp_path), warm=False)
+    assert calls == []
+
+
+@pytest.mark.parametrize("cpus, pool, threads", [(12, 1, 6), (12, 2, 3), (4, 1, 2), (1, 1, 1)])
+def test_model_jobs_share_half_the_cpus(monkeypatch, cpus, pool, threads) -> None:
+    """Half for the models, half for the event loop and a second model-running worker on the host."""
+    monkeypatch.setenv("TSG_LOCAL_MODEL_THREADPOOL_SIZE", str(pool))
+    get_settings.cache_clear()
+    monkeypatch.setattr(local_models, "_available_cpus", lambda: cpus)
+    assert local_models._torch_threads() == threads
+
+
+def test_one_model_job_at_a_time_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TSG_LOCAL_MODEL_THREADPOOL_SIZE", raising=False)
+    from app.core.config import Settings
+
+    assert Settings(_env_file=None).local_model_threadpool_size == 1
+
+
+def test_no_tokenizer_thread_pool_unless_the_operator_says_otherwise(monkeypatch) -> None:
+    """TOKENIZERS_PARALLELISM=false must be in place before torch loads, i.e. when this module is
+    imported; an explicit value in the environment wins."""
+    import importlib
+
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "true")
+    importlib.reload(local_models)
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "true"          # operator's choice kept
+    monkeypatch.delenv("TOKENIZERS_PARALLELISM")
+    importlib.reload(local_models)
+    assert os.environ["TOKENIZERS_PARALLELISM"] == "false"
 
 
 @pytest.mark.parametrize("files, expected", [
