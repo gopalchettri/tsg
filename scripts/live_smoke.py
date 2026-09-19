@@ -1071,7 +1071,7 @@ def phase4(r: Runner, other_key: str) -> dict[str, Any]:
             r.expect(r.req("GET", f"/v1/sessions/{psid}/scenarios/{psc}/treatment-plan/audit",
                            headers=r.entity_headers()), 200)
 
-        def plan_evidence_needs_version() -> None:
+        def plan_evidence_needs_plan_id() -> None:
             r.expect(r.req("GET", f"/v1/sessions/{psid}/scenarios/{psc}/treatment-plan/evidence",
                            headers=r.entity_headers()), 422)
 
@@ -1091,7 +1091,7 @@ def phase4(r: Runner, other_key: str) -> dict[str, Any]:
             # is a legal score), so each was re-pointed at a rule that still exists — digit
             # ceiling, lower bound, precision — rather than deleted, which would have left the
             # widened field with no negative coverage at all.
-            for bad in ({**_PLAN_BODY, "likelihood_rating": 100000000000},  # max_digits=15
+            for bad in ({**_PLAN_BODY, "likelihood_rating": 100000000000},  # >11 digits before the point
                         {**_PLAN_BODY, "impact_rating": -1},          # ge=0
                         {**_PLAN_BODY, "final_risk_rating": "4.12345"},  # decimal_places=4
                         {**_PLAN_BODY, "strategy": "avoid"},          # extra="forbid"
@@ -1107,17 +1107,23 @@ def phase4(r: Runner, other_key: str) -> dict[str, Any]:
             r.expect(r.req("POST", f"/v1/sessions/{psid}/scenarios/{psc}/treatment-plan",
                            headers={**r.entity_headers(), "content-type": "application/json"},
                            content=raw), 422, "21-digit rating must not be rounded")
+            # NaN is not JSON, but the stdlib reader accepts it. It must be a 422 — it was a 500,
+            # because the 422 handler could not serialize the NaN it echoed back.
+            raw = json.dumps({**_PLAN_BODY, "final_risk_rating": "@"}).replace('"@"', "NaN")
+            r.expect(r.req("POST", f"/v1/sessions/{psid}/scenarios/{psc}/treatment-plan",
+                           headers={**r.entity_headers(), "content-type": "application/json"},
+                           content=raw), 422, "NaN rating must be a 422, never a 500")
 
         r.check(P, "GET .../treatment-plan -> 200", plan_get, needs="plan_board")
         r.check(P, "GET .../treatment-plan/status -> 200", plan_status, needs="plan_board")
         r.check(P, "GET .../treatment-plan/audit -> 200", plan_audit, needs="plan_board")
-        r.check(P, "GET .../treatment-plan/evidence without version -> 422",
-                plan_evidence_needs_version, needs="plan_board")
-        r.check(P, "GET .../treatment-plan/evidence?version -> 200", plan_evidence,
+        r.check(P, "GET .../treatment-plan/evidence without plan_id -> 422",
+                plan_evidence_needs_plan_id, needs="plan_board")
+        r.check(P, "GET .../treatment-plan/evidence?plan_id -> 200", plan_evidence,
                 needs="plan_board")
         r.check(P, "POST .../treatment-plan where one exists -> 409", plan_duplicate_is_409,
                 needs="plan_board")
-        r.check(P, "POST .../treatment-plan out-of-range / extra fields -> 422",
+        r.check(P, "POST .../treatment-plan out-of-range / NaN / extra fields -> 422",
                 plan_body_bounds_are_422, needs="plan_board")
     return fx
 

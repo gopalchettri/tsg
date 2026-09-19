@@ -708,7 +708,7 @@ class TreatmentEvidenceAttempt(ApiModel):
 
 
 class TreatmentEvidence(ApiModel):
-    """GET .../treatment-plan/evidence?version={plan_id} — the reproducibility bundle for ONE
+    """GET .../treatment-plan/evidence?plan_id={plan_id} — the reproducibility bundle for ONE
     version (superseded versions included — that is what an auditor asks for): the frozen
     input snapshot, the validation/moderation record, and every AI-call receipt (linked by
     Prompt_Log.CorrelationID; attempts generated before that column exist as rows without

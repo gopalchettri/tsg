@@ -1036,10 +1036,12 @@ def _subset_from_accept_body(body: AcceptBody) -> list[str] | None:
 # FastAPI emits a schema only for models reachable from a route. Without this declaration the enum
 # never reaches /openapi.json, and a UI cannot generate the codes that tell it whether a blocked
 # action is a dead end (session_completed/cancelled/generation_abandoned) or a spinner
-# (generation_in_progress). That split is only trustworthy because accept.ensure_review_gate now
-# PROVES a live lease before emitting generation_in_progress: while the code was inferred from the
-# session's cached stage columns alone, a UI showing a spinner on it could spin forever against a
-# worker that had already died.
+# (generation_in_progress). That split is only trustworthy because accept.ensure_review_gate first
+# asks reaper.session_is_abandoned (the reaper's own rule, the ONE definition), finalises an
+# abandoned run on the spot, and only otherwise emits generation_in_progress — working, queued, or
+# between claims. A queued run that never starts goes stale after reaper_stale_grace_seconds and
+# then resolves to a terminal reason, so a spinner on this code is bounded. While the code was
+# inferred from the cached stage columns alone, a UI could spin forever against a dead worker.
 _CONFLICT_RESPONSES: dict[int | str, dict] = {409: {"model": ErrorResponse, "description": "Conflict — see details.reason."}}
 
 

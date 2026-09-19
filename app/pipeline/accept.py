@@ -322,10 +322,12 @@ def ensure_review_gate(sess: Session, scenario_session: RowMapping | dict) -> Ro
     a next-set task hung after committing its work but before releasing the `_LOCK`, and accept +
     regenerate both 409'd on a session whose scenarios were finished and sitting in the DB.
 
-    So: a live lease is required to CLAIM something is running (dal.live_lease_exists explains why
-    that signal is exact rather than heuristic). Without one, the run is abandoned, and this
-    finalises it on the spot through the very same `recover_abandoned_session` the reaper uses —
-    same `_LOCK` mutex, same decide_session_outcome — so an in-flight worker can never be raced.
+    So: when the reaper's OWN rule (reaper.session_is_abandoned — no live lease AND proven dead or
+    stale) says the run is abandoned, this finalises it on the spot through the very same recovery
+    the reaper uses — same `_LOCK` mutex, same decide_session_outcome — so an in-flight worker can
+    never be raced. Otherwise the refusal stands: the run is working, queued, or between claims.
+    "No live lease" alone is not enough — a still-QUEUED session holds none either, and treating
+    that as dead once cancelled a healthy run whose accept arrived 0.1 s after its create.
     Recovery is idempotent and returns None untouched if any lock is genuinely held."""
     gate = review_gate_reason(scenario_session)
     if gate is None:
@@ -337,16 +339,18 @@ def ensure_review_gate(sess: Session, scenario_session: RowMapping | dict) -> Ro
         raise AcceptConflict(message, reason=reason)
 
     sid = scenario_session["SessionID"]
-    if dal.session_has_live_lease(sess, sid):
-        raise AcceptConflict(message, reason=reason)   # a worker really is running: the message is true
+    # Local import: reaper -> tasks -> accept.
+    from app.pipeline.reaper import recover_session_now, session_is_abandoned
+    if not session_is_abandoned(sess, sid):
+        raise AcceptConflict(message, reason=reason)   # working, queued or between claims: true
 
     log.warning("review_gate.recovering_abandoned_run", session_id=sid,
                 stage=str(scenario_session["CurrentStage"]),
                 stage_status=str(scenario_session["StageStatus"]),
-                note="no live lease — previous run died or hung; finalising it now")
+                note="abandoned by the reaper's rule — previous run died or never started; "
+                     "finalising it now")
     # recover_session_now, NOT recover_abandoned_session: the latter is only the sweep's step 3 and
     # bails out on a held `_LOCK` — which is exactly the state an abandoned run leaves behind.
-    from app.pipeline.reaper import recover_session_now  # local: reaper -> tasks -> accept
     try:
         recover_session_now(sess, dict(scenario_session))
     except Exception:  # a failed recovery must still produce an honest 409, not a 500

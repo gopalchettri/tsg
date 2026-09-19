@@ -1185,8 +1185,8 @@ FROM Scenario_Audit WHERE SessionID='<sid>'
 |---|---|
 | Omit `mode`; or send `scenario_ids` with `mode` ≠ `"subset"`; or omit `scenario_ids` with `mode="subset"` | `422` |
 | Accept a session that was cancelled | `409 accept_conflict` (`details.reason: "session_cancelled"`) |
-| Accept while a worker genuinely still holds a live lease (generation truly in progress) | `409 accept_conflict` (`details.reason: "generation_in_progress"`) — the only reason worth polling on |
-| Accept after a worker died/hung with no live lease, and automatic recovery couldn't park the session at REVIEW | `409 accept_conflict` (`details.reason: "generation_abandoned"`) — not retryable; cancel and start a new session |
+| Accept while generation is working, still queued, or between stages | `409 accept_conflict` (`details.reason: "generation_in_progress"`) — the only reason worth polling on. An accept sent right after creating the session lands here; it never cancels the queued run |
+| Accept after the run was abandoned — a worker died (its lease expired) or it never started within the grace period — and automatic recovery couldn't park the session at REVIEW | `409 accept_conflict` (`details.reason: "generation_abandoned"`) — not retryable; cancel and start a new session |
 | A `scenario_id` naming two different versions of the same scenario, or one that conflicts with a version already accepted on this session | `409 accept_conflict` (`details.reason: "duplicate_identity"`) |
 | A `scenario_id` that isn't a decidable scenario of THIS session | `404 not_found` — and **nothing is accepted**, even the ids that were fine |
 | A master threat type/catalogue was **soft-deleted** (`IsDeleted=1`) meanwhile | `409 master_inactive`. This gate is `IsDeleted`-only **by design**: setting `IsActive=0` does NOT trip it. A threat that `promote-to-library` (Test 9b) just minted starts `IsActive=0` pending curator review, and accepting a session containing it has to keep working. A tester who merely deactivates a row and expects a 409 will get a 200 |
@@ -1654,6 +1654,14 @@ curl -s -X POST "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c1
 ```
 
 Same `TreatmentPlanAccepted` shape as 7b, but a **new** `plan_id` — the old one is now `Superseded=1`, not deleted.
+
+**A control that disappears is named, never silent.** The new version's controls are rebuilt from the library as it is *now*. If a control the previous version carried is not in the new one, the new version's `warnings` (GET `.../treatment-plan`) says which one and why, for example:
+
+```
+control CII-CID-117 (Unauthorized Network Services) was in the previous version but has been retired from the control library — omitted from this version
+```
+
+The reason is one of: `has been retired from the control library` (made inactive or deleted), `is no longer mapped to this scenario`, `is no longer in the control library` (the row is gone), or `is no longer available` (the lookup itself failed). The comparison is by the control's library id, so a retired code reused by a new control is still reported correctly.
 
 **How to test:**
 
@@ -2371,7 +2379,7 @@ ORDER BY CreatedAt DESC;
 | **What does it do?** | Returns one plan VERSION's evidence bundle. `status` here is the STORED value, deliberately unprojected — no staleness rewrite, unlike the poll GET. |
 | **When do you call it?** | Auditing a specific plan version, or debugging why a generation produced what it did. |
 
-**Input (complete request)** — `version` is required and names the exact `plan_id` to inspect (a superseded version is fine):
+**Input (complete request)** — `plan_id` is required and names the exact plan version to inspect (a superseded version is fine). `version` is still accepted as a deprecated alias; sending both is fine only if they agree:
 
 ```bash
 curl -s -X GET "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/scenarios/1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90/treatment-plan/evidence?plan_id=0f0e0d0c-0b0a-8988-8786-858483828180" \
@@ -2552,7 +2560,8 @@ contradict a payload reporting new scenarios.
 `asset_busy` (5 codes now, not 3). Those never appear on an event — they come back as
 `details.reason` on a **409** from the accept/regenerate/next-set gate itself, meaning the request
 never ran, rather than having run and found nothing. `generation_in_progress` is the only one
-worth waiting on (the gate proves a live worker lease before returning it); `generation_abandoned`
+worth waiting on (the gate returns it only when the reaper's own rule says the run is not abandoned —
+working, queued, or between stages; a run that never starts goes stale and resolves); `generation_abandoned`
 means recovery already gave up — not retryable, start a new session for the asset.
 
 **Don't transcribe any of these by hand.** All code sets, plus the event and

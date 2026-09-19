@@ -200,7 +200,7 @@ READ
   step6_verify.txt.
 
 EXPECT
-  PASS on: "All 13 boot-asserted indexes present, unique and correct"
+  PASS on: "All <n> boot-asserted indexes present, unique and correct"
   PASS on: the column, scenario-lifecycle and RCSI rows.
 
 IGNORE THIS ONE FAILURE
@@ -212,8 +212,8 @@ ALSO IGNORE, ONLY IF THE LIBRARIES ARE MEANT TO BE EMPTY
   "3. Seed_to_Threat_library.sql" and "5. Seed_to_Control_library.sql" now.
 
 STOP IF
-  Any index row fails. The application checks fourteen indexes at start-up and
-  will not run if one is missing, on the wrong columns, or not unique.
+  Any index row fails. The application checks every one of these indexes at
+  start-up and will not run if one is missing, on the wrong columns, or not unique.
 
 
 ==================== STEP 7 — RESTART AND SMOKE TEST =======================
@@ -395,5 +395,5 @@ and run it again.
 
   Application will not start after the run
       Run "6. TSG_Verify.sql" and read the index rows. The application checks
-      fourteen indexes at start-up and refuses to run if any is missing, on
+      its required indexes at start-up and refuses to run if any is missing, on
       the wrong columns, or not unique.

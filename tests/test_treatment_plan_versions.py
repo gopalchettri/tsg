@@ -553,6 +553,41 @@ def test_regenerate_baselines_on_active_row_after_switch(monkeypatch):
     assert new_snap["existing_controls"]["register_controls"] == ["annual patching"]  # P1's, not P2's
 
 
+def test_dropped_controls_are_reported_against_the_switched_in_version(monkeypatch):
+    """A3 after a version switch: the dropped-control warnings compare against the version being
+    REPLACED — the active row the approve switched back in (P1) — never the newest one (P2). The
+    library currently maps nothing, so this is also the every-control-dropped case: the empty-map
+    warning AND a per-control warning must both appear."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    _seed(Session)
+    _wire(Session, monkeypatch)
+    p1, p2 = _two_complete_versions(Session, monkeypatch)
+    # Read BOTH snapshots before writing: in-memory SQLite gives every Session the same connection,
+    # so a read session closed inside the write transaction would roll the first update back.
+    snaps = {r["PlanID"]: json.loads(r["InputSnapshotJSON"]) for r in _plans(Session)}
+    with Session() as s:
+        for pid, code, cid in ((p1, "P1-ONLY", 901), (p2, "P2-ONLY", 902)):
+            snap = snaps[pid]
+            snap["existing_controls"]["library_mapped"] = [
+                {"control_code": code, "control_name": f"{code} name", "control_library_id": cid}]
+            s.execute(update(m.Risk_Treatment_Plan).where(m.Risk_Treatment_Plan.PlanID == pid)
+                      .values(InputSnapshotJSON=json.dumps(snap)))
+        s.commit()
+    treatment_api.post_review_treatment_plan(SESSION_ID, SCENARIO_ID, _review(plan_id=p1),
+                                             _principal())
+
+    resp = treatment_api.post_regenerate_treatment_plan(
+        SESSION_ID, SCENARIO_ID, TreatmentPlanRegenerateBody(), _principal())
+
+    warnings = json.loads([r for r in _plans(Session)
+                           if r["PlanID"] == resp.plan_id][0]["InputSnapshotJSON"])["warnings"]
+    assert "no library-mapped controls for this scenario (Step-4 map is empty)" in warnings
+    assert ("control P1-ONLY (P1-ONLY name) was in the previous version but is no longer in the "
+            "control library — omitted from this version") in warnings
+    assert not any("P2-ONLY" in w for w in warnings), warnings
+
+
 def test_reactivate_refuses_already_active_row(monkeypatch):
     """Direct pin of reactivate_plan_version's Superseded=1 fence: the routes never reach it
     with an already-active target (the branch check intercepts first), so only a dal-level

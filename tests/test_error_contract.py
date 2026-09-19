@@ -46,6 +46,64 @@ def test_wrong_method_keeps_its_allow_header_and_the_envelope():
     assert resp.headers.get("allow"), "Allow header lost — exc.headers was not preserved"
 
 
+def test_the_422_handler_can_echo_any_value_without_becoming_a_500():
+    """The echoed `input` is whatever the client sent, and JSONResponse serializes with
+    allow_nan=False. A non-finite float (stdlib json.loads accepts NaN/Infinity) or a Decimal (the
+    ExactNumberRoute routes) used to raise INSIDE the handler — a 500 on the 422 it was reporting.
+    Found live: final_risk_rating=NaN returned 500."""
+    import asyncio
+    import json
+    from decimal import Decimal
+
+    from fastapi.exceptions import RequestValidationError
+
+    from app.api.errors import _handle_validation_error
+
+    exc = RequestValidationError([
+        {"type": "finite_number", "loc": ("body", "x"), "msg": "Input should be a finite number",
+         "input": float("nan")},
+        {"type": "finite_number", "loc": ("body", "y"), "msg": "m", "input": float("-inf")},
+        {"type": "decimal_max_digits", "loc": ("body", "z"), "msg": "m",
+         "input": Decimal("4.1234000000000000001")},
+        {"type": "missing", "loc": ("body", "w"), "msg": "m", "input": {"nested": float("inf")}},
+        # A non-JSON body is echoed as raw bytes; jsonable_encoder's own bytes.decode() raised on
+        # invalid UTF-8 — still a 500 until the handler escaped it.
+        {"type": "model_attributes_type", "loc": ("body",), "msg": "m", "input": b'\xff\xfe{"a":1}'},
+    ])
+    resp = asyncio.run(_handle_validation_error(None, exc))
+    assert resp.status_code == 422
+    echoed = [e["input"] for e in json.loads(resp.body)["details"]["errors"]]
+    assert echoed == ["nan", "-inf", "4.1234000000000000001", {"nested": "inf"},
+                      '\\xff\\xfe{"a":1}']
+
+
+def test_no_api_model_accepts_nan_or_infinity():
+    """ApiModel sets allow_inf_nan=False once; pydantic merges it into every subclass's own
+    model_config. Pinned for EVERY model, so a subclass that re-declares model_config and turns it
+    back on fails here, not in production."""
+    import pytest
+    from pydantic import ValidationError
+
+    import app.api.schemas_treatment  # noqa: F401  (registers the treatment models as subclasses)
+    from app.api.schemas import ApiModel
+
+    def _all(cls):
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from _all(sub)
+
+    lenient = sorted(c.__name__ for c in _all(ApiModel) if c.model_config.get("allow_inf_nan") is not False)
+    assert not lenient, f"models that accept NaN/Infinity: {lenient}"
+
+    class _Probe(ApiModel):
+        x: float
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError, match="finite"):
+            _Probe(x=bad)
+    assert _Probe(x=4.5).x == 4.5
+
+
 def test_every_published_422_matches_what_the_handler_returns():
     """Route-count-agnostic on purpose: a route (or a whole router) added later is covered with
     nothing to remember, which is the point of rewriting the finished schema in main.py."""

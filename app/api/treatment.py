@@ -888,13 +888,21 @@ def list_entity_treatment_audit(entity_id: str,
                                     events=events)
 
 
-def _evidence_plan_id(plan_id: str | None, version: str | None) -> str:
+def _evidence_plan_id(
+        plan_id: str | None = Query(None, description="The plan_id of the version to inspect (superseded versions allowed)."),
+        version: str | None = Query(None, deprecated=True, description="Deprecated alias of plan_id, kept so existing callers keep working. Send plan_id."),
+) -> str:
     """`plan_id` is the canonical name; `version` is its deprecated alias. The endpoint used to take
     only `version`, which reads as a version NUMBER — callers sent 1 or 2 and got a 404 for a value
     that is really a plan_id (it happened during this endpoint's own live testing). Exactly one is
     required; sending both is fine only if they agree. Raised as RequestValidationError so the 422
-    envelope is identical to every other validation failure."""
-    if plan_id and version and plan_id != version:
+    envelope is identical to every other validation failure.
+
+    A DEPENDENCY, not a call inside the handler: it runs as request validation, before the handler
+    opens a DB session — where the old required `version: str = Query(...)` was enforced. Called
+    from the handler body, a malformed request paid a pool checkout and the authorisation SELECT
+    before its 422. Agreement is case-insensitive: a GUID read back from SQL Server is uppercase."""
+    if plan_id and version and plan_id.casefold() != version.casefold():
         raise RequestValidationError([{
             "type": "value_error", "loc": ("query", "plan_id"),
             "msg": "plan_id and version were both sent and disagree; send only plan_id",
@@ -922,9 +930,10 @@ def _evidence_plan_id(plan_id: str | None, version: str | None) -> str:
                 "attempt list if it predates prompt linking."
             ))
 def get_treatment_plan_evidence(session_id: str, scenario_id: str,
-                                plan_id: str | None = Query(None, description="The plan_id of the version to inspect (superseded versions allowed)."),
-                                version: str | None = Query(None, deprecated=True, description="Deprecated alias of plan_id, kept so existing callers keep working. Send plan_id."),
-                                principal: Principal = Depends(get_principal)) -> TreatmentEvidence:
+                                # principal FIRST: dependencies resolve in declaration order, so an
+                                # unauthenticated caller still gets the 401 before any 422.
+                                principal: Principal = Depends(get_principal),
+                                target_plan_id: str = Depends(_evidence_plan_id)) -> TreatmentEvidence:
     """The reproducibility bundle for ONE plan version: the frozen input snapshot (exactly
     what the AI was given), the validation/moderation record, and every AI-call receipt —
     joined by Prompt_Log.CorrelationID, byte-for-byte, even for versions replaced long ago.
@@ -934,7 +943,7 @@ def get_treatment_plan_evidence(session_id: str, scenario_id: str,
     poll GET presents it as timed out."""
     with db_session() as sess:
         get_authorized_session(sess, session_id, principal)
-        row = dal.plan_row_by_id(sess, session_id, scenario_id, _evidence_plan_id(plan_id, version))
+        row = dal.plan_row_by_id(sess, session_id, scenario_id, target_plan_id)
         if row is None:
             raise dal.NotFoundError("no such plan version for this scenario")
         attempts = [TreatmentEvidenceAttempt(

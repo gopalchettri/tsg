@@ -504,3 +504,85 @@ def test_consolidated_script_builds_and_verifies_every_boot_index() -> None:
             problems.append(f"{name}: missing from the script's required_index check")
     assert not problems, ("a database built from tsg_remediation_tables.sql would not boot:\n  "
                           + "\n  ".join(problems))
+
+
+def test_every_boot_checked_index_names_a_script_that_creates_it() -> None:
+    """The boot refusal names the script for each missing index from invariants.INDEX_SCRIPTS. The
+    hand-written sentence it replaced fell behind a migration without anyone noticing; this pins
+    the data instead: every index the boot checks has an entry, no entry is stale, and every
+    named script exists and really creates that index."""
+    from app.db.invariants import FILTERED_INDEX_LITERALS, INDEX_SCRIPTS, REQUIRED_INDEXES
+
+    repo = Path(__file__).resolve().parents[1]
+    checked = {n for n, _, _ in REQUIRED_INDEXES} | {n for n, _ in FILTERED_INDEX_LITERALS}
+    problems = [f"{n}: no INDEX_SCRIPTS entry" for n in sorted(checked - INDEX_SCRIPTS.keys())]
+    problems += [f"{n}: INDEX_SCRIPTS entry for an index the boot never checks"
+                 for n in sorted(INDEX_SCRIPTS.keys() - checked)]
+    for name, scripts in INDEX_SCRIPTS.items():
+        for rel in scripts:
+            path = repo / rel
+            if not path.exists():
+                problems.append(f"{name}: {rel} does not exist")
+            elif not re.search(rf"CREATE\s+(UNIQUE\s+)?(NONCLUSTERED\s+)?INDEX\s+{name}\b",
+                               path.read_text(encoding="utf-8", errors="replace"), re.I):
+                problems.append(f"{name}: {rel} does not create it")
+    assert not problems, "\n".join(problems)
+
+
+class _FakeIndexEngine:
+    """Stands in for SQL Server's sys.indexes: _assert_indexes reads (name, table, is_disabled,
+    is_unique, 'col,col') rows, which is all this returns."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def connect(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+    def execute(self, *_a, **_k):
+        return self
+
+    def all(self):
+        return self.rows
+
+
+def _healthy_index_rows():
+    from app.db.invariants import REQUIRED_INDEXES
+    return [(n, t, False, True, ",".join(c)) for n, t, c in REQUIRED_INDEXES]
+
+
+def test_boot_passes_when_every_required_index_is_healthy() -> None:
+    """The fake is faithful: the unmodified rows must boot, or every refusal below is vacuous."""
+    from app.db.invariants import _assert_indexes
+    _assert_indexes(_FakeIndexEngine(_healthy_index_rows()))
+
+
+@pytest.mark.parametrize(("breakage", "expect"), [
+    # Missing — the refusal names BOTH ways to create it, including the new standalone migration.
+    ("missing", "UX_Scenario_ActiveScoped: scripts/eyshield_handoff/1. TSG_Core.sql "
+                "(or, on a database already up, scripts/TSG_Migration_ActiveScopedIndex.sql)"),
+    ("wrong_columns", "wrong table/columns"),
+    ("non_unique", "not enforcing"),
+    ("disabled", "not enforcing"),
+])
+def test_boot_refuses_a_broken_scoped_threat_index(breakage, expect) -> None:
+    """A1's guard is only a guard if a database without it cannot start. Never exercised before:
+    the live runs only proved the index refuses a duplicate once it exists."""
+    from app.db.invariants import StartupInvariantError, _assert_indexes
+
+    rows = []
+    for name, table, disabled, unique, cols in _healthy_index_rows():
+        if name != "UX_Scenario_ActiveScoped":
+            rows.append((name, table, disabled, unique, cols))
+        elif breakage != "missing":
+            rows.append({"wrong_columns": (name, table, disabled, unique, "SessionID,IdentityHash"),
+                         "non_unique": (name, table, disabled, False, cols),
+                         "disabled": (name, table, True, unique, cols)}[breakage])
+    with pytest.raises(StartupInvariantError, match=re.escape(expect)):
+        _assert_indexes(_FakeIndexEngine(rows))

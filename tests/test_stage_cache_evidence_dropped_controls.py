@@ -24,7 +24,6 @@ from app.db import models as m
 from app.db.invariants import ACTIVE_UNIQUE, REQUIRED_INDEXES
 from app.pipeline import treatment
 
-
 # ---------------------------------------------------------------------------------------------
 # A1 — every startup-only uniqueness rule has a database index behind it
 # ---------------------------------------------------------------------------------------------
@@ -105,6 +104,37 @@ def test_a_retired_code_reused_by_a_new_row_is_still_reported_retired() -> None:
     rows = [_lib(1, active=False), _lib(5)]          # id 1 retired, id 5 active, same code
     out = treatment._dropped_control_warnings(_RowsSess(rows), _PREV, _CUR)
     assert out == [_msg("has been retired from the control library")]
+
+
+def test_several_drops_in_one_regenerate_each_get_their_own_reason() -> None:
+    """One read serves every dropped control (one IN on their ids), and each keeps its own reason
+    and its previous-version order — retired, re-mapped and vanished side by side."""
+    prev = {"CII-001": ("MFA", 1), "CII-002": ("Segmentation", 2), "CII-003": ("Backups", 3)}
+    rows = [_lib(1, active=False), _lib(2)]                 # 3 is gone from the library
+    out = treatment._dropped_control_warnings(_RowsSess(rows), prev, [])
+    assert out == [
+        "control CII-001 (MFA) was in the previous version but has been retired from the control "
+        "library — omitted from this version",
+        "control CII-002 (Segmentation) was in the previous version but is no longer mapped to "
+        "this scenario — omitted from this version",
+        "control CII-003 (Backups) was in the previous version but is no longer in the control "
+        "library — omitted from this version",
+    ]
+
+
+def test_a_failed_library_lookup_reports_that_and_nothing_per_control(monkeypatch) -> None:
+    """When the CURRENT map cannot be read at all, every previous control would look dropped. That
+    is not what happened, so no per-control warning is raised — the one lookup-failed warning
+    says what really happened instead."""
+    def _boom(sess, sid):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(treatment, "_library_controls", _boom)
+    snap = treatment.build_treatment_input(
+        _RowsSess(), _SESSION_ROW, _SCENARIO_ROW, {"existing_controls": [], "risk_level": "High"},
+        previous_controls=_PREV)
+    assert "library control lookup failed — plan generated without mapped controls" in snap["warnings"]
+    assert not any("previous version" in w for w in snap["warnings"]), snap["warnings"]
 
 
 def test_a_legacy_snapshot_without_an_id_gets_no_guessed_reason() -> None:
@@ -188,6 +218,18 @@ def test_version_still_works_as_an_alias() -> None:
 
 def test_both_sent_and_agreeing_is_accepted() -> None:
     assert api_treatment._evidence_plan_id("p1", "p1") == "p1"
+
+
+def test_agreement_ignores_letter_case() -> None:
+    """A GUID read back from SQL Server is uppercase, dal.guid() mints lowercase: the same plan id
+    in two spellings is agreement, not a 422."""
+    assert api_treatment._evidence_plan_id("ABCD-1234", "abcd-1234") == "ABCD-1234"
+
+
+def test_an_empty_plan_id_falls_back_to_the_alias() -> None:
+    """`?plan_id=&version=p1` — an empty canonical parameter is "not sent", not a disagreement, so
+    an old client that appends version to a templated URL keeps working."""
+    assert api_treatment._evidence_plan_id("", "p1") == "p1"
 
 
 @pytest.mark.parametrize("plan_id, version", [("p1", "p2"), (None, None), ("", "")])
@@ -291,3 +333,35 @@ def test_it_never_moves_backwards(db) -> None:
     sid = _seed(db, stage="SCENARIO_GENERATION", stage_status="RUNNING")
     _claim(db, sid, SubsystemLevel.THREATS)
     assert _stage(db, sid) == ("SCENARIO_GENERATION", "RUNNING")
+
+
+def test_a_failed_display_write_never_costs_the_claim(db, monkeypatch) -> None:
+    """The stage cache is display-only; its write runs in a savepoint so a failure there is logged
+    and the claim it rides on still wins and commits. Never exercised before.
+
+    Logs are recorded through dal.log itself, not structlog.testing.capture_logs: an earlier test
+    in the suite caches dal's logger, after which capture_logs silently sees nothing from it."""
+    events: list[tuple[str, str]] = []
+
+    class _Recorder:
+        def __getattr__(self, level):
+            return lambda event, **_kw: events.append((level, event))
+
+    monkeypatch.setattr(dal, "log", _Recorder())
+    real = dal.execute_dml
+
+    def _flaky(sess, stmt):
+        if getattr(getattr(stmt, "table", None), "name", "") == "Scenario_Session":
+            raise RuntimeError("cache write failed")
+        return real(sess, stmt)
+
+    monkeypatch.setattr(dal, "execute_dml", _flaky)
+    sid = _seed(db)
+    assert _claim(db, sid, SubsystemLevel.SCENARIOS)
+    assert ("warning", "stage.session_cache_sync_failed") in events, events
+    assert _stage(db, sid) == ("THREAT_IDENTIFICATION", "IDLE")        # cache untouched...
+    with db() as s:                                                   # ...claim durable
+        status = s.execute(select(m.Subsystem_Stage_State.Status).where(
+            m.Subsystem_Stage_State.SessionID == sid,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS)).scalar_one()
+    assert str(status) == "RUNNING"

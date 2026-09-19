@@ -69,8 +69,11 @@ WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Tables');
 -- 2. THE 14 INDEXES THE APPLICATION ASSERTS AT BOOT
 -- ---------------------------------------------------------------------------
 -- Not performance indexes: each enforces a correctness rule. The application
--- checks all thirteen at every start and REFUSES TO BOOT if one is missing, on
--- the wrong table, or built on the wrong columns.
+-- checks every one of them at every start and REFUSES TO BOOT if one is missing,
+-- on the wrong table, or built on the wrong columns. (No count in this prose on
+-- purpose: an unpinned "thirteen" once sat under the pinned heading. The heading,
+-- the PASS line and the list itself are pinned to app/db/invariants.py by
+-- tests/test_schema_sync.py.)
 DECLARE @req_indexes TABLE (IndexName sysname, TableName sysname, Cols nvarchar(400));
 INSERT INTO @req_indexes (IndexName, TableName, Cols) VALUES
     (N'UX_Session_ActiveAsset', N'Scenario_Session', N'EntityID,AssetID'),

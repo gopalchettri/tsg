@@ -15,16 +15,24 @@ never executed by the suite. A regression in either is silent in production.
 """
 from __future__ import annotations
 
+import uuid
+from datetime import timedelta
+
 import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
 from app.api.sessions import get_overall_status
 from app.core.enums import (
     ReviewGateReason,
     SessionStatus,
     StageStatus,
+    SubsystemLevel,
     SubsystemProgress,
     WorkflowStage,
 )
+from app.db import models as m
+from app.db.dal import now
 from app.pipeline.accept import review_gate_reason
 
 _DONE = str(StageStatus.COMPLETE)
@@ -126,13 +134,13 @@ def _mid_run_row():
                 stage_status=StageStatus.RUNNING)
 
 
-def test_live_lease_still_refuses_as_generation_in_progress(monkeypatch) -> None:
-    """A worker really IS running: the message was true, so nothing changes. This is the guard
-    against 'fixing' the false 409 by removing the gate — a real in-flight run must still 409, and
-    recovery must never be attempted while a live worker could be racing it."""
+def test_a_run_that_is_not_abandoned_still_refuses_as_generation_in_progress(monkeypatch) -> None:
+    """Working, queued or between claims: the message is true, so nothing changes. This is the
+    guard against 'fixing' the false 409 by removing the gate — a real in-flight run must still
+    409, and recovery must never be attempted while a live worker could be racing it."""
     from app.pipeline import accept as accept_mod
 
-    monkeypatch.setattr(accept_mod.dal, "session_has_live_lease", lambda _s, _sid: True)
+    monkeypatch.setattr("app.pipeline.reaper.session_is_abandoned", lambda _s, _sid: False)
 
     def _boom(*_a, **_kw):  # pragma: no cover - must never run
         raise AssertionError("recovery attempted while a worker holds a live lease")
@@ -144,13 +152,13 @@ def test_live_lease_still_refuses_as_generation_in_progress(monkeypatch) -> None
     assert exc.value.reason == ReviewGateReason.generation_in_progress
 
 
-def test_no_live_lease_recovers_and_lets_the_request_through(monkeypatch) -> None:
-    """THE reported bug: stale cache says RUNNING, no worker holds a lease. The gate must finalise
-    the abandoned run and then pass, instead of refusing forever."""
+def test_an_abandoned_run_recovers_and_lets_the_request_through(monkeypatch) -> None:
+    """The original bug: stale cache says RUNNING, the worker died. The gate must finalise the
+    abandoned run and then pass, instead of refusing forever."""
     from app.pipeline import accept as accept_mod
 
     recovered = _row(session_status=SessionStatus.completed)  # REVIEW / AWAITING_DECISION
-    monkeypatch.setattr(accept_mod.dal, "session_has_live_lease", lambda _s, _sid: False)
+    monkeypatch.setattr("app.pipeline.reaper.session_is_abandoned", lambda _s, _sid: True)
     monkeypatch.setattr(accept_mod.dal, "get_session", lambda _s, _sid, _e: recovered)
     monkeypatch.setattr("app.pipeline.reaper.recover_session_now", lambda _s, _row: "review")
 
@@ -162,7 +170,7 @@ def test_recovery_that_cannot_reach_review_reports_generation_abandoned(monkeypa
     'generation_in_progress', because waiting cannot help."""
     from app.pipeline import accept as accept_mod
 
-    monkeypatch.setattr(accept_mod.dal, "session_has_live_lease", lambda _s, _sid: False)
+    monkeypatch.setattr("app.pipeline.reaper.session_is_abandoned", lambda _s, _sid: True)
     monkeypatch.setattr(accept_mod.dal, "get_session", lambda _s, _sid, _e: _mid_run_row())
     monkeypatch.setattr("app.pipeline.reaper.recover_session_now", lambda _s, _row: None)
 
@@ -214,3 +222,125 @@ def test_subsystem_task_limits_are_derived_and_stay_under_the_broker_ceiling() -
         assert (cfg.subsystem_task_soft_limit_seconds
                 < cfg.subsystem_task_hard_limit_seconds
                 <= cfg.broker_visibility_timeout_seconds)
+
+
+# --------------------------------------------------------------------------------------------
+# reaper.session_is_abandoned — the gate's "may I finalise this run?", against a real database.
+#
+# THE BUG IT FIXES (found live): an accept sent 0.1 s after a create cancelled a healthy session.
+# A still-QUEUED session holds no lease — nor does a next-set whose epoch was reserved but not yet
+# claimed — and the gate used to read "no live lease" as "abandoned". It must use the reaper's own
+# rule instead: no live lease AND (proven dead: a RUNNING row whose lease expired, OR stale).
+# --------------------------------------------------------------------------------------------
+@pytest.fixture
+def db(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'abandon.db'}", connect_args={"check_same_thread": False})
+    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State):
+        tbl.__table__.create(eng)
+    return sessionmaker(bind=eng, future=True)
+
+
+def _grace():
+    from app.core.config import get_settings
+    return timedelta(seconds=get_settings().reaper_stale_grace_seconds)
+
+
+def _seed_session(maker, *, stage="THREAT_IDENTIFICATION", stage_status="IDLE", status="active",
+                  touched=None, rows=()) -> str:
+    """rows: (Level, Status, lease_offset) — lease_offset None = no lease, else now()+offset."""
+    sid, t = str(uuid.uuid4()), now()
+    with maker() as s:
+        s.execute(m.Scenario_Session.__table__.insert().values(
+            SessionID=sid, TenantID="t", EntityID="78", AssetName="A", AssetID="99",
+            SessionStatus=status, CurrentStage=stage, StageStatus=stage_status, Mode="AUTO",
+            SubsystemsJSON="[]", CreatedAt=touched or t, UpdatedAt=touched or t))
+        for level, st, lease in rows:
+            s.execute(m.Subsystem_Stage_State.__table__.insert().values(
+                StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="78",
+                SubsystemID=0, Level=level, Status=st, GenerationEpoch=1,
+                LeaseExpiresAt=None if lease is None else t + lease, UpdatedAt=t, CreatedAt=t))
+        s.commit()
+    return sid
+
+
+_IDLE_ROWS = ((SubsystemLevel.THREATS, "IDLE", None), (SubsystemLevel.SCENARIOS, "IDLE", None),
+              (SubsystemLevel.LOCK, "IDLE", None))
+
+# name -> (seed kwargs, abandoned?)
+_CASES = {
+    # THE regression: created, task still queued, nobody has claimed anything yet.
+    "queued": (dict(rows=_IDLE_ROWS), False),
+    # dal.reserve_session's shape: next-set reserved, SCENARIOS reset to IDLE, no lease yet.
+    "next_set_reserved": (dict(stage="SCENARIO_GENERATION", stage_status="RUNNING",
+                               rows=((SubsystemLevel.THREATS, "COMPLETE", None),
+                                     (SubsystemLevel.SCENARIOS, "IDLE", None),
+                                     (SubsystemLevel.LOCK, "IDLE", None))), False),
+    "live_lease": (dict(stage="SCENARIO_GENERATION", stage_status="RUNNING",
+                        rows=((SubsystemLevel.SCENARIOS, "RUNNING", timedelta(minutes=5)),
+                              (SubsystemLevel.LOCK, "RUNNING", timedelta(minutes=5)))), False),
+    # A worker claimed, then stopped renewing: the lease lapsed while the row is still RUNNING.
+    "proven_dead": (dict(stage="SCENARIO_GENERATION", stage_status="RUNNING",
+                         rows=((SubsystemLevel.SCENARIOS, "RUNNING", timedelta(minutes=-1)),
+                               (SubsystemLevel.LOCK, "RUNNING", timedelta(minutes=-1)))), True),
+    # Never started, and untouched for longer than the grace window (e.g. never enqueued).
+    "stale_never_started": (dict(rows=_IDLE_ROWS, touched="STALE"), True),
+    # A legitimate human wait is never abandoned, however old.
+    "review_wait": (dict(stage="REVIEW", stage_status="AWAITING_DECISION", touched="STALE",
+                         rows=_IDLE_ROWS), False),
+}
+
+
+def _seed_case(maker, name: str) -> str:
+    kwargs, _ = _CASES[name]
+    if kwargs.get("touched") == "STALE":
+        kwargs = {**kwargs, "touched": now() - _grace() - timedelta(minutes=1)}
+    return _seed_session(maker, **kwargs)
+
+
+@pytest.mark.parametrize("name", list(_CASES))
+def test_session_is_abandoned_follows_the_reapers_rule(db, name) -> None:
+    from app.pipeline.reaper import session_is_abandoned
+
+    sid = _seed_case(db, name)
+    with db() as s:
+        assert session_is_abandoned(s, sid) is _CASES[name][1], name
+
+
+def test_the_gate_and_the_sweep_agree_on_every_case(db) -> None:
+    """Parity: session_is_abandoned is the sweep's rule for one session. Seed every case, run the
+    sweep's own selector (with proven_dead computed the way clean_up_abandoned_sessions does), and
+    the two verdicts must match session by session — the drift that caused the bug, pinned."""
+    from app.pipeline.reaper import _find_abandoned_sessions, _lease_expired, session_is_abandoned
+
+    sids = {name: _seed_case(db, name) for name in _CASES}
+    with db() as s:
+        t = now()
+        ss = m.Subsystem_Stage_State
+        proven = {str(r[0]).lower() for r in s.execute(
+            select(ss.SessionID).where(ss.Status == "RUNNING", _lease_expired(t))).all()}
+        swept = {str(r["SessionID"]).lower() for r in _find_abandoned_sessions(s, t, proven)}
+        for name, sid in sids.items():
+            assert session_is_abandoned(s, sid) is (sid.lower() in swept), name
+
+
+def test_an_early_accept_leaves_a_queued_session_running(db, monkeypatch) -> None:
+    """End to end through the real gate and a real database: the accept is refused with the
+    transient code, recovery is never attempted, and nothing about the session changes."""
+    from app.pipeline import accept as accept_mod
+
+    def _boom(*_a, **_kw):  # pragma: no cover - must never run
+        raise AssertionError("a queued session was treated as abandoned")
+
+    monkeypatch.setattr("app.pipeline.reaper.recover_session_now", _boom)
+    sid = _seed_case(db, "queued")
+    tbl = m.Scenario_Session.__table__
+    with db() as s:
+        row = dict(s.execute(select(tbl).where(tbl.c.SessionID == sid)).mappings().one())
+        with pytest.raises(accept_mod.AcceptConflict) as exc:
+            accept_mod.ensure_review_gate(s, row)
+        assert exc.value.reason == ReviewGateReason.generation_in_progress
+        statuses = {str(r[0]) for r in s.execute(
+            select(m.Subsystem_Stage_State.Status).where(m.Subsystem_Stage_State.SessionID == sid))}
+        session_status = s.execute(select(m.Scenario_Session.SessionStatus)
+                                   .where(m.Scenario_Session.SessionID == sid)).scalar_one()
+    assert statuses == {"IDLE"} and str(session_status) == "active"

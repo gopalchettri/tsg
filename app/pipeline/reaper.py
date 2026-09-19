@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -46,14 +46,23 @@ def _split_into_batches(items):
         yield items[i:i + chunk]
 
 
+def _lease_expired(_now: datetime):
+    """A lease that was taken and has lapsed. The ONE definition shared by the sweep, the
+    on-demand recovery and session_is_abandoned, so "proven dead" can never mean two things."""
+    lease = m.Subsystem_Stage_State.LeaseExpiresAt
+    return and_(lease.isnot(None), lease < _now)
+
+
 def _revoke_zombie_tasks(expired_rows) -> None:
     """Terminate the Celery tasks that were still holding the rows this pass just reclaimed.
 
-    An expired lease is an EXACT frozen-detector, not a heuristic: `tasks._ask_ai` renews both the
-    stage lease and the `_LOCK` lease before every single LLM call, so a healthy task — however
-    long it legitimately runs — never stops renewing. A holder that has gone a full lease window
-    without one has stopped executing. That is why this needs no wall-clock budget and no tuned
-    constant: it reads the same signal in dev, UAT and prod, and it can never fire on live work.
+    An expired lease is an EXACT dead-or-frozen detector, not a heuristic: pipeline.lease_keeper
+    renews every lease a task holds for as long as the task is alive — during long local-model
+    steps and control mapping as much as around LLM calls — so a healthy task, however long it
+    legitimately runs, never stops renewing. A lease lapses only when the worker died, its hub was
+    frozen for a full window, or the task outlived its time ceiling. (It used to be renewed only
+    before LLM calls, and this docstring's claim was false: on 18 Sep a run spent 14 minutes on
+    a pre-LLM step and was revoked here while working.)
 
     Reclaiming the DB row alone frees the SESSION but leaves the greenlet pinning a worker slot and
     a DB connection for good, with a redelivery free to run beside it. `terminate=True` kills the
@@ -164,30 +173,57 @@ def clean_up_abandoned_sessions(sess: Session) -> list[str]:
     return cancelled
 
 
+def _abandonment_filter(_now: datetime) -> list:
+    """What every "abandoned" verdict requires, shared by the sweep and session_is_abandoned so
+    the two can never diverge: active, not parked at REVIEW (a legitimate human wait), and no live
+    lease — dal.live_lease_exists is the SOLE definition of "a worker is alive". A finished
+    stage's lease is always NULL, so briefly sitting outside REVIEW alone never looks abandoned."""
+    return [dal.session_active(),  # literal — only IX_Session_Active makes the sweep O(active)
+            m.Scenario_Session.CurrentStage != WorkflowStage.REVIEW,
+            ~dal.live_lease_exists(m.Scenario_Session.SessionID, _now)]
+
+
+def _stale_before(_now: datetime) -> datetime:
+    """Untouched since this instant = never started (a never-enqueued task, or a regen epoch
+    reserved but never run), as opposed to merely QUEUED — which also holds no lease yet."""
+    return _now - timedelta(seconds=get_settings().reaper_stale_grace_seconds)
+
+
 def _find_abandoned_sessions(sess: Session, _now: datetime, proven_dead: set[str]):
-    """Active, non-REVIEW sessions with no live lease, that are either proven dead this pass or
-    stale-and-never-started (untouched for a full lease window — a never-enqueued task, or a
-    regen whose epoch was reserved but never ran). REVIEW sessions are a legitimate human wait
-    and are never reaped; a finished stage's lease is always NULL, so briefly sitting outside
-    REVIEW alone never looks abandoned."""
-    grace = _now - timedelta(seconds=get_settings().reaper_stale_grace_seconds)
-    # some worker is still actively working on this session. dal.live_lease_exists is the SOLE
-    # definition of "a worker is alive" — accept.ensure_review_gate asks the same question before
-    # it tells a caller that generation is still running, and the two must never diverge.
-    live_lease = dal.live_lease_exists(m.Scenario_Session.SessionID, _now)
+    """Sessions passing _abandonment_filter that are either proven dead this pass or stale (see
+    _stale_before)."""
     base = (select(m.Scenario_Session.SessionID, m.Scenario_Session.TenantID, m.Scenario_Session.EntityID)
-            .where(dal.session_active(),  # literal — only IX_Session_Active makes this sweep O(active)
-                m.Scenario_Session.CurrentStage != WorkflowStage.REVIEW,
-                ~live_lease))
+            .where(*_abandonment_filter(_now)))
     # Runs as two separate queries, deduped by SessionID, so `proven_dead` can be chunked past
     # SQL Server's ~2100-param IN cap on a mass crash.
     out: dict = {}
-    for row in sess.execute(base.where(m.Scenario_Session.UpdatedAt < grace)).mappings():
+    for row in sess.execute(base.where(m.Scenario_Session.UpdatedAt < _stale_before(_now))).mappings():
         out[row["SessionID"]] = row
     for chunk in _split_into_batches(proven_dead):
         for row in sess.execute(base.where(m.Scenario_Session.SessionID.in_(chunk))).mappings():
             out[row["SessionID"]] = row
     return list(out.values())
+
+
+def session_is_abandoned(sess: Session, session_id: str) -> bool:
+    """The sweep's own verdict for ONE session, on demand — accept.ensure_review_gate's "may I
+    finalise this run?". Same _abandonment_filter, AND either stale or proven dead, where proven
+    dead is what the sweep's steps 1/2 act on: a RUNNING row whose lease has expired. One query.
+
+    "No live lease" alone is NOT abandonment: a session whose task is still QUEUED, or a next-set
+    whose epoch was reserved but not yet claimed, holds no lease either. Treating that as dead
+    cancelled a healthy run — an accept sent 0.1 s after the create finalised the session
+    ("reaped: worker gone") before the worker had picked it up."""
+    _now = now()
+    s, ss = m.Scenario_Session, m.Subsystem_Stage_State
+    proven_dead = (select(1).select_from(ss)
+                   .where(ss.SessionID == s.SessionID, ss.Status == StageStatus.RUNNING,
+                          _lease_expired(_now))
+                   .exists())
+    return sess.execute(
+        select(s.SessionID).where(s.SessionID == session_id, *_abandonment_filter(_now),
+                                  or_(s.UpdatedAt < _stale_before(_now), proven_dead))
+    ).first() is not None
 
 
 def recover_session_now(sess: Session, scenario_session: dict) -> str | None:
@@ -207,7 +243,7 @@ def recover_session_now(sess: Session, scenario_session: dict) -> str | None:
     sid = scenario_session["SessionID"]
     ss = m.Subsystem_Stage_State
     _now = now()
-    expired = and_(ss.LeaseExpiresAt.isnot(None), ss.LeaseExpiresAt < _now)
+    expired = _lease_expired(_now)
     rows = sess.execute(
         select(ss.StateID, ss.SessionID, ss.SubsystemID, ss.ActiveTaskID, ss.Level)
         .where(ss.SessionID == sid, ss.Status == StageStatus.RUNNING, expired)).all()

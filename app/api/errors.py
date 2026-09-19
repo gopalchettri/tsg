@@ -3,6 +3,7 @@ and a status-code mapping registered on the FastAPI app.
 """
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 from http import HTTPStatus
 from typing import Any
@@ -179,6 +180,16 @@ async def _handle_admin_validation_error(_: Request, exc: AdminValidationError):
 
 
 
+def _json_safe_float(v: float) -> float | str:
+    """JSON has no NaN/Infinity: a finite float passes through, anything else is echoed as text."""
+    return v if math.isfinite(v) else str(v)
+
+
+def _json_safe_bytes(v: bytes) -> str:
+    """Valid UTF-8 echoes unchanged; invalid bytes come back as \\xNN escapes instead of a 500."""
+    return v.decode("utf-8", "backslashreplace")
+
+
 async def _handle_validation_error(_: Request, exc: RequestValidationError):
     """FastAPI/Pydantic request validation failure -> 422 in the [R9] envelope.
 
@@ -187,11 +198,17 @@ async def _handle_validation_error(_: Request, exc: RequestValidationError):
     through raw 500s on exactly the custom-validator errors this handler exists to report. `msg`
     already repeats the content.
 
-    jsonable_encoder, Decimal -> str: routes on ExactNumberRoute (app/api/exact_json.py) hand the
-    schema Decimals, so a rejected rating's `input` is one — JSONResponse cannot serialize it (a
-    500 on exactly the 422 it was reporting), and str echoes the digits the client sent."""
+    The same failure, for any value: the echoed `input` is whatever the client sent, and
+    JSONResponse (allow_nan=False) raises on anything JSON cannot represent — a 500 on exactly the
+    422 it was reporting. So the echo is encoded to JSON-safe forms, never trusted as-is:
+    Decimal -> str (routes on ExactNumberRoute, app/api/exact_json.py, hand the schema Decimals;
+    str keeps the digits the client sent), a non-finite float (json.loads accepts NaN/Infinity)
+    -> its text, and raw bytes (a non-JSON body echoes the body itself) -> text with any invalid
+    UTF-8 escaped — jsonable_encoder's own bytes.decode() raises on those. jsonable_encoder applies
+    custom_encoder before its own primitive pass-through."""
     errors = jsonable_encoder([{k: v for k, v in e.items() if k != "ctx"} for e in exc.errors()],
-                              custom_encoder={Decimal: str})
+                              custom_encoder={Decimal: str, float: _json_safe_float,
+                                              bytes: _json_safe_bytes})
     return JSONResponse(status_code=422, content=_env("validation_error", "request validation failed",
                                                     errors=errors))
 

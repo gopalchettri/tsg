@@ -86,6 +86,44 @@ REQUIRED_INDEXES = [
     ("UX_Control_Library_Code", "Control_Library", ("ControlCode",)),
 ]
 
+# Which script creates every index the boot checks (CHECKLIST 1 and 5), so a refusal names the
+# exact script for the index that is actually missing. This used to be a hand-written sentence in
+# the error text, and it silently fell behind: it never learned UX_Scenario_ActiveScoped's
+# migration. First = the canonical full-schema script; a second = the standalone migration for a
+# database that is already up. tests/test_schema_sync.py fails if a checked index has no entry or
+# a named script does not create it — so this can no longer drift.
+_CORE = "scripts/eyshield_handoff/1. TSG_Core.sql"
+_LIBRARY = "scripts/eyshield_handoff/2. Threat_library.sql"
+_CONTROLS = "scripts/eyshield_handoff/4. Control_library.sql"
+INDEX_SCRIPTS: dict[str, tuple[str, ...]] = {
+    "UX_Session_ActiveAsset": (_CORE,),
+    "IX_Session_Active": (_CORE,),
+    "UX_Session_IdempotencyKey": (_CORE,),
+    "UX_Scenario_ActiveIdentity": (_CORE,),
+    "UX_Scenario_ActiveScoped": (_CORE, "scripts/TSG_Migration_ActiveScopedIndex.sql"),
+    "UX_Scenario_ActiveAccepted": (_CORE,),
+    "UX_SubsystemStageState_SessionSubLevel": (_CORE,),
+    "UX_TreatmentPlan_ActiveScenario": (_CORE,),
+    "UX_GroundingCalibration_Running": (_CORE, "scripts/TSG_Migration_GroundingCalibration.sql"),
+    "UX_ThreatType_NaturalKey": (_LIBRARY,),
+    "UX_ThreatCatalogue_NaturalKey": (_LIBRARY, "scripts/TSG_Migration_CatalogueNaturalKey.sql"),
+    "UX_ThreatActor_NaturalKey": (_LIBRARY,),
+    "UX_ThreatCategory_NaturalKey": (_LIBRARY,),
+    "UX_Control_Standard_Name": (_CONTROLS,),
+    "UX_Control_Library_Code": (_CONTROLS,),
+}
+
+
+def _where_to_create(indexes: list[str]) -> str:
+    """'<index>: <script> (or, on a database already up, <migration>)' for each missing index."""
+    def _one(ix: str) -> str:
+        scripts = INDEX_SCRIPTS.get(ix, ())
+        if not scripts:
+            return f"{ix}: no script registered in invariants.INDEX_SCRIPTS"
+        tail = f" (or, on a database already up, {scripts[1]})" if len(scripts) > 1 else ""
+        return f"{ix}: {scripts[0]}{tail}"
+    return "; ".join(_one(ix) for ix in indexes)
+
 # (A former CHECKLIST 6 verified the CRM Risk-module tables existed when risk_module_enabled.
 # Removed 2026-08-06: the treatment-plan feature now receives ALL register risk data in the
 # request body — TSG reads no external risk tables, so there is nothing to verify.)
@@ -234,12 +272,7 @@ def _assert_indexes(engine: Engine) -> None:
     missing = [ix for ix in by_name if ix not in present]
     if missing:
         raise StartupInvariantError(
-            f"missing required indexes: {missing}. Which script creates which: the library "
-            "natural keys (Type/Catalogue/Actor/Category) come from scripts/eyshield_handoff/"
-            "'2. Threat_library.sql', the session and pipeline ones from '1. TSG_Core.sql', "
-            "the control ones from '4. Control_library.sql'; UX_GroundingCalibration_Running "
-            "from scripts/TSG_Migration_GroundingCalibration.sql, and "
-            "UX_ThreatCatalogue_NaturalKey from scripts/TSG_Migration_CatalogueNaturalKey.sql. "
+            f"missing required indexes — {_where_to_create(missing)}. "
             "A UNIQUE index still absent AFTER its script ran usually means the table holds "
             "duplicate live rows: the CREATE terminated with Msg 1505 and the guard left no "
             "index rather than dropping one. Check for duplicates before re-running."
@@ -273,10 +306,7 @@ def _assert_filtered_index_literals(engine: Engine) -> None:
     present = {r[0]: (r[1] or "") for r in rows}
     missing = [name for name in names if name not in present]
     if missing:
-        raise StartupInvariantError(
-            "missing filtered indexes (re-run scripts/eyshield_handoff/'1. TSG_Core.sql'; for "
-            f"UX_GroundingCalibration_Running alone, "
-            f"scripts/TSG_Migration_GroundingCalibration.sql): {missing}")
+        raise StartupInvariantError(f"missing filtered indexes — {_where_to_create(missing)}")
     stale = [name for name, status in FILTERED_INDEX_LITERALS if f"'{status.value}'" not in present[name]]
     if stale:
         raise StartupInvariantError(

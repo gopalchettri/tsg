@@ -13,7 +13,14 @@ from pydantic.json_schema import JsonDict
 
 
 class ApiModel(BaseModel):
-    """Base for every request/response model. Its ONLY job is to stamp UTC on timestamps.
+    """Base for every request/response model. Two jobs that no model may be allowed to forget:
+    stamp UTC on timestamps (below), and refuse non-finite numbers (`allow_inf_nan=False`).
+
+    Non-finite numbers: stdlib `json.loads` — which FastAPI parses every body with — accepts the
+    non-standard `NaN`/`Infinity` literals, and pydantic's float default lets them through. A NaN
+    that got in then broke the response or the stored row downstream, and one that was rejected
+    broke the 422 itself (JSONResponse serializes with allow_nan=False — see
+    errors._handle_validation_error). Refused here, once, every body gets a 422 `finite_number`.
 
     Every datetime in this schema is UTC by convention — `dal.now()` returns aware UTC and
     `_utc_naive` strips tzinfo at the boundary because "pyodbc silently drops tzinfo binding into
@@ -34,6 +41,9 @@ class ApiModel(BaseModel):
     The `*` serializer is safe for non-datetime values — verified it leaves nested models,
     lists and scalars untouched, returning them unchanged for pydantic's normal handling.
     """
+
+    # Merged into every subclass's own model_config (pydantic v2 inherits and merges ConfigDict).
+    model_config = ConfigDict(allow_inf_nan=False)
 
     @field_serializer("*", when_used="unless-none")
     def _stamp_utc(self, value):

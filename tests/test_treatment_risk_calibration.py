@@ -14,6 +14,8 @@ These tests pin the fix at both layers so it cannot silently regress:
 """
 from __future__ import annotations
 
+import pytest
+
 from app.core.enums import ActionPriority, RiskLevel
 from app.pipeline import prompts
 from app.pipeline.treatment import _risk_alignment_warnings
@@ -329,6 +331,21 @@ def test_genuine_mismatch_is_still_flagged_with_decimals():
     assert _disagrees(_snap(likelihood_rating=4.5, impact_rating=4.7, final_risk_rating=25))
 
 
+@pytest.mark.parametrize(("lr", "ir", "fr", "flagged"), [
+    # The product is rounded to final_risk_rating's OWN scale, half-up (the register's own
+    # rounding), and only then compared.
+    (0.5, 0.5, 0.3, False),   # 0.25 -> 0.3 at one place: a tie rounds UP, so this reconciles
+    (0.5, 0.5, 0.2, True),    # ...and the other side of the tie does not
+    (4.5, 4.7, 21, False),    # 21.15 -> 21 at whole-number scale: a register storing integers
+    (4.5, 4.7, 22, True),     # ...but 22 is a real contradiction
+    (3.3, 3.3, 11, False),    # 10.89 -> 11
+])
+def test_advisory_rounds_the_product_to_the_finals_own_scale(lr, ir, fr, flagged):
+    """Pins the tolerance rule itself — tie direction and a final coarser than the product — which
+    no earlier test fixed in place."""
+    assert _disagrees(_snap(likelihood_rating=lr, impact_rating=ir, final_risk_rating=fr)) is flagged
+
+
 def test_snapshot_stores_json_numbers_even_when_fed_strings():
     """THE root-cause pin. pydantic dumps Decimal as a STRING, and regenerate replays the stored
     snapshot without re-validating it, so a string reaching the blob would be re-read and
@@ -377,7 +394,6 @@ def test_corrupt_rating_degrades_to_uncalibrated_rather_than_raising():
 # --- the schema boundary: rejected values must never reach the pipeline at all ---
 
 def test_schema_bounds_reject_negative_over_4_places_and_over_15_digits():
-    import pytest
     from pydantic import ValidationError
 
     from app.api.schemas_treatment import TreatmentPlanBody

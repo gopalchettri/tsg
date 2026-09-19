@@ -43,7 +43,7 @@
   ---------------------------------------------------------------------------
   THE INDEXES ARE NOT OPTIONAL
   ---------------------------------------------------------------------------
-  The application verifies 14 of the indexes in Section 6 at start-up and
+  The application verifies the indexes in Section 6's required_index list at start-up and
   refuses to boot if any is missing, on the wrong columns, or not unique.
 
   Many of the rest are unique indexes that arbitrate concurrent writes. The

@@ -424,6 +424,14 @@ def test_treatment_plan_lifecycle_over_real_http(client, monkeypatch):
     assert r.status_code == 422, r.text
     err = r.json()["details"]["errors"][0]
     assert (err["type"], err["input"]) == ("decimal_max_digits", "4.1234000000000000001")
+    # Non-standard JSON the stdlib reader accepts anyway. Found live returning 500: the 422
+    # handler could not serialize the NaN it was echoing back.
+    for literal, echo in (("NaN", "nan"), ("Infinity", "inf"), ("-Infinity", "-inf")):
+        raw = json.dumps({**_PLAN_BODY, "final_risk_rating": "@"}).replace('"@"', literal)
+        r = client.post(tp, content=raw, headers={"content-type": "application/json"})
+        assert r.status_code == 422, (literal, r.text)
+        err = r.json()["details"]["errors"][0]
+        assert (err["type"], err["input"]) == ("finite_number", echo), literal
     r = client.post(tp, json=_PLAN_BODY)
     assert r.status_code == 202, r.text
     v1 = r.json()["plan_id"]
@@ -502,3 +510,15 @@ def test_treatment_plan_lifecycle_over_real_http(client, monkeypatch):
     assert ev.status_code == 200, ev.text
     keys(ev.json(), S.TreatmentEvidence, "evidence")
     assert ev.json()["plan_id"] == v1 and ev.json()["input_snapshot"]
+    # The plan id is request validation: a malformed request is refused BEFORE the handler opens a
+    # DB session (it used to pay a pool checkout and the authorisation SELECT first). The trap below
+    # fails the test if the handler body runs at all.
+    def _no_db():
+        raise AssertionError("evidence opened a DB session for a malformed request")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(treatment_api, "db_session", _no_db)
+        for query in ("", f"?plan_id={v1}&version=00000000-0000-0000-0000-000000000000"):
+            assert client.get(tp + "/evidence" + query).status_code == 422, query
+    # Same id, different letter case (SQL Server returns GUIDs uppercase): agreement, not a 422.
+    assert client.get(tp + f"/evidence?plan_id={v1.upper()}&version={v1.lower()}").status_code == 200
