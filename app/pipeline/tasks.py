@@ -411,6 +411,14 @@ def _ground_entry_points(scenario: dict, vocab: dict[str, int],
     scenario.pop("plausible_entry_points", None)  # coverage-planning names, superseded by _ids
 
 
+def _clean_title(scenario: dict, asset_name: str | None) -> None:
+    """Titles name the impact only; the asset is shown next to them. The prompt asks for that,
+    and this removes a leading asset name the model adds anyway, before validation sees it."""
+    title = scenario.get("scenario_title")
+    if isinstance(title, str):
+        scenario["scenario_title"] = validation.strip_asset_prefix(title, asset_name)
+
+
 def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict, sc,
                     enriched: dict, llm: LLMClient, task_id: str, epoch: int,
                     sibling_texts: list[tuple[int, str]] | None = None,
@@ -456,6 +464,7 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
                             scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID, stage="scenario",
                             expected_type=dict, correlation_id=correlation_id,
                             temperature=get_settings().scenario_generation_temperature)
+    _clean_title(scenario, scenario_session["AssetName"])
     # Use critical_service from base_ctx (what the model actually saw), not the raw
     # asset_context — placeholder values like "Unknown"/"TBD" are scrubbed out there, and
     # validation shouldn't require a value the model was never shown.
@@ -513,6 +522,7 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
             # threat at one scenario without any visible error. Merging means a repair can only
             # overwrite fields it actually returned — it can never accidentally delete one.
             merged = {**scenario, **repaired}
+            _clean_title(merged, scenario_session["AssetName"])   # a repaired title can bring it back
             # A merge can still accidentally EMPTY a field, though, which is just as bad as
             # deleting it: if the repair explicitly returns "supporting_systems_involved": [] or
             # "plausible_entry_points": [], that's a valid value that would overwrite the

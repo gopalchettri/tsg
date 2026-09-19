@@ -75,6 +75,67 @@ def _references(needle: str, haystack: str) -> bool:
     return re.search(rf"(?<![a-z0-9]){re.escape(n)}(?![a-z0-9])", h) is not None
 
 
+def _asset_boundary_pattern(asset_name: str) -> re.Pattern | None:
+    """Build a regex that finds the asset name inside text.
+
+    Build one regex pattern for matching/removing an asset name from text, used everywhere
+    this needs to happen. Uses lookarounds instead of \\b word boundaries because asset names
+    can start or end with non-word characters (like "(PGS)"). A plain substring match would
+    also match INSIDE unrelated words — asset name "CIS" once matched inside "decision",
+    corrupting text to "Loss of de ion integrity" and poisoning grounding, GenericName, and
+    triage downstream."""
+    # Handles three cases a plain literal match would miss — each one a real way the asset
+    # name used to leak through into GenericName and the shared library:
+    #   * trailing punctuation on the name ("ACME Corp.") not matching "ACME Corp systems"
+    #   * extra/missing whitespace ("Power  Plant" vs "Power Plant")
+    #   * a possessive right after the match ("Citizen Portal's credentials") leaving a
+    #     dangling "'s"
+    a = (asset_name or "").strip().rstrip(".,;:!")
+    if not a:
+        return None
+    body = r"\s+".join(re.escape(tok) for tok in a.split())
+    return re.compile(r"(?<!\w)" + body + r"(?:'s)?(?!\w)", re.IGNORECASE)
+
+
+def _asset_name_forms(asset_name: str | None) -> list[re.Pattern]:
+    """Every way a title can name the asset, longest first: the full name ("Power Generation
+    System (PGS)"), the name without its bracketed short form ("Power Generation System") and
+    the short form itself ("PGS"). Whole words only, so "PGSX" or "decision" never match."""
+    name = (asset_name or "").strip()
+    forms = [name]
+    short = re.search(r"\(([^()]+)\)\s*$", name)
+    if short:
+        forms += [name[:short.start()].strip(), short.group(1).strip()]
+    pats = (_asset_boundary_pattern(f) for f in dict.fromkeys(forms) if len(f) >= 2)
+    return [p for p in pats if p is not None]
+
+
+#: What sits between a leading asset name and the rest of a title: an em/en dash, colon or bar,
+#: or a hyphen with spaces around it ("PGS - loss"). A bare hyphen is part of a word
+#: ("PGS-related"). Dashes as escapes, which re reads the same, so nobody mistakes them for "-".
+_TITLE_SEPARATOR = r"(?:\s*[\u2014\u2013:|]+\s*|\s+-+\s+)"
+
+
+def strip_asset_prefix(title: str, asset_name: str | None) -> str:
+    """Drop a LEADING asset name and its separator from a scenario title, and start what is left
+    with a capital: "Power Generation System (PGS) — loss of telemetry" -> "Loss of telemetry".
+
+    Titles name the impact only; the asset is shown next to them. The prompt asks for that, and
+    this makes it true whatever the model writes. A title without such a prefix, or one that is
+    nothing but the asset name, is returned unchanged."""
+    for pat in _asset_name_forms(asset_name):
+        m = re.match(r"\s*(?:" + pat.pattern + r")" + _TITLE_SEPARATOR, title, pat.flags)
+        rest = title[m.end():].strip() if m else ""
+        if rest:
+            return rest[:1].upper() + rest[1:]
+    return title
+
+
+def title_names_asset(title: str, asset_name: str | None) -> bool:
+    """Whether a title still names the asset anywhere, in any of its forms."""
+    return any(p.search(title) for p in _asset_name_forms(asset_name))
+
+
 def _mentions(needle: str, haystack: str) -> bool:
     """Return whether ``haystack`` contains enough meaningful parts of ``needle``.
 
@@ -136,9 +197,12 @@ def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_
     # Skip reference checks for blank fields already reported by _check_fields.
     if statement.strip() and needle.strip() and not _mentions(needle, statement):
         errors.append(f"scenario_statement does not reference the threat name/type ({needle})")
+    # The title names the IMPACT only — the asset is shown next to it (the statement and risk
+    # statement below must still name it). strip_asset_prefix has already removed a leading
+    # asset name; one left anywhere else is reported, never rewritten mid-sentence.
     title = str(scenario.get("scenario_title") or "")
-    if title.strip() and asset_name and not _mentions(asset_name, title):
-        errors.append(f"scenario_title does not reference the asset ({asset_name})")
+    if title.strip() and asset_name and title_names_asset(title, asset_name):
+        errors.append(f"scenario_title names the asset ({asset_name}); titles carry only the impact")
     if statement.strip() and asset_name and not _mentions(asset_name, statement):
         errors.append(f"scenario_statement does not reference the asset ({asset_name})")
     # An asset may have no critical service, so check this field only when provided.

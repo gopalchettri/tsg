@@ -24,6 +24,10 @@ from app.db import models as m
 from app.db.dal import guid, now
 from app.pipeline import grounding, prompts, validation
 from app.pipeline.llm import LLMClient, Provenance
+
+# The asset-name matcher lives in validation (a text module with no app imports) so the scenario
+# title check can share it; importers of it from here keep working.
+from app.pipeline.validation import _asset_boundary_pattern
 from app.sse import bus
 
 log = get_logger(__name__)
@@ -180,28 +184,6 @@ def _safe_text(v: Any, default: str | None) -> str | None:
     if default is None:
         return v if isinstance(v, str) else None
     return grounding.ensure_text(v, default)
-
-
-def _asset_boundary_pattern(asset_name: str) -> re.Pattern | None:
-    """Build a regex that finds the asset name inside text.
-
-    Build one regex pattern for matching/removing an asset name from text, used everywhere
-    this needs to happen. Uses lookarounds instead of \\b word boundaries because asset names
-    can start or end with non-word characters (like "(PGS)"). A plain substring match would
-    also match INSIDE unrelated words — asset name "CIS" once matched inside "decision",
-    corrupting text to "Loss of de ion integrity" and poisoning grounding, GenericName, and
-    triage downstream."""
-    # Handles three cases a plain literal match would miss — each one a real way the asset
-    # name used to leak through into GenericName and the shared library:
-    #   * trailing punctuation on the name ("ACME Corp.") not matching "ACME Corp systems"
-    #   * extra/missing whitespace ("Power  Plant" vs "Power Plant")
-    #   * a possessive right after the match ("Citizen Portal's credentials") leaving a
-    #     dangling "'s"
-    a = (asset_name or "").strip().rstrip(".,;:!")
-    if not a:
-        return None
-    body = r"\s+".join(re.escape(tok) for tok in a.split())
-    return re.compile(r"(?<!\w)" + body + r"(?:'s)?(?!\w)", re.IGNORECASE)
 
 
 def asset_agnostic_name(name: str | None, asset_name: str) -> str | None:

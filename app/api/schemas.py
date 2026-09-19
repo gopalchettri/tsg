@@ -722,7 +722,7 @@ _SCENARIO_EXAMPLE: JsonDict = {
     "threat_category": "Tampering",
     "threat_type": "unauthorized modification of firmware",
     "threat_name": "Unauthorized firmware update of Remote Terminal Unit (RTU)",
-    "scenario_title": "Remote Terminal Unit (RTU) — Unauthorized firmware push",
+    "scenario_title": "Unauthorized firmware push",
     "scenario_statement": (
         "An attacker with OT network access pushes unsigned firmware to the RTU, "
         "compromising the integrity of its control logic."

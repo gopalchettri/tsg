@@ -619,7 +619,7 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6/
        "threat_category": "Tampering",
        "threat_type": "unauthorized modification of firmware",
        "threat_name": "Unauthorized firmware update of Remote Terminal Unit (RTU)",
-       "scenario_title": "Remote Terminal Unit (RTU) — Unauthorized firmware push",
+       "scenario_title": "Unauthorized firmware push",
        "scenario_statement": "An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.",
        "risk_statement": "The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.",
        "supporting_systems_involved": [
