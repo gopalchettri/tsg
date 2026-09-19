@@ -43,7 +43,34 @@ def get_engine() -> Engine:
         def _set_query_timeout(dbapi_connection: object, connection_record: object) -> None:
             dbapi_connection.timeout = s.db_statement_timeout_seconds  # type: ignore[attr-defined]
 
+        # retval=True: the "chained" handle_error style, where a returned exception replaces
+        # SQLAlchemy's and None keeps it.
+        event.listen(engine, "handle_error", map_serialization_failure, retval=True)
+
     return engine
+
+
+#: SQLSTATE of a transaction chosen as a deadlock victim (SQL Server 1205) or a serialization
+#: failure. Retrying the whole unit of work is the correct response to both.
+_SERIALIZATION_FAILURE = "40001"
+
+
+def map_serialization_failure(ctx) -> Exception | None:
+    """A deadlock victim is TEMPORARY: surface it as OperationalError.
+
+    pipeline_common.TRANSIENT_INFRA_ERRORS — the contract that sends an infrastructure hiccup to
+    Celery's autoretry instead of failing the run — is (OperationalError,). pyodbc raises its base
+    `Error` for SQLSTATE 40001, which SQLAlchemy wraps as a plain DBAPIError, so a deadlock fell
+    into the generic handler and a healthy run was recorded as failed. A no-op when the error is
+    already an OperationalError or has another SQLSTATE."""
+    from sqlalchemy.exc import OperationalError
+
+    if isinstance(ctx.sqlalchemy_exception, OperationalError):
+        return None
+    args = getattr(ctx.original_exception, "args", ())
+    if args and args[0] == _SERIALIZATION_FAILURE:
+        return OperationalError(ctx.statement, ctx.parameters, ctx.original_exception)
+    return None
 
 
 @lru_cache

@@ -30,7 +30,7 @@ from app.db import dal
 from app.db import models as m
 from app.db.dal import RegenerateConflict, guid, now
 from app.db.engine import db_session
-from app.pipeline import control_mapping, tasks
+from app.pipeline import control_mapping, lease_keeper, tasks
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 from app.pipeline.pipeline_common import TRANSIENT_INFRA_ERRORS, log_transient_infra_retry
 from app.sse import bus
@@ -98,8 +98,12 @@ def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, ki
     # execution, which runs on a session already completed at its review barrier.
     # acquire_lock's SessionStatus == active fence would CAS-fail on all of them.
     acquired = dal.acquire_execution_lock(sess, sid, subsystem_id, task_id)
+    stop_keeper = None
     if acquired:
         sess.commit()
+        # Leases stay alive while THIS task is alive — see lease_keeper. That covers every
+        # long no-LLM step under this lock, control mapping after finish_stage included.
+        stop_keeper = lease_keeper.start(sid, task_id)
     try:
         yield acquired
     except BaseException:
@@ -109,6 +113,8 @@ def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, ki
         sess.rollback()
         raise
     finally:
+        if stop_keeper is not None:
+            stop_keeper()   # BEFORE the release: never renew a lock this task is giving up
         if acquired:
             try:
                 if not dal.release_lock(sess, sid, subsystem_id, task_id):

@@ -89,27 +89,21 @@ def threat_label(t: dict) -> str:
 
 
 def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_session: dict,
-            subsystem_id: int, stage: str, level: SubsystemLevel | None = None,
-            epoch: int | None = None, task_id: str | None = None,
-            correlation_id: str | None = None,
+            subsystem_id: int, stage: str, correlation_id: str | None = None,
             expected_type: type, temperature: float | None = None,
             response_schema: type | None = None) -> tuple[Any, Provenance | None]:
     """Call the LLM and store the full prompt/response receipt in Prompt_Log.
+
+    Renews NO lease: lease_keeper keeps the task's leases alive for as long as the task is. This
+    used to renew the stage and `_LOCK` leases before every call — two UPDATEs per LLM call — and
+    being the ONLY renewal is what let any long step without an LLM call get a live run reaped.
 
     `response_schema` (a Pydantic class; the treatment plan today) is the exact reply shape,
     sent as strict Structured Outputs where the model honours them (llm._with_response_format).
     It rides along ONLY when declared: the stage fakes in the test-suite implement
     chat(messages, temperature=, expected_type=) with no **kw, and a stage that declares no
     schema must keep calling them unchanged."""
-    sid = scenario_session["SessionID"]
-    if level is not None and epoch is not None and task_id is not None:
-        # All three travel together: renew_lease needs every one of them, so guarding on
-        # `level` alone would hand it None for epoch/task_id on any caller that omitted them.
-        if not dal.renew_lease(sess, sid, subsystem_id, level, epoch, task_id):
-            log.warning("stage.lease_renewal_failed", session_id=sid,
-                        subsystem=subsystem_id, level=str(level))
-        if not dal.renew_lock_lease(sess, sid, subsystem_id, task_id):
-            log.debug("lock.lease_renewal_skipped", session_id=sid, subsystem=subsystem_id)
+    # Commit before the (slow) LLM call so no row lock is held across it.
     sess.commit()
     # expected_type controls the LLM provider's JSON mode. Getting this wrong breaks things:
     # "json_object" mode forces a top-level object, so the threats stage (which expects a

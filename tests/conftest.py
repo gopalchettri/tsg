@@ -52,6 +52,7 @@ def _clear_process_caches() -> None:
     bus._subscriber_pool.cache_clear()
     sessions._sse_semaphore.cache_clear()
     embeddings._vector_store.cache_clear()
+    embeddings.clear_cache()   # L1 vectors + matrices: one test's embeds are another's cache hits
     embeddings._breaker_open_until = 0.0
     dal._clear_scope_type_entity_cache()
     # technique_reference caches the WHOLE corpus in module globals for the life of the process.

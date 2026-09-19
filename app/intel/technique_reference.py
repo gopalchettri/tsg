@@ -324,21 +324,34 @@ def stats() -> dict[str, Any]:
     col = _store_if_healthy()
     if col is None:
         return {"total": 0, "by_source": {}, "by_stride": {}, "built_at": None,
-                "available": False, "sample": []}
+                "available": False, "sample": [], "vectors_cached": None, "warm": None}
     by_source: dict[str, int] = {}
     by_stride: dict[str, int] = {}
     built_at = None
     total = 0
-    for doc in col.find({}, {"_id": 0, "source": 1, "stride": 1, "built_at": 1}):
+    limit = get_settings().max_embed_chars
+    texts: list[str] = []
+    for doc in col.find({}, {"_id": 0}):
         total += 1
         by_source[doc.get("source", "?")] = by_source.get(doc.get("source", "?"), 0) + 1
         for c in doc.get("stride") or ():
             by_stride[c] = by_stride.get(c, 0) + 1
         built_at = built_at or doc.get("built_at")
+        texts.append(passage_text(doc, limit))
     sample = list(col.find({}, {"_id": 0, "id": 1, "name": 1, "stride": 1, "applies_to": 1})
                 .sort("id", 1).limit(3))
+    # How much of the corpus scenarios can actually USE: lookup is cache-only, so an uncached
+    # corpus means no technique block. Counted over the texts of THIS read, not the per-process
+    # _corpus() snapshot, which can be stale or empty — an empty one compared 0 >= 0 and reported
+    # warm=true for a corpus nothing could use.
+    from app.pipeline.embeddings import stored_count
+
+    cached = stored_count(texts, model_id=get_settings().embedding_model,
+                          group=COLLECTION, kind="passage") if texts else 0
+    warm = None if cached is None else bool(texts) and cached >= len(set(texts))
     return {"total": total, "by_source": by_source, "by_stride": by_stride,
-            "built_at": built_at, "available": True, "sample": sample}
+            "built_at": built_at, "available": True, "sample": sample,
+            "vectors_cached": cached, "warm": warm}
 
 
 # ---------------------------------------------------------------- lookup
@@ -405,6 +418,102 @@ def _corpus() -> tuple[list[dict], list[str]]:
     return entries, texts
 
 
+#: The admin-queue task that finishes warming the live corpus (celery_app.warm_technique_reference).
+WARM_TASK = "tsg.warm_technique_reference"
+#: Passages per warm step: one embed call and one durable Mongo write each, so a killed warm
+#: resumes from the last step instead of starting over.
+_WARM_BATCH = 32
+_WARM_LOCK_KEY = "tsg:technique-warm"
+#: A cold lookup asks for a warm at most this often per process — it runs on every scenario.
+_WARM_REQUEST_INTERVAL_S = 600.0
+_warm_requested_at: float | None = None
+
+
+class _WarmBusy(Exception):
+    """Another process is already warming the corpus."""
+
+
+def _request_warm() -> None:
+    """Ask the admin queue to finish warming the live corpus. Throttled per process, and never
+    raises: a lookup that cannot even ask must still return its fail-open []."""
+    global _warm_requested_at
+    t = time.monotonic()
+    if _warm_requested_at is not None and t - _warm_requested_at < _WARM_REQUEST_INTERVAL_S:
+        return
+    _warm_requested_at = t
+    log.warning("technique_reference.corpus_not_warm",
+                note="scenarios run without the technique block until the warm completes")
+    try:
+        from app.pipeline.celery_app import celery_app  # local: celery_app imports this module
+        celery_app.send_task(WARM_TASK)
+    except Exception:
+        log.warning("technique_reference.warm_request_failed", exc_info=True)
+
+
+def _shared_count(texts: list[str]) -> int | None:
+    """How many of `texts` the SHARED (Mongo) cache holds — what the pipeline workers can read."""
+    from app.pipeline.embeddings import stored_count
+
+    return stored_count(texts, model_id=get_settings().embedding_model, group=COLLECTION,
+                        kind="passage")
+
+
+def warm(llm, texts: list[str], *, budget_s: float) -> tuple[int | None, bool | None]:
+    """Embed `texts` into the shared cache in batches until done or `budget_s` runs out.
+    Returns (passages in the SHARED cache, complete), or (None, None) when it cannot be read.
+
+    Judged by the shared cache, never by this process's memory: a vector only this process holds
+    helps no pipeline worker, and a warm that counted its own L1 hits reported "complete" after a
+    failed Mongo write and was never asked again. So this process's L1 for the group is dropped
+    first — anything it held that Mongo lacks is recomputed and persisted. Resumable: every batch
+    is persisted, so the next call's L2 read skips whatever this one already paid for."""
+    from app.pipeline import embeddings
+
+    model_id = get_settings().embedding_model
+    embeddings.clear_cache(COLLECTION)
+    deadline = time.monotonic() + budget_s
+    for i in range(0, len(texts), _WARM_BATCH):
+        if time.monotonic() > deadline:
+            log.warning("technique_reference.warm_budget_exhausted", processed=i, total=len(texts))
+            break
+        embeddings.get_vectors(llm, texts[i:i + _WARM_BATCH], model_id=model_id,
+                               group=COLLECTION, kind="passage")
+    stored = _shared_count(texts)
+    return (None, None) if stored is None else (stored, stored >= len(set(texts)))
+
+
+def warm_live_corpus(*, budget_s: float) -> dict[str, Any]:
+    """Warm the LIVE corpus within `budget_s`, one warmer at a time across processes (the
+    rebuild and the warm task share this lock).
+
+    `complete`: True = every passage is in the shared cache; False = not yet; None = unknown
+    (another warmer holds the lock, the corpus or the shared cache could not be read).
+    `continue`: whether the caller should queue the next step — only when this step made
+    progress. A step that stored nothing (Mongo refusing writes, say) would recompute the whole
+    budget again every few seconds, forever; it stops and says so instead, and the next cold
+    lookup (throttled) asks again later."""
+    from app.core.joblock import job_lock
+    from app.pipeline.llm import _slot_redis, get_llm
+
+    _, texts = _corpus()
+    if not texts:   # no corpus, or it could not be read: nothing to warm now
+        return {"total": 0, "warmed": 0, "progress": 0, "complete": None, "continue": False}
+    try:
+        with job_lock(_WARM_LOCK_KEY, ttl=int(budget_s) + 120, busy=_WarmBusy(),
+                      redis_factory=_slot_redis):
+            before = _shared_count(texts)
+            warmed, complete = warm(get_llm(), texts, budget_s=budget_s)
+    except _WarmBusy:
+        return {"total": len(texts), "warmed": None, "progress": 0, "complete": None,
+                "continue": False}
+    progress = (warmed or 0) - (before or 0)
+    if complete is False and progress <= 0:
+        log.error("technique_reference.warm_stalled", total=len(texts), warmed=warmed,
+                  note="nothing reached the shared cache this step; check Mongo writes")
+    return {"total": len(texts), "warmed": warmed, "progress": progress, "complete": complete,
+            "continue": complete is False and progress > 0}
+
+
 def corpus_vocabulary() -> set[str]:
     """The DISTINCT applies_to labels the live corpus actually carries.
 
@@ -445,10 +554,20 @@ def lookup(llm, query: str, *, stride: str | None = None,
     if not entries:
         return []
     s = get_settings()
+    # A SHARED cache (Mongo) is what the admin-queue warm fills. Without one (EMBEDDING_STORE=memory)
+    # a warm elsewhere could never reach this process, so this process computes the corpus itself,
+    # once per process lifetime — memory mode already does that for every other corpus.
+    shared = s.embedding_store == "mongo"
     try:
+        # compute=False: with a shared cache a live scenario stage must NEVER embed the corpus. On
+        # 18 Sep it did — 900 cold passages on a CPU box, 14+ minutes before its first LLM call —
+        # and the run was reaped while working. Not fully cached yet -> no technique block this
+        # once (fail-open, this function's contract) and the admin queue is asked to warm it.
         got = embeddings.get_matrix(llm, texts, model_id=s.embedding_model,
-                                    group=COLLECTION, kind="passage")
-        if got is None:  # numpy missing, or no usable vectors
+                                    group=COLLECTION, kind="passage", compute=not shared)
+        if got is None:  # not fully cached yet, numpy missing, or no usable vectors
+            if shared:
+                _request_warm()
             return []
         mat, row_idx = got
         # Through get_vectors, not llm.embed directly, so the SAME threat asked again -- a

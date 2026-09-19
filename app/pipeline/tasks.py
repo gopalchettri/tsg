@@ -33,6 +33,7 @@ from app.intel import fetchers as intel
 from app.intel.fetchers import IntelTerms
 from app.pipeline import (
     control_mapping,
+    lease_keeper,
     prompts,
     scoping,
     validation,
@@ -453,8 +454,7 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
                                         entry_points=entry_labels, category=category)
     scenario, prov = _ask_ai(sess, llm, messages,
                             scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID, stage="scenario",
-                            level=SubsystemLevel.SCENARIOS, epoch=epoch, task_id=task_id, expected_type=dict,
-                            correlation_id=correlation_id,
+                            expected_type=dict, correlation_id=correlation_id,
                             temperature=get_settings().scenario_generation_temperature)
     # Use critical_service from base_ctx (what the model actually saw), not the raw
     # asset_context — placeholder values like "Unknown"/"TBD" are scrubbed out there, and
@@ -480,11 +480,10 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
                 "The previous response failed validation: " + "; ".join(missing) +
                 ". Correct only these violations. Do not change factual content unless "
                 "required. Return only the corrected JSON object."}]
-        try:  # through _ask_ai, so Prompt_Log keeps both attempts and the stage lease renews
+        try:  # through _ask_ai, so Prompt_Log keeps both attempts
             repaired, r_prov = _ask_ai(sess, llm, repair_messages,
                                     scenario_session=scenario_session, subsystem_id=ASSET_UNIT_ID,
-                                    stage="scenario", level=SubsystemLevel.SCENARIOS, epoch=epoch,
-                                    task_id=task_id, expected_type=dict,
+                                    stage="scenario", expected_type=dict,
                                     # Deliberately the SAME id as the attempt above: CorrelationID
                                     # has no unique constraint and the evidence read returns every
                                     # matching row ordered by CreatedAt, so the two attempts group.
@@ -934,8 +933,8 @@ def _generate_scenario_batch(sess: Session, scenario_session: dict, base_ctx: di
     These calls are independent, so running them one at a time made a session's ~10 scenarios
     take ~10x one call for no reason. Same tokens either way; only wall-clock changes.
 
-    EACH CONCURRENT ITEM GETS ITS OWN DB SESSION. _ask_ai commits Prompt_Log rows and renews
-    the stage lease mid-call, and a SQLAlchemy Session is not safe to share across greenlets -
+    EACH CONCURRENT ITEM GETS ITS OWN DB SESSION. _ask_ai commits Prompt_Log rows mid-call,
+    and a SQLAlchemy Session is not safe to share across greenlets -
     sharing one here would interleave those commits into each other's transactions. The
     caller's `sess` stays untouched until the sequential persist pass.
 
@@ -943,8 +942,10 @@ def _generate_scenario_batch(sess: Session, scenario_session: dict, base_ctx: di
     (one item, concurrency 1) or nothing to open sessions with (session_factory=None - the
     shape every existing test uses, so their in-memory SQLite session is never bypassed).
 
-    # ponytail: ThreadPoolExecutor, not a new abstraction - llm.rerank_many already runs this
-    # exact pattern under the same gevent worker, where threads are greenlets.
+    Fanned out through fanout.map_settled, not a raw ThreadPoolExecutor: when this task is revoked
+    (the reaper, or the hard time limit) the scenario children must die with it. A pool's workers
+    are not the task greenlet's children, so a revoked run's scenarios used to keep going — and
+    starve the next run.
     """
     sid = scenario_session["SessionID"]
     concurrency = min(get_settings().scenario_generation_concurrency, len(work))
@@ -964,7 +965,7 @@ def _generate_scenario_batch(sess: Session, scenario_session: dict, base_ctx: di
                 out.append((scoped_id, None, exc, (started, now())))
         return out
 
-    from concurrent.futures import ThreadPoolExecutor
+    from app.pipeline.fanout import map_settled
 
     def _one(item):
         sc, scoped_id, _target = item
@@ -983,8 +984,8 @@ def _generate_scenario_batch(sess: Session, scenario_session: dict, base_ctx: di
         except Exception as exc:  # noqa: BLE001 - [R8] same contract as the sequential branch
             return (scoped_id, None, exc, (started, now()))
 
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        return list(pool.map(_one, work))   # map preserves input order
+    # _one captures its own Exceptions (the [R8] tuple), so every settled pair is (value, None).
+    return [value for value, _ in map_settled(_one, work, max_workers=concurrency)]  # input order
 
 
 def _flag_same_batch_duplicates(by_scoped: dict, identities: dict, ratio: float) -> None:
@@ -1520,6 +1521,9 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
     log.info("pipeline.start", session_id=session_id, subsystems=len(subsystems), task_id=task_id)
     if dal.acquire_lock(sess, session_id, ASSET_UNIT_ID, task_id):
         sess.commit()
+        # Leases stay alive while THIS task is alive, not only around LLM calls — see
+        # lease_keeper. Stopped first in the `finally`, before the lock is released.
+        stop_keeper = lease_keeper.start(session_id, task_id)
         try:
             categories = dal.active_category_names(sess)
             _announce_generation_started(sess, scenario_session, ASSET_UNIT_ID)
@@ -1576,6 +1580,7 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
             _record_failure(sess, scenario_session, ASSET_UNIT_ID, exc)
             sess.commit()
         finally:
+            stop_keeper()
             if not dal.release_lock(sess, session_id, ASSET_UNIT_ID, task_id):
                 log.warning("asset.lock_lost", session_id=session_id, task_id=task_id)
             sess.commit()

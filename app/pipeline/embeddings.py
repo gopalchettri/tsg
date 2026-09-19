@@ -14,6 +14,7 @@ cold-start latency becomes a real problem.
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -205,6 +206,23 @@ def _l2_read(l1: dict[str, list[float]], result: dict[str, list[float]], missing
         return False
 
 
+def stored_count(texts: Sequence[str], *, model_id: str, group: str, kind: str) -> int | None:
+    """How many of `texts` have a vector in the SHARED (Mongo) cache — what every process can
+    read, not this one's L1. One count on the unique `k` index. None when that is unknowable:
+    the memory store, or Mongo unreachable (never raises; this feeds a health readout)."""
+    if get_settings().embedding_store != "mongo":
+        return None
+    col = _store_if_healthy()
+    if col is None:
+        return None
+    keys = list({_cache_key(model_id, group, kind, t) for t in texts})
+    try:
+        return col.count_documents({"k": {"$in": keys}})
+    except Exception:
+        log.warning("embeddings.stored_count_failed", group=group, exc_info=True)
+        return None
+
+
 def _embed_missing(llm: LLMClient, missing: list[str], kind: str) -> list[list[float]]:
     """External embedding-service tier: embed ONE batch of texts missing from L1 + L2.
 
@@ -248,23 +266,91 @@ def _l2_write(docs: list[dict]) -> None:
         log.warning("embedding store (mongo) write failed", exc_info=True)
 
 
-def get_vectors(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: str,
-                kind: str = "passage") -> dict[str, list[float]]:
-    """Return {text: vector}, computing each vector at most once (L1 → L2 Mongo → embed)."""
-    l1 = _L1.setdefault((model_id, group, kind), {})
-    use_mongo = get_settings().embedding_store == "mongo"
-    result, missing = _l1_lookup(l1, texts)
+#: Single-flight PER TEXT: (model, group, kind, text) -> an Event its filler sets when it is done,
+#: won or failed. With none, N concurrent callers missing the same cold texts each embedded ALL of
+#: them: on 18 Sep four scenario greenlets x four batch workers recomputed the same 900 technique
+#: passages, 16 torch jobs on 12 cores, and the run was reaped before any finished. Per text, not
+#: per group: a group-wide lock also queued callers missing DIFFERENT texts behind each other —
+#: every scenario's own technique query, each holding the lock through an LLM-slot wait and a
+#: remote call. Entries exist only while a fill is in flight, so nothing accumulates.
+_IN_FLIGHT: dict[tuple[str, str, str, str], threading.Event] = {}
+#: Guards _IN_FLIGHT only — never held across I/O or a yield.
+_IN_FLIGHT_GUARD = threading.Lock()
+#: How long a caller waits for a peer's fill before computing the texts itself. A peer is bounded
+#: by its own task's time limit; this bound only stops one stuck peer from stalling every waiter.
+_PEER_WAIT_SECONDS = 600.0
 
-    if missing and use_mongo:
+
+def get_vectors(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: str,
+                kind: str = "passage", compute: bool = True) -> dict[str, list[float]]:
+    """Return {text: vector}, computing each vector at most once (L1 → L2 Mongo → embed).
+
+    Texts another caller is already computing are waited for, not recomputed; texts nobody is
+    computing are filled at once, so callers with disjoint misses never wait on each other.
+
+    compute=False is the cache-only mode for a hot path that must never pay for a corpus: it
+    returns only what L1/L2 already hold, embeds nothing and waits for no one, so the result may
+    be missing texts."""
+    key = (model_id, group, kind)
+    l1 = _L1.setdefault(key, {})
+    result, missing = _l1_lookup(l1, texts)
+    if missing and not compute:
+        _fill(llm, l1, result, missing, model_id, group, kind, compute=False)
+    elif missing:
+        mine, theirs = _claim(key, missing)
+        try:
+            if mine:
+                _fill(llm, l1, result, mine, model_id, group, kind, compute=True)
+        finally:
+            _release(key, mine)
+        if theirs:
+            for event in theirs.values():
+                event.wait(_PEER_WAIT_SECONDS)
+            got, still = _l1_lookup(l1, list(theirs))
+            result.update(got)
+            if still:   # the peer failed or was killed: fill them here rather than return short
+                _fill(llm, l1, result, still, model_id, group, kind, compute=True)
+    # returned vectors are the SAME list objects as the cache entries — callers must treat
+    # them read-only (copy before mutating in place)
+    return {t: result[t] for t in texts if t in result}
+
+
+def _claim(key: tuple[str, str, str], missing: list[str]) -> tuple[list[str], dict[str, threading.Event]]:
+    """Split `missing` into texts this caller now fills and texts a peer is already filling."""
+    mine: list[str] = []
+    theirs: dict[str, threading.Event] = {}
+    with _IN_FLIGHT_GUARD:
+        for t in missing:
+            event = _IN_FLIGHT.get((*key, t))
+            if event is None:
+                _IN_FLIGHT[(*key, t)] = threading.Event()
+                mine.append(t)
+            else:
+                theirs[t] = event
+    return mine, theirs
+
+
+def _release(key: tuple[str, str, str], mine: list[str]) -> None:
+    """Wake whoever waits on `mine` — after success AND failure, so a failed fill never strands a
+    waiter (it finds the text still missing and fills it itself)."""
+    with _IN_FLIGHT_GUARD:
+        events = [_IN_FLIGHT.pop((*key, t)) for t in mine]
+    for event in events:
+        event.set()
+
+
+def _fill(llm: LLMClient, l1: dict[str, list[float]], result: dict[str, list[float]],
+          missing: list[str], model_id: str, group: str, kind: str, *, compute: bool) -> None:
+    """The miss path of get_vectors, for texts this caller owns (see _claim): L2 read, then
+    (unless compute is False) embed + persist whatever is still missing. Mutates l1/result."""
+    use_mongo = get_settings().embedding_store == "mongo"
+    if use_mongo:
         use_mongo = _l2_read(l1, result, missing, model_id, group, kind)
     # unconditional: even a mid-cursor Mongo failure still trims whatever rows we did get,
     # so they aren't redundantly re-embedded below
     missing = [t for t in missing if t not in result]
 
-    # ponytail: no per-key lock — two greenlets computing the same text is harmless
-    # (deterministic vectors, idempotent upsert), just redundant work. Add a lock only if
-    # that cost matters.
-    if missing:
+    if missing and compute:
         # Persist per batch, not once at the end. A full recreate is ~1100 distinct texts across
         # ~37 provider calls, so writing only after ALL of them means a timeout or 429 on the last
         # call discards every vector already paid for — and the Celery retry re-embeds all 1100.
@@ -298,29 +384,24 @@ def get_vectors(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: s
             for chunk in chunks:  # sequential: no pool, no threads, no behaviour change
                 _embed_and_persist(chunk)
         else:
-            # Bounded pool, same shape as llm.rerank_many: every concurrent embed() call takes
+            # Bounded fan-out, same shape as llm.rerank_many: every concurrent embed() call takes
             # its own _llm_slot, so the Redis semaphore stays the global authority and this is
             # only a local politeness cap. Batches are independent — each persists its own work,
             # and get_vectors returns a dict keyed by text, so completion order is irrelevant.
-            from concurrent.futures import ThreadPoolExecutor
+            # fanout.map_settled, not a raw pool: a revoked caller's queued batches must not keep
+            # embedding after it is gone. Every batch settles before the first failure is
+            # re-raised, so a sibling's failure never masks the one reported, and batches that
+            # did succeed stay persisted — the retry re-embeds only the tail.
+            from app.pipeline.fanout import map_settled
 
-            with ThreadPoolExecutor(max_workers=min(conc, len(chunks))) as pool:
-                futures = [pool.submit(_embed_and_persist, c) for c in chunks]
-            # Pool exited => every future is done (shutdown waits). Retrieve EVERY exception
-            # before re-raising the first: an unretrieved future logs a spurious warning when it
-            # is garbage-collected, and a sibling's failure must not mask the one we report.
-            # Batches that did succeed stay persisted, so the retry re-embeds only the tail.
-            failures = [e for e in (f.exception() for f in futures) if e is not None]
+            failures = [exc for _, exc in map_settled(_embed_and_persist, chunks, max_workers=conc)
+                        if exc is not None]
             if failures:
                 raise failures[0]
 
-    # returned vectors are the SAME list objects as the cache entries — callers must treat
-    # them read-only (copy before mutating in place)
-    return {t: result[t] for t in texts}
-
 
 def get_matrix(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: str,
-            kind: str = "passage") -> tuple[Any, list[int]] | None:
+            kind: str = "passage", compute: bool = True) -> tuple[Any, list[int]] | None:
     """Pre-normalized similarity matrix over `texts`, cached per (model, group, kind).
 
     Returns (matrix, row_indexes): matrix rows are L2-normalized float32 vectors, and
@@ -328,6 +409,10 @@ def get_matrix(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: st
     vectors are skipped, same as grounding._shortlist_candidates). Cosine similarity against
     every text is then one `matrix @ q_unit`. Returns None if numpy is unavailable or nothing
     is usable.
+
+    compute=False (cache-only, see get_vectors) is ALL-OR-NOTHING: if any text has no cached
+    vector it returns None and caches nothing. A partial matrix would rank a different candidate
+    set from one run to the next as the cache fills, which breaks determinism for its caller.
     """
     if _np is None or not texts:
         return None
@@ -338,7 +423,11 @@ def get_matrix(llm: LLMClient, texts: Sequence[str], *, model_id: str, group: st
         hit = slot.get(digest)
         if hit is not None:
             return hit
-    vecs = get_vectors(llm, texts, model_id=model_id, group=group, kind=kind)
+    vecs = get_vectors(llm, texts, model_id=model_id, group=group, kind=kind, compute=compute)
+    if len(vecs) < len(set(texts)):   # only possible with compute=False: not fully cached yet
+        log.info("embeddings.matrix_not_cached", group=group, kind=kind,
+                 cached=len(vecs), total=len(set(texts)))
+        return None
     dim = len(vecs[texts[0]])
     rows, row_indexes = [], []
     for i, t in enumerate(texts):

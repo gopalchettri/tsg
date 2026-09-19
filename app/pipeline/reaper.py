@@ -86,15 +86,15 @@ def _revoke_zombie_tasks(expired_rows) -> None:
         log.warning("reaper.revoke_failed", task_ids=sorted(task_ids), exc_info=True)
         return
     log.warning("reaper.revoked_zombie_tasks", task_ids=sorted(task_ids),
-                note="lease expired while still RUNNING — task was not executing")
+                note="no heartbeat for a full lease window — worker dead, hub frozen, or past "
+                     "its time ceiling")
 
 
 def clean_up_abandoned_sessions(sess: Session) -> list[str]:
     """The main cleanup pass. Returns the session ids driven to a terminal 'cancelled' state."""
     ss = m.Subsystem_Stage_State
-    lease = ss.LeaseExpiresAt
     _now = now()
-    expired = and_(lease.isnot(None), lease < _now)
+    expired = _lease_expired(_now)
 
     # Read-only candidate scan (see module docstring) — a plain SELECT never locks what it reads.
     # SubsystemID rides along so the publish below can include it; ActiveTaskID so _revoke_zombie_

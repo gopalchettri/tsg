@@ -706,23 +706,40 @@ def _sync_session_stage(sess: Session, session_id: str, level: SubsystemLevel) -
     CANCELLED one. The values match what reserve_session already writes for next-set.
 
     Runs in a savepoint: this is a display cache, and failing to update it must never cost the
-    stage claim it rides on."""
+    stage claim it rides on. But a failure is swallowed ONLY if rolling back to the savepoint
+    works, which proves the failure stayed inside it. If that rollback itself fails, the WHOLE
+    transaction is gone (SQL Server's deadlock victim, 1205, rolls back everything) and the claim
+    UPDATE went with it: the original error is re-raised so the caller fails like a failed claim
+    and retries. Swallowing it returned "won" for a claim that no longer existed, and the caller's
+    commit then committed nothing."""
     stage = _LEVEL_STAGE.get(level)
     if stage is None:
         return
     not_past = _STAGE_ORDER[:_STAGE_ORDER.index(stage) + 1]
+    savepoint = sess.begin_nested()
     try:
-        with sess.begin_nested():
-            execute_dml(
-                sess,
-                update(m.Scenario_Session)
-                .where(m.Scenario_Session.SessionID == session_id,
-                       m.Scenario_Session.SessionStatus == SessionStatus.active,
-                       m.Scenario_Session.CurrentStage.in_(not_past))
-                .values(CurrentStage=stage, StageStatus=StageStatus.RUNNING, UpdatedAt=now()))
-    except Exception:  # noqa: BLE001 — cache only; the claim above already succeeded
+        execute_dml(
+            sess,
+            update(m.Scenario_Session)
+            .where(m.Scenario_Session.SessionID == session_id,
+                   m.Scenario_Session.SessionStatus == SessionStatus.active,
+                   m.Scenario_Session.CurrentStage.in_(not_past))
+            .values(CurrentStage=stage, StageStatus=StageStatus.RUNNING, UpdatedAt=now()))
+    except Exception as exc:
+        # A disconnect-class error (MSSQL counts a statement timeout, HYT00, as one) invalidates
+        # the connection, and SQLAlchemy then skips ROLLBACK TO SAVEPOINT without raising — so the
+        # "rollback worked, the failure stayed inside the savepoint" test below would pass for a
+        # transaction that is already gone. The claim went with it: fail like a lost claim.
+        if getattr(exc, "connection_invalidated", False):
+            raise
+        try:
+            savepoint.rollback()
+        except Exception:  # noqa: BLE001 - ANY failure here means the savepoint is gone
+            raise exc from None   # ...so the whole transaction, and the claim with it, is too
         log.warning("stage.session_cache_sync_failed", session_id=session_id,
-                    level=str(level), exc_info=True)
+                    level=str(level), exc_info=True)   # cache only; the claim is intact
+        return
+    savepoint.commit()
 
 
 def stage_attempt_count(
@@ -815,27 +832,6 @@ def acquire_execution_lock(sess: Session, session_id: str, subsystem_id: int, ta
             Status=StageStatus.RUNNING, ActiveTaskID=task_id,
             LeaseExpiresAt=now() + timedelta(seconds=get_settings().stage_lease_seconds), UpdatedAt=now(),
         )
-    )
-    return res.rowcount == 1
-
-
-def renew_lock_lease(sess: Session, session_id: str, subsystem_id: int, task_id: str) -> bool:
-    """Push the `_LOCK` lease forward for its holder. Best-effort; True iff it landed. acquire_lock
-    stamps the lease once but the work spans a whole click, so without this the reaper reclaims the
-    lock and a second writer lands on the subsystem. RUNNING + ActiveTaskID is the whole fence."""
-    s = get_settings()
-    _now = now()
-    res = execute_dml(
-        sess,
-        update(m.Subsystem_Stage_State)
-        .where(
-            m.Subsystem_Stage_State.SessionID == session_id,
-            m.Subsystem_Stage_State.SubsystemID == subsystem_id,
-            m.Subsystem_Stage_State.Level == SubsystemLevel.LOCK,
-            m.Subsystem_Stage_State.Status == StageStatus.RUNNING,
-            m.Subsystem_Stage_State.ActiveTaskID == task_id,  # fencing token
-        )
-        .values(LeaseExpiresAt=_now + timedelta(seconds=s.stage_lease_seconds), UpdatedAt=_now)
     )
     return res.rowcount == 1
 
@@ -957,30 +953,19 @@ def live_lease_exists(session_id_col: Any, _now: datetime | None = None) -> Any:
 
     `session_id_col` is whatever the caller correlates against — a literal session id for a
     standalone check, or `m.Scenario_Session.SessionID` for the reaper's correlated sweep. A live
-    lease is the ONLY positive proof a worker is alive: `_ask_ai` renews both the stage lease and
-    the `_LOCK` lease before every LLM call, so a holder that has gone a full lease window without
-    renewing has stopped running — whether it crashed, was killed, or hung.
+    lease is the ONLY positive proof a worker is alive: pipeline.lease_keeper renews every lease a
+    task holds for as long as the task is alive, so a holder that has gone a full lease window
+    without renewing is dead, frozen, or past its time ceiling.
 
-    Sole definition, shared by reaper._find_abandoned_sessions and accept.ensure_review_gate: the
-    reaper's "leave a live worker alone" rule and the review gate's "is this really still
-    generating?" question are the same question, and they must never drift apart."""
+    Sole definition, used by reaper._abandonment_filter — which both the sweep and
+    accept.ensure_review_gate (via reaper.session_is_abandoned) go through: the reaper's "leave a
+    live worker alone" rule and the review gate's "is this really still generating?" question are
+    the same question, and they must never drift apart. NOT sufficient on its own to call a run
+    dead: a still-queued session holds no lease either."""
     ss = m.Subsystem_Stage_State
     return (select(1).select_from(ss)
             .where(ss.SessionID == session_id_col, ss.LeaseExpiresAt > (_now or now()))
             .exists())
-
-
-def session_has_live_lease(sess: Session, session_id: str) -> bool:
-    """True iff a worker currently holds an unexpired lease on any stage of this session.
-
-    False means every claim has lapsed: nothing is running, whatever the session's denormalised
-    CurrentStage/StageStatus columns still say.
-
-    `SELECT 1 WHERE EXISTS (...)`, NOT `SELECT EXISTS (...)`: T-SQL has no boolean type, so EXISTS
-    is legal only in a predicate position — selecting it directly compiles fine and then fails at
-    the server with "Incorrect syntax near the keyword 'EXISTS'". Same `.first() is not None` shape
-    as every other existence check in this module."""
-    return sess.execute(select(1).where(live_lease_exists(session_id))).first() is not None
 
 
 def stage_rows(sess: Session, session_id: str) -> list[RowMapping]:

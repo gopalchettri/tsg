@@ -784,19 +784,19 @@ class LiteLLMClient:
                 out.append(scores[pos:pos + len(docs)])
                 pos += len(docs)
             return out
-        from concurrent.futures import ThreadPoolExecutor
+        from app.pipeline.fanout import map_settled
 
-        results: list[list[float] | None] = [None] * len(items)
+        # fanout.map_settled, not a raw pool: a revoked caller's queued rerank calls must not keep
+        # running (and holding LLM slots) after it is gone. Settled pairs come back in input order.
+        settled = map_settled(lambda item: self.rerank(item[0], item[1], model=model), items,
+                              max_workers=self.s.rerank_concurrency)
+        results: list[list[float] | None] = []
         failures = 0
-        with ThreadPoolExecutor(max_workers=min(self.s.rerank_concurrency, len(items))) as pool:
-            futures = {pool.submit(self.rerank, q, docs, model=model): i
-                    for i, (q, docs) in enumerate(items)}
-        for fut, i in futures.items():  # pool exited -> all futures done; order restored via i
-            try:
-                results[i] = fut.result()
-            except Exception:
+        for i, (value, exc) in enumerate(settled):
+            if exc is not None:
                 failures += 1
-                log.warning("rerank_many.item_failed", index=i, exc_info=True)
+                log.warning("rerank_many.item_failed", index=i, exc_info=exc)
+            results.append(value)
         if failures == len(items):
             raise RuntimeError(f"rerank_many: all {len(items)} rerank calls failed")
         return results

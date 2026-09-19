@@ -365,3 +365,75 @@ def test_a_failed_display_write_never_costs_the_claim(db, monkeypatch) -> None:
             m.Subsystem_Stage_State.SessionID == sid,
             m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS)).scalar_one()
     assert str(status) == "RUNNING"
+
+
+def test_a_claim_rolled_back_under_the_savepoint_is_never_reported_as_won(db, monkeypatch) -> None:
+    """SQL Server's deadlock victim (1205) rolls back the WHOLE transaction, the claim UPDATE with
+    it, and then the savepoint cannot be rolled back to. Swallowing that returned won=True for a
+    claim that no longer existed; the caller then committed nothing and ran the stage unclaimed.
+    It must fail like a lost claim instead, so the task retries."""
+    real = dal.execute_dml
+
+    def _deadlock_victim(sess, stmt):
+        if getattr(getattr(stmt, "table", None), "name", "") == "Scenario_Session":
+            sess.connection().exec_driver_sql("ROLLBACK")      # the server ends the transaction
+            raise RuntimeError("deadlock victim")
+        return real(sess, stmt)
+
+    monkeypatch.setattr(dal, "execute_dml", _deadlock_victim)
+    sid = _seed(db)
+    with pytest.raises(RuntimeError, match="deadlock victim"):
+        _claim(db, sid, SubsystemLevel.SCENARIOS)
+    with db() as s:
+        status = s.execute(select(m.Subsystem_Stage_State.Status).where(
+            m.Subsystem_Stage_State.SessionID == sid,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS)).scalar_one()
+    assert str(status) == "IDLE", "the claim is gone, so nothing may act as if it were won"
+
+
+def test_a_claim_whose_connection_died_is_never_reported_as_won(db, monkeypatch) -> None:
+    """A disconnect-class error — MSSQL counts a statement timeout (HYT00) as one — invalidates
+    the connection, and SQLAlchemy then skips ROLLBACK TO SAVEPOINT without raising. The
+    'rollback worked' test passed for a transaction that was already gone, so the claim looked
+    won. connection_invalidated is what SQLAlchemy sets on exactly those errors."""
+    from sqlalchemy.exc import OperationalError
+
+    real = dal.execute_dml
+
+    def _connection_lost(sess, stmt):
+        if getattr(getattr(stmt, "table", None), "name", "") == "Scenario_Session":
+            raise OperationalError("UPDATE Scenario_Session", {}, Exception("HYT00", "timeout"),
+                                   connection_invalidated=True)
+        return real(sess, stmt)
+
+    monkeypatch.setattr(dal, "execute_dml", _connection_lost)
+    sid = _seed(db)
+    with pytest.raises(OperationalError):
+        _claim(db, sid, SubsystemLevel.SCENARIOS)
+    with db() as s:
+        status = s.execute(select(m.Subsystem_Stage_State.Status).where(
+            m.Subsystem_Stage_State.SessionID == sid,
+            m.Subsystem_Stage_State.Level == SubsystemLevel.SCENARIOS)).scalar_one()
+    assert str(status) == "IDLE"
+
+
+def test_a_deadlock_is_a_transient_error_everywhere() -> None:
+    """pyodbc raises its base Error for SQLSTATE 40001, which SQLAlchemy wraps as a plain
+    DBAPIError, so a deadlock skipped Celery's autoretry (TRANSIENT_INFRA_ERRORS) and failed a
+    healthy run. The engine hook maps it to OperationalError; other errors pass through."""
+    from types import SimpleNamespace
+
+    from sqlalchemy.exc import DBAPIError, OperationalError
+
+    from app.db.engine import map_serialization_failure
+    from app.pipeline.pipeline_common import TRANSIENT_INFRA_ERRORS
+
+    def ctx(sqlstate, wrapped=DBAPIError):
+        orig = Exception(sqlstate, f"[{sqlstate}] driver message")
+        return SimpleNamespace(original_exception=orig, statement="UPDATE x", parameters=(),
+                               sqlalchemy_exception=wrapped("UPDATE x", (), orig))
+
+    mapped = map_serialization_failure(ctx("40001"))
+    assert isinstance(mapped, OperationalError) and isinstance(mapped, TRANSIENT_INFRA_ERRORS)
+    assert map_serialization_failure(ctx("23000")) is None                 # constraint: not transient
+    assert map_serialization_failure(ctx("40001", OperationalError)) is None   # already transient

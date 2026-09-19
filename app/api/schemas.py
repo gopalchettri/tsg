@@ -2039,6 +2039,16 @@ class TechniqueCorpusStatus(ApiModel):
     built_at: Any | None = Field(default=None, description="When the live corpus was published.")
     sample: list[dict[str, Any]] = Field(default_factory=list,
                                         description="A few entries, to eyeball the shape.")
+    vectors_cached: int | None = Field(
+        default=None,
+        description="How many of the live corpus's entries have an embedding saved. Scenarios "
+                    "only use a FULLY cached corpus (they never compute it mid-run), so below "
+                    "`total` means no technique block yet while a background warm finishes. "
+                    "Null when the embedding store is in-memory or unreachable.")
+    warm: bool | None = Field(
+        default=None,
+        description="True once every entry is cached and scenarios use the corpus. Null when "
+                    "unknown (see vectors_cached).")
 
 
 class LibraryImportBody(ApiModel):

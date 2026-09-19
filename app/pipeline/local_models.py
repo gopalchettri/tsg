@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from collections.abc import Callable, Sequence
 from functools import lru_cache
 from pathlib import Path
@@ -38,13 +39,66 @@ def resolve_model_path(path: str) -> str:
     return path if os.path.isabs(path) else str(_ROOT / path)
 
 
+@lru_cache(maxsize=1)
+def _model_pool():
+    """Local models' OWN native-thread pool, `local_model_threadpool_size` real OS threads.
+
+    NOT gevent's hub.threadpool: gevent's thread resolver runs every getaddrinfo on that pool, so
+    torch jobs queued there made every NEW socket connection (DB, Redis, Mongo, HTTP) wait behind
+    them — ~18 s measured on 18 Sep, which also delayed the reaper's own work. A separate pool also
+    makes the setting a real cap: it used to set hub.threadpool.size, which gevent grows back to
+    its maxsize (10) on demand, so it never limited anything."""
+    from gevent.threadpool import ThreadPool
+
+    return ThreadPool(get_settings().local_model_threadpool_size)
+
+
+def _available_cpus() -> int:
+    """CPUs this process may actually use. os.cpu_count() is the HOST's count: in a container with
+    a CPU limit it overstates the budget (a 4-CPU pod on a 32-core node would give each job 16
+    threads). So: a cgroup CPU quota (v2, then v1) first, then the scheduler affinity mask."""
+    for quota_file, period_file in (("/sys/fs/cgroup/cpu.max", None),
+                                    ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+                                     "/sys/fs/cgroup/cpu/cpu.cfs_period_us")):
+        try:
+            if period_file is None:
+                quota, period = Path(quota_file).read_text().split()[:2]
+            else:
+                quota, period = Path(quota_file).read_text().strip(), Path(period_file).read_text().strip()
+            if quota not in ("max", "-1"):
+                return max(1, int(quota) // int(period))
+        except (OSError, ValueError):
+            continue
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0)) or 1
+    return os.cpu_count() or 1
+
+
+def _cap_torch_threads() -> None:
+    """Give each concurrent model job of THIS process an equal share of the CPUs it may use:
+    pool size x torch threads <= available CPUs. Unset, torch took ~all cores per job — 16 jobs x
+    10 threads on a 12-core box on 18 Sep; measured on 19 Sep, one job fell from 7.3 cores used to
+    5.6 at 6 threads for ~5% more wall time. The budget is per process: the admin worker (one job
+    at a time) takes its own share on top, and the tokenizer's own threads are not counted.
+    Called on the thread that runs the job, because torch's intra-op thread count is per-thread
+    under OpenMP.
+
+    Uses torch only if it is ALREADY loaded: torch is sentence-transformers' dependency, not
+    this module's, and it is loaded by the first model load — which the worker does at boot
+    (validate_local_models(warm=True)) before any job runs. Not loaded means nothing to cap."""
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        torch.set_num_threads(
+            max(1, _available_cpus() // get_settings().local_model_threadpool_size))
+
+
 def _offload(fn: Callable):
     """Run a CPU-bound model call without freezing a cooperative scheduler.
 
     Under gevent (patched `threading`), a normal ThreadPoolExecutor runs its workers as
-    GREENLETS — torch would still block the hub, stalling every concurrent session. gevent's
-    NATIVE threadpool uses real OS threads: the greenlet yields while torch (which releases the
-    GIL) runs. Outside gevent there's no shared hub to protect, so run inline.
+    GREENLETS — torch would still block the hub, stalling every concurrent session. A NATIVE
+    threadpool uses real OS threads: the greenlet yields while torch (which releases the GIL)
+    runs. Outside gevent there's no shared hub to protect, so run inline.
     """
     patched = False
     try:  # scope: ONLY the gevent-availability probe — never the work below
@@ -53,11 +107,14 @@ def _offload(fn: Callable):
         patched = monkey.is_module_patched("threading")
     except ImportError:
         pass
-    if patched:
-        import gevent
 
-        return gevent.get_hub().threadpool.apply(fn)  # fn's own errors propagate unchanged
-    return fn()
+    def _job():
+        _cap_torch_threads()
+        return fn()
+
+    if patched:
+        return _model_pool().apply(_job)  # fn's own errors propagate unchanged
+    return _job()
 
 
 @lru_cache(maxsize=get_settings().local_model_cache_size)

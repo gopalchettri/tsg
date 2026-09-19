@@ -372,8 +372,10 @@ _TECH_REBUILD_DESC = (
     "**Atomic:** the new corpus is staged and renamed over the live one, so a rebuild that fails "
     "or is killed leaves the previous corpus completely intact - never a half-populated one.\n\n"
     "**Publishing comes first, then vectors are warmed** within a time budget, so `warmed` "
-    "in the result may be partial - a reported outcome, not a failure. The corpus is "
-    "usable as soon as it is published.\n\n"
+    "in the result may be partial - a reported outcome, not a failure. Scenarios use the "
+    "corpus once its vectors are warm; until then they run without technique grounding, and a "
+    "background warm job finishes the rest. GET .../techniques shows `vectors_cached` and "
+    "`warm`.\n\n"
     "**What you get:** `202` with a `job_id`; stream it, or just read GET .../techniques after."
 )
 
@@ -383,6 +385,10 @@ _TECH_STATUS_DESC = (
     "still work, and the prompt is byte-identical to the pre-feature one, but they are written "
     "without technique grounding. `available: false` means the corpus store is unreachable, "
     "which is a fault rather than an empty state.\n\n"
+    "**Then `warm`.** Scenarios only use technique grounding once every passage has a cached "
+    "vector: `warm: false` means they are running without it while a background job fills the "
+    "cache (`vectors_cached` of `total` so far). `null` means it cannot be told (no shared "
+    "vector store).\n\n"
     "**No request body, no parameters.**"
 )
 

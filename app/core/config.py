@@ -342,8 +342,12 @@ class Settings(BaseSettings):
 
     # TSG_LOCAL_MODEL_CACHE_SIZE — loaded local models kept in memory.
     local_model_cache_size: int = 4
-    # TSG_LOCAL_MODEL_THREADPOOL_SIZE — gevent native-thread pool for local model calls.
-    local_model_threadpool_size: int = 10
+    # TSG_LOCAL_MODEL_THREADPOOL_SIZE — how many local model jobs (embed/rerank) one worker process
+    # runs at once, on their own native threads (never gevent's hub pool, which DNS uses). Each job
+    # gets (CPUs available to the process, container limit included) // this many torch threads,
+    # so one process's jobs never exceed its CPUs: 2 on a 12-core box = 2 jobs x 6 threads.
+    # Separate worker processes each take their own share. Raise it for more jobs, each slower.
+    local_model_threadpool_size: int = Field(2, ge=1, le=64)
 
     # --- 10. Matching & grounding ---------------------------------------------------
 

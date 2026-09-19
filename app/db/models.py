@@ -121,7 +121,7 @@ class Subsystem_Stage_State(Base):
     # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     # The stage's wall-clock span, and the ONLY source the API uses for per-stage duration.
-    # UpdatedAt cannot substitute: claim_stage, renew_lease, renew_lock_lease, release_lock AND
+    # UpdatedAt cannot substitute: claim_stage, renew_lease, lease_keeper, release_lock AND
     # finish_stage all overwrite it. CreatedAt cannot either: pipeline_common.set_up_progress_
     # tracking stamps every level at once, so it is a session-creation time.
     # StartedAt is the start of the attempt that produced the CURRENT result, not a first-attempt

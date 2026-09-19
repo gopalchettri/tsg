@@ -371,8 +371,9 @@ Write-Host "Celery worker starting in a new window (title: tsg-celery)..." -Fore
 # embeddings), which greenlets do nothing for, and one-at-a-time caps memory to a single heavy
 # job. solo rather than prefork because prefork's fork() semantics are unavailable on Windows;
 # the containers use prefork -c 1 (docker/compose.prod.yml).
-# NOTE solo also means the SOFT time limit works here, unlike the gevent pool where it silently
-# never fires -- which is what let a rebuild be hard-killed mid-flight.
+# NOTE the solo pool enforces NO time limit at all, soft or hard (celery's solo pool drops both).
+# Admin jobs therefore bound themselves: the technique warm-up works in budgeted, resumable steps
+# (celery_app.py warm_technique_reference). The gevent pool enforces only the HARD limit.
 # -A targets celery_app, NOT celery_worker: celery_worker monkey-patches for gevent BEFORE any import; with a non-gevent pool there is no hub to drive those patched calls and the worker hangs in boot (observed: stops after 'mingle: sync complete', never reaches ready). Use the UNPATCHED app instead -- same reason beat uses it.
 $adminLog = Join-Path $logsDir 'celery-admin.log'
 $adminCmd = "& '$venvPython' -m celery -A app.pipeline.celery_app.celery_app worker -Q admin -P solo -l info -n tsg-admin-${PID}@%h 2>&1 | ForEach-Object { `$_.ToString() } | Tee-Object -FilePath '$adminLog' -Append"

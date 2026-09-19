@@ -1685,7 +1685,11 @@ def main() -> int:
     run_id = str(int(time.time()))
     minted: dict[str, str] = {}
     routes: set[tuple[str, str]] = set()
-    with httpx.Client(base_url=args.base_url, timeout=httpx.Timeout(30.0)) as c:
+    # keepalive_expiry below uvicorn's 5 s keep-alive timeout: a poll that sleeps ~5 s would
+    # otherwise reuse a connection the server is closing at that very moment and die with
+    # "Server disconnected without sending a response" (seen live, 19 Sep).
+    with httpx.Client(base_url=args.base_url, timeout=httpx.Timeout(30.0),
+                      limits=httpx.Limits(keepalive_expiry=2.0)) as c:
         r = Runner(client=c, admin_key=admin_key)
         try:
             r.req("GET", "/health", timeout=5)

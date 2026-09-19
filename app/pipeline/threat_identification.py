@@ -785,7 +785,7 @@ def _generate_gap_proposals(r: _IdentificationRound, sess: Session, llm: LLMClie
         try:
             proposals, prov = _ask_ai(sess, llm, gap_gen_messages,
                                     scenario_session=scenario_session, subsystem_id=ss, stage="threats",
-                                    level=SubsystemLevel.THREATS, epoch=epoch, task_id=task_id, expected_type=list,
+                                    expected_type=list,
                                     temperature=get_settings().threat_identification_temperature)
         except LLMSlotUnavailable:
             raise  # codebase-wide contract: the Celery stage retry resumes via the CAS
@@ -838,9 +838,8 @@ def _ground_and_admit_proposals(r: _IdentificationRound, sess: Session, llm: LLM
     grounding.prime_query_embeddings(llm, to_ground, grounding_cache)
     rows_before = len(r.rows)
     for p, gp in zip(proposals, to_ground):
-        if not dal.renew_lease(sess, sid, ss, SubsystemLevel.THREATS, epoch, task_id):
-            log.warning("stage.lease_renewal_failed", session_id=sid, subsystem=ss,
-                        level=str(SubsystemLevel.THREATS))
+        # Commit per proposal: releases row locks before the (slow) grounding below. The lease
+        # is lease_keeper's job — this loop no longer renews it.
         sess.commit()
         # Clip these values to fit their DB columns right here, not later when building the
         # row: an over-long AI value would otherwise fail the whole batch insert (losing

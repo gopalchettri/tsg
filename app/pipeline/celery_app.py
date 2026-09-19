@@ -195,6 +195,7 @@ celery_app.conf.update(
     # against the launch commands, and /ready reports per queue, so that cannot go unnoticed.
     task_routes={
         "tsg.rebuild_technique_reference": {"queue": ADMIN_QUEUE},
+        "tsg.warm_technique_reference": {"queue": ADMIN_QUEUE},
         "tsg.import_threat_library": {"queue": ADMIN_QUEUE},
         "tsg.admin_embedding_action": {"queue": ADMIN_QUEUE},
         "tsg.calibrate_grounding": {"queue": ADMIN_QUEUE},
@@ -215,8 +216,6 @@ def _init_worker(sender=None, **_):
     verify_startup repeats the API's check because a worker can be deployed independently."""
     # worker-only setup: imported here so merely importing this module (e.g. from FastAPI)
     # doesn't drag it in
-    import gevent
-
     from app.core.config import assert_security_posture
     from app.db.engine import get_engine
     from app.db.invariants import verify_startup
@@ -247,8 +246,8 @@ def _init_worker(sender=None, **_):
     # catches whatever a receiver raises, logs "Signal handler ... raised", and carries on — so
     # every guard below was ADVISORY despite saying "fail-closed", and a worker that failed one
     # went on to report `ready` and pull tasks. Worse, the raise aborted the REST of this
-    # handler, so a single failed guard also silently skipped the DB invariants, the gevent
-    # threadpool sizing and the local-model warm-up.
+    # handler, so a single failed guard also silently skipped the DB invariants and the
+    # local-model warm-up.
     #
     # Anything meant to stop the worker therefore has to stop the PROCESS. sys.exit is no good
     # either: SystemExit is a BaseException, and the receiver dispatch catches it just the same.
@@ -270,10 +269,9 @@ def _init_worker(sender=None, **_):
             )
         assert_security_posture()      # fail-closed: same auth guard as the API
         verify_startup(get_engine())   # fail-fast: same DB invariant guard as the API
-        # local_models.py::_offload runs on gevent's native thread pool, sized independently of
-        # -c/--concurrency and otherwise capped at gevent's own default of 10. Set BEFORE
-        # validate_local_models warms the models, so the ceiling holds from the first call.
-        gevent.get_hub().threadpool.size = get_settings().local_model_threadpool_size
+        # (No threadpool sizing here any more: local_models runs torch on its OWN pool, sized by
+        # local_model_threadpool_size. Setting hub.threadpool.size never capped anything — gevent
+        # grows it back to maxsize on demand — and that pool is the DNS resolver's.)
         validate_local_models(warm=True)   # fail-fast + warm so the 1st request is fast
         # MUST stay inside this same try: verify_litellm_models' own comment below already
         # claimed "fail-fast: same discipline" as the checks above it — it just wasn't actually
@@ -562,9 +560,10 @@ def run_pipeline_task(self, session_id: str) -> None:
 # soft/time limits OVERRIDE the global ~55 minute pair: this task handles ONE subsystem and
 # finishes in minutes, so the global budget let a frozen greenlet hold its `_LOCK` for the best
 # part of an hour. Derived per environment (see Settings._derive_subsystem_task_limits) because no
-# constant is right in both dev (720s lease) and UAT (2880s). The soft limit is what matters — it
-# raises INSIDE the greenlet, so cascade._subsystem_lock's `finally` runs and the lock is released
-# properly; the hard limit is only the backstop if the soft signal is ignored.
+# constant is right in both dev (720s lease) and UAT (2880s). Under -P gevent only the HARD limit
+# fires (celery's gevent pool drops soft_timeout): it raises gevent.Timeout INSIDE the greenlet,
+# so cascade._subsystem_lock's `finally` runs, the lease keeper stops and the lock is released
+# properly. The soft limit applies only on a prefork deployment.
 @celery_app.task(bind=True, name="tsg.regenerate",
                 autoretry_for=(LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS),
                 retry_backoff=True, max_retries=None,
@@ -919,8 +918,15 @@ def import_threat_library_task(self, source: str, dry_run: bool, activate: bool,
 #:
 #: On the `admin` queue's prefork pool the SOFT limit also fires for real. It silently never
 #: does on gevent, which is why the best-effort `except` around the warm-up never got to run.
+#:
+#: A budget is not a finish line: 600s covers ~660 of ~900 passages on this CPU. Scenarios only
+#: use a FULLY cached corpus (technique_reference.lookup never computes it mid-run), so a warm
+#: that stops at the budget hands over to warm_technique_reference_task, which continues in
+#: budgeted steps until every passage is cached.
 _TECHNIQUE_WARM_BUDGET_SECONDS = 600
-_TECHNIQUE_WARM_BATCH = 32
+#: Pause between warm steps — lets queued admin work interleave; the steps themselves resume
+#: from Mongo, so this is not about correctness.
+_TECHNIQUE_WARM_CONTINUE_COUNTDOWN_SECONDS = 5
 
 
 @celery_app.task(
@@ -954,7 +960,7 @@ def rebuild_technique_reference_task(self, sources: list[str], user_id: str | No
     every single time -- the exact opposite of the "an un-warmed corpus still works" intent
     stated below. Publishing first makes that intent true instead of aspirational."""
     from app.intel.library_import import ThreatLibraryImportError
-    from app.intel.technique_reference import COLLECTION, build_entries, passage_text, publish
+    from app.intel.technique_reference import build_entries, publish, warm_live_corpus
 
     job_id = self.request.id
     _publish_intel_job_event(job_id, CeleryJobState.STARTED, sources=sources)
@@ -977,30 +983,18 @@ def rebuild_technique_reference_task(self, sources: list[str], user_id: str | No
                             total=len(entries))
     warmed = None
     try:
-        from app.core.config import get_settings as _gs
-        from app.pipeline.embeddings import get_vectors
-        from app.pipeline.llm import get_llm
-
-        limit = _gs().max_embed_chars
-        texts = [passage_text(e, limit) for e in entries]
-        # Warm in batches against a DEADLINE rather than in one call. The hard time limit is the
-        # only limit that fires on the gevent pool, and it kills the task outright -- so the work
-        # has to stop itself before then, or the job reports FAILURE for a rebuild that actually
-        # succeeded. Partial warming is a real outcome, reported as such in `warmed`.
-        deadline = time.monotonic() + _TECHNIQUE_WARM_BUDGET_SECONDS
-        llm, model_id = get_llm(), _gs().embedding_model
-        warmed = 0
-        for i in range(0, len(texts), _TECHNIQUE_WARM_BATCH):
-            if time.monotonic() > deadline:
-                log.warning("technique_reference.warm_budget_exhausted",
-                            warmed=warmed, total=len(texts))
-                break
-            batch = texts[i:i + _TECHNIQUE_WARM_BATCH]
-            get_vectors(llm, batch, model_id=model_id, group=COLLECTION, kind="passage")
-            warmed += len(batch)
+        # Budgeted, batched and resumable (technique_reference.warm): the hard time limit is the
+        # only limit that fires on the gevent pool and it kills the task outright, so the work
+        # stops itself before then. What the budget did not cover is handed to the warm task
+        # rather than left for a live scenario to compute — which is what got runs reaped.
+        outcome = warm_live_corpus(budget_s=_TECHNIQUE_WARM_BUDGET_SECONDS)
+        warmed = outcome["warmed"]
+        if outcome["continue"]:
+            warm_technique_reference_task.apply_async(
+                countdown=_TECHNIQUE_WARM_CONTINUE_COUNTDOWN_SECONDS)
     except Exception:
-        # Best-effort: an un-warmed corpus still works, the first lookup just pays for the
-        # embedding. Never a reason to withhold a corpus that built correctly.
+        # Best-effort: an un-warmed corpus still works (scenarios run without the technique block
+        # until it is warm). Never a reason to withhold a corpus that built correctly.
         log.warning("technique_reference.warm_failed", exc_info=True)
 
     result = {"sources": sources, "total": total, "warmed": warmed,
@@ -1009,6 +1003,34 @@ def rebuild_technique_reference_task(self, sources: list[str], user_id: str | No
             for k in ("sources", "total", "skipped_count")})
     _publish_intel_job_event(job_id, CeleryJobState.SUCCESS, total=total)
     return result
+
+
+@celery_app.task(
+    bind=True,
+    name="tsg.warm_technique_reference",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    max_retries=3,
+    soft_time_limit=900,
+    time_limit=960,
+)
+def warm_technique_reference_task(self) -> dict:
+    """Finish warming the LIVE technique corpus, one budgeted step at a time.
+
+    Queued by a rebuild whose own budget ran out, and by technique_reference.lookup when a
+    scenario finds the corpus not fully cached (throttled per process). Each step resumes from
+    Mongo (every batch is persisted) and re-queues itself while it is making progress (see
+    warm_live_corpus's `continue`). One warmer at a time across processes: a step that finds the
+    lock held returns and queues nothing — the holder finishes or hands over."""
+    from app.intel.technique_reference import warm_live_corpus
+
+    outcome = warm_live_corpus(budget_s=_TECHNIQUE_WARM_BUDGET_SECONDS)
+    log.info("technique_reference.warm_step", **outcome)
+    if outcome["continue"]:
+        self.apply_async(countdown=_TECHNIQUE_WARM_CONTINUE_COUNTDOWN_SECONDS)
+    return outcome
 
 
 def dispatch_refresh(feeds: list[str], user_id: str | None) -> dict[str, str]:
