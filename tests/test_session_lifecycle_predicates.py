@@ -69,6 +69,62 @@ def _row(*, session_status, stage=WorkflowStage.REVIEW, stage_status=StageStatus
             "CurrentStage": str(stage), "StageStatus": str(stage_status), "CompletedAt": None}
 
 
+def test_a_running_stage_is_never_reported_as_finished() -> None:
+    """EXHAUSTIVE over the whole input space, not one example.
+
+    get_overall_status is pure and its inputs are small finite sets, so the invariant can be
+    checked against every combination that exists rather than the handful someone thought of.
+    That is the point: the bug this pins was not a wrong branch, it was a MISSING one, and a
+    missing branch is exactly what example-based tests do not catch.
+
+    THE BUG. A regeneration or next-set re-opens a stage on a session that stays `completed` —
+    generation completes it at the review barrier to release the asset, and a rewrite does not
+    un-complete it. So `session_status == completed` fell through to `complete` while an LLM call
+    was in flight. Found in live end-to-end testing: regenerate returned 202 at epoch 2, the
+    SCENARIOS stage went RUNNING, and this field read `complete` for the ~75s the rewrite took.
+    Every client is documented to poll exactly this field, so one that stops at `complete` shows
+    the OLD version as final and never sees the replacement.
+
+    Same family as every other defect in this codebase: a terminal answer reported while work is
+    still happening.
+    """
+    checked = 0
+    for threats in StageStatus:
+        for scenarios in StageStatus:
+            for status in SessionStatus:
+                for undecided in (True, False):
+                    got = get_overall_status(threats, scenarios, status, undecided=undecided)
+                    checked += 1
+                    if StageStatus.RUNNING in (threats, scenarios):
+                        assert got != SubsystemProgress.complete, (
+                            f"reported finished with a stage RUNNING: threats={threats} "
+                            f"scenarios={scenarios} session={status} undecided={undecided}")
+    assert checked > 100, "the cross product collapsed — this would pass vacuously"
+
+    # Only `complete` is asserted, deliberately. The first draft also forbade `awaiting_review`
+    # while a stage runs, and the sweep immediately produced
+    # threats=RUNNING / scenarios=AWAITING_DECISION / session=completed. That combination is NOT
+    # REACHABLE: the only thing that runs THREATS after the barrier is next-set, and
+    # sessions._do_next_set CASes the session completed -> active via dal.reserve_session before
+    # enqueueing, so the session is `active` throughout. Regenerate is the opposite — it
+    # deliberately does not take the asset back, which is why its SCENARIOS-RUNNING state keeps
+    # session_status `completed` and produced the real bug.
+    #
+    # An exhaustive sweep covers states the system cannot construct, and asserting on those is
+    # asserting about fantasy. `complete` is sound across the whole space because finished is
+    # never the right answer while a stage runs, reachable or not.
+
+
+def test_error_and_cancelled_still_outrank_a_running_stage() -> None:
+    """The liveness check must not mask a terminal verdict. A stage left RUNNING by a crashed
+    worker on a CANCELLED session must still read cancelled, not in_progress forever — otherwise
+    the new branch trades a false 'finished' for a false 'still working'."""
+    assert get_overall_status(StageStatus.RUNNING, StageStatus.RUNNING,
+                            SessionStatus.cancelled) == SubsystemProgress.cancelled
+    assert get_overall_status(StageStatus.ERROR, StageStatus.RUNNING,
+                            SessionStatus.completed) == SubsystemProgress.error
+
+
 def test_review_barrier_survives_completion() -> None:
     """The gate tests the stage pair BEFORE SessionStatus, which is what lets accept and
     regenerate keep working on a completed session. If that order is ever flipped, every

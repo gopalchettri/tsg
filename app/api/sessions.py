@@ -164,6 +164,21 @@ def get_overall_status(threats: str, scenarios: str, session_status: str,
     if (scenarios == StageStatus.AWAITING_DECISION and undecided
             and session_status == SessionStatus.completed):
         return SubsystemProgress.awaiting_review
+    # LIVENESS BEFORE TERMINAL STATE. A regeneration or next-set re-opens a stage on a session
+    # that STAYS `completed` — generation completes it at the review barrier to release the asset,
+    # and a later rewrite does not un-complete it. So session status alone cannot mean "nothing is
+    # happening", and without this the branch below reports `complete` with an LLM call in flight.
+    #
+    # Caught in live end-to-end testing: a regenerate was accepted (202, epoch 2), the SCENARIOS
+    # stage went RUNNING, and this field read `complete` for the ~75s the rewrite took. Every
+    # client is told to poll exactly this field, so one that stops at `complete` renders the OLD
+    # version as final and never sees the replacement. That is the same defect as the rest of this
+    # family: a terminal answer reported while work is still in flight.
+    #
+    # Ordered AFTER awaiting_review deliberately: that branch requires AWAITING_DECISION, which is
+    # mutually exclusive with RUNNING, so it cannot mask a decision a human really can make.
+    if StageStatus.RUNNING in vals:
+        return SubsystemProgress.in_progress
     if session_status == SessionStatus.completed:
         return SubsystemProgress.complete
     if all(v == StageStatus.IDLE for v in vals):
