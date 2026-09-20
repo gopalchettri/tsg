@@ -104,6 +104,12 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("POST", "/v1/tsg/threat-intel/library/import/{source}"): require_admin,
     ("GET", "/v1/tsg/threat-intel/library/import/status/{job_id}"): require_admin,
     ("GET", "/v1/tsg/threat-intel/library/import/events/{job_id}"): require_admin,
+    # Curator approval of promoted library rows (app/api/threat_intel.py) — same cross-tenant
+    # master tables as the import above, so admin-key gated for the same reason. This is the step
+    # promote-to-library depends on: without it a promoted threat stays IsActive=0 forever and
+    # every session re-invents it. See the guard in scripts/test_pipeline_guards.py.
+    ("GET", "/v1/tsg/threat-intel/library/pending"): require_admin,
+    ("POST", "/v1/tsg/threat-intel/library/threats/approve"): require_admin,
     # ATT&CK/CAPEC technique reference corpus (app/api/threat_intel.py) — admin-key gated,
     # cross-tenant reference data shared by every entity's scenario prompts.
     ("POST", "/v1/tsg/threat-intel/techniques/rebuild"): require_admin,

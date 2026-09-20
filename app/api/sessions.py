@@ -1142,7 +1142,10 @@ def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depend
                 "Calling twice creates nothing and returns `created_count: 0` with everything `existing`.\n\n"
                 "**Watch out:** promoting does not make the threat matchable yet. New library rows are "
                 "created inactive, pending curator review, and matching only considers active rows. A curator "
-                "has to approve it before any session can retrieve it.\n\n"
+                "has to approve it before any session can retrieve it — they do that with "
+                "`POST /v1/tsg/threat-intel/library/threats/approve`, working from the queue at "
+                "`GET /v1/tsg/threat-intel/library/pending` (both admin-key routes). Until that runs, this "
+                "call has no effect any session can observe.\n\n"
                 "Controls are reported here but never written — they are already curated library data."
             ))
 def post_promote_to_library(session_id: str, scenario_id: str,

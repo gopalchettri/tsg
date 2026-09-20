@@ -93,6 +93,7 @@ from app.core.enums import (
     CeleryJobState,
     ClickOutcomeReason,
     ControlMappingExhaustionReason,
+    LibraryApprovalStatus,
     NextSetOutcome,
     ReviewGateReason,
     SSEEventType,
@@ -2166,6 +2167,91 @@ class LibraryImportStatus(ApiModel):
         default=None,
         description="The import's own report once finished, else null. Carries `error` instead "
                     "of counts when the content or the request was invalid.")
+
+
+class PendingLibraryRow(ApiModel):
+    """One threat waiting on a curator, and the state of the type above it."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "catalogue_id": 812, "threat_name": "Unpatched firmware on the RTU",
+        "source": "promote-api", "created_at": "2026-09-14T08:22:11Z",
+        "type_id": 57, "type_name": "Firmware Tampering",
+        "type_is_pending": True, "type_is_deleted": False}})
+
+    catalogue_id: int = Field(description="Pass this to POST .../library/threats/approve.")
+    threat_name: str = Field(description="The threat as promotion stored it.")
+    source: str | None = Field(
+        default=None,
+        description="Provenance: 'promote-api' (an explicit promote-to-library call), "
+                    "'ai_auto_promoted' (minted at accept time), or an import tag.")
+    created_at: datetime | None = Field(default=None, description="When it was promoted.")
+    type_id: int = Field(description="The threat type this threat sits under.")
+    type_name: str = Field(description="That type's name.")
+    type_is_pending: bool = Field(
+        description="True when the TYPE is also awaiting approval. Retrieval walks type then "
+                    "name, so a pending type keeps its threats unreachable no matter what you do "
+                    "to them — approving the threat activates the type too, and the approval "
+                    "response says whether it had to.")
+    type_is_deleted: bool = Field(
+        description="True when the parent type was soft-deleted. Approving cannot make such a "
+                    "row retrievable; it is listed so a curator can see the orphan rather than "
+                    "wonder where it went.")
+
+
+class PendingLibraryResponse(ApiModel):
+    """Everything promote-to-library has written that no session can see yet."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "pending_count": 1,
+        "pending": [{"catalogue_id": 812, "threat_name": "Unpatched firmware on the RTU",
+                    "source": "promote-api", "created_at": "2026-09-14T08:22:11Z",
+                    "type_id": 57, "type_name": "Firmware Tampering",
+                    "type_is_pending": True, "type_is_deleted": False}]}})
+
+    pending_count: int = Field(description="How many rows this page returned.")
+    pending: list[PendingLibraryRow] = Field(description="Oldest id first.")
+
+
+class LibraryApprovalBody(ApiModel):
+    """Body for POST /v1/tsg/threat-intel/library/threats/approve."""
+    model_config = ConfigDict(json_schema_extra={"example": {"catalogue_ids": [812, 813]}})
+
+    catalogue_ids: list[int] = Field(
+        min_length=1, max_length=100,
+        description="The catalogue ids to approve, from GET .../library/pending. Named ids only "
+                    "and capped at 100 ON PURPOSE: there is deliberately no 'approve everything "
+                    "pending', because one such call would make every AI-invented threat official "
+                    "and hollow out the review the pending state exists to force.")
+
+
+class LibraryApprovalResult(ApiModel):
+    """What actually happened to one requested id."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "catalogue_id": 812, "status": "approved", "type_activated": True}})
+
+    catalogue_id: int = Field(description="The id as requested.")
+    status: LibraryApprovalStatus = Field(
+        description="`approved` — it was pending and now is not. `already_approved` — nothing to "
+                    "do, not an error. `not_found` — no such id, or it was soft-deleted; missing "
+                    "and deleted are deliberately the same answer.")
+    type_activated: bool = Field(
+        description="True when this call also had to approve the parent TYPE. False when the "
+                    "type was already active, or when a sibling id in the same batch approved it "
+                    "first — a shared type is approved once, not once per threat.")
+
+
+class LibraryApprovalResponse(ApiModel):
+    """Per-item results, so one bad id neither fails the batch nor disappears from it."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "approved_count": 1,
+        "results": [{"catalogue_id": 812, "status": "approved", "type_activated": True},
+                    {"catalogue_id": 813, "status": "already_approved", "type_activated": False},
+                    {"catalogue_id": 999, "status": "not_found", "type_activated": False}]}})
+
+    approved_count: int = Field(
+        description="How many ids changed state — `approved` only. Already-approved and "
+                    "not-found ids are excluded, so this is the count of real writes, not of "
+                    "ids you sent.")
+    results: list[LibraryApprovalResult] = Field(
+        description="One entry per requested id, in the order requested.")
 
 
 class EmbeddingJobAccepted(ApiModel):

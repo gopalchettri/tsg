@@ -38,18 +38,25 @@ from app.api.schemas import (
     IntelItemsResponse,
     IntelJobEvent,
     IntelRefreshAccepted,
+    LibraryApprovalBody,
+    LibraryApprovalResponse,
+    LibraryApprovalResult,
     LibraryImportAccepted,
     LibraryImportBody,
     LibraryImportStatus,
+    PendingLibraryResponse,
+    PendingLibraryRow,
     TechniqueCorpusStatus,
     TechniqueRebuildAccepted,
     TechniqueRebuildBody,
 )
-from app.core.enums import SSEEventType
+from app.core.enums import LibraryApprovalStatus, SSEEventType
 from app.core.joblock import is_held
 from app.core.logging import get_logger
 from app.db import dal
+from app.db import models as m
 from app.db.dal import NotFoundError
+from app.db.engine import db_session
 from app.intel.fetchers import ALL_FEEDS, enabled_feed_names, feed_status, list_intel
 from app.intel.library_import import SOURCES as LIBRARY_SOURCES
 from app.intel.library_import import ImportAlreadyRunning, lock_key
@@ -449,3 +456,111 @@ async def technique_events(job_id: str, _principal: Principal = Depends(get_admi
     """SSE for one rebuild job - same contract and channel as the import and feed streams."""
     return await admin_job_event_stream(
         job_id, FAMILY_INTEL, intel_job_channel_key, str(SSEEventType.intel_job_update))
+
+
+_PENDING_DESC = (
+    "Threats that `promote-to-library` has written but no session can see yet.\n\n"
+    "Promotion mints library rows **pending** (`IsActive=0`) on purpose: a threat the model "
+    "invented must not become organisational ground truth until a human says so, and every "
+    "retrieval read filters `IsActive=1`. This is the queue of what is waiting, and the ids here "
+    "are what `POST .../library/threats/approve` takes.\n\n"
+    "**Read `type_is_pending`.** Retrieval walks type then name, so a threat under a pending type "
+    "stays unreachable however you treat the threat itself. Approving handles both halves; this "
+    "field is here so the queue tells the truth about what is blocking what."
+)
+
+_APPROVE_DESC = (
+    "Approve promoted threats so sessions can retrieve them.\n\n"
+    "This is the step that makes `promote-to-library` mean something: until it runs, a promoted "
+    "threat sits pending and every new session re-invents it as `unverified` instead of matching "
+    "the library row already there.\n\n"
+    "Approving a threat also approves its **type** when that is pending too, because retrieval "
+    "needs both — the response's `type_activated` says whether it had to. A type shared by "
+    "several ids in one batch is approved once.\n\n"
+    "Named ids only, capped at 100. There is deliberately **no 'approve everything pending'**: "
+    "one such call would make every AI-invented threat official in a keystroke, which is the "
+    "review the pending state exists to force.\n\n"
+    "Per-item results — an unknown or soft-deleted id comes back `not_found` while the rest of "
+    "the batch still approves. Idempotent: approving an approved id is `already_approved`, not an "
+    "error."
+)
+
+
+@router.get("/library/pending", response_model=PendingLibraryResponse,
+            summary="List threats awaiting curator approval", description=_PENDING_DESC)
+def pending_library(
+        limit: Annotated[int, Query(ge=1, le=500, description="Max rows to return.")] = 200,
+        _principal: Principal = Depends(get_admin_principal)) -> PendingLibraryResponse:
+    """The curator's queue. Read-only."""
+    with db_session() as sess:
+        rows = dal.pending_library_threats(sess, limit=limit)
+    pending = [PendingLibraryRow(
+        catalogue_id=r["ThreatCatalogueID"], threat_name=r["ThreatName"],
+        source=r["Source"], created_at=r["CreatedAt"],
+        type_id=r["ThreatTypeID"], type_name=r["ThreatTypeName"],
+        type_is_pending=not r["TypeIsActive"], type_is_deleted=bool(r["TypeIsDeleted"]))
+        for r in rows]
+    return PendingLibraryResponse(pending_count=len(pending), pending=pending)
+
+
+@router.post("/library/threats/approve", response_model=LibraryApprovalResponse,
+            summary="Approve promoted threats", description=_APPROVE_DESC)
+def approve_library_threats(body: LibraryApprovalBody, request: Request,
+                        principal: Principal = Depends(get_admin_principal),
+                        ) -> LibraryApprovalResponse:
+    """Flip pending library rows to active, one transaction for the batch.
+
+    The parent type is activated alongside the threat, NOT as a courtesy but because approving
+    only the threat leaves it exactly as unretrievable as before — grounding.get_possible_types
+    filters IsActive before get_possible_names is ever reached. A half-approval reporting success
+    would be the same class of defect this route exists to fix.
+
+    A bounded by-PK loop rather than one set-based UPDATE: dal.update_library_row's per-row
+    NotFoundError is what produces the per-item status, the batch is capped at 100, and this is a
+    curator's cold path, not a pipeline read."""
+    results: list[LibraryApprovalResult] = []
+    approved = 0
+    with db_session() as sess:
+        for cid in body.catalogue_ids:
+            try:
+                row = dal.get_library_row(sess, m.Threat_Catalogue,
+                                        m.Threat_Catalogue.ThreatCatalogueID, cid)
+                parent = dal.get_library_row(sess, m.Threat_Type,
+                                            m.Threat_Type.ThreatTypeID, row.ThreatTypeID)
+            except NotFoundError:
+                # Missing, soft-deleted, or orphaned under a soft-deleted type. All three answer
+                # the same: nothing here can be made retrievable, and saying "approved" would be
+                # the lie this route exists to stop telling.
+                results.append(LibraryApprovalResult(
+                    catalogue_id=cid, status=LibraryApprovalStatus.not_found, type_activated=False))
+                continue
+
+            # No batch-level "already did this type" set: the re-read above sees the type this
+            # same transaction may have just activated for a sibling id, so the second threat
+            # under one family reports type_activated=false on its own. A set tracking it would
+            # be state no caller could ever observe a difference from.
+            type_activated = False
+            if not parent.IsActive:
+                dal.update_library_row(sess, m.Threat_Type, m.Threat_Type.ThreatTypeID,
+                                    row.ThreatTypeID, {"IsActive": True}, principal.user_id)
+                type_activated = True
+
+            if row.IsActive:
+                results.append(LibraryApprovalResult(
+                    catalogue_id=cid, status=LibraryApprovalStatus.already_approved,
+                    type_activated=type_activated))
+                continue
+            dal.update_library_row(sess, m.Threat_Catalogue,
+                                m.Threat_Catalogue.ThreatCatalogueID, cid,
+                                {"IsActive": True}, principal.user_id)
+            approved += 1
+            results.append(LibraryApprovalResult(
+                catalogue_id=cid, status=LibraryApprovalStatus.approved,
+                type_activated=type_activated))
+        sess.commit()
+    # AFTER the commit: a log line for an approval that rolled back would be a permanent record of
+    # a write that never happened — the same ordering rule as the import route above.
+    log.warning("admin.library_approval", requested=len(body.catalogue_ids), approved=approved,
+                catalogue_ids=body.catalogue_ids, user_id=principal.user_id,
+                source_ip=request.client.host if request.client else None)
+    return LibraryApprovalResponse(approved_count=approved, results=results)

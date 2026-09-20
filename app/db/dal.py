@@ -2605,6 +2605,33 @@ def soft_delete_library_row(sess: Session, model, pk_col, pk_value: int, user_id
         raise NotFoundError(f"{model.__tablename__} {pk_value} not found")
 
 
+def pending_library_threats(sess: Session, *, limit: int = 200) -> list[RowMapping]:
+    """Catalogue rows waiting on a curator — IsActive=0, not deleted — with their parent type.
+
+    promote-to-library mints rows PENDING (upsert_threat_catalogue's is_active=False default) and
+    every retrieval read filters IsActive=1, so a promoted threat is invisible until approved.
+    Without this read the only way to find what is waiting is to reconstruct it from
+    Scenario_Audit DetailJSON, which is how the whole approval step came to be forgotten.
+
+    Carries the PARENT TYPE's state deliberately: the type is minted pending too, and retrieval
+    walks type-then-name (grounding.get_possible_types -> get_possible_names). Approving the
+    catalogue row while its type is still pending changes nothing a session can see, so the
+    curator has to be able to see both halves.
+
+    Joined, not filtered, on the type: a row whose type was soft-deleted is exactly the one a
+    curator most needs to see, and hiding it would make it unfixable as well as unreachable."""
+    tc, tt = m.Threat_Catalogue, m.Threat_Type
+    return list(sess.execute(
+        select(tc.ThreatCatalogueID, tc.ThreatName, tc.Source, tc.CreatedAt,
+            tt.ThreatTypeID, tt.ThreatTypeName,
+            tt.IsActive.label("TypeIsActive"), tt.IsDeleted.label("TypeIsDeleted"))
+        .select_from(tc.__table__.join(tt, tc.ThreatTypeID == tt.ThreatTypeID))
+        .where(tc.IsActive == False, tc.IsDeleted == False)
+        .order_by(tc.ThreatCatalogueID)
+        .limit(limit)
+    ).mappings())
+
+
 def session_audit_rows(sess: Session, session_id: str, *, scenario_id: str | None = None,
                     events: list[str] | None = None, actor: str | None = None,
                     since: datetime | None = None, until: datetime | None = None,

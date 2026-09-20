@@ -2163,6 +2163,82 @@ db.intel_feed_status.findOne({ feed: &quot;{feed_from_the_event_payload}&quot; }
     <p class="errs"><span class="lbl">Errors</span> 404 NotFoundError if job_id is unknown or its marker has expired (same TTL as the Celery result backend — result_expires_seconds; an id from a long-finished job eventually 404s); 503 sse_capacity_exceeded (with a Retry-After header) if the process is already at its sse_max_concurrent_streams cap, shared across every SSE route; 401 on bad/missing admin headers.</p>
   </details>
 </article>
+<article class="api" id="get-v1-tsg-threat-intel-library-pending">
+  <div class="api-head">
+    <span class="method m-get">GET</span>
+    <span class="path">/v1/tsg/threat-intel/library/pending</span>
+  </div>
+  <p class="purpose">The curator&#x27;s queue: threats that promote-to-library has written but no session can see yet. Promotion mints library rows pending (IsActive=0) so an AI&#x27;s invention does not become organisational ground truth unreviewed, and every retrieval read filters IsActive=1.</p>
+  <p class="auth"><span class="lbl">Auth</span> Same admin headers as every route on this router: X-Admin-Key + X-API-Key + X-User-Id required; X-Entity-Id unused (the library is shared across tenants); X-Tenant-Id optional.</p>
+  <div class="blk">
+    <h3>Request</h3>
+    <pre>none — optional ?limit=200 (1..500).</pre>
+  </div>
+  <div class="blk">
+    <h3>Response <span class="status">200</span></h3>
+    <pre>{
+  &quot;pending_count&quot;: 1,
+  &quot;pending&quot;: [
+    {
+      &quot;catalogue_id&quot;: 812,
+      &quot;threat_name&quot;: &quot;Unpatched firmware on the RTU&quot;,
+      &quot;source&quot;: &quot;promote-api&quot;,
+      &quot;created_at&quot;: &quot;2026-09-14T08:22:11Z&quot;,
+      &quot;type_id&quot;: 57,
+      &quot;type_name&quot;: &quot;Firmware Tampering&quot;,
+      &quot;type_is_pending&quot;: true,
+      &quot;type_is_deleted&quot;: false
+    }
+  ]
+}</pre>
+  </div>
+  <div class="blk verify">
+    <h3>Verify in the database</h3>
+    <pre>SELECT ThreatCatalogueID, ThreatName, IsActive FROM Threat_Catalogue WHERE IsActive = 0 AND IsDeleted = 0;</pre>
+  </div>
+  <div class="tables"></div>
+  <details class="notes">
+    <summary>Implementation notes &amp; error cases</summary>
+    <p>Read type_is_pending. Retrieval matches a TYPE first and a threat name second, so a threat under a pending type stays unreachable however you treat the threat itself — approving handles both halves, and this field is here so the queue tells the truth about what is blocking what. A row whose parent type was soft-deleted is listed with type_is_deleted true rather than hidden: approving cannot rescue it, and a curator needs to see the orphan instead of wondering where it went.</p>
+    <p class="errs"><span class="lbl">Errors</span> 401 on bad/missing admin headers; 422 if limit is outside 1..500.</p>
+  </details>
+</article>
+<article class="api" id="post-v1-tsg-threat-intel-library-threats-approve">
+  <div class="api-head">
+    <span class="method m-post">POST</span>
+    <span class="path">/v1/tsg/threat-intel/library/threats/approve</span>
+  </div>
+  <p class="purpose">Approves promoted threats so sessions can retrieve them — the step that makes promote-to-library mean something. Until it runs, a promoted threat sits pending and every new session re-invents it as unverified instead of matching the library row already there.</p>
+  <p class="auth"><span class="lbl">Auth</span> Same admin headers as every route on this router: X-Admin-Key + X-API-Key + X-User-Id required; X-Entity-Id unused; X-Tenant-Id optional.</p>
+  <div class="blk">
+    <h3>Request</h3>
+    <pre>{
+  &quot;catalogue_ids&quot;: [812, 813]
+}</pre>
+  </div>
+  <div class="blk">
+    <h3>Response <span class="status">200</span></h3>
+    <pre>{
+  &quot;approved_count&quot;: 1,
+  &quot;results&quot;: [
+    {&quot;catalogue_id&quot;: 812, &quot;status&quot;: &quot;approved&quot;, &quot;type_activated&quot;: true},
+    {&quot;catalogue_id&quot;: 813, &quot;status&quot;: &quot;already_approved&quot;, &quot;type_activated&quot;: false},
+    {&quot;catalogue_id&quot;: 999, &quot;status&quot;: &quot;not_found&quot;, &quot;type_activated&quot;: false}
+  ]
+}</pre>
+  </div>
+  <div class="blk verify">
+    <h3>Verify in the database</h3>
+    <pre>SELECT ThreatCatalogueID, IsActive, UpdatedBy, UpdatedAt FROM Threat_Catalogue WHERE ThreatCatalogueID = 812;
+SELECT ThreatTypeID, IsActive FROM Threat_Type WHERE ThreatTypeID = 57;</pre>
+  </div>
+  <div class="tables"></div>
+  <details class="notes">
+    <summary>Implementation notes &amp; error cases</summary>
+    <p>Approving a threat also approves its TYPE when that is pending too, because retrieval needs both — type_activated says whether it had to, and a type shared by several ids in one batch is approved once. Named ids only, capped at 100: there is deliberately no &quot;approve everything pending&quot;, because one such call would make every AI-invented threat official in a keystroke, which is the review the pending state exists to force. Per-item results, so an unknown or soft-deleted id comes back not_found while the rest of the batch still approves. Idempotent — approving an approved id is already_approved, not an error, and approved_count counts real writes rather than ids you sent. A threat whose parent type was soft-deleted answers not_found and writes nothing: approving could not make it retrievable, so claiming success would be the false success this route exists to end.</p>
+    <p class="errs"><span class="lbl">Errors</span> 401 on bad/missing admin headers; 422 for an empty list or more than 100 ids.</p>
+  </details>
+</article>
 </section>
 <section id="library_admin">
   <h2 class="section-title">Embeddings &amp; Grounding Admin</h2>

@@ -459,6 +459,20 @@ class UnacceptGateReason(StrEnum):
                                                          # unaccept already flipped it)
 
 
+class LibraryApprovalStatus(StrEnum):
+    """Outcome for ONE id in POST .../library/threats/approve.
+
+    Per-item rather than one status for the batch: a curator approving twenty ids should not lose
+    nineteen good writes to one stale id, and should not be left guessing which one it was.
+
+    `not_found` covers a missing id AND a soft-deleted one, the same conflation
+    dal.update_library_row makes — a deleted row must answer like an absent one, or DELETE
+    becomes silently repeatable."""
+    approved = "approved"                  # was pending, now active — the only status that writes
+    already_approved = "already_approved"  # nothing to do; not an error, and not counted
+    not_found = "not_found"                # no such id, or soft-deleted
+
+
 class TreatmentStageStatus(StrEnum):
     """How far ONE stage of remediation planning has got for a session, DERIVED — never stored.
 

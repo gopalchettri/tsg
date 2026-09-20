@@ -575,9 +575,65 @@ def check_every_decision_route_passes_the_review_gate() -> None:
     print("decisions: every decision route passes the review gate first")
 
 
+def check_promoted_library_rows_can_still_be_approved() -> None:
+    """Some route under app/api must be able to set IsActive=True via dal.update_library_row.
+
+    This guard exists because the absence it protects against has already shipped once, and ran
+    undetected for a year.
+
+    promote-to-library mints Threat_Type/Threat_Catalogue rows PENDING (IsActive=0) so an AI's
+    invention cannot become organisational ground truth unreviewed, and every retrieval read
+    filters IsActive=1. The curator's approval is therefore not a nicety: it is the ONLY exit from
+    that state. In 2026-08 the admin CRUD routes were deleted as unused complexity, taking the
+    only caller of update_library_row with them. Nothing failed. promote-to-library kept answering
+    200 with a created_count, and every promoted threat silently became permanently unreachable —
+    the endpoint's entire purpose ("so a future session can retrieve it instead of the model
+    reinventing it") quietly stopped happening.
+
+    The symptom was an ABSENCE: threats that should stop being reinvented, and kept being
+    reinvented. Absences do not appear in error logs, which is why testing that the approval route
+    behaves correctly is not enough — the route simply NOT EXISTING has to be what breaks the
+    build. Hence parsing, not a comment asking nicely.
+    """
+    app_api = Path(__file__).resolve().parents[1] / "app" / "api"
+    callers: list[str] = []
+    for path in sorted(app_api.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for call in ast.walk(tree):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "update_library_row"):
+                continue
+            # The call must actually carry IsActive: a caller that only renames a row leaves the
+            # pending state exactly as inescapable as no caller at all.
+            args = list(call.args) + [kw.value for kw in call.keywords]
+            if any("IsActive" in _dict_str_keys(a) for a in args):
+                callers.append(f"{path.relative_to(app_api.parents[1])}:{call.lineno}")
+    assert callers, (
+        "no route under app/api/ can set IsActive via dal.update_library_row.\n"
+        "Every row promote-to-library creates is born IsActive=0 and every retrieval read filters "
+        "IsActive=1, so with no approval route each promoted threat is stranded permanently and "
+        "promote-to-library becomes a write path with no reader — it keeps returning 200 while "
+        "doing nothing observable, forever.\n"
+        "This is exactly what happened when the admin CRUD routes were removed in 2026-08. If you "
+        "are deleting the approval route on purpose, delete promote-to-library with it, or give "
+        "the pending state another way out.")
+
+    # A guard is worthless if the helper it points at has been gutted, so check the write is
+    # really still there rather than trusting the name.
+    from app.db import dal
+    writer = getattr(dal, "update_library_row", None)
+    assert writer is not None, "dal.update_library_row is gone — this guard now protects nothing"
+    body = inspect.getsource(writer)
+    assert ".values(" in body and "UpdatedAt" in body, (
+        "dal.update_library_row no longer performs the update this guard assumes — either it was "
+        "split (point the guard at the new writer) or approval moved somewhere unguarded")
+    print(f"library: promoted rows can still be approved ({', '.join(callers)})")
+
+
 def demo() -> None:
     check_only_one_function_writes_a_scenario_decision()
     check_every_decision_route_passes_the_review_gate()
+    check_promoted_library_rows_can_still_be_approved()
     check_scenario_receipts_carry_their_scenario_id()
     check_usable_proposal()
     check_semantic_duplicates_same_category()

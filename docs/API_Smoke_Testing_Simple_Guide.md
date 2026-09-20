@@ -1239,7 +1239,7 @@ FROM Scenario_Audit WHERE SessionID='<sid>' AND EventType='scenario_unaccepted';
 | `replace_accepted` sent with `mode: "all"` or `mode: "none"` | `422` — refused rather than ignored |
 | Replacing in a version you already rejected | `404 not_found` (`reason: "already_rejected"`) — the accepted version is untouched |
 | A `scenario_id` that isn't a decidable scenario of THIS session | `404 not_found` — and **nothing is accepted**, even the ids that were fine |
-| A master threat type/catalogue was **soft-deleted** (`IsDeleted=1`) meanwhile | `409 master_inactive`. This gate is `IsDeleted`-only **by design**: setting `IsActive=0` does NOT trip it. A threat that `promote-to-library` (Test 9b) just minted starts `IsActive=0` pending curator review, and accepting a session containing it has to keep working. A tester who merely deactivates a row and expects a 409 will get a 200 |
+| A master threat type/catalogue was **soft-deleted** (`IsDeleted=1`) meanwhile | `409 master_inactive`. This gate is `IsDeleted`-only **by design**: setting `IsActive=0` does NOT trip it. A threat that `promote-to-library` (Test 9b) just minted starts `IsActive=0` pending curator review (Test 9c clears it), and accepting a session containing it has to keep working. A tester who merely deactivates a row and expects a 409 will get a 200 |
 
 **Reading that 404.** It names every bad id and why, so you don't have to hunt:
 
@@ -2945,7 +2945,7 @@ failure cards, and hide superseded rows unless you ask for them — or unless yo
 | | |
 |---|---|
 | **API** | `POST /v1/sessions/{session_id}/scenarios/{scenario_id}/promote-to-library`, `response_model=LibraryPromotionResponse`, `409` conflicts share the same `ErrorResponse` envelope as accept/reject/regenerate |
-| **Why does this API exist?** | Threat identification either RETRIEVES a threat already in the curated library (`grounding_status: "verified"`) or, when nothing matched well, has the model PROPOSE a new one (`grounding_status: "unverified"`). A proposed threat is scenario-specific and would otherwise disappear with the session — this is the only write path that adds it to `Threat_Type`/`Threat_Catalogue` (plus its category and actor links) so a future session on a similar asset profile can retrieve it instead of the model reinventing it from scratch. **Promotion does not make it retrievable on its own:** newly inserted rows are minted `IsActive=0`, pending curator review, and library retrieval filters `IsActive=1`. A curator has to activate the row before any session can match it. |
+| **Why does this API exist?** | Threat identification either RETRIEVES a threat already in the curated library (`grounding_status: "verified"`) or, when nothing matched well, has the model PROPOSE a new one (`grounding_status: "unverified"`). A proposed threat is scenario-specific and would otherwise disappear with the session — this is the only write path that adds it to `Threat_Type`/`Threat_Catalogue` (plus its category and actor links) so a future session on a similar asset profile can retrieve it instead of the model reinventing it from scratch. **Promotion does not make it retrievable on its own:** newly inserted rows are minted `IsActive=0`, pending curator review, and library retrieval filters `IsActive=1`. A curator has to activate the row before any session can match it — see **Test 9c**, which is the step that does it. Skip 9c and promotion is a write nothing ever reads. |
 | **What does it do?** | Promotes ONE already-accepted scenario's threat type and threat. Nothing is duplicated: each item comes back `inserted` (a new master row), `existing` (reused), or `failed` (an actor with no stored id, a soft-deleted actor, or a link that did not take — the call still returns `200`, with `success: false` and an `error` on that item). Calling it twice creates nothing and returns the same ids. Controls are only reported here, never written — a mapped control is already curated `Control_Library` master data. |
 | **When do you call it?** | After Test 6 accepts a scenario. Anyone holding `session_id` + `scenario_id` in their entity scope may call it — not owner-restricted, same posture as accept/reject. |
 
@@ -3030,6 +3030,54 @@ ORDER BY CreatedAt DESC;
 **Pass if:** the first call inserts the new library rows and records one `library_promoted` audit
 event; every later call on the same scenario returns `200` with `created_count: 0` and changes
 nothing in `Threat_Type`/`Threat_Catalogue`.
+
+> **Promotion alone changes nothing a session can see.** The rows it writes are pending. Test 9c
+> is the other half — without it, promotion is a write with no reader, and the threat you just
+> taught the library is re-invented from scratch by every future session.
+
+---
+
+### Test 9c — Approve a Promoted Threat ("Publish it to the library")
+
+| | |
+|---|---|
+| **API** | `GET /v1/tsg/threat-intel/library/pending` and `POST /v1/tsg/threat-intel/library/threats/approve`. Admin-key routes (`X-Admin-Key`), not entity-scoped — the library is shared across tenants |
+| **Why does this API exist?** | Test 9b writes the threat into the library **pending** (`IsActive=0`) on purpose: something the AI invented must not become organisational ground truth until a person says so, and retrieval only ever searches active rows. This is the person saying so. Until it runs, the promoted threat is invisible to every session — including the one that promoted it |
+| **What does it do?** | `pending` lists what is waiting. `approve` takes named catalogue ids and activates them, **plus the parent threat type when that is pending too** — retrieval matches a type first and a threat name second, so approving the threat alone would leave it just as unreachable. `type_activated` in the response says whether it had to |
+
+**Try it:**
+
+```bash
+curl -s "http://localhost:8000/v1/tsg/threat-intel/library/pending" -H "X-Admin-Key: $ADMIN_KEY"
+
+curl -s -X POST "http://localhost:8000/v1/tsg/threat-intel/library/threats/approve" \
+  -H "X-Admin-Key: $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"catalogue_ids": [812, 813]}'
+```
+
+**Must-fail checks:**
+
+| You do this | App must answer |
+|---|---|
+| Send more than 100 ids, or an empty list | `422 unprocessable_entity` — there is deliberately no "approve everything pending" |
+| Approve an id that does not exist, or was soft-deleted | `200`, that item `not_found`; **the rest of the batch still approves** |
+| Approve a threat whose parent type was soft-deleted | `200`, that item `not_found` — approving could not make it retrievable, so it is not claimed |
+| Approve the same id twice | `200`, `already_approved`, `approved_count: 0` — idempotent, not an error |
+| Omit `X-Admin-Key` | `401` |
+
+**Verify in the database:**
+
+```sql
+SELECT ThreatCatalogueID, ThreatName, IsActive, UpdatedBy, UpdatedAt
+FROM Threat_Catalogue WHERE ThreatCatalogueID = <catalogue_id>;
+-- and its parent, which retrieval also needs active:
+SELECT ThreatTypeID, ThreatTypeName, IsActive FROM Threat_Type WHERE ThreatTypeID = <type_id>;
+```
+
+**Pass if:** after approval both rows read `IsActive = 1`, `UpdatedBy` names the curator, and a
+**new session on a similar asset retrieves that threat as `grounding_status: "verified"`** instead
+of re-inventing it as `unverified`. That last check is the only one that proves the whole chain —
+the column flipping is not the point, the threat becoming reusable is.
 
 ---
 
