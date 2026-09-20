@@ -134,11 +134,11 @@ def get_possible_types(sess: Session, category_id: int | None) -> list[dict[str,
         mapped_type_ids = (
             select(m.Threat_Catalogue.ThreatTypeID)
             .join(m.Threat_Catalogue_Category_Map,
-                  m.Threat_Catalogue_Category_Map.ThreatCatalogueID
-                  == m.Threat_Catalogue.ThreatCatalogueID)
+                m.Threat_Catalogue_Category_Map.ThreatCatalogueID
+                == m.Threat_Catalogue.ThreatCatalogueID)
             .where(m.Threat_Catalogue_Category_Map.ThreatCategoryID == category_id,
-                   m.Threat_Catalogue.IsActive == True,
-                   m.Threat_Catalogue.IsDeleted == False)
+                m.Threat_Catalogue.IsActive == True,
+                m.Threat_Catalogue.IsDeleted == False)
         ).scalar_subquery()
         q = q.where(or_(m.Threat_Type.ThreatCategoryID == category_id,
                         m.Threat_Type.ThreatTypeID.in_(mapped_type_ids)))
@@ -548,7 +548,7 @@ def canonical_types_for(sess: Session, llm: LLMClient, categories: list[str],
     vecs: dict[str, list[float]] = {}
     try:
         vecs = embeddings.get_vectors(llm, every_name, model_id=s.embedding_model,
-                                      group="threat_type", kind="passage")
+                                    group="threat_type", kind="passage")
     except Exception:  # keyword leg still ranks — see nearest_library_actors' limitation note
         log.warning("canonical_types.type_vectors_failed_keyword_only", exc_info=True)
 
@@ -558,8 +558,8 @@ def canonical_types_for(sess: Session, llm: LLMClient, categories: list[str],
 
 
 def _fuse_type_ranks(names: list[str], used: Counter[str], query: str,
-                     query_vec: list[float] | None, vecs: dict[str, list[float]],
-                     cap: int) -> list[str]:
+                    query_vec: list[float] | None, vecs: dict[str, list[float]],
+                    cap: int) -> list[str]:
     """RRF over (usage among retrieved) and (name similarity). See canonical_types_for.
 
     Takes `vecs` rather than fetching them: this runs once per OVERFLOWING category, and the
@@ -571,7 +571,7 @@ def _fuse_type_ranks(names: list[str], used: Counter[str], query: str,
     candidates: list[dict[str, Any]] = [{"text": n, "name": n, "vector": vecs.get(n)}
                                         for n in names]
     by_words = [i for i, _score in hybrid_search.hybrid_match(query, candidates,
-                                                              query_vec=query_vec)]
+                                                            query_vec=query_vec)]
     fused = hybrid_search.rrf_fuse([by_usage, by_words])
     if not fused:
         # Both legs silent: nothing retrieved used these types AND the text legs scored zero

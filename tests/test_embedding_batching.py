@@ -425,3 +425,78 @@ def test_boot_probe_does_not_blame_batch_size_for_every_failure(monkeypatch):
 
     assert "reachable" in str(exc.value) and "key is valid" in str(exc.value)
     assert "401 invalid api key" in str(exc.value)   # the real cause is not swallowed
+
+
+def _capture_kwargs(monkeypatch) -> list[dict]:
+    """Stub litellm.embedding and keep every kwarg, not just `input` — these tests are about
+    WHERE the request went. Same stub-don't-import reasoning as _install_fake above."""
+    seen: list[dict] = []
+
+    def fake_embedding(*, model, input, **kwargs):
+        seen.append(kwargs)
+        return {"data": [{"index": i, "embedding": [0.0, 0.0]} for i in range(len(input))]}
+
+    stub = types.ModuleType("litellm")
+    stub.embedding = fake_embedding
+    monkeypatch.setitem(sys.modules, "litellm", stub)
+    return seen
+
+
+_OPENAI = {"embedding_provider": "openai", "embedding_model": "text-embedding-3-large",
+           "embedding_base_url": "https://res.services.ai.azure.com/openai/v1",
+           "embedding_api_key": "emb-key",
+           # set, and must NOT be what an openai-provider embedding call uses
+           "litellm_base_url": "http://localhost:4000", "litellm_api_key": "sk-local"}
+
+
+def test_openai_provider_embeds_against_its_own_endpoint_not_the_gateway(monkeypatch):
+    """EMBEDDING_PROVIDER=openai must use embedding_base_url/_api_key. The gateway pair is set to
+    real-looking values here on purpose: reading the wrong one would otherwise fail as an empty
+    string and look like a different bug."""
+    seen = _capture_kwargs(monkeypatch)
+
+    LiteLLMClient(_settings(**_OPENAI)).embed(["hello"])
+
+    assert seen[0]["api_base"] == "https://res.services.ai.azure.com/openai/v1"
+    assert seen[0]["api_key"] == "emb-key"
+    assert seen[0]["custom_llm_provider"] == "openai"
+
+
+def test_boot_probe_and_real_embed_agree_on_the_endpoint(monkeypatch):
+    """The probe certifies the route production takes, so the two must send to the same place. If
+    they could drift, a worker could boot green against one provider and embed against another."""
+    seen = _capture_kwargs(monkeypatch)
+    s = _settings(**_OPENAI, embedding_dimensions=2)
+
+    LiteLLMClient(s).embed(["hello"])
+    _verify_embedding_dimensions(s)
+
+    def route(kw):
+        return kw["custom_llm_provider"], kw["api_base"], kw["api_key"]
+
+    assert route(seen[0]) == route(seen[1])
+
+
+def test_litellm_proxy_embedding_is_unchanged_by_the_openai_branch(monkeypatch):
+    """The gateway path is what UAT runs (qwen3-embedding-8b-mig). Adding the openai branch must
+    not have moved it — including the alternate auth header, which is gateway-only."""
+    seen = _capture_kwargs(monkeypatch)
+
+    LiteLLMClient(_settings(litellm_base_url="https://llmapi.example", litellm_api_key="sk-gw",
+                            litellm_api_key_header="x-litellm-api-key")).embed(["hello"])
+
+    assert seen[0]["api_base"] == "https://llmapi.example"
+    assert seen[0]["api_key"] == "sk-gw"
+    assert seen[0]["custom_llm_provider"] == "litellm_proxy"
+    assert seen[0]["extra_headers"] == {"x-litellm-api-key": "sk-gw"}
+
+
+def test_openai_provider_does_not_send_the_gateway_auth_header(monkeypatch):
+    """A direct provider gets plain Authorization. Forwarding the gateway's private header to
+    Azure is at best noise and at worst a rejected request."""
+    seen = _capture_kwargs(monkeypatch)
+
+    LiteLLMClient(_settings(**_OPENAI,
+                            litellm_api_key_header="x-litellm-api-key")).embed(["hello"])
+
+    assert "extra_headers" not in seen[0]

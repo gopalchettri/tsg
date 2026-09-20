@@ -354,6 +354,29 @@ def _litellm_http_headers(s: Settings) -> dict[str, str]:
     return headers
 
 
+def _embedding_call_kwargs(s: Settings) -> dict[str, Any]:
+    """WHERE an embedding request is sent, for the only two places that send one:
+    `_embed_one_batch` and the boot probe `_verify_embedding_dimensions`.
+
+    Shared for the same reason as `_litellm_call_budget` above, but the stake is higher here: the
+    probe's whole purpose is to prove the REAL path works before the worker accepts jobs. If these
+    two could disagree about the endpoint, the probe would be certifying a route production never
+    takes — a green boot against one provider while every real embed hits another.
+
+    'openai' means any OpenAI-compatible endpoint (Azure OpenAI / AI Foundry included). litellm
+    treats custom_llm_provider 'openai' and 'litellm_proxy' identically for embeddings — plain
+    OpenAI SDK against api_base — so this branch is only about WHICH base_url and key, never about
+    the wire protocol. The alternate auth header is proxy-only: a direct provider gets the standard
+    Authorization header alone, and sending a gateway's private header to Azure would be noise.
+    """
+    if s.embedding_provider == "openai":
+        return {"custom_llm_provider": "openai", "api_base": s.embedding_base_url,
+                "api_key": s.embedding_api_key}
+    return {"custom_llm_provider": "litellm_proxy",  # see _chat_kwargs
+            "api_base": s.litellm_base_url, "api_key": s.litellm_api_key,
+            **_litellm_key_header(s)}  # gateway-safe alternate auth header, when configured
+
+
 def _apply_embed_prefix(s: Settings, texts: list[str], kind: str) -> list[str]:
     """Prepend the e5 family's trained-on `query: ` / `passage: ` tag. Provider-agnostic — the
     MODEL needs it whether it runs locally or behind the proxy; without it results degrade
@@ -477,7 +500,7 @@ class LiteLLMClient:
             return False
 
     def chat(self, messages, *, model=None, temperature=None, expected_type=None,
-             response_schema=None):
+            response_schema=None):
         """One completion → (text, Provenance). litellm is imported locally so a stub-only test
         run never needs the package installed.
 
@@ -567,8 +590,8 @@ class LiteLLMClient:
             # model it is usually an EMPTY string (the thinking spent the whole cap). Name it.
             if finish_reason == "length":
                 raise LLMResponseTruncated(max_tokens=kwargs.get("max_tokens"),
-                                           completion_tokens=completion_tokens,
-                                           reasoning_tokens=reasoning_tokens)
+                                        completion_tokens=completion_tokens,
+                                        reasoning_tokens=reasoning_tokens)
             # Structured Outputs' refusal shape: no content, a `refusal` string instead.
             refusal = msg.get("refusal")
             if not content and refusal:
@@ -697,9 +720,8 @@ class LiteLLMClient:
         import litellm
 
         resp = litellm.embedding(
-            model=model, input=texts, custom_llm_provider="litellm_proxy",  # see _chat_kwargs
-            api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
-            **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
+            model=model, input=texts,
+            **_embedding_call_kwargs(self.s),  # provider/endpoint, shared with the boot probe
             **_litellm_call_budget(self.s),  # same bounds as chat, from one source
         )
         # `data` MAY come back out of input order, so vectors are PLACED by their own `index`,
@@ -789,7 +811,7 @@ class LiteLLMClient:
         # fanout.map_settled, not a raw pool: a revoked caller's queued rerank calls must not keep
         # running (and holding LLM slots) after it is gone. Settled pairs come back in input order.
         settled = map_settled(lambda item: self.rerank(item[0], item[1], model=model), items,
-                              max_workers=self.s.rerank_concurrency)
+                            max_workers=self.s.rerank_concurrency)
         results: list[list[float] | None] = []
         failures = 0
         for i, (value, exc) in enumerate(settled):
@@ -897,8 +919,8 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
     # `sdk_max_retries` missing or non-zero in this line = the cap is NOT in effect.
     _budget = _litellm_call_budget(s)
     log.info("llm.retry_budget", attempts=_budget["num_retries"] + 1,
-             num_retries=_budget["num_retries"], sdk_max_retries=_budget["max_retries"],
-             timeout_seconds=_budget["timeout"])
+            num_retries=_budget["num_retries"], sdk_max_retries=_budget["max_retries"],
+            timeout_seconds=_budget["timeout"])
     _ensure_litellm_proxy_bypassed(s)
     if s.llm_provider != "litellm_proxy":  # direct providers have no registration check below
         # openai-direct pins the model so a configured fallback cannot mask a broken primary
@@ -917,6 +939,11 @@ def verify_litellm_models(settings: Settings | None = None) -> None:
         wanted["embedding_model"] = s.embedding_model
     if s.reranker_provider == "litellm_proxy":
         wanted["reranker_model"] = s.reranker_model
+    # A direct embedding provider has no proxy model list to check against — same posture as chat
+    # above ("direct providers have no registration check below"). The WIDTH probe still runs, and
+    # runs HERE because `wanted` is empty when nothing else uses the proxy and we return below.
+    if s.embedding_provider == "openai":
+        _verify_embedding_dimensions(s)
     if not wanted:
         return
 
@@ -1046,9 +1073,7 @@ def _verify_embedding_dimensions(s: Settings) -> None:
         with _llm_slot(s), _provider_429_retryable():
             resp = litellm.embedding(
                 model=s.embedding_model, input=probe,
-                custom_llm_provider="litellm_proxy",  # see _chat_kwargs
-                api_base=s.litellm_base_url, api_key=s.litellm_api_key,
-                **_litellm_key_header(s),  # gateway-safe alternate auth header, when configured
+                **_embedding_call_kwargs(s),  # the SAME endpoint _embed_one_batch will use
                 **_litellm_call_budget(s),
             )
     except LLMSlotUnavailable:

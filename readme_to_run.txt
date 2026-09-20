@@ -49,3 +49,6 @@ uvicorn app.main:app --reload --port 8000
 # grounding calibration). Without -Q above, the pipeline worker drains this queue too.
 # -A celery_app, NOT celery_worker: gevent monkey-patching hangs a solo pool at boot.
 .venv\Scripts\celery.exe -A app.pipeline.celery_app.celery_app worker -Q admin -P solo -l info
+
+
+.\start.ps1 -SkipDocker -EnvFile .env

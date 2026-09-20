@@ -322,8 +322,18 @@ class Settings(BaseSettings):
     reranker_model: str = Field(
         "bge-reranker-v2-m3", validation_alias=AliasChoices("RERANKER_MODEL", "TSG_RERANKER_MODEL"))
     # EMBEDDING_PROVIDER — leave unset to follow llm_provider (_derive_embedding_reranker_provider).
-    embedding_provider: Literal["litellm_proxy", "local"] = Field(
+    # 'openai' is any OpenAI-compatible endpoint (Azure OpenAI / AI Foundry included) addressed by
+    # embedding_base_url + embedding_api_key below — the embedding twin of llm_provider='openai'.
+    embedding_provider: Literal["litellm_proxy", "local", "openai"] = Field(
         "local", validation_alias=AliasChoices("EMBEDDING_PROVIDER", "TSG_EMBEDDING_PROVIDER"))
+    # TSG_EMBEDDING_BASE_URL / TSG_EMBEDDING_API_KEY — only read when embedding_provider=openai.
+    # Deliberately NOT openai_base_url/openai_api_key: chat and embeddings routinely live on
+    # DIFFERENT resources with different keys (they do here), so one shared pair would force them
+    # onto the same endpoint.
+    embedding_base_url: str = Field(
+        "", validation_alias=AliasChoices("EMBEDDING_BASE_URL", "TSG_EMBEDDING_BASE_URL"))
+    embedding_api_key: str = Field(
+        "", validation_alias=AliasChoices("EMBEDDING_API_KEY", "TSG_EMBEDDING_API_KEY"))
     # EMBEDDING_DIMENSIONS — vector size; MUST match the active model or comparisons corrupt.
     embedding_dimensions: int = Field(
         1024, validation_alias=AliasChoices("EMBEDDING_DIMENSIONS", "TSG_EMBEDDING_DIMENSIONS"))
@@ -732,6 +742,20 @@ class Settings(BaseSettings):
                 self.embedding_provider = "litellm_proxy"
             if "reranker_provider" not in self.model_fields_set:
                 self.reranker_provider = "litellm_proxy"
+        return self
+
+    # An embedding endpoint must be NAMED, never inferred — this one is an egress gate, not a
+    # typo check. Left blank, litellm defaults to api.openai.com, and the models deployed on
+    # Azure carry OpenAI's own names ('text-embedding-3-large'), so the call SUCCEEDS and returns
+    # a correctly-sized vector. Boot stays green, the dimension probe passes, and every asset
+    # description quietly leaves for a third party nobody chose. Refuse instead.
+    @model_validator(mode="after")
+    def _require_embedding_base_url(self) -> Settings:
+        if self.embedding_provider == "openai" and not self.embedding_base_url.strip():
+            raise ValueError(
+                "EMBEDDING_PROVIDER=openai requires TSG_EMBEDDING_BASE_URL. Without it embedding "
+                "traffic silently defaults to api.openai.com — which would answer successfully, "
+                "so nothing downstream would flag it. Set the endpoint explicitly.")
         return self
 
     # Progress clocks must outlast a full LLM retry chain, or a slow-but-live worker is reaped:
