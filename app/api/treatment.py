@@ -102,8 +102,12 @@ _CONFLICT_RESPONSES: dict[int | str, dict] = {
 #: HISTORICAL — never raised — and deliberately absent).
 _GATE_TEXT: dict[TreatmentGateReason, str] = {
     TreatmentGateReason.scenario_not_accepted:
-        "treatment plans are generated and reviewed for accepted scenarios only — this scenario "
-        "is not the accepted version (a regeneration may have replaced it)",
+        # No cause named here on purpose. Three raise sites share this one spelling — create,
+        # regenerate and review — and only review's is ever about a replacement. Naming one
+        # site's cause made the commonest 409 of all (nobody has decided this scenario yet)
+        # accuse a regeneration that never happened. The site-specific detail lives in the
+        # review route's own description.
+        "treatment plans are generated and reviewed for accepted scenarios only",
     TreatmentGateReason.generation_in_progress:
         "a treatment plan is already being generated for this scenario",
     TreatmentGateReason.not_in_progress:
@@ -673,7 +677,13 @@ def post_review_treatment_plan(session_id: str, scenario_id: str, body: Treatmen
         # and it is already gone from the board and the register that a verdict feeds. Create and
         # regenerate gate on the same flag; cancel deliberately does not, since stopping spend on
         # a generation nobody wants any more is always allowed.
-        if row["Accepted"] != 1:
+        #
+        # `== 0`, NOT `!= 1`: active_plan_row OUTER joins the scenario, so Accepted is NULL when
+        # the linkage is broken — the case that join exists for. `!= 1` refused those too, making
+        # such a plan permanently unapprovable and blaming a regeneration that never happened,
+        # while entity_plan_rows deliberately keeps the very same rows visible. Refuse only what
+        # the database actually says is not accepted.
+        if row["Accepted"] == 0:
             raise _conflict(TreatmentGateReason.scenario_not_accepted)
 
         target_id = body.plan_id  # canonicalized at the schema boundary; row ids canonical too

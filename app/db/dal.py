@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from sqlalchemy import (
     Executable,
@@ -1431,6 +1431,23 @@ _DECISION_EVENT = {
 }
 
 
+class Replacement(NamedTuple):
+    """One acceptance moved between two versions of the same scenario. BOTH ids, because a caller
+    needs to know what gained the decision and what lost it — the loser is the id whose cached
+    plan, board row and register entry just stopped being the answer for that risk."""
+    scenario_id: str       # now the accepted version
+    replaced_scenario_id: str  # accepted until this call, now history
+
+
+class Decided(NamedTuple):
+    """What `decide_scenarios` actually wrote. `count` is the rows decided; `replaced` is the
+    replacements it really made (empty on every call that did not ask for one). Two fields rather
+    than a bare int because the caller must be able to report, log and audit what HAPPENED — the
+    requested set is not that."""
+    count: int
+    replaced: list[Replacement]
+
+
 def _decidable_where(session_id: str, subsystem_ids: list[int], decision: AuditDecision,
                      subset: list[str] | None) -> list:
     """The rows a decision may touch — THE single definition, shared by the write
@@ -1465,7 +1482,7 @@ def decide_scenarios(
     sess: Session, session_id: str, subsystem_ids: list[int], *, decision: AuditDecision,
     subset: list[str] | None = None, tenant_id: str | None = None, entity_id: str | None = None,
     user_id: str | None = None, displace: dict[str, str] | None = None,
-) -> int:
+) -> Decided:
     """Record ONE reviewer decision per scenario — the row write and its ledger entry, together.
 
     `subset=[]` decides none; `subset=None` decides the current version of everything.
@@ -1495,10 +1512,15 @@ def decide_scenarios(
     scripts/test_pipeline_guards.py allows to write a decision column — the single-writer rule is
     what keeps the decision and its ledger entry inseparable, and a replacement is two decisions.
 
-    Returns rows actually decided, so the caller can tell "N requested, M<N matched" from a clean
-    run — otherwise a subset id naming a wrong row vanishes silently."""
+    Returns `Decided(count, replaced)`: rows actually decided, so the caller can tell "N requested,
+    M<N matched" from a clean run — otherwise a subset id naming a wrong row vanishes silently —
+    and the versions actually un-accepted. `replaced` is NOT `displace`: the un-accept is fenced,
+    so a row another decision moved first matches nothing and must not be reported as replaced.
+    The caller has no second way to find out — re-reading cannot distinguish "I replaced it" from
+    "it was already like that" — so the fact is returned rather than recomputed."""
     event_type = _DECISION_EVENT[decision]
     out = m.Threat_Scenario
+    flipped: list[Replacement] = []
     if displace:
         # BEFORE the accept below, not after: UX_Scenario_ActiveAccepted permits one accepted
         # version per identity, so the other order violates it at statement time.
@@ -1512,20 +1534,31 @@ def decide_scenarios(
         # RETURNING, so the ledger records exactly the rows this UPDATE flipped. A row someone
         # else decided first simply does not match, and the accept below then collides with the
         # unique index — which accept_session already converts into a typed 409.
-        flipped = [str(r[0]) for r in sess.execute(
+        flipped = [Replacement(displace[str(r[0])], str(r[0])) for r in sess.execute(
             update(out)
-            .where(out.SessionID == session_id, out.ScenarioID.in_(list(displace)),
-                accepted(out.Accepted))
+            # Subsystem-fenced like every other write in this function. It is not redundant with
+            # the id list: `displace`'s keys come from accepted_identity_pairs, which is
+            # SESSION-scoped, while the decision below is subsystem-scoped. Today the two agree
+            # because identity_hash folds SubsystemID into the digest, so a colliding prior is
+            # necessarily in the same subsystem — an invariant living 300 lines away, which is
+            # exactly the kind this predicate exists to stop depending on.
+            .where(out.SessionID == session_id, out.SubsystemID.in_(subsystem_ids),
+                out.ScenarioID.in_(list(displace)), accepted(out.Accepted))
             .values(Accepted=0, AcceptedAt=None, AcceptedBy=None, AcceptedSubsetJSON=None)
             .returning(out.ScenarioID)
         ).all()]
         if flipped:
             sess.execute(insert(m.Scenario_Audit), [
                 audit_row(sess, AuditID=guid(), SessionID=session_id, TenantID=tenant_id,
-                        EntityID=entity_id, ScenarioID=oid,
-                        EventType=AuditEventType.scenario_unaccepted, ActorUserID=user_id,
-                        DetailJSON=json.dumps({"replaced_by": displace[oid]}))
-                for oid in flipped])
+                        EntityID=entity_id, ScenarioID=old,
+                        EventType=AuditEventType.scenario_unaccepted,
+                        # The same Decision its sibling scenario_accepted row carries: this
+                        # un-accept IS part of that accept call. Left NULL, one scenario's
+                        # history read `accept` on one row and nothing on the other, and every
+                        # consumer of the trail had to special-case the event type to see both.
+                        Decision=decision, ActorUserID=user_id,
+                        DetailJSON=json.dumps({"replaced_by": new}))
+                for new, old in flipped])
     where = _decidable_where(session_id, subsystem_ids, decision, subset)
 
     # Read first, so each scenario gets its own ledger row. Exact rather than racy: every caller
@@ -1534,7 +1567,10 @@ def decide_scenarios(
     rows = sess.execute(
         select(out.ScenarioID, out.Accepted, out.RejectedAt).where(*where)).mappings().all()
     if not rows:
-        return 0
+        # `flipped` still rides along: a caller whose subset matched nothing rolls back anyway,
+        # but reporting a replacement it did not make would be a lie in the one path that most
+        # needs the truth.
+        return Decided(0, flipped)
     # The ledger records TRANSITIONS, not matches. A row already carrying this decision still
     # matches (deciding twice is idempotent, not a 404), but writing a second audit row for it
     # would put two decisions in the trail where the reviewer made one — a double-click, or a
@@ -1568,7 +1604,7 @@ def decide_scenarios(
                     EntityID=entity_id, ScenarioID=oid, EventType=event_type, Decision=decision,
                     ActorUserID=actor)
             for oid in changed])
-    return res.rowcount
+    return Decided(res.rowcount, flipped)
 
 
 def undecidable_subset_reasons(
@@ -1775,6 +1811,31 @@ def supersede_by_scoped_threats(sess: Session, session_id: str, subsystem_id: in
         )
         .values(Superseded=1)
     )
+
+
+def supersede_scenarios_by_ids(sess: Session, session_id: str, subsystem_id: int,
+                            scenario_ids) -> set[str]:
+    """Retire exactly these scenario versions, naming them — the REGENERATION path's replacement.
+    Returns the ids actually retired, so the caller stamps ReplacesScenarioID only where a row
+    really was replaced.
+
+    A regeneration KNOWS which version it was asked to replace, so it says so. Its
+    identity-matching sibling below exists for next-set, which has no target and must find
+    whatever row a fresh fold lands on. Using that sibling for a regeneration made the retire
+    depend on a hash recomputed from the threat's CURRENT library ids — and promote-to-library
+    rewrites those ids, so a target whose stored IdentityHash was NULL or stale matched nothing
+    and stayed live beside its own replacement: two versions of one scenario, each separately
+    acceptable. An id cannot drift."""
+    if not scenario_ids:
+        return set()
+    out = m.Threat_Scenario
+    return {str(r[0]) for r in sess.execute(
+        update(out)
+        .where(out.SessionID == session_id, out.SubsystemID == subsystem_id,
+            out.ScenarioID.in_(list(scenario_ids)), active(out.Superseded))
+        .values(Superseded=1)
+        .returning(out.ScenarioID)
+    ).all()}
 
 
 def supersede_by_identity_hashes(sess: Session, session_id: str, subsystem_id: int, identity_hashes,

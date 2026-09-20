@@ -34,10 +34,10 @@ from test_accept_any_version import (
 )
 
 from app.api.schemas import AcceptBody
-from app.core.enums import AuditEventType, ScenarioDecisionReason, StageStatus
+from app.core.enums import AuditDecision, AuditEventType, ScenarioDecisionReason, StageStatus
 from app.db import dal
 from app.db import models as m
-from app.pipeline.accept import AcceptConflict, reject_scenarios
+from app.pipeline.accept import AcceptConflict, accept_session, reject_scenarios
 from app.sse import bus
 
 
@@ -120,16 +120,104 @@ def test_without_the_flag_the_refusal_explains_both_ways_out(monkeypatch):
 
 def test_two_versions_in_one_call_are_refused_even_with_the_flag(monkeypatch):
     """Replacing resolves ONE accepted version per scenario. A subset naming two versions of the
-    same scenario is still nonsense, flag or no flag."""
+    same scenario is still nonsense, flag or no flag.
+
+    A version is accepted FIRST on purpose. Without that, `already` is empty, `prior` is None and
+    the replace branch is never entered — the test would pass for the same reason its no-flag twin
+    does, pinning nothing. With it, the run reaches `displace[prior] = oid` and only then hits the
+    duplicate check, which is the ordering that matters."""
     Session = sessionmaker(bind=_engine(), future=True)
     sid = _seed_session(Session)
-    _a, b, _c, d = _versions_abcd(Session, sid)
+    a, b, _c, d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [a], monkeypatch) == 1
 
     with pytest.raises(AcceptConflict) as exc_info:
         _accept(Session, sid, [b, d], monkeypatch, replace=True)
 
     assert exc_info.value.reason == ScenarioDecisionReason.duplicate_identity
+    assert _flags(Session, a)[0] == 1, "the standing decision survives the refused call"
     assert _flags(Session, b)[0] == 0 and _flags(Session, d)[0] == 0
+    assert _audit(Session, AuditEventType.scenario_unaccepted) == [], (
+        "the displace write is rolled back with the rest of the refused call")
+
+
+def test_accept_all_refusal_points_at_a_call_the_api_will_accept(monkeypatch):
+    """Accept-all cannot carry replace_accepted — AcceptBody answers 422 for that pair — so its
+    refusal must not tell the caller to repeat THIS call with the flag. It did, which sent a UI
+    following the message straight into a 422."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+
+    with pytest.raises(AcceptConflict) as exc_info:
+        _accept(Session, sid, None, monkeypatch)
+    all_msg = str(exc_info.value)
+    assert "repeat this call" not in all_msg, "accept-all cannot be repeated with the flag"
+    assert 'mode "subset"' in all_msg and "replace_accepted" in all_msg
+    assert AcceptBody(mode="subset", scenario_ids=[d], replace_accepted=True), (
+        "and the call it names is one the schema accepts")
+
+    with pytest.raises(AcceptConflict) as exc_info:
+        _accept(Session, sid, [d], monkeypatch)
+    assert "repeat this call" in str(exc_info.value), "the subset refusal still says the short thing"
+
+
+def test_the_write_reports_what_it_replaced_not_what_was_asked(monkeypatch):
+    """accept_session returns what the UPDATE actually flipped. The pre-flight's `displace` is a
+    request; a row another decision moved first matches nothing, and reporting it would tell a
+    client to invalidate a plan that never moved."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
+
+    with Session() as s:
+        plain = accept_session(s, sid, "86", "u1", subset=[b])
+    assert plain == dal.Decided(1, []), "an ordinary accept replaces nothing"
+
+    with Session() as s:
+        swapped = accept_session(s, sid, "86", "u1", subset=[d], replace_accepted=True)
+    assert swapped.count == 1
+    assert swapped.replaced == [dal.Replacement(scenario_id=d, replaced_scenario_id=b)]
+
+
+def test_the_unaccept_row_carries_the_same_decision_as_its_sibling(monkeypatch):
+    """One scenario's history must read as one story. The scenario_accepted row records the
+    decision that produced it; left NULL here, the same scenario's scenario_unaccepted row showed
+    a hole, and every consumer of the trail had to special-case the event type to see both."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+    assert _accept(Session, sid, [d], monkeypatch, replace=True) == 1
+
+    with Session() as s:
+        rows = s.execute(
+            select(m.Scenario_Audit.EventType, m.Scenario_Audit.Decision,
+                m.Scenario_Audit.ActorUserID)
+            .where(m.Scenario_Audit.ScenarioID == b)).all()
+    decisions = {event: decision for event, decision, _actor in rows}
+    assert decisions[str(AuditEventType.scenario_accepted)] == str(AuditDecision.accept)
+    assert decisions[str(AuditEventType.scenario_unaccepted)] == str(AuditDecision.accept)
+    assert all(actor == "u1" for _e, _d, actor in rows)
+
+
+def test_a_failed_replace_leaves_nothing_behind(monkeypatch):
+    """THE rollback path, and the only one that can strand a scenario with no accepted version:
+    the displace UPDATE flips a row and writes its ledger entry, and only THEN does the call fail
+    on an id it cannot decide. Everything must go back."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+
+    with pytest.raises(dal.NotFoundError):
+        _accept(Session, sid, [d, str(uuid.uuid4())], monkeypatch, replace=True)
+
+    assert _flags(Session, b)[0] == 1, "the version that was accepted still is"
+    assert _flags(Session, d)[0] == 0, "and the one that would have replaced it did not"
+    assert _audit(Session, AuditEventType.scenario_unaccepted) == [], "no ledger entry survives"
 
 
 def test_accept_all_never_replaces(monkeypatch):
@@ -239,31 +327,98 @@ def test_body_refuses_the_flag_outside_subset_mode():
     assert AcceptBody(mode="all").replace_accepted is False, "off unless asked for"
 
 
-def test_review_is_refused_for_a_replaced_version(monkeypatch):
-    """A verdict is what a regulator reads, so it may only land on the plan of the version the
-    register carries. The old plan stays readable; approving it would sign off remediation for
-    text the organisation no longer stands by."""
+def test_the_accept_response_names_what_it_replaced(monkeypatch):
+    """The wire half of the same fact. A client that replaced a version has to be told which id
+    lost the decision — that is the plan it must stop showing, and the response was previously
+    byte-identical to an ordinary accept."""
+    from contextlib import contextmanager
+
+    import app.api.sessions as sessions_mod
+    from app.api.deps import Principal
+
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+
+    @contextmanager
+    def fake_db_session():
+        with Session() as s:
+            yield s
+
+    with Session() as s:
+        session_row = dict(dal.load_session(s, sid))
+    monkeypatch.setattr(sessions_mod, "db_session", fake_db_session)
+    monkeypatch.setattr(sessions_mod, "get_authorized_session", lambda *a, **k: session_row)
+    monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
+    principal = Principal(claims={"sub": "u1"}, entities={"86"}, client_id="c", tenant_id="t")
+
+    plain = sessions_mod.post_accept(sid, AcceptBody(mode="subset", scenario_ids=[b]), principal)
+    assert plain.replaced == [], "an ordinary accept reports nothing replaced"
+
+    swapped = sessions_mod.post_accept(
+        sid, AcceptBody(mode="subset", scenario_ids=[d], replace_accepted=True), principal)
+    assert swapped.accepted_count == 1
+    assert [(r.scenario_id, r.replaced_scenario_id) for r in swapped.replaced] == [(d, b)]
+
+
+def _review(Session, monkeypatch, sid: str, scenario_id: str, plan_id: str):
+    """Drive the real review route against these tables — no stubbed plan row.
+
+    Handing the route a hand-written dict hid the seam that matters: the gate reads a column
+    (`Accepted`) that dal.active_plan_row must actually select. With a stub, deleting that column
+    from the query leaves the test green while every real review call raises KeyError → 500."""
     from contextlib import contextmanager
 
     import app.api.treatment as treatment_api
     from app.api.deps import Principal
+
+    @contextmanager
+    def real_session():
+        with Session() as s:
+            yield s
+
+    monkeypatch.setattr(treatment_api, "db_session", real_session)
+    monkeypatch.setattr(treatment_api, "get_authorized_session",
+                        lambda *a, **k: {"SessionID": sid, "TenantID": "t", "EntityID": "86"})
+    body = treatment_api.TreatmentReviewBody(plan_id=plan_id, decision="approved")
+    principal = Principal(claims={"sub": "u1"}, entities={"86"}, client_id="c", tenant_id="t")
+    return treatment_api.post_review_treatment_plan(sid, scenario_id, body, principal)
+
+
+def test_review_is_refused_for_a_replaced_version(monkeypatch):
+    """A verdict is what a regulator reads, so it may only land on the plan of the version the
+    register carries. The old plan stays readable; approving it would sign off remediation for
+    text the organisation no longer stands by."""
     from app.core.enums import TreatmentGateReason
     from app.pipeline import treatment as treatment_mod
 
-    @contextmanager
-    def fake_db_session():
-        yield object()
-
-    plan_id = str(uuid.uuid4())
-    monkeypatch.setattr(treatment_api, "db_session", fake_db_session)
-    monkeypatch.setattr(treatment_api, "get_authorized_session", lambda *a, **k: {"SessionID": "s"})
-    monkeypatch.setattr(dal, "active_plan_row", lambda *a, **k: {
-        "PlanID": plan_id, "Accepted": 0, "Status": str(StageStatus.COMPLETE),
-        "TenantID": "t", "EntityID": "86"})
-    body = treatment_api.TreatmentReviewBody(plan_id=plan_id, decision="approved")
-    principal = Principal(claims={"sub": "u1"}, entities={"86"}, client_id="c", tenant_id="t")
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+    plan_id = _plan(Session, sid, b, review_status=None)
+    assert _accept(Session, sid, [d], monkeypatch, replace=True) == 1
 
     with pytest.raises(treatment_mod.TreatmentConflict) as exc_info:
-        treatment_api.post_review_treatment_plan("s", str(uuid.uuid4()), body, principal)
+        _review(Session, monkeypatch, sid, b, plan_id)
 
     assert exc_info.value.reason == TreatmentGateReason.scenario_not_accepted
+    with Session() as s:
+        assert dal.active_plan_row(s, sid, b)["ReviewStatus"] is None, "no verdict was recorded"
+
+
+def test_review_still_works_when_the_scenario_row_is_missing(monkeypatch):
+    """The OUTER join in active_plan_row exists so a broken linkage nulls the scenario columns
+    rather than dropping the plan — and entity_plan_rows deliberately keeps those rows visible.
+    A gate written as `!= 1` also caught NULL, so exactly those plans became permanently
+    unapprovable, with a 409 blaming a regeneration that never happened."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    orphan = str(uuid.uuid4())            # a plan pointing at a scenario row that isn't there
+    plan_id = _plan(Session, sid, orphan, review_status=None)
+
+    result = _review(Session, monkeypatch, sid, orphan, plan_id)
+
+    assert result.review_status == "approved"
+    assert result.reviewed_by == "u1"

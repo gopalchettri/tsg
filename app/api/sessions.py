@@ -40,6 +40,7 @@ from app.api.schemas import (
     RegenResultEvent,
     RejectBody,
     RejectResponse,
+    ReplacedVersion,
     ScenarioListItem,
     ScenarioResult,
     SessionAuditEvent,
@@ -1079,11 +1080,17 @@ def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depend
     `accept_session`; this is the authz + HTTP wrapper."""
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
-        matched = accept_session(sess, session_id, scenario_session["EntityID"], principal.user_id,
+        decided = accept_session(sess, session_id, scenario_session["EntityID"], principal.user_id,
                                 subset=_subset_from_accept_body(body),
                                 replace_accepted=body.replace_accepted)
+    # Built from what the write REPORTED, never from what the request asked for: a version
+    # another decision moved first is absent here, and a client that trusted the request would
+    # invalidate a plan that never moved.
     return AcceptResponse(session_id=session_id, user_id=scenario_session["UserID"],
-                        status=str(SessionStatus.completed), accepted_count=matched)
+                        status=str(SessionStatus.completed), accepted_count=decided.count,
+                        replaced=[ReplacedVersion(scenario_id=r.scenario_id,
+                                                replaced_scenario_id=r.replaced_scenario_id)
+                                for r in decided.replaced])
 
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/promote-to-library",
@@ -1724,7 +1731,10 @@ def get_session_audit(
                 "or if the session was cancelled."
             ))
 def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_principal)) -> AcceptedScenariosResponse:
-    """Returns the accepted, non-superseded scenarios for this session."""
+    """Returns this session's accepted scenarios — WHICHEVER version was accepted, superseded or
+    not. Accepting an older version has always been legal, and replacing one (accept with
+    replace_accepted) makes accepted-and-superseded rows ordinary rather than exotic, so a
+    recency filter here would silently drop decisions the register carries."""
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
         rows = dal.accepted_scenarios(sess, scenario_session["SessionID"])

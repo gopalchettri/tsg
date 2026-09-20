@@ -1192,16 +1192,33 @@ class SessionResults(ApiModel):
     )
 
 
+class ReplacedVersion(ApiModel):
+    """One scenario whose acceptance this request MOVED to another version of itself."""
+    scenario_id: str = Field(description="The version that is now the accepted one.")
+    replaced_scenario_id: str = Field(
+        description=(
+            "The version that was accepted until this request and is now history. It is not "
+            "deleted: it keeps its audit trail, its remediation plan stays attached to it and "
+            "readable at this id, and accepting it again brings that plan back."))
+
+
 class AcceptResponse(ApiModel):
     """Response confirming an accept request was processed."""
     model_config = ConfigDict(
-        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "status": "completed", "accepted_count": 3}}
+        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "user_id": "qa-user", "status": "completed", "accepted_count": 3, "replaced": []}}
     )
 
     session_id: str = Field(description="Session's unique id (GUID).")
     user_id: str | None = Field(description="The session's owning user (who created it). Null only if the principal had no identity to record.")
     status: str = Field(description="Result of the accept request. Always 'completed' on success.")
     accepted_count: int = Field(description="Number of scenarios actually marked accepted by this request (0 for mode='none').")
+    replaced: list[ReplacedVersion] = Field(
+        default_factory=list,
+        description=(
+            "What `replace_accepted` actually moved — empty on every ordinary accept. Reports "
+            "the write, not the request: a version another decision moved first is absent. Read "
+            "it to drop any cached plan for `replaced_scenario_id`, which has just left the plan "
+            "board and the remediation register."))
 
 
 class PromotedRef(ApiModel):

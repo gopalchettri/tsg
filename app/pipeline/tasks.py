@@ -798,11 +798,16 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
         dal.supersede_by_scoped_threats(sess, sid, ss, old_scoped_ids)
     scoped_rows = []
     output_rows = []
+    #: ScopedThreatID -> the version this rewrite was asked to replace. Only regeneration has one;
+    #: next-set is additive and has no target.
+    target_of: dict[str, str] = {}
     for sc, scoped_id, target in pairs:
         if sc.threat_id in excluded_ids:
             continue
         if regen_mode and scoped_id not in scenarios:
             continue
+        if target is not None:
+            target_of[scoped_id] = target.scenario_id
         scoped_rows.append(_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id))
         if scoped_id not in scenarios:
             continue
@@ -828,16 +833,30 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
             seen_keys.add(key)
             deduped_output_rows.append(r)
         output_rows = deduped_output_rows
-        by_number: dict[int, set[str]] = {}
-        for h, number in seen_keys:
-            by_number.setdefault(number, set()).add(h)
-        retired: dict[tuple[str, int], str] = {}
-        for number, hashes in by_number.items():
-            for h, old_id in dal.supersede_by_identity_hashes(
-                    sess, sid, ss, hashes, scenario_number=number).items():
-                retired[(h, number)] = old_id
-        for r in output_rows:
-            r["ReplacesScenarioID"] = retired.get((r["IdentityHash"], r["ScenarioNumber"]))
+        if regen_mode:
+            # Retire the versions this regeneration NAMED, by id. Identity matching is the
+            # next-set path's tool: it has no target, so it must find whatever row a fresh fold
+            # lands on. A regeneration does have one, and re-deriving it from the threat's current
+            # library ids is what let promote-to-library leave a target live beside its rewrite.
+            retired_ids = dal.supersede_scenarios_by_ids(
+                sess, sid, ss, {target_of[r["ScopedThreatID"]] for r in output_rows
+                                if r["ScopedThreatID"] in target_of})
+            for r in output_rows:
+                old = target_of.get(r["ScopedThreatID"])
+                # Only where a row really was retired: a target another run replaced first must
+                # not be claimed as this rewrite's predecessor.
+                r["ReplacesScenarioID"] = old if old in retired_ids else None
+        else:
+            by_number: dict[int, set[str]] = {}
+            for h, number in seen_keys:
+                by_number.setdefault(number, set()).add(h)
+            retired: dict[tuple[str, int], str] = {}
+            for number, hashes in by_number.items():
+                for h, old_id in dal.supersede_by_identity_hashes(
+                        sess, sid, ss, hashes, scenario_number=number).items():
+                    retired[(h, number)] = old_id
+            for r in output_rows:
+                r["ReplacesScenarioID"] = retired.get((r["IdentityHash"], r["ScenarioNumber"]))
     if output_rows:
         sess.execute(insert(m.Threat_Scenario), output_rows)
     return True

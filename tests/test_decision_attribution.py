@@ -47,7 +47,7 @@ def _decide(Session, sid: str, decision: AuditDecision, *, subset, actor):
     exercise its gates rather than the write."""
     with Session() as s:
         n = dal.decide_scenarios(s, sid, [0], decision=decision, subset=subset,
-                                 tenant_id="t", entity_id="86", user_id=actor)
+                                 tenant_id="t", entity_id="86", user_id=actor).count
         s.commit()
         return n
 

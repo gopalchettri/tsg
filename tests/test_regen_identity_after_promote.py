@@ -20,15 +20,31 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import timedelta
 
-from sqlalchemy import select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from test_accept_any_version import HASH_10, _engine, _now, _seed_session
 
-from app.core.enums import ScenarioStatus
+from app.core.enums import ScenarioStatus, StageStatus, SubsystemLevel
 from app.db import dal
 from app.db import models as m
 from app.pipeline import scoping, tasks
+
+
+class _FakeLLM:
+    """Same shape as test_scenario_batch_finalize_order's — one canned scenario, no network."""
+
+    def chat(self, messages, temperature=None, expected_type=None, **kwargs):
+        return json.dumps({
+            "scenario_title": "Firmware swapped at the loading bay",
+            "scenario_statement": "An insider exchanges the vendor package before installation.",
+            "risk_statement": "Loss of control at the pumping station.",
+            "supporting_systems_involved": [],
+        }), None
+
+    def embed(self, texts, kind=None):
+        return [[0.0] * 8 for _ in texts]
 
 #: What promotion leaves behind: the same threat, now carrying the catalogue id it was linked to.
 #: `_dedup_key` prefers that id over the type/name pair, so the fold lands somewhere else entirely.
@@ -106,6 +122,132 @@ def test_a_regeneration_retires_the_version_it_replaced_after_a_promotion():
     assert rows[new_id]["Superseded"] == 0
     assert rows[new_id]["IdentityHash"] == HASH_10, "the rewrite is the same scenario"
     assert str(rows[new_id]["ReplacesScenarioID"]) == old_id, "and says which version it replaced"
+
+
+def test_a_target_with_no_stored_identity_is_still_retired():
+    """The case identity-matching cannot serve at all.
+
+    A row written before scenarios carried an IdentityHash has nothing to match: the rewrite folds
+    a fresh hash, the identity-matching retire finds no row holding it, and the target stays live
+    beside its own replacement — two versions of one scenario, both separately acceptable, which
+    is the outcome all of this exists to prevent. Naming the row by id cannot drift or miss."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid = _seed_session(Session)
+    old_scoped, new_scoped = str(uuid.uuid4()), str(uuid.uuid4())
+    old_id = str(uuid.uuid4())
+    with Session() as s:
+        s.execute(m.Scoped_Threat.__table__.insert().values(
+            ScopedThreatID=old_scoped, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ThreatID=_TID, Score=9.5, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=_now()))
+        s.execute(m.Threat_Scenario.__table__.insert().values(
+            ScenarioID=old_id, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            SubsystemID=0, ScopedThreatID=old_scoped, Status=str(ScenarioStatus.complete),
+            ScenarioJSON=json.dumps({"scenario_title": "legacy"}),
+            Accepted=0, Superseded=0, IdentityHash=None, ScenarioNumber=1,
+            GenerationEpoch=1, CreatedAt=_now()))
+        s.commit()
+
+    target = tasks.RegenTarget(scenario_id=old_id, threat_id=_TID, scoped_threat_id=old_scoped,
+                            scenario_number=1, identity_hash=None)
+    with Session() as s:
+        assert tasks._reconcile_targeted_regen(
+            s, sid, 0, "t", "86", "u1",
+            pairs=[(_scored(), new_scoped, target)],
+            scenarios={new_scoped: ({"scenario_title": "rewritten"}, {}, (_now(), _now()))},
+            enriched={_TID: _INFO_AFTER_PROMOTION}, epoch=2, task_id="task-1",
+            regen_mode=True) is True
+        s.commit()
+
+    with Session() as s:
+        rows = {str(r["ScenarioID"]): r for r in s.execute(
+            select(m.Threat_Scenario.ScenarioID, m.Threat_Scenario.Superseded,
+                m.Threat_Scenario.ReplacesScenarioID)
+            .where(m.Threat_Scenario.SessionID == sid)).mappings()}
+    new_id = next(oid for oid in rows if oid != old_id)
+    assert rows[old_id]["Superseded"] == 1, "the legacy version is retired, hash or no hash"
+    assert str(rows[new_id]["ReplacesScenarioID"]) == old_id
+    assert sum(1 for r in rows.values() if not r["Superseded"]) == 1, "exactly one live version"
+
+
+def test_a_rewrite_is_not_asked_to_differ_from_its_own_text(monkeypatch, tmp_path):
+    """Through the REAL batch, not the reconcile alone — `write_scenarios` folds a second identity
+    map of its own, and it must agree with what the rows carry.
+
+    `others` is "scenarios already on screen, differ from these", built by excluding the item's own
+    identity. Recomputed after a promote-to-library, the exclusion missed and the target's OWN text
+    was handed back to the model as something to differ from — steering a rewrite away from itself.
+    Seeded here with a distinctive sentence so the miss cannot hide. The database outcome is
+    asserted too: one live version, pointing at the one it replaced."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'regen.db'}",
+                        connect_args={"check_same_thread": False})
+    for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Identified_Threat, m.Scoped_Threat,
+                m.Threat_Scenario, m.Threat_Scenario_Control_Map, m.Scenario_Audit, m.Prompt_Log):
+        tbl.__table__.create(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    sid, old_scoped, old_id = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    own_text = "A courier swaps the vendor USB before the firmware window."
+
+    with Session() as s:
+        s.execute(m.Scenario_Session.__table__.insert().values(
+            SessionID=sid, TenantID="t", EntityID="86", UserID="u1", AssetID="1",
+            AssetName="Pumping Station", SessionStatus="active",
+            CurrentStage="SCENARIO_GENERATION", StageStatus="RUNNING", Mode="AUTO",
+            SubsystemsJSON=json.dumps([{"id": 41, "name": "SCADA HMI", "asset_type": "OT"}]),
+            CreatedAt=_now(), UpdatedAt=_now()))
+        for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS, SubsystemLevel.LOCK):
+            s.execute(m.Subsystem_Stage_State.__table__.insert().values(
+                StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="86",
+                SubsystemID=0, Level=level, Status=StageStatus.IDLE, GenerationEpoch=1,
+                LeaseExpiresAt=_now() + timedelta(minutes=30), UpdatedAt=_now(), CreatedAt=_now()))
+        s.execute(m.Scoped_Threat.__table__.insert().values(
+            ScopedThreatID=old_scoped, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ThreatID=_TID, Score=9.5, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=_now()))
+        s.execute(m.Threat_Scenario.__table__.insert().values(
+            ScenarioID=old_id, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            SubsystemID=0, ScopedThreatID=old_scoped, Status=str(ScenarioStatus.complete),
+            ScenarioJSON=json.dumps({"scenario_title": "USB swap", "scenario_statement": own_text}),
+            # Written before the promotion: the identity of that moment, not of the threat now.
+            Accepted=1, Superseded=0, IdentityHash=HASH_10, ScenarioNumber=1,
+            GenerationEpoch=1, CreatedAt=_now()))
+        s.commit()
+
+    captured: dict = {}
+    real_batch = tasks._generate_scenario_batch
+    monkeypatch.setattr(tasks, "_fetch_intel", lambda *a, **k: None)
+    monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
+    monkeypatch.setattr(tasks, "_finalize_scenario_batch", lambda *a, **k: None)
+    monkeypatch.setattr(tasks, "_generate_scenario_batch",
+                        lambda *a, **k: (captured.setdefault("per_item", a[8]), real_batch(*a, **k))[1])
+
+    threats = [{"threat_id": _TID, "grounding_status": "verified", "category": "Exfiltration",
+                "threat_type": "Data exfiltration", "threat_name": "USB export",
+                "library_threat_type": None, "library_threat_name": None,
+                "threat_type_id": 5, "catalogue_id": 77,  # what promote-to-library left behind
+                "actors": []}]
+    target = tasks.RegenTarget(scenario_id=old_id, threat_id=_TID, scoped_threat_id=old_scoped,
+                            scenario_number=1, identity_hash=HASH_10)
+    with Session() as s:
+        session_row = dict(dal.load_session(s, sid))
+        tasks.write_scenarios(s, session_row, json.loads(session_row["SubsystemsJSON"]),
+                            {"name": "Pumping Station", "asset_type": "Pumping Station"},
+                            threats, _FakeLLM(), str(uuid.uuid4()),
+                            regen_targets={old_id: target})
+
+    per_item = captured["per_item"]
+    assert len(per_item) == 1, "one target, one work item"
+    coverage = next(iter(per_item.values()))["coverage"]
+    assert own_text not in (coverage.others or []), (
+        "the rewrite must not be told to differ from the very text it is replacing")
+
+    with Session() as s:
+        rows = {str(r["ScenarioID"]): r for r in s.execute(
+            select(m.Threat_Scenario.ScenarioID, m.Threat_Scenario.Superseded,
+                m.Threat_Scenario.IdentityHash, m.Threat_Scenario.ReplacesScenarioID)
+            .where(m.Threat_Scenario.SessionID == sid)).mappings()}
+    live = [r for r in rows.values() if not r["Superseded"]]
+    assert len(live) == 1 and live[0]["IdentityHash"] == HASH_10
+    assert str(live[0]["ReplacesScenarioID"]) == old_id
 
 
 def test_next_set_leaves_alone_a_threat_that_already_has_a_scenario():

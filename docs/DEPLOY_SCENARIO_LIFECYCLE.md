@@ -95,6 +95,25 @@ Authentication is **not** relaxed: every route verifies `X-API-Key` against a st
 checks entity scope, and `app/api/route_audit.py` refuses to boot if any route misses that. A URL
 on its own returns 401.
 
+## 5a. Run the version check once, per environment
+
+```bash
+.venv/Scripts/python.exe scripts/check_scenario_versions.py
+```
+
+Read-only, writes nothing, exits 1 if it finds anything. It looks for one threat carrying **two
+live or two accepted scenario versions** — damage that predates this release and does not repair
+itself. The cause was regeneration retiring the old version by a recomputed identity while
+`promote-to-library` rewrote the ids that identity is folded from: the target survived beside its
+own replacement, and since the two rows then hold different hashes, everything downstream reads
+them as unrelated scenarios — both acceptable, both plannable, one risk counted twice in the
+register.
+
+Regeneration now retires the version it was asked to replace **by id**, so no new pair can appear.
+Existing pairs are a human decision: reject the version you do not want, or accept the one you do
+with `replace_accepted`. Development was clean when this shipped; UAT and production had not been
+checked.
+
 ## 6. Verify after deploying
 
 ```bash

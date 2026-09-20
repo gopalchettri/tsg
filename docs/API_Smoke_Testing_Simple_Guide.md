@@ -1128,8 +1128,14 @@ already carries.
 200 {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
      "user_id": "qa-user",
      "status": "completed",
-     "accepted_count": 1}
+     "accepted_count": 1,
+     "replaced": []}
 ```
+
+`replaced` is empty on every ordinary accept. After a successful `replace_accepted` it names both
+sides — `{"scenario_id": "<now accepted>", "replaced_scenario_id": "<was accepted>"}` — so a UI
+knows which plan just left the board and the register. It reports the **write**, not the request:
+if another decision moved that version first, the entry is absent.
 
 `accepted_count` must equal the number of ids you sent. `status` always reads
 `"completed"` on a successful call — that is a fact about the response, not

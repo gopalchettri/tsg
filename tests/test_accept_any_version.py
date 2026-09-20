@@ -135,7 +135,9 @@ def _accept(Session, sid: str, subset, monkeypatch, *, replace: bool = False) ->
     of that scenario is already accepted. Default off, exactly as on the wire."""
     monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
     with Session() as s:
-        return accept_session(s, sid, "86", "u1", subset=subset, replace_accepted=replace)
+        # .count — accept_session returns dal.Decided(count, replaced); the replacements are
+        # asserted on directly by the tests that care (test_accept_replace_version).
+        return accept_session(s, sid, "86", "u1", subset=subset, replace_accepted=replace).count
 
 
 def _flags(Session, oid: str) -> tuple[int, int]:

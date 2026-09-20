@@ -115,14 +115,21 @@ def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: lis
         prior = already.get(pair)
         if prior is not None and prior != oid:
             if not replace_accepted or subset is None:
+                # Two refusals, because the two callers have different ways out. Accept-ALL
+                # cannot carry replace_accepted at all (AcceptBody rejects the pair with a 422),
+                # so telling an accept-all caller to "repeat this call with the flag" sent them
+                # to a dead end — a message must only name an action the API will accept.
+                how = (
+                    f'accept {oid} on its own — mode "subset", naming it, with '
+                    f'"replace_accepted": true' if subset is None else
+                    'repeat this call with "replace_accepted": true')
                 raise AcceptConflict(
                     f"Nothing was accepted. {oid} "
                     f"{_REASON_TEXT[ScenarioDecisionReason.duplicate_identity]} "
                     f"(version {prior} of that scenario was already accepted on this session). "
-                    f"To make {oid} the accepted version instead, repeat this call naming it with "
-                    f'"replace_accepted": true — {prior} then moves to history, keeping its audit '
-                    f"trail, and its remediation plan stays with it and leaves the plan board. To "
-                    f"keep {prior}, reject {oid} instead.",
+                    f"To make {oid} the accepted version instead, {how} — {prior} then moves to "
+                    f"history, keeping its audit trail, and its remediation plan stays with it "
+                    f"and leaves the plan board. To keep {prior}, reject {oid} instead.",
                     reason=ScenarioDecisionReason.duplicate_identity)
             displace[prior] = oid
         if pair in seen_identity:
@@ -136,7 +143,8 @@ def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: lis
 
 
 def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str | None,
-                subset: list[str] | None = None, *, replace_accepted: bool = False) -> int:
+                subset: list[str] | None = None, *,
+                replace_accepted: bool = False) -> dal.Decided:
     scenario_session = dal.get_session(sess, session_id, entity_id)
     if scenario_session is None:
         raise EntityForbidden(f"session {session_id} not in entity {entity_id}")
@@ -169,10 +177,11 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             # no separate audit step that could fall out of step with the decision. `displace`
             # rides along for the same reason: a replacement un-accepts one version and accepts
             # another, and those two writes must not be separable either.
-            matched = dal.decide_scenarios(
+            decided = dal.decide_scenarios(
                 sess, session_id, good_subs, decision=AuditDecision.accept, subset=subset,
                 tenant_id=scenario_session["TenantID"], entity_id=str(entity_id), user_id=user_id,
                 displace=displace)
+            matched, replaced = decided.count, decided.replaced
         except IntegrityError as exc:
             # The pre-flight above reads, then this writes — two concurrent accepts naming
             # different versions of one scenario both pass the read and collide here.
@@ -227,12 +236,15 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
                             EntityID=str(entity_id), EventType=event, Decision=decision, ActorUserID=user_id,
                             DetailJSON=json.dumps({"subset": subset}) if subset is not None else None)
         sess.commit()
+        # replaced_count is what the write ACTUALLY flipped, not what the pre-flight asked for:
+        # a prior another decision moved first matches nothing, and a log that still claimed a
+        # replacement would be the only out-of-band record of it — and wrong.
         log.info("session.accepted", session_id=session_id, decision=str(decision),
-                accepted_count=matched, replaced_count=len(displace), user=user_id)
+                accepted_count=matched, replaced_count=len(replaced), user=user_id)
         # SSE is a hint; stream status is authoritative.
         bus.publish(session_id, {"type": "session_accepted", "session_id": session_id,
                                 "status": str(SessionStatus.completed), "ts": now().isoformat()})
-        return matched
+        return dal.Decided(matched, replaced)
     except Exception:
         # Keep committed locks durable; discard pending decision work.
         sess.rollback()
@@ -281,9 +293,11 @@ def reject_scenarios(sess: Session, session_id: str, entity_id: str, user_id: st
         subset = [dal.canonical_guid(s) for s in scenario_ids]
         # decide_scenarios writes the scenario_rejected ledger rows in the same call. No
         # session-level audit row: the session is not what is being decided here.
+        # .count: reject never displaces (a rejection replaces no decision), so the other half of
+        # Decided is always empty here and naming it would only invite someone to read it.
         matched = dal.decide_scenarios(
             sess, session_id, good_subs, decision=AuditDecision.reject, subset=subset,
-            tenant_id=scenario_session["TenantID"], entity_id=str(entity_id), user_id=user_id)
+            tenant_id=scenario_session["TenantID"], entity_id=str(entity_id), user_id=user_id).count
         requested = len(set(subset))
         if matched != requested:
             raise _undecidable_subset(sess, session_id, subset, good_subs,

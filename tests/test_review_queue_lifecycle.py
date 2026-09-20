@@ -50,7 +50,7 @@ def _overall(Session, sid: str) -> str:
 def _accept(Session, sid: str, subset, monkeypatch) -> int:
     monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
     with Session() as s:
-        return accept_mod.accept_session(s, sid, ENTITY, ACTOR, subset=subset)
+        return accept_mod.accept_session(s, sid, ENTITY, ACTOR, subset=subset).count
 
 
 def _reject(Session, sid: str, ids, monkeypatch) -> int:

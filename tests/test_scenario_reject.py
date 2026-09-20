@@ -44,7 +44,7 @@ def _reject(Session, sid: str, ids, monkeypatch, actor: str = CREATOR) -> int:
 def _accept(Session, sid: str, subset, monkeypatch, actor: str = CREATOR) -> int:
     monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
     with Session() as s:
-        return accept_mod.accept_session(s, sid, "86", actor, subset=subset)
+        return accept_mod.accept_session(s, sid, "86", actor, subset=subset).count
 
 
 def _row(Session, oid: str):
