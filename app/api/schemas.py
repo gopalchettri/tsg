@@ -1329,6 +1329,23 @@ class RejectBody(ApiModel):
         return self
 
 
+class UnacceptResponse(ApiModel):
+    """Response confirming one acceptance was taken back."""
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                                    "scenario_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
+                                    "accepted": False}}
+    )
+
+    session_id: str = Field(description="Session's unique id (GUID).")
+    scenario_id: str = Field(description="The scenario whose acceptance was taken back.")
+    accepted: bool = Field(
+        description=(
+            "Always false — the scenario is undecided again and back in the review queue, so it "
+            "can be rejected later or accepted again. Echoed rather than implied: a client that "
+            "re-renders the card from this response needs the flag, not the absence of one."))
+
+
 class RejectResponse(ApiModel):
     """Response confirming a reject request was processed."""
     model_config = ConfigDict(

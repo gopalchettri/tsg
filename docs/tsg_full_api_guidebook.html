@@ -657,6 +657,38 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
     <p class="errs"><span class="lbl">Errors</span> 404 if session_id unknown/wrong entity, or if a subset id can&#x27;t be matched at all — details.unacceptable lists each unmatched id and why (e.g. already_accepted, already_rejected, failure_card); 409 accept_conflict with details.reason in {generation_in_progress, session_completed, session_cancelled, duplicate_identity, nothing_to_accept} depending on session state or a subset conflict; 422 if mode=&#x27;subset&#x27; with empty/missing scenario_ids, or scenario_ids supplied under mode=&#x27;all&#x27;/&#x27;none&#x27;, or replace_accepted sent under mode=&#x27;all&#x27;/&#x27;none&#x27;.</p>
   </details>
 </article>
+<article class="api" id="post-v1-sessions-session-id-scenarios-scenario-id-unaccept">
+  <div class="api-head">
+    <span class="method m-post">POST</span>
+    <span class="path">/v1/sessions/{session_id}/scenarios/{scenario_id}/unaccept</span>
+  </div>
+  <p class="purpose">Takes one acceptance back, leaving the scenario undecided and back in the review queue — the third decision, for &quot;I accepted that by mistake and I don&#x27;t want a rewrite either&quot;, which reject (refused on an accepted scenario) and replace (needs another version to adopt) could not express.</p>
+  <p class="auth"><span class="lbl">Auth</span> X-API-Key, X-User-Id, X-Entity-Id, X-Tenant-Id — all required, via Depends(get_principal); same entity-scoped, not-owner-restricted access as POST .../accept.</p>
+  <div class="blk">
+    <h3>Request</h3>
+    <pre>none — no body, no query params.</pre>
+  </div>
+  <div class="blk">
+    <h3>Response <span class="status">200 (409 Conflict — see error_cases)</span></h3>
+    <pre>{
+  &quot;accepted&quot;: false,
+  &quot;scenario_id&quot;: &quot;b3fc2c96-3f66-4562-8fa6-5717afa63f66&quot;,
+  &quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;
+}</pre>
+  </div>
+  <div class="blk verify">
+    <h3>Verify in the database</h3>
+    <pre>SELECT ScenarioID, Accepted, AcceptedBy, AcceptedAt FROM Threat_Scenario WHERE ScenarioID = &#x27;{scenario_id}&#x27;;
+SELECT EventType, Decision, ActorUserID, DetailJSON FROM Scenario_Audit WHERE ScenarioID = &#x27;{scenario_id}&#x27; ORDER BY CreatedAt;</pre>
+  </div>
+  <div class="tables"><span class="tbl">Threat_Scenario</span><span class="tbl">Scenario_Audit</span></div>
+  <details class="notes">
+    <summary>Implementation notes &amp; error cases</summary>
+    <p>Per scenario and never batched: undoing a decision a register already carries is not something to do to a list at once. The acceptance columns are cleared (Accepted, AcceptedAt, AcceptedBy, AcceptedSubsetJSON) so a later re-accept records who decided THEN — they coalesce on the way in, and a left-behind timestamp would misdate it. Nothing is erased: the original scenario_accepted row stays and a scenario_unaccepted row is appended beside it, carrying Decision=&#x27;unaccept&#x27; and the acting user. The scenario becomes UNDECIDED (not rejected), so progress.overall returns to awaiting_review and it can later be rejected or accepted again. Written through the same single writer, behind the same review gate and the same per-subsystem lock as accept and reject, because an unaccept races exactly what they race.</p>
+    <p>Its remediation plan is deliberately untouched. The plan stays attached to this scenario, leaves the plan board and the entity register while the scenario is not accepted, cannot be reviewed there (409 scenario_not_accepted), and returns with its verdict if the scenario is accepted again — the same behaviour a replacement has. That is why there is no treatment_plan_exists refusal: a plan is never orphaned and never counted twice.</p>
+    <p class="errs"><span class="lbl">Errors</span> 404 if session_id/scenario_id is unknown or belongs to a different session; 409 accept_conflict with details.reason=&#x27;not_accepted&#x27; when the scenario is pending or rejected — only an acceptance can be taken back; 409 accept_conflict with details.reason in {generation_in_progress, session_completed, session_cancelled} if the session isn&#x27;t at the review barrier.</p>
+  </details>
+</article>
 <article class="api" id="post-v1-sessions-session-id-scenarios-reject">
   <div class="api-head">
     <span class="method m-post">POST</span>

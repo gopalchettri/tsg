@@ -557,6 +557,26 @@ def run_pipeline_task(self, session_id: str) -> None:
         _process_all_supporting_systems(sess, session_id, get_llm(), self.request.id or guid())
 
 
+def _retry_or_settle(task, sess, busy: Exception, scenario_session: dict, subsystem_id: int,
+                    epoch: int, kind: str, target_ids: list | None = None) -> None:
+    """Wait for a busy subsystem a bounded number of times, then hand its stage back.
+
+    The alternative — dropping the click — is what this exists to end: the endpoint has already
+    reset the stage at a new epoch, so nobody else will finish it. Retrying at the SAME epoch is
+    safe by construction: the endpoint reserves the epoch once, and every stage write is a CAS on
+    it, so a redelivery either does the work or no-ops.
+    """
+    if task.request.retries < cascade.BUSY_MAX_RETRIES:
+        log.info(f"{kind}.subsystem_busy_retry", session_id=scenario_session["SessionID"],  # noqa: G004
+                subsystem=subsystem_id, attempt=task.request.retries + 1,
+                of=cascade.BUSY_MAX_RETRIES)
+        raise task.retry(exc=busy,
+                        countdown=cascade.BUSY_RETRY_SECONDS * (task.request.retries + 1),
+                        max_retries=cascade.BUSY_MAX_RETRIES)
+    cascade.settle_unstarted(sess, scenario_session, subsystem_id, epoch,
+                            task.request.id or guid(), kind, target_ids=target_ids)
+
+
 # soft/time limits OVERRIDE the global ~55 minute pair: this task handles ONE subsystem and
 # finishes in minutes, so the global budget let a frozen greenlet hold its `_LOCK` for the best
 # part of an hour. Derived per environment (see Settings._derive_subsystem_task_limits) because no
@@ -578,8 +598,17 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
         session = dal.load_session(sess, session_id)
         if session is None:
             return  # deleted or never existed by the time this task ran
-        cascade.run_regeneration(sess, dict(session), subsystem_id, RegenGranularity(granularity),
-                                target_ids, epoch, get_llm(), self.request.id or guid())
+        try:
+            cascade.run_regeneration(sess, dict(session), subsystem_id,
+                                    RegenGranularity(granularity), target_ids, epoch, get_llm(),
+                                    self.request.id or guid())
+        except cascade.SubsystemBusy as busy:
+            # A held lock is not a failure, it is a "not yet" — retried HERE rather than through
+            # autoretry_for because this task runs max_retries=None for slot shortages, and a
+            # lock must not inherit an unbounded ceiling: its holder can be a crashed sweep on a
+            # completed session, which no reaper reclaims. Bounded, then settled.
+            _retry_or_settle(self, sess, busy, dict(session), subsystem_id, epoch, "regen",
+                            target_ids=target_ids)
 
 
 # Same per-subsystem limit override and the same reasoning as regenerate_task above. THIS is the
@@ -599,8 +628,13 @@ def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_
         session = dal.load_session(sess, session_id)
         if session is None:
             return  # deleted or never existed by the time this task ran
-        cascade.run_next_set(sess, dict(session), subsystem_id, epoch, threats_epoch,
-                            get_llm(), self.request.id or guid())
+        try:
+            cascade.run_next_set(sess, dict(session), subsystem_id, epoch, threats_epoch,
+                                get_llm(), self.request.id or guid())
+        except cascade.SubsystemBusy as busy:
+            # Same bounded retry as regenerate — and here giving up silently also stranded the
+            # ASSET, because this request re-reserved it before enqueueing.
+            _retry_or_settle(self, sess, busy, dict(session), subsystem_id, epoch, "next_set")
 
 
 # max_retries BOUNDED (and shared with the other slot-shortage tasks, same as

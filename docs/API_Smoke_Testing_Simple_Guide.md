@@ -376,11 +376,16 @@ split matches who actually acted.
   for rows with those `EventType` values. `AuditDecision.regenerate` is still
   defined but still has no writer: a regenerate is recorded through
   `regeneration_completed`, never through `Scenario_Audit.Decision='regenerate'`.
-  Separately, `scenario_unaccepted` is written by exactly one thing: an accept
-  carrying `replace_accepted: true` (Test 6), which moves the decision to
-  another version of the same scenario. Its `DetailJSON` names the version that
-  replaced it (`{"replaced_by": "..."}`), and the original `scenario_accepted`
-  row stays — the trail shows both decisions, never a rewritten one.
+  Separately, `scenario_unaccepted` is written by two things, both of which take
+  an acceptance back: `POST .../unaccept` (Test 6b), and an accept carrying
+  `replace_accepted: true` (Test 6), which moves the decision to another version
+  of the same scenario. In the replace case both rows carry the link — the
+  un-accept row names what replaced it (`{"replaced_by": "..."}`) and the new
+  version's `scenario_accepted` row names what it displaced
+  (`{"replaces": "..."}`), so either id answers the question. A stand-alone
+  un-accept has no such pair and carries no detail. The original
+  `scenario_accepted` row always stays: the trail shows both decisions, never a
+  rewritten one.
 
 ### What the trail does not cover
 
@@ -1263,6 +1268,60 @@ version is a legitimate accept (see Test 4's callout), not a refusal.
 `message` names the first few offenders; `details.unacceptable` always lists all of them.
 
 **Pass if:** the chosen scenarios show `accepted: true`, and a repeat accept with the same ids succeeds again without changing who decided first.
+
+---
+
+### Test 6b — Un-accept a Scenario ("I accepted that by mistake")
+
+| | |
+|---|---|
+| **API** | `POST /v1/sessions/{session_id}/scenarios/{scenario_id}/unaccept` |
+| **Why does this API exist?** | "I accepted that by mistake, and I don't want a rewrite either" had no answer. Reject is refused on an accepted scenario — the two decisions are mutually exclusive — and replacing (Test 6) needs another version to adopt. This is the third decision: take the acceptance back and leave the scenario undecided. |
+| **What does it do?** | Clears the acceptance. The scenario returns to the review queue, so it can be rejected later or accepted again. Nothing is deleted: the original acceptance stays in the audit trail with this reversal recorded beside it. |
+| **When do you call it?** | Same review gate as accept. Per scenario, never batched — undoing a decision the register already carries is not something to do to a list at once. |
+
+**Input (complete request):**
+
+```bash
+curl -s -X POST "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6/scenarios/b3fc2c96-3f66-4562-8fa6-5717afa63f66/unaccept" \
+  -H "X-API-Key: <X-API-Key>" \
+  -H "X-User-Id: qa-user" \
+  -H "X-Entity-Id: 78" \
+  -H "X-Tenant-Id: <X-Tenant-Id>"
+```
+
+No body.
+
+**Output (complete response):**
+
+```json
+200 {"session_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+     "scenario_id": "b3fc2c96-3f66-4562-8fa6-5717afa63f66",
+     "accepted": false}
+```
+
+**How to test:**
+
+1. Accept a scenario (Test 6), then un-accept it here.
+2. Re-run Test 3: that scenario reads `accepted: false` again, with `accepted_by`/`accepted_at` cleared.
+3. Re-run Test 2: `progress.overall` is back to `awaiting_review` — it owes a decision again.
+4. Test 7a: the trail shows **both** — `scenario_accepted` and `scenario_unaccepted`, each naming its actor. Nothing was rewritten.
+5. Accept it again, or reject it. Both work; it is an ordinary undecided scenario now.
+
+**What happens to its remediation plan.** It is kept, attached to this scenario. While the
+scenario is not accepted the plan leaves the plan board (Test 7f) and the entity register
+(Test 7i) and cannot be approved (Test 7h answers `409 scenario_not_accepted`) — and it comes
+back, verdict and all, if you accept the scenario again. That is the same behaviour as replacing
+a version, which is why there is no "you may not un-accept while a plan exists" rule: the plan is
+never orphaned, and never counted twice.
+
+**Must-fail checks:**
+
+| You do this | App must answer |
+|---|---|
+| Un-accept a scenario that is pending or rejected | `409 accept_conflict` (`details.reason: "not_accepted"`) — only an acceptance can be taken back |
+| Un-accept a `scenario_id` from another session | `404` |
+| Un-accept while the session is still generating | `409 accept_conflict` (`details.reason: "generation_in_progress"`) — same gate as accept |
 
 ---
 
@@ -2592,6 +2651,7 @@ English, safe to show the end user):
 | `generation_failed` | "We hit a temporary problem generating the scenario(s). Nothing was lost — click 'generate next set' again to retry." (transient — the affected threat(s) stay selected and re-servable) |
 | `no_target_ids` | (regenerate only) the request resolved to zero targets — normally rejected by the request schema itself. |
 | `output_not_found_or_superseded` | "One or more of the scenarios you tried to regenerate have already been updated or no longer exist — refresh the results and try again with the current list." |
+| `subsystem_busy` | "The assessment was busy with another job, so we didn't make the change. Nothing was lost — try again in a minute." Another execution held the session for the whole retry window (usually the periodic control-map sweep, an accept, or a second click). The request never started and nothing was written; the session is exactly where it was before the click, so accept and reject work normally. Re-click to retry. |
 | `null` | A rare concurrent-click race — show a generic "That action couldn't be completed — please try again." |
 
 **`reason` is not the same question as `outcome`.** `reason` says *why a click found

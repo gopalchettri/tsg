@@ -75,6 +75,14 @@ _REASON_INFO: dict[str, dict[str, str]] = {
                 "one item), so only reachable via a direct/internal caller that bypasses it.",
         "message": "Please select at least one scenario to regenerate.",
     },
+    "subsystem_busy": {
+        "detail": "Another execution held this session's subsystem for the whole retry window — "
+                "usually the periodic control-map sweep, an accept/reject, or a second click. "
+                "The request never started, nothing was written, and the stage was handed back "
+                "so the session is exactly where it was before the click.",
+        "message": "The assessment was busy with another job, so we didn't make the change. "
+                "Nothing was lost — try again in a minute.",
+    },
     "output_not_found_or_superseded": {
         "detail": "One or more requested ScenarioIDs did not resolve to an active "
                 "(non-superseded) Threat_Scenario row for this session/subsystem — "
@@ -85,6 +93,50 @@ _REASON_INFO: dict[str, dict[str, str]] = {
                 "current list.",
     },
 }
+
+class SubsystemBusy(Exception):
+    """Another execution holds this subsystem right now — the control-map sweep, an accept, or a
+    second click. RETRYABLE, and that is the whole point of it existing.
+
+    It used to be a `log.warning` and a bare `return`, which silently dropped the request: the
+    ENDPOINT had already reset the stage to IDLE at a new epoch and answered 202, so the session
+    was left mid-flight with nobody owning it. decide_session_outcome does nothing while a stage
+    is IDLE, and the reaper only scans active, non-REVIEW sessions — which a regenerating session
+    is not. The click simply vanished: progress read `complete`, accept and reject answered
+    404/409, until somebody thought to click again."""
+
+
+#: How long a dropped click is worth chasing. The usual holder is the control-map sweep
+#: (run_control_map_sweep, every control_map_sweep_seconds), so the window must outlast one sweep
+#: run: 5 attempts at a linearly growing delay is ~5 minutes, comfortably more, while still
+#: ending. Constants rather than Settings — nothing here is environment-shaped, and an operator
+#: has no reason to tune a number whose only job is to be longer than a sweep.
+BUSY_MAX_RETRIES = 5
+BUSY_RETRY_SECONDS = 20
+
+
+def settle_unstarted(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
+                    task_id: str, kind: str, target_ids: list | None = None) -> str | None:
+    """Put a stage back that its execution never got to run, and say so on the wire.
+
+    The endpoint resets SCENARIOS to IDLE at a new epoch before enqueueing, so a run that gives up
+    must hand that stage back or nothing else can proceed. Finishing it at AWAITING_DECISION is
+    the same shape the stale-target branch already uses: for a regeneration it restores the review
+    barrier (accept and reject work again, progress reads awaiting_review), and for a next-set it
+    ALSO releases the asset, because decide_session_outcome then reaches _send_to_review, whose CAS
+    flips the session back from `active` to `completed`. A next-set that quietly gave up used to
+    leave that asset reserved until the reaper cancelled the whole session."""
+    if dal.claim_stage(sess, scenario_session["SessionID"], subsystem_id,
+                    SubsystemLevel.SCENARIOS, epoch, task_id):
+        dal.finish_stage(sess, scenario_session["SessionID"], subsystem_id,
+                        SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION, epoch, task_id)
+        sess.commit()
+    log.warning(f"{kind}.gave_up_subsystem_busy", session_id=scenario_session["SessionID"],  # noqa: G004
+                subsystem=subsystem_id, epoch=epoch, attempts=BUSY_MAX_RETRIES)
+    _publish_regen_result(scenario_session["SessionID"], subsystem_id, target_ids, [],
+                        reason="subsystem_busy")
+    return tasks.decide_session_outcome(sess, scenario_session)
+
 
 @contextmanager
 def _subsystem_lock(sess: Session, sid: str, subsystem_id: int, task_id: str, kind: str) -> Generator[bool]:
@@ -380,8 +432,9 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
 
     with _subsystem_lock(sess, sid, subsystem_id, task_id, "regen") as acquired:
         if not acquired:
-            log.warning("regen.locked", session_id=sid, subsystem=subsystem_id)
-            return tasks.decide_session_outcome(sess, scenario_session)
+            # RAISED, not swallowed: the endpoint has already reset this stage at a new epoch, so
+            # returning here abandons the click. The task retries this, then settles the stage.
+            raise SubsystemBusy(f"subsystem {subsystem_id} of session {sid} is busy")
         try:
             targets = get_threat_id_to_redo(sess, sid, subsystem_id, granularity, target_ids)
             threats = dal.active_threats(sess, sid, subsystem_id)
@@ -543,9 +596,10 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
     signal: str | None = None
     with _subsystem_lock(sess, sid, subsystem_id, task_id, "next_set") as acquired:
         if not acquired:
-            # Serialize concurrent clicks for this session and subsystem.
-            log.warning("next_set.locked", session_id=sid, subsystem=subsystem_id)
-            return tasks.decide_session_outcome(sess, scenario_session)
+            # Same as regenerate — and here the stakes are higher: this request RE-RESERVED the
+            # asset (dal.reserve_session), so a silent return left the session `active` holding
+            # it until the reaper cancelled the session outright.
+            raise SubsystemBusy(f"subsystem {subsystem_id} of session {sid} is busy")
         next_set_size = get_settings().next_set_size
         additive_failed = False
         try:

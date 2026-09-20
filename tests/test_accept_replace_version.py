@@ -33,6 +33,7 @@ from test_accept_any_version import (
     _versions_abcd,
 )
 
+import app.pipeline.accept as accept_mod
 from app.api.schemas import AcceptBody
 from app.core.enums import AuditDecision, AuditEventType, ScenarioDecisionReason, StageStatus
 from app.db import dal
@@ -187,12 +188,12 @@ def test_the_write_reports_what_it_replaced_not_what_was_asked(monkeypatch):
 
     with Session() as s:
         plain = accept_session(s, sid, "86", "u1", subset=[b])
-    assert plain == dal.Decided(1, []), "an ordinary accept replaces nothing"
+    assert plain == accept_mod.Accepted(1, []), "an ordinary accept replaces nothing"
 
     with Session() as s:
         swapped = accept_session(s, sid, "86", "u1", subset=[d], replace_accepted=True)
     assert swapped.count == 1
-    assert swapped.replaced == [dal.Replacement(scenario_id=d, replaced_scenario_id=b)]
+    assert swapped.replaced == [accept_mod.Replacement(scenario_id=d, replaced_scenario_id=b)]
 
 
 def test_the_unaccept_row_carries_the_same_decision_as_its_sibling(monkeypatch):
@@ -212,7 +213,10 @@ def test_the_unaccept_row_carries_the_same_decision_as_its_sibling(monkeypatch):
             .where(m.Scenario_Audit.ScenarioID == b)).all()
     decisions = {event: decision for event, decision, _actor in rows}
     assert decisions[str(AuditEventType.scenario_accepted)] == str(AuditDecision.accept)
-    assert decisions[str(AuditEventType.scenario_unaccepted)] == str(AuditDecision.accept)
+    # Its own verb, not the enclosing call's: this row IS an un-acceptance. What the fix was
+    # for is that the column is never NULL — every per-scenario row names a decision, so a
+    # trail grouped by decision shows no hole.
+    assert decisions[str(AuditEventType.scenario_unaccepted)] == str(AuditDecision.unaccept)
     assert all(actor == "u1" for _e, _d, actor in rows)
 
 
@@ -434,6 +438,109 @@ def test_the_card_stops_warning_once_the_replacement_has_happened(monkeypatch):
     assert cards[d].accepted is True
     assert cards[d].replaces_accepted_version is None
     assert b not in cards, "the replaced version is undecided history now, not a live card"
+
+
+def _unaccept(Session, sid: str, scenario_id: str, monkeypatch) -> None:
+    monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
+    with Session() as s:
+        accept_mod.unaccept_scenario(s, sid, "86", "u1", scenario_id)
+
+
+def test_unaccept_takes_one_acceptance_back(monkeypatch):
+    """The decision a reviewer could not make: reject is refused on an accepted scenario, and
+    replacing needs another version to adopt. "I accepted that by mistake" had no answer."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, _d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+
+    _unaccept(Session, sid, b, monkeypatch)
+
+    assert _flags(Session, b)[0] == 0, "undecided again, not rejected"
+    with Session() as s:
+        stamps = s.execute(select(m.Threat_Scenario.AcceptedAt, m.Threat_Scenario.AcceptedBy,
+                                m.Threat_Scenario.RejectedAt)
+                        .where(m.Threat_Scenario.ScenarioID == b)).one()
+        assert tuple(stamps) == (None, None, None)
+        assert dal.has_undecided_scenarios(s, sid) is True, "it is back in the review queue"
+    # Nothing is erased: the acceptance and its reversal sit side by side, each naming its actor.
+    assert [oid for oid, _ in _audit(Session, AuditEventType.scenario_accepted)] == [b]
+    assert _audit(Session, AuditEventType.scenario_unaccepted) == [(b, {})]
+
+
+def test_unaccept_is_refused_when_there_is_nothing_to_undo(monkeypatch):
+    """Only an acceptance can be taken back. A pending or rejected scenario answers 409 with its
+    own reason rather than silently doing nothing."""
+    from app.core.enums import UnacceptGateReason
+
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+
+    with pytest.raises(AcceptConflict) as exc_info:
+        _unaccept(Session, sid, d, monkeypatch)
+    assert exc_info.value.reason == UnacceptGateReason.not_accepted
+
+    assert _reject(Session, sid, [d], monkeypatch) == 1
+    with pytest.raises(AcceptConflict):
+        _unaccept(Session, sid, d, monkeypatch)
+    assert _flags(Session, b)[0] == 0 and _flags(Session, d)[0] == 0
+
+
+def test_unaccept_parks_the_plan_and_re_accepting_brings_it_back(monkeypatch):
+    """The reason there is no treatment_plan_exists refusal. The plan is not orphaned: it stays on
+    its scenario, stops being the answer for the risk while that scenario is undecided, and
+    returns with its verdict when the scenario is accepted again — exactly like a replacement."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, _d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+    plan_id = _plan(Session, sid, b)
+    assert _register_plan_ids(Session) == [plan_id]
+
+    _unaccept(Session, sid, b, monkeypatch)
+
+    with Session() as s:
+        assert dal.session_plan_board(s, sid) == [], "no accepted scenario, no board row"
+        assert dal.active_plan_row(s, sid, b) is not None, "the plan itself is untouched"
+    assert _register_plan_ids(Session) == [], "and it stops answering for the risk"
+
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+    with Session() as s:
+        board = dal.session_plan_board(s, sid)
+    assert [str(r["PlanID"]) for r in board] == [plan_id]
+    assert board[0]["ReviewStatus"] == "approved", "its verdict came back with it"
+
+
+def test_accept_all_works_after_an_unaccept(monkeypatch):
+    """An un-accepted scenario is undecided, so the ordinary path picks it up again — no special
+    case, and no session left in a state only a regenerate could clear."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, _b, _c, d = _versions_abcd(Session, sid)
+    other = _scenario(Session, sid, identity=HASH_03, superseded=0, title="sibling")
+    assert _accept(Session, sid, [d], monkeypatch) == 1
+
+    _unaccept(Session, sid, d, monkeypatch)
+
+    assert _accept(Session, sid, None, monkeypatch) == 2, "both live scenarios accept again"
+    assert _flags(Session, d)[0] == 1 and _flags(Session, other)[0] == 1
+
+
+def test_the_replace_link_reads_from_both_ends(monkeypatch):
+    """Walk old → new from the un-accept row, and new → old from the accept row. Before this the
+    second direction had no answer at all once someone switched back, because the scenario rows
+    only chain a regeneration to its immediate predecessor."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+    assert _accept(Session, sid, [d], monkeypatch, replace=True) == 1
+
+    assert _audit(Session, AuditEventType.scenario_unaccepted) == [(b, {"replaced_by": d})]
+    accepted_rows = dict(_audit(Session, AuditEventType.scenario_accepted))
+    assert accepted_rows[d] == {"replaces": b}, "the version that gained it names what it displaced"
+    assert accepted_rows[b] == {}, "an ordinary accept carries no detail"
 
 
 def _review(Session, monkeypatch, sid: str, scenario_id: str, plan_id: str):

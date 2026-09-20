@@ -234,6 +234,10 @@ class AuditDecision(StrEnum):
     accept = "accept"          # subset was None ("accept all")
     partial = "partial"        # AcceptBody mode="subset"
     reject = "reject"          # AcceptBody mode="none"
+    unaccept = "unaccept"      # an acceptance taken back — POST .../scenarios/{id}/unaccept, and
+                               # the first half of a replace (accept with replace_accepted). Per
+                               # SCENARIO only: no session-level call means "unaccept", so this
+                               # never appears on a review_decision row
     regenerate = "regenerate"  # no writer (regeneration is audited via regeneration_completed)
 
 
@@ -440,13 +444,19 @@ class ScenarioDecisionReason(StrEnum):
 
 
 class UnacceptGateReason(StrEnum):
-    """(Forthcoming) Why POST .../scenarios/{output_id}/unaccept would be refused — HTTP 409
-    `details.reason`. Reserved for the paused per-scenario unaccept feature; NO route raises
-    these yet."""
+    """Why POST .../scenarios/{output_id}/unaccept was refused — HTTP 409 `details.reason`,
+    inside the accept_conflict envelope (same shape, same handler: an unaccept IS a decision on
+    a scenario, and a second error code would only make clients branch twice).
+
+    `treatment_plan_exists` is GONE, deliberately. It said "a plan was generated FROM this
+    acceptance — undoing beneath it would orphan the plan", and that stopped being true: a plan
+    stays attached to its own version, leaves the board and the register while that version is
+    not accepted, cannot be approved there, and comes back if the version is accepted again —
+    exactly what already happens when a replacement displaces a version. Refusing here while
+    permitting it there would have been the inconsistency, not the safety. It never had a raise
+    site, so it never reached /openapi.json and nothing can be switching on it."""
     not_accepted = "not_accepted"                        # the scenario isn't accepted (or a racing
                                                          # unaccept already flipped it)
-    treatment_plan_exists = "treatment_plan_exists"      # a plan was generated FROM this acceptance —
-                                                         # undoing beneath it would orphan the plan
 
 
 class TreatmentStageStatus(StrEnum):

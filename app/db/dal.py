@@ -1431,24 +1431,17 @@ def scenario_row(sess: Session, session_id: str, output_id: str) -> RowMapping |
 _DECISION_EVENT = {
     AuditDecision.accept: AuditEventType.scenario_accepted,
     AuditDecision.reject: AuditEventType.scenario_rejected,
+    AuditDecision.unaccept: AuditEventType.scenario_unaccepted,
 }
 
 
-class Replacement(NamedTuple):
-    """One acceptance moved between two versions of the same scenario. BOTH ids, because a caller
-    needs to know what gained the decision and what lost it — the loser is the id whose cached
-    plan, board row and register entry just stopped being the answer for that risk."""
-    scenario_id: str       # now the accepted version
-    replaced_scenario_id: str  # accepted until this call, now history
-
-
 class Decided(NamedTuple):
-    """What `decide_scenarios` actually wrote. `count` is the rows decided; `replaced` is the
-    replacements it really made (empty on every call that did not ask for one). Two fields rather
-    than a bare int because the caller must be able to report, log and audit what HAPPENED — the
-    requested set is not that."""
+    """What `decide_scenarios` actually wrote: how many rows it decided, and which ids genuinely
+    transitioned. Two fields rather than a bare int because the caller must be able to report,
+    log and audit what HAPPENED — a re-accept matches without changing anything, and the
+    requested set is not the written set."""
     count: int
-    replaced: list[Replacement]
+    changed: list[str]
 
 
 def _decidable_where(session_id: str, subsystem_ids: list[int], decision: AuditDecision,
@@ -1466,13 +1459,25 @@ def _decidable_where(session_id: str, subsystem_ids: list[int], decision: AuditD
     reached the database and surfaced as an IntegrityError the accept path mislabelled
     `duplicate_identity`. The constraint is now a backstop, not the arbiter."""
     out = m.Threat_Scenario
+    #: What each decision may touch, beyond "a real scenario of this session".
+    #:   accept   — anything not already rejected (re-accepting is idempotent, not a 404)
+    #:   reject   — anything not accepted (the two are mutually exclusive)
+    #:   unaccept — only what IS accepted; there is nothing else to undo. No recency filter:
+    #:              the accepted version is often a superseded one, and refusing to undo THAT
+    #:              would leave the commonest case — a mistaken accept, later regenerated — with
+    #:              no way back.
+    decidable = {
+        AuditDecision.accept: out.RejectedAt.is_(None),
+        AuditDecision.reject: out.Accepted == 0,
+        AuditDecision.unaccept: accepted(out.Accepted),
+    }[decision]
     where = [out.SessionID == session_id,
             out.SubsystemID.in_(subsystem_ids),
             # complete only: a FAILURE CARD (null scenario) must never carry a decision — it would
             # reach downstream consumers as an accepted scenario with no content. A subset naming
             # one simply does not match, and the caller reports it as undecidable (404).
             out.Status == ScenarioStatus.complete,
-            out.RejectedAt.is_(None) if decision is AuditDecision.accept else out.Accepted == 0]
+            decidable]
     if subset is not None:
         where.append(out.ScenarioID.in_(subset))
     else:
@@ -1484,7 +1489,7 @@ def _decidable_where(session_id: str, subsystem_ids: list[int], decision: AuditD
 def decide_scenarios(
     sess: Session, session_id: str, subsystem_ids: list[int], *, decision: AuditDecision,
     subset: list[str] | None = None, tenant_id: str | None = None, entity_id: str | None = None,
-    user_id: str | None = None, displace: dict[str, str] | None = None,
+    user_id: str | None = None, details: dict[str, dict] | None = None,
 ) -> Decided:
     """Record ONE reviewer decision per scenario — the row write and its ledger entry, together.
 
@@ -1509,59 +1514,28 @@ def decide_scenarios(
     `AcceptedSubsetJSON` is stamped only for a partial accept, so non-NULL means precisely "part of
     an explicit partial pick" and a reviewer needs no Scenario_Audit join.
 
-    `displace` is {already-accepted ScenarioID: the version replacing it}, built by accept.py's
-    pre-flight when the reviewer explicitly asked to replace (AcceptBody.replace_accepted). Those
-    rows are un-accepted HERE rather than in a helper, because this is the one function
-    scripts/test_pipeline_guards.py allows to write a decision column — the single-writer rule is
-    what keeps the decision and its ledger entry inseparable, and a replacement is two decisions.
+    UNACCEPT is the third decision, and it is a decision like the other two — not an "undo" that
+    edits history. It clears the acceptance and its stamps and appends its own ledger row; the
+    original scenario_accepted row stays exactly where it was. Clearing rather than keeping the
+    stamps is what lets a later re-accept record who decided THEN: AcceptedAt/AcceptedBy coalesce
+    on the way in, so a left-behind timestamp would misdate it.
 
-    Returns `Decided(count, replaced)`: rows actually decided, so the caller can tell "N requested,
+    A REPLACEMENT is two of these decisions, in order — accept.py un-accepts the displaced version
+    and then accepts the new one, inside one transaction and one lock. It is not a mode here:
+    UX_Scenario_ActiveAccepted forces the order anyway, and folding it in cost this function a
+    bespoke branch that duplicated the write below.
+
+    `details` is {ScenarioID: DetailJSON dict} for the ledger rows — what a replacement uses to
+    record BOTH directions (`replaced_by` on the un-accept, `replaces` on the accept), so either
+    id answers "what happened to this version?" with one indexed lookup. Every row of the insert
+    carries the key (None when absent) because executemany needs one shape.
+
+    Returns `Decided(count, changed)`: rows actually decided, so the caller can tell "N requested,
     M<N matched" from a clean run — otherwise a subset id naming a wrong row vanishes silently —
-    and the versions actually un-accepted. `replaced` is NOT `displace`: the un-accept is fenced,
-    so a row another decision moved first matches nothing and must not be reported as replaced.
-    The caller has no second way to find out — re-reading cannot distinguish "I replaced it" from
-    "it was already like that" — so the fact is returned rather than recomputed."""
+    and WHICH ids actually transitioned. The caller has no second way to learn that: re-reading
+    cannot tell "I changed it" from "it was already like that"."""
     event_type = _DECISION_EVENT[decision]
     out = m.Threat_Scenario
-    flipped: list[Replacement] = []
-    if displace:
-        # BEFORE the accept below, not after: UX_Scenario_ActiveAccepted permits one accepted
-        # version per identity, so the other order violates it at statement time.
-        #
-        # The stamps are CLEARED, not kept. AcceptedAt/AcceptedBy are coalesced on the way in
-        # ("first decider wins"), so leaving Monday's timestamp on a row that is no longer
-        # accepted would misdate a later re-accept of that same version. The decision itself is
-        # not lost: the scenario_accepted row stays in the ledger and the scenario_unaccepted row
-        # below is appended beside it, which is what an append-only trail means.
-        #
-        # RETURNING, so the ledger records exactly the rows this UPDATE flipped. A row someone
-        # else decided first simply does not match, and the accept below then collides with the
-        # unique index — which accept_session already converts into a typed 409.
-        flipped = [Replacement(displace[str(r[0])], str(r[0])) for r in sess.execute(
-            update(out)
-            # Subsystem-fenced like every other write in this function. It is not redundant with
-            # the id list: `displace`'s keys come from accepted_identity_pairs, which is
-            # SESSION-scoped, while the decision below is subsystem-scoped. Today the two agree
-            # because identity_hash folds SubsystemID into the digest, so a colliding prior is
-            # necessarily in the same subsystem — an invariant living 300 lines away, which is
-            # exactly the kind this predicate exists to stop depending on.
-            .where(out.SessionID == session_id, out.SubsystemID.in_(subsystem_ids),
-                out.ScenarioID.in_(list(displace)), accepted(out.Accepted))
-            .values(Accepted=0, AcceptedAt=None, AcceptedBy=None, AcceptedSubsetJSON=None)
-            .returning(out.ScenarioID)
-        ).all()]
-        if flipped:
-            sess.execute(insert(m.Scenario_Audit), [
-                audit_row(sess, AuditID=guid(), SessionID=session_id, TenantID=tenant_id,
-                        EntityID=entity_id, ScenarioID=old,
-                        EventType=AuditEventType.scenario_unaccepted,
-                        # The same Decision its sibling scenario_accepted row carries: this
-                        # un-accept IS part of that accept call. Left NULL, one scenario's
-                        # history read `accept` on one row and nothing on the other, and every
-                        # consumer of the trail had to special-case the event type to see both.
-                        Decision=decision, ActorUserID=user_id,
-                        DetailJSON=json.dumps({"replaced_by": new}))
-                for new, old in flipped])
     where = _decidable_where(session_id, subsystem_ids, decision, subset)
 
     # Read first, so each scenario gets its own ledger row. Exact rather than racy: every caller
@@ -1570,16 +1544,15 @@ def decide_scenarios(
     rows = sess.execute(
         select(out.ScenarioID, out.Accepted, out.RejectedAt).where(*where)).mappings().all()
     if not rows:
-        # `flipped` still rides along: a caller whose subset matched nothing rolls back anyway,
-        # but reporting a replacement it did not make would be a lie in the one path that most
-        # needs the truth.
-        return Decided(0, flipped)
+        return Decided(0, [])
     # The ledger records TRANSITIONS, not matches. A row already carrying this decision still
     # matches (deciding twice is idempotent, not a 404), but writing a second audit row for it
     # would put two decisions in the trail where the reviewer made one — a double-click, or a
     # retried request, silently corrupting the very evidence this per-scenario trail exists to be.
-    changed = [str(r["ScenarioID"]) for r in rows
-            if not (r["Accepted"] if decision is AuditDecision.accept else r["RejectedAt"])]
+    # Unaccept has no such case: _decidable_where already matched only accepted rows, so every
+    # row it returns is a real transition.
+    already = {AuditDecision.accept: "Accepted", AuditDecision.reject: "RejectedAt"}.get(decision)
+    changed = [str(r["ScenarioID"]) for r in rows if already is None or not r[already]]
 
     _now = now()
     if decision is AuditDecision.accept:
@@ -1592,6 +1565,9 @@ def decide_scenarios(
                         "AcceptedSubsetJSON": json.dumps(subset) if subset is not None else None,
                         "AcceptedAt": func.coalesce(out.AcceptedAt, _now),
                         "AcceptedBy": func.coalesce(out.AcceptedBy, user_id)}
+    elif decision is AuditDecision.unaccept:
+        values = {"Accepted": 0, "AcceptedAt": None, "AcceptedBy": None,
+                "AcceptedSubsetJSON": None}
     else:
         values = {"RejectedAt": func.coalesce(out.RejectedAt, _now),
                 "RejectedBy": func.coalesce(out.RejectedBy, user_id)}
@@ -1602,12 +1578,14 @@ def decide_scenarios(
         # naming the session owner would put a person's name on something they did not do — the
         # same lie audit_row used to tell. NULL here is the honest answer, and ActorType says so.
         actor = user_id
+        detail = details or {}
         sess.execute(insert(m.Scenario_Audit), [
             audit_row(sess, AuditID=guid(), SessionID=session_id, TenantID=tenant_id,
                     EntityID=entity_id, ScenarioID=oid, EventType=event_type, Decision=decision,
-                    ActorUserID=actor)
+                    ActorUserID=actor,
+                    DetailJSON=json.dumps(detail[oid]) if oid in detail else None)
             for oid in changed])
-    return Decided(res.rowcount, flipped)
+    return Decided(res.rowcount, changed)
 
 
 def undecidable_subset_reasons(

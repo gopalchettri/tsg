@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import NamedTuple
 
 from sqlalchemy import RowMapping, select
 from sqlalchemy.exc import IntegrityError
@@ -15,6 +16,7 @@ from app.core.enums import (
     SessionStatus,
     StageStatus,
     SubsystemLevel,
+    UnacceptGateReason,
     WorkflowStage,
 )
 from app.core.logging import get_logger
@@ -35,6 +37,21 @@ _REASON_TEXT = {
     ScenarioDecisionReason.already_accepted: "is already accepted — that decision stands",
     ScenarioDecisionReason.already_rejected: "is already rejected — that decision stands",
 }
+
+
+class Replacement(NamedTuple):
+    """One acceptance moved between two versions of the same scenario. BOTH ids, because a caller
+    needs to know what gained the decision and what lost it — the loser is the id whose cached
+    plan, board row and register entry just stopped being the answer for that risk."""
+    scenario_id: str            # now the accepted version
+    replaced_scenario_id: str   # accepted until this call, now history
+
+
+class Accepted(NamedTuple):
+    """What an accept call did: rows accepted, and the replacements it really made (empty on
+    every ordinary accept). The pair the API and the log both report from."""
+    count: int
+    replaced: list[Replacement]
 
 
 class AcceptConflict(Exception):
@@ -144,7 +161,7 @@ def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: lis
 
 def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str | None,
                 subset: list[str] | None = None, *,
-                replace_accepted: bool = False) -> dal.Decided:
+                replace_accepted: bool = False) -> Accepted:
     scenario_session = dal.get_session(sess, session_id, entity_id)
     if scenario_session is None:
         raise EntityForbidden(f"session {session_id} not in entity {entity_id}")
@@ -173,15 +190,31 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
         displace = _assert_one_version_per_scenario(sess, session_id, subset, good_subs,
                                                 replace_accepted=replace_accepted)
         try:
-            # decide_scenarios writes the per-scenario ledger rows in the SAME call — accept has
-            # no separate audit step that could fall out of step with the decision. `displace`
-            # rides along for the same reason: a replacement un-accepts one version and accepts
-            # another, and those two writes must not be separable either.
+            # A REPLACEMENT is two decisions, written in this order and in this transaction.
+            # Un-accept first because UX_Scenario_ActiveAccepted permits one accepted version per
+            # identity — the other order violates it at statement time. Both calls go through the
+            # single writer, so neither decision can exist without its ledger row, and the
+            # rollback below covers the pair.
+            #
+            # `replaced` reports what the un-accept ACTUALLY flipped, never what the pre-flight
+            # asked for: a version some other decision moved first matches nothing, and a client
+            # told otherwise would invalidate a plan that never moved.
+            replaced: list[Replacement] = []
+            if displace:
+                undone = dal.decide_scenarios(
+                    sess, session_id, good_subs, decision=AuditDecision.unaccept,
+                    subset=list(displace), tenant_id=scenario_session["TenantID"],
+                    entity_id=str(entity_id), user_id=user_id,
+                    details={old: {"replaced_by": new} for old, new in displace.items()})
+                replaced = [Replacement(displace[old], old) for old in undone.changed]
             decided = dal.decide_scenarios(
                 sess, session_id, good_subs, decision=AuditDecision.accept, subset=subset,
                 tenant_id=scenario_session["TenantID"], entity_id=str(entity_id), user_id=user_id,
-                displace=displace)
-            matched, replaced = decided.count, decided.replaced
+                # The other half of the link: from the version that GAINED the decision, name the
+                # one it displaced. Without it the trail walked old → new only, and after a switch
+                # back the scenario rows cannot answer it either.
+                details={r.scenario_id: {"replaces": r.replaced_scenario_id} for r in replaced})
+            matched = decided.count
         except IntegrityError as exc:
             # The pre-flight above reads, then this writes — two concurrent accepts naming
             # different versions of one scenario both pass the read and collide here.
@@ -244,7 +277,7 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
         # SSE is a hint; stream status is authoritative.
         bus.publish(session_id, {"type": "session_accepted", "session_id": session_id,
                                 "status": str(SessionStatus.completed), "ts": now().isoformat()})
-        return dal.Decided(matched, replaced)
+        return Accepted(matched, replaced)
     except Exception:
         # Keep committed locks durable; discard pending decision work.
         sess.rollback()
@@ -257,6 +290,76 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             sess.commit()
         except Exception:  # noqa: BLE001 — best-effort lock release; must not mask the original error
             log.warning("accept.lock_release_failed", session_id=session_id)
+
+
+def unaccept_scenario(sess: Session, session_id: str, entity_id: str, user_id: str | None,
+                    scenario_id: str) -> None:
+    """Take one acceptance back, without adopting anything in its place.
+
+    The third decision, and the one the reviewer had no way to make: reject is refused on an
+    accepted scenario (the two are mutually exclusive), and replacing needs another version to
+    adopt. "I accepted that by mistake, and I do not want a rewrite either" had no answer at all.
+
+    The scenario returns to UNDECIDED, so the review queue reopens for it and it can later be
+    rejected, or accepted again. Nothing is deleted: the original scenario_accepted row stays in
+    the ledger with the scenario_unaccepted row appended beside it.
+
+    Its remediation plan is deliberately NOT touched. It stays attached to this version, drops
+    off the plan board and the entity register while the version is not accepted, cannot be
+    approved there, and comes back if the version is accepted again — the same behaviour a
+    replacement already has. That is why there is no treatment_plan_exists refusal: the orphan it
+    guarded against cannot happen.
+
+    Same gate, same per-subsystem lock and the same single writer as accept and reject, because
+    an unaccept races exactly what they race.
+    """
+    scenario_session = dal.get_session(sess, session_id, entity_id)
+    if scenario_session is None:
+        raise EntityForbidden(f"session {session_id} not in entity {entity_id}")
+    # Called here, not inside a helper: scripts/test_pipeline_guards.py walks each function's own
+    # AST and fails the build if a decision writer skips the gate.
+    scenario_session = _ensure_session_ready_to_accept(sess, scenario_session)
+
+    subsystem_ids = dal.subsystem_ids_at_level(sess, session_id, SubsystemLevel.LOCK)
+    good_subs = dal.subsystem_ids_at_level(
+        sess, session_id, SubsystemLevel.SCENARIOS, status=StageStatus.AWAITING_DECISION)
+
+    acquired: list[int] = []
+    try:
+        for ss in subsystem_ids:
+            if not dal.acquire_execution_lock(sess, session_id, ss, task_id=session_id):
+                raise AcceptConflict(f"subsystem {ss} lock held (regeneration in progress)")
+            acquired.append(ss)
+            sess.commit()  # make the lock visible to a concurrent accept/regeneration
+
+        oid = dal.canonical_guid(scenario_id)
+        if dal.decide_scenarios(
+                sess, session_id, good_subs, decision=AuditDecision.unaccept, subset=[oid],
+                tenant_id=scenario_session["TenantID"], entity_id=str(entity_id),
+                user_id=user_id).count != 1:
+            # Nothing to undo. Reported as the SAME 409 envelope accept uses, with its own reason:
+            # an unaccept is a decision on a scenario, and a second error code would only make a
+            # client branch twice for one class of answer.
+            raise AcceptConflict(
+                f"Nothing was un-accepted. {oid} is not an accepted scenario of this session — "
+                f"only an acceptance can be taken back. Check GET /v1/sessions/{session_id}"
+                f"/results, where the accepted version reads accepted: true.",
+                reason=UnacceptGateReason.not_accepted)
+        sess.commit()
+        log.info("scenario.unaccepted", session_id=session_id, scenario_id=oid, user=user_id)
+        # SSE is a hint; stream status is authoritative. Same shape as its two siblings.
+        bus.publish(session_id, {"type": "scenario_unaccepted", "session_id": session_id,
+                                "scenario_id": oid, "ts": now().isoformat()})
+    except Exception:
+        sess.rollback()  # keep committed locks durable; discard pending decision work
+        raise
+    finally:
+        try:
+            for ss in acquired:
+                dal.release_lock(sess, session_id, ss, task_id=session_id)
+            sess.commit()
+        except Exception:  # noqa: BLE001 — a lost lock must not mask the caller's error
+            log.warning("unaccept.lock_release_failed", session_id=session_id)
 
 
 def reject_scenarios(sess: Session, session_id: str, entity_id: str, user_id: str | None,

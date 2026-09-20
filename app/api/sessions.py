@@ -53,6 +53,7 @@ from app.api.schemas import (
     StandardRef,
     SubsystemStartedEvent,
     TreatmentPlanResultEvent,
+    UnacceptResponse,
 )
 from app.core import tuning
 from app.core.config import get_settings
@@ -82,6 +83,7 @@ from app.pipeline.accept import (
     ensure_review_gate,
     reject_scenarios,
     review_gate_reason,
+    unaccept_scenario,
 )
 from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
 from app.pipeline.context import gather_asset_details
@@ -1180,6 +1182,39 @@ def post_promote_to_library(session_id: str, scenario_id: str,
         threat_actors=[PromotedRef(**a) for a in result.threat_actors],
         controls=[MappedControl(**c) for c in result.controls],
         controls_mapped=result.controls_mapped)
+
+
+@router.post("/sessions/{session_id}/scenarios/{scenario_id}/unaccept",
+            response_model=UnacceptResponse, responses=_CONFLICT_RESPONSES,
+            summary="Take back an acceptance",
+            description=(
+                "Undoes one acceptance. The scenario becomes undecided again and returns to the review "
+                "queue, where it can be rejected later or accepted again.\n\n"
+                "**Why it exists:** 'I accepted that by mistake, and I do not want a rewrite either' had no "
+                "answer. Reject is refused on an accepted scenario — the two decisions are mutually "
+                "exclusive — and replacing needs another version to adopt.\n\n"
+                "**Before you call:** same review point as accept, and the scenario must actually be "
+                "accepted. If it is not, you get `409` with the reason `not_accepted`.\n\n"
+                "**Nothing is deleted.** The original acceptance stays in the audit trail with this "
+                "reversal recorded beside it, naming who did which.\n\n"
+                "**Its remediation plan is kept too**, attached to this scenario. While the scenario is not "
+                "accepted the plan leaves the plan board and the entity register and cannot be approved — "
+                "and it comes back, verdict and all, if you accept the scenario again. That is the same "
+                "behaviour as replacing a version, so a plan is never orphaned and never counted twice."
+            ))
+def post_unaccept_scenario(session_id: str, scenario_id: str,
+                        principal: Principal = Depends(get_principal)) -> UnacceptResponse:
+    """Take one acceptance back. The third decision a reviewer can make, beside accept and reject.
+
+    Deliberately per-scenario and un-batched: undoing a decision the register already carries is
+    not something to do to a list at once. Validation, locking and the write live in
+    `accept.unaccept_scenario`; this is the authz + HTTP wrapper."""
+    with db_session() as sess:
+        scenario_session = get_authorized_session(sess, session_id, principal)
+        unaccept_scenario(sess, session_id, scenario_session["EntityID"], principal.user_id,
+                        scenario_id)
+    return UnacceptResponse(session_id=session_id, scenario_id=dal.canonical_guid(scenario_id),
+                            accepted=False)
 
 
 @router.post("/sessions/{session_id}/scenarios/reject", response_model=RejectResponse,
