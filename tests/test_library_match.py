@@ -17,6 +17,10 @@ What this file pins:
    would fold to one IdentityHash through the `cat:` rung and one scenario could retire the other.
 7. TYPES are never matched this way. Measured, type names cannot separate synonyms from opposites
    ("Obtain Capabilities" vs "Develop Capabilities" reranks 99.8), so a novel type still mints.
+8. The BULK IMPORTER gets the same question and a different answer: it REPORTS near-duplicates and
+   never merges. Its rows carry external standard ids (AML.T0043.000, INP36, AC19), so a wrong
+   merge corrupts the mapping back to the source standard — worse than the duplicate it avoids —
+   and its rows are curator-vouched and born active, so the invisibility ratchet does not apply.
 """
 from __future__ import annotations
 
@@ -35,6 +39,24 @@ from app.pipeline import library_match, promote
 
 TYPE_ID = 28
 ORIGINAL = 647
+
+
+class _RerankMany:
+    """A reranker that also answers rerank_many — the batch form the import scan uses."""
+
+    def __init__(self, table=None, boom=False):
+        self.table = table or {}
+        self.boom = boom
+
+    def rerank(self, query, docs, *, model=None):
+        if self.boom:
+            raise RuntimeError("reranker down")
+        return [self.table.get(d, 3.0) for d in docs]
+
+    def rerank_many(self, items, *, model=None):
+        if self.boom:
+            raise RuntimeError("reranker down")
+        return [self.rerank(q, docs) for q, docs in items]
 
 
 class _Reranker:
@@ -252,3 +274,106 @@ def test_a_reuse_is_recorded_in_the_audit_trail(db):
     detail = json.loads(row.DetailJSON)
     assert detail["reused_catalogue_id"] == ORIGINAL
     assert detail["reuse_score"] == pytest.approx(100.0, abs=0.01)
+
+
+# ------------------------------------------------------------------ the bulk importer
+
+def _near_dupes(Session, incoming, llm, **kw):
+    with Session() as s:
+        return library_match.near_duplicates(s, llm, get_settings(), incoming, **kw)
+
+
+def test_the_importer_scan_reports_a_differently_worded_twin(db):
+    """The importer dedups on exact name only, so a curated row and an imported rewording of it
+    both survive. This surfaces that for a curator instead of merging it."""
+    with db() as s:
+        _seed_library(s, rows=[(ORIGINAL, "Impersonation of operator sessions")])
+    llm = _RerankMany({"Impersonation of operator sessions": 99.9})
+
+    got = _near_dupes(db, [("Identity Impersonation",
+                            "Impersonation of authorized control sessions")], llm)
+    assert got["scored"] == 1
+    assert got["pairs"] == [{"incoming": "Impersonation of authorized control sessions",
+                            "catalogue_id": ORIGINAL,
+                            "existing": "Impersonation of operator sessions", "score": 99.9}]
+
+
+def test_the_importer_scan_never_merges(db):
+    """The point of the difference from promote. Imported rows carry external standard ids, so a
+    wrong merge corrupts the mapping back to the standard — worse than the duplicate."""
+    with db() as s:
+        _seed_library(s, rows=[(ORIGINAL, "Impersonation of operator sessions")])
+    before = _catalogue_count(db)
+    _near_dupes(db, [("Identity Impersonation", "Impersonation of authorized control sessions")],
+                _RerankMany({"Impersonation of operator sessions": 99.9}))
+    assert _catalogue_count(db) == before, "a REPORT must not touch the library"
+
+
+def test_a_below_bar_import_pair_is_not_reported(db):
+    """"White-Box" vs "Black-Box Optimization" are distinct. Reporting every faint resemblance
+    would train a curator to ignore the report."""
+    with db() as s:
+        _seed_library(s, rows=[(ORIGINAL, "AML.T0043.000 White-Box Optimization")])
+    got = _near_dupes(db, [("Identity Impersonation", "AML.T0043.001 Black-Box Optimization")],
+                    _RerankMany({"AML.T0043.000 White-Box Optimization": 0.613}))
+    assert got["pairs"] == []
+
+
+def test_a_type_the_import_would_mint_has_nothing_to_compare(db):
+    """No existing family means no candidates — and must not be an error."""
+    with db() as s:
+        _seed_library(s, rows=[(ORIGINAL, "Impersonation of operator sessions")])
+    got = _near_dupes(db, [("A Brand New Type", "Something novel")], _RerankMany())
+    assert got == {"scored": 0, "skipped_for_cap": 0, "pairs": []}
+
+
+def test_the_import_scan_cap_is_reported_not_silent(db):
+    """A silent cap reads as 'nothing found'. Saying what was skipped is the difference between
+    a clean report and a false one."""
+    with db() as s:
+        _seed_library(s, rows=[(ORIGINAL, "Impersonation of operator sessions")])
+    incoming = [("Identity Impersonation", f"variant {i}") for i in range(5)]
+    got = _near_dupes(db, incoming, _RerankMany(), limit=2)
+    assert got["scored"] == 2
+    assert got["skipped_for_cap"] == 3
+
+
+def test_a_broken_reranker_does_not_fail_the_import(db):
+    """The scan is advisory. An import that completed must not be reported as failed because a
+    reranker was down."""
+    with db() as s:
+        _seed_library(s, rows=[(ORIGINAL, "Impersonation of operator sessions")])
+    got = _near_dupes(db, [("Identity Impersonation", "Impersonation of authorized control")],
+                    _RerankMany(boom=True))
+    assert got["pairs"] == []
+    assert "error" in got and "import itself was unaffected" in got["error"]
+
+
+def test_run_import_actually_runs_the_scan(db, monkeypatch):
+    """The wiring line itself. Every other import test here calls near_duplicates directly, so
+    deleting the call inside run_import would leave them all green — revert-checking caught
+    exactly that. This asserts the importer asks the question at all.
+
+    Dry run: no writes, so it also pins that the scan happens BEFORE any write and is reported
+    for a dry run too, which is when a curator most wants to see it.
+    """
+    from app.intel import library_import
+
+    with db() as s:
+        _seed_library(s, rows=[(ORIGINAL, "Impersonation of operator sessions")])
+
+    records = [{"type_name": "Identity Impersonation",
+                "threat_name": "Impersonation of authorized control sessions",
+                "categories": ["Spoofing"]}]
+    monkeypatch.setattr(library_import, "load", lambda source: {})
+    monkeypatch.setitem(library_import.ADAPTERS, "pytm", lambda data: (records, []))
+    monkeypatch.setattr(library_import, "get_llm",
+                        lambda: _RerankMany({"Impersonation of operator sessions": 99.9}))
+
+    with db() as s:
+        result = library_import.run_import(s, "pytm", dry_run=True)
+
+    assert "near_duplicates" in result, "the importer must ASK, not just be able to"
+    assert result["near_duplicates"]["pairs"][0]["catalogue_id"] == ORIGINAL
+    assert result["threats_created"] == 0, "dry run writes nothing"
+    assert _catalogue_count(db) == 1

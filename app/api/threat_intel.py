@@ -44,13 +44,16 @@ from app.api.schemas import (
     LibraryImportAccepted,
     LibraryImportBody,
     LibraryImportStatus,
+    LibraryRejectionBody,
+    LibraryRejectionResponse,
+    LibraryRejectionResult,
     PendingLibraryResponse,
     PendingLibraryRow,
     TechniqueCorpusStatus,
     TechniqueRebuildAccepted,
     TechniqueRebuildBody,
 )
-from app.core.enums import LibraryApprovalStatus, SSEEventType
+from app.core.enums import LibraryApprovalStatus, LibraryRejectionStatus, SSEEventType
 from app.core.joblock import is_held
 from app.core.logging import get_logger
 from app.db import dal
@@ -564,3 +567,65 @@ def approve_library_threats(body: LibraryApprovalBody, request: Request,
                 catalogue_ids=body.catalogue_ids, user_id=principal.user_id,
                 source_ip=request.client.host if request.client else None)
     return LibraryApprovalResponse(approved_count=approved, results=results)
+
+
+_REJECT_DESC = (
+    "Discard promoted threats a curator does not want in the library — the other half of "
+    "approve.\n\n"
+    "Without this, the queue at `GET .../library/pending` was one-way: you could publish a draft "
+    "but never clear a bad one, so rejects piled up as permanent clutter and every future queue "
+    "read showed them again.\n\n"
+    "Soft delete only (`IsDeleted=1`): completed sessions reference these ids, so the row must "
+    "survive as a tombstone. Every read that matters is already `IsDeleted`-filtered, and the "
+    "natural-key index is filtered too, so the freed name becomes reusable.\n\n"
+    "**Pending rows only.** An id that is already approved comes back `is_approved` and is NOT "
+    "discarded: an active row is curated data that live sessions may be matching against, and "
+    "removing it is a far larger act than clearing a draft nobody has seen.\n\n"
+    "Named ids, capped at 100, per-item results — same shape as approve. Idempotent: rejecting a "
+    "rejected id is `already_rejected`, not an error."
+)
+
+
+@router.post("/library/threats/reject", response_model=LibraryRejectionResponse,
+            summary="Discard promoted threats", description=_REJECT_DESC)
+def reject_library_threats(body: LibraryRejectionBody, request: Request,
+                        principal: Principal = Depends(get_admin_principal),
+                        ) -> LibraryRejectionResponse:
+    """Soft-delete pending library rows, one transaction for the batch.
+
+    The parent TYPE is deliberately left alone. Approving activates it because retrieval needs it
+    active; rejecting needs nothing of the sort, and a type may carry siblings this call was never
+    asked about — deleting it would take them down too."""
+    results: list[LibraryRejectionResult] = []
+    rejected = 0
+    with db_session() as sess:
+        for cid in body.catalogue_ids:
+            try:
+                row = dal.get_library_row(sess, m.Threat_Catalogue,
+                                        m.Threat_Catalogue.ThreatCatalogueID, cid)
+            except NotFoundError:
+                # get_library_row hides soft-deleted rows, so missing and already-rejected arrive
+                # here identically; re-read including them to tell the curator which it was.
+                gone = sess.get(m.Threat_Catalogue, cid)
+                results.append(LibraryRejectionResult(
+                    catalogue_id=cid,
+                    status=(LibraryRejectionStatus.already_rejected if gone is not None
+                            else LibraryRejectionStatus.not_found)))
+                continue
+            if row.IsActive:
+                results.append(LibraryRejectionResult(
+                    catalogue_id=cid, status=LibraryRejectionStatus.is_approved))
+                continue
+            dal.soft_delete_library_row(sess, m.Threat_Catalogue,
+                                        m.Threat_Catalogue.ThreatCatalogueID, cid,
+                                        principal.user_id)
+            rejected += 1
+            results.append(LibraryRejectionResult(
+                catalogue_id=cid, status=LibraryRejectionStatus.rejected))
+        sess.commit()
+    # AFTER the commit, same ordering rule as the approve and import routes: a log line for a
+    # write that rolled back is a permanent record of something that never happened.
+    log.warning("admin.library_rejection", requested=len(body.catalogue_ids), rejected=rejected,
+                catalogue_ids=body.catalogue_ids, user_id=principal.user_id,
+                source_ip=request.client.host if request.client else None)
+    return LibraryRejectionResponse(rejected_count=rejected, results=results)

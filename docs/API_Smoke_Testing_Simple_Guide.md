@@ -255,7 +255,7 @@ the steps stay the same.
 | `Threat_Scenario_Control_Map` | Step-4 control mapping: which `Control_Library` rows were matched to each scenario, and their rank/score. |
 | `Scenario_Audit` | The logbook. Append-only — every action adds a row, nothing is ever edited. `EventType` names the action; `ScenarioID` (not `OutputID`) names which scenario an event is about. See Part 3a. |
 | `Prompt_Log` | 1 row per AI call (even failed ones) — your proof the AI actually ran. |
-| `Threat_Type`, `Threat_Catalogue`, `Threat_Actor`, `Threat_Category` + map tables | The master threat library. **Read-only** except when a scenario is promoted into it — automatically at accept time (`library_promoted`), or explicitly via `POST .../promote-to-library`. The admin routes that used to let someone hand-edit or bulk-import library rows were removed (2026-08) as unused complexity — there is no `Config_Threat_Rule`, `Threat_Candidate_Review`, or `Threat_Library_Import_Run` table any more. |
+| `Threat_Type`, `Threat_Catalogue`, `Threat_Actor`, `Threat_Category` + map tables | The master threat library. A curator approves or rejects promoted drafts via `POST .../library/threats/approve` / `.../reject` (Test 9c). Otherwise **read-only** except when a scenario is promoted into it — automatically at accept time (`library_promoted`), or explicitly via `POST .../promote-to-library`. The admin routes that used to let someone hand-edit or bulk-import library rows were removed (2026-08) as unused complexity — there is no `Config_Threat_Rule`, `Threat_Candidate_Review`, or `Threat_Library_Import_Run` table any more. |
 | `Control_Library`, `Control_Standard`, `Control_Library_Standard_Map` | The 1,288 security controls, their standards (ISO, NIST…), and the links between them. |
 | `Risk_Treatment_Plan` | One LLM-generated risk-treatment-plan attempt per accepted scenario. |
 | `Grounding_Calibration_Run` | One row per grounding-threshold calibration sweep. This table also **is** the live threshold — the newest successful row for a given model pair is what the pipeline reads; there's no separate settings store. |
@@ -3064,6 +3064,20 @@ curl -s -X POST "http://localhost:8000/v1/tsg/threat-intel/library/threats/appro
 | Approve a threat whose parent type was soft-deleted | `200`, that item `not_found` — approving could not make it retrievable, so it is not claimed |
 | Approve the same id twice | `200`, `already_approved`, `approved_count: 0` — idempotent, not an error |
 | Omit `X-Admin-Key` | `401` |
+
+**Rejecting instead** — `POST /v1/tsg/threat-intel/library/threats/reject`, same body shape and
+same cap, for drafts you do *not* want:
+
+```bash
+curl -s -X POST "http://localhost:8000/v1/tsg/threat-intel/library/threats/reject"   -H "X-Admin-Key: $ADMIN_KEY" -H "Content-Type: application/json"   -d '{"catalogue_ids": [648]}'
+```
+
+| You do this | App must answer |
+|---|---|
+| Reject a pending draft | `200`, `rejected` — soft-deleted (`IsDeleted=1`), `UpdatedBy` names you. It leaves the queue |
+| Reject an **approved** row | `200`, `is_approved`, **nothing written**. Active rows are curated data live sessions match against; removing one is a bigger act than clearing a draft |
+| Reject the same id twice | `200`, `already_rejected` — and an id that never existed is `not_found`, told apart on purpose |
+| Reject one of two drafts under a type | The sibling and the type both survive — rejecting never cascades |
 
 **Verify in the database:**
 

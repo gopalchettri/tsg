@@ -94,6 +94,7 @@ from app.core.enums import (
     ClickOutcomeReason,
     ControlMappingExhaustionReason,
     LibraryApprovalStatus,
+    LibraryRejectionStatus,
     NextSetOutcome,
     ReviewGateReason,
     SSEEventType,
@@ -2251,6 +2252,46 @@ class LibraryApprovalResponse(ApiModel):
                     "not-found ids are excluded, so this is the count of real writes, not of "
                     "ids you sent.")
     results: list[LibraryApprovalResult] = Field(
+        description="One entry per requested id, in the order requested.")
+
+
+class LibraryRejectionBody(ApiModel):
+    """Body for POST /v1/tsg/threat-intel/library/threats/reject."""
+    model_config = ConfigDict(json_schema_extra={"example": {"catalogue_ids": [648, 649]}})
+
+    catalogue_ids: list[int] = Field(
+        min_length=1, max_length=100,
+        description="The catalogue ids to discard, from GET .../library/pending. Same named-ids "
+                    "rule and same cap as approve: there is no 'reject everything pending', "
+                    "because one call emptying the queue is exactly the review this state exists "
+                    "to force.")
+
+
+class LibraryRejectionResult(ApiModel):
+    """What actually happened to one requested id."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "catalogue_id": 648, "status": "rejected"}})
+
+    catalogue_id: int = Field(description="The id as requested.")
+    status: LibraryRejectionStatus = Field(
+        description="`rejected` — it was pending and is now discarded. `already_rejected` — "
+                    "nothing to do, not an error. `is_approved` — REFUSED: the row is active "
+                    "curated data that sessions may be matching against, and discarding it is a "
+                    "larger act than clearing a draft. `not_found` — no such id.")
+
+
+class LibraryRejectionResponse(ApiModel):
+    """Per-item results, so one bad id neither fails the batch nor disappears from it."""
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "rejected_count": 1,
+        "results": [{"catalogue_id": 648, "status": "rejected"},
+                    {"catalogue_id": 647, "status": "is_approved"},
+                    {"catalogue_id": 999, "status": "not_found"}]}})
+
+    rejected_count: int = Field(
+        description="How many ids changed state — `rejected` only, so this counts real writes "
+                    "rather than ids you sent.")
+    results: list[LibraryRejectionResult] = Field(
         description="One entry per requested id, in the order requested.")
 
 

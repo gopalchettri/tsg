@@ -38,11 +38,14 @@ import ijson
 import yaml
 from sqlalchemy import func, select
 
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.naming import normalize_name
 from app.core.stride import STRIDE_ORDER
 from app.db import dal
 from app.db import models as m
+from app.pipeline import library_match
+from app.pipeline.llm import get_llm
 
 log = get_logger(__name__)
 
@@ -703,13 +706,26 @@ def run_import(sess, source: str, *, dry_run: bool = False, activate: bool = Tru
             result["warning"] = (f"0 usable threats found for source {source!r} -- check the "
                                  "content matches the selected source")
             result["after_count"] = result["before_count"]
-        elif dry_run:
-            # after_count == before_count and new_category_links stays None: link newness is
-            # unknowable without writing, and must not be guessed at.
-            result["after_count"] = result["before_count"]
         else:
-            result.update(import_records(sess, records, tag, created_by, is_active=activate))
-            result["after_count"] = source_count(sess, tag)
+            # BEFORE any write, so a dry run reports it too and the scan never runs inside the
+            # import's write transaction. REPORT ONLY -- unlike promote-to-library, this never
+            # merges: these rows carry external standard ids (AML.T0043.000, INP36, AC19) and
+            # collapsing two would corrupt the mapping back to the source standard, which is
+            # worse than the duplicate it would avoid. They are curator-vouched and born active
+            # too, so the invisibility ratchet that justifies automatic linking on the promote
+            # path does not apply. import_records' exact-name dedup is untouched; this surfaces
+            # only what that dedup cannot see -- a differently-worded twin of an existing row.
+            result["near_duplicates"] = library_match.near_duplicates(
+                sess, get_llm(), get_settings(),
+                [(type_name, r["threat_name"])
+                for type_name, recs in group_by_type(records).items() for r in recs])
+            if dry_run:
+                # after_count == before_count and new_category_links stays None: link newness is
+                # unknowable without writing, and must not be guessed at.
+                result["after_count"] = result["before_count"]
+            else:
+                result.update(import_records(sess, records, tag, created_by, is_active=activate))
+                result["after_count"] = source_count(sess, tag)
 
     result["skipped_count"] = len(skipped)
     result["skipped"] = skipped[:RESULT_LIST_CAP]

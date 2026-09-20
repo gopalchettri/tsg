@@ -20,6 +20,9 @@ What this file pins:
 4. Per-item outcomes: an unknown, soft-deleted, or type-orphaned id is `not_found` while the rest
    of the batch still approves. Idempotent — a second call is `already_approved`, not an error.
 5. The queue lists what is waiting, and only what is waiting.
+6. REJECT is the other half: a pending draft can be discarded (soft delete, attributably), an
+   ALREADY-APPROVED row is refused rather than removed, and missing is told apart from
+   already-rejected. Without it the queue was one-way and bad drafts were permanent clutter.
 """
 from __future__ import annotations
 
@@ -32,9 +35,17 @@ from sqlalchemy.orm import sessionmaker
 from test_accept_any_version import _engine, _now, _seed_session
 
 from app.api.deps import Principal
-from app.api.schemas import LibraryApprovalBody
-from app.api.threat_intel import approve_library_threats, pending_library
-from app.core.enums import LibraryApprovalStatus, ScenarioStatus
+from app.api.schemas import LibraryApprovalBody, LibraryRejectionBody
+from app.api.threat_intel import (
+    approve_library_threats,
+    pending_library,
+    reject_library_threats,
+)
+from app.core.enums import (
+    LibraryApprovalStatus,
+    LibraryRejectionStatus,
+    ScenarioStatus,
+)
 from app.db import dal
 from app.db import models as m
 from app.pipeline import threat_retrieval
@@ -66,6 +77,11 @@ def _principal() -> Principal:
 
 def _approve(ids: list[int]):
     return approve_library_threats(LibraryApprovalBody(catalogue_ids=ids), _Request(),
+                                _principal())
+
+
+def _reject(ids: list[int]):
+    return reject_library_threats(LibraryRejectionBody(catalogue_ids=ids), _Request(),
                                 _principal())
 
 
@@ -275,3 +291,73 @@ def test_the_queue_lists_what_is_waiting_and_nothing_else(db):
     assert by_id[860].type_is_pending is True
     assert by_id[861].type_is_pending is False
     assert by_id[860].type_name == "Type 62"
+
+
+# --------------------------------------------------------------------------- reject
+
+def test_a_pending_draft_can_be_discarded(db):
+    """The other half of approve. Without it the queue was one-way: publish a draft or leave it
+    there forever, so every future queue read showed the same rejects again."""
+    with db() as s:
+        _seed_pending(s, type_id=70, catalogue_ids=[870])
+
+    result = _reject([870])
+    assert result.rejected_count == 1
+    assert result.results[0].status == LibraryRejectionStatus.rejected
+    with db() as s:
+        row = s.get(m.Threat_Catalogue, 870)
+        assert row.IsDeleted and row.UpdatedBy == "curator-1", "soft delete, attributably"
+    assert pending_library(limit=200, _principal=_principal()).pending_count == 0
+
+
+def test_an_approved_row_is_refused_not_discarded(db):
+    """An active row is curated data live sessions may be matching against. Removing it is a far
+    larger act than clearing a draft nobody has seen, and is not what this call asks for."""
+    with db() as s:
+        _seed_pending(s, type_id=71, catalogue_ids=[880])
+    _approve([880])
+
+    result = _reject([880])
+    assert result.rejected_count == 0
+    assert result.results[0].status == LibraryRejectionStatus.is_approved
+    with db() as s:
+        row = s.get(m.Threat_Catalogue, 880)
+        assert row.IsActive and not row.IsDeleted, "nothing was written"
+
+
+def test_rejecting_twice_is_not_an_error(db):
+    with db() as s:
+        _seed_pending(s, type_id=72, catalogue_ids=[890])
+    assert _reject([890]).rejected_count == 1
+    second = _reject([890])
+    assert second.rejected_count == 0
+    assert second.results[0].status == LibraryRejectionStatus.already_rejected
+
+
+def test_reject_tells_missing_apart_from_already_rejected(db):
+    """get_library_row hides soft-deleted rows, so both arrive as NotFoundError. Collapsing them
+    would tell a curator an id they just rejected does not exist."""
+    with db() as s:
+        _seed_pending(s, type_id=73, catalogue_ids=[900])
+    _reject([900])
+    result = _reject([900, 99999])
+    assert [r.status for r in result.results] == [
+        LibraryRejectionStatus.already_rejected, LibraryRejectionStatus.not_found]
+
+
+def test_rejecting_a_threat_leaves_its_type_alone(db):
+    """Approving activates the parent type because retrieval needs it active. Rejecting needs
+    nothing of the sort, and the type may carry siblings this call was never asked about."""
+    with db() as s:
+        _seed_pending(s, type_id=74, catalogue_ids=[910, 911])
+    _reject([910])
+    with db() as s:
+        assert not s.get(m.Threat_Type, 74).IsDeleted
+        assert not s.get(m.Threat_Catalogue, 911).IsDeleted, "the sibling survives"
+
+
+def test_the_reject_batch_is_capped(db):
+    with pytest.raises(ValueError):
+        LibraryRejectionBody(catalogue_ids=list(range(101)))
+    with pytest.raises(ValueError):
+        LibraryRejectionBody(catalogue_ids=[])

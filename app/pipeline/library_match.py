@@ -35,6 +35,7 @@ while this process holds a database transaction — least of all promote's write
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,6 +45,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.core.logging import get_logger
 from app.db import models as m
+from app.db.dal import find_type_id_by_norm_name as dal_find_type
 from app.pipeline import grounding
 from app.pipeline.llm import LLMClient
 
@@ -55,6 +57,10 @@ log = get_logger(__name__)
 
 #: Sanity bound on a name sent to the reranker; Threat_Catalogue.ThreatName is Unicode(500).
 _MAX_NAME = 500
+
+#: How many near-duplicate pairs an import report carries. Matches library_import's own
+#: RESULT_LIST_CAP convention: a job result is a summary a human reads, not a dataset.
+_REPORT_CAP = 50
 
 
 @dataclass(frozen=True)
@@ -137,3 +143,76 @@ def pick(probe_: ReuseProbe | None, llm: LLMClient) -> tuple[int, float] | None:
     log.info("library_match.reuse", catalogue_id=cid, score=round(best, 2),
             threshold=probe_.threshold, proposed=probe_.generic_name, matched=name)
     return cid, best
+
+
+def near_duplicates(sess: Session, llm: LLMClient, settings: Settings,
+                    incoming: Sequence[tuple[str, str]], *, limit: int = 300) -> dict[str, Any]:
+    """Which rows a bulk import would ADD that already resemble something in the library?
+
+    REPORTS, never merges — the deliberate difference from promote. Imported rows carry external
+    standard identifiers (AML.T0043.000, INP36, AC19), and collapsing two of those would corrupt
+    the mapping back to the source standard, which is worse than the duplicate it avoids. They are
+    also curator-vouched and born active, so the invisibility ratchet that justifies automatic
+    linking on the promote path does not apply here. A curator triggering an import — with
+    `dry_run` available — is exactly the human this report is for.
+
+    `incoming` is (type_name, threat_name) pairs. Scored per type, because the library's own
+    candidate pool is type-scoped; a name is only compared against the family it would join.
+    Matching the type by normalized name mirrors what the importer itself does, so a type the
+    import is about to MINT simply has no family and nothing to report.
+
+    Bounded, and says so: `limit` caps how many names are scored and `skipped_for_cap` reports
+    what was not, because a silent cap reads as "nothing found".
+    """
+    by_type: dict[str, list[str]] = {}
+    for type_name, threat_name in incoming:
+        if (threat_name or "").strip():
+            by_type.setdefault(type_name, []).append(threat_name[:_MAX_NAME])
+
+    threshold = grounding.resolve_thresholds(sess, llm, settings).value
+    queries: list[tuple[str, Sequence[str]]] = []
+    context: list[tuple[str, list[tuple[int, str]]]] = []
+    scored = 0
+    skipped = 0
+    for type_name, names in by_type.items():
+        type_id = dal_find_type(sess, type_name)
+        if type_id is None:
+            continue  # the import is about to mint this type: no family, nothing to compare
+        rows = sess.execute(
+            select(m.Threat_Catalogue.ThreatCatalogueID, m.Threat_Catalogue.ThreatName)
+            .where(m.Threat_Catalogue.ThreatTypeID == type_id,
+                m.Threat_Catalogue.IsDeleted == False)
+            .order_by(m.Threat_Catalogue.ThreatCatalogueID)).all()
+        family = [(r[0], str(r[1] or "")[:_MAX_NAME]) for r in rows if (r[1] or "").strip()]
+        if not family:
+            continue
+        for name in names:
+            if scored >= limit:
+                skipped += 1
+                continue
+            scored += 1
+            queries.append((name, [n for _, n in family]))
+            context.append((name, family))
+
+    pairs: list[dict[str, Any]] = []
+    if queries:
+        try:
+            batched = llm.rerank_many(queries)
+        except Exception:
+            log.exception("library_match.import_scan_failed", queries=len(queries))
+            return {"scored": 0, "skipped_for_cap": skipped, "pairs": [],
+                    "error": "similarity scan unavailable — the import itself was unaffected"}
+        for (name, family), scores in zip(context, batched, strict=True):
+            if not scores or len(scores) != len(family):
+                continue  # rerank_many reports a per-item failure as None; skip, never guess
+            best_i = max(range(len(scores)), key=lambda i: scores[i])
+            if scores[best_i] < threshold:
+                continue
+            cid, existing = family[best_i]
+            pairs.append({"incoming": name, "catalogue_id": cid, "existing": existing,
+                        "score": round(scores[best_i], 2)})
+
+    if pairs:
+        log.warning("library_match.import_near_duplicates", count=len(pairs), scored=scored,
+                    threshold=threshold)
+    return {"scored": scored, "skipped_for_cap": skipped, "pairs": pairs[:_REPORT_CAP]}

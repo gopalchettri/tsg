@@ -473,6 +473,19 @@ class LibraryApprovalStatus(StrEnum):
     not_found = "not_found"                # no such id, or soft-deleted
 
 
+class LibraryRejectionStatus(StrEnum):
+    """Outcome for ONE id in POST .../library/threats/reject — the other half of approval.
+
+    `is_approved` is a REFUSAL, not a failure. A row that is already active is curated library
+    data that live sessions may be matching against; discarding it is a different and much larger
+    act than discarding a draft nobody has seen, and it is not what a reject-the-pending-queue
+    call is asking for. Deactivating a published entry needs its own deliberate route."""
+    rejected = "rejected"                  # was pending, now soft-deleted — the only status that writes
+    already_rejected = "already_rejected"  # nothing to do; not an error, and not counted
+    is_approved = "is_approved"            # refused: active rows are not discarded through here
+    not_found = "not_found"                # no such id
+
+
 class TreatmentStageStatus(StrEnum):
     """How far ONE stage of remediation planning has got for a session, DERIVED — never stored.
 

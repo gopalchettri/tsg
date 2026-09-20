@@ -110,6 +110,7 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     # every session re-invents it. See the guard in scripts/test_pipeline_guards.py.
     ("GET", "/v1/tsg/threat-intel/library/pending"): require_admin,
     ("POST", "/v1/tsg/threat-intel/library/threats/approve"): require_admin,
+    ("POST", "/v1/tsg/threat-intel/library/threats/reject"): require_admin,
     # ATT&CK/CAPEC technique reference corpus (app/api/threat_intel.py) — admin-key gated,
     # cross-tenant reference data shared by every entity's scenario prompts.
     ("POST", "/v1/tsg/threat-intel/techniques/rebuild"): require_admin,
