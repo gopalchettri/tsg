@@ -242,3 +242,46 @@ def test_the_review_gate_still_refuses_a_session_not_at_a_barrier(monkeypatch):
         _accept(Session, sid, [oid], monkeypatch)
     assert exc_info.value.reason == "generation_in_progress"
     assert _row(Session, oid)["Accepted"] == 0
+
+
+def test_the_reject_ROUTE_actually_rejects(monkeypatch):
+    """Through post_reject_scenarios, not through reject_scenarios.
+
+    Every other test in this file calls reject_scenarios directly, which left the ROUTE's one
+    load-bearing line — app/api/sessions.py:1272 — covered by nothing. Change it to `matched = 0`
+    and the endpoint answers 200 with a rejected_count while deciding nothing, and all 1090 tests
+    still pass. scripts/test_pipeline_guards.py proves by AST that only dal.decide_scenarios may
+    write a decision; this proves the route still reaches it.
+
+    Same shape as the promote and un-accept route tests, and as the 2026-08 deletion that left
+    promote-to-library with no approval path for a year: a helper covered six ways, and nothing
+    covering the line that calls it.
+    """
+    from contextlib import contextmanager
+
+    from app.api import sessions as sessions_api
+    from app.api.deps import Principal
+    from app.api.schemas import RejectBody
+
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    a = _scenario(Session, sid, identity="ident-a", number=1, superseded=0, title="A")
+    b = _scenario(Session, sid, identity="ident-b", number=2, superseded=0, title="B")
+
+    @contextmanager
+    def _session():
+        with Session() as s:
+            yield s
+
+    monkeypatch.setattr(sessions_api, "db_session", _session)
+    monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
+    principal = Principal(claims={"sub": CREATOR}, entities={"86"},
+                        client_id="c", tenant_id="t")
+
+    resp = sessions_api.post_reject_scenarios(sid, RejectBody(scenario_ids=[a]), principal)
+
+    assert resp.rejected_count == 1
+    assert _row(Session, a).RejectedAt is not None, (
+        "the route must reach the pipeline — a 200 with the row undecided is the bug this pins")
+    assert _row(Session, a).RejectedBy == CREATOR
+    assert _row(Session, b).RejectedAt is None, "only the named scenario was decided"

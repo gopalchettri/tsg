@@ -726,12 +726,64 @@ def check_the_duplicate_guards_are_still_wired_in() -> None:
         + ", ".join(f"{n}<-{len(h)}" for n, h in sorted(seen.items())) + ")")
 
 
+#: Write routes deliberately left unexercised. Empty, and meant to stay that way — an entry here
+#: is a decision somebody wrote down, not an omission nobody noticed.
+_UNEXERCISED_BY_DESIGN: dict[tuple[str, str], str] = {}
+
+
+def check_every_write_route_is_entered_by_a_test() -> None:
+    """No POST/PUT/PATCH/DELETE route may be one that no test ever executes.
+
+    This is the generalisation of three separate incidents. Tests here call pipeline functions
+    directly — fast, convenient — so route BODIES go unexecuted, and the line where a route calls
+    the pipeline is covered by nothing:
+
+      * 2026-08 — the admin CRUD routes were deleted, taking update_library_row's only caller.
+        promote-to-library kept answering 200 while every promoted threat became unreachable, for
+        a year.
+      * 2026-09 — neutering one line in each of three routes (promote's matcher call, un-accept's
+        pipeline call, the Celery busy handler) left all 1090 tests green.
+      * the audit that followed found TEN write routes no test entered at all, including
+        POST /v1/sessions/{id}/scenarios/reject — a decision that goes on the record, where a
+        sibling guard in this very file proves only dal.decide_scenarios may write it, and nothing
+        proved the route still called that.
+
+    Detection is scripts/audit_route_wiring.py; see its docstring for why BOTH a direct call and
+    an HTTP request count, and for the two false-positive modes it had to be hardened against.
+
+    THE LIMIT, stated because a guard that overstates itself is worse than none: this proves a
+    test ENTERS the route, not that it asserts anything once inside. An authz test expecting a
+    403 dies three lines above the pipeline call and still counts. Pairing it with tests that
+    assert the observable outcome — tests/test_route_wiring.py, and the route tests in
+    test_scenario_reject / test_library_match / test_accept_replace_version — is what closes that.
+    Neither half is sufficient alone.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import audit_route_wiring
+
+    buckets = audit_route_wiring.audit()
+    unreached = [(m, p, n) for m, p, n in buckets["unreached"]
+                if m in audit_route_wiring.WRITE_METHODS
+                and (m, p) not in _UNEXERCISED_BY_DESIGN]
+    assert not unreached, (
+        "write route(s) that no test enters:\n  "
+        + "\n  ".join(f"{m:6} {p}  ({n})" for m, p, n in sorted(unreached, key=lambda r: r[1]))
+        + "\nBreak the line where one of them calls the pipeline and the suite stays green — that "
+        "is the defect this guard exists for. Satisfy it EITHER by calling the handler by name "
+        "in a test that imports it from its app.api module, OR by driving it with "
+        "client.post('/v1/...'). If a route is genuinely not worth a test, say so in "
+        "_UNEXERCISED_BY_DESIGN with a reason.")
+    print(f"routes: every write route is entered by a test "
+        f"({len(buckets['direct'])} direct, {len(buckets['http'])} over HTTP)")
+
+
 def demo() -> None:
     check_only_one_function_writes_a_scenario_decision()
     check_every_decision_route_passes_the_review_gate()
     check_promoted_library_rows_can_still_be_approved()
     check_every_catalogue_mint_is_preceded_by_a_dedup_lookup()
     check_the_duplicate_guards_are_still_wired_in()
+    check_every_write_route_is_entered_by_a_test()
     check_scenario_receipts_carry_their_scenario_id()
     check_usable_proposal()
     check_semantic_duplicates_same_category()
