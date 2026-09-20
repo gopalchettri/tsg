@@ -60,6 +60,19 @@ def _plan(Session, sid: str, oid: str, *, review_status: str | None = "approved"
     return plan_id
 
 
+def _plan_history(Session, sid: str, oid: str) -> str:
+    """A retired version of the same scenario's plan — what ?include_superseded returns."""
+    plan_id = str(uuid.uuid4())
+    with Session() as s:
+        s.execute(m.Risk_Treatment_Plan.__table__.insert().values(
+            PlanID=plan_id, SessionID=sid, ScenarioID=oid, TenantID="t", EntityID="86",
+            Status=str(StageStatus.COMPLETE), TreatmentStrategy="Mitigate",
+            ReviewStatus="rejected", RiskLevel="Critical", Superseded=1,
+            CreatedAt=_now(), UpdatedAt=_now()))
+        s.commit()
+    return plan_id
+
+
 def _register_plan_ids(Session) -> list[str]:
     with Session() as s:
         return [str(r["PlanID"]) for r in dal.entity_plan_rows(
@@ -362,6 +375,67 @@ def test_the_accept_response_names_what_it_replaced(monkeypatch):
     assert [(r.scenario_id, r.replaced_scenario_id) for r in swapped.replaced] == [(d, b)]
 
 
+def _results(Session, monkeypatch, sid: str):
+    """GET /results through the real route, so the card fields are the ones a client receives."""
+    from contextlib import contextmanager
+
+    import app.api.sessions as sessions_mod
+    from app.api.deps import Principal
+
+    @contextmanager
+    def fake_db_session():
+        with Session() as s:
+            yield s
+
+    with Session() as s:
+        session_row = dict(dal.load_session(s, sid))
+    monkeypatch.setattr(sessions_mod, "db_session", fake_db_session)
+    monkeypatch.setattr(sessions_mod, "get_authorized_session", lambda *a, **k: session_row)
+    monkeypatch.setattr(sessions_mod, "build_board", lambda *a, **k: {
+        "progress": {"threats": "COMPLETE", "scenarios": "COMPLETE",
+                    "overall": "awaiting_review", "error_message": {}}})
+    principal = Principal(claims={"sub": "u1"}, entities={"86"}, client_id="c", tenant_id="t")
+    return {c.scenario_id: c for c in
+            sessions_mod.get_results(sid, include_replaced=False, principal=principal).scenarios}
+
+
+def test_the_card_says_which_accepted_version_it_would_replace(monkeypatch):
+    """What a UI needs BEFORE the click. Until now the only way to learn that a scenario already
+    had an accepted version was to attempt the accept and read the 409 — so the screen either
+    guessed or surprised the reviewer."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    other = _scenario(Session, sid, identity=HASH_03, superseded=0, title="an unrelated scenario")
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+
+    cards = _results(Session, monkeypatch, sid)
+
+    assert cards[d].replaces_accepted_version == b, (
+        "the rewrite names the accepted version it would displace")
+    assert cards[b].replaces_accepted_version is None, (
+        "the accepted version replaces nothing — re-accepting it is idempotent")
+    assert cards[other].replaces_accepted_version is None, "an ordinary card says nothing"
+    # And it names an id that is on this same list, so the UI can mark both sides.
+    assert b in cards
+
+
+def test_the_card_stops_warning_once_the_replacement_has_happened(monkeypatch):
+    """After the switch the new version IS the accepted one, so there is nothing left to warn
+    about — a stale warning would offer a confirmation for an ordinary accept."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+    assert _accept(Session, sid, [d], monkeypatch, replace=True) == 1
+
+    cards = _results(Session, monkeypatch, sid)
+
+    assert cards[d].accepted is True
+    assert cards[d].replaces_accepted_version is None
+    assert b not in cards, "the replaced version is undecided history now, not a live card"
+
+
 def _review(Session, monkeypatch, sid: str, scenario_id: str, plan_id: str):
     """Drive the real review route against these tables — no stubbed plan row.
 
@@ -406,6 +480,44 @@ def test_review_is_refused_for_a_replaced_version(monkeypatch):
     assert exc_info.value.reason == TreatmentGateReason.scenario_not_accepted
     with Session() as s:
         assert dal.active_plan_row(s, sid, b)["ReviewStatus"] is None, "no verdict was recorded"
+
+
+def test_the_plan_screen_says_its_scenario_was_replaced(monkeypatch):
+    """The other half of the same warning. Someone opening the plan of a replaced version — from
+    a bookmark, or the audit trail — saw an approved plan with nothing saying it is no longer the
+    answer for this risk. The flag is the same for the active row and its history, because they
+    are all one scenario."""
+    from contextlib import contextmanager
+
+    import app.api.treatment as treatment_api
+    from app.api.deps import Principal
+
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+    _plan(Session, sid, b)
+    _plan_history(Session, sid, b)
+
+    @contextmanager
+    def real_session():
+        with Session() as s:
+            yield s
+
+    monkeypatch.setattr(treatment_api, "db_session", real_session)
+    monkeypatch.setattr(treatment_api, "get_authorized_session",
+                        lambda *a, **k: {"SessionID": sid, "TenantID": "t", "EntityID": "86"})
+    principal = Principal(claims={"sub": "u1"}, entities={"86"}, client_id="c", tenant_id="t")
+
+    before = treatment_api.get_treatment_plan(sid, b, include_superseded=True, principal=principal)
+    assert before.scenario_replaced is False, "while it is the accepted version, nothing to say"
+
+    assert _accept(Session, sid, [d], monkeypatch, replace=True) == 1
+    after = treatment_api.get_treatment_plan(sid, b, include_superseded=True, principal=principal)
+
+    assert after.scenario_replaced is True
+    assert [v.scenario_replaced for v in after.superseded] == [True], (
+        "one scenario, one answer — the history cannot disagree with its own parent")
 
 
 def test_review_still_works_when_the_scenario_row_is_missing(monkeypatch):

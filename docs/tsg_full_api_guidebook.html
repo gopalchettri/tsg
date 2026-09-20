@@ -355,6 +355,7 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
       &quot;moderation_categories&quot;: [],
       &quot;moderation_checked&quot;: false,
       &quot;replaced_scenarios&quot;: [],
+      &quot;replaces_accepted_version&quot;: null,
       &quot;scenario&quot;: {
         &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
         &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
@@ -727,7 +728,7 @@ SELECT ScenarioID, ScenarioNumber, GenerationEpoch FROM Threat_Scenario WHERE Se
     <span class="method m-post">POST</span>
     <span class="path">/v1/sessions/{session_id}/regenerate/scenarios</span>
   </div>
-  <p class="purpose">Rebuilds the narrative of one or more EXISTING scenarios in place — siblings untouched, the old version is superseded and nested under the new one. Returns immediately; the rewrite runs asynchronously. A rewrite never inherits an accept: regenerating an accepted scenario leaves that decision (and its remediation plan) on the old version until someone accepts the rewrite with replace_accepted or rejects it.</p>
+  <p class="purpose">Rebuilds the narrative of one or more EXISTING scenarios in place — siblings untouched, the old version is superseded and nested under the new one. Returns immediately; the rewrite runs asynchronously. A rewrite never inherits an accept: regenerating an accepted scenario leaves that decision (and its remediation plan) on the old version until someone accepts the rewrite with replace_accepted or rejects it. GET /results says so on the card itself — the rewrite carries replaces_accepted_version naming the version it would displace, so a UI can ask before the click instead of learning it from the 409.</p>
   <p class="auth"><span class="lbl">Auth</span> X-API-Key, X-User-Id, X-Entity-Id, X-Tenant-Id — all required, via Depends(get_principal); same entity-scoped review-gated access as POST .../accept.</p>
   <div class="blk">
     <h3>Request</h3>
@@ -912,6 +913,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   ],
   &quot;created_at&quot;: &quot;2026-07-20T14:32:11.123Z&quot;,
   &quot;entity_id&quot;: &quot;ENT-001&quot;,
+  &quot;replaces_accepted_version&quot;: null,
   &quot;scenario&quot;: {
     &quot;risk_statement&quot;: &quot;The RTU provides the Substation Control critical service; corrupted firmware could cause a sustained outage.&quot;,
     &quot;scenario_statement&quot;: &quot;An attacker with OT network access pushes unsigned firmware to the RTU, compromising the integrity of its control logic.&quot;,
@@ -1325,6 +1327,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     ]
   },
   &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
+  &quot;scenario_replaced&quot;: false,
   &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;,
   &quot;status&quot;: &quot;COMPLETE&quot;,
   &quot;treatment_strategy&quot;: &quot;Mitigate&quot;,
@@ -1607,6 +1610,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
           },
           &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
           &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+          &quot;scenario_replaced&quot;: false,
           &quot;status&quot;: &quot;&lt;status&gt;&quot;,
           &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
           &quot;scenario&quot;: {
@@ -1703,6 +1707,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
           },
           &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
           &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+          &quot;scenario_replaced&quot;: false,
           &quot;status&quot;: &quot;&lt;status&gt;&quot;,
           &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
           &quot;scenario&quot;: {

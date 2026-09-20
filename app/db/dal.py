@@ -1251,6 +1251,9 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
         )
     ).all()
     active_hashes = {r[0] for r in served}
+    # Deliberately blind to Scoped_Threat.Superseded: the question is whether the THREAT has a
+    # live scenario on screen, and it does — a regeneration retires the scoping row under a
+    # scenario it keeps. Filtering on it would call such a threat unserved and serve it twice.
     served_threat_ids = {str(r[1]) for r in served if r[1] is not None}
     it, st = m.Identified_Threat, m.Scoped_Threat
     rows = sess.execute(

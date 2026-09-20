@@ -319,6 +319,15 @@ class TreatmentPlanStatus(ApiModel):
                     "superseded-version row, which is history and has no live lifecycle.")
     session_id: str = Field(description="Owning session.")
     scenario_id: str = Field(description="The accepted scenario this plan treats.")
+    scenario_replaced: bool = Field(
+        default=False,
+        description=(
+            "True when the scenario this plan treats is NO LONGER the accepted version — someone "
+            "adopted a regeneration of it (accept with `replace_accepted`). The plan is kept and "
+            "still readable here, but it has left the plan board and the remediation register, "
+            "and it can no longer be approved (409 `scenario_not_accepted`). Show it as historic: "
+            "the risk's current answer is whatever the accepted version has.\n\n"
+            "Always false on the board and the entity register, which list accepted versions only."))
     status: str = Field(description="RUNNING | COMPLETE | ERROR — the poll signal (stale RUNNING projects as ERROR).")
     treatment_strategy: str = Field(description="The strategy this plan was generated for — server-stamped 'Mitigate'.")
     scenario: ScenarioNarrative | None = Field(

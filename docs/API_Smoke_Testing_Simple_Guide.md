@@ -665,6 +665,7 @@ curl -s "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963f66afa6/
         ]}
      ],
      "accepted": false,
+     "replaces_accepted_version": null,
      "accepted_by": null,
      "accepted_at": null,
      "rejected_by": null,
@@ -1105,8 +1106,10 @@ curl -s -X POST "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963
 | `subset` | `{"mode": "subset", "scenario_ids": ["..."]}` | accept only the ids you list |
 
 **Changing your mind after a regeneration.** Only one version of a scenario can be
-accepted. If you accepted a scenario, regenerated it, and now want the rewrite instead,
-name the rewrite and add `replace_accepted`:
+accepted. You can see this coming in Test 3 before you click: the rewrite's card carries
+`replaces_accepted_version` naming the version it would displace (null on every ordinary
+card, and on the accepted version itself). If you accepted a scenario, regenerated it, and
+now want the rewrite instead, name the rewrite and add `replace_accepted`:
 
 ```bash
   -d '{"mode": "subset", "scenario_ids": ["<the rewrite>"], "replace_accepted": true}'
@@ -1833,6 +1836,7 @@ curl -s "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e/
   "progress": {"generation": "COMPLETE", "review": "PENDING", "overall": "awaiting_review"},
   "session_id": "5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e",
   "scenario_id": "1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90",
+  "scenario_replaced": false,
   "status": "COMPLETE",
   "treatment_strategy": "Mitigate",
   "scenario": {

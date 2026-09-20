@@ -969,6 +969,17 @@ class ScenarioResult(ApiModel):
         ),
     )
     accepted: bool = Field(description="Whether a human reviewer has accepted this scenario.")
+    replaces_accepted_version: str | None = Field(
+        default=None,
+        description=(
+            "The scenario id accepting THIS version would replace — another version of the same "
+            "scenario that is already accepted. Null on an ordinary card, including on the "
+            "accepted version itself (re-accepting it replaces nothing).\n\n"
+            "Non-null means a plain accept is refused (409 `duplicate_identity`): send "
+            "`replace_accepted: true` to adopt this version, or reject it to keep the current "
+            "one. Reading it here is how a UI can ask 'replace the accepted version?' BEFORE the "
+            "click instead of discovering it from the refusal — and, since it names the other id, "
+            "it also says which card on this same list is the one being replaced."))
     # WHO decided, beside the flag that says a decision happened. `Accepted: true` with no
     # accepted_by used to be the only thing this endpoint could say. Named snake_case because
     # that is the convention the whole response surface is moving to — new fields land in the

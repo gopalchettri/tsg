@@ -530,6 +530,10 @@ def _scenario_select():
         out.ScenarioID, out.ScenarioJSON, out.Accepted, out.ValidationJSON, out.GenerationEpoch,
         out.ScenarioNumber, out.ReplacesScenarioID, out.ControlsMappedAt, out.ControlMapAttempts,
         out.ScenarioSource,
+        # IdentityHash: which VERSIONS are the same scenario. Rides this select so /results can
+        # tell a card that accepting it would replace an already-accepted sibling
+        # (replaces_accepted_version) without a second query — the rows are all here already.
+        out.IdentityHash,
         # Per-scenario generation span. gen_seconds is derived from these on the way out
         # (dal.span_seconds) rather than stored, so there is only ever one version of the fact.
         out.GenStartedAt, out.GenFinishedAt,
@@ -697,6 +701,14 @@ def get_results(
         actor_ids = _actor_ids_from_blobs(
             sess, [r.get("ThreatActorsJSON") for rows_ in (scenarios, replaced) for r in rows_])
         by_id = {r["ScenarioID"]: r for r in replaced}
+        # Which version of each scenario currently holds the decision — computed from the rows
+        # ALREADY fetched, never a second query: the default view deliberately carries the
+        # accepted row even when a regeneration superseded it, so the sibling is present here
+        # whenever one exists. Keyed exactly as UX_Scenario_ActiveAccepted is, so "the same
+        # scenario" means the same thing on this screen as in the write that would refuse.
+        accepted_by_identity = {(s["IdentityHash"], s["ScenarioNumber"]): s["ScenarioID"]
+                                for s in scenarios
+                                if s["Accepted"] and s["IdentityHash"] is not None}
 
         def _nested(chain: list[str]) -> list[ScenarioResult]:
             """The card's own history, oldest-to-newest order preserved from the chain. Built
@@ -720,7 +732,9 @@ def get_results(
             scenarios=[_scenario_result(s, controls.by_output.get(s["ScenarioID"]),
                                         _nested(chains.get(s["ScenarioID"]) or []),
                                         actor_ids=actor_ids,
-                                        unavailable=controls.unavailable)
+                                        unavailable=controls.unavailable,
+                                        replaces_accepted=_replaces_accepted(
+                                            s, accepted_by_identity))
                     for s in scenarios],
         )
 
@@ -973,10 +987,25 @@ def _scenario_narrative(scenario_json: str | None,
     return scenario
 
 
+def _replaces_accepted(row: dict, accepted_by_identity: dict[tuple, str]) -> str | None:
+    """The already-accepted version this card would replace, or None.
+
+    None on the accepted card itself: re-accepting a version replaces nothing, and saying
+    otherwise would make a UI offer a confirmation for an idempotent call. A legacy row with no
+    IdentityHash also answers None — accept's own pre-flight skips those for the same reason (the
+    filtered index exempts them), so a warning here would describe a refusal that never comes."""
+    identity = row.get("IdentityHash")
+    if identity is None:
+        return None
+    prior = accepted_by_identity.get((identity, row["ScenarioNumber"]))
+    return prior if prior is not None and prior != row["ScenarioID"] else None
+
+
 def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                     replaced: list[ScenarioResult] | None = None,
                     actor_ids: dict[str, int] | None = None,
-                    *, unavailable: bool = False) -> ScenarioResult:
+                    *, unavailable: bool = False,
+                    replaces_accepted: str | None = None) -> ScenarioResult:
     controls_mapped = row["ControlsMappedAt"] is not None
     # .get(): not every select feeding this builder carries ControlMapAttempts yet — absent
     # reads as 0 attempts, i.e. never exhausted, same "missing column = safe default" contract
@@ -994,6 +1023,11 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                         actors=_actor_block(row, actor_ids),
                         controls=controls or [],
                         accepted=bool(row["Accepted"]),
+                        # Passed in, not derived here: it is a fact about this card's SIBLINGS,
+                        # and only the caller holding the whole list can see them. The two other
+                        # readers of this builder (/accepted-scenarios, the single-scenario
+                        # fetch) return one card with no siblings in hand, so they leave it null.
+                        replaces_accepted_version=replaces_accepted,
                         # .get(): this builder is fed by more than one select, and a row that did
                         # not carry the column must publish null rather than KeyError a whole view.
                         accepted_by=row.get("AcceptedBy"), accepted_at=row.get("AcceptedAt"),

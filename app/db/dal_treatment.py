@@ -333,6 +333,12 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
             # again, but it must not sit beside the new version's plan as a second answer for one
             # risk. `ScenarioID IS NULL` keeps the outer join's purpose: a plan whose scenario
             # linkage is broken stays visible rather than being silently dropped.
+            #
+            # `accepted()`, not `Accepted == 1`: it adds `IdentityHash IS NOT NULL` so MSSQL can
+            # match the filtered UX_Scenario_ActiveAccepted index — a bare equality makes every
+            # call site ineligible and scans this polled page. The conjunct excludes only
+            # pre-IdentityHash rows, which both row builders make impossible to write today and
+            # which session_plan_board has always treated the same way.
             or_(out.ScenarioID.is_(None), accepted(out.Accepted))))
     if status == str(StageStatus.ERROR):
         stmt = stmt.where(or_(p.Status == StageStatus.ERROR,

@@ -136,7 +136,8 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
                           actor_ids: dict[str, int] | None = None,
                           controls: _Controls | None = None,
                           superseded_row: bool = False,
-                        superseded: list[TreatmentPlanStatus] | None = None) -> TreatmentPlanStatus:
+                        superseded: list[TreatmentPlanStatus] | None = None,
+                        scenario_replaced: bool = False) -> TreatmentPlanStatus:
     """One plan row -> the wire model. Shared by the single-plan GET, the Excel export, the
     versions history (?include_superseded) and the detailed register (?include_plan), so no
     two views can ever disagree — the guarantee the export used to buy by re-entering the GET
@@ -175,6 +176,11 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
     return TreatmentPlanStatus(
         plan_id=row["PlanID"], session_id=row["SessionID"], scenario_id=row["ScenarioID"],
         status=status, treatment_strategy=row["TreatmentStrategy"],
+        # A PARAMETER, not a column read: only the single-plan GET knows this (its select is the
+        # one that carries the scenario's Accepted flag), and the board and register cannot be
+        # anything but false — they list accepted versions only. Passing it keeps this presenter
+        # reading exactly the columns plan_presenter_columns() promises.
+        scenario_replaced=scenario_replaced,
         # THE SAME fold the board uses, over a list of one — so the per-scenario screen and the
         # board cannot report different lifecycle states for the same plan. `superseded` is the
         # one exception: a retired version is history, not a live lifecycle, and the caller

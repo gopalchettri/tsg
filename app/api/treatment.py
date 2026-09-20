@@ -458,6 +458,11 @@ def get_treatment_plan(session_id: str, scenario_id: str,
         # presenter keys the lookup by the ROW's ScenarioID, not this URL parameter (which nothing
         # canonicalises: an upper-case id used to render every block except an empty `controls`).
         controls = _controls_by_output(sess, [scenario_id])
+        # Every version in this response belongs to ONE scenario, so the answer is the same for
+        # the active row and its history — a payload that said "replaced" at the top and "not
+        # replaced" three entries down would be its own bug. `== 0`, not `!= 1`: a broken
+        # linkage nulls this column and is not a replacement, matching the review gate.
+        replaced = row["Accepted"] == 0
         older = None
         if include_superseded:
             # History rows carry no scenario/threat join — the scenario is version-independent,
@@ -471,10 +476,11 @@ def get_treatment_plan(session_id: str, scenario_id: str,
             # between them would supersede the row just read as current, making it show up in
             # BOTH places on one response. Dropping it here keeps the reply self-consistent.
             older = [_plan_status_from_row({**echo, **r}, stale_cutoff, actor_ids, controls,
-                                           superseded_row=True)
+                                           superseded_row=True, scenario_replaced=replaced)
                     for r in dal.superseded_plan_rows(sess, session_id, scenario_id)
                     if r["PlanID"] != row["PlanID"]]
-        return _plan_status_from_row(row, stale_cutoff, actor_ids, controls, superseded=older)
+        return _plan_status_from_row(row, stale_cutoff, actor_ids, controls, superseded=older,
+                                    scenario_replaced=replaced)
 
 
 _CANCELLED_MESSAGE = "cancelled by user"
