@@ -2994,8 +2994,8 @@ calling this twice on the same scenario — that's a `200`, not an error.)
 | Table | Read/Write | What happens |
 |---|---|---|
 | `Threat_Scenario` ⟕ `Scoped_Threat` ⟕ `Identified_Threat` | Read | loads the accepted scenario and the threat it was generated from — the promotion gate (`Status=complete`, `Accepted=1`, not superseded) |
-| `Threat_Type` | Read/Write | resolves the threat's type, inserting one only if nothing matches by name. An inserted row is minted `IsActive=0` (pending curation) |
-| `Threat_Catalogue`, `Threat_Catalogue_Category_Map` | Read/Write | resolves the threat itself and its category link, same insert-if-new rule |
+| `Threat_Type` | Read/Write | resolves the threat's type, inserting one only if nothing matches **by name** — types are deliberately NOT matched by meaning, because measurement showed two- or three-word type names cannot separate a synonym from an opposite. An inserted row is minted `IsActive=0` (pending curation, see Test 9c) |
+| `Threat_Catalogue`, `Threat_Catalogue_Category_Map` | Read/Write | resolves the threat itself and its category link. Two rungs: exact name, then **meaning** — a threat already filed under this type under different words is reused, not duplicated, and the audit entry records which row it matched and how confidently |
 | `Threat_Actor` | Read | the threat's already-stored actors. **Never written** — the AI never invents an adversary |
 | `ThreatType_ThreatActor_Map` | Read/Write | links those actors to the type |
 | `Identified_Threat` | Write | stamps the resolved `ThreatTypeID`/`ThreatCatalogueID` back onto the source threat row, fenced on `Superseded = 0` |

@@ -342,7 +342,7 @@ def test_supersede_mid_flight_rolls_back_the_minted_row(sf, monkeypatch):
     real = promote._read_controls
 
     def _supersede_then_read(sess, scenario_id):
-        # Simulate the regeneration landing after _load_scenario_and_threat's read.
+        # Simulate the regeneration landing after load_scenario_and_threat's read.
         sess.execute(update(m.Identified_Threat)
                      .where(m.Identified_Threat.ThreatID == tid).values(Superseded=1))
         return real(sess, scenario_id)

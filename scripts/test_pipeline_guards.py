@@ -630,10 +630,59 @@ def check_promoted_library_rows_can_still_be_approved() -> None:
     print(f"library: promoted rows can still be approved ({', '.join(callers)})")
 
 
+def check_every_catalogue_mint_is_preceded_by_a_dedup_lookup() -> None:
+    """A function that mints a Threat_Catalogue row must dedup in the SAME function.
+
+    The library filled with twins because minting and dedup were separated by an assumption:
+    promote's docstring claimed an absent catalogue id "means generation already searched and
+    found nothing", when it actually meant grounding scored its best match below the trust cutoff
+    and discarded it. A new mint site written under that same assumption is one import away.
+
+    CATALOGUE ONLY, deliberately. The same rule for Threat_TYPE would be a guard demanding
+    something we measured and rejected: type names are two or three words, and
+    scripts/measure_library_name_similarity.py shows they cannot separate synonyms from opposites
+    ("Obtain Capabilities" vs "Develop Capabilities" reranks 99.8, a real type duplicate 20.9).
+    A novel type still mints on purpose; guarding it would force a fix that merges opposites.
+    """
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    dedup = {"find_catalogue_id_by_norm_name", "normalize_name"}
+    offenders: list[str] = []
+    for path in sorted(app_dir.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in [n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]:
+            called = {c.func.attr for c in ast.walk(fn)
+                    if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)}
+            called |= {c.func.id for c in ast.walk(fn)
+                    if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            if "upsert_threat_catalogue" in called and not (called & dedup):
+                offenders.append(f"{path.relative_to(app_dir.parent)}: {fn.name}()")
+    assert not offenders, (
+        "a Threat_Catalogue row is minted without a dedup lookup in the same function:\n  "
+        + "\n  ".join(offenders)
+        + "\nAn absent catalogue id does NOT mean the library lacks this threat — it means "
+        "grounding scored its best match below the cutoff and threw the row away. Mint only "
+        "after asking.")
+
+    # The exact-name rung alone is what let three wordings of one threat through, so the
+    # same-meaning rung must still be reachable. Checked by source rather than by behaviour: a
+    # promote test seeds its own reuse value and would keep passing if the parameter stopped
+    # being consulted.
+    from app.pipeline import promote
+    body = inspect.getsource(promote._promote_threat)
+    assert "reuse" in body and "catalogue_active" in body, (
+        "promote._promote_threat no longer consults the caller-resolved same-meaning match, or "
+        "no longer validates its liveness — the exact-name rung on its own is what minted "
+        "'Impersonation of operator sessions' beside 'Impersonation of authorized control "
+        "sessions'")
+    print("library: every catalogue mint dedups first (threats only — types measured unsafe)")
+
+
 def demo() -> None:
     check_only_one_function_writes_a_scenario_decision()
     check_every_decision_route_passes_the_review_gate()
     check_promoted_library_rows_can_still_be_approved()
+    check_every_catalogue_mint_is_preceded_by_a_dedup_lookup()
     check_scenario_receipts_carry_their_scenario_id()
     check_usable_proposal()
     check_semantic_duplicates_same_category()

@@ -4,12 +4,20 @@ The ONLY write path into the library (accept-time auto-promotion was removed 202
 holding session_id + scenario_id may call it, the scenario must be ACCEPTED, and every promotion
 is recorded in Scenario_Audit — who, when, and the per-item outcome.
 
-This module is a **pure writer**. It performs no matching, no nearest-match search and no
-discovery: every "is this the same as something we already have?" question was answered during
-generation (grounding.find_threat_in_library for the type/threat/category, the type-actor map
-for the actors), and every answer was persisted as an id on Identified_Threat. Here an id that
-is present is used; an id that is absent means generation already searched and found nothing,
-so the row is genuinely new.
+This module still performs no search of its own: every "is this the same as something we already
+have?" question is answered elsewhere and arrives here as an id. An id present on
+Identified_Threat is used; a `reuse` id decided by app/pipeline/library_match (before this
+transaction opened, so a possibly-remote reranker never sits on the write path) is validated and
+used; only when both are absent is a row minted.
+
+It used to say an absent id "means generation already searched and found nothing, so the row is
+genuinely new". That was FALSE, and it is the sentence that hid a year-long defect. An absent
+catalogue id means grounding scored its best match BELOW the trust cutoff and discarded the row
+(grounding.py:1445) — "found something at 70/100" and "found nothing" arrive here identically.
+Worse, a minted row is born pending while grounding filters IsActive==True, so the next session
+cannot see it and mints another wording: three phrasings of one threat reached the live library
+that way. Hence the second rung. Types are deliberately NOT matched this way — measured, their
+names are too short to separate synonyms from opposites (see library_match's module docstring).
 
 What a NEW threat writes, in one transaction:
     Threat_Type                    (if the type itself is new — name-only dedup)
@@ -56,7 +64,7 @@ class PromotionResult(NamedTuple):
     success: bool
 
 
-def _load_scenario_and_threat(sess: Session, session_id: str, scenario_id: str) -> tuple[Any, Any]:
+def load_scenario_and_threat(sess: Session, session_id: str, scenario_id: str) -> tuple[Any, Any]:
     """The accepted scenario and the Identified_Threat behind it, or raise.
 
     Both ids must name the SAME row — passing another session's scenario_id must 404, not silently
@@ -112,12 +120,38 @@ def _promote_type(sess: Session, threat: Any, category_id: int | None,
                     "category_id": category_id, "status": INSERTED if created else EXISTING}
 
 
+def _reuse_would_collide(sess: Session, threat: Any, catalogue_id: int) -> bool:
+    """Would linking this threat to `catalogue_id` give two live threats in one (session,
+    subsystem) the SAME catalogue id?
+
+    That is not cosmetic. dal.identity_hash folds `cat:{ThreatCatalogueID}` as its first rung
+    (pipeline_common._dedup_key), so two threats sharing a catalogue id fold to ONE IdentityHash —
+    and supersede_by_identity_hashes then treats their scenarios as versions of each other and
+    retires one, which can be a scenario a reviewer has already accepted.
+
+    Reachable today through the exact-name rung, but rare; reuse-by-meaning makes it common enough
+    to fence. Refusing here costs a duplicate row, which is visible and fixable — the collision is
+    neither.
+    """
+    return sess.execute(
+        select(m.Identified_Threat.ThreatID)
+        .where(m.Identified_Threat.SessionID == threat.SessionID,
+            m.Identified_Threat.SubsystemID == threat.SubsystemID,
+            m.Identified_Threat.ThreatID != threat.ThreatID,
+            m.Identified_Threat.ThreatCatalogueID == catalogue_id,
+            m.Identified_Threat.Superseded == 0)
+        .limit(1)).first() is not None
+
+
 def _promote_threat(sess: Session, threat: Any, type_id: int, category_id: int | None,
-                    asset_name: str | None,
-                    user_id: str | None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Reuse the identified catalogue row, or mint one. Never searches beyond the app-owned
-    normalized-name dedup (type-scoped; UX_ThreatCatalogue_NaturalKey(ThreatName) is the
-    concurrency backstop).
+                    asset_name: str | None, user_id: str | None,
+                    reuse: tuple[int, float] | None = None,
+                    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Reuse the identified catalogue row, or a caller-resolved near-match, or mint one.
+
+    Three rungs, cheapest first: the stored id, the app-owned normalized-name dedup (type-scoped;
+    UX_ThreatCatalogue_NaturalKey(ThreatName) is the concurrency backstop), then `reuse` — a
+    same-meaning match the CALLER resolved, which this function validates but never computes.
 
     Returns (threat entry, actor entries). The category map row and the type-actor links are
     written ONLY alongside a row minted HERE: an existing catalogue threat's curation belongs
@@ -156,6 +190,23 @@ def _promote_threat(sess: Session, threat: Any, type_id: int, category_id: int |
                 "type_id": type_id, "category_id": category_id,
                 "status": EXISTING},
                 _actor_entries(sess, threat, type_id, write=False))
+
+    # SECOND rung: the same threat under different WORDS. normalize_name above folds CHARACTERS
+    # (case, accents, punctuation), so "Impersonation of operator sessions" and "Impersonation of
+    # authorized control sessions" are two distinct keys and both mint. The caller resolved this
+    # one by MEANING, outside our transaction (app/pipeline/library_match.py); we only apply it,
+    # and only once the cheap exact rung has missed.
+    if reuse is not None:
+        reuse_id, reuse_score = reuse
+        if dal.catalogue_active(sess, reuse_id) and not _reuse_would_collide(sess, threat,
+                                                                            reuse_id):
+            log.info("promote.catalogue_reused_by_meaning", catalogue_id=reuse_id,
+                    score=round(reuse_score, 2), proposed=generic, type_id=type_id)
+            return ({"id": reuse_id, "name": generic,
+                    "type_id": type_id, "category_id": category_id,
+                    "status": EXISTING, "reused_catalogue_id": reuse_id,
+                    "reuse_score": round(reuse_score, 2)},
+                    _actor_entries(sess, threat, type_id, write=False))
 
     new_id, created = dal.upsert_threat_catalogue(
         sess, generic, type_id, created_by=user_id)
@@ -238,10 +289,16 @@ def _read_controls(sess: Session, scenario_id: str) -> list[dict[str, Any]]:
 
 
 def promote_scenario_to_library(sess: Session, scenario_session: dict, scenario_id: str,
-                                user_id: str | None) -> PromotionResult:
-    """Write one accepted scenario's threat data into the library. See module docstring."""
+                                user_id: str | None,
+                                reuse: tuple[int, float] | None = None) -> PromotionResult:
+    """Write one accepted scenario's threat data into the library. See module docstring.
+
+    `reuse` is an ALREADY-DECIDED (catalogue_id, score) from app/pipeline/library_match, resolved
+    by the caller before this transaction opened — this module does not search for it, which is
+    what keeps a possibly-remote reranker off the write path. It is still validated here
+    (liveness, same-session collision) before anything is linked to it."""
     session_id = scenario_session["SessionID"]
-    out, threat = _load_scenario_and_threat(sess, session_id, scenario_id)
+    out, threat = load_scenario_and_threat(sess, session_id, scenario_id)
 
     # Read straight off the row — generation resolved this. No find_category call here.
     category_id = threat.ThreatCategoryID
@@ -255,7 +312,7 @@ def promote_scenario_to_library(sess: Session, scenario_session: dict, scenario_
 
     controls = _read_controls(sess, out.ScenarioID)
     threat_entry, actor_entries = _promote_threat(
-        sess, threat, type_id, category_id, scenario_session.get("AssetName"), user_id)
+        sess, threat, type_id, category_id, scenario_session.get("AssetName"), user_id, reuse)
 
     # Stamp the ids back, FENCED on Superseded = 0: a regeneration landing between the read
     # above and this write must not have ids stamped onto a row it already replaced.
@@ -286,6 +343,13 @@ def promote_scenario_to_library(sess: Session, scenario_session: dict, scenario_
                             "category_id": category_id,
                             "statuses": {"threat_type": type_entry["status"],
                                             "threat": threat_entry["status"]},
+                            # Present ONLY when this promotion linked to an existing row by
+                            # MEANING rather than by name. An automatic merge that left no trace
+                            # would be unreviewable, and this is the durable one — the response
+                            # is gone the moment the caller stops reading it.
+                            **({"reused_catalogue_id": threat_entry["reused_catalogue_id"],
+                                "reuse_score": threat_entry["reuse_score"]}
+                                if "reused_catalogue_id" in threat_entry else {}),
                             "actor_ids": [a["id"] for a in actor_entries if a.get("id")],
                             "control_ids": [c["control_id"] for c in controls],
                             "source": "promote-to-library"}))

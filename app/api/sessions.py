@@ -76,7 +76,7 @@ from app.db import dal
 from app.db import models as m
 from app.db.dal import EntityForbidden, IdempotencyKeyConflict, RegenerateConflict, now
 from app.db.engine import db_session
-from app.pipeline import cascade, grounding, tasks
+from app.pipeline import cascade, grounding, library_match, tasks
 from app.pipeline.accept import (
     AcceptConflict,
     accept_session,
@@ -88,7 +88,8 @@ from app.pipeline.accept import (
 from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
 from app.pipeline.context import gather_asset_details
 from app.pipeline.grounding import stored_actors
-from app.pipeline.promote import promote_scenario_to_library
+from app.pipeline.llm import get_llm
+from app.pipeline.promote import load_scenario_and_threat, promote_scenario_to_library
 from app.pipeline.tasks import ASSET_UNIT_ID, set_up_progress_tracking
 from app.sse import bus
 
@@ -1162,9 +1163,17 @@ def post_promote_to_library(session_id: str, scenario_id: str,
     Nothing is created that already exists: each item comes back `inserted` (a new row) or
     `existing` (reused), so calling twice creates nothing and returns the same ids.
 
-    "Already in the database" is judged on the NAME via app-owned normalization
-    (core.naming.normalize_name, type-scoped), with UX_ThreatCatalogue_NaturalKey as the
-    concurrency backstop.
+    "Already in the database" is judged twice for a THREAT: first on the NAME via app-owned
+    normalization (core.naming.normalize_name, type-scoped) with UX_ThreatCatalogue_NaturalKey as
+    the concurrency backstop, then — only if that misses — on MEANING, against the rows already
+    filed under the same type. Name-only matching is what let "Impersonation of operator sessions"
+    and "Impersonation of authorized control sessions" become two rows. A meaning match reports
+    `existing` like any other reuse, and records what it matched and how confidently in the
+    promotion's audit entry.
+
+    A threat TYPE is still matched by name alone, deliberately: type names are two or three words,
+    and measurement showed no mechanism can separate a synonym from an opposite at that length
+    ("Obtain Capabilities" vs "Develop Capabilities"). A novel type is created, as before.
 
     An EXISTING catalogue threat is returned by id and nothing else is touched — curation
     stays with the curators. Controls themselves are never created or curated by this call: a
@@ -1175,9 +1184,23 @@ def post_promote_to_library(session_id: str, scenario_id: str,
     purpose — the DB driver is synchronous, so FastAPI runs this in a threadpool; `async def`
     would block the event loop for every other request.
     """
+    # Resolve a same-meaning match BEFORE the write session, in three steps, because the reranker
+    # may be remote (reranker_provider='litellm_proxy' takes an LLM slot with the 90s call budget)
+    # and must never run while this request holds a database transaction — least of all promote's
+    # write transaction, which stays open until its commit.
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
-        result = promote_scenario_to_library(sess, scenario_session, scenario_id, principal.user_id)
+        _out, _threat = load_scenario_and_threat(sess, scenario_session["SessionID"],
+                                                scenario_id)
+        reuse_probe = library_match.probe(sess, _threat,
+                                        asset_name=scenario_session.get("AssetName"),
+                                        llm=get_llm(), settings=get_settings())
+    reuse = library_match.pick(reuse_probe, get_llm())  # no session open here, by design
+
+    with db_session() as sess:
+        scenario_session = get_authorized_session(sess, session_id, principal)
+        result = promote_scenario_to_library(sess, scenario_session, scenario_id,
+                                            principal.user_id, reuse)
     return LibraryPromotionResponse(
         session_id=session_id, scenario_id=str(scenario_id), success=result.success,
         created_count=result.created_count,
