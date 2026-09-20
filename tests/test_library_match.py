@@ -31,6 +31,7 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 from test_accept_any_version import _engine, _now, _seed_session
 
+from app.api.deps import Principal
 from app.core.config import get_settings
 from app.core.enums import ScenarioStatus
 from app.db import dal
@@ -377,3 +378,34 @@ def test_run_import_actually_runs_the_scan(db, monkeypatch):
     assert result["near_duplicates"]["pairs"][0]["catalogue_id"] == ORIGINAL
     assert result["threats_created"] == 0, "dry run writes nothing"
     assert _catalogue_count(db) == 1
+
+
+def test_the_promote_ROUTE_links_a_duplicate_end_to_end(db, monkeypatch):
+    """Through post_promote_to_library itself — not through probe/pick directly.
+
+    Every other test in this file calls the matcher directly, which is fast and convenient and
+    left the ROUTE untested: neutering any of the three wiring lines in sessions.py kept the whole
+    1087-test suite green. That is the exact shape of the two BLIND revert-checks this session
+    already hit, and of the 2026-08 deletion that stranded promote-to-library for a year — a
+    helper covered six ways, and nothing covering the line that calls it.
+
+    So this one drives the real entry point and asserts the observable outcome: no twin row.
+    """
+    from app.api import sessions as sessions_mod
+
+    with db() as s:
+        _seed_library(s, rows=[(ORIGINAL, "Impersonation of operator sessions")])
+    sid, oid = _seed_threat(db, name="Impersonation of authorized control sessions")
+
+    monkeypatch.setattr(sessions_mod, "db_session", db)
+    monkeypatch.setattr(sessions_mod, "get_llm",
+                        lambda: _Reranker({"Impersonation of operator sessions": 99.996}))
+    principal = Principal(claims={"sub": "curator"}, entities={"86"},
+                        client_id="curator", tenant_id="t")
+
+    resp = sessions_mod.post_promote_to_library(sid, oid, principal)
+
+    assert resp.threat.id == ORIGINAL, "the route must reach the matcher, not just be able to"
+    assert resp.threat.status == promote.EXISTING
+    assert resp.created_count == 0
+    assert _catalogue_count(db) == 1, "no twin — the whole point, asserted through the route"

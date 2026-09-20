@@ -13,8 +13,16 @@ so the stage stayed IDLE indefinitely. `progress.overall` read `complete` while 
 click again. Next-set was worse: its request had re-reserved the asset, so the session also sat
 `active` holding it until the reaper cancelled the whole thing.
 
-The fix has two halves and both are pinned here: the run RAISES `SubsystemBusy` so the task has
-something to retry, and when the retries run out the stage is handed back exactly as found.
+The fix has three halves, and all three are pinned here: the run RAISES `SubsystemBusy` so the
+task has something to retry, the CELERY TASK catches it and routes it to the bounded retry, and
+when the retries run out the stage is handed back exactly as found.
+
+The middle one was added late. The first two were tested by calling `cascade` and
+`settle_unstarted` directly, which left the task's `except cascade.SubsystemBusy` handler
+uncovered: renaming it to a different exception kept all 1087 tests green while every busy
+regeneration would have crashed the worker instead of retrying. That is the same
+tested-helper/untested-caller shape that cost this codebase its library approval path for a year,
+so the handler now has a test that drives the task itself.
 """
 from __future__ import annotations
 
@@ -150,3 +158,36 @@ def test_the_retry_window_outlasts_a_control_map_sweep():
     window = sum(cascade.BUSY_RETRY_SECONDS * (attempt + 1)
                 for attempt in range(cascade.BUSY_MAX_RETRIES))
     assert window > get_settings().control_map_sweep_interval_seconds
+
+
+# --------------------------------------------------------------------------- the task's handler
+
+def test_the_celery_task_routes_a_busy_lock_to_the_bounded_retry(monkeypatch):
+    """Drives regenerate_task, not cascade — the handler, not the thing it handles.
+
+    Every test above calls cascade or settle_unstarted directly, so the task's
+    `except cascade.SubsystemBusy` was covered by nothing: swap it for another exception class
+    and the whole suite stayed green while a busy lock would crash the worker. A raised
+    SubsystemBusy must reach _retry_or_settle and NOT escape the task.
+    """
+    from app.pipeline import celery_app as ca
+
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid, _ = _seed(Session, status=SessionStatus.completed, stage=WorkflowStage.REVIEW)
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(ca, "db_session", Session)
+    monkeypatch.setattr(ca, "get_llm", lambda: object())
+    monkeypatch.setattr(ca.cascade, "run_regeneration",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            cascade.SubsystemBusy("held by the sweep")))
+    monkeypatch.setattr(ca, "_retry_or_settle",
+                        lambda *a, **k: seen.update(kind=a[6], subsystem=a[4]))
+
+    # bind=True, so Celery binds `self` itself: .run() is the task body, no broker needed.
+    ca.regenerate_task.run(sid, 0, "scenario", None, 2)
+
+    assert seen.get("kind") == "regen", (
+        "the task must hand a busy lock to _retry_or_settle — if this passes with the handler "
+        "renamed, it is pinning nothing")
+

@@ -641,3 +641,33 @@ def test_review_still_works_when_the_scenario_row_is_missing(monkeypatch):
 
     assert result.review_status == "approved"
     assert result.reviewed_by == "u1"
+
+
+def test_the_unaccept_ROUTE_actually_unaccepts(monkeypatch):
+    """Through post_unaccept_scenario, not through unaccept_scenario.
+
+    Every other un-accept assertion in this repo calls the pipeline function directly, which left
+    the ROUTE's one line uncovered: neutering `unaccept_scenario(...)` in app/api/sessions.py kept
+    all 1087 tests green while the endpoint would have answered 200 and changed nothing. That is
+    the same tested-helper/untested-caller shape as the library approval path that sat
+    disconnected for a year, so the route gets its own test.
+    """
+    from app.api import sessions as sessions_mod
+    from app.api.deps import Principal
+
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid = _seed_session(Session)
+    _a, b, _c, _d = _versions_abcd(Session, sid)
+    assert _accept(Session, sid, [b], monkeypatch) == 1
+    assert _flags(Session, b)[0] == 1
+
+    monkeypatch.setattr(sessions_mod, "db_session", Session)
+    principal = Principal(claims={"sub": "u1"}, entities={"86"},
+                        client_id="c", tenant_id="t")
+
+    resp = sessions_mod.post_unaccept_scenario(sid, b, principal)
+
+    assert resp.scenario_id == b
+    assert _flags(Session, b)[0] == 0, (
+        "the route must reach the pipeline — a 200 with the flag still set is the bug this pins")
+    assert _audit(Session, AuditEventType.scenario_unaccepted), "and it leaves a ledger row"

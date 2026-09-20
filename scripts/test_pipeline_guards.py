@@ -678,11 +678,60 @@ def check_every_catalogue_mint_is_preceded_by_a_dedup_lookup() -> None:
     print("library: every catalogue mint dedups first (threats only — types measured unsafe)")
 
 
+def check_the_duplicate_guards_are_still_wired_in() -> None:
+    """Every entry point of app/pipeline/library_match must have a caller in app/.
+
+    This guard exists because the same failure has now happened three times in this codebase, and
+    twice it was caught only by luck. A helper gets six tests covering its behaviour, the ONE line
+    that calls it gets none, and deleting that line leaves the whole suite green:
+
+      * 2026-08 — the admin CRUD routes were deleted, taking update_library_row's only caller.
+        promote-to-library kept answering 200 while every promoted threat became unreachable, for
+        a year.
+      * this round — nothing asserted run_import CALLS the near-duplicate scan.
+      * this round — neutering any of the three library_match lines in app/api/sessions.py left
+        all 1087 tests passing.
+
+    Behaviour tests cannot catch a caller that no longer exists, because they call the helper
+    themselves. Only a structural check can. Note the honest limit: this proves a call SITE
+    exists, not that it is reached with real arguments — a call neutered in place
+    (`x = None and f(...)`) still satisfies it. That is what the route-level tests in
+    tests/test_library_match.py are for. The two together are the fix; either alone is not.
+    """
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    wanted = {"probe", "pick", "near_duplicates"}
+    seen: dict[str, list[str]] = {name: [] for name in wanted}
+    for path in sorted(app_dir.rglob("*.py")):
+        if path.name == "library_match.py":
+            continue  # its own internals don't count as a caller
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for call in ast.walk(tree):
+            # Matched as an ATTRIBUTE on the module (library_match.probe(...)), which is how
+            # every caller spells it — a bare `probe(` elsewhere is a different function.
+            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in wanted
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "library_match"):
+                seen[call.func.attr].append(f"{path.relative_to(app_dir.parent)}:{call.lineno}")
+    orphans = sorted(n for n, hits in seen.items() if not hits)
+    assert not orphans, (
+        f"library_match entry point(s) with no caller in app/: {orphans}\n"
+        "Each one is a duplicate guard that has been disconnected: `probe`/`pick` stop "
+        "promote-to-library linking a differently-worded twin, and `near_duplicates` is the bulk "
+        "importer's only warning that it is about to add one. Deleting the caller does not fail "
+        "any behaviour test, because those call the helper directly — which is exactly how this "
+        "codebase lost its library approval path for a year. If the removal is deliberate, delete "
+        "the entry point too, so the next reader is not guarded by a function nobody runs.")
+    print("library: duplicate guards still wired in ("
+        + ", ".join(f"{n}<-{len(h)}" for n, h in sorted(seen.items())) + ")")
+
+
 def demo() -> None:
     check_only_one_function_writes_a_scenario_decision()
     check_every_decision_route_passes_the_review_gate()
     check_promoted_library_rows_can_still_be_approved()
     check_every_catalogue_mint_is_preceded_by_a_dedup_lookup()
+    check_the_duplicate_guards_are_still_wired_in()
     check_scenario_receipts_carry_their_scenario_id()
     check_usable_proposal()
     check_semantic_duplicates_same_category()
