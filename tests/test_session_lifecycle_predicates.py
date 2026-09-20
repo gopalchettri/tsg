@@ -77,13 +77,20 @@ def test_a_running_stage_is_never_reported_as_finished() -> None:
     That is the point: the bug this pins was not a wrong branch, it was a MISSING one, and a
     missing branch is exactly what example-based tests do not catch.
 
-    THE BUG. A regeneration or next-set re-opens a stage on a session that stays `completed` —
+    TWO BUGS, both found live, both the same shape. A regeneration or next-set re-opens a stage
+    on a session that stays `completed` —
     generation completes it at the review barrier to release the asset, and a rewrite does not
     un-complete it. So `session_status == completed` fell through to `complete` while an LLM call
     was in flight. Found in live end-to-end testing: regenerate returned 202 at epoch 2, the
     SCENARIOS stage went RUNNING, and this field read `complete` for the ~75s the rewrite took.
     Every client is documented to poll exactly this field, so one that stops at `complete` shows
     the OLD version as final and never sees the replacement.
+
+    THE SECOND ONE the first fix missed, caught 8 seconds into the very next live run: regenerate
+    answers 202 and resets the stage to IDLE at a new epoch, but nothing reads RUNNING until a
+    worker CLAIMS the task. That queue window reported `complete` too — and with no worker to
+    claim it, the window never closes. Checking only RUNNING was checking the second half of
+    "in flight" and calling it done.
 
     Same family as every other defect in this codebase: a terminal answer reported while work is
     still happening.
@@ -95,10 +102,20 @@ def test_a_running_stage_is_never_reported_as_finished() -> None:
                 for undecided in (True, False):
                     got = get_overall_status(threats, scenarios, status, undecided=undecided)
                     checked += 1
-                    if StageStatus.RUNNING in (threats, scenarios):
+                    running = StageStatus.RUNNING in (threats, scenarios)
+                    # QUEUED counts as in flight: regenerate resets the stage to IDLE at a new
+                    # epoch and answers 202 BEFORE any worker claims it. Generation parks
+                    # SCENARIOS at AWAITING_DECISION permanently, so IDLE on a COMPLETED session
+                    # can only mean a rewrite was queued — possibly one no worker ever claims.
+                    # SCENARIOS only: `threats` defaults to IDLE when its stage row is absent,
+                    # so keying on either stage would condemn every ordinary reviewed session.
+                    queued = (status == SessionStatus.completed
+                            and scenarios == StageStatus.IDLE)
+                    if running or queued:
                         assert got != SubsystemProgress.complete, (
-                            f"reported finished with a stage RUNNING: threats={threats} "
-                            f"scenarios={scenarios} session={status} undecided={undecided}")
+                            f"reported finished with work {'running' if running else 'queued'}: "
+                            f"threats={threats} scenarios={scenarios} session={status} "
+                            f"undecided={undecided}")
     assert checked > 100, "the cross product collapsed — this would pass vacuously"
 
     # Only `complete` is asserted, deliberately. The first draft also forbade `awaiting_review`

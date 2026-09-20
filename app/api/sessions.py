@@ -179,6 +179,21 @@ def get_overall_status(threats: str, scenarios: str, session_status: str,
     # mutually exclusive with RUNNING, so it cannot mask a decision a human really can make.
     if StageStatus.RUNNING in vals:
         return SubsystemProgress.in_progress
+    # ...and QUEUED counts as in flight too. The first version of this check only caught RUNNING,
+    # and the live run found the hole 8 seconds later: regenerate answers 202 and resets the stage
+    # to IDLE at the new epoch, but the stage does not read RUNNING until a worker CLAIMS it. In
+    # that window this reported `complete` again — and if no worker ever claims it (broker down,
+    # worker stopped) the window never closes.
+    #
+    # IDLE on a COMPLETED session is unambiguous: generation parks SCENARIOS at AWAITING_DECISION
+    # and never moves it off (see `undecided` above), so the only thing that puts it back to IDLE
+    # is dal.reset_stage_for_regen reserving a new epoch for a rewrite. A session still generating
+    # for the first time is `active`, not `completed`, so it cannot reach here.
+    # SCENARIOS specifically, never `IDLE in vals`: `threats` defaults to IDLE whenever the row
+    # is absent (stages.get above), so the wider test fires on ordinary fully-reviewed sessions —
+    # the review-queue suite catches that immediately, which is the reason it is written this way.
+    if session_status == SessionStatus.completed and scenarios == StageStatus.IDLE:
+        return SubsystemProgress.in_progress
     if session_status == SessionStatus.completed:
         return SubsystemProgress.complete
     if all(v == StageStatus.IDLE for v in vals):
