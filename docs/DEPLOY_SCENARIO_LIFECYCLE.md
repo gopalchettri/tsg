@@ -72,6 +72,8 @@ loudly at deploy rather than quietly at runtime. Migrate first and it is a non-e
 | Accept is repeatable | Calling accept again with different scenario ids is normal, not an error |
 | New: `POST /v1/sessions/{session_id}/scenarios/reject` | Body `{"scenario_ids": [...]}`. Records a decision; does not delete anything |
 | Accept's 404 body may carry `already_rejected`; reject's may carry `already_accepted` | Both are typed values in `details.unacceptable[].reason` |
+| New: accept takes `replace_accepted` (`mode: "subset"` only) | Adopt a version of a scenario whose other version is already accepted — the reviewer changed their mind after a regeneration. Without it, that stays the same `409 duplicate_identity` as before, so **no client breaks**; the message now names both ways forward, which is what a "replace it?" prompt should say. The replaced version keeps its row and its history, and its remediation plan stays on it — readable at its own `scenario_id`, but out of the plan board and the register, so one risk never shows two plans. **No schema change:** it writes `Accepted`/`AcceptedAt`/`AcceptedBy` and one `Scenario_Audit` row of type `scenario_unaccepted` |
+| A remediation plan whose scenario is no longer the accepted version cannot be approved | `POST .../treatment-plan/review` answers `409` with `details.reason: "scenario_not_accepted"`. Unreachable before this release, since nothing could un-accept a scenario |
 | `session_entered_review` SSE event | Unchanged name. It now also means the asset has been released |
 
 ## 5. Who may decide — a deliberate decision

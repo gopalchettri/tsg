@@ -220,10 +220,13 @@ class AuditEventType(StrEnum):
                                                            # retired_plan_id, output_id}; ActorType=user.
                                                            # plan_id key REQUIRED — the per-scenario trail
                                                            # filters on it (api/treatment.py)
-    scenario_unaccepted = "scenario_unaccepted"            # (forthcoming — no route writes this yet)
-                                                           # per-scenario accept UNDONE post-completion;
-                                                           # {output_id}; ActorType=user. The accept's own
-                                                           # rows stay — the ledger shows both decisions
+    scenario_unaccepted = "scenario_unaccepted"            # per-scenario accept UNDONE post-completion;
+                                                           # DetailJSON {replaced_by}; ActorType=user.
+                                                           # Written by dal.decide_scenarios when an accept
+                                                           # carries AcceptBody.replace_accepted — the
+                                                           # reviewer adopted another version of the same
+                                                           # scenario. The accept's own rows stay: the
+                                                           # ledger shows both decisions
 
 
 class AuditDecision(StrEnum):

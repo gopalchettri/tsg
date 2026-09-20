@@ -1061,7 +1061,16 @@ _CONFLICT_RESPONSES: dict[int | str, dict] = {409: {"model": ErrorResponse, "des
                 "Accepting does not end the session; scenarios you leave undecided stay decidable on a later "
                 "visit.\n\n"
                 "Accepting a scenario you already declined is refused with `404` and the reason "
-                "`already_rejected`. The two decisions are mutually exclusive per scenario."
+                "`already_rejected`. The two decisions are mutually exclusive per scenario.\n\n"
+                "**Changing your mind after a regeneration.** Only one version of a scenario can be "
+                "accepted. Naming a different version of an already-accepted scenario is refused with "
+                "`409` and the reason `duplicate_identity`; the message spells out both ways forward. To "
+                "make the new version the accepted one, repeat the call with `mode: \"subset\"` and "
+                "`replace_accepted: true` — the previous version moves to history (never deleted, and "
+                "both decisions stay in the audit trail), and its remediation plan stays with it, "
+                "leaving the plan board and the register. To keep the current one, reject the new "
+                "version instead. `replace_accepted` is refused with `mode: \"all\"`, so accept-all can "
+                "never rewrite a decision."
             ))
 def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depends(get_principal)) -> AcceptResponse:
     """Records an accept decision on all or a subset of this session's scenarios. Repeatable:
@@ -1071,7 +1080,8 @@ def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depend
     with db_session() as sess:
         scenario_session = get_authorized_session(sess, session_id, principal)
         matched = accept_session(sess, session_id, scenario_session["EntityID"], principal.user_id,
-                                subset=_subset_from_accept_body(body))
+                                subset=_subset_from_accept_body(body),
+                                replace_accepted=body.replace_accepted)
     return AcceptResponse(session_id=session_id, user_id=scenario_session["UserID"],
                         status=str(SessionStatus.completed), accepted_count=matched)
 
@@ -1274,7 +1284,8 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
                 "**Watch out:** the count normally stays the same, because this replaces rather than adds. "
                 "The exception is regenerating a scenario you had already accepted: the accepted version "
                 "stays in the results beside its replacement, so you will count one more. Tell them apart by "
-                "`accepted`.\n\n"
+                "`accepted`. The rewrite does NOT inherit that decision — to move it, accept the new version "
+                "with `replace_accepted: true`; to keep the old one, reject the new version.\n\n"
                 "There is no free-text steering field. If the AI fails on a rewrite, your original scenario "
                 "is kept rather than destroyed."
             ))

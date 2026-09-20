@@ -217,6 +217,8 @@ class AcceptBody(ApiModel):
                 {"mode": "all"},
                 {"mode": "none"},
                 {"mode": "subset", "scenario_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]},
+                {"mode": "subset", "scenario_ids": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"],
+                 "replace_accepted": True},
             ]
         }
     )
@@ -237,8 +239,22 @@ class AcceptBody(ApiModel):
             f"Output ids to accept. Required (non-empty, max {_MAX_BATCH}) when mode='subset'; "
             "must be omitted otherwise. An id may name ANY version of a scenario — including an "
             "older one that a regeneration replaced (see replaced_scenarios in GET /results"
-            "?include_replaced=true); the named version becomes the accepted one. Naming two "
-            "versions of the same scenario is rejected (409, reason 'duplicate_identity')."
+            "?include_replaced=true); the named version becomes the accepted one. If a DIFFERENT "
+            "version of that scenario is already accepted, the call is rejected (409, reason "
+            "'duplicate_identity') unless you also send replace_accepted=true. Naming two "
+            "versions of the same scenario in one call is always rejected."
+        ),
+    )
+    replace_accepted: bool = Field(
+        default=False,
+        description=(
+            "Only with mode='subset'. Make a named version the accepted one even though another "
+            "version of that scenario is already accepted — the reviewer changed their mind after "
+            "a regeneration. The previously accepted version moves to history (it is never "
+            "deleted, and both decisions stay in the audit trail), and its remediation plan stays "
+            "with it and leaves the plan board and the register. Off by default, and ignored by "
+            "no mode: sending it with mode='all' or 'none' is a 422, so one click can never "
+            "rewrite decisions the register already carries."
         ),
     )
 
@@ -251,6 +267,12 @@ class AcceptBody(ApiModel):
         # skip this validator entirely — {"mode": "all", "scenario_ids": []} would then be told
         # to ADD items ("at least 1 item") when the actual fix is to REMOVE the field. One
         # validation site keeps every mode/scenario_ids disagreement on one context-aware message.
+        if self.mode != "subset" and self.replace_accepted:
+            # Refused rather than ignored: replacing retires a decision the register already
+            # carries, so "I sent it and nothing happened" is the one outcome this must not have.
+            raise ValueError(
+                f"replace_accepted is only allowed with mode='subset' (name the version to "
+                f"accept); it must not be sent with mode={self.mode!r}")
         if self.mode == "subset":
             if not self.scenario_ids:
                 raise ValueError("scenario_ids is required (non-empty) when mode='subset'")

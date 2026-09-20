@@ -230,13 +230,13 @@ def _intel_vocabulary(sess: Session, subsystems: list[dict], asset_context: dict
     were ignored.
 
     product: vendor / technology / platform names from _INTEL_TECH_FIELDS plus the asset's
-             operating_system, placeholders ("NA", "Unknown") dropped via is_placeholder.
+            operating_system, placeholders ("NA", "Unknown") dropped via is_placeholder.
     scope:   canonical sector keys from sector / sub_sector / critical_service (fixed dropdown
-             values such as "Energy", "Power Transmission" → 'sector:energy') plus the
-             configured home country — matched by equality against each item's structured
-             scope_tags, so a sector word can never hit an unrelated title by coincidence.
+            values such as "Energy", "Power Transmission" → 'sector:energy') plus the
+            configured home country — matched by equality against each item's structured
+            scope_tags, so a sector word can never hit an unrelated title by coincidence.
     categories: ctm_scan_category codes (IT / OT / ...) — DB-resolved, not text-matched; one OT
-             component anywhere is enough for ICS advisories to be drawn first."""
+            component anywhere is enough for ICS advisories to be drawn first."""
     product: list[str] = []
     seen: set[str] = set()
 
@@ -257,7 +257,7 @@ def _intel_vocabulary(sess: Session, subsystems: list[dict], asset_context: dict
     if home:
         scope += intel.country_keys(home)
     return IntelTerms(product=product, scope=scope,
-                      categories=control_mapping.session_category_codes(sess, subsystems, asset_context))
+                    categories=control_mapping.session_category_codes(sess, subsystems, asset_context))
 
 
 def _prefer_kinds(categories: set[str]) -> tuple[str, ...]:
@@ -612,10 +612,19 @@ def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, s
                             epoch: int, entity_id: str | None, user_id: str | None, info: dict,
                             scenario_number: int = 1, replaces_scenario_id: str | None = None,
                             source: str = "generated", *,
-                            span: tuple[datetime, datetime]) -> dict:
+                            span: tuple[datetime, datetime], identity: str | None = None) -> dict:
+    """`identity` is this version's IdentityHash. A REGENERATION passes the one its target already
+    carries; every other caller folds it from the threat's current library ids.
 
+    That distinction is load-bearing. The fold reads ThreatCatalogueID/ThreatTypeID, and
+    promote-to-library rewrites both on an AI-found threat — so recomputing it here gave a rewrite
+    a different identity from the version it was replacing. supersede_by_identity_hashes then
+    retired nothing (leaving TWO live versions of one scenario, each separately acceptable) or,
+    where another threat had meanwhile folded to that identity, retired somebody else's scenario.
+    A regeneration is a new version of THE SAME scenario, so it inherits that scenario's identity
+    instead of re-deriving it from data that moved underneath it."""
     scenario = _scrub_model_output(scenario, sid, info.get("threat_id"))
-    identity = dal.identity_hash(sid, ss, info)
+    identity = identity or dal.identity_hash(sid, ss, info)
     return {
         "ScenarioID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
         "SubsystemID": ss,
@@ -802,7 +811,11 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
         output_rows.append(_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
                                                     entity_id, user_id, enriched.get(sc.threat_id, {}),
                                                     scenario_number=number, source="generated",
-                                                    span=span))
+                                                    span=span,
+                                                    # A regeneration keeps its target's identity —
+                                                    # see _build_scenario_output_row. Next-set has
+                                                    # no target and folds a fresh one.
+                                                    identity=target.identity_hash if target else None))
     if scoped_rows:
         sess.execute(insert(m.Scoped_Threat), scoped_rows)
     if output_rows:
@@ -1106,8 +1119,13 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
         already_done = _begin_full_run_attempt(sess, sid, ss, tenant, entity_id, user_id, pairs, epoch)
     work = [(sc, scoped_id, target) for sc, scoped_id, target in pairs
             if sc.selected and sc.threat_id not in already_done]
-    identities = {scoped_id: dal.identity_hash(sid, ss, enriched.get(sc.threat_id, {}))
-                for sc, scoped_id, _t in work}
+    # Same rule as the row builder: a regeneration reuses its target's stored identity, so the
+    # coverage and cross-scenario lookups below key on what the stored rows actually carry.
+    # Recomputing it made both miss after a promote-to-library, which silently dropped the frozen
+    # entry points and fed the target's own text back as "another scenario to differ from".
+    identities = {scoped_id: (t.identity_hash if t is not None and t.identity_hash
+                            else dal.identity_hash(sid, ss, enriched.get(sc.threat_id, {})))
+                for sc, scoped_id, t in work}
     per_item: dict[str, dict] = {}
     for _sc, scoped_id, target in work:
         sibling_texts = None

@@ -630,7 +630,8 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   &quot;mode&quot;: &quot;all&quot;,
   &quot;scenario_ids&quot;: [
     &quot;&lt;scenario_ids&gt;&quot;
-  ]
+  ],
+  &quot;replace_accepted&quot;: false
 }</pre>
   </div>
   <div class="blk">
@@ -650,7 +651,8 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
   <details class="notes">
     <summary>Implementation notes &amp; error cases</summary>
     <p>mode is REQUIRED with no default — omitting it is a 422, not an implicit accept-all; scenario_ids is required (non-empty, max 50) only under mode=&#x27;subset&#x27; and forbidden under &#x27;all&#x27;/&#x27;none&#x27;. Repeatable across visits: generation already completes the session at REVIEW, so scenarios left undecided on one visit can still be accepted on a later call; re-accepting an already-accepted id is a no-op that preserves the ORIGINAL accepted_by/accepted_at (append-only, never rewritten). Naming two different VERSIONS of one scenario (e.g. a current id plus its predecessor from replaced_scenarios) in one call -&gt; 409 with details.reason=&#x27;duplicate_identity&#x27;; accept and reject are mutually exclusive per scenario.</p>
-    <p class="errs"><span class="lbl">Errors</span> 404 if session_id unknown/wrong entity, or if a subset id can&#x27;t be matched at all — details.unacceptable lists each unmatched id and why (e.g. already_accepted, already_rejected, failure_card); 409 accept_conflict with details.reason in {generation_in_progress, session_completed, session_cancelled, duplicate_identity, nothing_to_accept} depending on session state or a subset conflict; 422 if mode=&#x27;subset&#x27; with empty/missing scenario_ids, or scenario_ids supplied under mode=&#x27;all&#x27;/&#x27;none&#x27;.</p>
+    <p>replace_accepted (boolean, default false, mode=&#x27;subset&#x27; only) adopts a named version even though ANOTHER version of that scenario is already accepted — the reviewer changed their mind after a regeneration. Without it, that collision is the same 409 duplicate_identity, whose message names both ways forward, so a UI can turn the refusal into a &quot;replace it?&quot; prompt. The replaced version goes back to Accepted=0 with its stamps cleared, plus a scenario_unaccepted ledger row naming what replaced it; its own scenario_accepted row stays, so the trail carries both decisions. Its remediation plan is neither moved nor deleted: it stays on that version, readable at its own scenario_id, and leaves the plan board and the entity register so one risk never shows two plans — accepting that version again brings it back. Sending replace_accepted with mode=&#x27;all&#x27; or &#x27;none&#x27; is a 422, so one click can never rewrite decisions the register already carries.</p>
+    <p class="errs"><span class="lbl">Errors</span> 404 if session_id unknown/wrong entity, or if a subset id can&#x27;t be matched at all — details.unacceptable lists each unmatched id and why (e.g. already_accepted, already_rejected, failure_card); 409 accept_conflict with details.reason in {generation_in_progress, session_completed, session_cancelled, duplicate_identity, nothing_to_accept} depending on session state or a subset conflict; 422 if mode=&#x27;subset&#x27; with empty/missing scenario_ids, or scenario_ids supplied under mode=&#x27;all&#x27;/&#x27;none&#x27;, or replace_accepted sent under mode=&#x27;all&#x27;/&#x27;none&#x27;.</p>
   </details>
 </article>
 <article class="api" id="post-v1-sessions-session-id-scenarios-reject">
@@ -724,7 +726,7 @@ SELECT ScenarioID, ScenarioNumber, GenerationEpoch FROM Threat_Scenario WHERE Se
     <span class="method m-post">POST</span>
     <span class="path">/v1/sessions/{session_id}/regenerate/scenarios</span>
   </div>
-  <p class="purpose">Rebuilds the narrative of one or more EXISTING scenarios in place — siblings untouched, the old version is superseded and nested under the new one. Returns immediately; the rewrite runs asynchronously.</p>
+  <p class="purpose">Rebuilds the narrative of one or more EXISTING scenarios in place — siblings untouched, the old version is superseded and nested under the new one. Returns immediately; the rewrite runs asynchronously. A rewrite never inherits an accept: regenerating an accepted scenario leaves that decision (and its remediation plan) on the old version until someone accepts the rewrite with replace_accepted or rejects it.</p>
   <p class="auth"><span class="lbl">Auth</span> X-API-Key, X-User-Id, X-Entity-Id, X-Tenant-Id — all required, via Depends(get_principal); same entity-scoped review-gated access as POST .../accept.</p>
   <div class="blk">
     <h3>Request</h3>
@@ -1454,7 +1456,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   <details class="notes">
     <summary>Implementation notes &amp; error cases</summary>
     <p>plan_id is REQUIRED — a verdict always names the version it applies to, so a regeneration landing between the reviewer&#x27;s GET and this POST can never redirect it onto a plan nobody read; omitting it is a 422. Pass the ACTIVE version&#x27;s own id to review the current plan — a re-review simply overwrites (latest wins). Pass a HISTORICAL plan_id (from GET ?include_superseded=true) with decision=&quot;approved&quot; to atomically make that version active AND approve it in one call; the same historical plan_id with decision=&quot;rejected&quot; is refused (409 version_not_active) since it&#x27;s already not the operative plan and rejecting it changes nothing. Only a COMPLETE plan is reviewable — reviewing a RUNNING or ERROR plan always 409s not_complete. plan_id is canonicalized/validated as a GUID at the schema boundary before any DB lookup.</p>
-    <p class="errs"><span class="lbl">Errors</span> 404 (&quot;no treatment plan has been requested for this scenario&quot;) if the scenario has no active plan at all; 404 (&quot;no such plan version for this scenario&quot;) if plan_id is given but doesn&#x27;t match any version&#x27;s id for this session+scenario; 409 version_not_active if a historical plan_id is rejected rather than approved; 409 generation_in_progress if a swap/regenerate raced the version-switch&#x27;s retire step; 409 not_complete if the target plan (active or named) isn&#x27;t COMPLETE; 422 if decision isn&#x27;t approved|rejected, comment exceeds 2000 chars, or plan_id isn&#x27;t a valid GUID.</p>
+    <p class="errs"><span class="lbl">Errors</span> 404 (&quot;no treatment plan has been requested for this scenario&quot;) if the scenario has no active plan at all; 404 (&quot;no such plan version for this scenario&quot;) if plan_id is given but doesn&#x27;t match any version&#x27;s id for this session+scenario; 409 version_not_active if a historical plan_id is rejected rather than approved; 409 generation_in_progress if a swap/regenerate raced the version-switch&#x27;s retire step; 409 not_complete if the target plan (active or named) isn&#x27;t COMPLETE; 409 scenario_not_accepted if the plan&#x27;s scenario is no longer the accepted version (someone adopted a regeneration with replace_accepted) — the plan stays readable and becomes reviewable again if that version is accepted again, since a verdict belongs only on the version the register carries; 422 if decision isn&#x27;t approved|rejected, comment exceeds 2000 chars, or plan_id isn&#x27;t a valid GUID.</p>
   </details>
 </article>
 <article class="api" id="post-v1-sessions-session-id-scenarios-scenario-id-treatment-plan-cancel">
@@ -1801,7 +1803,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     <span class="method m-get">GET</span>
     <span class="path">/v1/entities/{entity_id}/treatment-plans</span>
   </div>
-  <p class="purpose">The entity-wide remediation register: every active treatment plan across all of the entity&#x27;s sessions/assets in one page, filterable and sortable newest-first — &#x27;which Critical risks still have no approved plan?&#x27;.</p>
+  <p class="purpose">The entity-wide remediation register: every active treatment plan across all of the entity&#x27;s sessions/assets in one page, filterable and sortable newest-first — &#x27;which Critical risks still have no approved plan?&#x27;. Plans belonging to scenario versions that are no longer accepted (replaced via accept + replace_accepted) are left out, so one risk never appears twice; each stays readable at its own scenario_id and returns here if that version is accepted again.</p>
   <p class="auth"><span class="lbl">Auth</span> get_principal (X-API-Key, X-User-Id, X-Entity-Id, X-Tenant-Id) PLUS principal.require_entity(entity_id): the X-Entity-Id header must equal the {entity_id} path segment exactly — 403 EntityForbidden otherwise. There is no session to fall back on for object-level authz here.</p>
   <div class="blk">
     <h3>Request</h3>

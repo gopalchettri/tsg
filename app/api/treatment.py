@@ -102,7 +102,8 @@ _CONFLICT_RESPONSES: dict[int | str, dict] = {
 #: HISTORICAL — never raised — and deliberately absent).
 _GATE_TEXT: dict[TreatmentGateReason, str] = {
     TreatmentGateReason.scenario_not_accepted:
-        "treatment plans are generated for accepted scenarios only",
+        "treatment plans are generated and reviewed for accepted scenarios only — this scenario "
+        "is not the accepted version (a regeneration may have replaced it)",
     TreatmentGateReason.generation_in_progress:
         "a treatment plan is already being generated for this scenario",
     TreatmentGateReason.not_in_progress:
@@ -156,7 +157,9 @@ def post_treatment_plan(session_id: str, scenario_id: str, body: TreatmentPlanBo
                         principal: Principal = Depends(get_principal)) -> TreatmentPlanAccepted:
     """FIRST generation of the Mitigate treatment plan for one ACCEPTED scenario. The register's
     risk data arrives IN the body (TSG reads no risk-module tables); everything is frozen into
-    the snapshot at insert — the worker and the GET only ever see that snapshot.
+    the snapshot at insert — the WORKER only ever sees that snapshot. The GET does not: it
+    re-reads the scenario, threat and controls live by ScenarioID (dal.active_plan_row), and the
+    frozen bytes are served by /evidence alone.
 
     If ANY plan already exists for the scenario (whatever its status) → 409 plan_already_exists:
     every later version is minted by POST .../treatment-plan/regenerate, which reuses the frozen
@@ -633,7 +636,11 @@ def post_cancel_treatment_plan(session_id: str, scenario_id: str,
                 "still running is refused with `generation_in_progress`. A `plan_id` that is not a version of "
                 "this scenario at all is a `404`.\n\n"
                 "`reviewed_by` always comes from your `X-User-Id` header; there is no reviewer field in the "
-                "body, so nobody can review as someone else. Re-reviewing overwrites the previous verdict."
+                "body, so nobody can review as someone else. Re-reviewing overwrites the previous verdict.\n\n"
+                "**Replaced scenarios cannot be reviewed.** If the scenario is no longer the accepted "
+                "version — someone accepted a regeneration with `replace_accepted` — this returns `409` with "
+                "the reason `scenario_not_accepted`. The old plan stays readable at its own scenario id, and "
+                "becomes reviewable again if that version is accepted again."
             ))
 def post_review_treatment_plan(session_id: str, scenario_id: str, body: TreatmentReviewBody,
                             principal: Principal = Depends(get_principal)) -> TreatmentReviewResponse:
@@ -659,6 +666,15 @@ def post_review_treatment_plan(session_id: str, scenario_id: str, body: Treatmen
         row = dal.active_plan_row(sess, session_id, scenario_id)
         if row is None:
             raise dal.NotFoundError("no treatment plan has been requested for this scenario")
+        # A verdict is the artefact a regulator reads, so it may only land on the plan of the
+        # version the register actually carries. Once a reviewer replaces an accepted scenario
+        # (accept with replace_accepted), the old version's plan stays readable — but approving it
+        # would put a signature on the remediation for text the organisation no longer stands by,
+        # and it is already gone from the board and the register that a verdict feeds. Create and
+        # regenerate gate on the same flag; cancel deliberately does not, since stopping spend on
+        # a generation nobody wants any more is always allowed.
+        if row["Accepted"] != 1:
+            raise _conflict(TreatmentGateReason.scenario_not_accepted)
 
         target_id = body.plan_id  # canonicalized at the schema boundary; row ids canonical too
         if target_id != str(row["PlanID"]):
@@ -731,7 +747,9 @@ def post_review_treatment_plan(session_id: str, scenario_id: str, body: Treatmen
                 "Each scenario's CURRENT plan version across every session and asset for one entity, newest "
                 "first. This is the page that answers 'which Critical risks still have no approved plan?'. "
                 "Versions you regenerated away are not listed here — read those per scenario with "
-                "`?include_superseded=true`.\n\n"
+                "`?include_superseded=true`. Plans of scenario versions that are no longer accepted are "
+                "not listed either, so one risk never shows two plans; they stay readable at their own "
+                "scenario id.\n\n"
                 "**Before you call:** the `entity_id` in the path must match your `X-Entity-Id` header.\n\n"
                 "**Filters:** `status` (`RUNNING`, `COMPLETE`, `ERROR`), `review_status` (`approved`, "
                 "`rejected`), `risk_level` (`Low`, `Medium`, `High`, `Critical`), plus `limit` (max 500) and "

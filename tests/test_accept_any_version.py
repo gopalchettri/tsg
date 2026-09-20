@@ -127,12 +127,15 @@ def _versions_abcd(Session, sid: str) -> tuple[str, str, str, str]:
     return a, b, c, d
 
 
-def _accept(Session, sid: str, subset, monkeypatch) -> int:
+def _accept(Session, sid: str, subset, monkeypatch, *, replace: bool = False) -> int:
     """Run the real accept_session with its two advisory tails stubbed (SSE + promotion —
-    both out of scope here and both explicitly never-raise paths)."""
+    both out of scope here and both explicitly never-raise paths).
+
+    `replace` is AcceptBody.replace_accepted: adopt the named version even though another version
+    of that scenario is already accepted. Default off, exactly as on the wire."""
     monkeypatch.setattr(bus, "publish", lambda *a, **k: None)
     with Session() as s:
-        return accept_session(s, sid, "86", "u1", subset=subset)
+        return accept_session(s, sid, "86", "u1", subset=subset, replace_accepted=replace)
 
 
 def _flags(Session, oid: str) -> tuple[int, int]:

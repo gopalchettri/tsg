@@ -502,15 +502,16 @@ def active_accept_candidates(sess: Session, session_id: str,
                              subsystem_ids: list[int]) -> dict[str, tuple[str | None, int]]:
     """{ScenarioID: (IdentityHash, ScenarioNumber)} for exactly the rows an ACCEPT-ALL would flip.
 
-    Mirrors mark_scenarios_accepted's subset=None predicates (active + complete + these
-    subsystems) so the pre-flight and the write can never disagree about the candidate set."""
+    Asks `_decidable_where` for the accept-all predicate rather than restating it — the rule
+    `scenario_identity_pairs` already follows, and for the same reason. Restating it is how this
+    drifted: the hand-copied list never excluded REJECTED rows, so a scenario that was accepted,
+    regenerated, and whose replacement was then rejected still offered that rejected row to
+    accept.py's duplicate-identity pre-flight. Its identity was already accepted, so accept-all
+    409'd the whole session from then on over a row the write would never have touched."""
     out = m.Threat_Scenario
     return {str(r["ScenarioID"]): (r["IdentityHash"], r["ScenarioNumber"]) for r in sess.execute(
         select(out.ScenarioID, out.IdentityHash, out.ScenarioNumber)
-        .where(out.SessionID == session_id,
-            out.SubsystemID.in_(subsystem_ids),
-            out.Status == ScenarioStatus.complete,
-            active(out.Superseded))
+        .where(*_decidable_where(session_id, subsystem_ids, AuditDecision.accept, None))
     ).mappings()}
 
 
@@ -1215,15 +1216,28 @@ def identity_hash(session_id: str, subsystem_id: int, info: dict) -> str:
 
 
 def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: int, n: int) -> list[str]:
-    """Up to `n` active ThreatIDs whose dedup identity has NO active scenario yet — the pool
-    "generate next set" serves from before falling back to a fresh AI batch.
+    """Up to `n` active ThreatIDs with NO live scenario yet — the pool "generate next set" serves
+    from before falling back to a fresh AI batch.
 
     Best-first (Score desc, then ThreatID); an unscored threat has a NULL score and sorts last
-    (LEFT JOIN) but stays eligible. Identity folds exactly like Threat_Scenario's
-    IdentityHash, so "already shown" == an active IdentityHash. Candidates sharing one identity
-    collapse to the best-ranked, so one call never proposes an internal duplicate."""
-    active_hashes = set(sess.execute(
-        select(m.Threat_Scenario.IdentityHash).where(
+    (LEFT JOIN) but stays eligible. "Already shown" is TWO questions, both answered below: is this
+    identity on screen (identity folds exactly like Threat_Scenario's IdentityHash), and does this
+    THREAT already have a live scenario. Candidates sharing one identity collapse to the
+    best-ranked, so one call never proposes an internal duplicate."""
+    # Two answers from ONE read: the identities already on screen, and the THREATS behind them.
+    #
+    # The identity half alone was not enough. A threat's identity is folded from its CURRENT
+    # library ids, and promote-to-library rewrites those ids on an AI-found threat
+    # (promote._promote_threat). Its stored scenario rows keep the identity they were written
+    # with, so the recomputed identity below stops matching and a threat whose scenario is on
+    # screen — accepted, even — reads as unserved and gets served a second time. Asking "does
+    # this threat already have a live scenario?" cannot drift, because it compares ids rather
+    # than a hash of mutable data.
+    served = sess.execute(
+        select(m.Threat_Scenario.IdentityHash, m.Scoped_Threat.ThreatID)
+        .select_from(m.Threat_Scenario.__table__.outerjoin(
+            m.Scoped_Threat, m.Threat_Scenario.ScopedThreatID == m.Scoped_Threat.ScopedThreatID))
+        .where(
             m.Threat_Scenario.SessionID == session_id,
             m.Threat_Scenario.SubsystemID == subsystem_id,
             active(m.Threat_Scenario.Superseded),
@@ -1235,7 +1249,9 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
             # of this table filters the same way; this query was the lone exception.
             m.Threat_Scenario.Status == ScenarioStatus.complete,
         )
-    ).scalars())
+    ).all()
+    active_hashes = {r[0] for r in served}
+    served_threat_ids = {str(r[1]) for r in served if r[1] is not None}
     it, st = m.Identified_Threat, m.Scoped_Threat
     rows = sess.execute(
         select(it.ThreatID, it.ThreatCatalogueID, it.ThreatTypeID, it.ThreatType, it.ThreatName, st.Score)
@@ -1262,7 +1278,7 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
     seen: set[str] = set()
     for r in rows:
         identity = identity_hash(session_id, subsystem_id, _row_to_dedup_info(r))
-        if identity in active_hashes or identity in seen:
+        if identity in active_hashes or str(r["ThreatID"]) in served_threat_ids or identity in seen:
             continue
         seen.add(identity)
         picked.append(r["ThreatID"])
@@ -1448,7 +1464,7 @@ def _decidable_where(session_id: str, subsystem_ids: list[int], decision: AuditD
 def decide_scenarios(
     sess: Session, session_id: str, subsystem_ids: list[int], *, decision: AuditDecision,
     subset: list[str] | None = None, tenant_id: str | None = None, entity_id: str | None = None,
-    user_id: str | None = None,
+    user_id: str | None = None, displace: dict[str, str] | None = None,
 ) -> int:
     """Record ONE reviewer decision per scenario — the row write and its ledger entry, together.
 
@@ -1473,10 +1489,43 @@ def decide_scenarios(
     `AcceptedSubsetJSON` is stamped only for a partial accept, so non-NULL means precisely "part of
     an explicit partial pick" and a reviewer needs no Scenario_Audit join.
 
+    `displace` is {already-accepted ScenarioID: the version replacing it}, built by accept.py's
+    pre-flight when the reviewer explicitly asked to replace (AcceptBody.replace_accepted). Those
+    rows are un-accepted HERE rather than in a helper, because this is the one function
+    scripts/test_pipeline_guards.py allows to write a decision column — the single-writer rule is
+    what keeps the decision and its ledger entry inseparable, and a replacement is two decisions.
+
     Returns rows actually decided, so the caller can tell "N requested, M<N matched" from a clean
     run — otherwise a subset id naming a wrong row vanishes silently."""
     event_type = _DECISION_EVENT[decision]
     out = m.Threat_Scenario
+    if displace:
+        # BEFORE the accept below, not after: UX_Scenario_ActiveAccepted permits one accepted
+        # version per identity, so the other order violates it at statement time.
+        #
+        # The stamps are CLEARED, not kept. AcceptedAt/AcceptedBy are coalesced on the way in
+        # ("first decider wins"), so leaving Monday's timestamp on a row that is no longer
+        # accepted would misdate a later re-accept of that same version. The decision itself is
+        # not lost: the scenario_accepted row stays in the ledger and the scenario_unaccepted row
+        # below is appended beside it, which is what an append-only trail means.
+        #
+        # RETURNING, so the ledger records exactly the rows this UPDATE flipped. A row someone
+        # else decided first simply does not match, and the accept below then collides with the
+        # unique index — which accept_session already converts into a typed 409.
+        flipped = [str(r[0]) for r in sess.execute(
+            update(out)
+            .where(out.SessionID == session_id, out.ScenarioID.in_(list(displace)),
+                accepted(out.Accepted))
+            .values(Accepted=0, AcceptedAt=None, AcceptedBy=None, AcceptedSubsetJSON=None)
+            .returning(out.ScenarioID)
+        ).all()]
+        if flipped:
+            sess.execute(insert(m.Scenario_Audit), [
+                audit_row(sess, AuditID=guid(), SessionID=session_id, TenantID=tenant_id,
+                        EntityID=entity_id, ScenarioID=oid,
+                        EventType=AuditEventType.scenario_unaccepted, ActorUserID=user_id,
+                        DetailJSON=json.dumps({"replaced_by": displace[oid]}))
+                for oid in flipped])
     where = _decidable_where(session_id, subsystem_ids, decision, subset)
 
     # Read first, so each scenario gets its own ledger row. Exact rather than racy: every caller

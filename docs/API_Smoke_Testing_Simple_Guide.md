@@ -376,8 +376,11 @@ split matches who actually acted.
   for rows with those `EventType` values. `AuditDecision.regenerate` is still
   defined but still has no writer: a regenerate is recorded through
   `regeneration_completed`, never through `Scenario_Audit.Decision='regenerate'`.
-  Separately, `scenario_unaccepted` (undoing an accept after the fact) is
-  defined but has no route that writes it yet.
+  Separately, `scenario_unaccepted` is written by exactly one thing: an accept
+  carrying `replace_accepted: true` (Test 6), which moves the decision to
+  another version of the same scenario. Its `DetailJSON` names the version that
+  replaced it (`{"replaced_by": "..."}`), and the original `scenario_accepted`
+  row stays — the trail shows both decisions, never a rewritten one.
 
 ### What the trail does not cover
 
@@ -884,8 +887,15 @@ rows — the retired original keeps `Superseded=1`, and `/results` returns the l
 accepted old version stays on the list beside its replacement and you count 6, not 5. That is
 correct rather than a duplicate: an accept is a decision on record and must not disappear
 because somebody regenerated afterwards. Tell the two apart by `accepted` — the retired one
-reads `accepted: true`, the fresh one `accepted: false`. If you want the count to stay at 5,
-regenerate before accepting, not after.
+reads `accepted: true`, the fresh one `accepted: false`.
+
+**A rewrite does not inherit the decision, and you have to make one.** The rewrite comes back
+`accepted: false`, and while it sits undecided the session's `progress.overall` returns to
+`awaiting_review`. Two ways to close it, both in Test 6: accept the rewrite with
+`"replace_accepted": true` — it becomes the accepted version and the old one moves to history,
+taking its remediation plan off the board with it — or reject the rewrite to keep what you
+already accepted. Until you do one of them, accept-all stays refused for this session, because
+the undecided rewrite is a second version of an already-accepted scenario.
 
 **Three things can happen — and two of them look like "nothing happened".**
 All three leave you with the same number of scenarios, so check this table
@@ -1094,6 +1104,24 @@ curl -s -X POST "http://localhost:8000/v1/sessions/3fa85f64-5717-4562-b3fc-2c963
 | `none` | `{"mode": "none"}` | accept nothing (still a valid, successful call — `accepted_count: 0`) |
 | `subset` | `{"mode": "subset", "scenario_ids": ["..."]}` | accept only the ids you list |
 
+**Changing your mind after a regeneration.** Only one version of a scenario can be
+accepted. If you accepted a scenario, regenerated it, and now want the rewrite instead,
+name the rewrite and add `replace_accepted`:
+
+```bash
+  -d '{"mode": "subset", "scenario_ids": ["<the rewrite>"], "replace_accepted": true}'
+```
+
+The rewrite becomes the accepted version; the one it replaces stops being accepted and
+moves to history — never deleted, and both decisions stay in the audit trail. Its
+remediation plan stays attached to it: still readable at its own `scenario_id`, but out
+of the plan board and the register, so one risk never shows two plans. Accept that older
+version again (same flag) and its plan comes back with it. Without the flag the call is
+refused with `409 duplicate_identity`, and the message spells out both ways forward — so
+a UI can turn that refusal into a "replace it?" prompt. `replace_accepted` with
+`mode: "all"` or `"none"` is a `422`: one click must never rewrite decisions the register
+already carries.
+
 **Output (complete response):**
 
 ```json
@@ -1157,7 +1185,7 @@ verify it — that table does not exist in the current schema at all.
 
 | Table | Read/Write | What happens |
 |---|---|---|
-| `Threat_Scenario` | Write | chosen rows get `Accepted=1`, `AcceptedAt`/`AcceptedBy` |
+| `Threat_Scenario` | Write | chosen rows get `Accepted=1`, `AcceptedAt`/`AcceptedBy`. With `replace_accepted`, the version being replaced first goes back to `Accepted=0` with those stamps cleared — so a later re-accept records who decided *then*; the ledger keeps the original decision |
 | `Subsystem_Stage_State` | Write (transient) | `_LOCK` row held for the call's duration, then released |
 | `Scenario_Audit` | Write | the three events above, attributed to you |
 | `Identified_Threat`, `Threat_Type`, `Threat_Catalogue` | Read | the liveness gate behind `master_inactive` |
@@ -1177,6 +1205,11 @@ SELECT SessionStatus, CurrentStage, CompletedAt FROM Scenario_Session WHERE Sess
 SELECT EventType, Decision, ActorUserID, ActorType, CreatedAt
 FROM Scenario_Audit WHERE SessionID='<sid>'
   AND EventType IN ('review_decision','scenarios_accepted','scenario_accepted');
+
+-- After a replace: who dropped which version, and what replaced it. The original
+-- scenario_accepted row is still there — both decisions, never one rewritten:
+SELECT ScenarioID, ActorUserID, DetailJSON, CreatedAt
+FROM Scenario_Audit WHERE SessionID='<sid>' AND EventType='scenario_unaccepted';
 ```
 
 **Must-fail checks:**
@@ -1187,7 +1220,10 @@ FROM Scenario_Audit WHERE SessionID='<sid>'
 | Accept a session that was cancelled | `409 accept_conflict` (`details.reason: "session_cancelled"`) |
 | Accept while generation is working, still queued, or between stages | `409 accept_conflict` (`details.reason: "generation_in_progress"`) — the only reason worth polling on. An accept sent right after creating the session lands here; it never cancels the queued run |
 | Accept after the run was abandoned — a worker died (its lease expired) or it never started within the grace period — and automatic recovery couldn't park the session at REVIEW | `409 accept_conflict` (`details.reason: "generation_abandoned"`) — not retryable; cancel and start a new session |
-| A `scenario_id` naming two different versions of the same scenario, or one that conflicts with a version already accepted on this session | `409 accept_conflict` (`details.reason: "duplicate_identity"`) |
+| A `scenario_id` naming two different versions of the same scenario **in one call** | `409 accept_conflict` (`details.reason: "duplicate_identity"`) — always, even with `replace_accepted` |
+| A `scenario_id` naming a different version of a scenario already accepted on this session, without `replace_accepted` | `409 accept_conflict` (`details.reason: "duplicate_identity"`). Resend with `"replace_accepted": true` to adopt it, or reject it to keep the current one |
+| `replace_accepted` sent with `mode: "all"` or `mode: "none"` | `422` — refused rather than ignored |
+| Replacing in a version you already rejected | `404 not_found` (`reason: "already_rejected"`) — the accepted version is untouched |
 | A `scenario_id` that isn't a decidable scenario of THIS session | `404 not_found` — and **nothing is accepted**, even the ids that were fine |
 | A master threat type/catalogue was **soft-deleted** (`IsDeleted=1`) meanwhile | `409 master_inactive`. This gate is `IsDeleted`-only **by design**: setting `IsActive=0` does NOT trip it. A threat that `promote-to-library` (Test 9b) just minted starts `IsActive=0` pending curator review, and accepting a session containing it has to keep working. A tester who merely deactivates a row and expects a 409 will get a 200 |
 
@@ -2099,6 +2135,7 @@ curl -s -X POST "http://localhost:8000/v1/sessions/5b7c9d21-93a4-4f10-9a83-0f4c1
 2. Re-run `GET .../treatment-plan`: `review_status` matches, `reviewed_by`/`reviewed_at` are stamped.
 3. Review again with the opposite decision — the verdict overwrites; only the latest shows.
 4. To exercise the version-switch branch: regenerate the plan once (a fresh active version, unreviewed), then POST here with `plan_id` set to the FIRST plan's id and `decision: "approved"`. The old plan becomes active again; the regenerated one becomes history — both keep their own verdicts.
+5. **A replaced scenario's plan cannot be reviewed.** If someone accepted a regeneration of this scenario with `replace_accepted` (Test 6), this returns `409 treatment_conflict` (`details.reason: "scenario_not_accepted"`). The plan is still readable at its own `scenario_id` and becomes reviewable again if that version is accepted again — a verdict only belongs on the version the register carries.
 
 **Tables used:**
 
@@ -2143,7 +2180,7 @@ ORDER BY CreatedAt;
 |---|---|
 | **API** | `GET /v1/entities/{entity_id}/treatment-plans` |
 | **Why does this API exist?** | "Which Critical risks still have no approved plan?" spans every asset an entity owns — this is the one page that answers it without a database ticket. |
-| **What does it do?** | Lists every plan (across every session/scenario) belonging to the entity, newest first, filterable by status/review outcome/risk level. |
+| **What does it do?** | Lists every plan (across every session/scenario) belonging to the entity, newest first, filterable by status/review outcome/risk level. Plans of scenario versions that are no longer accepted — someone replaced them via Test 6's `replace_accepted` — are not listed, so one risk never shows two plans; they stay readable at their own `scenario_id`. |
 | **When do you call it?** | Any time — it's a read-only register view, not tied to any single session's lifecycle. |
 
 **Input (complete request):**

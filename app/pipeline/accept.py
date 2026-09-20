@@ -68,8 +68,17 @@ class MasterInactive(Exception):
 
 
 def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: list[str] | None,
-                                    subsystem_ids: list[int]) -> None:
+                                    subsystem_ids: list[int],
+                                    *, replace_accepted: bool = False) -> dict[str, str]:
     """Refuse an accept that would leave TWO versions of one scenario accepted, before any write.
+
+    Returns {already-accepted ScenarioID: the version replacing it} — empty unless the reviewer
+    asked to replace. `replace_accepted` is that ask (AcceptBody.replace_accepted): the collision
+    below stops being a refusal and becomes the replacement decide_scenarios writes. It is
+    deliberately NOT the default — retiring a decision the register already carries, and with it
+    the remediation plan hanging off that version, is not something a stray double-click may do.
+    Accept-ALL never replaces: `subset is None` keeps the refusal whatever the flag says, so one
+    click can never rewrite every decision in a session.
 
     `subset=None` means accept-all, which is checked too: accepting version A, regenerating to
     version B, then clicking accept-all flips B while A is still Accepted=1 — two accepted
@@ -91,11 +100,12 @@ def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: lis
     an already-accepted scenario is a conflict. Keeping the pairs but discarding the ids made an
     id collide with itself, turning a harmless double-click into a 409."""
     if subset is not None and not subset:
-        return  # decide-none writes nothing; nothing can collide
+        return {}  # decide-none writes nothing; nothing can collide
     already = dal.accepted_identity_pairs(sess, session_id)
     pairs = (dal.scenario_identity_pairs(sess, session_id, subset, subsystem_ids) if subset is not None
             else dal.active_accept_candidates(sess, session_id, subsystem_ids))
     seen_identity: dict[tuple, str] = {}
+    displace: dict[str, str] = {}
     for oid in (dict.fromkeys(subset) if subset is not None else pairs):
         pair = pairs.get(oid)
         # NULL IdentityHash = a legacy pre-IdentityHash row, which the filtered index exempts
@@ -104,12 +114,17 @@ def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: lis
             continue
         prior = already.get(pair)
         if prior is not None and prior != oid:
-            raise AcceptConflict(
-                f"Nothing was accepted. {oid} "
-                f"{_REASON_TEXT[ScenarioDecisionReason.duplicate_identity]} "
-                f"(version {prior} of that scenario was already accepted on this session — "
-                f"accept only one version of each scenario).",
-                reason=ScenarioDecisionReason.duplicate_identity)
+            if not replace_accepted or subset is None:
+                raise AcceptConflict(
+                    f"Nothing was accepted. {oid} "
+                    f"{_REASON_TEXT[ScenarioDecisionReason.duplicate_identity]} "
+                    f"(version {prior} of that scenario was already accepted on this session). "
+                    f"To make {oid} the accepted version instead, repeat this call naming it with "
+                    f'"replace_accepted": true — {prior} then moves to history, keeping its audit '
+                    f"trail, and its remediation plan stays with it and leaves the plan board. To "
+                    f"keep {prior}, reject {oid} instead.",
+                    reason=ScenarioDecisionReason.duplicate_identity)
+            displace[prior] = oid
         if pair in seen_identity:
             raise AcceptConflict(
                 f"Nothing was accepted. {oid} "
@@ -117,10 +132,11 @@ def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: lis
                 f"(the other selected version: {seen_identity[pair]}).",
                 reason=ScenarioDecisionReason.duplicate_identity)
         seen_identity[pair] = oid
+    return displace
 
 
 def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str | None,
-                subset: list[str] | None = None) -> int:
+                subset: list[str] | None = None, *, replace_accepted: bool = False) -> int:
     scenario_session = dal.get_session(sess, session_id, entity_id)
     if scenario_session is None:
         raise EntityForbidden(f"session {session_id} not in entity {entity_id}")
@@ -146,13 +162,17 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
         if subset is not None:
             # Use canonical ids for checks, writes, and audit data.
             subset = [dal.canonical_guid(s) for s in subset]
-        _assert_one_version_per_scenario(sess, session_id, subset, good_subs)
+        displace = _assert_one_version_per_scenario(sess, session_id, subset, good_subs,
+                                                replace_accepted=replace_accepted)
         try:
             # decide_scenarios writes the per-scenario ledger rows in the SAME call — accept has
-            # no separate audit step that could fall out of step with the decision.
+            # no separate audit step that could fall out of step with the decision. `displace`
+            # rides along for the same reason: a replacement un-accepts one version and accepts
+            # another, and those two writes must not be separable either.
             matched = dal.decide_scenarios(
                 sess, session_id, good_subs, decision=AuditDecision.accept, subset=subset,
-                tenant_id=scenario_session["TenantID"], entity_id=str(entity_id), user_id=user_id)
+                tenant_id=scenario_session["TenantID"], entity_id=str(entity_id), user_id=user_id,
+                displace=displace)
         except IntegrityError as exc:
             # The pre-flight above reads, then this writes — two concurrent accepts naming
             # different versions of one scenario both pass the read and collide here.
@@ -208,7 +228,7 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
                             DetailJSON=json.dumps({"subset": subset}) if subset is not None else None)
         sess.commit()
         log.info("session.accepted", session_id=session_id, decision=str(decision),
-                accepted_count=matched, user=user_id)
+                accepted_count=matched, replaced_count=len(displace), user=user_id)
         # SSE is a hint; stream status is authoritative.
         bus.publish(session_id, {"type": "session_accepted", "session_id": session_id,
                                 "status": str(SessionStatus.completed), "ts": now().isoformat()})

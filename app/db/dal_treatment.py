@@ -40,7 +40,7 @@ from app.db.dal import (  # shared helpers stay in the parent
 
 
 # ---------------------------------------------------------------------------
-# Risk Treatment Plan rows (docs/RISK_TREATMENT_PLAN_SDD.md §6). The plan row IS the state — no
+# Risk Treatment Plan rows. The plan row IS the state — no
 # Subsystem_Stage_State involvement, since accepted scenarios live on completed sessions where
 # acquire_lock refuses to run. Every conditional-UPDATE fence lives here; treatment.py and
 # api/treatment.py never build their own SQL.
@@ -217,7 +217,10 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
         # ReviewComment — wire-hidden, hauled only here so the poll GET keeps its
         # one-flag-unhide contract.
         select(*plan_presenter_columns(), p.TenantID, p.EntityID, p.ActiveTaskID, p.ReviewComment,
-               out.ScenarioJSON,
+            # Accepted: the review route's gate. A verdict may only land on the plan of the
+            # version the register carries — see api/treatment.py::post_review_treatment_plan.
+            out.Accepted,
+            out.ScenarioJSON,
             # The threat's own identity — NOT part of the LLM's scenario JSON (same split as
             # sessions._build_scenario). OUTER for the same reason as _scenario_read_select:
             # no enforced FKs, so a broken linkage must null these, never drop the plan row.
@@ -322,7 +325,15 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
     stmt = (
         select(*cols)
         .select_from(joined)
-        .where(ss.EntityID == entity_id, active(p.Superseded)))
+        .where(ss.EntityID == entity_id, active(p.Superseded),
+            # The register answers "which risks still lack an approved plan", so it carries the
+            # plans of the versions actually on the register — the rule session_plan_board already
+            # follows. A plan whose scenario was REPLACED (accept with replace_accepted) stays
+            # readable at its own scenario id and returns here if that version is ever accepted
+            # again, but it must not sit beside the new version's plan as a second answer for one
+            # risk. `ScenarioID IS NULL` keeps the outer join's purpose: a plan whose scenario
+            # linkage is broken stays visible rather than being silently dropped.
+            or_(out.ScenarioID.is_(None), accepted(out.Accepted))))
     if status == str(StageStatus.ERROR):
         stmt = stmt.where(or_(p.Status == StageStatus.ERROR,
                             and_(p.Status == StageStatus.RUNNING,
