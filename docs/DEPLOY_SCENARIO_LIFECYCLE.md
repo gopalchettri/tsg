@@ -97,7 +97,10 @@ Authentication is **not** relaxed: every route verifies `X-API-Key` against a st
 checks entity scope, and `app/api/route_audit.py` refuses to boot if any route misses that. A URL
 on its own returns 401.
 
-## 5a. Run the version check once, per environment
+## 5a. If this environment holds sessions from before the release, run the version check
+
+Skip this step on an environment whose data starts at this release — it can only find damage
+written by the old code. Where older sessions exist:
 
 ```bash
 .venv/Scripts/python.exe scripts/check_scenario_versions.py
@@ -114,7 +117,8 @@ register.
 Regeneration now retires the version it was asked to replace **by id**, so no new pair can appear.
 Existing pairs are a human decision: reject the version you do not want, or accept the one you do
 with `replace_accepted`. Development was clean when this shipped; UAT and production had not been
-checked.
+checked. Keep the script: it stays cheap, costs nothing at runtime, and is the only way to answer
+the question if an environment is ever suspected of holding a pair.
 
 ## 6. Verify after deploying
 

@@ -1224,7 +1224,8 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
     identity on screen (identity folds exactly like Threat_Scenario's IdentityHash), and does this
     THREAT already have a live scenario. Candidates sharing one identity collapse to the
     best-ranked, so one call never proposes an internal duplicate."""
-    # Two answers from ONE read: the identities already on screen, and the THREATS behind them.
+    # Two answers from ONE read, shared with active_identified_threat_identities so the question
+    # "is this threat already here?" cannot be answered two ways by two callers.
     #
     # The identity half alone was not enough. A threat's identity is folded from its CURRENT
     # library ids, and promote-to-library rewrites those ids on an AI-found threat
@@ -1233,28 +1234,13 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
     # screen — accepted, even — reads as unserved and gets served a second time. Asking "does
     # this threat already have a live scenario?" cannot drift, because it compares ids rather
     # than a hash of mutable data.
-    served = sess.execute(
-        select(m.Threat_Scenario.IdentityHash, m.Scoped_Threat.ThreatID)
-        .select_from(m.Threat_Scenario.__table__.outerjoin(
-            m.Scoped_Threat, m.Threat_Scenario.ScopedThreatID == m.Scoped_Threat.ScopedThreatID))
-        .where(
-            m.Threat_Scenario.SessionID == session_id,
-            m.Threat_Scenario.SubsystemID == subsystem_id,
-            active(m.Threat_Scenario.Superseded),
-            # complete ONLY — the same contract threats_with_active_scenario states: a threat
-            # whose only active row is a FAILURE CARD has NOT been served, and the next-set sweep
-            # must treat it as unserved. Without this predicate a failed generation stamps a real
-            # IdentityHash here, the threat reads as done, and it becomes permanently unreachable
-            # by "generate next set" — only a per-card regenerate recovers it. Every sibling read
-            # of this table filters the same way; this query was the lone exception.
-            m.Threat_Scenario.Status == ScenarioStatus.complete,
-        )
-    ).all()
-    active_hashes = {r[0] for r in served}
+    #
     # Deliberately blind to Scoped_Threat.Superseded: the question is whether the THREAT has a
     # live scenario on screen, and it does — a regeneration retires the scoping row under a
     # scenario it keeps. Filtering on it would call such a threat unserved and serve it twice.
-    served_threat_ids = {str(r[1]) for r in served if r[1] is not None}
+    served = scenario_identities_by_threat(sess, session_id, subsystem_id)
+    active_hashes = set(served)
+    served_threat_ids = set(served.values())
     it, st = m.Identified_Threat, m.Scoped_Threat
     rows = sess.execute(
         select(it.ThreatID, it.ThreatCatalogueID, it.ThreatTypeID, it.ThreatType, it.ThreatName, st.Score)
@@ -1290,13 +1276,51 @@ def next_unserved_unique_threats(sess: Session, session_id: str, subsystem_id: i
     return picked
 
 
+def scenario_identities_by_threat(sess: Session, session_id: str,
+                                subsystem_id: int) -> dict[str, str]:
+    """{IdentityHash stored on a live scenario row: the ThreatID it was generated from}.
+
+    A threat's identity is FOLDED from its library ids, and promote-to-library rewrites those ids
+    — so after a promotion the session knows one threat under two spellings: the fold of its ids
+    now, and the one its scenario rows were written with. This is the second spelling, read from
+    the rows themselves, where it cannot drift.
+
+    One source for the two questions that must never disagree: "has this threat been served?"
+    (next_unserved_unique_threats) and "is this threat already here?"
+    (active_identified_threat_identities). Complete rows only, the contract every sibling read of
+    this table keeps: a failure card is not a served threat."""
+    out, st = m.Threat_Scenario, m.Scoped_Threat
+    return {r[0]: str(r[1]) for r in sess.execute(
+        select(out.IdentityHash, st.ThreatID)
+        .select_from(out.__table__.join(st, out.ScopedThreatID == st.ScopedThreatID))
+        .where(out.SessionID == session_id, out.SubsystemID == subsystem_id,
+            active(out.Superseded), out.Status == ScenarioStatus.complete,
+            out.IdentityHash.is_not(None))
+    ).all()}
+
+
 def active_identified_threat_identities(sess: Session, session_id: str, subsystem_id: int) -> dict[str, str]:
-    """Folded identity -> ThreatID of this (session, subsystem)'s ACTIVE Identified_Threat rows.
-    find_threats(supersede=False) skips an additive proposal matching one — otherwise a
-    re-proposal leaks a never-scored dead threat row (the index still blocks the duplicate
-    scenario). The ThreatID rides along so a caught duplicate can record WHICH existing threat
-    it matched (Identified_Duplicate_Threat.DuplicateOfThreatID) — previously computed here and
-    discarded once the hash was folded."""
+    """EVERY identity this (session, subsystem)'s active threats are known by -> ThreatID.
+    find_threats(supersede=False) skips an additive proposal matching one, so a threat already
+    here is recorded as a duplicate instead of being admitted twice. The ThreatID rides along so
+    the duplicate row can name WHICH existing threat it matched
+    (Identified_Duplicate_Threat.DuplicateOfThreatID).
+
+    TWO spellings per threat, not one. This used to fold the identity from each threat's CURRENT
+    library ids only, on the reasoning — written in its own docstring — that a leaked re-proposal
+    was harmless because "the index still blocks the duplicate scenario". Promote-to-library
+    rewrites those ids, and that is exactly what stops the index blocking it:
+
+      * the promoted threat's scenario rows keep the identity they were written with;
+      * promotion mints its catalogue row INACTIVE pending curation, and matching only considers
+        active rows — so the AI re-proposing that same threat does not ground onto it, and folds
+        the OLD spelling, which this dictionary did not contain;
+      * admitted as a new threat, its scenario is written under that old identity, and
+        supersede_by_identity_hashes then matches the ACCEPTED scenario and retires it.
+
+    A reviewer's accepted scenario, silently replaced by a "new" threat's, looking like an
+    ordinary regeneration. Carrying both spellings ends it at the source: the answer to "is this
+    threat already here?" no longer depends on which spelling you ask with."""
     identities: dict[str, str] = {}
     for r in sess.execute(
         select(m.Identified_Threat.ThreatID, m.Identified_Threat.ThreatCatalogueID,
@@ -1306,7 +1330,11 @@ def active_identified_threat_identities(sess: Session, session_id: str, subsyste
             active(m.Identified_Threat.Superseded))
     ).mappings():
         identities[identity_hash(session_id, subsystem_id, _row_to_dedup_info(r))] = r["ThreatID"]
-    return identities
+    # The rows' own spelling second, so a live scenario's identity always resolves to its threat.
+    # It never overwrites a current fold with a stale one for a DIFFERENT threat: both map to the
+    # same ThreatID when they belong to the same threat, and a scenario whose threat is no longer
+    # active is exactly the case the caller still wants recognised.
+    return scenario_identities_by_threat(sess, session_id, subsystem_id) | identities
 
 
 def active_category_names(sess: Session) -> list[str]:

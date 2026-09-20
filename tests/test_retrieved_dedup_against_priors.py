@@ -105,11 +105,14 @@ class FakeLLM:
 
 def _engine():
     engine = create_engine("sqlite://")
+    # Threat_Scenario/Scoped_Threat: the prior-round dedup now also asks which identities this
+    # session's LIVE SCENARIOS carry, because a threat's folded identity moves when
+    # promote-to-library rewrites its library ids while its scenario rows keep the old spelling.
     for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Identified_Threat,
                 m.Identified_Duplicate_Threat, m.Scenario_Audit, m.Prompt_Log,
                 m.Threat_Category, m.Threat_Type, m.Threat_Catalogue,
                 m.Threat_Actor, m.ThreatType_ThreatActor_Map,
-                m.Threat_Catalogue_Category_Map):
+                m.Threat_Catalogue_Category_Map, m.Threat_Scenario, m.Scoped_Threat):
         tbl.__table__.create(engine)
     return engine
 

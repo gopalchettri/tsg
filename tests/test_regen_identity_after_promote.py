@@ -250,6 +250,122 @@ def test_a_rewrite_is_not_asked_to_differ_from_its_own_text(monkeypatch, tmp_pat
     assert str(live[0]["ReplacesScenarioID"]) == old_id
 
 
+def _promoted_session(Session):
+    """A session whose accepted scenario 6 has been through the REAL promote-to-library.
+
+    Every other test here simulates the promotion by stamping the catalogue id the way promote
+    does. This one calls the actual function, so the drift under test is the one production
+    produces — including the detail that decides the rest: the catalogue row it mints is INACTIVE,
+    pending curation, and matching only considers active rows.
+    """
+    from app.pipeline.promote import promote_scenario_to_library
+
+    sid = _seed_session(Session)
+    tid, scoped_id, oid = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    # An AI-FOUND threat: no catalogue id yet, which is the case promotion changes.
+    info = {"threat_id": tid, "catalogue_id": None, "threat_type_id": None,
+            "threat_type": "Data exfiltration", "threat_name": "USB export of billing records"}
+    identity = dal.identity_hash(sid, 0, info)
+    with Session() as s:
+        s.execute(m.Identified_Threat.__table__.insert().values(
+            ThreatID=tid, SessionID=sid, SubsystemID=0, ThreatCategory="Exfiltration",
+            ThreatType=info["threat_type"], ThreatName=info["threat_name"],
+            ThreatTypeID=None, ThreatCatalogueID=None, ThreatCategoryID=None,
+            GroundingStatus="unverified", Superseded=0, CreatedAt=_now()))
+        s.execute(m.Scoped_Threat.__table__.insert().values(
+            ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ThreatID=tid, Score=9.5, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=_now()))
+        s.execute(m.Threat_Scenario.__table__.insert().values(
+            ScenarioID=oid, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            SubsystemID=0, ScopedThreatID=scoped_id, Status=str(ScenarioStatus.complete),
+            ScenarioJSON=json.dumps({"scenario_title": "USB export",
+                                    "scenario_statement": "An agent copies the payment list."}),
+            Accepted=1, Superseded=0, IdentityHash=identity, ScenarioNumber=1,
+            GenerationEpoch=1, CreatedAt=_now()))
+        s.commit()
+
+    with Session() as s:
+        session_row = dict(dal.load_session(s, sid))
+        promote_scenario_to_library(s, session_row, oid, "u1")
+
+    with Session() as s:
+        threat = s.execute(select(m.Identified_Threat.ThreatCatalogueID,
+                                m.Identified_Threat.ThreatTypeID)
+                        .where(m.Identified_Threat.ThreatID == tid)).mappings().one()
+        drifted = dal.identity_hash(sid, 0, {**info, "catalogue_id": threat["ThreatCatalogueID"],
+                                            "threat_type_id": threat["ThreatTypeID"]})
+    assert threat["ThreatCatalogueID"] is not None, "the real promote stamped a catalogue id"
+    assert drifted != identity, (
+        "precondition: the threat's identity really did move, or this proves nothing")
+    return sid, tid, scoped_id, oid, identity
+
+
+def test_promote_then_regenerate_leaves_exactly_one_live_version(monkeypatch):
+    """THE bug, end to end, through the real promote: accept a scenario, promote its threat to the
+    library, then regenerate it.
+
+    Before the fix the rewrite was stamped with the threat's NEW identity and retired "whatever
+    holds it" — nothing — so the accepted version stayed live beside its replacement. Two versions
+    of one scenario, carrying different identities, each separately acceptable and each able to
+    hold its own remediation plan: one risk, counted twice."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid, tid, scoped_id, oid, identity = _promoted_session(Session)
+
+    new_scoped = str(uuid.uuid4())
+    target = tasks.RegenTarget(scenario_id=oid, threat_id=tid, scoped_threat_id=scoped_id,
+                            scenario_number=1, identity_hash=identity)
+    with Session() as s:
+        # The threat AS IT IS NOW — carrying the ids promotion stamped, which is what the
+        # regeneration would fold a fresh identity from if it re-derived one.
+        enriched = {t["threat_id"]: t for t in dal.active_threats(s, sid, 0)}
+        assert tasks._reconcile_targeted_regen(
+            s, sid, 0, "t", "86", "u1",
+            pairs=[(_scored(tid), new_scoped, target)],
+            scenarios={new_scoped: ({"scenario_title": "rewritten"}, {}, (_now(), _now()))},
+            enriched=enriched, epoch=2, task_id="task-1", regen_mode=True) is True
+        s.commit()
+
+    with Session() as s:
+        rows = {str(r["ScenarioID"]): r for r in s.execute(
+            select(m.Threat_Scenario.ScenarioID, m.Threat_Scenario.Superseded,
+                m.Threat_Scenario.Accepted, m.Threat_Scenario.IdentityHash,
+                m.Threat_Scenario.ReplacesScenarioID)
+            .where(m.Threat_Scenario.SessionID == sid)).mappings()}
+    live = [r for r in rows.values() if not r["Superseded"]]
+    assert len(live) == 1, "one scenario, one live version — this is the whole bug"
+    assert live[0]["IdentityHash"] == identity, (
+        "the rewrite kept the identity its target carried, so the accept guard still sees "
+        "one scenario rather than two unrelated ones")
+    assert str(live[0]["ReplacesScenarioID"]) == oid
+    assert rows[oid]["Superseded"] == 1, "the version it replaced is retired"
+    assert rows[oid]["Accepted"] == 1, "its decision is untouched — only accept may move that"
+
+
+def test_next_set_cannot_replace_an_accepted_scenario_after_a_promotion():
+    """The path that was still open after the first fix, and the reason it mattered.
+
+    The AI re-proposes a threat that is already here — common, it is a real threat for this asset.
+    It does not ground onto the catalogue row promotion just minted, because that row is INACTIVE
+    pending curation, so it folds the threat's OLD identity. That spelling was missing from the
+    dedup dictionary, so the proposal was admitted as a NEW threat, its scenario was written under
+    the old identity, and supersede_by_identity_hashes then matched the ACCEPTED scenario and
+    retired it — a reviewer's decision silently replaced, looking like an ordinary regeneration.
+
+    Both spellings now resolve to the same threat, so the re-proposal is recognised for what it
+    is before anything is written."""
+    Session = sessionmaker(bind=_engine(), future=True)
+    sid, tid, _scoped_id, _oid, identity = _promoted_session(Session)
+
+    with Session() as s:
+        known = dal.active_identified_threat_identities(s, sid, 0)
+
+    assert known.get(identity) == tid, (
+        "the identity the accepted scenario carries must still resolve to its threat")
+    with Session() as s:
+        assert dal.next_unserved_unique_threats(s, sid, 0, 5) == [], (
+            "and the threat counts as served, so next-set will not re-serve it either")
+
+
 def test_next_set_leaves_alone_a_threat_that_already_has_a_scenario():
     """The other half of the same drift. The threat's scenario is on screen — accepted, even — so
     "generate next set" must not serve it again just because its identity now folds elsewhere."""
