@@ -30,6 +30,7 @@ the caller's own `identity_keys()` dedup would accept a list the resolver then c
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
@@ -82,13 +83,24 @@ class _LibraryControl:
     control_description: str | None = None
 
     def as_reference(self) -> dict[str, Any]:
-        """The canonical reference: the LIBRARY's spelling of all five keys, whichever one the
-        caller sent. The register's baseline is rendered from this downstream
+        """The canonical reference: the LIBRARY's spelling of every key, whichever one the caller
+        sent. The register's baseline is rendered from this downstream
         (treatment_input.build_existing_controls_block), so a caller's mis-cased code or loosely
-        spelled name reaches the model as the library's own text rather than as their typo."""
-        return {"control_id": self.control_id, "control_code": self.control_code,
-                "control_name": self.control_name, "domain": self.domain,
-                "control_description": self.control_description}
+        spelled name reaches the model as the library's own text rather than as their typo.
+
+        BUILT FROM THE FIELDS, not a hand-typed dict. The keys were listed by hand here AND again
+        in build_existing_controls_block, which rebuilds the entry key by key — so a sixth field
+        added here was silently dropped from the snapshot, and the AI judged control coverage
+        without data the shipped prompt tells it it has. No error, no warning, just quietly worse
+        output. This half now extends itself; the parity test holds the other half to it."""
+        return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+
+
+#: The keys a resolved control reference carries, derived from the dataclass so it cannot be
+#: out of date. treatment_input.build_existing_controls_block rebuilds the entry key by key and
+#: CANNOT import this (app.pipeline must not import app.api), so the parity test in
+#: tests/test_control_reference_shape.py is what holds the two halves together.
+CONTROL_REFERENCE_KEYS: tuple[str, ...] = tuple(f.name for f in dataclasses.fields(_LibraryControl))
 
 
 @dataclass

@@ -158,7 +158,10 @@ class TreatmentPlanBody(ApiModel):
                      "controls by TSG (name, domain and description fetched from the library); "
                      "free text is judged by the AI. Optional: omitted, null, \"\" and [] all "
                      "mean a risk with no recorded controls. At most 50 entries; blank entries "
-                     "are dropped, order is kept, and naming one control twice is a 422."))
+                     "are dropped, order is kept, and naming one control twice KEEPS THE FIRST "
+                     "and drops the repeat — it is not an error. (The scenario's own "
+                     "mapped_controls is the opposite: a duplicate there is a 422, because those "
+                     "entries become rows.)"))
     likelihood_rating: _RATING | None = Field(
         default=None, description=f"Register likelihood — {_RATING_RULE}.")
     impact_rating: _RATING | None = Field(
