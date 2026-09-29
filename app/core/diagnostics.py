@@ -31,6 +31,7 @@ covers the class of failure 6174F288 belonged to, not every possible death.
 from __future__ import annotations
 
 import json
+import time
 import traceback as _traceback
 from typing import Any
 
@@ -61,12 +62,128 @@ _NEVER_CAPTURE = ("sqlalchemy", "aioodbc", "pyodbc", "app.core.diagnostic_writer
                   "app.core.diagnostics")
 
 
+#: Redis key holding the runtime override. ONE key, shared by the API process and every Celery
+#: worker — which is the entire reason this lives in Redis rather than in a module global. A
+#: toggle held in one process's memory changes nothing in the workers, where the pipeline actually
+#: runs: you would flip the switch, watch the API agree, and the capture would carry on unchanged.
+_OVERRIDE_KEY = "tsg:diagnostics:categories"
+
+#: Seconds a process may serve the override from memory before re-reading it. The trade this
+#: number makes: a change takes up to this long to reach every process, and in exchange a Redis
+#: round trip happens at most once per interval per process instead of ONCE PER LOG RECORD.
+_OVERRIDE_TTL = 10.0
+
+#: Seconds to back off after a FAILED read — deliberately far longer than the TTL. With Redis
+#: down, retrying on the normal interval would put a connect timeout on a log call every 10
+#: seconds forever, so the outage would degrade logging rather than just the toggle.
+_OVERRIDE_BACKOFF = 60.0
+
+#: Hard ceiling on how long one refresh may stall its caller. This read sits ON THE LOG PATH, so
+#: a slow Redis must degrade to "use the env value", never to "the application logs slowly".
+#: ponytail: a 250ms stall once per interval is the accepted cost; move the refresh onto the
+#: writer thread if that ever shows up in a latency profile.
+_OVERRIDE_TIMEOUT = 0.25
+
+#: (expires_at_monotonic, value). A plain tuple, reassigned atomically — no lock, because the
+#: worst outcome of two threads refreshing at once is two Redis reads and one discarded answer.
+#: MONOTONIC, not wall clock: a clock step must not freeze the cache or expire it early.
+_override_cache: tuple[float, str | None] = (0.0, None)
+_redis_client = None
+
+
+def _override_redis():
+    """A small client of our own, on the Redis this deployment already runs for the SSE bus and
+    the LLM slot limiter. Neither `bus._redis()` nor `llm._slot_redis()`: app.core must not import
+    app.sse or app.pipeline, and this client wants a far shorter timeout than either — it is read
+    from inside a log call, where their multi-second timeouts would be a stall, not a retry."""
+    global _redis_client
+    if _redis_client is None:
+        import redis
+
+        _redis_client = redis.Redis.from_url(
+            get_settings().redis_url, decode_responses=True,
+            socket_connect_timeout=_OVERRIDE_TIMEOUT, socket_timeout=_OVERRIDE_TIMEOUT)
+    return _redis_client
+
+
+def active_categories() -> str:
+    """The category list in force RIGHT NOW, normalised. The one source both readers below use.
+
+    Precedence, highest first: the runtime override in Redis, then the env var, then the built-in
+    default. Redis unreachable falls back to the env value rather than failing — an observability
+    switch must never be the thing that breaks the system it observes.
+    """
+    global _override_cache
+    env = (get_settings().diagnostic_db_categories or "").strip().lower()
+    expires, cached = _override_cache
+    now = time.monotonic()
+    if now >= expires:
+        try:
+            value = _override_redis().get(_OVERRIDE_KEY)
+            cached = (str(value).strip().lower() or None) if value is not None else None
+            _override_cache = (now + _OVERRIDE_TTL, cached)
+        except Exception:  # noqa: BLE001 — the env value is the documented fallback
+            cached = None
+            _override_cache = (now + _OVERRIDE_BACKOFF, None)
+    return cached or env
+
+
+def set_override(categories: str | None, ttl_seconds: int | None = None) -> None:
+    """Write (or, with None, clear) the runtime override. RAISES — unlike everything else here.
+
+    Deliberately the one loud function in this module: it is called from an admin endpoint by a
+    human who needs to know whether the switch actually moved. A silent failure would leave an
+    operator believing capture was off while every worker carried on writing.
+
+    `ttl_seconds` makes the override EXPIRE BY ITSELF, and it is the safety valve for the one
+    category that matters: `logs` writes personal data durably, and the realistic failure is not a
+    bad decision but a forgotten one — switched on to reproduce something, then left on for a
+    month. An operator who says "on for 30 minutes" cannot forget. None means no expiry, which
+    stays the right default for the four small categories."""
+    global _override_cache
+    r = _override_redis()
+    if categories is None:
+        r.delete(_OVERRIDE_KEY)
+    else:
+        r.set(_OVERRIDE_KEY, categories.strip().lower(), ex=ttl_seconds or None)
+    _override_cache = (0.0, None)   # expire OUR copy now; other processes follow within the TTL
+
+
+def override_status() -> dict[str, Any]:
+    """What this ONE process currently believes, for the admin config endpoint.
+
+    Per process on purpose. The endpoint answers "did my change land?", and the honest answer
+    differs between the API and each worker until their caches lapse — reporting a single global
+    number would hide exactly the case an operator is checking for."""
+    try:
+        raw = _override_redis().get(_OVERRIDE_KEY)
+        reachable, override = True, (str(raw).strip().lower() if raw is not None else None)
+    except Exception as exc:  # noqa: BLE001 — "Redis is down" is an ANSWER here, not a failure
+        reachable, override = False, None
+        return {"override": None, "redis_reachable": False,
+                "redis_error": f"{type(exc).__name__}: {exc}"[:200],
+                "env": (get_settings().diagnostic_db_categories or "").strip().lower(),
+                "effective": (get_settings().diagnostic_db_categories or "").strip().lower(),
+                "cache_ttl_seconds": _OVERRIDE_TTL, "dropped_rows": WRITER.dropped}
+    env = (get_settings().diagnostic_db_categories or "").strip().lower()
+    return {"override": override, "redis_reachable": reachable, "redis_error": None, "env": env,
+            "effective": override or env, "cache_ttl_seconds": _OVERRIDE_TTL,
+            "dropped_rows": WRITER.dropped}
+
+
+def known_categories() -> tuple[str, ...]:
+    """The accepted category names, so the admin endpoint validates against this module rather
+    than against a second hand-copied list that would drift the moment a category is added."""
+    return tuple(_CATEGORIES)
+
+
 def _enabled_kinds() -> frozenset[DiagnosticKind]:
     """Which kinds the current configuration saves.
 
-    Parsed per call, deliberately: get_settings is cached so this is a dict lookup, and reading it
-    live means a settings change takes effect without some code path holding the old answer."""
-    raw = (get_settings().diagnostic_db_categories or "").strip().lower()
+    Resolved per call, deliberately: a cached settings lookup plus a cached override read. Reading
+    it live is what lets the runtime toggle take effect without some code path holding the old
+    answer for the life of the process."""
+    raw = active_categories()
     if raw in {"", "none"}:
         return frozenset()
     if raw == "all":
@@ -135,7 +252,7 @@ def _request_id() -> str | None:
 def log_enabled() -> bool:
     """Is the raw log stream being captured? Read per record, so the runtime toggle takes effect
     without a restart and without this module holding a stale answer."""
-    raw = (get_settings().diagnostic_db_categories or "").strip().lower()
+    raw = active_categories()
     return raw == "all" or "logs" in {p.strip() for p in raw.split(",")}
 
 

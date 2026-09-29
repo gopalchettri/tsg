@@ -23,9 +23,44 @@ from app.api.sessions import _scenario_select
 from app.main import create_app
 
 _ERROR_REF = "#/components/schemas/ErrorResponse"
-# The only genuinely unauthenticated routes: platform liveness/readiness probes, which carry no
-# caller identity by design (app/api/route_audit.py maps both to `None`).
-_PUBLIC = {("/health", "get"), ("/ready", "get")}
+# The genuinely unauthenticated routes. Every entry is a DECISION recorded in
+# app/api/route_audit.py as `None`, and this set is the second place that decision has to be
+# written down — so making a route public is two deliberate edits, never a side effect of
+# forgetting a dependency somewhere.
+#
+#   /health, /ready              platform liveness and readiness probes, which carry no caller
+#                                identity by design.
+#   /v1/tsg/diagnostics*  (GET)  support diagnostics. Open on purpose: answering "why did this run
+#                                fail" must not require an admin key or database access, because
+#                                needing them is what put diagnosis behind the engineering team in
+#                                the first place. What keeps that safe is not auth but the SHAPE of
+#                                the response — tracebacks, captured log bodies and the context
+#                                blob are withheld unless TSG_DIAGNOSTIC_PUBLIC_DETAIL is on, and
+#                                it defaults off.
+#
+# PATCH /v1/tsg/diagnostics/config is deliberately ABSENT from this set: it is the switch that
+# turns on durable capture of prompt text, so it keeps require_admin. If it ever appears here,
+# that is the regression, and the test directly below says so.
+_PUBLIC = {
+    ("/health", "get"), ("/ready", "get"),
+    ("/v1/tsg/diagnostics", "get"),
+    ("/v1/tsg/diagnostics/logs", "get"),
+    ("/v1/tsg/diagnostics/config", "get"),
+}
+
+
+def test_the_diagnostics_write_switch_is_never_public(schema):
+    """The reads are open; the WRITE must not be — an asymmetry worth its own test rather than
+    trusting the set above to stay right.
+
+    PATCH /config turns on the `logs` category, which durably records whatever the application was
+    logging; in this system that includes asset context and prompt text. Public, it would let a
+    stranger start that recording, and fill the database doing it. Reading a failure is a support
+    action; changing what the system captures is not."""
+    op = schema["paths"]["/v1/tsg/diagnostics/config"]["patch"]
+    assert "security" in op, (
+        "PATCH /v1/tsg/diagnostics/config is published as unauthenticated — anyone could switch on "
+        "durable capture of prompt text and asset context, and fill the database doing it")
 
 
 @pytest.fixture(scope="module")

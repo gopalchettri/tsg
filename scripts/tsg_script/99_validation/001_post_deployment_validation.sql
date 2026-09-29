@@ -169,7 +169,7 @@ DECLARE @d int = (SELECT COUNT(*) FROM sys.default_constraints dc
                   WHERE tb.name IN (SELECT name FROM @owned));
 PRINT ' [INFO]    Tables:              ' + CAST(@t AS varchar(10)) + ' of 22';
 PRINT ' [INFO]    Non-PK indexes:      ' + CAST(@i AS varchar(10)) +
-      '  (32 expected: 31 from 03_indexes + UQ_Config_Tuning_Key)';
+      '  (36 expected: 35 from 03_indexes + UQ_Config_Tuning_Key)';
 PRINT ' [INFO]    Default constraints: ' + CAST(@d AS varchar(10)) + '  (22 expected)';
 
 /*-------------------------- the verdict --------------------------*/

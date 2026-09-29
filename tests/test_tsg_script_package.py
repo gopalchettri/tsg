@@ -176,7 +176,19 @@ def test_the_sign_off_verifies_every_column_and_index_shape() -> None:
 
     # Index SHAPE, not just presence: key columns in order, uniqueness and filtered-ness.
     idx = gen.index_definitions()
-    assert len(idx) == 31, f"expected 31 indexes parsed from the reviewed DDL, got {len(idx)}"
+    # DERIVED from the DDL, not hardcoded. The failure this guards is "the regex stopped matching"
+    # — a parser that silently drops indexes, so the verdict checks fewer shapes than the package
+    # builds. A literal count ALSO fails every time an index is legitimately added, which teaches
+    # whoever hits it that the number is noise to bump rather than a signal to read; it said 31
+    # until the diagnostics indexes landed. Counting CREATE statements in the same file the parser
+    # reads keeps the tripwire and drops the false alarm.
+    declared = len(re.findall(
+        r"^\s*CREATE\s+(?:UNIQUE\s+)?(?:NON)?CLUSTERED?\s*INDEX|^\s*CREATE\s+(?:UNIQUE\s+)?INDEX",
+        gen.SOURCE_SQL.read_text(encoding="utf-8"), re.M | re.I))
+    assert len(idx) == declared, (
+        f"the reviewed DDL declares {declared} indexes but the parser found {len(idx)} — the DDL "
+        "regex has stopped matching, and every shape comparison it feeds is now silently checking "
+        "fewer indexes than the package actually creates")
     assert all(i["columns"] for i in idx), (
         "an index parsed with no key columns — the DDL regex stopped matching, and every shape "
         "comparison it feeds would silently compare against an empty column list")

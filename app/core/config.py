@@ -132,6 +132,25 @@ class Settings(BaseSettings):
     # an out-of-memory kill. Losing diagnostics is a bad day; losing the worker is an outage.
     diagnostic_queue_max: int = Field(
         10000, ge=100, validation_alias=AliasChoices("TSG_DIAGNOSTIC_QUEUE_MAX"))
+    # TSG_DIAGNOSTIC_PUBLIC_DETAIL — whether the UNAUTHENTICATED diagnostics routes return the
+    # heavy fields: tracebacks, captured log bodies, and the context blob.
+    #
+    # WHY IT IS A SWITCH AND WHY IT DEFAULTS OFF. Those routes are deliberately public so a
+    # support engineer needs no key and no database access — that is the whole point of them. But
+    # public means public: the same URL answers anyone who finds it. The three fields this gates
+    # are the ones carrying payload rather than fact. A traceback names internal paths and code
+    # structure, and a captured log line in THIS system carries asset context and prompt text —
+    # tenancy contracts, landlord and tenant data, Emirates ID.
+    #
+    # What stays public either way is what support actually asks for: which session, when, what
+    # kind of failure, the exception class and message, and the sanitised text the customer saw.
+    # That answers "why did session X fail" without publishing anyone's documents.
+    #
+    # Turn it on for an environment holding test data. Turning it on where real tenant data lives
+    # publishes that data to anyone with the URL, which is a decision for someone who can make it
+    # rather than a default.
+    diagnostic_public_detail: bool = Field(
+        False, validation_alias=AliasChoices("TSG_DIAGNOSTIC_PUBLIC_DETAIL"))
     # TSG_TRACE_DIR — where file sinks (and log_file) write; relative = PROJECT ROOT, never CWD.
     trace_dir: str = Field(
         "logs/trace", validation_alias=AliasChoices("TRACE_DIR", "TSG_TRACE_DIR"))

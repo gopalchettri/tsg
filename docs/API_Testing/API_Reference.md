@@ -1,4 +1,4 @@
-# TSG API Reference — all 62 routes
+# TSG API Reference — all 66 routes
 
 **What this is.** Every HTTP route the application exposes, grouped by purpose, with its auth,
 prerequisites and where it sits in the lifecycle.
@@ -8,7 +8,7 @@ walks the main path in depth. This file is the complete list.
 
 **How the count is guaranteed.** Every route must appear in one of the two registries in
 `app/api/route_audit.py`, or `create_app()` refuses to start. That is where this list comes from:
-**28 entity-scoped + 34 exempt = 62**. If a route exists and is missing here, this document is
+**28 entity-scoped + 38 exempt = 66**. If a route exists and is missing here, this document is
 wrong — the application cannot boot with an unregistered route.
 
 ---
@@ -399,7 +399,7 @@ Auth: admin headers.
 | GET | `/v1/tsg/threat-intel/library/import/events/{job_id}` | Processing | Live progress (SSE) | — |
 
 `{source}` must be one of `pytm`, `emb3d`, `atlas`, `misp_actors` — anything else is a 422
-`admin_validation_error` (section 12), and so is `max_actors` on any source but `misp_actors`. Use
+`admin_validation_error` (section 13), and so is `max_actors` on any source but `misp_actors`. Use
 `dry_run` first. A second import while one runs is a 409.
 
 ### Curation — the queue a manual scenario feeds
@@ -624,7 +624,33 @@ the admin worker.
 
 ---
 
-## 10. Routes by lifecycle phase
+## 10. Diagnostics — why a run failed (4)
+
+| Method | Path | Phase | Purpose | Output |
+|---|---|---|---|---|
+| GET | `/v1/tsg/diagnostics` | Support | Why did session X fail — the real exception behind `stage processing failed` | `rows[]`, `truncated` |
+| GET | `/v1/tsg/diagnostics/logs` | Support | Captured log lines, for the period the `logs` category was on | `rows[]`, `truncated` |
+| GET | `/v1/tsg/diagnostics/config` | Support | What this process is capturing right now, and whether rows are being dropped | `effective`, `override`, `env`, `dropped_rows` |
+| PATCH | `/v1/tsg/diagnostics/config` | Config | Change what is captured, with no restart | the config, as above |
+
+> **The three reads take no key; the PATCH does.** Answering "why did this run fail" must not
+> require an admin key or database access — needing them is what put diagnosis behind the
+> engineering team, and a container log that dies with the container is not an answer. What keeps
+> open reads safe is the *shape* of the response: tracebacks, captured log bodies and the context
+> blob are withheld unless `TSG_DIAGNOSTIC_PUBLIC_DETAIL` is on, and it defaults off. What stays
+> public is what support actually asks for — which session, when, the exception class and message,
+> and `client_message`, the exact sanitised text the customer saw, which is what turns "it said
+> stage processing failed" into one lookup.
+>
+> **PATCH keeps the admin key** because it switches on durable capture of prompt text and asset
+> context. Reading a failure is a support action; changing what the system records is not. It
+> answers `503` if Redis is unreachable, having changed nothing — an override that silently did
+> nothing would be worse than one that failed. Full guide:
+> [`DIAGNOSTICS_CONFIGURATION.md`](../DIAGNOSTICS_CONFIGURATION.md).
+
+---
+
+## 11. Routes by lifecycle phase
 
 | Phase | Routes |
 |---|---|
@@ -639,7 +665,7 @@ the admin worker.
 
 ---
 
-## 11. Routes that are safe to call repeatedly
+## 12. Routes that are safe to call repeatedly
 
 | Safe to repeat | Care needed |
 |---|---|
@@ -652,7 +678,7 @@ the admin worker.
 
 ---
 
-## 12. Standard error envelope
+## 13. Standard error envelope
 
 Every error uses one shape:
 
@@ -679,7 +705,7 @@ When a manual scenario was saved but its plan was then refused, the error `detai
 
 ---
 
-## 13. Documentation map
+## 14. Documentation map
 
 | Need | Read |
 |---|---|
@@ -687,7 +713,7 @@ When a manual scenario was saved but its plan was then refused, the error `detai
 | Find a route | This file |
 | Live schema, always current | `GET /openapi.json`, or `/docs` in a browser |
 | SSE contract | `docs/SSE_SESSION_PROGRESS_CONTRACT_GUIDE.md` |
-| Per-route examples and DB checks | `docs/tsg_full_api_guidebook.html` (covers 50 of 62 routes) |
+| Per-route examples and DB checks | `docs/tsg_full_api_guidebook.html` (covers 50 of 66 routes) |
 | Local setup | `readme_to_run.txt`, `SETUP_AND_RUN_GUIDE.md` |
 | UAT and production | `readme_to_run_uat_prod.txt`, `deploy/DEPLOYMENT_HANDBOOK.md` |
 | Docker demo | `DEMO_DOCKER_GUIDE.md` |

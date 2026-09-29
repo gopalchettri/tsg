@@ -129,6 +129,28 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     ("POST", "/v1/tsg/threat-intel/techniques/rebuild"): require_admin,
     ("GET", "/v1/tsg/threat-intel/techniques"): require_admin,
     ("GET", "/v1/tsg/threat-intel/techniques/events/{job_id}"): require_admin,
+    # Support diagnostics (app/api/diagnostics.py) — the three READS are DELIBERATELY OPEN, and
+    # this is the only place in the file where `None` means a decision rather than an absence.
+    #
+    # The point of these routes is reach: a support engineer must be able to answer "why did this
+    # run fail" from a URL, with no admin key to obtain and no database credentials. Requiring a
+    # key is what put diagnosis behind the engineering team, which is the problem being solved.
+    #
+    # NOT entity-scoped either, and that is forced rather than chosen: a failure is recorded
+    # whether or not an entity was ever resolved — a crash before auth has none — so scoping per
+    # entity would hide precisely the failures that happened before scoping was possible.
+    #
+    # WHAT KEEPS THIS SAFE is not this registry but two properties of the routes themselves:
+    # tracebacks, captured log bodies and the context blob are withheld unless
+    # TSG_DIAGNOSTIC_PUBLIC_DETAIL is on (default off), and the WRITE below is not open.
+    ("GET", "/v1/tsg/diagnostics"): None,
+    ("GET", "/v1/tsg/diagnostics/logs"): None,
+    ("GET", "/v1/tsg/diagnostics/config"): None,
+    # The one exception, and the reason it is an exception: this switch turns ON durable capture
+    # of prompt text and asset context. Public, it would let a stranger start that recording — and
+    # fill the database doing it. Reading a failure is a support action; changing what the system
+    # captures is not.
+    ("PATCH", "/v1/tsg/diagnostics/config"): require_admin,
 }
 
 

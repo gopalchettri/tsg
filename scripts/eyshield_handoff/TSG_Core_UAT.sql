@@ -1106,6 +1106,29 @@ CREATE INDEX IX_PromptLog_Session ON Prompt_Log(SessionID, SubsystemID);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Correlation' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
 CREATE INDEX IX_PromptLog_Correlation ON Prompt_Log(CorrelationID, CreatedAt) WHERE CorrelationID IS NOT NULL;
 
+-- Diagnostics reads and the retention purge. "Why did session X fail" is THE query the
+-- diagnostics table exists to answer, and it is asked by a support engineer while someone
+-- waits; CreatedAt is the second key because the answer is always read newest-first, so the
+-- ordering comes from the index rather than from a sort over the matched rows.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Session' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+CREATE INDEX IX_DiagnosticEvent_Session ON Diagnostic_Event(SessionID, CreatedAt DESC) WHERE SessionID IS NOT NULL;
+
+-- Two readers: "what has been failing lately" with no session filter, AND the retention
+-- purge, which deletes by age. The purge is why this is not optional -- without it the
+-- scheduled DELETE scans the whole table to find the old rows, on a table whose entire
+-- purpose is to keep growing.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+CREATE INDEX IX_DiagnosticEvent_Created ON Diagnostic_Event(CreatedAt DESC);
+
+-- The same pair on the log stream, where they matter MORE rather than less: this table takes
+-- every line at INFO and above, so an unindexed read or purge here is not a slow query, it is
+-- an outage.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
+CREATE INDEX IX_ApplicationLog_Created ON Application_Log(CreatedAt DESC);
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Session' AND object_id = OBJECT_ID('dbo.Application_Log'))
+CREATE INDEX IX_ApplicationLog_Session ON Application_Log(SessionID, CreatedAt DESC) WHERE SessionID IS NOT NULL;
+
 -- (SessionID, SubsystemID, Level) is the row's real identity — the whole CAS/lock design
 -- assumes exactly one row per triple. CREATE FIRST, DROP SECOND: a failed CREATE (duplicate
 -- rows already exist) then leaves the old index in place instead of leaving none at all.

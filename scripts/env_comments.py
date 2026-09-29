@@ -345,6 +345,24 @@ COMMENTS: dict[str, str] = {
         hundreds for a single run - so it is a short trail for working out what happened this week,
         not a long-term record.
     """,
+    "TSG_DIAGNOSTIC_PUBLIC_DETAIL": """
+        Whether the problem-lookup pages show the full technical detail to anyone, or only the
+        summary. Off by default.
+
+        Those pages are open on purpose, so a support engineer can look up why a run failed
+        without needing a password or access to the database. Open means open, though: the same
+        web address answers anybody who finds it.
+
+        Left off, a lookup still says which run, when, what kind of failure, the name of the error
+        and the message the customer was shown - which is what a support question actually needs.
+
+        Turned on, it also returns the full internal error trace and the saved log lines. Those
+        contain whatever the system was working on at the time, which here can include contract
+        details, landlord and tenant information and Emirates ID numbers.
+
+        So: switch it on where the data is test data. Switching it on where real customer data
+        lives publishes that data to anyone with the address.
+    """,
     "TSG_DIAGNOSTIC_QUEUE_MAX": """
         How many records may wait to be written before new ones are DISCARDED. You should not
         normally need to change this.

@@ -13,7 +13,7 @@
 
   Contents: legacy-name migration, 24 tables, 320 reconciled columns,
   22 default constraints,
-  3 check constraints, 31 indexes.
+  3 check constraints, 35 indexes.
 
   Those five numbers are PINNED to the statements below them by
   tests/test_schema_sync.py::test_the_consolidated_header_counts_match_the_script.
@@ -2034,7 +2034,7 @@ GO
 
 
 /*==============================================================================
-  SECTION 6 — Indexes (31)
+  SECTION 6 — Indexes (35)
 
   Please create all of them exactly as written. Index names, column order, the
   UNIQUE keyword and the text of each WHERE clause are all either checked by the
@@ -2225,7 +2225,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_API_Client_KeyHash' AN
 GO
 
 -------------------------------------------------------------------------------
--- 6c. Performance (12 with a known reader). Each of these backs a query the
+-- 6c. Performance (16 with a known reader). Each of these backs a query the
 --     application actually runs.
 -------------------------------------------------------------------------------
 
@@ -2310,6 +2310,44 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Correlation'
     CREATE NONCLUSTERED INDEX [IX_PromptLog_Correlation] ON [dbo].[Prompt_Log] ([CorrelationID], [CreatedAt])
         WHERE [CorrelationID] IS NOT NULL;
 GO
+
+/* "Why did session X fail" is THE query the diagnostics table exists to answer,
+   and it is asked by a support engineer while someone waits. Without this index
+   it scans every row ever recorded. CreatedAt is the second key because the
+   answer is always read newest-first, so the ordering comes from the index
+   rather than from a sort over the matched rows. Filtered, because a failure
+   that happened before any session was resolved has none. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Session' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+    CREATE NONCLUSTERED INDEX [IX_DiagnosticEvent_Session] ON [dbo].[Diagnostic_Event] ([SessionID], [CreatedAt] DESC)
+        WHERE [SessionID] IS NOT NULL;
+GO
+
+/* Two readers, not one: "what has been failing lately" with no session filter,
+   AND the retention purge, which deletes by age. The purge is why this is not
+   optional - without it the scheduled DELETE scans the whole table to find the
+   old rows, on a table whose entire purpose is to keep growing. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+    CREATE NONCLUSTERED INDEX [IX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event] ([CreatedAt] DESC);
+GO
+
+/* The same pair on the log stream, where they matter MORE rather than less:
+   this table takes every line at INFO and above - hundreds per run, six figures
+   on a busy day - so an unindexed read or purge here is not a slow query, it is
+   an outage. CreatedAt leads because every read is time-bounded first. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
+    CREATE NONCLUSTERED INDEX [IX_ApplicationLog_Created] ON [dbo].[Application_Log] ([CreatedAt] DESC);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Session' AND object_id = OBJECT_ID('dbo.Application_Log'))
+    CREATE NONCLUSTERED INDEX [IX_ApplicationLog_Session] ON [dbo].[Application_Log] ([SessionID], [CreatedAt] DESC)
+        WHERE [SessionID] IS NOT NULL;
+GO
+
+/* DELIBERATELY NOT INDEXED: Application_Log.Level. Filtering to ERROR is a real
+   query, but every read is already bounded to a time window, and this is the
+   hottest insert path in the system - a third index would cost write throughput
+   to save a scan that is already small. Add it only if a measured plan says the
+   time window is not selective enough. */
 
 -------------------------------------------------------------------------------
 -- 6d. NO CURRENT READER (3). Kept so this database matches the ones already

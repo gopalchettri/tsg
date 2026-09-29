@@ -111,6 +111,14 @@ def _clear_process_caches() -> None:
     # tests passed alone and failed in a full run the moment the live Mongo corpus stopped being
     # empty. Same reason as every clear above -- process-lifetime state is not test state.
     technique_reference._invalidate_cache()
+    # The diagnostics runtime override lives in REDIS, and this machine runs one. Left alone, any
+    # test that logs would read a real override key -- the same defect as the suite reading a real
+    # .env, one layer along: a result that depends on the machine and that no test declares.
+    # Pinning the cache to never expire means active_categories() returns the ENV value and never
+    # opens a socket. A test that wants the override resets this itself (test_diagnostics.py),
+    # which is the rule everywhere else in this file: declared, never inherited.
+    from app.core import diagnostics
+    diagnostics._override_cache = (float("inf"), None)
 
 
 @pytest.fixture(autouse=True)

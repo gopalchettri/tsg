@@ -11,6 +11,7 @@ from app.api.admin import control_map_router, grounding_router
 from app.api.admin import router as admin_router
 from app.api.api_clients import router as api_clients_router
 from app.api.deps import require_admin
+from app.api.diagnostics import router as diagnostics_router
 from app.api.errors import register_error_handlers
 from app.api.health import router as health_router
 from app.api.route_audit import (
@@ -99,6 +100,24 @@ def create_app() -> FastAPI:
                     "Manage the shared embedding cache used by both the threat and control "
                     "libraries for AI matching: create/update/recreate/delete vectors, and poll "
                     "job status. Requires the admin key."
+                ),
+            },
+            {
+                "name": "Diagnostics",
+                "description": (
+                    "**Why did this run fail.** When a run fails, the customer is shown "
+                    "`stage processing failed` — deliberately vague, because that text is "
+                    "tenant-visible and must never carry internal detail. These routes are the "
+                    "other side of it: the real exception class, the message, and the sanitised "
+                    "text the customer saw, so a report of \"it said stage processing failed\" "
+                    "becomes one lookup.\n\n"
+                    "**The reads need no key.** Answering a support question must not require an "
+                    "admin key or database access — needing them is what put diagnosis behind the "
+                    "engineering team. Tracebacks and captured log bodies are withheld unless "
+                    "`TSG_DIAGNOSTIC_PUBLIC_DETAIL` is enabled.\n\n"
+                    "**Changing what is captured still needs the admin key**, because that switch "
+                    "starts a durable recording of prompt text and asset context. See "
+                    "docs/DIAGNOSTICS_CONFIGURATION.md."
                 ),
             },
             {
@@ -200,6 +219,10 @@ def create_app() -> FastAPI:
     app.include_router(grounding_router)
     app.include_router(control_map_router)
     app.include_router(threat_intel_router)
+    # Unconditional, unlike the treatment router below: an operator needs to read a failure most
+    # in the deployment that is behaving worst, so this must not be behind a feature flag that a
+    # struggling environment might have off.
+    app.include_router(diagnostics_router)
     # Feature-flagged: routes only mount, and only 404-by-absence otherwise
     if get_settings().risk_module_enabled:
         app.include_router(treatment_router)

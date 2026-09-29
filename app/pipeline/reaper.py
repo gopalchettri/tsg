@@ -36,6 +36,86 @@ from app.sse import bus
 
 log = get_logger(__name__)
 
+#: Rows deleted per statement by the retention purge. Bounded, and the bound is the point: a
+#: single unqualified DELETE of a week of Application_Log is millions of rows in one transaction,
+#: which on SQL Server escalates to a table lock and blocks every diagnostic write behind it.
+#: Short transactions mean a purge running during an incident cannot be the reason the incident
+#: stopped being recorded.
+_PURGE_BATCH = 5000
+
+#: Batches per table per tick. The purge is a background chore competing with real work, so it is
+#: allowed to fall behind rather than to monopolise a connection: 10 x 5000 is 50k rows a tick,
+#: which clears a normal day's accumulation in a few ticks and never runs unboundedly long.
+_PURGE_MAX_BATCHES = 10
+
+
+def purge_expired_diagnostics(sess: Session) -> dict[str, int]:
+    """Delete diagnostic and log rows past their configured retention. Returns rows removed.
+
+    WHY IT LIVES HERE rather than in a new scheduled job: the reaper already runs on a timer,
+    already owns a session, and is already where "things that must happen periodically or the
+    system degrades" live. A second scheduler for one DELETE is a second thing to deploy, monitor
+    and forget about.
+
+    THE TWO HORIZONS ARE SEPARATE, AND THAT IS THE WHOLE REASON THE TABLES ARE SEPARATE.
+    Diagnostic_Event holds rare, valuable rows and is kept for weeks. Application_Log takes every
+    line at INFO and above and is kept for days. One table would have forced one policy on both
+    and buried the valuable rows in the volume.
+
+    UNBOUNDED GROWTH IS ITSELF A PRODUCTION INCIDENT, which is why this is not optional: with no
+    purge, the table added to make failures diagnosable eventually becomes the failure. It is also
+    the enforcement half of the personal-data retention promise — a horizon nothing acts on is a
+    statement, not a control.
+    """
+    s = get_settings()
+    removed = {
+        m.Diagnostic_Event.__tablename__: _purge_older_than(
+            sess, m.Diagnostic_Event, s.diagnostic_retention_days),
+        m.Application_Log.__tablename__: _purge_older_than(
+            sess, m.Application_Log, s.application_log_retention_days),
+    }
+    if any(removed.values()):
+        log.info("diagnostics.purged", **removed,
+                 diagnostic_retention_days=s.diagnostic_retention_days,
+                 application_log_retention_days=s.application_log_retention_days)
+    return removed
+
+
+def _purge_older_than(sess: Session, table, days: int) -> int:
+    """Delete in bounded batches until nothing old is left or this tick's budget is spent.
+
+    Deletes BY PRIMARY KEY after selecting the ids, rather than issuing one DELETE ... WHERE
+    CreatedAt < cutoff. The select is a seek on the CreatedAt index and the delete is a seek on
+    the clustered key, so neither statement takes a range lock over rows the writer is still
+    inserting into — the same reason clean_up_abandoned_sessions selects before it updates, and
+    for the same deadlock it was avoiding.
+
+    NEVER RAISES: retention is housekeeping, and a failed purge that aborted the tick would take
+    session recovery down with it — the reaper's actual job, and far more important than disk."""
+    key = table.__table__.primary_key.columns.keys()[0]
+    cutoff = now() - timedelta(days=days)
+    deleted = 0
+    try:
+        for _ in range(_PURGE_MAX_BATCHES):
+            ids = sess.execute(
+                select(table.__table__.c[key])
+                .where(table.CreatedAt < cutoff)
+                .limit(_PURGE_BATCH)).scalars().all()
+            if not ids:
+                break
+            for chunk in _split_into_batches(ids):
+                sess.execute(table.__table__.delete().where(table.__table__.c[key].in_(chunk)))
+            sess.commit()          # per batch: short transactions, no lock escalation
+            deleted += len(ids)
+            if len(ids) < _PURGE_BATCH:
+                break
+    except Exception as exc:  # noqa: BLE001 — see the docstring; housekeeping never fails the tick
+        sess.rollback()
+        log.warning("diagnostics.purge_failed", table=table.__tablename__,
+                    error=f"{type(exc).__name__}: {exc}"[:300])
+    return deleted
+
+
 def _split_into_batches(items):
     """Yield <=Settings.reaper_sql_in_chunk_size slices (default 1000, capped at 2000 — SQL
     Server's IN-list limit is ~2100 params) so a mass-crash id list never blows past it. Empty

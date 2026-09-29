@@ -25,7 +25,7 @@ WHAT IT CONTAINS
   Section 3   Columns (320), then three one-time data fixes
   Section 4   Default constraints (22)
   Section 5   Check constraints (3)
-  Section 6   Indexes (31)
+  Section 6   Indexes (35)
   Section 7   Verification
 
   Those counts are pinned to the script by tests/test_schema_sync.py, along with

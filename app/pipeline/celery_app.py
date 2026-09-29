@@ -54,7 +54,7 @@ from app.db.engine import db_session
 from app.pipeline import cascade, embeddings, grounding, treatment
 from app.pipeline.llm import LLMSlotUnavailable, TransientProviderError, get_llm
 from app.pipeline.pipeline_common import TRANSIENT_INFRA_ERRORS
-from app.pipeline.reaper import clean_up_abandoned_sessions
+from app.pipeline.reaper import clean_up_abandoned_sessions, purge_expired_diagnostics
 from app.pipeline.selfcheck import run_self_checks
 from app.pipeline.tasks import _process_all_supporting_systems
 from app.sse import bus
@@ -891,9 +891,16 @@ def admin_embedding_action_task(self, action: str, group: str | None, names: lis
 @celery_app.task(name="tsg.reap")
 def reap_task() -> list[str]:
     """Periodic stuck-job reaper; scheduled by `beat_schedule` above — run `celery beat` alongside
-    the worker. clean_up_abandoned_sessions() already logs the cancelled set."""
+    the worker. clean_up_abandoned_sessions() already logs the cancelled set.
+
+    It also purges expired diagnostics, in that order and never the reverse: recovering stuck
+    sessions is the job people notice, housekeeping is not, so the purge runs on whatever time is
+    left rather than ahead of the work. purge_expired_diagnostics swallows its own failures for
+    the same reason — a full disk must never stop sessions from being recovered."""
     with db_session() as sess:
-        return clean_up_abandoned_sessions(sess)
+        cancelled = clean_up_abandoned_sessions(sess)
+        purge_expired_diagnostics(sess)
+        return cancelled
 
 
 
