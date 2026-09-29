@@ -134,5 +134,7 @@ Two things were checked and are **correct as they stand**, despite looking like 
   SDD described the old design. The change was deliberate: renewing only before an AI call meant a
   long non-LLM step was reaped while still alive. The SDD was corrected, not the code.
 - **`verify_membership` defaulting off** (`app/core/config.py:628`). This is the accepted auth
-  model, not a pending remediation, and `assert_security_posture` states it at INFO rather than
-  WARN precisely so it is not mistaken for one.
+  model, not a pending remediation. It used to be stated at INFO on every boot by
+  `assert_security_posture`, at INFO rather than WARN precisely so it would not be mistaken for a
+  pending remediation. **That function was removed on 2026-09-29 at the owner's instruction**, so
+  the posture is no longer announced anywhere at boot: it is now documented here and nowhere else.

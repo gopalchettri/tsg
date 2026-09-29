@@ -167,19 +167,13 @@ def test_retired_auth_dev_mode_is_silently_ignored(monkeypatch):
 
 
 def _staging_settings():
-    """Minimal duck-typed Settings for the two boot checks below.
+    """Minimal duck-typed Settings for the three boot checks below.
 
-    Carries db_dsn/redis_url/allow_remote_in_dev as well as app_env/verify_membership because
-    assert_security_posture now inspects the infrastructure posture too (loopback-vs-remote at
-    local/dev, and TrustServerCertificate at prod). Loopback + a verified certificate keeps this
-    stub on the "nothing to complain about" path, so the test still asserts exactly one thing:
-    membership-off warns and does not raise."""
+    _assert_api_client_configured reads exactly these two fields: staging with no admin key is
+    the combination that must refuse the boot, because then there is no way to create the first
+    API key and every request would 401 forever."""
     return type("S", (), {
         "app_env": "staging",
-        "verify_membership": False,
-        "db_dsn": "mssql+pyodbc://@localhost/DB?driver=x&TrustServerCertificate=no",
-        "redis_url": "redis://127.0.0.1:6379/0",
-        "allow_remote_in_dev": False,
         "admin_api_key": "",
     })()
 
@@ -217,11 +211,6 @@ def test_staging_with_active_api_client_passes(monkeypatch):
         s.commit()
     monkeypatch.setattr(inv, "get_settings", _staging_settings)
     inv._assert_api_client_configured(eng)              # must not raise
-
-
-def test_posture_warns_when_membership_off_but_does_not_raise():
-    from app.core.config import assert_security_posture
-    assert_security_posture(_staging_settings())        # logs a warning; must not raise
 
 
 # --- item 21: SSE graceful-shutdown startup assertion ---

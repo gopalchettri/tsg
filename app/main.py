@@ -29,10 +29,9 @@ from app.core.middleware import BodySizeLimitMiddleware, RequestIDMiddleware
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Fail-closed startup: refuse to serve traffic if security posture, DB invariants,
-    # or the local-model path aren't sane.
+    # Fail-closed startup: refuse to serve traffic if the DB invariants or the local-model
+    # path aren't sane.
     from app.core.config import (
-        assert_security_posture,
         assert_sse_graceful_shutdown_wired,
         assert_sse_library_supports_our_calls,
     )
@@ -42,7 +41,6 @@ async def lifespan(app: FastAPI):
     from app.pipeline.local_models import validate_local_models
 
     configure_logging()
-    assert_security_posture()  # warn if the (user,entity) DB check is off in prod
     verify_startup(get_engine())  # fail-fast if a required DB guard is missing
     validate_local_models(warm=False)  # fail-fast on a bad local-model path
     assert_sse_graceful_shutdown_wired()  # fail loudly if the worker class drifted from uvicorn

@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import os
-import socket
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -959,11 +958,6 @@ class Settings(BaseSettings):
     verify_membership: bool = Field(
         False, validation_alias=AliasChoices("VERIFY_MEMBERSHIP", "TSG_VERIFY_MEMBERSHIP"))
 
-    # TSG_ALLOW_REMOTE_IN_DEV — deliberate escape hatch: lets APP_ENV=local/dev point at
-    # non-loopback DB/Redis, which assert_security_posture otherwise refuses.
-    allow_remote_in_dev: bool = Field(
-        False, validation_alias=AliasChoices("ALLOW_REMOTE_IN_DEV", "TSG_ALLOW_REMOTE_IN_DEV"))
-
     # FLOWER_BASIC_AUTH — "user:password" for Flower's --basic-auth. Read by
     # docker/compose.prod.yml and start.ps1, never by Python; declared here so env_selfcheck
     # keeps it documented in every template.
@@ -1387,107 +1381,6 @@ def busy_retry_window_seconds() -> int:
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-
-
-#: Hosts that mean "this developer's own machine". Anything else is shared infrastructure.
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "host.docker.internal", ""})
-
-#: This machine's own short name, lower-cased. socket.gethostname() is a local syscall - no DNS
-#: lookup, nothing that can hang at import (unlike socket.getfqdn()).
-_OWN_HOSTNAME = socket.gethostname().strip().lower().split(".", 1)[0]
-
-
-def _is_own_machine(host: str) -> bool:
-    r"""Does this host mean "the box this process is running on"?
-
-    _LOOPBACK_HOSTS alone did not cover the most ordinary case on Windows: a SQL Server Express
-    instance addressed as `MACHINENAME\SQLEXPRESS` rather than `localhost\SQLEXPRESS`. Same
-    instance, same data, same machine - but the gate below saw a non-loopback host and refused
-    to boot BOTH the API and the Celery worker.
-
-    This is NOT a weakening of the gate. That identical database is already reachable through
-    `localhost`, which has always been allowed, so admitting the machine's own name adds no
-    target a developer could not already point at. It only stops the gate firing on a
-    distinction that carries no meaning.
-
-    Compares the SHORT name, so `xwf8tnjr3.corp.example.com` matches `xwf8tnjr3` without
-    paying for a resolver call."""
-    host = host.strip().lower()
-    return host in _LOOPBACK_HOSTS or host.split(".", 1)[0] == _OWN_HOSTNAME
-
-
-def _dsn_host(url: str) -> str:
-    r"""Best-effort host out of a SQLAlchemy DSN or a redis:// URL.
-
-    Deliberately string-level, not urlparse: an ODBC DSN can carry a backslashed instance name
-    (``@HOST\SQLEXPRESS``) and a password full of URL-hostile characters, both of which make
-    urlparse either raise or return nonsense. Returns "" when nothing host-shaped is found, and
-    "" is treated as loopback so an unparseable DSN can never HARD-FAIL a boot on its own.
-    """
-    tail = url.split("://", 1)[-1]
-    authority = tail.split("/", 1)[0].split("?", 1)[0]
-    host = authority.rsplit("@", 1)[-1]          # strip user:password@
-    for sep in ("\\", ","):                      # instance name / MSSQL port separator
-        host = host.split(sep, 1)[0]
-    if host.startswith("["):                      # bracketed IPv6
-        return host.split("]", 1)[0] + "]"
-    return host.split(":", 1)[0].strip().lower()
-
-
-# Startup posture check: two HARD gates plus the membership warning. Called first in the FastAPI
-# lifespan, so it is the earliest gate there is (the >=1-API-key gate lives in db.invariants).
-def assert_security_posture(settings: Settings | None = None) -> None:
-    s = settings or get_settings()
-
-    # GATE 1 — a dev/local build must not run against shared infrastructure. APP_ENV is a
-    # switch, not a label: at local/dev the app echoes raw exception text to clients, mounts
-    # /dev/sse-test, skips the active-API_Client boot check, and silences the membership
-    # warning — four protections off at once, so pointing such a build at real infra is refused.
-    if s.app_env in ("local", "dev") and not s.allow_remote_in_dev:
-        remote = {name: host for name, host in
-                (("TSG_DB_DSN", _dsn_host(s.db_dsn)), ("TSG_REDIS_URL", _dsn_host(s.redis_url)))
-                if not _is_own_machine(host)}
-        if remote:
-            targets = ", ".join(f"{k} -> {v}" for k, v in sorted(remote.items()))
-            raise RuntimeError(
-                f"APP_ENV={s.app_env} but this process points at NON-LOOPBACK infrastructure "
-                f"({targets}). At local/dev the app returns raw exception text to clients, mounts "
-                f"the /dev/sse-test page, and skips the active-API_Client boot check — none of "
-                f"which may run against shared data. Either set APP_ENV=staging|prod (the real "
-                f"posture), or set TSG_ALLOW_REMOTE_IN_DEV=true to state deliberately that you "
-                f"are developing against shared infrastructure.")
-
-    # GATE 2 — TLS posture: TrustServerCertificate=yes skips certificate verification (MITM
-    # undetectable). Hard-fail in prod only; staging may legitimately run self-signed.
-    if "trustservercertificate=yes" in s.db_dsn.lower():
-        if s.app_env == "prod":
-            raise RuntimeError(
-                "TSG_DB_DSN sets TrustServerCertificate=yes with APP_ENV=prod: the server "
-                "certificate is not validated, so the connection is not MITM-resistant. Install a "
-                "trusted certificate on the SQL Server and set TrustServerCertificate=no.")
-        if s.app_env == "staging":
-            from app.core.logging import get_logger
-            get_logger(__name__).warning(
-                "db.tls_certificate_unverified", app_env=s.app_env,
-                note="TSG_DB_DSN sets TrustServerCertificate=yes — the server certificate is not "
-                    "validated. Acceptable on a self-signed staging box; this is a HARD FAILURE "
-                    "at APP_ENV=prod, so fix it before promoting.")
-
-    # INFO, not a warning, and deliberately so. This is the ACCEPTED auth model, not a pending
-    # remediation — the previous text told every reader to "set TSG_VERIFY_MEMBERSHIP=true once
-    # the prod scope table is confirmed", an instruction nobody will ever act on. A warning that
-    # fires on every boot and can never be resolved only trains operators to skip this channel,
-    # which also carries db.tls_certificate_unverified above. Stated once, at the right level.
-
-    if s.app_env in ("staging", "prod") and not s.verify_membership:
-        from app.core.logging import get_logger
-        get_logger(__name__).info(
-            "auth.posture_api_key_only",
-            app_env=s.app_env,
-            note="X-API-Key is the credential. X-User-Id/X-Entity-Id are request INPUT the "
-                "calling service is trusted to populate, not verified against "
-                "user_scope_assignment. One key therefore reaches every entity in every tenant, "
-                "so keys are server-side only — never shipped to a browser or mobile client.")
 
 
 # Startup check that the INSTALLED sse_starlette can actually accept the arguments this code

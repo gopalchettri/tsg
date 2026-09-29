@@ -162,9 +162,13 @@ services:
     restart: unless-stopped
     # --basic-auth is REQUIRED: Flower has no auth by default and exposes task revoke/terminate
     # to anyone who reaches the port. The guard lives HERE, in Flower's own startup, rather than
-    # in the app's assert_security_posture(): that runs in the api/worker processes, which would
-    # both force a Flower password onto deployments that never run this service AND still leave
+    # in any application boot check: those run in the api/worker processes, which would both
+    # force a Flower password onto deployments that never run this service AND still leave
     # Flower itself unguarded. Fail where the risk actually is.
+    #
+    # This is now the ONLY place that argument is made. The app-side posture check it used to
+    # contrast with was removed on 2026-09-29, so no boot check refuses a misconfigured
+    # deployment any more — which makes this guard load-bearing rather than one of several.
     #
     # `$$` escapes compose interpolation so the SHELL expands it from the container env
     # (env_file, below) — this way the guard holds even if someone omits `--env-file` on the

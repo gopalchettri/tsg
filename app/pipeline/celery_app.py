@@ -249,14 +249,14 @@ celery_app.conf.update(
 @worker_init.connect        # fires exactly once per worker process, for EVERY pool type
 @worker_process_init.connect  # fires per forked child under prefork specifically
 def _init_worker(sender=None, **_):
-    """Per-worker-process startup: verify posture/DB invariants and warm the models.
+    """Per-worker-process startup: verify the DB invariants and warm the models.
 
     BOTH signals are needed: `worker_process_init` is prefork-only and never fires under gevent,
-    so without `worker_init` a gevent worker skips the security and local-model guards entirely.
-    verify_startup repeats the API's check because a worker can be deployed independently."""
+    so without `worker_init` a gevent worker skips the DB-invariant and local-model guards
+    entirely. verify_startup repeats the API's check because a worker can be deployed
+    independently."""
     # worker-only setup: imported here so merely importing this module (e.g. from FastAPI)
     # doesn't drag it in
-    from app.core.config import assert_security_posture
     from app.db.engine import get_engine
     from app.db.invariants import verify_startup
 
@@ -312,7 +312,6 @@ def _init_worker(sender=None, **_):
                 "`-A app.pipeline.celery_app` for a prefork/solo worker (see the admin worker "
                 "in docker/compose.prod.yml)."
             )
-        assert_security_posture()      # fail-closed: same auth guard as the API
         verify_startup(get_engine())   # fail-fast: same DB invariant guard as the API
         # (No threadpool sizing here any more: local_models runs torch on its OWN pool, sized by
         # local_model_threadpool_size. Setting hub.threadpool.size never capped anything — gevent

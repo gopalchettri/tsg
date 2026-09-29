@@ -185,16 +185,6 @@ COMMENTS: dict[str, str] = {
         When true, also check that the calling user is really assigned to the entity they are
         asking about, instead of accepting the pair on trust. Turn it on anywhere real.
     """,
-    "TSG_ALLOW_REMOTE_IN_DEV": """
-        Lets a dev-mode app connect to a database or Redis that is not on this machine.
-        Normally that combination is blocked at start-up, because it means dev-level
-        protections are running against shared, real data.
-
-        Setting this true switches off four safeguards at once: full error text is returned to
-        callers, a test-only page is exposed, the check that an active API client exists is
-        skipped, and the membership warning is suppressed. Only set it to state deliberately
-        that you are developing against shared infrastructure.
-    """,
     "TSG_FLOWER_BASIC_AUTH": """
         Username and password for the Flower dashboard, which shows background job activity.
 

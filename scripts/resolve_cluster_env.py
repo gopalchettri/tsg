@@ -2,12 +2,11 @@
 
 Pods read `envFrom: [tsg-api-config (ConfigMap), tsg-api-secrets (Secret)]` in that order, so
 for duplicate keys the Secret (listed last) wins. This script reproduces that merge and then
-constructs `Settings` plus `assert_security_posture` on it — catching, BEFORE any `oc apply`:
+constructs `Settings` on it — catching, BEFORE any `oc apply`:
 
   * a fatal pin hiding in the untracked ConfigMap (e.g. TSG_STAGE_LEASE_SECONDS=300, which is
     below the 720 floor once TSG_LLM_TIMEOUT_SECONDS=180 lands and raises at import — every
     workload would crash-loop on the very rollout meant to fix the APP_ENV crash-loop);
-  * APP_ENV/posture problems (dev + non-loopback infra refuses to boot);
   * any invariant violation across the ~165 coupled settings.
 
 Usage:
@@ -57,7 +56,7 @@ def main() -> int:
     try:
         # A clean slate, then exactly the pod env. Settings reads os.environ; the .env file
         # source is disabled so nothing local leaks into the simulation.
-        from app.core.config import Settings, assert_security_posture  # import BEFORE clearing
+        from app.core.config import Settings  # import BEFORE clearing
         os.environ.clear()
         os.environ.update(merged)
         Settings.model_config["env_file"] = None
@@ -74,12 +73,7 @@ def main() -> int:
                 "control_map_shortlist_k", "max_concurrent_llm_calls", "litellm_bypass_proxy",
                 "log_file", "trace_sinks"):
             print(f"  {k:28} = {getattr(s, k)!r}")
-        try:
-            assert_security_posture(s)
-        except RuntimeError as e:
-            print(f"\nGATE FAILED — security posture refuses to boot:\n  {e}")
-            return 1
-        print("\nGATE OK: posture passes (warnings above, if any, are non-fatal). "
+        print("\nGATE OK: Settings resolves with every invariant satisfied. "
             "Safe to `oc apply` and roll.")
         return 0
     finally:

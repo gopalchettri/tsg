@@ -234,6 +234,16 @@ run_treatment_generation                    pipeline/treatment.py
 
 ## 7. Security, tenancy and egress
 
+> **2026-09-29 — `assert_security_posture` was removed at the owner's instruction.** E2 below
+> describes it as emitting a boot-time signal when `verify_membership` is off; it no longer emits
+> anything, because the function no longer exists. Two guards went with it and are worth naming
+> where a security reader will look: a `local`/`dev` build is no longer refused when it points at
+> non-loopback infrastructure (that mode returns raw exception text to clients, mounts
+> `/dev/sse-test`, and skips the active-API_Client boot check), and `APP_ENV=prod` with
+> `TrustServerCertificate=yes` is no longer a hard failure. The rest of this section is left as
+> the record of what was analysed at the time.
+
+
 | # | Gap | File : Line | Why / Benefit | Proposed solution | Sev | Eff |
 |---|---|---|---|---|---|---|
 | **E1** | **The integration credential carries no tenant or entity scope** | `db/models.py:599-615`, `api/deps.py:53-65`, `:68-83`, `:104-106`, `:120-121` | `API_Client` has `ClientID`, `KeyHash`, `Name`, `Module`, `Active` and audit columns — **nothing binding a key to a tenant, an entity, or a set of allowed operations**. `verify_api_key` returns only a ClientID, which is bound to the log context and never consulted again for any authorization decision. `_authenticate` takes `X-User-Id` and `X-Tenant-Id` verbatim; `get_principal` takes `X-Entity-Id` verbatim. A holder of **any** active `Module='tsg'` key can read and mutate **every** entity's data by changing one header: `GET /v1/entities/{entity_id}/scenarios` returns another organization's full threat-scenario set, and `.../treatment-plans` returns their unremediated Critical risks. **Benefit:** the credential becomes the authorization boundary instead of the caller's own claim | Add nullable `TenantID` and `EntityScopeJSON` columns to `API_Client`, and have `verify_api_key` return the row rather than just the ClientID. In `_authenticate`, when the row carries a scope, require the requested tenant/entity to be inside it and raise `AuthError`/`EntityForbidden` otherwise; **a NULL scope keeps today's behaviour**, so existing keys are not broken on deploy. **No route-handler changes at all** — they already call `require_entity`/`get_authorized_session` against `Principal.entities`, so narrowing what lands in that set is sufficient. Then backfill real keys and make NULL a boot failure in staging/prod using the `invariants.py:132-149` pattern | **high** | d |
