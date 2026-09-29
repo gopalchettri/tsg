@@ -107,13 +107,18 @@ def test_an_entry_resolves_by_id_then_code_then_name(library) -> None:
     once, and the mixed entry `{code, name}` is decided by the CODE with the name ignored — which is
     what makes `{"control_code": "CII-CID-198", "control_name": "sample name"}` a valid entry."""
     sess, _ = library
+    # Every entry names a DIFFERENT control. The mixed `{code, name}` case used to reuse 1483,
+    # which the resolver now refuses outright — naming one control twice in a SCENARIO's list is a
+    # 422, because those entries become rows under a composite primary key. Reusing it was only an
+    # assertion convenience; the rule being proven is that the CODE decides and the name is
+    # ignored, which 1600 shows just as well while staying a legal payload.
     assert resolve_scenario_control_references(sess, _references(
         {"control_id": 1483},
         {"control_code": "CII-CID-198"},
         {"control_name": "Phishing & Spam Protection"},
         {"control_id": 1508, "control_code": "CII-CID-220", "control_name": "User Awareness"},
-        {"control_code": "CII-CID-195", "control_name": "sample name"},
-    )) == [1483, 1486, 1501, 1508, 1483]
+        {"control_code": "CII-CID-300", "control_name": "sample name"},
+    )) == [1483, 1486, 1501, 1508, 1600]
 
 
 def test_codes_and_names_match_case_insensitively_like_the_library_lookup(library) -> None:
@@ -122,8 +127,13 @@ def test_codes_and_names_match_case_insensitively_like_the_library_lookup(librar
     one column is the drift class this codebase keeps getting bitten by, so the NAME door uses the
     same one."""
     sess, _ = library
-    assert resolve_scenario_control_references(sess, _references(
-        {"control_code": "cii-cid-198"}, {"control_name": "mOBILE cODE"})) == [1486, 1486]
+    # ONE CALL PER DOOR. Both spellings name control 1486, which is the whole point — and is
+    # exactly why they cannot share a list any more: a scenario naming one control twice is a 422.
+    # Resolving them separately proves the same thing (each door is case-insensitive, and both
+    # arrive at the same row) without asking the resolver to accept a payload it must refuse.
+    by_code = resolve_scenario_control_references(sess, _references({"control_code": "cii-cid-198"}))
+    by_name = resolve_scenario_control_references(sess, _references({"control_name": "mOBILE cODE"}))
+    assert by_code == by_name == [1486]
 
 
 def test_a_mixed_twenty_five_entry_list_costs_one_query(library) -> None:
@@ -227,8 +237,14 @@ def test_register_free_text_survives_and_a_resolved_reference_is_canonicalized(l
         {"control_name": "user awareness"},       # a name, resolved
         {"control_id": 1501}))
     assert resolved[0].control_name == "Quarterly phishing simulation"
-    assert resolved[1] == {"control_id": 1486, "control_code": "CII-CID-198",
-                           "control_name": "Mobile Code"}
+    # SUBSET, not equality. A resolved reference carries every key the library row has — the
+    # domain and description ride along so the model can judge coverage of a control it has been
+    # told the meaning of. Asserting the whole dict pinned the shape of the day it was written, so
+    # it broke when those two keys were added even though nothing it cares about changed. What
+    # this test is about is CANONICALIZATION: the library's spelling replacing the caller's.
+    # tests/test_control_reference_shape.py is what pins the shape itself.
+    assert resolved[1].items() >= {"control_id": 1486, "control_code": "CII-CID-198",
+                                   "control_name": "Mobile Code"}.items()
     assert resolved[2]["control_code"] == "CII-CID-220"
     assert resolved[3]["control_name"] == "Phishing & Spam Protection"
 
@@ -470,8 +486,16 @@ def test_a_manual_scenario_named_entirely_by_ids_is_saved_and_planned(client) ->
         # Nothing was proposed: every id named a row the library already holds.
         assert "library_promoted" not in {a.EventType for a in sess.execute(
             select(m.Scenario_Audit)).scalars()}
-    assert _snapshot(scenario_id)["existing_controls"]["register_controls"] == [
-        "CII-CID-213 — Phishing & Spam Protection"]
+    # An OBJECT, not the old "CODE — NAME" string. A register entry that resolved to a library row
+    # keeps its id, so whether a mapped control is already covered by the register is a fact the
+    # worker enforces rather than something the model infers from two strings — and the domain and
+    # description ride along so it can judge coverage of a control it has been told the meaning of
+    # (prompts.py says exactly that to the model). The flattened string survives only for entries
+    # with no id: free text, an unresolved reference, or a legacy snapshot.
+    (register_entry,) = _snapshot(scenario_id)["existing_controls"]["register_controls"]
+    assert register_entry["control_id"] == 1501
+    assert register_entry.items() >= {"control_code": "CII-CID-213",
+                                      "control_name": "Phishing & Spam Protection"}.items()
 
 
 def test_a_manual_scenario_with_no_mapped_controls_is_saved_with_none_and_says_so(client) -> None:

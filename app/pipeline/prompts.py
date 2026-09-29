@@ -29,7 +29,18 @@ log = get_logger(__name__)
 # "1.0+<hash of this file>": changes whenever ANY prompt text here changes, so Prompt_Log rows
 # are groupable by the prompt that actually wrote them (SDD §15 "every execution records the
 # prompt version"; gap A7). The "1.0" base stays for anything that pattern-matches on it.
-PROMPT_VERSION = "1.0" 
+#
+# THE HASH WAS DELETED AND EVERYTHING AROUND IT LEFT BEHIND: this read `"1.0"`, while the comment
+# above, the docstring on the schema below ("PROMPT_VERSION hashes it, so a schema change bumps
+# the version") and the now-unused hashlib/Path imports all still described the hash. So every
+# Prompt_Log row recorded the same version no matter how the prompts changed, and the SDD's
+# "every execution records the prompt version" was met in name only — two materially different
+# prompts were indistinguishable in stored provenance, forever and silently.
+#
+# The file's own bytes, so ANY edit here moves it. That over-reports — a typo in a comment bumps
+# the version too — which is the right direction for provenance: a version that changes when it
+# did not matter costs a regroup, one that stays put when it did costs the audit trail.
+PROMPT_VERSION = f"1.0+{hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:8]}"
 
 # The stable key for "the threat reached the asset directly, through no supporting system".
 # Supporting-system ids are positive DB primary keys, so 0 is free. Deliberately NOT reusing
