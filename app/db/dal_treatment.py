@@ -36,6 +36,7 @@ from app.db.dal import (  # shared helpers stay in the parent
     execute_dml,
     now,
     scenario_threat_columns,
+    scoped_threat_columns,
 )
 
 
@@ -194,6 +195,9 @@ def plan_status_row(sess: Session, session_id: str, output_id: str) -> RowMappin
     """
     if not _valid_guid(output_id):
         return None
+    # No scenario join, deliberately — and no ScenarioSource either: the poll route answers with
+    # TreatmentPlanStatusSummary, which publishes lifecycle and review state only. Adding the
+    # column here would pay for a join whose value nothing serializes.
     p = m.Risk_Treatment_Plan
     return sess.execute(
         select(p.PlanID, p.SessionID, p.ScenarioID, p.Status, p.ErrorMessage, p.ErrorReason,
@@ -220,7 +224,7 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
             # Accepted: the review route's gate. A verdict may only land on the plan of the
             # version the register carries — see api/treatment.py::post_review_treatment_plan.
             out.Accepted,
-            out.ScenarioJSON,
+            out.ScenarioJSON, out.ScenarioSource,
             # The threat's own identity — NOT part of the LLM's scenario JSON (same split as
             # sessions._build_scenario). OUTER for the same reason as _scenario_read_select:
             # no enforced FKs, so a broken linkage must null these, never drop the plan row.
@@ -232,11 +236,11 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
             # screen a reviewer signs off. Widening it here is what lets the presenter reuse
             # sessions._threat_block instead of reimplementing a narrower one.
             *scenario_threat_columns(),
-            # Score/ScopeRank live on Scoped_Threat, NOT Identified_Threat, so the shared list
-            # cannot carry them — and _threat_block reads both. Without them the plan's threat
-            # block answered null for two fields /results populates, which is the drift this
-            # whole change removes. Verified by diffing the two blocks on a real row.
-            st.Score, st.ScopeRank)
+            # The Scoped_Threat half, as ONE tuple. This was a hand-added `st.Score, st.ScopeRank`
+            # and the SelectionKind that says whether those two numbers mean anything was left
+            # behind — so the plan GET published a hand-written threat's placeholder 60.0 / rank 1
+            # as a genuine relevance score while /results answered null for the same scenario.
+            *scoped_threat_columns())
         .select_from(p.__table__.outerjoin(out, out.ScenarioID == p.ScenarioID)
                     .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
@@ -268,6 +272,7 @@ def session_plan_board(sess: Session, session_id: str, *,
     out, p = m.Threat_Scenario, m.Risk_Treatment_Plan
     cols = [out.ScenarioID,
             func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle"),
+            out.ScenarioSource,
             p.PlanID, p.Status, p.RiskLevel, p.ReviewStatus, p.ErrorMessage, p.ErrorReason,
             p.CreatedAt.label("PlanCreatedAt"), p.UpdatedAt.label("PlanUpdatedAt"),
             p.CompletedAt.label("PlanCompletedAt")]
@@ -300,28 +305,43 @@ def entity_plan_rows(sess: Session, entity_id: str, *, stale_cutoff: datetime,
     (?include_plan=true), bounded by the page limit, and NOT redundant here: every register row
     is a different scenario. Off keeps today's byte-stable SQL."""
     p, ss, out = m.Risk_Treatment_Plan, m.Scenario_Session, m.Threat_Scenario
+    st, it = m.Scoped_Threat, m.Identified_Threat
     context = [ss.AssetName,
-               func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle")]
+               func.json_value(out.ScenarioJSON, "$.scenario_title").label("ScenarioTitle"),
+               out.ScenarioSource]
     cols = [p.PlanID, p.SessionID, p.ScenarioID, p.Status, p.RiskLevel, p.ReviewStatus,
             p.ReviewedBy, p.ReviewedAt, p.ErrorMessage, p.ErrorReason, p.CreatedAt, p.UpdatedAt,
-            p.CompletedAt, *context]
+            p.CompletedAt, *context,
+            # THE FOUR NAME COLUMNS THE LIBRARY BLOCK NEEDS, on the DEFAULT page too.
+            # This page used to carry ScenarioSource without any threat join, so
+            # sessions._library_block read absent columns and published
+            # {"name": "", "status": "existing"} — a verdict about a library entry it could not
+            # name, on the register a GRC reviewer signs. The guard there now returns null when
+            # ThreatName is absent, which silenced the fabrication but ALSO removed the block
+            # from this page entirely, and `?include_plan` must not change what the page says
+            # about the library. Four narrow varchar columns and two outer joins are the honest
+            # price; the multi-KB ScenarioJSON and the plan body stay behind include_plan.
+            it.ThreatName, it.LibraryThreatName, it.ThreatType, it.LibraryThreatType]
     joined = (p.__table__
               .join(ss, ss.SessionID == p.SessionID)
-              .outerjoin(out, out.ScenarioID == p.ScenarioID))
+              .outerjoin(out, out.ScenarioID == p.ScenarioID)
+              .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
+              .outerjoin(it, st.ThreatID == it.ThreatID))
     if include_plan:
-        st, it = m.Scoped_Threat, m.Identified_Threat
         # The detail view renders through the poll GET's own presenter, so it selects THE shared
         # presenter list — plan_presenter_columns() — not a hand-picked subset: two such subsets
         # are how the treatment response drifted three times. That includes ValidationJSON
         # (sub-KB) although TreatmentRegisterRow publishes no warnings today: structural parity
         # beats a per-row micro-saving, and the field can be published later without a query
         # change. ReviewComment stays out — wire-hidden, active_plan_row only. Same shared threat
-        # list as active_plan_row; Score/ScopeRank live on Scoped_Threat and are added explicitly.
+        # list as active_plan_row, and the Scoped_Threat half as ONE tuple: it used to be a
+        # hand-added `st.Score, st.ScopeRank`, which left SelectionKind behind and made this page
+        # publish a hand-written threat's placeholder score as if it were real.
+        # NO extra joins here — the base query now joins Scoped_Threat and Identified_Threat for
+        # the library block's names, so re-joining them would alias the same tables twice.
         cols = [*plan_presenter_columns(), *context,
-                out.ScenarioJSON, *scenario_threat_columns(), st.Score, st.ScopeRank]
-        joined = (joined
-                .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
-                .outerjoin(it, st.ThreatID == it.ThreatID))
+                out.ScenarioJSON, out.ScenarioSource, *scenario_threat_columns(),
+                *scoped_threat_columns()]
     stmt = (
         select(*cols)
         .select_from(joined)

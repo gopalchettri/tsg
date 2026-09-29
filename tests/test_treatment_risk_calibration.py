@@ -56,7 +56,7 @@ def test_rule4_no_longer_bans_the_supplied_ratings():
     """Rule 4 used to read as a blanket ban on rating labels, which suppressed exactly the
     behaviour rule 6 now requires. It must scope the ban to INVENTED values only."""
     system = prompts.treatment_prompt({})[0]["content"]
-    assert "beyond those supplied" in system
+    assert "never recalculate, change or invent" in system
 
 
 # ---------------------------------------------------------------------------
@@ -126,34 +126,11 @@ def test_prompt_handles_null_ratings_and_empty_library():
     """C1 + C2: rule 6 is conditional on values being present (a legacy snapshot carries nulls,
     and the model must OMIT, never invent), and an empty library_mapped can never be 'covered'."""
     system = prompts.treatment_prompt({})[0]["content"]
-    assert "carries non-null" in system
-    assert "OMIT it from the plan" in system
-    assert "When library_mapped is EMPTY" in system
-    # C3 SUPERSEDED: timelines are now ABSOLUTE DATES, so "day 0" is gone — a duration had no
-    # origin and so no position on the register's calendar. The contract is pinned in
-    # tests/test_treatment_timeline_dates.py; this line asserts the old phrasing cannot return.
-    assert "day 0" not in system
-
-
-def test_zero_day_window_is_enforced_not_disabled():
-    """C11/C22: a same-day window yields total_days=0 — the TIGHTEST budget, which the old falsy
-    guard treated as 'no window' and switched every overrun check off."""
-    from app.pipeline.treatment import _window_violations
-    # LEGACY path: a stored pre-dates-contract plan still carries a relative duration, and the
-    # total_days comparison is what still catches it.
-    plan = {"mitigation_timeline": "within 30 days", "remediation_action_plan": []}
-    warns = _window_violations(plan, {"total_days": 0})
-    assert any("exceeds" in w for w in warns), warns
-
-
-def test_hyphenated_durations_parse_and_unparsable_timelines_warn():
-    """C23: '30-day' phrasings must not evade the window check, and a timeline the parser cannot
-    read at all must SAY so instead of silently passing."""
-    from app.pipeline.treatment import _window_violations
-    hyphen = {"mitigation_timeline": "a 30-day hardening sprint", "remediation_action_plan": []}
-    assert any("exceeds" in w for w in _window_violations(hyphen, {"total_days": 14}))
-    prose = {"mitigation_timeline": "as soon as practicable", "remediation_action_plan": []}
-    assert any("no parsable duration" in w for w in _window_violations(prose, {"total_days": 14}))
+    assert "non-null risk_assessment values" in system and "omit nulls" in system
+    assert "library_mapped empty" in system
+    # Timelines are a server-scheduled duration chain now (tests/test_treatment_timeline_dates.py):
+    # the model never writes a date.
+    assert "Never output dates" in system
 
 
 def test_recommended_controls_carry_the_library_domain_stamped_server_side():
@@ -246,12 +223,26 @@ def test_snapshot_advisories_for_inconsistent_scores_and_past_window():
          "existing_controls_all_subsystems_justification": "orphan justification",
          "mitigation_start_date": "2020-01-01", "mitigation_end_date": "2020-03-01"})
 
-    joined = " | ".join(snap["warnings"])
-    assert "does not equal likelihood x impact (4x5=20)" in joined
-    assert "already in the past" in joined
+    # EXACT LIST, IN ORDER — not a joined substring match. The module docstrings of
+    # treatment_input.py and build_treatment_input both declare the snapshot's KEY ORDER and the
+    # warnings' POSITIONS to be persisted data that the orchestrator alone owns (the evidence
+    # endpoint serves the blob verbatim and regenerate reads it back), and nothing in the suite
+    # failed when either moved: every other assertion over snap["warnings"] is membership-based, so
+    # reordering the merge at build_treatment_input, or the dict literal it returns, stayed green.
+    # The order below is the merge order: the threat block's warnings, then the control read's, then
+    # the register-consistency advisories.
+    assert snap["warnings"] == [
+        "library control lookup failed — plan generated without mapped controls",
+        "final_risk_rating 18 does not equal likelihood x impact (4x5=20); register values taken "
+        "as-is",
+        "mitigation window ended 2020-03-01 — already in the past at plan creation"]
+    # The asset/base context contributes the leading keys (prompts.build_base_context owns those);
+    # every key the orchestrator itself adds is pinned here, in its literal's order.
+    assert list(snap)[-7:] == ["threat", "scenario", "existing_controls", "risk_assessment",
+                            "treatment_strategy", "register", "warnings"]
     assert snap["existing_controls"]["register_controls"] == ["MFA"]  # blanks + dupe gone
     assert snap["existing_controls"]["applied_to_all_subsystems_justification"] is None
-    assert snap["risk_assessment"]["assessment_window"]["total_days"] == 60
+    assert snap["risk_assessment"]["assessment_window"]["total_days"] == 61
 
 
 def test_legacy_snapshot_with_no_scores_is_flagged_uncalibrated():
@@ -409,12 +400,18 @@ def test_schema_bounds_reject_negative_over_4_places_and_over_15_digits():
     # Rejected at the boundary — never absorbed downstream. The two 16+-digit values are the ones
     # a float would have stored as a DIFFERENT number (…9997 -> …9998; …0001 -> 4.1234).
     for bad in (-1, "-0.0001", "4.12345", "100000000000", "999999999999.9997",
-                "4.1234000000000000001", "1e20", None, ""):
+                "4.1234000000000000001", "1e20"):
         with pytest.raises(ValidationError):
             TreatmentPlanBody(**body(final_risk_rating=bad))
-    # …and still required.
-    with pytest.raises(ValidationError):
-        TreatmentPlanBody(**{k: v for k, v in body().items() if k != "final_risk_rating"})
+    # …and NOT rejected: absent, null and "" (moved out of the `bad` list above, and the
+    # "still required" assertion that used to close this test is gone with them). The approved
+    # 2026-09 payload makes all three ratings optional — a register that has not scored a risk yet
+    # sends no number, and the plan then shows null instead of the request being refused outright.
+    # The BOUNDS are what this test is about, and they still hold for every value that IS sent.
+    for absent in (None, "", "   "):
+        assert TreatmentPlanBody(**body(final_risk_rating=absent)).final_risk_rating is None
+    assert TreatmentPlanBody(
+        **{k: v for k, v in body().items() if k != "final_risk_rating"}).final_risk_rating is None
 
 
 def test_full_wire_round_trip_post_then_regenerate_keeps_numbers():

@@ -12,9 +12,11 @@ entrypoint for `celery worker`.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import time
+from typing import Any
 
 import structlog
 from celery import Celery  # type: ignore[import-untyped]
@@ -57,6 +59,14 @@ from app.pipeline.selfcheck import run_self_checks
 from app.pipeline.tasks import _process_all_supporting_systems
 from app.sse import bus
 
+#: The same tuple the treatment task's `autoretry_for=` uses, named ONCE so it can also appear in
+#: an `except` clause. `except (LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS)` is valid Python and
+#: correct at runtime, but unpacking a variadic `tuple[type[Exception], ...]` in EXCEPT position
+#: makes mypy fall back to `object` and reject the whole clause — the identical expression in
+#: `autoretry_for=` is not flagged. A named tuple-of-types is accepted in both places.
+_TREATMENT_RETRYABLE: tuple[type[Exception], ...] = (LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS)
+
+
 _s = get_settings()
 log = get_logger(__name__)
 
@@ -67,8 +77,13 @@ def _build_beat_schedule(s: Settings) -> dict[str, dict]:
     A FUNCTION, not the inline dict this used to be, purely so both sides of every gate are
     testable. `beat_schedule` is built at import against the module-global `_s`, so a test could
     only reach the disabled branch by reloading this module — which re-registers every task. The
-    sweep gate was therefore pinned only in whichever state the ambient environment happened to
-    be in, leaving `assert entry is None` dead in CI. TWO entries are gated, and both had it.
+    gate was therefore pinned only in whichever state the ambient environment happened to be in,
+    leaving `assert entry is None` dead in CI.
+
+    ONE entry is gated here now: intel-refresh. The sweep's gate USED to be here too and moved
+    into map_controls_sweep_task, because reading it at import made it a boot-time decision no
+    restart of anything but beat could change; this function still registers that entry
+    unconditionally and marks it `scheduled`, which is what the flag now governs.
 
     Pure on purpose: no logging, no side effects, so a test can call it with any Settings.
     """
@@ -80,11 +95,24 @@ def _build_beat_schedule(s: Settings) -> dict[str, dict]:
     }
     # THE consumer of the control-mapping retry queue — without it, map_controls' three
     # "leave it for the next run" paths have no next run. See cascade.run_control_map_sweep.
-    # Gated by TSG_CONTROL_MAP_SWEEP_ENABLED (default on) — off removes the beat entry entirely,
-    # and _init_worker warns about it, because there is no API route to drain the queue by hand.
-    if s.control_map_sweep_enabled:
-        schedule["map-controls-sweep"] = {"task": "tsg.map_controls_sweep",
-                                          "schedule": s.control_map_sweep_interval_seconds}
+    #
+    # UNGATED, deliberately. TSG_CONTROL_MAP_SWEEP_ENABLED used to be read HERE, which made it a
+    # boot-time decision rather than a setting: this dict is built once at import
+    # (`beat_schedule=_build_beat_schedule(_s)` below), so flipping the variable changed nothing
+    # until someone restarted beat — a switch that did not switch. The gate now lives inside
+    # map_controls_sweep_task, which re-reads it on every tick, so the schedule is a constant and
+    # the setting is honoured by the process that acts on it.
+    #
+    # The cost is one no-op message per interval while disabled, where off used to mean no traffic
+    # at all. It is paid for in the task: the disabled branch returns before opening a DB session
+    # or touching the model, and logs at debug — _init_worker already states it once at boot.
+    # kwargs is what makes the gate reachable at all: map_controls_sweep_task declines only when
+    # `scheduled` is true, so THIS entry is the one caller the setting governs. The admin route
+    # and a bare `celery call` leave it at its False default and always run — that asymmetry is
+    # the whole point, and it lives in one keyword rather than in a second, driftable code path.
+    schedule["map-controls-sweep"] = {"task": "tsg.map_controls_sweep",
+                                      "schedule": s.control_map_sweep_interval_seconds,
+                                      "kwargs": {"scheduled": True}}
     # threat-intel refresh is scheduled ONLY when TSG_INTEL_REFRESH_INTERVAL_SECONDS > 0
     # (SDD §33: configured source refresh runs on a scheduler). At 0 — the default — it stays
     # admin-triggered via POST /v1/tsg/threat-intel/feeds/refresh. Either path fans out
@@ -193,12 +221,24 @@ celery_app.conf.update(
     # A route added here without a worker subscribing to that queue is a silent black hole: the
     # API returns 202 and the job never runs. tests/test_queue_routing.py pins the queue set
     # against the launch commands, and /ready reports per queue, so that cannot go unnoticed.
+    # THE OTHER DIRECTION OF THE SAME HOLE. Every guard above, and every one in
+    # tests/test_queue_routing.py, checks route -> worker: that a queue named here has a consumer.
+    # NOTHING checked task -> queue, so a heavy admin job added WITHOUT an entry here was invisible.
+    # That is exactly what happened to tsg.calibrate_control_map: it shipped unrouted and was
+    # measured on 2026-09-25 running 20+ minutes on the DEFAULT queue, holding a user-facing
+    # generation slot, while its own sibling tsg.calibrate_grounding sat correctly on `admin`. The
+    # harm this comment already quantifies (generation 355s -> 967s) is the reason for the split.
+    # `test_every_task_an_admin_route_enqueues_runs_on_the_admin_queue` closes it: it reads what the
+    # admin API modules actually enqueue and requires each one to appear below.
     task_routes={
         "tsg.rebuild_technique_reference": {"queue": ADMIN_QUEUE},
         "tsg.warm_technique_reference": {"queue": ADMIN_QUEUE},
         "tsg.import_threat_library": {"queue": ADMIN_QUEUE},
         "tsg.admin_embedding_action": {"queue": ADMIN_QUEUE},
         "tsg.calibrate_grounding": {"queue": ADMIN_QUEUE},
+        # Same shape and cost as its grounding sibling: reranks every measured scenario against the
+        # whole control library, which the route itself documents in minutes, not seconds.
+        "tsg.calibrate_control_map": {"queue": ADMIN_QUEUE},
     },
     task_soft_time_limit=_s.broker_visibility_timeout_seconds - 300,
     task_time_limit=_s.broker_visibility_timeout_seconds,
@@ -220,19 +260,24 @@ def _init_worker(sender=None, **_):
     from app.db.engine import get_engine
     from app.db.invariants import verify_startup
 
-    # The retry queue has NO consumer while this is off, and — unlike every other disabled
-    # feature here — no API route can drain it by hand. Announced at boot rather than left to a
-    # config comment: a comment is read by whoever opens config.py, this is read by whoever is
-    # looking at the logs when scenarios turn up with empty control lists. The manual command is
-    # spelled out because it is the only recovery path that actually exists.
+    # The retry queue has no AUTOMATIC consumer while this is off. Announced at boot rather than
+    # left to a config comment: a comment is read by whoever opens config.py, this is read by
+    # whoever is looking at the logs when scenarios turn up with empty control lists. Stated once
+    # here precisely so the task itself can stay silent (debug) on every disabled tick.
+    #
+    # Read from _s, the import-time settings — same process, same lru_cache'd object the task
+    # reads, so this warning and the task's behaviour can never disagree.
     if not _s.control_map_sweep_enabled:
         log.warning(
             "control_map.sweep_disabled",
-            note="map_controls' 'leave it for the next run' paths now have NO next run: outputs "
-                 "left unstamped stay unmapped and publish as controls: [], which the API "
-                 "documents as a genuine library gap rather than an error. No API route drains "
-                 "the queue. Manual: celery -A app.pipeline.celery_app.celery_app call "
-                 "tsg.map_controls_sweep")
+            note="map_controls' 'leave it for the next run' paths have no automatic next run: "
+                 "outputs left unstamped stay unmapped and publish as controls: [], which the API "
+                 "documents as a genuine library gap rather than an error. BOTH manual drains "
+                 "still work, because only the SCHEDULED tick is gated: "
+                 "POST /v1/tsg/control-map/sweep (admin), or "
+                 "celery -A app.pipeline.celery_app.celery_app call tsg.map_controls_sweep. "
+                 "Beat keeps scheduling the task and it declines each tick while this is off, so "
+                 "turning it back on needs only this worker restarted, never beat.")
     from app.pipeline.llm import log_litellm_key_info, verify_litellm_models
     from app.pipeline.local_models import validate_local_models
 
@@ -462,6 +507,50 @@ def calibrate_grounding_task(self, force: bool = False, started_by: str | None =
     return out
 
 
+# NO autoretry_for, deliberately, unlike calibrate_grounding_task above. That one needs it because a
+# grounding sweep issues ~100 BILLED chat calls and a slot shortage mid-run is an ORDINARY outcome;
+# this measurement makes none — it embeds the queries once and reranks locally. Declining autoretry
+# also declines the whole "do not close the ledger row while an attempt remains" hazard that task
+# has to reason about: leave the row running and a concurrent POST gets a 202 instead of a 409;
+# close it and the eventual success UPDATEs a recorded failure back to success. One attempt, closed
+# honestly, and the operator posts again.
+@celery_app.task(bind=True, name="tsg.calibrate_control_map")
+def calibrate_control_map_task(self, run_id: str, limit: int) -> dict:
+    """Measure the control-mapping relevance cutoff for the CURRENT embedding+reranker pair and
+    store it on the ledger row the route already opened.
+
+    NEVER queued automatically — the only trigger is POST /v1/tsg/control-map/calibrate. It reranks
+    every measured scenario against the whole active control library, which is minutes of work.
+
+    `run_id` is REQUIRED, not optional as calibrate_grounding_task's is: that row is the
+    concurrency guard, only the route can open it before the publish, and a task with no row has
+    nowhere to store its answer — so there is no honest "open my own" branch to offer.
+
+    A measurement with no cutoff is a task SUCCESS recorded as `no_signal`, not a failure: it ran
+    correctly and the answer is "retrieval came back empty". Conflating the two would send whoever
+    reads it to the reranker instead of to the embedding cache."""
+    s = get_settings()
+    key = (s.embedding_model, s.reranker_model)
+    try:
+        with db_session() as sess:
+            candidates = grounding.get_control_candidates(sess, None)
+            queries = grounding.control_map_scenario_queries(sess, limit, s.max_embed_chars)
+        # OUTSIDE the session on purpose: the embeds and reranks take minutes, and a measurement
+        # must not be the thing holding a transaction open against the instance it is measuring.
+        measurement = grounding.measure_control_map_cutoff(get_llm(), candidates, queries, s)
+    except BaseException as exc:
+        # record_calibration_finished, reused verbatim for the FAILED path: with result=None it
+        # writes Status/FinishedAt/ErrorMessage and touches neither measured column.
+        grounding.record_calibration_finished(run_id, error=repr(exc))
+        raise
+    grounding.record_control_map_finished(run_id, measurement)
+    out = {**measurement._asdict(), "run_id": run_id,
+        "embedding_model": key[0], "reranker_model": key[1]}
+    from app.core.logging import get_logger  # module idiom: no module-level logger here
+    get_logger(__name__).warning("control_map.cutoff_measured", job_id=self.request.id, **out)
+    return out
+
+
 @task_prerun.connect
 def _bind_task_context(task_id=None, task=None, args=None, **_kw) -> None:
     """Bind the session onto the LOG CONTEXT once per task, so every line the worker emits
@@ -471,13 +560,14 @@ def _bind_task_context(task_id=None, task=None, args=None, **_kw) -> None:
     the field is actually on the line, and today it is present only where somebody remembered to
     add it. Bound HERE, at the one place every task passes through, rather than at each task body.
 
-    Every pipeline task takes session_id as its first positional argument; anything that does not
-    simply binds no session, which is correct rather than wrong.
+    Session tasks take session_id as their first positional argument; a task that does not
+    (calibration, treatment plans, admin/intel jobs) binds no session — see _session_of.
     """
     structlog.contextvars.bind_contextvars(
         task_id=task_id, task_name=getattr(task, "name", None))
-    if args:
-        structlog.contextvars.bind_contextvars(session_id=str(args[0]))
+    session_id = _session_of(task, args)
+    if session_id:
+        structlog.contextvars.bind_contextvars(session_id=session_id)
 
 
 # --- Terminal-outcome visibility -------------------------------------------------------------
@@ -488,9 +578,17 @@ def _bind_task_context(task_id=None, task=None, args=None, **_kw) -> None:
 # is nothing to alert on and nothing to debug from, so the four ways a task can end badly each get
 # a log line here. `shadow=` renames tasks in Celery's own INFO lines, so `sender.name` is recorded
 # explicitly — grepping for "tsg.next_set" in the raw log finds nothing.
-def _session_of(args) -> str | None:
-    """Every pipeline task takes session_id first; anything else simply has none."""
-    return str(args[0]) if args else None
+def _session_of(task, args) -> str | None:
+    """args[0], but ONLY for a task whose first parameter IS session_id. Not every task starts
+    with one: calibrate_grounding's first argument is `force`, so every calibration log line was
+    tagged session_id="True" — and plan_id/action/feed/source were mislabelled the same way."""
+    if not args:
+        return None
+    try:
+        first = next(iter(inspect.signature(task.run).parameters), None)  # bound: no `self`
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return str(args[0]) if first == "session_id" else None
 
 
 @task_failure.connect
@@ -499,7 +597,7 @@ def _log_task_failure(sender=None, task_id=None, exception=None, args=None, einf
     from app.core.logging import get_logger
     get_logger(__name__).error(
         "task.failed", task_name=getattr(sender, "name", None), task_id=task_id,
-        session_id=_session_of(args), error=repr(exception), exc_info=einfo)
+        session_id=_session_of(sender, args), error=repr(exception), exc_info=einfo)
 
 
 @task_revoked.connect
@@ -510,7 +608,7 @@ def _log_task_revoked(sender=None, request=None, terminated=None, signum=None, e
     from app.core.logging import get_logger
     get_logger(__name__).warning(
         "task.revoked", task_name=getattr(sender, "name", None),
-        task_id=getattr(request, "id", None), session_id=_session_of(getattr(request, "args", None)),
+        task_id=getattr(request, "id", None), session_id=_session_of(sender, getattr(request, "args", None)),
         terminated=terminated, signum=str(signum), expired=expired)
 
 
@@ -663,7 +761,7 @@ def generate_treatment_plan_task(self, plan_id: str) -> None:
     try:
         with db_session() as sess:
             treatment.run_treatment_generation(sess, plan_id, get_llm(), task_id)
-    except (LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS) as exc:
+    except _TREATMENT_RETRYABLE as exc:
         if self.request.retries < self.max_retries:
             raise  # attempts remain — autoretry_for backs off and re-runs
         transient = isinstance(exc, TRANSIENT_INFRA_ERRORS)
@@ -782,12 +880,33 @@ def reap_task() -> list[str]:
 
 
 @celery_app.task(name="tsg.map_controls_sweep")
-def map_controls_sweep_task() -> list[str]:
-    """Periodic control-mapping retry sweep; scheduled by `beat_schedule` above.
+def map_controls_sweep_task(scheduled: bool = False) -> list[str]:
+    """Control-mapping retry sweep. `scheduled=True` only from beat; every other caller means it.
 
     Unlike the reaper this one calls the model (grounding reranks), so it is bounded per tick by
     `control_mapping.SWEEP_LIMIT` and takes the per-subsystem lock — a slow tick must not starve
-    foreground scenario generation of worker slots. run_control_map_sweep logs what it swept."""
+    foreground scenario generation of worker slots. run_control_map_sweep logs what it swept.
+
+    WHAT TSG_CONTROL_MAP_SWEEP_ENABLED ACTUALLY GATES: the SCHEDULED tick, not the work. The flag
+    used to be read in _build_beat_schedule, which is evaluated once at import, so flipping it
+    changed nothing until beat was restarted — a switch that did not switch. Moving the read in
+    here fixed that, but gating the TASK broke something worse: the admin route and the documented
+    `celery ... call tsg.map_controls_sweep` both publish THIS task, so while the flag was off the
+    two manual drains silently returned [] — a no-op in the exact state they exist for, and a
+    regression of the CLI path, which had no gate before. The parameter is the fix: the decline is
+    a property of the scheduled tick, so a manual caller bypasses it BY CONSTRUCTION rather than
+    through a second code path that can rot. Default False, so a bare `celery call` behaves as it
+    always did.
+
+    A declining tick returns BEFORE db_session() and get_llm(): no connection, no model, no lock,
+    so it costs one broker message and nothing else. debug, not warning: _init_worker announces
+    the disabled state once at boot, and a per-tick warning at the configured interval is ~1440
+    identical lines a day — the volume that teaches people to ignore warnings."""
+    if scheduled and not get_settings().control_map_sweep_enabled:
+        log.debug("control_map.sweep_skipped",
+                  note="TSG_CONTROL_MAP_SWEEP_ENABLED is off, so the SCHEDULED tick declines; "
+                       "POST /v1/tsg/control-map/sweep and a direct celery call still run it")
+        return []
     with db_session() as sess:
         return cascade.run_control_map_sweep(sess, get_llm())
 
@@ -803,6 +922,17 @@ def _publish_intel_job_event(job_id: str | None, state: CeleryJobState, **fields
                 "state": str(state), **fields})
 
 
+#: The hard kill time for ONE feed refresh, and the TTL of that feed's lock. ONE constant used
+#: in BOTH places on purpose. It used to be the literal 660 on the decorator, with the body
+#: reading it back as `self.time_limit` — but Celery's Task.time_limit defaults to None and the
+#: global `task_time_limit` does NOT populate it, so that attribute was an int only while the
+#: literal existed. Removing it as "the global covers it" would have made job_lock's ttl None:
+#: the lock is then created with no expiry, the renew thread raises before the `try:` so the
+#: `finally` never releases it, and that feed's key is held forever — every later refresh
+#: returning 0 with no error. Naming it once removes the coupling entirely.
+_INTEL_REFRESH_HARD_LIMIT = 660
+
+
 @celery_app.task(
     bind=True,
     name="tsg.intel_refresh_feed",
@@ -815,7 +945,7 @@ def _publish_intel_job_event(job_id: str | None, state: CeleryJobState, **fields
     # per-feed job_lock in the body (TTL = time_limit) keeps a redelivered or double-clicked
     # copy from walking the same feed alongside the first.
     soft_time_limit=600,         # raises SoftTimeLimitExceeded — refresh_one records it per feed
-    time_limit=660,              # hard backstop if a fetch ignores the soft signal
+    time_limit=_INTEL_REFRESH_HARD_LIMIT,   # hard backstop if a fetch ignores the soft signal
 )
 def intel_refresh_feed_task(self, feed: str) -> int:
     """Refresh exactly ONE intel feed; returns the item count.
@@ -842,7 +972,9 @@ def intel_refresh_feed_task(self, feed: str) -> int:
         # hard time_limit, so a killed run can never hold a feed longer than it could have run.
         # Fails open when Redis is down (core.joblock): this guards redundant OTX/CISA traffic
         # and cursor clobbering, never correctness -- the upserts are idempotent.
-        with job_lock(f"tsg:intel-refresh:{feed}", ttl=self.time_limit,
+        # The CONSTANT, not self.time_limit: Celery types that attribute `int | None` and only
+        # the decorator literal made it an int. See _INTEL_REFRESH_HARD_LIMIT.
+        with job_lock(f"tsg:intel-refresh:{feed}", ttl=_INTEL_REFRESH_HARD_LIMIT,
                     busy=RefreshAlreadyRunning(f"a refresh of {feed!r} is already running"),
                     redis_factory=_slot_redis):
             count = refresh_one(feed)
@@ -1001,7 +1133,10 @@ def rebuild_technique_reference_task(self, sources: list[str], user_id: str | No
     try:
         entries, skipped = build_entries(sources)
     except ThreatLibraryImportError as exc:
-        result = {"sources": sources, "error": str(exc)[:2000]}
+        # dict[str, Any] on the FIRST binding: this function's `result` later holds counts, a
+        # flag and a timestamp string, and without it mypy fixes the mapping's value type from
+        # this branch alone and rejects every later entry.
+        result: dict[str, Any] = {"sources": sources, "error": str(exc)[:2000]}
         _publish_intel_job_event(job_id, CeleryJobState.FAILURE, error=result["error"])
         return result
     except Exception as exc:

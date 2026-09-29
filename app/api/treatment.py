@@ -17,15 +17,20 @@ import json
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import Principal, get_principal
 from app.api.exact_json import ExactNumberRoute
+from app.api.library_references import resolve_register_control_references
 from app.api.schemas import (
+    REMEDIATION_ROUTING_FIELDS,
     UNAVAILABLE_RESPONSES,
     ErrorResponse,
+    RemediationPlanAccepted,
+    RemediationPlanBody,
     TreatmentAuditEvent,
     TreatmentAuditTrail,
     TreatmentBoard,
@@ -47,7 +52,9 @@ from app.api.schemas import (
 from app.api.sessions import (
     _actor_ids_from_blobs,
     _controls_by_output,
+    _library_block,
     get_authorized_session,
+    save_manual_scenario,
 )
 
 # The presenter (row -> wire model) and its folds live in treatment_presenter.py. Imported by
@@ -67,8 +74,10 @@ from app.api.treatment_presenter import (  # noqa: F401
     _scenario_echo,
     _visible_plan,
 )
+from app.core import security
 from app.core.enums import (
     AuditEventType,
+    ContentSource,
     RiskLevel,
     StageStatus,
     TreatmentGateReason,
@@ -80,7 +89,7 @@ from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
 from app.db.engine import db_session
-from app.pipeline import treatment
+from app.pipeline import control_mapping, treatment
 from app.pipeline.celery_app import generate_treatment_plan_task
 from app.pipeline.tasks import ASSET_UNIT_ID
 
@@ -139,16 +148,27 @@ def enqueue_treatment_plan(plan_id: str, entity_id: str, user_id: str | None) ->
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan", status_code=202,
             response_model=TreatmentPlanAccepted,
             responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES,
-            summary="Request a remediation plan",
+            summary="8.1 · Request a remediation plan",
             description=(
                 "Asks the AI to write the FIRST remediation plan for one accepted scenario.\n\n"
                 "**Before you call:** the scenario must be accepted. This endpoint is first-generation only — "
                 "if any plan already exists for the scenario, whatever its state, this fails with "
                 "`plan_already_exists` and you must use the regenerate endpoint instead.\n\n"
                 "**What to send:** your risk register's own scoring data. TSG stores none of it, so it "
-                "travels in this body and is frozen into the plan. Five fields are required: "
-                "`existing_controls` (may be an empty list, but the key must be present), "
-                "`likelihood_rating`, `impact_rating`, `final_risk_rating` and `risk_level`.\n\n"
+                "travels in this body and is frozen into the plan. Nothing in it is required any more: "
+                "`existing_controls`, `likelihood_rating`, `impact_rating`, `final_risk_rating` and "
+                "`risk_level` may each be omitted, null or blank, and the plan then says which "
+                "calibration it had to do without.\n\n"
+                "Each `existing_controls` entry may name a Control Library row by `control_id`, "
+                "`control_code`, `control_name` or any mix (the id wins, then the code), or be free "
+                "text for a control the library does not hold. A resolved reference reaches the AI as "
+                "the library's own code and name; free text is kept verbatim. A `control_id` or "
+                "`control_code` no active library row has is a `422`, as is one entry whose id and "
+                "code name two different controls.\n\n"
+                "A first launch also tops up a scenario short of the configured minimum of mapped "
+                "controls (5 by default) with the closest Control Library matches before they are "
+                "frozen, when the deployment has this enabled; if that top-up cannot run, the plan "
+                "proceeds from the controls already mapped.\n\n"
                 "**What you get:** `202` with a `plan_id`. Queued, not written — poll the status endpoint "
                 "until `progress.overall` leaves `generating`.\n\n"
                 "**If the queue is unreachable you get `503`, and a plan row has ALREADY been created** and "
@@ -173,7 +193,7 @@ def post_treatment_plan(session_id: str, scenario_id: str, body: TreatmentPlanBo
     always)."""
     return _launch_generation(
         session_id, scenario_id, principal,
-        risk_input=body.model_dump(mode="json"),
+        risk_input=body.model_dump(mode="json"), request_payload=body.model_dump(mode="json"),
         risk_level=str(body.risk_level), risk_identification_date=body.risk_identification_date,
         first_generation=True)
 
@@ -181,7 +201,7 @@ def post_treatment_plan(session_id: str, scenario_id: str, body: TreatmentPlanBo
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/regenerate",
             status_code=202, response_model=TreatmentPlanAccepted,
             responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES,
-            summary="Regenerate a remediation plan",
+            summary="8.6 (optional) · Regenerate a remediation plan",
             description=(
                 "Creates a new version of a plan that already exists. Every version after the first is minted "
                 "here — the request endpoint refuses once any plan exists.\n\n"
@@ -189,7 +209,10 @@ def post_treatment_plan(session_id: str, scenario_id: str, body: TreatmentPlanBo
                 "scenario must still be accepted. Send a literal empty object `{}` as the body; any key at "
                 "all is rejected.\n\n"
                 "**You do not resend your risk data.** It is reused from the snapshot frozen at the first "
-                "request. Only the scenario and control half is rebuilt against whatever they are now.\n\n"
+                "request. Only the scenario and control half is rebuilt against whatever they are now. "
+                "A regeneration tops up only a scenario that has no mapped controls at all, so a first "
+                "launch whose top-up failed can be repaired here without touching a scenario that "
+                "already has controls.\n\n"
                 "**What you get:** `202` with a NEW `plan_id`. The previous version is retired, not deleted, "
                 "and remains readable. Calling again while a regeneration is still running fails with "
                 "`generation_in_progress`. A `503` means the queue was unreachable and the new version is "
@@ -210,10 +233,199 @@ def post_regenerate_treatment_plan(session_id: str, scenario_id: str, body: Trea
     return _launch_generation(session_id, scenario_id, principal, first_generation=False)
 
 
+#: The 200 half of the remediation route: a replay answers with the ORIGINAL plan, not a new one.
+_REPLAY_RESPONSE: dict[int | str, dict] = {
+    200: {"model": RemediationPlanAccepted,
+        "description": "Replay of an already-saved manual scenario — nothing new was saved."}}
+
+_ALREADY_PLANNED = frozenset({str(TreatmentGateReason.plan_already_exists),
+                            str(TreatmentGateReason.generation_in_progress)})
+
+
+@router.post("/remediation-plans", status_code=202, response_model=RemediationPlanAccepted,
+            # UNAVAILABLE_RESPONSES like its sibling routes (a dead broker answers 503 here
+            # too), and 404 explicitly: this is the first route that names its resources in the
+            # BODY, so main.py's path-parameter heuristic does not add it.
+            responses=_REPLAY_RESPONSE | _CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES
+                    | {404: {"model": ErrorResponse,
+                            "description": "is_manual=false: no such session or scenario."}},
+            summary="8.1 (alternative) · Request a remediation plan for any scenario",
+            description=(
+                "One request for BOTH kinds of scenario, chosen by `is_manual`.\n\n"
+                "**`is_manual` false — a scenario TSG generated:** send `session_id` and "
+                "`scenario_id` of an accepted scenario plus your risk-register data. Identical to "
+                "requesting a plan on the scenario's own path, top-up included: an AI-generated "
+                "scenario holding fewer than the configured minimum of mapped controls (5 by "
+                "default) is first topped up with the closest distinct Control Library matches, "
+                "when the deployment has this enabled; controls a person chose are never re-mapped "
+                "or replaced.\n\n"
+                "**`is_manual` true — a scenario a person wrote:** send `manual_scenario` instead "
+                "(no session or scenario id — TSG creates them) and an `Idempotency-Key` header, a "
+                "new random value per user action. In ONE call TSG checks the asset belongs to your "
+                "entity and reads its details, matches the threat category, type and threat to the "
+                "threat library — each named by its id, its name, or both, and an id sent with a "
+                "name that disagrees with the library is a `422` naming both — saves the scenario "
+                "with the controls you sent in "
+                "`mapped_controls` as its only controls, accepts it, and starts the plan. Each of "
+                "those may name a Control Library row by `control_id`, `control_code`, "
+                "`control_name` or any mix; omit the field entirely and TSG maps the scenario "
+                "itself, with the same Control Library matching an AI-generated scenario gets, "
+                "before the plan is written. A type "
+                "or threat not in the library is proposed to the curators as a pending entry "
+                "marked `manual`, with you as its creator. Everything is saved together or not at "
+                "all. The AI never rewrites a manual scenario (scenario regenerate and next-set "
+                "refuse it with `manual_session`; its PLAN regenerates as usual) and controls a "
+                "person chose are never re-mapped or replaced.\n\n"
+                "**What you get:** `202` with `plan_id`, `session_id` and `scenario_id` — keep "
+                "the two ids: status, plan, review and regenerate all take them in their path. "
+                "Re-sending the SAME `Idempotency-Key` returns `200` with the original ids and "
+                "`replayed` true instead of saving a second copy; the same key for a different "
+                "asset, or one that already started an AI session, is `409 "
+                "idempotency_key_conflict`. Only the asset is compared, so re-sending the key with "
+                "a DIFFERENT body for the same asset still returns the original scenario and its "
+                "plan, and the new body is ignored — the same rule as starting a session. The one "
+                "exception: if the original saved the scenario but no plan exists for it (the plan "
+                "was refused, or the request died first), the retry starts that plan from the "
+                "retry's OWN risk-register data and answers `202` with `replayed` true; its "
+                "`manual_scenario` is still ignored.\n\n"
+                "**Errors:** `422` names the field (an unknown category, an unknown or retired "
+                "control, one control entry whose id and code name two different controls, a name "
+                "several library controls share — send the id or the code instead — a blank "
+                "value, a category/type/threat combination the library does not hold — e.g. a "
+                "threat sent with a type other than the one the library files it under — a flag "
+                "that does not match the fields sent, or a missing `Idempotency-Key`) and nothing "
+                "is saved; `403` when the asset or a supporting "
+                "system is not your entity's. If a manual scenario was saved but the plan was "
+                "then refused, the `409` carries its `session_id` and `scenario_id`."
+            ))
+def post_remediation_plan(
+        body: RemediationPlanBody, principal: Principal = Depends(get_principal),
+        # Same bound as create_session's key: it is stored in the same nvarchar(200) column.
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=200),
+) -> RemediationPlanAccepted | JSONResponse:
+    """One entry for both kinds of scenario. is_manual=false is post_treatment_plan by another
+    address — the same _launch_generation, control top-up included; is_manual=true saves the
+    person's scenario (sessions.save_manual_scenario — one all-or-nothing transaction, accepted
+    through the single decision writer) and then starts the plan through that SAME
+    _launch_generation, so a manual plan is topped up, gated, frozen, generated and audited by
+    the code every generated plan goes through."""
+    risk_input = body.model_dump(mode="json", exclude=set(REMEDIATION_ROUTING_FIELDS))
+    # A SECOND, unfiltered dump for the audit record: the routing fields stripped above include
+    # `manual_scenario`, which for a manual request IS the body.
+    request_payload = body.model_dump(mode="json")
+
+    def _plan(session_id: str, scenario_id: str) -> TreatmentPlanAccepted:
+        """The one create both kinds go through — the path route's own implementation."""
+        return _launch_generation(session_id, scenario_id, principal, first_generation=True,
+                                  risk_input=risk_input, request_payload=request_payload,
+                                  risk_level=str(body.risk_level),
+                                  risk_identification_date=body.risk_identification_date)
+
+    if not body.is_manual:
+        # The body validator guarantees both ids on this branch.
+        session_id, scenario_id = str(body.session_id), str(body.scenario_id)
+        accepted = _plan(session_id, scenario_id)
+        # From the SCENARIO, never the flag: these ids may name a hand-written scenario (the two
+        # kinds share every route past this one), and a response that called it generated would
+        # be the provenance lie the flag exists to prevent.
+        return RemediationPlanAccepted(**accepted.model_dump(),
+                                       is_manual=_scenario_is_manual(accepted.session_id,
+                                                                     accepted.scenario_id))
+
+    key = (idempotency_key or "").strip()
+    if not key:
+        raise RequestValidationError([{
+            "type": "missing", "loc": ("header", "Idempotency-Key"), "input": None,
+            "msg": "Field required when is_manual is true — send a new random value per action"}])
+    manual = body.manual_scenario
+    if manual is None:  # the body validator already refuses this; kept so no path can pass None
+        raise RequestValidationError([{
+            "type": "missing", "loc": ("body", "manual_scenario"), "input": None,
+            "msg": "Field required when is_manual is true"}])
+    # The register's control references are checked BEFORE the save, on this branch only, because
+    # this route promises "422 names the field ... and nothing is saved". _launch_generation resolves
+    # them again inside the transaction that freezes them (check-then-write against curator-owned
+    # rows), which is idempotent here — a canonical {id, code, name} reference resolves to itself —
+    # so the cost is one extra indexed query on a request that already writes a dozen rows, and the
+    # payoff is that a bogus control_id in the register half cannot commit a scenario first and then
+    # be refused by a 422 whose envelope has nowhere to carry the ids it just created.
+    with db_session() as sess:
+        risk_input["existing_controls"] = resolve_register_control_references(
+            sess, risk_input.get("existing_controls"))
+    session_id, scenario_id, replayed = save_manual_scenario(manual, principal, key)
+    if replayed:
+        existing = _existing_manual_plan(session_id, scenario_id, principal)
+        if existing is not None:
+            return JSONResponse(status_code=200, content=existing.model_dump(mode="json"))
+    try:
+        accepted = _plan(session_id, scenario_id)
+    except Exception as exc:
+        # A replay racing its own original onto the plan it is creating: answer with that plan.
+        if (replayed and isinstance(exc, treatment.TreatmentConflict)
+                and exc.reason in _ALREADY_PLANNED):
+            existing = _existing_manual_plan(session_id, scenario_id, principal)
+            if existing is not None:
+                return JSONResponse(status_code=200, content=existing.model_dump(mode="json"))
+        # ONE attach point, for EVERY refusal: the save has COMMITTED by now, so whatever refuses
+        # the plan — a gate conflict, a dead broker's 503, a row that vanished — must still hand
+        # back the ids of what now exists, or the client cannot even build the regenerate path
+        # the 503's own message tells it to call. errors.py carries `details` on every shape.
+        exc.details = {  # type: ignore[attr-defined]  # every handler reads it with getattr
+            **(getattr(exc, "details", None) or {}),
+            "session_id": session_id, "scenario_id": scenario_id}
+        raise
+    return RemediationPlanAccepted(**accepted.model_dump(), is_manual=True, replayed=replayed,
+                                   library=_manual_library_block(session_id, scenario_id))
+
+
+def _scenario_is_manual(session_id: str, scenario_id: str) -> bool:
+    """Whether a person wrote this scenario, read from the row itself (ScenarioSource) — the one
+    source of truth for provenance, so no response can report what the request merely claimed."""
+    with db_session() as sess:
+        row = dal.scenario_row(sess, session_id, scenario_id)
+    return bool(row is not None and str(row["ScenarioSource"] or "") == str(ContentSource.manual))
+
+
+def _manual_library_block(session_id: str, scenario_id: str) -> dict | None:
+    """What the save just did to the threat library, for the receipt.
+
+    Read back rather than returned from the writer, so the SAME call serves a fresh save and a
+    replay. Both have a committed scenario row and, when anything was proposed or refused, a
+    committed audit row — so a retry answers exactly what the original answered instead of losing
+    the warning that told the caller to pick a different name. One extra read, on this route only:
+    the receipt is written once per request, never polled."""
+    with db_session() as sess:
+        row = dal.scenario_row(sess, session_id, scenario_id)
+        if row is None:
+            return None
+        return _library_block(dict(row),
+                              dal.library_outcomes_for_scenarios(sess, [scenario_id]))
+
+
+def _existing_manual_plan(session_id: str, scenario_id: str,
+                          principal: Principal) -> RemediationPlanAccepted | None:
+    """The plan a replayed manual request's original already created, as that request's answer —
+    or None when the original saved the scenario but never got as far as a plan. The status is
+    the PRESENTED one (a stale RUNNING reads ERROR), the same projection the status route uses."""
+    with db_session() as sess:
+        get_authorized_session(sess, session_id, principal)
+        row = dal.plan_status_row(sess, session_id, scenario_id)
+        if row is None:
+            return None
+        status, _err, _reason = _present_status(row["Status"], row["ErrorMessage"],
+                                                row["UpdatedAt"], treatment._stale_cutoff(),
+                                                row["ErrorReason"])
+    return RemediationPlanAccepted(plan_id=str(row["PlanID"]), session_id=session_id,
+                                   scenario_id=str(row["ScenarioID"]), status=str(status),
+                                   is_manual=True, replayed=True,
+                                   library=_manual_library_block(session_id, scenario_id))
+
+
 def _launch_generation(session_id: str, scenario_id: str, principal: Principal, *,
                     first_generation: bool,
                     risk_input: dict | None = None, risk_level: str | None = None,
-                    risk_identification_date=None) -> TreatmentPlanAccepted:
+                    risk_identification_date=None,
+                    request_payload: dict | None = None) -> TreatmentPlanAccepted:
     """Shared create/regenerate implementation — the split is at the route layer only.
 
     `first_generation` gates on "no plan rows exist" (the exactly-one-active invariant makes
@@ -223,12 +435,43 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
     get_authorized_session and paid an extra round trip for one logical action; folding it in also
     narrows the window between reading the baseline and superseding it. The fence (the baseline's
     own PlanID) still arbitrates: the retire targets exactly the row whose snapshot was read, or
-    fails the CAS."""
+    fails the CAS.
+
+    `request_payload` is the request body as sent (None on regenerate, which sends none): it is
+    kept verbatim on the treatment_plan_requested audit row and, risk_owner masked, on the
+    `treatment.requested` log line."""
+    # THE control top-up, for every launch — both routes, both kinds of scenario, regenerate
+    # included (which fills only a scenario with no map rows at all; that rule and the
+    # person-chosen-codes rule live inside). BEFORE the route transaction, not in it: the top-up
+    # does network I/O (embed + rerank) between its own short transactions, so nothing here is
+    # held open across it. Fail-open; authz runs first inside its read.
+    control_mapping.top_up_scenario_controls(
+        session_id, scenario_id, first_generation=first_generation,
+        authorize=lambda sess: get_authorized_session(sess, session_id, principal))
     with db_session() as sess:
         # Called for its SIDE EFFECT — this raises on an unauthorized caller and IS the
         # authorization boundary. The return value is unused: the board load behind it omits
         # the JSON blobs, so the full row is re-read via dal.load_session just below.
         get_authorized_session(sess, session_id, principal)
+
+        # The register's `existing_controls` arrive as LIBRARY REFERENCES (control_id / control_code
+        # / control_name, or free text) since 2026-09, so they are resolved against the Control
+        # Library here — once, for a whole list, in ONE query (app/api/library_references).
+        #
+        # `risk_input is not None` is precisely "this came from a request body": REGENERATE passes
+        # None and rebuilds it from the frozen snapshot a few lines below, where the entries are
+        # already the resolved strings this POST stored. Re-resolving those would be worse than
+        # wasteful — a free-text baseline entry that merely LOOKS like a library name would start
+        # resolving on a later regeneration and quietly change the gap-analysis input of a plan
+        # nobody re-submitted.
+        #
+        # INSIDE this transaction, not in the route, for the reason sessions._write_manual_scenario
+        # documents for the same lookup: a control retired between an earlier read-only check and
+        # this INSERT would be frozen into the snapshot as live. One query, on the create path only.
+        if risk_input is not None:
+            risk_input = {**risk_input,
+                        "existing_controls": resolve_register_control_references(
+                            sess, risk_input.get("existing_controls"))}
 
         fence_plan_id: str | None = None
         previous_controls: dict[str, tuple[str, int | None]] | None = None
@@ -270,6 +513,9 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
         # The register's half of the context is `risk_input` (the validated body on create; the
         # active version's frozen snapshot on regenerate) — no external reads. The
         # session-entity check above (get_authorized_session) is THE authorization boundary.
+        if risk_input is None:  # unreachable today: set from the body on create, from the
+            # snapshot on regenerate. Stated rather than assumed, because nothing else does.
+            raise ValueError("risk_input is required to build a treatment plan")
         snapshot = treatment.build_treatment_input(
             sess, dict(session_row), dict(scn), risk_input, previous_controls=previous_controls)
 
@@ -312,7 +558,18 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
             # from it entirely — which is why the per-scenario trail had to fetch the whole
             # session and narrow in Python ("DetailJSON is opaque to SQL here").
             ScenarioID=scn["ScenarioID"], PlanID=plan_id,
-            DetailJSON=json.dumps({"plan_id": plan_id, "scenario_id": scn["ScenarioID"]}))
+            DetailJSON=json.dumps({"plan_id": plan_id, "scenario_id": scn["ScenarioID"],
+                                   "request": request_payload}))
+
+    # After the commit, never before: a line naming a plan the rollback then erased would be a
+    # lie. Body only — headers are never logged — with risk_owner (a person's name) masked; the
+    # audit row above keeps it verbatim, as the snapshot already does.
+    payload = request_payload or {}
+    log.info("treatment.requested", plan_id=plan_id, session_id=session_id,
+             scenario_id=scn["ScenarioID"],
+             is_manual=str(scn["ScenarioSource"] or "") == str(ContentSource.manual),
+             request=security._redact_value(
+                 {**payload, "risk_owner": "***" if payload.get("risk_owner") else None}))
 
     # Enqueue OUTSIDE the db_session block (Pattern A). A failed enqueue must not wedge the
     # scenario_id behind the staleness window: park the committed RUNNING row in ERROR, then answer
@@ -351,7 +608,7 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
 
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/status",
             response_model=TreatmentPlanStatusSummary,
-            summary="Check a remediation plan's status",
+            summary="8.2 · Check a remediation plan's status",
             description=(
                 "The cheap poll: lifecycle and review state only, with no plan content, scenario or threat "
                 "attached.\n\n"
@@ -403,7 +660,7 @@ def get_treatment_plan_status(session_id: str, scenario_id: str,
 
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan",
             response_model=TreatmentPlanStatus,
-            summary="Read a remediation plan",
+            summary="8.3 · Read a remediation plan",
             description=(
                 "The plan itself: the recommended controls, the numbered action list with owners and target "
                 "dates, and the timeline — plus the scenario, threat, adversaries and mapped controls, so a "
@@ -463,6 +720,14 @@ def get_treatment_plan(session_id: str, scenario_id: str,
         # replaced" three entries down would be its own bug. `== 0`, not `!= 1`: a broken
         # linkage nulls this column and is not a replacement, matching the review gate.
         replaced = row["Accepted"] == 0
+        # READ BEFORE the history loop, and passed to BOTH. What a hand-written scenario did to
+        # the threat library hangs off ScenarioID, exactly like the scenario echo — it is a fact
+        # about the scenario, not about one plan version. Computing it after the loop and giving
+        # it only to the active row made every history entry answer `library: null` in the same
+        # response whose current version answered with the block, which reads as "this version
+        # proposed nothing" rather than "same scenario, same library outcome". One query either
+        # way; superseded_plan_rows returns the same ScenarioID.
+        library = dal.library_outcomes_for_scenarios(sess, [row["ScenarioID"]])
         older = None
         if include_superseded:
             # History rows carry no scenario/threat join — the scenario is version-independent,
@@ -476,16 +741,18 @@ def get_treatment_plan(session_id: str, scenario_id: str,
             # between them would supersede the row just read as current, making it show up in
             # BOTH places on one response. Dropping it here keeps the reply self-consistent.
             older = [_plan_status_from_row({**echo, **r}, stale_cutoff, actor_ids, controls,
-                                           superseded_row=True, scenario_replaced=replaced)
+                                           superseded_row=True, scenario_replaced=replaced,
+                                           library=library)
                     for r in dal.superseded_plan_rows(sess, session_id, scenario_id)
                     if r["PlanID"] != row["PlanID"]]
         return _plan_status_from_row(row, stale_cutoff, actor_ids, controls, superseded=older,
-                                    scenario_replaced=replaced)
+                                    scenario_replaced=replaced, library=library)
 
 
 _CANCELLED_MESSAGE = "cancelled by user"
 
-#: Wire labels for the audit feeds — short verbs, not internal enum names.
+#: Wire labels for the audit feeds — short verbs, not internal enum names. A `requested` event's
+#: `detail.request` is the plan request body as sent (null on regenerate), risk_owner included.
 _EVENT_LABELS = {
     str(AuditEventType.treatment_plan_requested): "requested",
     str(AuditEventType.treatment_plan_outcome): "outcome",
@@ -496,7 +763,7 @@ _EVENT_LABELS = {
 
 
 @router.get("/sessions/{session_id}/treatment-plans", response_model=TreatmentBoard,
-            summary="List a session's remediation plans",
+            summary="8.7 · List a session's remediation plans",
             description=(
                 "Every accepted scenario in the session with its plan state, in one call. This replaces "
                 "polling each scenario separately.\n\n"
@@ -587,7 +854,7 @@ def get_treatment_board(session_id: str,
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/cancel",
             response_model=TreatmentCancelResponse, responses=_CONFLICT_RESPONSES,
-            summary="Cancel a running plan generation",
+            summary="As needed · Cancel a running plan generation",
             description=(
                 "The stop button: immediately marks a generation that is still running as failed, instead of "
                 "waiting out the staleness timeout after a mistaken click.\n\n"
@@ -633,7 +900,7 @@ def post_cancel_treatment_plan(session_id: str, scenario_id: str,
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/review",
             response_model=TreatmentReviewResponse, responses=_CONFLICT_RESPONSES,
-            summary="Approve or decline a remediation plan",
+            summary="8.5 · Approve or decline a remediation plan",
             description=(
                 "Records a human's verdict on a plan. This is the decision a regulator would ask to see.\n\n"
                 "**Before you call:** the plan version you are deciding on must be complete.\n\n"
@@ -758,7 +1025,7 @@ def post_review_treatment_plan(session_id: str, scenario_id: str, body: Treatmen
 
 
 @router.get("/entities/{entity_id}/treatment-plans", response_model=TreatmentRegisterPage,
-            summary="List an entity's remediation plans",
+            summary="8.7 · List an entity's remediation plans",
             description=(
                 "Each scenario's CURRENT plan version across every session and asset for one entity, newest "
                 "first. This is the page that answers 'which Critical risks still have no approved plan?'. "
@@ -813,14 +1080,24 @@ def list_entity_treatment_plans(entity_id: str,
         # list precisely so this cannot become an N+1 as the register grows.
         page_controls = (_controls_by_output(sess, [str(r["ScenarioID"]) for r in rows])
                          if include_plan else None)
+        # ONE library read for the page, for BOTH branches: the summary rows publish it too, so
+        # `?include_plan` cannot change what the register says a scenario did to the library.
+        page_library = dal.library_outcomes_for_scenarios(sess, [r["ScenarioID"] for r in rows])
         items = []
         for r in rows:
             if include_plan:
                 # The poll GET's own presenter renders the detail — one projection, two pages,
                 # so the register can never disagree with GET .../treatment-plan.
-                ps = _plan_status_from_row(r, stale_cutoff, actor_ids, page_controls)
+                ps = _plan_status_from_row(r, stale_cutoff, actor_ids, page_controls,
+                                           library=page_library)
                 items.append(TreatmentRegisterRow(
                     plan_id=ps.plan_id, session_id=ps.session_id, scenario_id=ps.scenario_id,
+                    # Provenance on the page a GRC reviewer SIGNS. Both branches read it from the
+                    # SAME row, so the register cannot answer one way with `include_plan` and
+                    # another without; the presenter has already folded legacy NULL ->
+                    # "generated". Omitted, every row published null — including the plans that
+                    # treat a scenario a person hand-wrote.
+                    scenario_source=ps.scenario_source, library=ps.library,
                     asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
                     status=ps.status, risk_level=ps.risk_level,
                     review_status=ps.review_status, reviewed_by=ps.reviewed_by,
@@ -835,6 +1112,9 @@ def list_entity_treatment_plans(entity_id: str,
                                             stale_cutoff, r["ErrorReason"])
             items.append(TreatmentRegisterRow(
                 plan_id=r["PlanID"], session_id=r["SessionID"], scenario_id=r["ScenarioID"],
+                # Same fold as the presenter applies above, on the same column.
+                scenario_source=r["ScenarioSource"] or "generated",
+                library=_library_block(dict(r), page_library),
                 asset_name=r["AssetName"], scenario_title=r["ScenarioTitle"],
                 status=st, risk_level=r["RiskLevel"], review_status=r["ReviewStatus"],
                 reviewed_by=r["ReviewedBy"], error_message=err, reason=reason,
@@ -844,7 +1124,7 @@ def list_entity_treatment_plans(entity_id: str,
 
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/audit",
             response_model=TreatmentAuditTrail,
-            summary="Read one scenario's plan history",
+            summary="8.8 · Read one scenario's plan history",
             description=(
                 "Every remediation-plan event for one scenario, across all its versions, oldest first: who "
                 "requested each plan, how each generation ended, cancellations, review verdicts and version "
@@ -887,7 +1167,7 @@ def get_treatment_plan_audit(session_id: str, scenario_id: str,
 
 @router.get("/entities/{entity_id}/treatment-plans/audit",
             response_model=TreatmentEntityAuditPage,
-            summary="Read an entity's plan activity",
+            summary="8.8 · Read an entity's plan activity",
             description=(
                 "Every remediation-plan action across the whole entity, newest first. This is the compliance "
                 "export.\n\n"
@@ -950,7 +1230,7 @@ def _evidence_plan_id(
 
 @router.get("/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/evidence",
             response_model=TreatmentEvidence,
-            summary="Get a plan version's evidence bundle",
+            summary="8.4 · Get a plan version's evidence bundle",
             description=(
                 "The receipt for one plan version: the exact frozen input the AI was given, the validation "
                 "and moderation record, and every raw AI prompt and response.\n\n"

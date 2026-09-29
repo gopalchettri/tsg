@@ -128,21 +128,29 @@ def test_every_documented_example_validates_against_its_own_model():
         if not (isinstance(model, type) and issubclass(model, BaseModel)) or model is BaseModel:
             continue
         extra = (model.model_config or {}).get("json_schema_extra") or {}
-        example = extra.get("example") if isinstance(extra, dict) else None
-        if not isinstance(example, dict):
+        if not isinstance(extra, dict):
             continue
-        if name.endswith(request_suffixes):
-            try:
-                model.model_validate(example)
-            except Exception as exc:  # noqa: BLE001 - the message is the whole point of the report
-                stale.append(f"{name}: documented example is REJECTED by its own model -> {exc}")
-        elif (model.model_config or {}).get("extra") != "allow":
-            # extra="allow" models (ScenarioNarrative) pass model-authored keys through on
-            # purpose, so an undeclared key in their example is the documented behaviour, not drift.
-            unknown = set(example) - set(model.model_fields) - {
-                a for f in model.model_fields.values() if (a := f.alias)}
-            if unknown:
-                stale.append(f"{name}: example documents fields that do not exist -> {sorted(unknown)}")
+        # BOTH spellings. A body whose two forms are mutually exclusive — AcceptBody's three modes,
+        # RemediationPlanBody's manual-vs-existing scenario — publishes `examples` (plural, a
+        # picker in Swagger) because one example would leave half its callers guessing. Reading
+        # only the singular key meant every one of those went unvalidated, which is the same blind
+        # spot this test exists to close, one level up.
+        published = [extra["example"]] if isinstance(extra.get("example"), dict) else []
+        published += [e for e in (extra.get("examples") or []) if isinstance(e, dict)]
+        for position, example in enumerate(published):
+            where = f"{name}[{position}]" if len(published) > 1 else name
+            if name.endswith(request_suffixes):
+                try:
+                    model.model_validate(example)
+                except Exception as exc:  # noqa: BLE001 - the message is the point of the report
+                    stale.append(f"{where}: documented example is REJECTED by its own model -> {exc}")
+            elif (model.model_config or {}).get("extra") != "allow":
+                # extra="allow" models (ScenarioNarrative) pass model-authored keys through on
+                # purpose, so an undeclared key there is documented behaviour, not drift.
+                unknown = set(example) - set(model.model_fields) - {
+                    a for f in model.model_fields.values() if (a := f.alias)}
+                if unknown:
+                    stale.append(f"{where}: example documents fields that do not exist -> {sorted(unknown)}")
     assert not stale, "stale documented examples:\n  " + "\n  ".join(stale)
 
 

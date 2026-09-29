@@ -15,7 +15,7 @@ from app.api.schemas_treatment import TreatmentPlanDocument
 from app.core.enums import ActionPriority, ControlCoverage, ControlType, TreatmentOutcomeReason, YesNo
 from app.pipeline.llm import LLMRefusal, LLMResponseTruncated
 from app.pipeline.prompts import TreatmentPlanGenerated
-from app.pipeline.treatment import _RESERVED_PLAN_KEYS, _classify_failure, _validate_plan
+from app.pipeline.treatment import _RESERVED_PLAN_KEYS, _SCHEDULED_PLAN_KEYS, _classify_failure, _validate_plan
 
 
 def _walk(node: dict, path: str = ""):
@@ -61,7 +61,8 @@ def test_keys_partition_between_model_and_server():
     served = set(TreatmentPlanDocument.model_fields)
     assert generated.isdisjoint(_RESERVED_PLAN_KEYS), "a reserved key must never be model-authored"
     assert generated <= served
-    assert generated | set(_RESERVED_PLAN_KEYS) >= served
+    assert generated.isdisjoint(_SCHEDULED_PLAN_KEYS), "a scheduled key must never be model-authored"
+    assert generated | set(_RESERVED_PLAN_KEYS) | set(_SCHEDULED_PLAN_KEYS) >= served
 
 
 def sample_generated_plan() -> TreatmentPlanGenerated:
@@ -75,10 +76,11 @@ def sample_generated_plan() -> TreatmentPlanGenerated:
             "priority": ActionPriority.critical, "control_code": "CII-CID-028"}]},
         remediation_action_plan=[{
             "action_id": "A1", "action": "Enrol every remote account in MFA", "owner": "IAM team",
-            "priority": ActionPriority.critical, "dependencies": "None", "timeline": "2026-09-01",
+            "priority": ActionPriority.critical, "dependencies": "None", "depends_on": [],
+            "duration_days": 14, "implements_controls": ["CII-CID-028"],
             "success_criteria": "100% of remote accounts enrolled, verified by IdP report"}],
         action_plan="A1 closes the gap; urgency follows risk_level Critical (final_risk_rating 20).",
-        mitigation_timeline="2026-09-01", mitigation_owner="Head of IAM",
+        mitigation_owner="Head of IAM",
         applicable_to_all_subsystems=YesNo.yes)
 
 

@@ -1,12 +1,13 @@
 # FastAPI entrypoint. Run with: uvicorn app.main:app
 from __future__ import annotations
 
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.admin import grounding_router
+from app.api.admin import control_map_router, grounding_router
 from app.api.admin import router as admin_router
 from app.api.api_clients import router as api_clients_router
 from app.api.deps import require_admin
@@ -54,11 +55,75 @@ def create_app() -> FastAPI:
         title=get_settings().application_name,
         version=get_settings().application_version,
         description=get_settings().application_description,
+        # Declared in TEST ORDER: Swagger renders groups in this order, and each route title's
+        # prefix numbers it (1.1, 1.2, ...). Setup blocks 1-4 must run before 6-8: the scenario
+        # and remediation calls succeed on an unprepared platform but return weak or empty
+        # results (unverified threats, no controls). See
+        # docs/API_Testing/End_to_End_API_Testing_Guide.md "Before you test".
         openapi_tags=[
-            {"name": "Health", "description": "Liveness/readiness probes for orchestrators. No authentication required."},
+            {"name": "Health", "description": (
+                "**Block 0 — run first.** 0.1 liveness, 0.2 readiness: confirms the app, database, "
+                "cache and job broker are up. Readiness does NOT check that any data is loaded. "
+                "No authentication required.")},
+            {
+                "name": "API Clients Admin",
+                "description": (
+                    "**Setup block 1 of 4 — run after Block 0.** 1.1 create a key, 1.2 list keys to "
+                    "confirm. Every other call needs the key 1.1 returns.\n\n"
+                    "Mint, list and revoke the API client keys callers authenticate with. "
+                    "Requires the admin key alone — issuing the first key must not itself need "
+                    "one. The secret is returned exactly once on create and never stored; a "
+                    "lost secret is revoked and re-minted, never recovered."
+                ),
+            },
+            {
+                "name": "Threat Intel Admin",
+                "description": (
+                    "**Setup block 2 of 4 — run after block 1.** Loads the CONTENT the platform "
+                    "reasons with, so it comes before embeddings and calibration: 2.1 import extra "
+                    "threats from public libraries (optional) → 2.2 check the import → 2.3 rebuild "
+                    "the ATT&CK/CAPEC technique corpus → 2.4 check it reports warm → 2.5 refresh the "
+                    "live intel feeds → 2.6/2.7 check the feeds and items. The curation routes are "
+                    "ongoing, after scenarios are promoted: approve, then run 3.1 again.\n\n"
+                    "Refresh live threat-intel feeds (CISA KEV/ICS, OTX, URLhaus, ...) that "
+                    "feed the threats-prompt hint. Requires the admin key."
+                ),
+            },
+            {
+                "name": "Embeddings Admin",
+                "description": (
+                    "**Setup block 3 of 4 — run after block 2.** 3.1 fill in missing vectors → 3.2 "
+                    "check the job. Fingerprints the FINAL library, including anything block 2 "
+                    "imported, so threats and controls can be matched by meaning. Run 3.1 again "
+                    "whenever library content changes.\n\n"
+                    "Manage the shared embedding cache used by both the threat and control "
+                    "libraries for AI matching: create/update/recreate/delete vectors, and poll "
+                    "job status. Requires the admin key."
+                ),
+            },
+            {
+                "name": "Grounding Admin",
+                "description": (
+                    "**Setup block 4 of 4 — run LAST, after block 3.** 4.1 read the current "
+                    "threshold → 4.2 calibrate → 4.3 check the sweep → 4.4 read the threshold again "
+                    "(origin should be calibrated). Calibration samples the library and uses its "
+                    "vectors, so it must see the finished library; run earlier, it measures the "
+                    "wrong library and wastes its model calls.\n\n"
+                    "Measure the grounding match threshold — the score at or above which an "
+                    "AI-proposed threat is treated as an existing library entry rather than a "
+                    "new one. The right value is specific to the configured embedding+reranker "
+                    "pair, so it is measured per pair and stored, not hand-tuned: read the "
+                    "current one (with its provenance) and queue a re-calibration after "
+                    "changing models or curating the library. Requires the admin key."
+                ),
+            },
             {
                 "name": "Threat Scenario Generation",
                 "description": (
+                    "**Block 6 — after setup blocks 1-4.** 6.1 start → 6.2 follow progress → 6.3 "
+                    "read the scenarios → 6.4 refine (optional) → 6.5 accept → 6.6 list accepted → "
+                    "6.7 promote a new threat to the library (optional). Remediation needs "
+                    "ACCEPTED scenarios.\n\n"
                     "Create and drive a threat-scenario-generation session: identify threats, "
                     "generate scenarios, accept/regenerate/cancel, stream live progress, and "
                     "fetch previously accepted scenarios."
@@ -67,6 +132,7 @@ def create_app() -> FastAPI:
             {
                 "name": "Scenarios",
                 "description": (
+                    "**Block 7 — after block 6.** 7.1 one scenario → 7.2 by user → 7.3 by entity.\n\n"
                     "Cross-session scenario reads: list everything one user created, list "
                     "everything under one entity, or fetch a single scenario by id. Results "
                     "are always restricted to the caller's authorized entities."
@@ -75,6 +141,9 @@ def create_app() -> FastAPI:
             {
                 "name": "Remediation Plans",
                 "description": (
+                    "**Block 8 — after block 6 has accepted scenarios.** 8.1 request a plan → 8.2 "
+                    "poll status → 8.3 read → 8.4 evidence → 8.5 approve or decline → 8.6 "
+                    "regenerate (optional) → 8.7 lists → 8.8 history.\n\n"
                     "AI-generated Risk Treatment (Mitigate) plans for accepted scenarios. "
                     "The register's risk data (ratings, level, existing controls) is sent in "
                     "the request body. Present only when RISK_MODULE_ENABLED is on. POST to "
@@ -92,41 +161,20 @@ def create_app() -> FastAPI:
                 ),
             },
             {
-                "name": "Embeddings Admin",
+                "name": "Control Mapping Admin",
                 "description": (
-                    "Manage the shared embedding cache used by both the threat and control "
-                    "libraries for AI matching: create/update/recreate/delete vectors, and poll "
-                    "job status. Requires the admin key."
+                    "**Recovery only — not part of setup.** Use it after block 6 if accepted "
+                    "scenarios show an empty control list.\n\n"
+                    "Run the control-mapping retry sweep by hand. Control matching has three "
+                    "paths that stop without finishing a scenario — the control library returned "
+                    "no candidates, another worker held the lease, or a rerank never answered — "
+                    "each safe only because a scheduled sweep retries them. While that schedule "
+                    "is switched off, a stranded scenario publishes an empty control list, which "
+                    "reads as 'the library has nothing for this threat' rather than 'nobody "
+                    "finished looking'. This is the manual drain, and it runs whether the "
+                    "schedule is on or off. Requires the admin key."
                 ),
             },
-            {
-                "name": "Grounding Admin",
-                "description": (
-                    "Measure the grounding match threshold — the score at or above which an "
-                    "AI-proposed threat is treated as an existing library entry rather than a "
-                    "new one. The right value is specific to the configured embedding+reranker "
-                    "pair, so it is measured per pair and stored, not hand-tuned: read the "
-                    "current one (with its provenance) and queue a re-calibration after "
-                    "changing models or curating the library. Requires the admin key."
-                ),
-            },
-            {
-                "name": "Threat Intel Admin",
-                "description": (
-                    "Refresh live threat-intel feeds (CISA KEV/ICS, OTX, URLhaus, ...) that "
-                    "feed the threats-prompt hint. Requires the admin key."
-                ),
-            },
-            {
-                "name": "API Clients Admin",
-                "description": (
-                    "Mint, list and revoke the API client keys callers authenticate with. "
-                    "Requires the admin key alone — issuing the first key must not itself need "
-                    "one. The secret is returned exactly once on create and never stored; a "
-                    "lost secret is revoked and re-minted, never recovered."
-                ),
-            },
-
         ],
         lifespan=lifespan,
     )
@@ -150,6 +198,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_router)
     app.include_router(api_clients_router)
     app.include_router(grounding_router)
+    app.include_router(control_map_router)
     app.include_router(threat_intel_router)
     # Feature-flagged: routes only mount, and only 404-by-absence otherwise
     if get_settings().risk_module_enabled:
@@ -174,6 +223,25 @@ def create_app() -> FastAPI:
 
 _API_KEY_SCHEME = "ApiKeyAuth"
 _ADMIN_KEY_SCHEME = "AdminKeyAuth"
+
+_STEP = re.compile(r"^(\d+)\.(\d+)([a-z]?)")
+
+
+def _paths_in_test_order(schema: dict) -> dict:
+    """Swagger lists a group's routes in REGISTRATION order, so a group read 2.6, 2.7, 2.1, ...
+    Sort the published paths by (group position in openapi_tags, step number from the route
+    title) so each group reads top-to-bottom in the order a tester runs it. Titles without a step
+    ("As needed", "Curation", "Recovery") go after the numbered ones in their group. A path
+    carrying several methods sorts by its earliest step."""
+    group = {t["name"]: i for i, t in enumerate(schema.get("tags", []))}
+
+    def key(op: dict) -> tuple:
+        m = _STEP.match(op.get("summary", ""))
+        step = (int(m[1]), int(m[2]), m[3]) if m else (999, 0, op.get("summary", ""))
+        return (group.get((op.get("tags") or [""])[0], 999), *step)
+
+    return dict(sorted(schema["paths"].items(), key=lambda kv: min(key(op) for op in kv[1].values())))
+
 
 def _finalize_openapi(app: FastAPI) -> None:
     """Make the PUBLISHED spec match what the app actually does: one error envelope, declared
@@ -215,6 +283,7 @@ def _finalize_openapi(app: FastAPI) -> None:
     them instead would turn every missing-key 401 into a 422.
     """
     schema = app.openapi()
+    schema["paths"] = _paths_in_test_order(schema)
     ref = {"$ref": "#/components/schemas/ErrorResponse"}
 
     def envelope(description: str) -> dict:

@@ -21,7 +21,7 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import get_settings
@@ -37,7 +37,7 @@ def _engine():
     for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Threat_Scenario_Control_Map, m.Scenario_Audit,
                 # map_controls joins these to put the THREAT in the control query
-                # (control_mapping.collect_control_query) — without them the join
+                # (control_mapping._retrieval_query) — without them the join
                 # errors and mapping silently degrades to zero controls.
                 m.Scoped_Threat, m.Identified_Threat):
         tbl.__table__.create(engine)
@@ -128,7 +128,10 @@ def test_unanswered_output_is_not_stamped_and_is_retried(monkeypatch):
     # ...and the degradation is PERSISTED, not just logged, so a later reader can tell this
     # run apart from a clean one (the tasks._validate_candidates `degraded` discipline).
     assert audits[0]["unanswered"] == 1
-    assert audits[0]["mapped"] == 2
+    # mapped_count, not "mapped": every number in this row is now folded from the
+    # ControlSelection objects the policy module returned, one key per number, so the audit and
+    # the decision cannot drift.
+    assert audits[0]["mapped_count"] == 2
 
     # --- the recurrence half: the provider recovers and the next run finishes the job -------
     _stub(monkeypatch, lambda i: _HIT)
@@ -207,6 +210,145 @@ def test_the_final_allowed_attempt_that_succeeds_does_not_log_exhausted(monkeypa
     assert outputs[ids[0]].ControlsMappedAt is not None, "the final allowed attempt must still succeed"
     assert not [e for e in logged if e["event"] == "controls.mapping_exhausted"], (
         "must not report 'exhausted' for an attempt that just succeeded")
+
+
+def test_an_abandoned_map_batch_is_not_reported_as_an_empty_library(monkeypatch):
+    """THE F4 REGRESSION PIN. When the IntegrityError isolation retry ALSO clashes, every scenario
+    comes back clashed, `answered` is empty, `_tally` folds an empty list, and every count in the
+    audit row lands on 0 — byte-identical to a clean pass that reranked everything and matched
+    nothing, which app/api/schemas.py documents in three places as a genuine, curated library gap.
+    The only trace was a log line, and a log line is not the durable record.
+
+    `_conflicting_scenario_ids` is patched to see nothing, which is exactly what a racing writer
+    whose commit lands between that SELECT and the retry insert produces — the window the abandoned
+    branch exists for."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid, task_id = str(uuid.uuid4()), str(uuid.uuid4())
+    with Session() as s:
+        ids = _seed(s, sid, task_id, n_outputs=2)
+
+    _stub(monkeypatch, lambda i: _HIT)
+    monkeypatch.setattr(control_mapping, "_conflicting_scenario_ids", lambda sess, sids: set())
+
+    with Session() as s:
+        def _race(llm, flat, candidates, s_):
+            # A concurrent writer commits the row we are about to insert for ids[0].
+            s.execute(m.Threat_Scenario_Control_Map.__table__.insert().values(
+                ScenarioID=ids[0], ControlLibraryID=1, SessionID=sid, MapRank=1, Score=90.0,
+                CreatedAt=NOW))
+            s.commit()
+            return [_HIT for _ in flat]
+        monkeypatch.setattr(grounding, "ground_control_queries", _race)
+        control_mapping.map_controls(s, {"SessionID": sid, "TenantID": "t", "EntityID": "e"},
+                                    {}, [], _FakeLLM(), 0, task_id, 1, durable=True)
+
+    outputs, _maps, audits = _state(Session)
+    assert audits[0]["conflict_outcome"] == "abandoned", (
+        "an abandoned batch must be a recorded outcome, not a zeroed-out clean pass")
+    assert audits[0]["conflicted_count"] == 2
+    assert audits[0]["mapped_count"] == 0
+    assert all(r.ControlsMappedAt is None for r in outputs.values()), (
+        "nothing was written, so nothing may be stamped — the queue is the retry")
+
+
+def test_a_clean_pass_records_the_clean_conflict_outcome(monkeypatch):
+    """The control for the test above: the two states must be distinguishable in the audit row, so
+    the healthy one has to say so rather than merely leaving the fields at zero."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid, task_id = str(uuid.uuid4()), str(uuid.uuid4())
+    with Session() as s:
+        _seed(s, sid, task_id, n_outputs=2)
+    _stub(monkeypatch, lambda i: _HIT)
+    _run(Session, sid, task_id)
+    _outputs, _maps, audits = _state(Session)
+    assert (audits[0]["conflict_outcome"], audits[0]["conflicted_count"]) == ("clean", 0)
+
+
+def test_each_advisory_warning_names_the_scenario_it_is_about(monkeypatch):
+    """F6(f). One audit row covers the whole pass and its `warnings` list is truncated at 20, so
+    "mapped 1 controls, fewer than the 5 expected" named no scenario at all — the advisory a
+    reviewer most needs to act on was the one they could not attribute."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid, task_id = str(uuid.uuid4()), str(uuid.uuid4())
+    with Session() as s:
+        ids = _seed(s, sid, task_id, n_outputs=3)
+    _stub(monkeypatch, lambda i: _HIT)      # one control each, well under control_map_min_count
+    _run(Session, sid, task_id)
+
+    _outputs, _maps, audits = _state(Session)
+    warnings = audits[0]["warnings"]
+    assert warnings, "being short of the floor must still be recorded"
+    assert {w.split(":")[0] for w in warnings} == {f"scenario {oid}" for oid in ids}
+
+
+def test_a_pass_with_nothing_groundable_still_writes_its_audit_row(monkeypatch):
+    """F6(b). The `nothing_groundable` early return stamped every output PERMANENTLY and returned
+    before `_settle_pass`, so no controls_mapped row was written at all — the one durable record was
+    missing exactly when a reviewer needs to know why a scenario has no controls, and a stamped
+    scenario with zero rows reads as a curated library gap."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid, task_id = str(uuid.uuid4()), str(uuid.uuid4())
+    with Session() as s:
+        ids = _seed(s, sid, task_id, n_outputs=1)
+        # No threat chain and no narrative: _retrieval_query returns None, so there is nothing to ask.
+        s.execute(m.Threat_Scenario.__table__.update()
+                .where(m.Threat_Scenario.ScenarioID == ids[0]).values(ScenarioJSON="{}"))
+        s.commit()
+
+    def _never_grounds(*_a, **_k):
+        raise AssertionError("a pass with no groundable query must not reach the reranker")
+    monkeypatch.setattr(grounding, "get_control_candidates",
+                        lambda sess, itot: [{"ControlLibraryID": 1, "text": "MFA"}])
+    monkeypatch.setattr(control_mapping, "_min_score",
+                        lambda sess, llm, s: grounding.Threshold(0.0, "test"))
+    monkeypatch.setattr(grounding, "ground_control_queries", _never_grounds)
+    _run(Session, sid, task_id)
+
+    outputs, maps, audits = _state(Session)
+    assert outputs[ids[0]].ControlsMappedAt is not None, "nothing to ask is a definitive answer"
+    assert maps == []
+    assert len(audits) == 1, "the stamp is permanent, so the reason must be durable too"
+    assert (audits[0]["skipped"], audits[0]["mapped_count"], audits[0]["outputs"]) == (1, 0, 0)
+
+
+def test_the_attempt_counter_reads_its_rows_by_name(monkeypatch):
+    """F6(d). `_record_control_map_attempts` read `row[0]`, in a function whose own docstring
+    forbids positional reads — `eligible_outputs` has grown twice and a positional read of it has
+    already cost this module one swallowed ValueError. Fed a row whose FIRST column is not the
+    ScenarioID, it must still increment the right rows."""
+    engine = _engine()
+    Session = sessionmaker(bind=engine, future=True)
+    sid, task_id = str(uuid.uuid4()), str(uuid.uuid4())
+    with Session() as s:
+        ids = _seed(s, sid, task_id, n_outputs=2)
+    out = m.Threat_Scenario
+    with Session() as s:
+        reordered = s.execute(select(out.SubsystemID, out.ScenarioNumber, out.ScenarioID)
+                            .where(out.SessionID == sid)).all()
+        control_mapping._record_control_map_attempts(s, reordered)
+    with Session() as s:
+        attempts = dict(s.execute(select(out.ScenarioID, out.ControlMapAttempts)).all())
+    assert attempts == {ids[0]: 1, ids[1]: 1}
+
+
+def test_a_corrupt_stored_blob_is_reported_not_silently_defaulted(monkeypatch):
+    """F6(a). `_blob` swallowed both unparseable JSON and a wrong-shaped payload with no log,
+    counter or audit field, for three different session/scenario columns — so a corrupt
+    SubsystemsJSON silently produced an empty ITOT context that read like an honest thin answer.
+    The degrade stays; the silence does not."""
+    logged: list[dict] = []
+    monkeypatch.setattr(control_mapping.log, "warning",
+                        lambda event, **kw: logged.append({"event": event, **kw}))
+    assert control_mapping._blob("{not json", {}, column="ScenarioJSON") == {}
+    assert control_mapping._blob('{"a": 1}', [], column="SubsystemsJSON") == []
+    assert control_mapping._blob(None, {}, column="AssetContextJSON") == {}   # empty is not corrupt
+    assert [(e["event"], e["column"]) for e in logged] == [
+        ("controls.blob_unparseable", "ScenarioJSON"),
+        ("controls.blob_wrong_shape", "SubsystemsJSON")]
 
 
 def test_the_final_allowed_attempt_that_fails_logs_exhausted_and_stops_for_good(monkeypatch):

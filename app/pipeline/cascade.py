@@ -20,6 +20,8 @@ from app.core.enums import (
     AuditEventType,
     NextSetOutcome,
     RegenGranularity,
+    ReviewGateReason,
+    SessionMode,
     SSEEventType,
     StageStatus,
     SubsystemLevel,
@@ -115,8 +117,20 @@ BUSY_MAX_RETRIES = 5
 BUSY_RETRY_SECONDS = 20
 
 
+def _refuses_ai_writes(scenario_session: dict) -> bool:
+    """A person wrote this session's scenario, so no AI stage may ever write to it.
+
+    Read from the session row the worker already holds — no query, and no way for a caller to
+    forget: both AI writers ask this as their first statement."""
+    if scenario_session.get("Mode") != SessionMode.MANUAL:
+        return False
+    log.info("ai_write.refused_manual_session", session_id=scenario_session.get("SessionID"))
+    return True
+
+
 def settle_unstarted(sess: Session, scenario_session: dict, subsystem_id: int, epoch: int,
-                    task_id: str, kind: str, target_ids: list | None = None) -> str | None:
+                    task_id: str, kind: str, target_ids: list | None = None,
+                    reason: str = "subsystem_busy") -> str | None:
     """Put a stage back that its execution never got to run, and say so on the wire.
 
     The endpoint resets SCENARIOS to IDLE at a new epoch before enqueueing, so a run that gives up
@@ -131,10 +145,10 @@ def settle_unstarted(sess: Session, scenario_session: dict, subsystem_id: int, e
         dal.finish_stage(sess, scenario_session["SessionID"], subsystem_id,
                         SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION, epoch, task_id)
         sess.commit()
-    log.warning(f"{kind}.gave_up_subsystem_busy", session_id=scenario_session["SessionID"],  # noqa: G004
+    log.warning(f"{kind}.gave_up_{reason}", session_id=scenario_session["SessionID"],  # noqa: G004
                 subsystem=subsystem_id, epoch=epoch, attempts=BUSY_MAX_RETRIES)
     _publish_regen_result(scenario_session["SessionID"], subsystem_id, target_ids, [],
-                        reason="subsystem_busy")
+                        reason=reason)
     return tasks.decide_session_outcome(sess, scenario_session)
 
 
@@ -400,6 +414,12 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
     return the session outcome. A capacity error is re-raised for task retry; stale targets are
     reported as conflicts without failing the stage.
     """
+    if _refuses_ai_writes(scenario_session):
+        # The route already refuses (sessions._assert_regen_eligible); this is the second wall, at
+        # the one place AI rewrites actually happen, so no queued, redelivered or future message
+        # can rewrite a person's text. Handed back exactly like any regeneration that never ran.
+        return settle_unstarted(sess, scenario_session, subsystem_id, epoch, task_id, "regen",
+                                target_ids=target_ids, reason=ReviewGateReason.manual_session)
     sid = scenario_session["SessionID"]
     subsystems, asset_context = _resolve_regen_context(scenario_session)
 
@@ -590,6 +610,9 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
     scenarios accumulate without replacing unrelated outputs. Return the session outcome or a
     no-new-threats signal. Reused epochs prevent duplicate threat generation.
     """
+    if _refuses_ai_writes(scenario_session):
+        return settle_unstarted(sess, scenario_session, subsystem_id, epoch, task_id, "next_set",
+                                reason=ReviewGateReason.manual_session)
     sid = scenario_session["SessionID"]
     subsystems, asset_context = _resolve_regen_context(scenario_session)
 

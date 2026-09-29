@@ -256,7 +256,7 @@ def main() -> None:
     # is the only thing narrowing applicable_to_all_subsystems for an uninvolved system now.
     treat_sys = prompts.treatment_prompt(snapshot(base))[0]["content"]
     assert "scenario.supporting_systems_involved" in treat_sys
-    assert "NOT in that list is outside this scenario's scope" in treat_sys
+    assert "out-of-scope systems don't block" in treat_sys
     print("14 OK treatment prompt carries actors + involved systems, and instructs on absence")
 
     print("\nprompt db-key self-check OK")

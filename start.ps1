@@ -42,7 +42,26 @@
     endpoint can take it; keep it low when the endpoint rate-limits.
 
 .PARAMETER Reload
-    Pass -Reload to start uvicorn with --reload.
+    Force auto-reload ON. Rarely needed: it is ALREADY on when the env file is the dev '.env'
+    (see -NoReload). Kept so the example below keeps working, and to force reload deliberately
+    for a non-'.env' file.
+
+.PARAMETER NoReload
+    Turn auto-reload OFF. It is ON BY DEFAULT for '.env' and OFF for every other env file, so a
+    code edit takes effect without restarting the whole stack.
+
+    NOT uvicorn's --reload. That one is broken here: measured 2026-09-24, its in-process reloader
+    dies on its FIRST restart, taking the console process group with it and leaving nothing on the
+    port -- with and without the log pipe, with WATCHFILES_FORCE_POLLING=1, and with
+    --reload-delay 1. A five-line ASGI app failed identically, so the cause is the environment,
+    not TSG. The launch block uses `watchfiles` to supervise uvicorn from outside instead, which
+    survives repeated reloads. Only .py files under app/ retrigger it.
+
+    WHY THE ENV FILE DECIDES, and not APP_ENV. '.env' and '.env.uat' BOTH declare APP_ENV=staging
+    (app/core/config.py allows local|dev|staging|prod), so the environment cannot tell a dev launch
+    from a UAT one -- the FILE can. Precedence: -NoReload wins, then -Reload, then this default.
+    Only this script and run.ps1 are affected; the containers and the OpenShift manifest run
+    gunicorn with several worker processes and never read these switches.
 
 .PARAMETER DockerServices
     Which docker/compose.yml services to bring up. Default: redis, mongo, litellm.
@@ -78,7 +97,13 @@ param(
     [string]$EnvFile = $(if ($env:TSG_ENV_FILE) { $env:TSG_ENV_FILE } else { '.env' }),
     [int]$Port = 8000,
     [int]$Concurrency = 10,
+    # If anyone ever makes reload the default, do NOT write `[switch]$Reload = $true`: run.ps1
+    # forwards `-Reload:$Reload`, which binds the switch EXPLICITLY, so a $true default would be
+    # overwritten with $false on every plain .\run.ps1 and the default would be dead at the entry
+    # point people actually use. Compute it into $useReload below instead. (See -Reload's help
+    # first: the reloader does not survive a restart on this machine.)
     [switch]$Reload,
+    [switch]$NoReload,
     [switch]$SkipDocker,
     [switch]$NoFlower,
     [int]$FlowerPort = 5555,
@@ -171,6 +196,25 @@ $appEnv = Get-EnvValue -Path $envPath -Keys 'APP_ENV', 'TSG_APP_ENV'
 if (-not $appEnv) { $appEnv = 'unset -> config default: prod' }
 $effectiveEnvFile = "$EnvFile  (APP_ENV=$appEnv)"
 
+# Auto-reload: ON for the dev '.env', OFF for every other env file. Decided ONCE, here, so the
+# banner below and the launch line cannot disagree about it.
+#
+# WHY IT IS ON. Editing app code and not seeing the change is the failure this removes: a fix can
+# be correct on disk and green in the suite while the running API still serves the old code, which
+# reads as "the fix does not work" rather than "the server was never restarted".
+#
+# HOW it reloads matters -- see the launch block below. uvicorn's own --reload is NOT used; it
+# kills the whole console process group on its first restart here. watchfiles supervises the
+# server instead, which was measured to survive repeated reloads.
+#
+# Not keyed on APP_ENV, deliberately: '.env' and '.env.uat' BOTH say staging, so APP_ENV cannot
+# separate a dev launch from a UAT one. The FILE can, and it is the thing the operator chose.
+#
+# Split-Path -Leaf on $envPath, not a compare against $EnvFile: $EnvFile may arrive as an absolute
+# path or from an exported TSG_ENV_FILE (see the param default), and the leaf is right for both.
+$isDefaultEnvFile = (Split-Path -Leaf $envPath) -eq '.env'
+$useReload = (-not $NoReload) -and ($Reload.IsPresent -or $isDefaultEnvFile)
+
 # Refuse to double-launch. Two workers on one box race the same queue (and, before -n below,
 # under identical broker hostnames). NOTE: ONE healthy stack normally shows a celery.exe +
 # TWO python.exe chain per service (launcher parent + real process) -- matched python.exe
@@ -193,7 +237,9 @@ Write-Host "Project root : $ProjectRoot" -ForegroundColor Cyan
 Write-Host "Env file     : $effectiveEnvFile" -ForegroundColor Cyan
 Write-Host "FastAPI port : $Port"        -ForegroundColor Cyan
 Write-Host "Concurrency  : $Concurrency" -ForegroundColor Cyan
-Write-Host "Auto-reload  : $($Reload.IsPresent)" -ForegroundColor Cyan
+# The EFFECTIVE value, not the raw switch: reload is now decided by the env file, so printing
+# $Reload.IsPresent would report False on a plain .\start.ps1 that is in fact reloading.
+Write-Host "Auto-reload  : $useReload  (env file: $(Split-Path -Leaf $envPath))" -ForegroundColor Cyan
 Write-Host ""
 
 # ---------------------------------------------------------------------------
@@ -286,12 +332,15 @@ function Stop-ProcessOnPort {
         $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
         if (-not $proc) { continue }
         Write-Host "  $Label : port $Port held by PID $ownerPid ($($proc.ProcessName)) - stopping..." -ForegroundColor Yellow
-        try {
-            $null = $proc.CloseMainWindow()
-            if (-not $proc.WaitForExit(2000)) {
-                Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
-            }
-        } catch {
+        # /T, the whole TREE: with auto-reload on by default the API is a reloader supervisor PLUS
+        # a server child, and only ONE of them owns the listening socket. Killing that one PID left
+        # the other half alive to fight the next start for the port. stop.ps1 already kills by tree
+        # for exactly this reason; this is the same call, not a second mechanism.
+        # 2>$null | Out-Null + try/catch: PS 5.1 turns a native command's stderr into a terminating
+        # error under $ErrorActionPreference='Stop', and a failed kill must not abort the launch.
+        try { & taskkill /PID $ownerPid /T /F 2>$null | Out-Null } catch {}
+        if (-not $proc.HasExited) {
+            try { $proc.WaitForExit(2000) | Out-Null } catch {}
             Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
         }
     }
@@ -462,8 +511,32 @@ if (-not $workerReady) {
 Stop-ProcessOnPort -Port $Port -Label 'uvicorn (pre-existing)'
 
 # Full path -- same reason as $celeryCmd/$beatCmd above.
-$uvicornCmd = "& '$venvPython' -m uvicorn app.main:app --host 0.0.0.0 --port $Port"
-if ($Reload.IsPresent) { $uvicornCmd += ' --reload' }
+#
+# AUTO-RELOAD IS NOT uvicorn's --reload. Measured 2026-09-24: uvicorn's IN-PROCESS reloader dies
+# on its first restart on this machine. It stops the server child and then exits itself, leaving
+# nothing on the port and nothing in the log after "WatchFiles detected changes ... Reloading...".
+# It takes the whole console process group with it -- a diagnostic shell that launched it with
+# -NoNewWindow was killed at the same instant, which is what finally identified the cause. It is
+# not TSG: a five-line ASGI app died identically, as did runs with and without the Tee pipe
+# below, with WATCHFILES_FORCE_POLLING=1, and with --reload-delay 1.
+#
+# watchfiles supervises uvicorn from OUTSIDE instead: it runs the server as a child command and
+# re-runs it when a .py file changes, so a restart replaces the child rather than signalling the
+# console. Verified to survive two consecutive reloads of the real app. watchfiles is already a
+# dependency -- uvicorn[standard] (pyproject.toml:8) pulls it in, which is also what uvicorn's own
+# reloader uses.
+#
+# Bare `python` INSIDE the supervised command, not $venvPython: Start-InNewWindow activates the
+# venv, so PATH resolves it to this venv's interpreter, and a quoted absolute path with spaces
+# does not survive being nested inside watchfiles' single target argument.
+$serveCmd = "python -m uvicorn app.main:app --host 0.0.0.0 --port $Port"
+if ($useReload) {
+    # --filter python: only .py retriggers, so the Tee-Object write to logs\api.log below cannot
+    # restart the server. 'app' as the watched path, not the repo root, for the same reason.
+    $uvicornCmd = "& '$venvPython' -m watchfiles --filter python '$serveCmd' 'app'"
+} else {
+    $uvicornCmd = "& '$venvPython' -m uvicorn app.main:app --host 0.0.0.0 --port $Port"
+}
 
 # Same tee as the worker/beat windows above, and for the same reason: this window is where a
 # boot failure prints (unreachable DB, refused setting, wrong env file), and without a file it

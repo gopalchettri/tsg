@@ -1,0 +1,110 @@
+/*==============================================================================
+  INDEXES: Scenario_Audit
+
+  Script:      016_Scenario_Audit_indexes.sql
+  Order:       03_indexes / 016
+  Purpose:     3 index(es) on Scenario_Audit.
+  Depends on:  01_tables/ *_Scenario_Audit.sql
+  Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
+  Modifies:    indexes on dbo.Scenario_Audit
+
+  GENERATED FILE - do not edit by hand.
+  Regenerate:  python scripts/tsg_script/_generate.py
+  Sources:     app/db/models.py (columns), tsg_remediation_tables.sql (indexes, constraints)
+==============================================================================*/
+SET NOCOUNT ON;
+SET QUOTED_IDENTIFIER ON;   -- required: several indexes are filtered
+GO
+
+PRINT '';
+PRINT '--- indexes: Scenario_Audit ---';
+GO
+
+BEGIN TRY
+BEGIN TRANSACTION;
+IF EXISTS (SELECT 1 FROM sys.indexes i
+        WHERE i.name = N'IX_ScenarioAudit_SessionSubEvent' AND i.object_id = OBJECT_ID(N'dbo.Scenario_Audit')
+          AND (i.is_unique <> 0 OR i.has_filter <> 0
+          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 4
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'SessionID')
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'SubsystemID')
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 3 AND c.name = N'EventType')
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 4 AND c.name = N'CreatedAt')))
+BEGIN
+    PRINT ' [REBUILD] Scenario_Audit.IX_ScenarioAudit_SessionSubEvent exists with the wrong shape - recreating it on (SessionID, SubsystemID, EventType, CreatedAt).';
+    DROP INDEX [IX_ScenarioAudit_SessionSubEvent] ON [dbo].[Scenario_Audit];
+END;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_SessionSubEvent' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+    CREATE NONCLUSTERED INDEX [IX_ScenarioAudit_SessionSubEvent] ON [dbo].[Scenario_Audit] ([SessionID], [SubsystemID], [EventType], [CreatedAt] DESC);
+COMMIT;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK;
+    PRINT ' [ERROR]   Could not create or rebuild Scenario_Audit.IX_ScenarioAudit_SessionSubEvent on (SessionID, SubsystemID, EventType, CreatedAt).';
+    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
+    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
+    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    RAISERROR('Index IX_ScenarioAudit_SessionSubEvent could not be created - deployment stopped.', 16, 1);
+END CATCH;
+GO
+
+BEGIN TRY
+BEGIN TRANSACTION;
+IF EXISTS (SELECT 1 FROM sys.indexes i
+        WHERE i.name = N'IX_ScenarioAudit_Scenario' AND i.object_id = OBJECT_ID(N'dbo.Scenario_Audit')
+          AND (i.is_unique <> 0 OR i.has_filter <> 1
+          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'ScenarioID')
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'CreatedAt')))
+BEGIN
+    PRINT ' [REBUILD] Scenario_Audit.IX_ScenarioAudit_Scenario exists with the wrong shape - recreating it on (ScenarioID, CreatedAt).';
+    DROP INDEX [IX_ScenarioAudit_Scenario] ON [dbo].[Scenario_Audit];
+END;
+/* "The decision history of this scenario" is the query a reviewer actually
+   runs; this makes it a seek. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Scenario' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+    CREATE NONCLUSTERED INDEX [IX_ScenarioAudit_Scenario] ON [dbo].[Scenario_Audit] ([ScenarioID], [CreatedAt] DESC)
+        WHERE [ScenarioID] IS NOT NULL;
+COMMIT;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK;
+    PRINT ' [ERROR]   Could not create or rebuild Scenario_Audit.IX_ScenarioAudit_Scenario on (ScenarioID, CreatedAt).';
+    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
+    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
+    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    RAISERROR('Index IX_ScenarioAudit_Scenario could not be created - deployment stopped.', 16, 1);
+END CATCH;
+GO
+
+BEGIN TRY
+BEGIN TRANSACTION;
+IF EXISTS (SELECT 1 FROM sys.indexes i
+        WHERE i.name = N'IX_ScenarioAudit_Plan' AND i.object_id = OBJECT_ID(N'dbo.Scenario_Audit')
+          AND (i.is_unique <> 0 OR i.has_filter <> 1
+          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'PlanID')
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'CreatedAt')))
+BEGIN
+    PRINT ' [REBUILD] Scenario_Audit.IX_ScenarioAudit_Plan exists with the wrong shape - recreating it on (PlanID, CreatedAt).';
+    DROP INDEX [IX_ScenarioAudit_Plan] ON [dbo].[Scenario_Audit];
+END;
+/* No reader: the treatment audit feed filters session, event type and scenario.
+   No query filters the audit table by PlanID; the column is output only. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Plan' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+    CREATE NONCLUSTERED INDEX [IX_ScenarioAudit_Plan] ON [dbo].[Scenario_Audit] ([PlanID], [CreatedAt] DESC)
+        WHERE [PlanID] IS NOT NULL;
+COMMIT;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK;
+    PRINT ' [ERROR]   Could not create or rebuild Scenario_Audit.IX_ScenarioAudit_Plan on (PlanID, CreatedAt).';
+    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
+    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
+    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    RAISERROR('Index IX_ScenarioAudit_Plan could not be created - deployment stopped.', 16, 1);
+END CATCH;
+GO

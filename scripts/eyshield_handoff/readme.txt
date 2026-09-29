@@ -22,9 +22,16 @@ THREE THINGS TO KNOW BEFORE YOU START
 
   * MAINTENANCE WINDOW. TSG_Core.sql enables Read Committed Snapshot Isolation,
     which the application requires to start. If RCSI is not already on, the script
-    runs ALTER DATABASE SET SINGLE_USER WITH ROLLBACK IMMEDIATE — this DISCONNECTS
-    every other session and rolls back their in-flight work. TSG_Preflight.sql tells
-    you in advance whether this will happen.
+    runs ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK
+    IMMEDIATE — this DISCONNECTS every other session and rolls back their in-flight
+    work. TSG_Preflight.sql tells you in advance whether this will happen.
+    It never takes the database SINGLE_USER. It used to, in a three-statement
+    sequence whose middle statement could fail and leave the database single-user
+    with nothing to restore it — and this database also holds the platform tables
+    other applications read. The one statement above evicts the same sessions
+    atomically: either the setting changes or nothing does. If it cannot get
+    exclusive access it reports who is holding the database and stops, changing
+    nothing. Section 0 of TSG_Core.sql carries the switch and the reasoning.
 
   * RUN WITH QUOTED_IDENTIFIER ON. Every script sets it itself, so this is normally
     automatic. But if your tooling forces it OFF and you see "Msg 1934", re-run with

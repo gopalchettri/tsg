@@ -33,9 +33,9 @@ master table (the catalogue model has no threat→control curation).
 from __future__ import annotations
 
 import json
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.orm import Session
 
 from app.core.enums import ActorType, AuditEventType, ScenarioDecisionReason, ScenarioStatus
@@ -56,7 +56,11 @@ INSERTED, EXISTING, FAILED = "inserted", "existing", "failed"
 
 class PromotionResult(NamedTuple):
     threat_type: dict[str, Any]
-    threat: dict[str, Any] | None
+    # NOT `| None`: the ONE construction site (:386) passes `threat_entry` straight from
+    # _promote_threat, whose exit paths each return a populated dict — every other outcome
+    # raises AcceptConflict instead of returning. The Optional was vestigial, and it made
+    # `PromotedRef(**result.threat)` in sessions.py read as a possible TypeError.
+    threat: dict[str, Any]
     threat_actors: list[dict[str, Any]]
     controls: list[dict[str, Any]]
     controls_mapped: bool
@@ -114,8 +118,15 @@ def _promote_type(sess: Session, threat: Any, category_id: int | None,
     if type_id is not None and dal.threat_type_active(sess, type_id):
         return type_id, {"id": type_id, "name": threat.ThreatType,
                         "category_id": category_id, "status": EXISTING}
-    new_id, created = dal.upsert_threat_type(
-        sess, threat.ThreatType, category_id, created_by=user_id)
+    try:
+        new_id, created = dal.upsert_threat_type(
+            sess, threat.ThreatType, category_id, created_by=user_id)
+    except dal.BlankLibraryName as blank:
+        # A proposed type of punctuation alone has no identity: every dedup lookup and every
+        # curator tombstone skips an empty normalized key, so minting it would add a row nobody
+        # can reuse, reject or ever find again. 409, not 500 — the route's db_session rolls back
+        # and the operator is told which wording was refused.
+        raise AcceptConflict(f"{blank}; nothing was promoted") from None
     return new_id, {"id": new_id, "name": threat.ThreatType,
                     "category_id": category_id, "status": INSERTED if created else EXISTING}
 
@@ -208,8 +219,23 @@ def _promote_threat(sess: Session, threat: Any, type_id: int, category_id: int |
                     "reuse_score": round(reuse_score, 2)},
                     _actor_entries(sess, threat, type_id, write=False))
 
-    new_id, created = dal.upsert_threat_catalogue(
-        sess, generic, type_id, created_by=user_id)
+    try:
+        new_id, created = dal.upsert_threat_catalogue(
+            sess, generic, type_id, created_by=user_id)
+    except dal.BlankLibraryName as blank:
+        # See _promote_type: a name with no letters or digits cannot be deduped, rejected or
+        # found again, so it is refused rather than minted.
+        raise AcceptConflict(f"{blank}; nothing was promoted") from None
+    except dal.CuratorRejected as rejected:
+        # A curator already threw this wording away. Promoting it again would overturn that
+        # decision silently and put the row back in their queue.
+        raise AcceptConflict(f"{rejected}; nothing was promoted") from None
+    except dal.CatalogueNameTaken as taken:
+        # That name is another type's threat. A promotion cannot know which filing is right,
+        # so it refuses rather than re-file curated data; the route's db_session rolls back
+        # anything this call minted, including a type minted moments ago.
+        raise AcceptConflict(
+            f"{taken}, not under this threat's type; nothing was promoted") from None
 
     # Curation for the freshly minted row: the resolved category on the map, and the stored
     # actors on the TYPE map (actors attach per type in this model).
@@ -324,7 +350,9 @@ def promote_scenario_to_library(sess: Session, scenario_session: dict, scenario_
             .where(m.Identified_Threat.ThreatID == threat.ThreatID,
                 m.Identified_Threat.Superseded == 0)
             .values(ThreatTypeID=type_id, ThreatCatalogueID=new_catalogue_id))
-        if res.rowcount == 0:
+        # CursorResult, not Result: a DML execute() returns the former at runtime and only it
+        # declares .rowcount.
+        if cast("CursorResult[Any]", res).rowcount == 0:
             sess.rollback()
             raise AcceptConflict(
                 "the threat was superseded while promoting — nothing was written, refresh and retry",

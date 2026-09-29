@@ -16,8 +16,25 @@ with no recommended controls and reasonably concludes the library does not cover
 
 So: don't eyeball the number, measure it. This script runs the REAL production path — the same
 `grounding.get_control_candidates`, the same hybrid shortlist, the same reranker, the same
-`control_mapping.collect_control_query` — against the REAL library, and prints what each candidate
+`control_mapping._retrieval_query` — against the REAL library, and prints what each candidate
 threshold would actually do.
+
+MEASURED DEFECT IN THIS INSTRUMENT, not in the pipeline: DB mode used to build its queries with
+`control_mapping.collect_control_query`, a wrapper that existed only for these two scripts and has since been deleted, which emits
+threat type + name + scenario title + statement and nothing else. Control mapping had meanwhile
+moved to `control_relevance.build_control_retrieval_query` (reached through
+`control_mapping._retrieval_query`), whose query LEADS with the threat category and also carries
+the threat actors, the risk statement, the asset name + technology and the involved supporting
+systems — a leading threat identity is worth 1.9 -> 60.6 on a real scenario, so the two strings
+score nothing alike. The instrument was therefore measuring a query production no longer sends,
+and a cutoff re-pinned from it would have been mis-calibrated: the exact silent failure this
+script exists to prevent, reintroduced through the measuring instrument. The copy then broke a
+SECOND time when `control_mapping._blob` gained a required `column=` keyword and only the pipeline's
+own caller was updated. Both drifts needed that second copy to exist, so it is GONE: DB mode calls
+`grounding.control_map_scenario_queries`, the same function the admin calibration route measures
+with, so the script and the route cannot measure different text and a signature change reaches this
+file through the suite. It still prints which builder it used and one real query, so parity can be
+read rather than trusted.
 
     python scripts/measure_control_map_scores.py                       # use real scenarios in the DB
     python scripts/measure_control_map_scores.py --limit 200
@@ -40,7 +57,9 @@ part). The default limit is deliberately small.
 
 `--text-file` takes one scenario paragraph per line, for an environment that has the control
 library seeded but has not run a session yet. Use real prose, not labels: feeding it short
-control-shaped strings reproduces the very bias this script exists to detect.
+control-shaped strings reproduces the very bias this script exists to detect. It measures a
+NARRATIVE-ONLY query by design — there is no threat, asset or system context before the first
+session — so its scores are systematically different from a session's and the header says so.
 
 Exit codes: 0 = measured, report printed · 2 = nothing to measure (no library, no scenarios and
 no --text-file, or empty shortlists — a retrieval fault, not a threshold one).
@@ -54,86 +73,22 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # make `app` importable
 
-from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
-from app.db import models as m
 from app.db.engine import db_session
-from app.pipeline import control_mapping, grounding
+from app.pipeline import grounding
+from app.pipeline.control_threshold import (
+    percentile_nearest_rank,
+    recommend_relevance_cutoff,
+    sweep_relevance_thresholds,
+)
 from app.pipeline.llm import get_llm
 
-#: Thresholds the report walks. Wide on purpose — the point is to SEE where the cliff is, and a
-#: narrow sweep around today's value would hide a cliff sitting just outside it.
-_SWEEP = (0, 10, 20, 30, 40, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95)
-
-
-def _pct(values: list[float], p: float) -> float:
-    """Nearest-rank percentile. Not statistics.quantiles: that interpolates and needs n >= 2,
-    and this runs on samples as small as a handful of scenarios."""
-    if not values:
-        return float("nan")
-    ordered = sorted(values)
-    idx = min(len(ordered) - 1, max(0, round(p / 100.0 * (len(ordered) - 1))))
-    return ordered[idx]
-
-
-def sweep(results: list[list[tuple[dict, float]]], top_k: int,
-        thresholds: tuple[int, ...] = _SWEEP) -> list[tuple[int, int, float]]:
-    """(threshold, scenarios that would publish ZERO controls, mean controls per scenario).
-
-    `empty` is the number that matters: those scenarios publish `controls: []`, which the API
-    documents as a healthy library gap, so they are the silent failure this whole script exists
-    to price. Capped at top_k because production caps there — counting uncapped matches would
-    overstate what a threshold actually delivers."""
-    rows = []
-    for t in thresholds:
-        kept = [min(top_k, sum(1 for _row, score in matches if score >= t))
-                for matches in results]
-        rows.append((t, sum(1 for k in kept if k == 0),
-                    statistics.mean(kept) if kept else 0.0))
-    return rows
-
-
-def recommend(rows: list[tuple[int, int, float]], best: list[float]) -> tuple[int | None, float]:
-    """(safe threshold, stricter alternative).
-
-    Safe = the HIGHEST swept value at which no scenario loses all its controls. None when even
-    0 leaves scenarios empty, which means their shortlists were empty and the fault is in
-    retrieval, not the cutoff — a threshold recommendation there would be noise dressed as an
-    answer. The stricter alternative trades ~5% of scenarios going empty for a cleaner tail;
-    it is offered, never chosen here, because that trade is the operator's to make."""
-    safe = max((t for t, empty, _mean in rows if empty == 0), default=None)
-    return safe, _pct(best, 5)
-
-
-def _queries_from_db(sess, limit: int) -> list[tuple[str, str]]:
-    """(label, query) from real completed scenarios, built with the SAME query builder
-    production uses — a hand-rolled "title + statement" here would measure a query shape the
-    pipeline never actually sends."""
-    # The threat joins in because collect_control_query takes it — measuring the narrative
-    # alone would measure a query shape production no longer sends, which is exactly the
-    # mismatch this script exists to catch.
-    out_t, st_t, it_t = m.Threat_Scenario, m.Scoped_Threat, m.Identified_Threat
-    rows = sess.execute(
-        select(out_t.ScenarioID, out_t.ScenarioJSON,
-            it_t.ThreatName, it_t.ThreatType, it_t.LibraryThreatName, it_t.LibraryThreatType)
-        .select_from(out_t.__table__
-                    .outerjoin(st_t, out_t.ScopedThreatID == st_t.ScopedThreatID)
-                    .outerjoin(it_t, st_t.ThreatID == it_t.ThreatID))
-        .where(out_t.Status == "complete",
-            out_t.Superseded == 0,
-            out_t.ScenarioJSON.is_not(None))
-        .order_by(out_t.CreatedAt.desc())
-        .limit(limit)
-    ).all()
-    out = []
-    for scenario_id, scenario_json, tname, ttype, ltname, lttype in rows:
-        query = control_mapping.collect_control_query(scenario_json, ltname or tname,
-                                                    lttype or ttype)
-        if query:
-            out.append((str(scenario_id)[:8], query))
-    return out
+# The sweep + recommendation maths used to live HERE. It moved to app/pipeline/control_threshold.py
+# unchanged, because the application now runs this measurement too (an admin route stores the
+# result) and two copies of a decision rule is exactly the drift this script's own docstring is a
+# monument to. Read that module before acting on `stricter`: it is offered, not chosen.
 
 
 def _queries_from_file(path: str, limit: int) -> list[tuple[str, str]]:
@@ -170,8 +125,19 @@ def main() -> int:
             print("FAIL  Control_Library returned no active rows — run Seed_to_Control_library.sql "
                 "first. Measuring against an empty library would 'prove' any threshold.")
             return 2
+        # DB mode calls the SAME function the admin calibration route measures with, so the two can
+        # never measure different text. This script used to own a private copy of that SELECT and its
+        # per-row assembly. The module docstring above is a monument to what a second copy costs: the
+        # copy went on calling a builder the pipeline had moved off, so the instrument measured a
+        # query production no longer sends — and a leading threat identity is worth 1.9 -> 60.6 on a
+        # real scenario, so a cutoff re-pinned from it was mis-calibrated. That is the very silent
+        # failure this script exists to prevent, reintroduced through the measuring instrument. The
+        # copy then broke a SECOND time in the same week: control_mapping._blob gained a required
+        # `column=` keyword and only the pipeline's own caller was updated. Sharing the function
+        # makes a signature change reach this file through the suite instead of at an operator's
+        # prompt, and `grounding` owns it because the APPLICATION runs this measurement too.
         queries = (_queries_from_file(args.text_file, args.limit) if args.text_file
-                else _queries_from_db(sess, args.limit))
+                else grounding.control_map_scenario_queries(sess, args.limit, s.max_embed_chars))
         if not queries:
             print("FAIL  no scenario text to measure. Run one session first, or pass --text-file "
                 "with real scenario paragraphs (NOT short control labels — that reproduces the "
@@ -195,8 +161,27 @@ def main() -> int:
         print(f"queries         {len(queries)} "
             + ("scenario paragraphs from --text-file" if args.text_file
                 else "real scenarios from the DB"))
+        # WHICH QUERY WAS MEASURED, stated rather than assumed. A threshold is only transferable to
+        # production if the text it was measured on is production's text, and the two modes differ
+        # on exactly that — so the mode, the builder and one real query are all printed, and an
+        # operator can check parity instead of trusting this script's word for it.
+        if args.text_file:
+            print("query shape     NARRATIVE ONLY (--text-file mode): no threat category, type or "
+                "name, no actors, no risk statement, no asset or system context. Production leads "
+                "its query with the threat identity, so these scores are systematically DIFFERENT "
+                "from a session's — treat the recommendation as provisional until re-measured "
+                "from real scenarios.")
+        else:
+            print("query shape     production's own, via control_mapping._retrieval_query -> "
+                "control_relevance.build_control_retrieval_query: threat category, type, name "
+                "(library spelling preferred), actors, scenario title, statement, risk statement, "
+                "asset name + technology, involved systems. No production input is withheld.")
+        sample_label, sample_query = queries[0]
+        print(f"query sample    [{sample_label}] {sample_query[:240]}"
+            + ("..." if len(sample_query) > 240 else ""))
         print(f"models          embed={s.embedding_model}  rerank={s.reranker_model}")
-        print(f"shortlist_k     {s.grounding_shortlist_k}   top_k={s.control_map_top_k}")
+        print(f"shortlist_k     {s.grounding_shortlist_k}   min_count={s.control_map_min_count}   "
+            f"max_count={s.control_map_max_count}")
         print(f"threshold NOW   {in_force:.1f}   ({origin})")
         print()
 
@@ -229,7 +214,7 @@ def main() -> int:
     # from "we never got an answer" (a failed rerank item — not a measurement). Folding the
     # second into the first would inflate the "0 controls" column at EVERY threshold and, with
     # one provider blip, suppress the recommendation entirely while blaming retrieval.
-    # Labels ride along. _queries_from_db/_queries_from_file both return (label, query) and the
+    # Labels ride along. control_map_scenario_queries/_queries_from_file both return (label, query) and the
     # report used to throw the label away, so it could say "3 scenarios publish no controls"
     # without being able to name ONE of them — leaving the operator to go find them by hand.
     measured_pairs = [(label, r.matches)
@@ -244,7 +229,11 @@ def main() -> int:
         shortlist_sizes.append(len(scores))
         if scores:
             best.append(scores[0])
-            at_k.append(scores[min(s.control_map_top_k, len(scores)) - 1])
+            # The MINIMUM, not the ceiling: this measures "what does the Nth best control score",
+            # which is what a cutoff has to clear for a scenario to reach its minimum. Reading the
+            # ceiling (25) here instead of the minimum (5) would answer a question nobody asks and
+            # push the recommended cutoff far too low.
+            at_k.append(scores[min(s.control_map_min_count, len(scores)) - 1])
 
     if unanswered:
         print(f"NOTE  {unanswered} of {len(results)} queries never got an answer (their rerank "
@@ -267,10 +256,15 @@ def main() -> int:
         return 2
 
     print("SCORE DISTRIBUTION  (reranker score, 0-100)")
-    print(f"  best match per scenario      p05 {_pct(best, 5):6.1f}   p25 {_pct(best, 25):6.1f}   "
-        f"median {_pct(best, 50):6.1f}   p95 {_pct(best, 95):6.1f}")
-    print(f"  #{s.control_map_top_k} match per scenario        p05 {_pct(at_k, 5):6.1f}   "
-        f"p25 {_pct(at_k, 25):6.1f}   median {_pct(at_k, 50):6.1f}   p95 {_pct(at_k, 95):6.1f}")
+    print(f"  best match per scenario      p05 {percentile_nearest_rank(best, 5):6.1f}   "
+        f"p25 {percentile_nearest_rank(best, 25):6.1f}   "
+        f"median {percentile_nearest_rank(best, 50):6.1f}   "
+        f"p95 {percentile_nearest_rank(best, 95):6.1f}")
+    print(f"  #{s.control_map_min_count} match per scenario        "
+        f"p05 {percentile_nearest_rank(at_k, 5):6.1f}   "
+        f"p25 {percentile_nearest_rank(at_k, 25):6.1f}   "
+        f"median {percentile_nearest_rank(at_k, 50):6.1f}   "
+        f"p95 {percentile_nearest_rank(at_k, 95):6.1f}")
     print(f"  shortlist size               min {min(shortlist_sizes)}  "
         f"median {statistics.median(shortlist_sizes):.0f}  max {max(shortlist_sizes)}")
     print()
@@ -278,10 +272,10 @@ def main() -> int:
     # --- what each threshold would actually DO ---------------------------------------------
     # The only number that matters for the silent-failure risk is `empty`: scenarios that would
     # publish controls: [] and be read as a healthy library gap.
-    print(f"WHAT EACH THRESHOLD WOULD DO  ({len(measured)} measured scenarios, capped at "
-        f"top_k={s.control_map_top_k})")
+    print(f"WHAT EACH THRESHOLD WOULD DO  ({len(measured)} measured scenarios, minimum "
+        f"{s.control_map_min_count}, ceiling {s.control_map_max_count})")
     print("  threshold   scenarios with 0 controls   mean controls/scenario")
-    rows = sweep(measured, s.control_map_top_k)
+    rows = sweep_relevance_thresholds(measured, s.control_map_max_count)
     for t, empty, mean_kept in rows:
         print(f"  {t:>9}   {empty:>25}   {mean_kept:>21.2f}")
     # The in-force value gets its OWN line, evaluated at the real float. Flagging the nearest
@@ -301,7 +295,7 @@ def main() -> int:
     print()
 
     # --- the recommendation -----------------------------------------------------------------
-    safe, p05_based = recommend(rows, best)
+    safe, p05_based = recommend_relevance_cutoff(rows, best)
     print("RECOMMENDATION")
     if safe is None:
         print("  Even a threshold of 0 leaves scenarios with no controls, which means their "

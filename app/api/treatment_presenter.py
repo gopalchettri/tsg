@@ -18,6 +18,7 @@ from app.api.schemas import (
 from app.api.sessions import (
     _actor_block,
     _Controls,
+    _library_block,
     _scenario_narrative,
     _threat_block,
 )
@@ -46,8 +47,13 @@ _VISIBLE_PLAN_KEYS = tuple(TreatmentPlanDocument.model_fields)
 #: overlay the active row's single copy onto each history row instead. DERIVED from the same
 #: dal.scenario_threat_columns() the selects unpack, never restated: a hand-copied name list that
 #: silently stops matching its query is exactly the drift that left history rows blank.
-_SCENARIO_ECHO_KEYS = ("ScenarioJSON", "Score", "ScopeRank",
-                       *(c.key for c in dal.scenario_threat_columns()))
+#: Score/ScopeRank were hand-listed here while SelectionKind — the column saying whether those
+#: two numbers mean anything — was not, so history entries republished a hand-written threat's
+#: placeholder 60.0 / rank 1 as a real relevance score. Both now come from the shared tuple, so
+#: the verdict can never again be dropped while the numbers ride along.
+_SCENARIO_ECHO_KEYS = ("ScenarioJSON", "ScenarioSource",
+                       *(c.key for c in dal.scenario_threat_columns()),
+                       *(c.key for c in dal.scoped_threat_columns()))
 
 
 def _scenario_echo(row: RowMapping) -> dict:
@@ -132,12 +138,16 @@ def _progress_of(rows: list[tuple[str | None, str | None, str | None]]) -> Treat
     return TreatmentPlanProgress(generation=generation, review=review, overall=overall)
 
 
-def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
+# RowMapping | dict: the history path builds its row as `{**echo, **r}` (treatment.py:653, :732),
+# a plain dict by construction, while the active path passes the RowMapping straight from the
+# select. Both are Mappings, and every read below uses .get() or `in`.
+def _plan_status_from_row(row: RowMapping | dict, stale_cutoff: datetime,
                           actor_ids: dict[str, int] | None = None,
                           controls: _Controls | None = None,
                           superseded_row: bool = False,
                         superseded: list[TreatmentPlanStatus] | None = None,
-                        scenario_replaced: bool = False) -> TreatmentPlanStatus:
+                        scenario_replaced: bool = False,
+                        library: dict[str, dict] | None = None) -> TreatmentPlanStatus:
     """One plan row -> the wire model. Shared by the single-plan GET, the Excel export, the
     versions history (?include_superseded) and the detailed register (?include_plan), so no
     two views can ever disagree — the guarantee the export used to buy by re-entering the GET
@@ -175,6 +185,23 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
     ctl_list = controls.by_output.get(str(row["ScenarioID"]), []) if controls else []
     return TreatmentPlanStatus(
         plan_id=row["PlanID"], session_id=row["SessionID"], scenario_id=row["ScenarioID"],
+        # Who wrote the scenario: a person ('manual') or the AI ('generated', which legacy NULL
+        # rows also read as).
+        #
+        # Decided from the PROVENANCE COLUMN, never inferred from ScenarioJSON as it once was.
+        # ScenarioJSON is a poor proxy for "the scenario is linked": it is legitimately NULL on a
+        # FAILED generation (enums.ScenarioStatus.error — the failure card keeps a row with a null
+        # scenario and an ErrorMessage), so any plan hanging off such a scenario lost its
+        # provenance on every surface that publishes it. Guessing whether a fact is knowable,
+        # instead of reading the column that states it.
+        #
+        # `in`, not `.get()`: several selects feed this presenter and they carry different column
+        # sets — plan_status_row deliberately selects no scenario columns, because the poll route
+        # answers with TreatmentPlanStatusSummary and publishes no provenance at all. A row shape
+        # with no scenario link must therefore publish null, never assert `generated` about a
+        # scenario it never saw.
+        scenario_source=((row["ScenarioSource"] or "generated")
+                         if "ScenarioSource" in row else None),
         status=status, treatment_strategy=row["TreatmentStrategy"],
         # A PARAMETER, not a column read: only the single-plan GET knows this (its select is the
         # one that carries the scenario's Accepted flag), and the board and register cannot be
@@ -193,6 +220,9 @@ def _plan_status_from_row(row: RowMapping, stale_cutoff: datetime,
         # or tolerates a missing ThreatID, so a superseded-version row (which carries no
         # scenario/threat join at all) yields null/[] rather than raising KeyError.
         threat=_threat_block(row),
+        # Envelope sibling, same shape the session surfaces publish, from the same builder — so
+        # the plan screen and /results cannot disagree about what the library did with a name.
+        library=_library_block(row, library),
         actors=_actor_block(row, actor_ids),
         controls=ctl_list,
         controls_unavailable=bool(controls and controls.unavailable),
@@ -235,6 +265,16 @@ def _normalize_plan_shape(plan: dict | None) -> dict | None:
     their raw snapshot if that history is ever needed."""
     if plan is None:
         return None
+    # Plans generated before the duration-chain schedule carry none of its keys; serve them with
+    # the same key set as a new plan (values null/empty) so no client branches on a plan's age.
+    plan.setdefault("mitigation_timeline_days", None)
+    plan.setdefault("mitigation_end_date_planned", None)
+    for act in plan.get("remediation_action_plan") or []:
+        if isinstance(act, dict):
+            for key in ("depends_on", "implements_controls"):
+                act.setdefault(key, [])
+            for key in ("duration_days", "start_date", "end_date"):
+                act.setdefault(key, None)
     cti = plan.get("controls_to_be_implemented")
     if not isinstance(cti, dict):
         plan["controls_to_be_implemented"] = {

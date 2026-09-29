@@ -20,6 +20,7 @@ from typing import Annotated
 
 from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
+from sqlalchemy import select
 
 from app.api.admin import AdminValidationError
 from app.api.admin_jobs import (
@@ -52,6 +53,7 @@ from app.api.schemas import (
     TechniqueCorpusStatus,
     TechniqueRebuildAccepted,
     TechniqueRebuildBody,
+    sse_responses,
 )
 from app.core.enums import LibraryApprovalStatus, LibraryRejectionStatus, SSEEventType
 from app.core.joblock import is_held
@@ -90,7 +92,7 @@ def _dispatch(feeds: list[str], user_id: str | None) -> IntelRefreshAccepted:
 
 
 @router.get("/feeds", response_model=IntelFeedsResponse,
-            summary="Check threat-intel feed health",
+            summary="2.6 · Check threat-intel feed health",
             description=(
                 "The operational status of every known intel feed: whether it is switched on, how many items "
                 "are cached, and when it last ran, succeeded or failed.\n\n"
@@ -114,7 +116,7 @@ def list_feeds(_principal: Principal = Depends(get_admin_principal)) -> IntelFee
 
 
 @router.get("/items", response_model=IntelItemsResponse, responses=UNAVAILABLE_RESPONSES,
-            summary="Browse cached intel items",
+            summary="2.7 · Browse cached intel items",
             description=(
                 "Pages through the intel actually cached — exploited vulnerabilities, advisories, adversary "
                 "reports — newest first.\n\n"
@@ -146,7 +148,7 @@ def list_items(source: str | None = None,
 
 
 @router.post("/feeds/refresh", response_model=IntelRefreshAccepted, status_code=202,
-            summary="Refresh every enabled feed",
+            summary="2.5 · Refresh every enabled feed",
             description=(
                 "Queues a refresh for each enabled feed, one background job per feed, so a slow feed cannot "
                 "hold up the others.\n\n"
@@ -179,7 +181,7 @@ def refresh_all_feeds(request: Request,
 
 
 @router.post("/feeds/{feed}/refresh", response_model=IntelRefreshAccepted, status_code=202,
-            summary="Refresh one feed",
+            summary="As needed · Refresh one feed",
             description=(
                 "Queues a refresh for a single named feed. This is the targeted retry after one feed fails "
                 "while the others succeed.\n\n"
@@ -234,10 +236,9 @@ def _extend_intel_terminal(result: AsyncResult) -> dict:
 
 
 @router.get("/feeds/events/{job_id}",
-            responses={200: {"model": IntelJobEvent, "content": {"text/event-stream": {}},
-                        "description": "SSE stream; each `data:` line is one IntelJobEvent."}}
+            responses=sse_responses(IntelJobEvent, "SSE stream; each `data:` line is one IntelJobEvent.")
                     | UNAVAILABLE_RESPONSES,
-            summary="Stream a feed refresh",
+            summary="2.5b · Stream a feed refresh",
             description=(
                 "Pushes one feed-refresh job's progress live, instead of re-reading the feed list on a timer.\n\n"
                 "**Call it:** right after either refresh endpoint, using a job id from the response.\n\n"
@@ -306,7 +307,7 @@ _IMPORT_EVENTS_DESC = (
 
 
 @router.post("/library/import/{source}", response_model=LibraryImportAccepted, status_code=202,
-            summary="Import an open-source threat library", description=_IMPORT_DESC)
+            summary="2.1 · Import an open-source threat library (optional)", description=_IMPORT_DESC)
 def import_library(body: LibraryImportBody, request: Request,
                 source: Annotated[str, Path(description="pytm | emb3d | atlas | misp_actors")],
                 principal: Principal = Depends(get_admin_principal)) -> LibraryImportAccepted:
@@ -341,7 +342,7 @@ def import_library(body: LibraryImportBody, request: Request,
 
 @router.get("/library/import/status/{job_id}", response_model=LibraryImportStatus,
             responses=UNAVAILABLE_RESPONSES,
-            summary="Check a library import", description=_IMPORT_STATUS_DESC)
+            summary="2.2 · Check a library import", description=_IMPORT_STATUS_DESC)
 def import_status(job_id: str,
                 _principal: Principal = Depends(get_admin_principal)) -> LibraryImportStatus:
     """Poll one import job.
@@ -360,10 +361,9 @@ def import_status(job_id: str,
 
 
 @router.get("/library/import/events/{job_id}",
-            responses={200: {"model": IntelJobEvent, "content": {"text/event-stream": {}},
-                        "description": "SSE stream; each `data:` line is one IntelJobEvent."}}
+            responses=sse_responses(IntelJobEvent, "SSE stream; each `data:` line is one IntelJobEvent.")
                     | UNAVAILABLE_RESPONSES,
-            summary="Stream a library import", description=_IMPORT_EVENTS_DESC)
+            summary="2.2b · Stream a library import", description=_IMPORT_EVENTS_DESC)
 async def import_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE for one import job - same hint-layer/AsyncResult-backstop contract as job_events
     above, sharing the intel job channel and the streaming mechanics in admin_sse.py."""
@@ -404,7 +404,7 @@ _TECH_STATUS_DESC = (
 
 
 @router.post("/techniques/rebuild", response_model=TechniqueRebuildAccepted, status_code=202,
-            summary="Rebuild the ATT&CK/CAPEC technique corpus", description=_TECH_REBUILD_DESC)
+            summary="2.3 · Rebuild the ATT&CK/CAPEC technique corpus", description=_TECH_REBUILD_DESC)
 def rebuild_techniques(body: TechniqueRebuildBody, request: Request,
                     principal: Principal = Depends(get_admin_principal)) -> TechniqueRebuildAccepted:
     """Queue a corpus rebuild. Source names are validated HERE so a typo is a 422 on this call
@@ -443,7 +443,7 @@ _TECH_EVENTS_DESC = (
             # No UNAVAILABLE_RESPONSES: this route CANNOT return 503. An unreachable
             # corpus store answers 200 with available=false (technique_stats swallows it),
             # so declaring a 503 published a status code the handler has no path to.
-            summary="Check the technique corpus", description=_TECH_STATUS_DESC)
+            summary="2.4 · Check the technique corpus", description=_TECH_STATUS_DESC)
 def technique_corpus(_principal: Principal = Depends(get_admin_principal)) -> TechniqueCorpusStatus:
     """Live corpus counts. Never raises on an unreachable store: it reports available=false, so a
     Mongo outage reads as a fault here instead of as an empty corpus."""
@@ -451,10 +451,9 @@ def technique_corpus(_principal: Principal = Depends(get_admin_principal)) -> Te
 
 
 @router.get("/techniques/events/{job_id}",
-            responses={200: {"model": IntelJobEvent, "content": {"text/event-stream": {}},
-                        "description": "SSE stream; each `data:` line is one IntelJobEvent."}}
+            responses=sse_responses(IntelJobEvent, "SSE stream; each `data:` line is one IntelJobEvent.")
                     | UNAVAILABLE_RESPONSES,
-            summary="Stream a technique rebuild", description=_TECH_EVENTS_DESC)
+            summary="2.3b · Stream a technique rebuild", description=_TECH_EVENTS_DESC)
 async def technique_events(job_id: str, _principal: Principal = Depends(get_admin_principal)):
     """SSE for one rebuild job - same contract and channel as the import and feed streams."""
     return await admin_job_event_stream(
@@ -490,7 +489,7 @@ _APPROVE_DESC = (
 
 
 @router.get("/library/pending", response_model=PendingLibraryResponse,
-            summary="List threats awaiting curator approval", description=_PENDING_DESC)
+            summary="Curation 1 · List threats awaiting curator approval", description=_PENDING_DESC)
 def pending_library(
         limit: Annotated[int, Query(ge=1, le=500, description="Max rows to return.")] = 200,
         _principal: Principal = Depends(get_admin_principal)) -> PendingLibraryResponse:
@@ -499,7 +498,7 @@ def pending_library(
         rows = dal.pending_library_threats(sess, limit=limit)
     pending = [PendingLibraryRow(
         catalogue_id=r["ThreatCatalogueID"], threat_name=r["ThreatName"],
-        source=r["Source"], created_at=r["CreatedAt"],
+        source=r["Source"], created_at=r["CreatedAt"], created_by=r["CreatedBy"],
         type_id=r["ThreatTypeID"], type_name=r["ThreatTypeName"],
         type_is_pending=not r["TypeIsActive"], type_is_deleted=bool(r["TypeIsDeleted"]))
         for r in rows]
@@ -507,7 +506,7 @@ def pending_library(
 
 
 @router.post("/library/threats/approve", response_model=LibraryApprovalResponse,
-            summary="Approve promoted threats", description=_APPROVE_DESC)
+            summary="Curation 2 · Approve promoted threats (then run 3.1)", description=_APPROVE_DESC)
 def approve_library_threats(body: LibraryApprovalBody, request: Request,
                         principal: Principal = Depends(get_admin_principal),
                         ) -> LibraryApprovalResponse:
@@ -586,16 +585,39 @@ _REJECT_DESC = (
 )
 
 
+def _remove_orphan_pending_type(sess, type_id: int, user_id: str | None) -> bool:
+    """Soft-delete a PENDING type that just lost its last live threat; True iff it was removed.
+
+    Scoped hard on purpose: an ACTIVE type is curated data and is never touched, and a type with
+    any live threat left (approved or pending) still has children to answer for. Only the
+    childless pending row — unreachable by every curator route once its threats are gone — is
+    cleared, so a rejection cannot leave the library growing rows nobody can see or act on."""
+    type_row = sess.get(m.Threat_Type, type_id)
+    if type_row is None or type_row.IsActive or type_row.IsDeleted:
+        return False
+    survivors = sess.execute(
+        select(m.Threat_Catalogue.ThreatCatalogueID).where(
+            m.Threat_Catalogue.ThreatTypeID == type_id,
+            m.Threat_Catalogue.IsDeleted == False).limit(1)).first()
+    if survivors is not None:
+        return False
+    dal.soft_delete_library_row(sess, m.Threat_Type, m.Threat_Type.ThreatTypeID, type_id, user_id)
+    return True
+
+
 @router.post("/library/threats/reject", response_model=LibraryRejectionResponse,
-            summary="Discard promoted threats", description=_REJECT_DESC)
+            summary="Curation 2 · Discard promoted threats", description=_REJECT_DESC)
 def reject_library_threats(body: LibraryRejectionBody, request: Request,
                         principal: Principal = Depends(get_admin_principal),
                         ) -> LibraryRejectionResponse:
     """Soft-delete pending library rows, one transaction for the batch.
 
-    The parent TYPE is deliberately left alone. Approving activates it because retrieval needs it
-    active; rejecting needs nothing of the sort, and a type may carry siblings this call was never
-    asked about — deleting it would take them down too."""
+    The parent TYPE is left alone while it still holds anything: approving activates it because
+    retrieval needs it active, and a type may carry siblings this call was never asked about.
+    The ONE exception is the orphan this route used to create — a PENDING type whose last live
+    threat this call just rejected. Nothing can reach such a row again: the curator queue lists
+    catalogue rows, approve/reject take catalogue ids, and the by-name lookup ignores tombstones,
+    so the next save would mint the same name afresh. It goes with its last child."""
     results: list[LibraryRejectionResult] = []
     rejected = 0
     with db_session() as sess:
@@ -621,7 +643,9 @@ def reject_library_threats(body: LibraryRejectionBody, request: Request,
                                         principal.user_id)
             rejected += 1
             results.append(LibraryRejectionResult(
-                catalogue_id=cid, status=LibraryRejectionStatus.rejected))
+                catalogue_id=cid, status=LibraryRejectionStatus.rejected,
+                type_removed=_remove_orphan_pending_type(sess, row.ThreatTypeID,
+                                                         principal.user_id)))
         sess.commit()
     # AFTER the commit, same ordering rule as the approve and import routes: a log line for a
     # write that rolled back is a permanent record of something that never happened.

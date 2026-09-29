@@ -23,7 +23,7 @@ logger = get_logger(__name__)
 
 
 @router.get("/health", response_model=LivenessReport,
-            summary="Liveness check",
+            summary="0.1 · Liveness check",
             description=(
                 "Answers one question: is this process running? Always `200` while the app is up.\n\n"
                 "**Use it for:** an orchestrator's liveness probe, deciding whether to restart the process.\n\n"
@@ -134,7 +134,7 @@ def _check_workers() -> dict[str, bool]:
 
 
 @router.get("/ready", response_model=ReadinessReport,
-            summary="Readiness check",
+            summary="0.2 · Readiness check",
             description=(
                 "Answers a different question from liveness: can this process actually serve traffic? It "
                 "pings the database, the cache, the document store where used, and looks for a live "

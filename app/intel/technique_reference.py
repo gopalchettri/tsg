@@ -267,7 +267,9 @@ def _store(name: str = COLLECTION):
     import pymongo
 
     s = get_settings()
-    col = pymongo.MongoClient(
+    # Parameterised: MongoClient's _DocumentType is otherwise unsolved. Keeps the deliberate
+    # lazy `import pymongo` inside the function.
+    col = pymongo.MongoClient[dict[str, Any]](
         s.mongo_url,
         serverSelectionTimeoutMS=s.mongo_connect_timeout_ms,
         connectTimeoutMS=s.mongo_connect_timeout_ms,

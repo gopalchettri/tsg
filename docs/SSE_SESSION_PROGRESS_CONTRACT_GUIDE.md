@@ -124,6 +124,26 @@ key as guaranteed on the wire for this event regardless of what the generated sc
 `GET /v1/sessions/{session_id}/treatment-plans` separately on connect and on every reconnect (see
 §4.3).
 
+**`mode`** says which kind of session this is: `"AUTO"` for a TSG run, `"MANUAL"` for a session
+created by `POST /v1/remediation-plans` with `is_manual=true`, i.e. a scenario a *person* wrote.
+
+> **A MANUAL session's stream carries almost nothing, by construction.** That session did no
+> generation: it was written, accepted and parked at its review barrier inside the one request
+> that created it. So none of the six pipeline-lifecycle events in §1 can ever fire on it —
+> there was no work to narrate — and in particular **`session_entered_review` never arrives,
+> because the session had already entered review before you could connect.** A client that blocks
+> on that event blocks forever. The `reconcile` snapshot you get on connect is already the
+> finished board — `mode: "MANUAL"` and **`progress.overall: "complete"`**, because the scenario
+> was accepted inside the save, so there is no review decision outstanding and no review prompt
+> to show. (It becomes `"awaiting_review"` only if someone later un-accepts it.) The only event
+> still to come is `treatment_plan_result`, when the remediation plan for that scenario commits.
+> That one is advisory as always (§4.3), so keep the backstop poll.
+>
+> The stream itself stays OPEN: a MANUAL session sits at `REVIEW`/`AWAITING_DECISION`
+> indefinitely, which is exactly the state `_stream_still_open` keeps a stream alive for, so the
+> plan event does reach you. Pinned by
+> `tests/test_remediation_plans.py::test_the_event_stream_stays_open_for_a_manual_session`.
+
 ### 2.2 `stage_started`
 
 ```json

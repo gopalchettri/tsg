@@ -49,6 +49,10 @@ _ENTITY_SCOPED_ROUTES: set[tuple[str, str]] = {
     # Treatment plans (app/api/treatment.py) — mounted only when risk_module_enabled. Entries
     # for an unmounted router are inert (the audit walks LIVE app routes), so these stay
     # unconditional; when the router IS mounted, missing entries would fail the boot.
+    # Entity-scoped through the BODY, not the path: is_manual=false carries session_id +
+    # scenario_id, is_manual=true carries manual_scenario.entity_id, and both paths call
+    # principal.require_entity before anything is read or written.
+    ("POST", "/v1/remediation-plans"),
     ("POST", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan"),
     ("GET", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan"),
     ("GET", "/v1/sessions/{session_id}/scenarios/{scenario_id}/treatment-plan/status"),
@@ -90,6 +94,15 @@ _EXEMPT_ROUTES: dict[tuple[str, str], Callable[..., object] | None] = {
     # Grounding-threshold calibration — admin-scoped, never entity-scoped: the threshold is a
     # property of the deployment's embedding+reranker pair, shared by every entity's sessions.
     ("GET", "/v1/tsg/grounding/threshold"): require_admin,
+    # The manual drain for the control-mapping retry queue. Admin-only: it queues real
+    # reranker work on the default queue.
+    ("POST", "/v1/tsg/control-map/sweep"): require_admin,
+    # The control-relevance CUTOFF measurement (admin.py) — exempt for exactly the reason the
+    # grounding-threshold routes above are: the cutoff is a property of the deployment's
+    # embedding+reranker pair, shared by every entity's scenarios, and the measurement reranks the
+    # cross-tenant control library. There is no one entity whose data this is.
+    ("POST", "/v1/tsg/control-map/calibrate"): require_admin,
+    ("GET", "/v1/tsg/control-map/calibrate/status/{job_id}"): require_admin,
     ("POST", "/v1/tsg/grounding/calibrate"): require_admin,
     ("GET", "/v1/tsg/grounding/calibrations"): require_admin,
     ("GET", "/v1/tsg/grounding/calibrate/status/{job_id}"): require_admin,

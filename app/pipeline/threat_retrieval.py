@@ -215,7 +215,9 @@ def retrieve_library_threats(sess: Session, llm: LLMClient, subsystems: list[dic
     # LLMSlotUnavailable is the ONE exception that must NOT degrade: the Celery stage retry
     # re-runs the whole stage cleanly, where keyword-only would store a materially worse
     # candidate set a retry would have gotten right.
-    query_vecs = list(query_vecs) if supplied_qvs else [None] * len(queries)
+    # `query_vecs is not None` rather than the supplied_qvs flag: the two mean the same thing
+    # here, but only the direct test narrows the Optional away for the list() call.
+    query_vecs = list(query_vecs) if query_vecs is not None else [None] * len(queries)
     ranking_degraded = False
     try:
         texts = [c["text"] for c in corpus]

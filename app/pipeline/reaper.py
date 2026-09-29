@@ -157,7 +157,9 @@ def clean_up_abandoned_sessions(sess: Session) -> list[str]:
     # SESSION, but a task frozen mid-flight keeps its worker slot and DB connection forever, and
     # a redelivery would then run beside it. See _revoke_zombie_tasks for why an expired lease is
     # an exact frozen-detector rather than a heuristic.
-    _revoke_zombie_tasks(expired_work + expired_locks)
+    # list(...): SQLAlchemy's .all() returns a real list at runtime, but its stubs declare the
+    # narrower Sequence, which has no __add__.
+    _revoke_zombie_tasks(list(expired_work) + list(expired_locks))
 
     # 3. Finalize every abandoned session through the SAME rule the pipeline uses.
     cancelled: list[str] = []

@@ -54,6 +54,21 @@ DERIVED_SETTINGS: tuple[str, ...] = (
 #: defaults to the same file), hence the only one whose values reach production.
 POSTURE_FILE = ".env.uat"
 
+#: The four env files the project SHIPS and scripts/apply_env_comments.py maintains — the ones a
+#: setting is genuinely expected to be documented in.
+#:
+#: WHY THIS EXISTS SEPARATELY FROM THE GLOB. `check()` deliberately globs `.env*` so a new template
+#: is covered the day it appears, and that stays: an undocumented setting in a file someone actually
+#: deploys is worth reporting. But the glob also picks up whatever else a working tree happens to
+#: hold — `.env copy`, `.env copy.uat` and `.env.demo` in this one — and those are operator scratch,
+#: decoupled from the model years ago and missing settings by the hundred. `control_map_backfill_ratio`
+#: shipped documented in NO file for exactly that reason: rule 1 DID report it, on line 1 of an
+#: otherwise green run, under 169 lines of noise about files nobody deploys. So the REGRESSION PIN
+#: (tests/test_env_documents_every_setting.py) scopes to this tuple while the CLI keeps reporting
+#: everything — a pin that fails on day one over scratch files gets deleted, and then nothing checks
+#: the four files that matter.
+SHIPPED_ENV_FILES: tuple[str, ...] = (".env", POSTURE_FILE, ".env.example", ".env.prod.example")
+
 #: Values THIS deployment has DECIDED, each with the evidence that decided it.
 #:
 #: WHY A LIST IN SOURCE. Everything else here checks that a setting is PRESENT and SPELLED right;

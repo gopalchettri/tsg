@@ -52,8 +52,15 @@ async def _handle_auth_error(_: Request, exc: AuthError):
 
 
 async def _handle_forbidden(_: Request, exc: EntityForbidden):
-    """Caller is authenticated but not entitled to the target entity -> 403."""
-    return JSONResponse(status_code=403, content=_env("forbidden", str(exc)))
+    """Caller is authenticated but not entitled to the target entity -> 403.
+
+    `details` a raise site attached is carried through, the same way _handle_not_found
+    already does: the remediation route commits the scenario BEFORE the plan can be
+    refused, and attaches its ids to whatever it re-raises, so dropping them here leaves
+    the client holding an error about a scenario it cannot name."""
+    return JSONResponse(status_code=403,
+                        content=_env("forbidden", str(exc),
+                                     **(getattr(exc, "details", None) or {})))
 
 
 async def _handle_session_conflict(_: Request, exc: SessionConflict):
@@ -79,8 +86,16 @@ async def _handle_master_inactive(_: Request, exc: MasterInactive):
 
 async def _handle_treatment_conflict(_: Request, exc: TreatmentConflict):
     """Treatment-plan request refused -> 409, with `details.reason` (TreatmentGateReason) when
-    the raise site gave one — same shape as accept_conflict."""
-    extra = {"reason": exc.reason} if exc.reason is not None else {}
+    the raise site gave one — same shape as accept_conflict.
+
+    `details` a raise site attached rides along too, like _handle_not_found/_handle_forbidden.
+    Dropping it broke a PUBLISHED promise: POST /v1/remediation-plans states that when a manual
+    scenario was saved but its plan was then refused, the 409 carries its session_id and
+    scenario_id — the client's only way to name what was already committed on its behalf. The
+    raise site attaches them (pipeline/treatment.py::TreatmentConflict(details=...)); only this
+    handler read past them. `reason` is merged LAST so an explicit reason always wins."""
+    extra = {**(getattr(exc, "details", None) or {}),
+             **({"reason": exc.reason} if exc.reason is not None else {})}
     return JSONResponse(status_code=409, content=_env("treatment_conflict", str(exc), **extra))
 
 
@@ -228,8 +243,11 @@ async def _handle_http_exception(_: Request, exc: StarletteHTTPException):
     """
     code = HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_") \
         if exc.status_code in {s.value for s in HTTPStatus} else "http_error"
+    # `details` a raise site attached rides along — see _handle_forbidden. The 503 for a dead
+    # broker names a regenerate path the client can only build from those ids.
     return JSONResponse(status_code=exc.status_code,
-                        content=_env(code, str(exc.detail)),
+                        content=_env(code, str(exc.detail),
+                                     **(getattr(exc, "details", None) or {})),
                         headers=getattr(exc, "headers", None))
 
 

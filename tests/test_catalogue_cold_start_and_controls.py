@@ -248,10 +248,11 @@ def _seed_output(s, sid: str, out_id: str, *, catalogue_id=None, library_name=No
 
 def test_catalogue_verified_output_rides_grounding_like_a_generated_one():
     """No curated bypass survives the register: a catalogue-verified threat's output is
-    eligible for grounding exactly like a generated one, and each row is the 6-tuple
-    (scenario_id, ScenarioJSON, ThreatName, ThreatType, LibraryThreatName, LibraryThreatType)
-    build_output_queries consumes — the library spelling riding along on the SAME row, not
-    a bypass lane."""
+    eligible for grounding exactly like a generated one, and each row carries the WHOLE threat
+    identity control_mapping._retrieval_query consumes — ScenarioJSON, ThreatName, ThreatType,
+    the library spellings, plus ThreatCategory and ThreatActorsJSON — riding along on the SAME
+    row rather than costing a lookup per scenario. Read by NAME: the widening of this SELECT is
+    exactly what a positional read cannot survive."""
     engine, sid = _outputs_engine(), str(uuid.uuid4())
     out_cat, out_gen = str(uuid.uuid4()), str(uuid.uuid4())
     with sessionmaker(engine)() as s:
@@ -260,15 +261,16 @@ def test_catalogue_verified_output_rides_grounding_like_a_generated_one():
         _seed_output(s, sid, out_gen)
         rows = control_mapping.eligible_outputs(s, sid)
 
-    assert {r[0] for r in rows} == {out_cat, out_gen}
-    by_id = {r[0]: r for r in rows}
-    assert all(len(r) == 6 for r in rows)
-    _, sj, tname, ttype, ltname, lttype = by_id[out_cat]
-    assert (tname, ttype) == (f"name-{out_cat}", f"type-{out_cat}")
-    assert (ltname, lttype) == ("Credential theft", "Credential Theft")
-    assert json.loads(sj) == {"title": out_cat}
+    assert {r.ScenarioID for r in rows} == {out_cat, out_gen}
+    by_id = {r.ScenarioID: r for r in rows}
+    catalogue = by_id[out_cat]
+    assert (catalogue.ThreatName, catalogue.ThreatType) == (f"name-{out_cat}", f"type-{out_cat}")
+    assert (catalogue.LibraryThreatName, catalogue.LibraryThreatType) == (
+        "Credential theft", "Credential Theft")
+    assert catalogue.ThreatCategory == S
+    assert json.loads(catalogue.ScenarioJSON) == {"title": out_cat}
     # The generated twin carries its own identity with NO library spelling to prefer.
-    assert by_id[out_gen][4] is None and by_id[out_gen][5] is None
+    assert by_id[out_gen].LibraryThreatName is None and by_id[out_gen].LibraryThreatType is None
 
 
 def test_only_a_recorded_mapping_attempt_leaves_the_grounding_path():

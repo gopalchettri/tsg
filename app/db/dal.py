@@ -36,6 +36,7 @@ from app.core.enums import (
     ControlMappingStatus,
     ScenarioDecisionReason,
     ScenarioStatus,
+    SessionMode,
     SessionStatus,
     StageStatus,
     SubsystemLevel,
@@ -241,6 +242,9 @@ _SESSION_BOARD_COLS = (
     m.Scenario_Session.StageStatus, m.Scenario_Session.CompletedAt,
     # Control mapping owns no stage row, so its timing cannot ride stage_rows like the other two.
     m.Scenario_Session.ControlMapSeconds,
+    # AUTO or MANUAL: every gate that refuses the AI on a person's scenario reads it from here,
+    # so it rides the one board load rather than a second query per check.
+    m.Scenario_Session.Mode,
 )
 
 def execute_dml(sess: Session, stmt: Executable) -> CursorResult[Any]:
@@ -598,23 +602,30 @@ def assert_capacity_available(sess: Session, entity_id: str | None = None) -> No
         raise CapacityExceeded()
 
 def reserve_idempotency_key_or_get_existing(
-    sess: Session, entity_id: str, idempotency_key: str, asset_id: str,
+    sess: Session, entity_id: str, idempotency_key: str, asset_id: str, *, manual: bool = False,
 ) -> tuple[str | None, bool, str | None]:
     """One indexed read of `UX_Session_IdempotencyKey`:
     - (None, False, None)          — key unused, caller proceeds to create.
-    - (session_id, False, user_id) — same key + same asset → return the existing session.
-    - (session_id, True, user_id)  — same key + DIFFERENT asset → caller raises 409.
+    - (session_id, False, user_id) — same key + same asset + same KIND → return that session.
+    - (session_id, True, user_id)  — same key, different asset or different kind → caller 409s.
+
+    `manual` is the KIND the caller is asking for: an AI run (POST /v1/sessions, False) and a
+    hand-written save (POST /v1/remediation-plans, True) share this one key space, and handing
+    one caller the other's session would report a session that queued nothing — or re-plan a
+    person's scenario as an AI run. Compared in BOTH directions for that reason.
 
     `user_id` is the EXISTING row's owner (the key is scoped by (EntityID, key), not by user). The
     race past this read is caught by `create_session`'s IntegrityError handler."""
     row = sess.execute(
-        select(m.Scenario_Session.SessionID, m.Scenario_Session.AssetID, m.Scenario_Session.UserID)
+        select(m.Scenario_Session.SessionID, m.Scenario_Session.AssetID,
+               m.Scenario_Session.UserID, m.Scenario_Session.Mode)
         .where(m.Scenario_Session.EntityID == entity_id,
             m.Scenario_Session.IdempotencyKey == idempotency_key)
     ).mappings().first()
     if row is None:
         return None, False, None
-    return row["SessionID"], row["AssetID"] != asset_id, row["UserID"]
+    other_kind = (row["Mode"] == SessionMode.MANUAL) != manual
+    return row["SessionID"], row["AssetID"] != asset_id or other_kind, row["UserID"]
 
 # ---------------------------------------------------------------------------
 # Stage state — CAS primitives
@@ -1373,12 +1384,35 @@ def scenario_threat_columns():
             it.GroundingStatus, it.GroundingScore, it.IsThreatAIGenerated, it.IsThreatTypeAIGenerated)
 
 
+def scoped_threat_columns():
+    """The Scoped_Threat half of a threat block — the sibling of scenario_threat_columns().
+
+    WHY THIS EXISTS. Score and ScopeRank live here, not on Identified_Threat, so five selects used
+    to hand-add `st.Score, st.ScopeRank` and the comment beside them said the shared list "cannot
+    carry them". That was the bug: three of those selects also remembered SelectionKind and two
+    did not, and SelectionKind is the column that says whether the other two MEAN anything.
+
+    Both Score and ScopeRank are NOT NULL, so a hand-written threat had to be given the session's
+    base score just to be stored. `sessions._threat_block` nulls them out when
+    SelectionKind == manual_entry — via `.get()`, so a select that omitted the column silently
+    took the else branch and published 60.0 / rank 1 as a genuine relevance score, on the plan and
+    the entity register, while /results answered null for the same scenario.
+
+    Keeping the three together in ONE tuple is the fix: the verdict column can no longer travel
+    separately from the two numbers it qualifies."""
+    st = m.Scoped_Threat
+    return (st.Score, st.ScopeRank, st.SelectionKind)
+
+
 def _scenario_read_select():
     out, ss, st, it = m.Threat_Scenario, m.Scenario_Session, m.Scoped_Threat, m.Identified_Threat
     return (
         select(out.ScenarioID, out.SessionID, out.SubsystemID, out.ScenarioJSON,
             out.Accepted, out.Superseded, out.ScenarioNumber, out.CreatedAt, out.ControlsMappedAt,
             out.ControlMapAttempts,
+            # Who wrote it: 'manual' = a person, else TSG's AI. Every response that shows a
+            # scenario reads it from here, so provenance can never be inferred from a request.
+            out.ScenarioSource,
             # Per-scenario generation span. CreatedAt is when the row was PERSISTED (sequentially,
             # after the whole batch generated), so it is not a substitute for either of these.
             out.GenStartedAt, out.GenFinishedAt,
@@ -1389,7 +1423,10 @@ def _scenario_read_select():
             out.AcceptedAt, out.AcceptedBy, out.RejectedAt, out.RejectedBy,
             ss.EntityID, ss.UserID, ss.SessionStatus,
             *scenario_threat_columns(),
-            st.Score, st.ScopeRank)
+            # ONE tuple, never hand-listed: SelectionKind says whether Score/ScopeRank mean
+            # anything, and a select that took the numbers without the verdict published a
+            # hand-written threat's placeholder as a real score. See scoped_threat_columns().
+            *scoped_threat_columns())
         .select_from(out.__table__
             .join(ss, out.SessionID == ss.SessionID)
             .outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
@@ -1468,7 +1505,8 @@ class Decided(NamedTuple):
     transitioned. Two fields rather than a bare int because the caller must be able to report,
     log and audit what HAPPENED — a re-accept matches without changing anything, and the
     requested set is not the written set."""
-    count: int
+    # shadows tuple.count — see accept.Accepted for why this is safe and deliberate.
+    count: int  # type: ignore[assignment]
     changed: list[str]
 
 
@@ -1688,7 +1726,7 @@ def scenario_identity_pairs(sess: Session, session_id: str, output_ids: list[str
 # Generic write helpers
 # ---------------------------------------------------------------------------
 # A superseded output KEEPS its control-map rows: GET /results?include_replaced=true can still
-# reach them. Costs ~control_map_top_k (5) rows per regeneration; nothing re-maps them
+# reach them. Costs up to control_map_max_count rows per regeneration; nothing re-maps them
 # (map_controls filters Superseded=0, per ScenarioID).
 # ponytail: if the table ever grows enough to matter, prune by session age, not on the write path.
 
@@ -2263,6 +2301,41 @@ def find_type_id_by_norm_name(sess: Session, name: str) -> int | None:
         require_active=False)
 
 
+def curator_rejected_catalogue_id(sess: Session, name: str) -> int | None:
+    """A catalogue row a curator REJECTED — soft-deleted and never approved (IsActive=0) — whose
+    name normalizes to `name`'s key, lowest id; None otherwise.
+
+    A tombstone is a curator's answer: a hand-written scenario naming it is saved with the
+    person's own wording and NO library link, rather than putting the same name back in the
+    pending queue. An approved row later retired keeps IsActive=1, so it is not a rejection."""
+    key = normalize_name(name)
+    if not key:
+        return None
+    tc = m.Threat_Catalogue
+    hits = [cid for cid, cname in sess.execute(
+        select(tc.ThreatCatalogueID, tc.ThreatName).where(tc.IsDeleted == True,
+                                                          tc.IsActive == False))
+        if normalize_name(cname or "") == key]
+    return min(hits) if hits else None
+
+
+def library_category_ids(sess: Session, type_id: int, catalogue_id: int | None = None) -> set[int]:
+    """The categories the library files a threat under: its type's own (default) category plus
+    the category map of `catalogue_id` — or, for a threat not in the library yet, the map of
+    every live row under the type. Empty = the library records no category for it, so there is
+    nothing for a hand-written scenario's category to contradict."""
+    tc, mp = m.Threat_Catalogue, m.Threat_Catalogue_Category_Map
+    q = select(mp.ThreatCategoryID).join(tc, tc.ThreatCatalogueID == mp.ThreatCatalogueID)
+    q = (q.where(tc.ThreatCatalogueID == catalogue_id) if catalogue_id is not None
+         else q.where(tc.ThreatTypeID == type_id, tc.IsDeleted == False))
+    out = {int(c) for c in sess.execute(q).scalars()}
+    default = sess.execute(select(m.Threat_Type.ThreatCategoryID)
+                           .where(m.Threat_Type.ThreatTypeID == type_id)).scalar()
+    if default is not None:
+        out.add(int(default))
+    return out
+
+
 def find_catalogue_id_by_norm_name(sess: Session, type_id: int, name: str) -> int | None:
     """Live Threat_Catalogue row UNDER `type_id` whose ThreatName normalizes to `name`'s key —
     the promote API's duplicate guard, scoped to the already-matched type so one generic name
@@ -2287,6 +2360,29 @@ def find_actor_id_by_norm_name(sess: Session, name: str) -> int | None:
     """Active Threat_Actor whose name normalizes to `name`'s key."""
     return _find_active_id_by_norm_name(
         sess, m.Threat_Actor, m.Threat_Actor.ThreatActorID, m.Threat_Actor.ThreatActorName, name)
+class BlankLibraryName(ValueError):
+    """The name has no letters or digits, so `normalize_name` folds it to an empty key and the
+    row would have no IDENTITY — e.g. '...', '---', '  /  '.
+
+    Raised by the mints themselves, for the same reason as CuratorRejected: an empty key is
+    exactly what every identity mechanism in this module SKIPS. `_find_active_id_by_norm_name`
+    and `find_catalogue_id_by_norm_name` return None on it, so the app-owned dedup never matches
+    and each import or promotion mints another row; `curator_rejected_catalogue_id` returns None
+    on it, so a curator's tombstone does not hold and the rejected wording is proposed again; and
+    the filtered unique indexes key on the RAW name, so '...' and '---' collide with neither each
+    other nor themselves. Two guarantees this module states in prose — upsert_threat_type's "a
+    duplicate cannot be created even on a database whose unique indexes were never built" and the
+    curator rule — are simply false for such a name unless it is refused before the INSERT.
+
+    Checked AFTER the column-width truncation, on the value that would actually be STORED: a
+    name whose letters all sit past the cut normalizes non-empty before truncation and empty
+    after it, so validating the caller's string instead would let exactly that case through."""
+
+    def __init__(self, name: str):
+        super().__init__(f"{name!r} has no letters or digits, so it cannot name a library row")
+        self.name = name
+
+
 def upsert_threat_type(sess: Session, name: str, category_id: int | None,
                     source: str = "ai_auto_promoted",
                     created_by: str | None = None,
@@ -2313,6 +2409,8 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None,
     # name raises DataError, NOT the IntegrityError caught here, so it would abort the whole
     # accept-session transaction.
     name = name[:300]
+    if not normalize_name(name):
+        raise BlankLibraryName(name)
     # APPLICATION-OWNED DEDUP, before any insert is attempted: a normalized-name match wins
     # outright, ignoring category and sector (which is exactly what used to fork one name into
     # several rows). This holds even where the unique index does not exist; the IntegrityError
@@ -2347,6 +2445,33 @@ def upsert_threat_type(sess: Session, name: str, category_id: int | None,
         return winner, False
 
 
+class CuratorRejected(Exception):
+    """The name is a curator's tombstone — soft-deleted and never approved — so it is never
+    minted again.
+
+    Raised by the mint itself, not by a caller: the tombstone is invisible to every reuse
+    lookup (they filter IsDeleted=False) AND to the natural-key indexes (filtered the same way),
+    so nothing else stops an INSERT. Enforcing it at one caller left promote and the import free
+    to put a rejected threat straight back in the curator queue."""
+
+    def __init__(self, name: str, catalogue_id: int):
+        super().__init__(f"'{name}' was rejected by a curator; it is not proposed again")
+        self.catalogue_id = catalogue_id
+
+
+class CatalogueNameTaken(Exception):
+    """The threat name is a live Threat_Catalogue row filed under ANOTHER type.
+
+    UX_ThreatCatalogue_NaturalKey is on the name ALONE, so the name cannot be minted under the
+    caller's type — and handing back that other type's row would store a (type, threat) pair the
+    library does not hold. Each caller decides: the manual save refuses with a 422 naming the
+    library's type, promote answers 409, the import skips the record and reports it."""
+
+    def __init__(self, name: str, catalogue_id: int, type_id: int, type_name: str | None):
+        super().__init__(f"'{name}' is filed under '{type_name or type_id}' in the threat library")
+        self.catalogue_id, self.type_id, self.type_name = catalogue_id, type_id, type_name
+
+
 def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
                             source: str = "promote-api",
                             created_by: str | None = None,
@@ -2356,8 +2481,9 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
     NAME-ONLY collision recovery, mirroring upsert_threat_type exactly: the recovery predicate
     keys on ThreatName ALONE, matching UX_ThreatCatalogue_NaturalKey(ThreatName). The old
     type+name+sector predicate would find nothing on a cross-type name collision and turn every
-    such promotion into a 500. The caller runs the app-owned normalized-name dedup first
-    (find_catalogue_id_by_norm_name, type-scoped); this function only mints. No sector —
+    such promotion into a 500. The winner is returned only when it sits under `type_id`; one
+    filed under another type raises CatalogueNameTaken. The caller runs the app-owned
+    normalized-name dedup first (find_catalogue_id_by_norm_name, type-scoped). No sector —
     SectorID stays unmapped and NULL (sector logic removed 2026-08, user instruction), and no
     description — Threat_Catalogue.Description was removed as unused, so the promoted row now
     carries its name alone.
@@ -2365,6 +2491,11 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
     `is_active`: see upsert_threat_type — same caller-declared visibility policy, same default,
     and the same rule that an EXISTING row keeps whatever IsActive it already had."""
     name = name[:500]
+    if not normalize_name(name):
+        raise BlankLibraryName(name)
+    tombstone = curator_rejected_catalogue_id(sess, name)
+    if tombstone is not None:
+        raise CuratorRejected(name, tombstone)
     try:
         with sess.begin_nested():
             res = execute_dml(sess, insert(m.Threat_Catalogue).values(
@@ -2376,14 +2507,22 @@ def upsert_threat_catalogue(sess: Session, name: str, type_id: int,
                 CreatedAt=now(), CreatedBy=created_by))
         return inserted_pk(res), True
     except IntegrityError:
+        tc, tt = m.Threat_Catalogue, m.Threat_Type
         winner = sess.execute(
-            select(m.Threat_Catalogue.ThreatCatalogueID).where(
-                m.Threat_Catalogue.ThreatName == name,
-                m.Threat_Catalogue.IsDeleted == False)
-        ).scalar()
+            select(tc.ThreatCatalogueID, tc.ThreatTypeID, tt.ThreatTypeName)
+            .outerjoin(tt, tt.ThreatTypeID == tc.ThreatTypeID)
+            .where(tc.ThreatName == name, tc.IsDeleted == False)
+        ).first()
         if winner is None:  # not a natural-key duplicate — fail loud, never return a NULL id
             raise
-        return winner, False
+        if winner.ThreatTypeID != type_id:
+            # The name's ONE row belongs to another type. Returning it would pair this
+            # caller's type with another type's threat — the mis-link this guard exists
+            # for. Refuse here, at the one function every mint goes through, so no caller
+            # can reintroduce it.
+            raise CatalogueNameTaken(name, winner.ThreatCatalogueID, winner.ThreatTypeID,
+                                     winner.ThreatTypeName) from None
+        return winner.ThreatCatalogueID, False
 
 
 def catalogue_active(sess: Session, catalogue_id: int) -> bool:
@@ -2500,6 +2639,8 @@ def upsert_threat_actor(sess: Session, name: str, source: str = "ai_auto_promote
     # bound -> rstrip, EXACTLY that boundary's shape: a slice ending on a space would store a
     # name the accept memo's exact/casefold keys can never match (casefold doesn't strip).
     name = name.strip()[:200].rstrip()
+    if not normalize_name(name):
+        raise BlankLibraryName(name)
     # See upsert_threat_type. Callers that already resolved by identity (accept_actors.
     # resolve_actor_id_by_identity) skip this by never reaching here; the check makes the
     # guarantee hold for the ones that do NOT — admin CRUD and the bulk importer.
@@ -2623,6 +2764,9 @@ def pending_library_threats(sess: Session, *, limit: int = 200) -> list[RowMappi
     tc, tt = m.Threat_Catalogue, m.Threat_Type
     return list(sess.execute(
         select(tc.ThreatCatalogueID, tc.ThreatName, tc.Source, tc.CreatedAt,
+            # WHO proposed it: a hand-written scenario names a person, so a curator
+            # reviewing the queue can tell that from an AI promotion at a glance.
+            tc.CreatedBy,
             tt.ThreatTypeID, tt.ThreatTypeName,
             tt.IsActive.label("TypeIsActive"), tt.IsDeleted.label("TypeIsDeleted"))
         .select_from(tc.__table__.join(tt, tc.ThreatTypeID == tt.ThreatTypeID))
@@ -2630,6 +2774,42 @@ def pending_library_threats(sess: Session, *, limit: int = 200) -> list[RowMappi
         .order_by(tc.ThreatCatalogueID)
         .limit(limit)
     ).mappings())
+
+
+def library_outcomes_for_scenarios(sess: Session, scenario_ids) -> dict[str, dict]:
+    """{scenario_id: {"threat_type": <LibraryOutcome>, "threat": <LibraryOutcome>}} — what each
+    hand-written scenario did to the threat library.
+
+    ONE read for a whole page, never one per card: the rule _controls_by_output follows, and the
+    reason this takes a LIST. Seeks the filtered IX_ScenarioAudit_Scenario.
+
+    READ FROM THE AUDIT ROW, not recomputed. The alternative — asking curator_rejected_catalogue_id
+    per scenario — reads every tombstoned catalogue row and normalises in Python, a table scan on
+    endpoints clients poll. The audit row is the fact, written inside the save's own transaction.
+
+    ABSENCE IS AN ANSWER, not missing data: the manual save writes this row only when a status is
+    something other than `existing`, so a scenario with no row matched the library on both counts.
+    Callers publish existing/existing for it rather than null.
+
+    Filters on the detail's own `source`: promote.py writes `library_promoted` too, for the AI
+    promote-to-library path, with a different detail shape that carries no `statuses` — reading
+    that as a manual proposal would credit a curator's promotion to whoever wrote the scenario."""
+    ids = sorted({str(s) for s in (scenario_ids or []) if s})
+    if not ids:
+        return {}
+    a = m.Scenario_Audit
+    found: dict[str, dict] = {}
+    for scid, detail in sess.execute(
+            select(a.ScenarioID, a.DetailJSON)
+            .where(a.ScenarioID.in_(ids), a.EventType == AuditEventType.library_promoted)
+            # Oldest first so a LATER row for the same scenario wins: a re-save's outcome is the
+            # current truth and the first proposal is history.
+            .order_by(a.CreatedAt, a.AuditID)):
+        detail_dict = safe_json_dict(detail) or {}
+        statuses = detail_dict.get("statuses")
+        if detail_dict.get("source") == "manual-scenario" and isinstance(statuses, dict):
+            found[str(scid)] = statuses
+    return found
 
 
 def session_audit_rows(sess: Session, session_id: str, *, scenario_id: str | None = None,
@@ -2691,9 +2871,11 @@ def accepted_scenarios(sess: Session, session_id: str) -> list[dict]:
             # `Accepted` was FILTERED on below but never SELECTED, so the accepted register could
             # not report the flag it is defined by — nor, now, who set it. All three ride this
             # same SELECT; no extra query.
-            out.Accepted, out.AcceptedAt, out.AcceptedBy,
+            out.Accepted, out.AcceptedAt, out.AcceptedBy, out.ScenarioSource,
             *scenario_threat_columns(),
-            st.Score, st.ScopeRank)
+            # ONE tuple — see scoped_threat_columns(). The verdict column cannot travel
+            # separately from the two numbers it qualifies.
+            *scoped_threat_columns())
         .select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                     .outerjoin(it, st.ThreatID == it.ThreatID))
         .where(out.SessionID == session_id, accepted(out.Accepted))

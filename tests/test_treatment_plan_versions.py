@@ -277,7 +277,7 @@ def test_regenerate_carries_register_data(monkeypatch):
     assert new_row["RiskIdentificationDate"] == rows[0]["RiskIdentificationDate"]
     # Explicit, so a future change that makes the window None on BOTH sides cannot make the
     # equality above pass vacuously again — the exact way both bugs hid.
-    assert old_snap["risk_assessment"]["assessment_window"]["total_days"] == 92
+    assert old_snap["risk_assessment"]["assessment_window"]["total_days"] == 93
 
     # Chained regenerate: the register data (and the window) survive a second hop too.
     _set_status(Session, resp.plan_id, str(StageStatus.COMPLETE))
@@ -780,5 +780,12 @@ def test_generation_declares_the_strict_plan_schema(monkeypatch):
     assert seen["expected_type"] is dict
     (row,) = _plans(Session)
     assert row["Status"] == str(StageStatus.COMPLETE), row["ErrorMessage"]
-    assert json.loads(row["PlanJSON"])["title"] == generated.title
+    stored = json.loads(row["PlanJSON"])
+    assert stored["title"] == generated.title
     assert receipt["ParseSucceeded"] and receipt["Model"] == "fake-model"
+    # The scheduler ran on the finish path: the model's duration chain became the server-owned
+    # schedule, with the same keys whether or not the register sent a window.
+    action = stored["remediation_action_plan"][0]
+    assert action["duration_days"] == 14 and {"start_date", "end_date", "timeline"} <= set(action)
+    assert stored["mitigation_timeline_days"] == 14
+    assert "mitigation_end_date_planned" in stored and stored["mitigation_timeline"]

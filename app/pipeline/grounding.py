@@ -14,24 +14,32 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from itertools import pairwise
 from types import ModuleType
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
-from sqlalchemy import func, insert, or_, select, update
+from sqlalchemy import CursorResult, func, insert, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
-from app.core.enums import CalibrationStatus, GroundingStatus
+from app.core.enums import CalibrationStatus, GroundingStatus, ScenarioStatus
 from app.core.logging import get_logger
 from app.core.naming import normalize_name
 from app.db import dal
 from app.db import models as m
 from app.db.dal import guid, now
-from app.pipeline import embeddings, hybrid_search
+
+# control_relevance is pure policy (no Session, no LLM, no settings) and imports nothing from
+# here, so this direction is acyclic by construction — see _match_asset_categories for why the
+# matching rule is imported rather than restated.
+from app.pipeline import control_relevance, embeddings, hybrid_search
+from app.pipeline.control_threshold import (
+    recommend_relevance_cutoff,
+    sweep_relevance_thresholds,
+)
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 from app.pipeline.validation import parse_json
 
@@ -176,6 +184,33 @@ def control_itot_vocabulary(sess: Session) -> set[str]:
 
 
 
+def _match_asset_categories(sess: Session, category_ids: set[int], resolved: set[str],
+                            log_event: str) -> Iterator[tuple[int, str | None]]:
+    """The SQL half of the matching rule — yields (category id, matched label or None) for each
+    of `category_ids`, in ctm_scan_category row order.
+
+    THE RULE ITSELF IS NOT HERE. It is `control_relevance._match_category_to_vocabulary` (code
+    first, then the parenthesised "(CODE)" marker inside the name), and this function CALLS it
+    rather than restating it. That is the whole point of this shape: the rule briefly existed in
+    three places — here, in a coverage sibling since deleted, and in control_relevance, which is
+    what control mapping actually runs — and this repo has already paid for two copies of one rule
+    drifting (see control_relevance's module docstring on the two control-query builders). One
+    implementation, two callers, and the direction of the dependency is the safe one:
+    control_relevance is pure policy and imports nothing from here.
+
+    All that is left in this module is what needs a `Session`: reading (code, name) for the ids,
+    and logging a category the vocabulary cannot represent. The miss is YIELDED, not decided,
+    because the caller's fail-open is a filtering policy, not a matching one."""
+    by_fold = control_relevance._vocabulary_by_fold(resolved)
+    for cat_id, code, name in sess.execute(
+            select(m.ctm_scan_category.id, m.ctm_scan_category.code, m.ctm_scan_category.name)
+            .where(m.ctm_scan_category.id.in_(sorted(category_ids)))):
+        matched = control_relevance._match_category_to_vocabulary(code, name, by_fold)
+        if matched is None:
+            log.info(log_event, category_id=cat_id, code=code)
+        yield cat_id, matched
+
+
 def resolve_asset_labels(sess: Session, category_ids: set[int],
                         vocabulary: Callable[[], set[str]],
                         *, log_event: str = "asset_labels.category_without_vocabulary") -> list[str] | None:
@@ -195,7 +230,11 @@ def resolve_asset_labels(sess: Session, category_ids: set[int],
 
     Shared by the control-pool filter (control_mapping._resolve_control_labels) and the technique
     reference (intel.technique_reference), so the two cannot drift into different answers for the
-    same session.
+    same session. The PARTIAL-knowledge variant of this — keep the labels that matched, report the
+    ids that did not — lives in control_relevance.ItotApplicabilityContext, which is what control
+    mapping's ITOT-aware scoring uses. A third copy of it briefly existed here and had no caller
+    at all; it was deleted rather than wired up, because dead code whose docstring names a
+    consumer it does not have tells the next reader the wiring exists.
 
     `vocabulary` is a FACTORY, not a set, and is called only after the category ids prove
     non-empty. Taking a computed set instead made it every caller's job to remember not to build
@@ -207,20 +246,13 @@ def resolve_asset_labels(sess: Session, category_ids: set[int],
     resolved = vocabulary()
     if not resolved:
         return None
-    by_fold = {v.casefold(): v for v in resolved}
     labels: set[str] = set()
-    for cat_id, code, name in sess.execute(
-            select(m.ctm_scan_category.id, m.ctm_scan_category.code, m.ctm_scan_category.name)
-            .where(m.ctm_scan_category.id.in_(sorted(category_ids)))):
-        matched = by_fold.get((code or "").strip().casefold())
+    for _cat_id, matched in _match_asset_categories(sess, category_ids, resolved, log_event):
         if matched is None:
-            folded_name = (name or "").casefold()
-            matched = next((v for f, v in by_fold.items() if f"({f})" in folded_name), None)
-        if matched is None:
-            log.info(log_event, category_id=cat_id, code=code)
             return None
         labels.add(matched)
     return sorted(labels)
+
 
 def get_control_candidates(sess: Session, itot_labels: list[str] | None) -> list[dict[str, Any]]:
     """Active Control_Library rows for Step-4 grounding (control_mapping.map_controls).
@@ -230,19 +262,52 @@ def get_control_candidates(sess: Session, itot_labels: list[str] | None) -> list
     `itot_labels` is the DATA-DRIVEN filter control_mapping resolved from the session's asset
     categories against control_itot_vocabulary — None/empty means no filter (whole library).
     Nothing here hardcodes IT/OT: a future 'PHY_INFRA'-labeled control narrows exactly the
-    same way. Fetch once per session and reuse across every suggestion, not once per query."""
+    same way. Fetch once per session and reuse across every suggestion, not once per query.
+
+    ITOT rides along for APPLICABILITY, not display: it is what lets a score downstream know
+    whether a candidate matches the session's own nature. Without it in the projection there is
+    no IT/OT signal anywhere past this query, so no ITOT-aware scoring is possible at all — and
+    when the pool is UNFILTERED (labels None, the fail-open case) every control in the library is
+    a candidate, which is exactly when that signal matters most. It is one more column on a query
+    already running. Consumers must tolerate its ABSENCE: several tests stub this function with
+    ITOT-less dicts, so read it with .get(), never [\"ITOT\"].
+
+    AN UNLABELLED CONTROL IS ADMITTED BY EVERY FILTER, and that is not a convenience — it is the
+    only reading that agrees with the other half of the ITOT policy. Downstream,
+    control_relevance's ordering rule NEVER demotes a control whose ITOT is blank, because
+    unclassified is not the same as inapplicable. A bare SQL `IN` disagreed with that silently: a
+    blank ITOT matches no label (control_itot_vocabulary drops blanks, so there is nothing for it to
+    equal), so a control a curator left unlabelled was dropped from the candidate pool for EVERY
+    session and could never be mapped to anything — while the demotion rule was treating that same
+    control as applying everywhere. Both halves cannot be right, and the fail-open one is: narrowing
+    the pool is the defect this whole rule exists to prevent (see resolve_asset_labels), so the fix
+    belongs here rather than in the demotion rule.
+
+    BLANK is the reachable shape, NULL is the cheap guard. The column is `NVARCHAR(100) NOT NULL` in
+    the deployment DDL and non-Optional on the model, so "the curator left it blank" means '' or
+    whitespace. The IS NULL arm costs one OR term and is what keeps the two halves agreeing if that
+    column is ever relaxed — which is how this disagreement got in.
+
+    Latent when written — the live library had 1288 active controls, 731 IT + 557 OT and none blank
+    — which is exactly why it is worth spelling out: the first unlabelled control disappears
+    silently, with no error and nothing in the logs."""
     q = select(
         m.Control_Library.ControlLibraryID,
         m.Control_Library.ControlCode,
         m.Control_Library.Domain,
         m.Control_Library.ControlName,
+        m.Control_Library.ITOT,
         embeddings._CONTROL_TEXT.label("text"),
     ).where(
         m.Control_Library.IsActive == True,
         m.Control_Library.IsDeleted == False,
     ).order_by(m.Control_Library.ControlLibraryID)  # deterministic tie-break, see get_possible_types
     if itot_labels:
-        q = q.where(m.Control_Library.ITOT.in_(sorted(set(itot_labels))))
+        # LTRIM(RTRIM(...)), not TRIM(...): TRIM arrived in SQL Server 2017 and this has to run on
+        # whatever the deployment is, while both dialects here have had LTRIM/RTRIM forever.
+        q = q.where(or_(m.Control_Library.ITOT.in_(sorted(set(itot_labels))),
+                        m.Control_Library.ITOT.is_(None),
+                        func.ltrim(func.rtrim(m.Control_Library.ITOT)) == ""))
     return [dict(r) for r in sess.execute(q).mappings()]
 
 
@@ -277,7 +342,7 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
 
     `queries` = (text, optionally pre-embedded qv). Returns, PER QUERY, a ControlMatches
     carrying the full reranked shortlist best-first — never collapsed to a single best: the
-    caller sends ONE scenario-text query per output and needs control_map_top_k distinct
+    caller sends ONE scenario-text query per output and needs up to control_map_max_count distinct
     matches from it, so collapsing here would silently cap every output at one control.
 
     ANSWERED vs MATCHED are different questions and this return type keeps them apart. Both
@@ -387,7 +452,7 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
         if len(rr) != len(docs):  # same fail-loud guard as find_closest_match
             raise RuntimeError(f"rerank returned {len(rr)} scores for {len(docs)} docs")
         # Full reranked list, best-first — the caller filters by min score, dedups by
-        # ControlLibraryID and caps at control_map_top_k. Collapsing to max() here would
+        # ControlLibraryID and caps at control_map_max_count. Collapsing to max() here would
         # silently cap every scenario at ONE mapped control under the one-query design.
         results[i] = ControlMatches(
             sorted(zip(docs, rr), key=lambda rs: rs[1], reverse=True), True)
@@ -395,7 +460,7 @@ def ground_control_queries(llm: LLMClient, queries: list[tuple[str, list[float] 
 
 
 def nearest_library_actors(sess: Session, llm: LLMClient, query: str,
-                        top_n: int = 3) -> list[str]:
+                        top_n: int = 3) -> list[tuple[int, str]]:
     """Nearest live Threat_Actor rows to `query` — the fallback when a threat matched no
     catalogue type with linked actors (or its type was unverified). NEVER invents: every
     returned name is a real library row, and an empty actor table yields []. Returns
@@ -1144,6 +1209,143 @@ def calibrate(sess: Session | None, llm: LLMClient | None, s: Settings | None = 
     return result
 
 
+# --- the CONTROL-MAP cutoff measurement ---------------------------------------------------------
+# A different question from calibrate() above, which scores a short threat label against the threat
+# library. This scores a scenario PARAGRAPH against the CONTROL library, and the two score
+# distributions are materially different — which is the whole reason the cutoff needs measuring
+# rather than borrowing. The maths that turns the measured scores into a recommendation is
+# control_threshold's, imported, not restated; this is the IO half that feeds it.
+# ------------------------------------------------------------------------------------------------
+
+
+class ControlMapMeasurement(NamedTuple):
+    """One completed control-map cutoff measurement, and enough to judge it.
+
+    `cutoff` is control_threshold's `safe` VERBATIM, including its None. `note` is why it is None —
+    an answer to surface, never a value to coerce: every None here means retrieval came back empty,
+    and a threshold cannot fix retrieval. `stricter_alternative` is recorded and offered, never
+    selected (see record_control_map_finished)."""
+    cutoff: float | None
+    stricter_alternative: float | None
+    scenarios: int
+    controls: int
+    note: str | None
+
+
+def control_map_scenario_queries(sess: Session, limit: int, max_chars: int, *,
+                                session_id: str | None = None) -> list[tuple[str, str]]:
+    """(scenario_id, query) for the newest completed scenarios — each built by the MAPPING PASS'S
+    OWN assembler, so what gets measured is what production sends.
+
+    `session_id` narrows to ONE session, for the shortlist-width comparison, which measures recall
+    against the controls already stored for that session's scenarios. Keyword-only so the three
+    positional callers cannot bind it by accident, and served from here rather than a second SELECT
+    for the reason this function exists at all: every caller that has owned a private copy of this
+    query has drifted away from production, and this one drifted TWICE.
+
+    The id comes back in FULL, not truncated to a display label. Truncation is the caller's
+    business, and the comparison joins these ids against `Threat_Scenario_Control_Map` — where an
+    8-character prefix matches nothing at all, which would read as zero recall rather than an error.
+
+    It CALLS control_mapping._retrieval_query (imported locally: control_mapping imports this
+    module, so the cycle is real even though the dependency is not). Restating the column choices
+    instead — library spelling preferred for type and name, actors parsed out of ThreatActorsJSON,
+    involved systems read off the scenario JSON — is exactly how the previous instrument drifted:
+    it measured a query production had stopped sending, and a leading threat identity is worth
+    1.9 -> 60.6 on a real scenario, so a cutoff re-pinned from it was mis-calibrated. That is the
+    silent failure this measurement exists to prevent, reintroduced through the measuring
+    instrument. A private import is a far cheaper coupling than a second builder.
+
+    `.mappings()` and a by-NAME read for the reason _retrieval_query takes a mapping at all: this
+    SELECT has grown twice, and widening it must never shift a field onto the wrong argument."""
+    from app.pipeline import control_mapping  # local — control_mapping imports this module
+
+    out_t, st_t, it_t, ss_t = (m.Threat_Scenario, m.Scoped_Threat, m.Identified_Threat,
+                            m.Scenario_Session)
+    rows = sess.execute(
+        select(out_t.ScenarioID, out_t.ScenarioJSON,
+            it_t.ThreatName, it_t.ThreatType, it_t.LibraryThreatName, it_t.LibraryThreatType,
+            it_t.ThreatCategory, it_t.ThreatActorsJSON, ss_t.AssetName, ss_t.AssetContextJSON)
+        .select_from(out_t.__table__
+                    .outerjoin(st_t, out_t.ScopedThreatID == st_t.ScopedThreatID)
+                    .outerjoin(it_t, st_t.ThreatID == it_t.ThreatID)
+                    .outerjoin(ss_t, out_t.SessionID == ss_t.SessionID))
+        .where(out_t.Status == ScenarioStatus.complete, out_t.Superseded == 0,
+            out_t.ScenarioJSON.is_not(None))
+        # Superseded rows are excluded for BOTH callers, deliberately. A regenerated scenario's old
+        # version still owns map rows, and measuring against those measures a mapping production has
+        # already replaced. The comparison used to select on ScenarioJSON IS NOT NULL alone.
+        .where(*([out_t.SessionID == session_id] if session_id else []))
+        .order_by(out_t.CreatedAt.desc()).limit(limit)).mappings().all()
+    pairs: list[tuple[str, str]] = []
+    for row in rows:
+        context = control_mapping._blob(row["AssetContextJSON"], {}, column="AssetContextJSON")
+        query = control_mapping._retrieval_query(
+            row, control_mapping._blob(row["ScenarioJSON"], {}, column="ScenarioJSON"),
+            asset_name=row["AssetName"], asset_technology=context.get("asset_type"),
+            max_chars=max_chars)
+        if query:
+            pairs.append((str(row["ScenarioID"]), query))
+    return pairs
+
+
+def measure_control_map_cutoff(llm: LLMClient, candidates: list[dict[str, Any]],
+                            queries: list[tuple[str, str]],
+                            s: Settings | None = None) -> ControlMapMeasurement:
+    """Run the REAL Step-4 funnel over `queries` and recommend a cutoff — the safe one only.
+
+    NO Session, deliberately: the embeds and reranks run for minutes, and holding a SQL Server
+    transaction open across them would make the measurement the thing that blocks the system it is
+    measuring. The caller reads `candidates`/`queries` in a session and closes it before calling.
+
+    MEASURED AGAINST THE WHOLE LIBRARY (the caller passes an unnarrowed pool), like the operator
+    script this shares its maths with. A real session narrows the pool by ITOT, so the number this
+    produces is mildly OPTIMISTIC for a narrowed session: the best-scoring control for a scenario
+    may not be in that session's half. Stated rather than corrected, because a per-ITOT cutoff
+    would need a column per label and there is one."""
+    s = s or get_settings()
+    if not candidates or not queries:
+        return ControlMapMeasurement(None, None, 0, len(candidates), (
+            "nothing to measure: the control library returned no active rows, or no completed "
+            "scenario carries text to query with. A cutoff measured against an empty pool would "
+            "'prove' any value."))
+    texts = list(dict.fromkeys(q for _label, q in queries))
+    qv = dict(zip(texts, llm.embed(texts, kind="query")))  # ONE deduped call, as map_controls does
+    results = ground_control_queries(llm, [(q, qv.get(q)) for _label, q in queries], candidates, s)
+    # `answered` separates "we reranked and nothing scored" (a real data point) from "we never got
+    # an answer" (a failed rerank item — not a measurement). Folding the second into the first
+    # would inflate the empty-scenario count at EVERY threshold, so one provider blip would
+    # suppress the recommendation entirely while blaming retrieval.
+    measured = [r.matches for r in results if r.answered]
+    best = [ms[0][1] for ms in measured if ms]
+    if not best:
+        return ControlMapMeasurement(None, None, len(measured), len(candidates), (
+            f"none of the {len(results)} queries got an answer — every rerank item failed, so this "
+            "is a MODEL/PROVIDER fault and nothing was measured at all" if not measured else
+            "every measured scenario came back with an EMPTY shortlist — a retrieval fault, not a "
+            "cutoff one: confirm the control_library embedding group is populated"))
+    rows = sweep_relevance_thresholds(measured, s.control_map_max_count)
+    safe, stricter = recommend_relevance_cutoff(rows, best)
+    if safe is None:
+        return ControlMapMeasurement(None, None, len(measured), len(candidates), (
+            f"even a cutoff of 0 leaves scenarios with no controls across {len(measured)} measured "
+            "scenario(s), which means their shortlists were empty. Fix retrieval before tuning the "
+            "cutoff; nothing was stored, because storing 0 would admit every control at every "
+            "score while claiming to have been measured."))
+    # `stricter` is legitimately None — "there is no stricter cutoff worth offering" — and
+    # `float(None)` raises TypeError. Reachable with a perfectly good `safe`: one measured scenario,
+    # or a flat tie at the bottom of the distribution landing on a swept step.
+    # `recommend_relevance_cutoff` now returns the alternative only when it is STRICTLY greater than
+    # `safe` and strands a bounded number of scenarios, so "no alternative" is an answer, not a gap.
+    # Every link downstream already carries it: ControlMapMeasurement.stricter_alternative,
+    # LowestPositive (NULL) and ControlMapCalibrationStatus.stricter_alternative are all nullable.
+    # Coercing here turned that answer into a task failure AFTER the reranks were paid for, and the
+    # run recorded `failed` with a TypeError — an exception about a type, for a measurement that
+    # actually succeeded.
+    return ControlMapMeasurement(float(safe), None if stricter is None else float(stricter),
+                                len(measured), len(candidates), None)
+
+
 # --- the calibration ledger: history AND the threshold store ------------------------------------
 # Grounding_Calibration_Run is both "who calibrated, when, did it pass" and the home of the
 # measured cutoff itself. One table, because the alternative — a ledger plus a separate best-effort
@@ -1169,6 +1371,85 @@ def latest_successful_run(sess: Session, model_pair: tuple[str, str]) -> float |
     except Exception:
         log.warning("grounding.calibration_read_failed", exc_info=True)
         return None
+
+
+def latest_control_map_cutoff(sess: Session, model_pair: tuple[str, str]) -> float | None:
+    """ControlMapTh from the newest successful CONTROL-MAP measurement for this embedding+reranker
+    pair, or None.
+
+    The mirror image of latest_successful_run, over the other measured column of the same ledger.
+    The non-null column is the discriminator (see models.Grounding_Calibration_Run): a
+    threat-grounding sweep leaves ControlMapTh NULL and a control-map run leaves MatchTh NULL, so
+    neither reader can see the other's rows and there is no `kind` column to keep in sync.
+
+    KEYED BY MODEL PAIR, NEVER BY ENVIRONMENT, and that is the property to preserve. UAT and
+    production run the same models, so ONE measurement covers both with no per-environment pinning
+    and no redeploy; dev runs different models, so it lands on its own row and a dev number can
+    never leak into UAT — the key simply does not match.
+
+    NEVER RAISES, copied from latest_successful_run deliberately: a broken read must degrade to
+    EXACTLY what a missing measurement degrades to. The caller's fallback already handles None, and
+    making the unreadable case louder than the unmeasured one would let an unreadable audit table
+    stop scenarios getting controls at all."""
+    try:
+        r = m.Grounding_Calibration_Run
+        return sess.execute(
+            select(r.ControlMapTh)
+            .where(r.EmbeddingModel == model_pair[0], r.RerankerModel == model_pair[1],
+                r.Status == CalibrationStatus.success, r.ControlMapTh.is_not(None))
+            .order_by(r.StartedAt.desc())
+            .limit(1)
+        ).scalar()
+    except Exception:
+        log.warning("grounding.control_map_cutoff_read_failed", exc_info=True)
+        return None
+
+
+def record_control_map_finished(run_id: str, measurement: ControlMapMeasurement) -> None:
+    """Close a control-map run's ledger row and — when there is a cutoff — STORE IT in the same
+    write. record_calibration_finished's one-write rule, for its reason: a number stored apart from
+    the record of its own measurement is a number a long run can lose to one blip while reporting
+    success.
+
+    `cutoff is None` closes the row `no_signal` with ControlMapTh left NULL and the reason in
+    ErrorMessage. Not `failed` — nothing crashed, the measurement ran and its answer is "the
+    shortlists were empty, so the fault is retrieval and no cutoff fixes it". And emphatically not
+    `success` with a 0: 0 admits every control at every score, and would do so while claiming to
+    have been measured.
+
+    TWO COLUMNS ARE BORROWED. Nothing in their names says so, so it is written down here:
+        PositivesCount  = scenarios measured — both mean "the samples that fed the number"
+        LowestPositive  = the stricter alternative, which IS a low percentile of the best genuine
+                          match per scenario, the same kind of statistic min(positives) is
+    Quality, NegativesCount and HighestNegative stay NULL: a control-map run measures no impostor
+    class at all, and writing zeros would read as a run that separated nothing. Dedicated columns
+    would be clearer and mean editing app/db/models.py plus the deployment SQL.
+
+    THE STRICTER ALTERNATIVE IS RECORDED, NEVER APPLIED — see control_threshold's module docstring.
+    It buys a cleaner tail by letting ~5% of scenarios publish `controls: []`, which this API
+    documents as a healthy library gap, so the cost is invisible in the response and lands on a
+    human reviewer. That trade belongs to the operator; storing it would make it silently.
+
+    Raises when a cutoff WAS measured, swallows otherwise — record_calibration_finished's
+    asymmetry, unchanged: on success this write is the measurement, not a note about it."""
+    stored = measurement.cutoff is not None
+    values = {
+        "Status": CalibrationStatus.success if stored else CalibrationStatus.no_signal,
+        "FinishedAt": now(), "ControlMapTh": measurement.cutoff,
+        "PositivesCount": measurement.scenarios,
+        "LowestPositive": measurement.stricter_alternative,
+        "ErrorMessage": measurement.note,
+    }
+    from app.db.engine import db_session
+
+    try:
+        with db_session() as sess:
+            sess.execute(update(m.Grounding_Calibration_Run)
+                        .where(m.Grounding_Calibration_Run.RunID == run_id).values(**values))
+    except Exception:
+        if stored:
+            raise  # see the docstring: this write IS the measurement
+        log.warning("grounding.control_map_finish_failed", run_id=run_id, exc_info=True)
 
 
 def _utc_naive(dt: datetime) -> datetime:
@@ -1249,7 +1530,9 @@ def settle_abandoned_runs(sess: Session, model_pair: tuple[str, str]) -> int:
         .values(Status=CalibrationStatus.failed, FinishedAt=now(),
                 ErrorMessage="calibration did not report an outcome within the stale window — "
                             "the worker was killed or hung; superseded by a later run"))
-    return res.rowcount or 0
+    # CursorResult, not Result: a DML execute() returns the former at runtime and only it
+    # declares .rowcount. The cast is the narrowing SQLAlchemy's own stubs cannot do here.
+    return cast("CursorResult[Any]", res).rowcount or 0
 
 
 def recent_runs(sess: Session, limit: int = 50) -> list[Any]:

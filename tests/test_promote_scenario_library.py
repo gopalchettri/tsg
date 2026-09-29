@@ -356,22 +356,77 @@ def test_supersede_mid_flight_rolls_back_the_minted_row(sf, monkeypatch):
         assert s.get(m.Identified_Threat, tid).ThreatCatalogueID is None, "stamped anyway"
 
 
-def test_cross_type_name_collision_recovers_to_existing_row(sf):
+def test_cross_type_name_collision_is_409_and_writes_nothing(sf):
     """UX_ThreatCatalogue_NaturalKey(ThreatName) is the backstop the app-owned dedup cannot
     replace: the norm-name lookup is TYPE-scoped, so a live same-name row under a DIFFERENT
-    type is invisible to it and the insert genuinely collides. The recovery must select by
-    ThreatName ALONE and reuse that row — not 500, and never mint a twin."""
+    type is invisible to it and the insert genuinely collides. That row is another type's
+    threat: reusing it would stamp (this type, that type's row) — a pair the library does not
+    hold. So: 409, no twin, no stamp, and the row stays under its own type."""
     _seed_catalogue(sf, cid=501, name="Ransomware encrypts historian data at rest",
                     type_id=OTHER_TYPE_ID)
-    ss, oid, _ = _seed(sf)
+    ss, oid, tid = _seed(sf)
+    before = _counts(sf)
+
+    with sf() as s, pytest.raises(AcceptConflict, match="filed under"):
+        promote.promote_scenario_to_library(s, ss, oid, "reviewer")
+
+    assert _counts(sf) == before, "a refused promotion wrote to the library"
+    with sf() as s:
+        assert s.get(m.Identified_Threat, tid).ThreatCatalogueID is None, "stamped anyway"
+        assert s.get(m.Threat_Catalogue, 501).ThreatTypeID == OTHER_TYPE_ID
+
+
+@pytest.mark.parametrize("blank", ["...", "---", "  /  ", "()"])
+def test_a_name_with_no_letters_or_digits_is_refused_by_every_mint(sf, blank):
+    """normalize_name folds these to an empty key, and EVERY identity mechanism in dal SKIPS an
+    empty key: the app-owned dedup returns None, so each call mints another row; the curator
+    tombstone lookup returns None, so rejected wording comes back; and the filtered unique
+    indexes key on the RAW name, so '...' and '---' collide with neither each other nor
+    themselves. Two guarantees dal states in prose — 'a duplicate cannot be created even on a
+    database whose unique indexes were never built' and 'a curator-rejected threat is never
+    re-proposed' — are false for such a name unless the mint itself refuses it."""
+    before = _counts(sf)
+    with sf() as s:
+        types_before = s.query(m.Threat_Type).count()
+        with pytest.raises(dal.BlankLibraryName):
+            dal.upsert_threat_type(s, blank, CAT_ID)
+        with pytest.raises(dal.BlankLibraryName):
+            dal.upsert_threat_catalogue(s, blank, TYPE_ID)
+        with pytest.raises(dal.BlankLibraryName):
+            dal.upsert_threat_actor(s, blank)
+        assert s.query(m.Threat_Type).count() == types_before, "a blank type was minted"
+    assert _counts(sf) == before, "a refused mint wrote to the library"
+
+
+def test_a_name_whose_letters_fall_past_the_column_width_is_refused(sf):
+    """The check runs on the value that would be STORED, after truncation to the column width.
+    This name normalizes non-empty (its letters are at the end) and empty once cut to 500
+    characters — validating the caller's string instead would let exactly this case through and
+    store a row with no identity."""
+    before = _counts(sf)
+    with sf() as s:
+        with pytest.raises(dal.BlankLibraryName):
+            dal.upsert_threat_catalogue(s, "." * 500 + "Ransomware", TYPE_ID)
+    assert _counts(sf) == before
+
+
+def test_upsert_refuses_a_name_filed_under_another_type(sf):
+    """The 409 above is one caller's answer; the refusal itself belongs here, in the single
+    function every mint goes through — promote, the manual save and the library import all
+    reach Threat_Catalogue through it, so a per-caller check would leave the next caller free
+    to hand back another type's row again. The error carries the winning row's ids because each
+    caller has to name the library's own type back to its user."""
+    _seed_catalogue(sf, cid=501, name="Credential Phishing", type_id=OTHER_TYPE_ID)
+    before = _counts(sf)
 
     with sf() as s:
-        r = promote.promote_scenario_to_library(s, ss, oid, "reviewer")
+        with pytest.raises(dal.CatalogueNameTaken) as exc:
+            dal.upsert_threat_catalogue(s, "Credential Phishing", TYPE_ID)
+        assert exc.value.catalogue_id == 501
+        assert exc.value.type_id == OTHER_TYPE_ID
+        # Counted in the SAME session, before the close rolls anything back: the insert's
+        # savepoint is gone, so there is no twin and no half-written row left pending for
+        # whatever this caller does next.
+        assert s.query(m.Threat_Catalogue).count() == 1, "a twin was minted under the new type"
 
-    assert r.threat["status"] == promote.EXISTING and r.threat["id"] == 501
-    assert r.created_count == 0 and r.success is True
-    counts = _counts(sf)
-    assert counts[0] == 1, "the IntegrityError backstop minted a twin"
-    # Recovery means created=False, so the curation writes are skipped exactly as they are for
-    # any other EXISTING threat.
-    assert counts[1] == 0 and counts[2] == 0, "junctions written for a recovered EXISTING row"
+    assert _counts(sf) == before, "a refused upsert wrote to the library"

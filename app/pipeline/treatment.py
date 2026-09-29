@@ -1,8 +1,14 @@
 """Risk Treatment (Mitigate) Plan generation — docs/RISK_TREATMENT_PLAN_SDD.md.
 
-Self-contained module in the control_mapping.py mould: the snapshot builder, output
-validation and the worker body all live here; the API layer (app/api/treatment.py) calls the
+Module in the control_mapping.py mould: the snapshot ORCHESTRATOR (build_treatment_input), output
+validation and the worker body live here; the API layer (app/api/treatment.py) calls the
 build half at POST time, the Celery task calls run_treatment_generation.
+
+Two sibling modules hold the arithmetic and assembly this file used to do inline, each a set of
+functions over plain already-parsed data so a single rule unit-tests without a Session or an LLM:
+treatment_input.py (one snapshot block per function, plus the register-consistency advisories and
+the library-controls read) and treatment_schedule.py (remediation dates and timelines). Both import
+nothing from here, so the direction is one-way.
 
 TSG reads NO risk-module tables: the register's risk data (ratings, level, existing
 controls, echo fields) arrives IN the request body and is frozen — together with TSG's own
@@ -22,9 +28,7 @@ completion contract; see that function's docstring for the three outcomes that n
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timedelta
-from decimal import MAX_PREC, ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from typing import Any
 
 from sqlalchemy import select
@@ -45,14 +49,25 @@ from app.core.enums import (
     YesNo,
 )
 from app.core.logging import get_logger
-from app.core.security import redact
 from app.db import dal
 from app.db import models as m
-from app.pipeline import grounding, prompts
+from app.pipeline import grounding, prompts, treatment_input
 from app.pipeline import llm as llm_mod
 from app.pipeline.llm import LLMClient, LLMSlotUnavailable
 from app.pipeline.pipeline_common import TRANSIENT_INFRA_ERRORS, log_transient_infra_retry
 from app.pipeline.tasks import ASSET_UNIT_ID, _ask_ai, _classify_llm_failure
+
+# Re-exported deliberately, NOT for convenience: api/treatment.py calls `treatment._clip` and the
+# __main__ self-check below compiles `treatment._library_map_stmt`/`_standards_stmt` and clips text
+# through `treatment._clip`. Their bodies moved to treatment_input.py with the snapshot builder;
+# importing them under the same names here keeps that split invisible to every existing caller.
+from app.pipeline.treatment_input import (
+    _assessment_window,
+    _clip,
+    _library_map_stmt,
+    _standards_stmt,
+)
+from app.pipeline.treatment_schedule import schedule_remediation_actions
 from app.pipeline.validation import LLMResponseParseError
 from app.sse import bus
 
@@ -64,19 +79,22 @@ log = get_logger(__name__)
 # the AI's own gap-analysis table, so the injector must never touch it.)
 _RESERVED_PLAN_KEYS = ("treatment_plan", "risk_identification_date",
                     "risk_owner", "impacted_business_division")
-
-# Per-field cap applied to UI-supplied free text at snapshot time (house analog: intel items
-# truncate before entering the prompt). Pydantic max_length bounds reject oversized fields at
-# the boundary; this is defense-in-depth for anything that slips a path around them. Lives in
-# Settings.treatment_free_text_cap now (default unchanged: 2000).
+# Plan keys the SCHEDULER computes (treatment_schedule.schedule_remediation_actions) from each
+# action's duration_days + depends_on — never model-authored, so the schema does not ask for them.
+_SCHEDULED_PLAN_KEYS = ("mitigation_timeline", "mitigation_timeline_days",
+                        "mitigation_end_date_planned")
 
 
 class TreatmentConflict(Exception):
     """Treatment-plan request refused → HTTP 409 with `details.reason` (TreatmentGateReason).
     Mirrors AcceptConflict's shape: message for the human, reason for the client switch."""
 
-    def __init__(self, message: str, *, reason: TreatmentGateReason | None = None):
+    def __init__(self, message: str, *, reason: TreatmentGateReason | None = None,
+                details: dict | None = None):
         self.reason = str(reason) if reason else None
+        # Machine-readable extras the 409 carries beside the reason — the manual save attaches
+        # the ids of what it just committed, so a refusal never leaves the client empty-handed.
+        self.details = dict(details or {})
         super().__init__(message)
 
 
@@ -84,18 +102,6 @@ class TreatmentPlanInvalid(Exception):
     """The LLM reply parsed as JSON but violates the plan contract structurally (a required
     table missing or not a list of objects). str(exc) is client-safe by construction — it
     names the field, never the model text (raw text is already in Prompt_Log)."""
-
-
-def _clip(text: str | None) -> str | None:
-    """redact() + length cap for one UI-supplied free-text value crossing into the snapshot."""
-    cleaned = redact(text)
-    cap = get_settings().treatment_free_text_cap
-    if cleaned and len(cleaned) > cap:
-        # Marked and logged, never silent: an unmarked mid-word cut can invert the meaning of a
-        # control description the model then gap-analyses against.
-        log.warning("treatment.free_text_truncated", cap=cap, length=len(cleaned))
-        return cleaned[:cap] + " [truncated]"
-    return cleaned
 
 
 def _stale_cutoff(at: datetime | None = None) -> datetime:
@@ -106,56 +112,8 @@ def _stale_cutoff(at: datetime | None = None) -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# Library-controls read (TSG's own tables).
-#
-# Every multi-table statement is built by a module-level `_*_stmt` function so the __main__
-# self-check can .compile() each one WITHOUT a database — plain Select.compile() raises
-# InvalidRequestError on a malformed join and CompileError on a bad column, which is exactly
-# the bug class that once shipped here as an accidental self-join. New statements MUST
-# follow this pattern and be added to the self-check list.
+# Regenerate's version comparison (the library READ itself lives in treatment_input.py)
 # ---------------------------------------------------------------------------
-def _library_map_stmt(scenario_id: str):
-    cmap, lib = m.Threat_Scenario_Control_Map, m.Control_Library
-    return (
-        select(cmap.MapRank, lib.ControlLibraryID, lib.ControlCode, lib.Domain, lib.ControlName)
-        .join(lib, lib.ControlLibraryID == cmap.ControlLibraryID)
-        .where(cmap.ScenarioID == scenario_id,
-            lib.IsActive == True, lib.IsDeleted == False)
-        .order_by(cmap.MapRank)
-    )
-
-
-def _standards_stmt(control_library_ids: list[int]):
-    smap, std = m.Control_Library_Standard_Map, m.Control_Standard
-    return (
-        select(smap.ControlLibraryID, std.StandardName)
-        .join(std, std.StandardID == smap.StandardID)
-        .where(smap.ControlLibraryID.in_(control_library_ids),
-            std.IsActive == True, std.IsDeleted == False)
-        .order_by(std.StandardName)
-    )
-
-
-def _library_controls(sess: Session, scenario_id: str) -> list[dict[str, Any]]:
-    """The scenario's Step-4 grounded Control_Library rows, as plain dicts. Same join shape as
-    sessions._query_controls, deliberately re-issued here rather than imported — API→pipeline
-    is the only allowed import direction, and pulling the session router in would drag the
-    whole API layer into every worker."""
-    rows = sess.execute(_library_map_stmt(scenario_id)).mappings().all()
-    std_names: dict[int, list[str]] = {}
-    if rows:
-        for cid, name in sess.execute(
-            _standards_stmt(sorted({r["ControlLibraryID"] for r in rows}))
-        ):
-            std_names.setdefault(cid, []).append(name)
-    return [
-        {"control_library_id": r["ControlLibraryID"], "control_code": r["ControlCode"],
-        "domain": r["Domain"], "control_name": r["ControlName"],
-        "standards": std_names.get(r["ControlLibraryID"], [])}
-        for r in rows
-    ]
-
-
 def _snapshot_controls(snapshot: dict[str, Any]) -> dict[str, tuple[str, int | None]]:
     """{control_code: (control_name, control_library_id)} for a stored snapshot's library-mapped
     controls, in order — the replaced version's controls, handed to build_treatment_input on
@@ -167,7 +125,7 @@ def _snapshot_controls(snapshot: dict[str, Any]) -> dict[str, tuple[str, int | N
 
 
 def _dropped_control_warnings(sess: Session, previous: dict[str, tuple[str, int | None]],
-                              library_mapped: list[dict[str, Any]]) -> list[str]:
+                            library_mapped: list[dict[str, Any]]) -> list[str]:
     """One warning per control the previous version carried that this one does not, saying WHY.
 
     WHICH controls dropped is decided by CODE, so a scenario re-mapped from one library row to
@@ -187,7 +145,7 @@ def _dropped_control_warnings(sess: Session, previous: dict[str, tuple[str, int 
             select(lib.ControlLibraryID, lib.IsActive, lib.IsDeleted)
             .where(lib.ControlLibraryID.in_(ids))).all()} if ids else {}
     except Exception:
-        sess.rollback()  # read-only point in the POST, same as the _library_controls fallback
+        sess.rollback()  # read-only point in the POST, as in treatment_input's library fallback
         log.warning("treatment.dropped_control_reason_failed", exc_info=True)
         state = None
     out = []
@@ -271,320 +229,53 @@ def build_treatment_input(sess: Session, session_row: dict, scenario_row: dict,
     `warnings` (TSG bookkeeping, merged into ValidationJSON at finish) and `register` (the
     echo fields — risk_owner is a person's name the model must never see; the date is banned
     from generation anyway). `impacted_business_division` additionally rides the
-    prompt-visible risk_assessment block as org context."""
-    warnings: list[str] = []
+    prompt-visible risk_assessment block as org context.
 
-    asset_context = _loads(session_row.get("AssetContextJSON"), {})
-    subsystems = _loads(session_row.get("SubsystemsJSON"), [])
+    THIS FUNCTION IS THE ORCHESTRATOR and owns exactly two things no extracted piece can: the
+    snapshot's KEY ORDER and the WARNING ORDER. Both are data — the snapshot is persisted, re-read
+    by regenerate and served verbatim by the evidence endpoint — so the sequence below is a
+    contract, not a style choice. Every block builder lives in treatment_input.py, where each rule
+    unit-tests without a Session.
+    """
+    warnings: list[str] = []
     # Every context field the session froze is sent (SDD §7.2's sector/sub_sector/
     # cii_asset_description included) — build_base_context applies no field-name gate, only
     # redaction and the no-value scrub, so a field is absent here exactly when it was empty
     # or a placeholder in the snapshot.
-    base = prompts.build_base_context(
-        session_row.get("AssetName") or "", asset_context, subsystems)
-
-    # Threat block — both hops to Identified_Threat are OUTER joins, so a broken linkage
-    # nulls the columns; an explicit null + warning beats a silently empty block.
-    # Actors come through the ONE shared reader (the stored blob is a dict, not a list), and
-    # deliberately through the RAW one: this plan treats a scenario the model ALREADY wrote from
-    # that same raw list (dal.active_threats feeds scenario_prompt stored_actors), so a
-    # validated_actors gate would hand the treatment [] for every unverified threat and plan
-    # against adversaries the scenario it is treating names out loud.
-    threat_fields: dict[str, Any] = {
-        "category": redact(scenario_row.get("ThreatCategory")),
-        "type": redact(scenario_row.get("LibraryThreatType") or scenario_row.get("ThreatType")),
-        "name": redact(scenario_row.get("LibraryThreatName") or scenario_row.get("ThreatName")),
-        "actors": [redact(a) for a in grounding.stored_actors(scenario_row.get("ThreatActorsJSON")) if a],
-    }
-    threat: dict[str, Any] | None = threat_fields
-    if not threat_fields["type"] and not threat_fields["name"]:
-        threat = None
-        warnings.append("threat join returned no rows — plan generated without threat identity")
-
-    scenario_json = _loads(scenario_row.get("ScenarioJSON"), {})
-    # scenario_suggested is GONE from the snapshot: the LLM no longer proposes controls
-    # (library-first redesign), so library_mapped is the whole TSG-derived control input.
-    # Legacy snapshots still carrying the key are inert — nothing reads it back.
-
-    # Degrade-to-empty, same rationale as sessions._controls_by_output: a DB where
-    # Control_library.sql hasn't run yet must not 500 the POST. The two warnings are
-    # deliberately DISTINCT — a hard lookup failure must never masquerade as an empty map.
-    lookup_failed = False
-    try:
-        library_mapped = _library_controls(sess, scenario_row["ScenarioID"])
-    except Exception:
-        sess.rollback()  # no uncommitted writes exist at this point in the POST
-        log.warning("treatment.library_controls_read_failed", exc_info=True)
-        library_mapped, lookup_failed = [], True
-        warnings.append("library control lookup failed — plan generated without mapped controls")
-    if not library_mapped and not lookup_failed:
-        warnings.append("no library-mapped controls for this scenario (Step-4 map is empty)")
+    base = prompts.build_base_context(session_row.get("AssetName") or "",
+                                    _loads(session_row.get("AssetContextJSON"), {}),
+                                    _loads(session_row.get("SubsystemsJSON"), []))
+    threat, threat_warnings = treatment_input.build_threat_block(scenario_row)
+    warnings += threat_warnings
+    library_mapped, control_warnings, lookup_failed = (
+        treatment_input.read_library_controls_for_snapshot(sess, scenario_row))
+    warnings += control_warnings
     # Regenerate only (`previous_controls` is the replaced version's list): name every control that
     # version carried and this one does not. The empty-map warning above only covers "all of them";
     # a PARTIAL drop used to be silent, so a reviewer comparing versions saw a control vanish with
-    # no reason given.
+    # no reason given. Gated on `lookup_failed`: against a map that could not be read, EVERY
+    # previous control looks dropped, which is not what happened.
     if previous_controls and not lookup_failed:
-        warnings.extend(_dropped_control_warnings(sess, previous_controls, library_mapped))
-
-    # Register-consistency advisories — flag, never block: the register owns its numbers, but
-    # a contradiction the model will cite verbatim (rule 6) must reach the reviewer's warnings.
-    # Normalized ONCE here and reused for the snapshot below — see _dec. Comparing at _fr's OWN
-    # scale (quantize) rather than exactly: two 4-dp scores multiply to up to 8 dp, which the
-    # register cannot express, so an exact != would flag every correctly-rounded decimal plan.
-    # MAX_PREC: multiply and quantize are exact operations, so in this context the product is never
-    # rounded and quantize can never overflow — whatever size the schema allows. (The default
-    # 28-digit context rounded two 11-digit scores' 30-digit product before comparing.)
-    _lr, _ir, _fr = (_dec(risk_input.get("likelihood_rating")),
-                    _dec(risk_input.get("impact_rating")),
-                    _dec(risk_input.get("final_risk_rating")))
-    if None not in (_lr, _ir, _fr):
-        with localcontext(prec=MAX_PREC):
-            _product = _lr * _ir
-            _mismatch = _fr != _product.quantize(_fr, rounding=ROUND_HALF_UP)
-        if _mismatch:
-            warnings.append(f"final_risk_rating {_fr} does not equal likelihood x impact "
-                            f"({_lr}x{_ir}={_product}); register values taken as-is")
-    if (_lr, _ir, _fr) == (None, None, None) and risk_input.get("risk_level") is None:
-        warnings.append("risk_assessment carries no register scores (legacy snapshot) — "
-                        "the plan is NOT risk-calibrated")
-    _window = _assessment_window(risk_input)
-    _wend = _as_date((_window or {}).get("timeline_end_date"))
-    if _wend is not None and _wend < dal.now().date():
-        warnings.append(f"mitigation window ended {_wend.isoformat()} — already in the past "
-                        "at plan creation")
-
-    date = risk_input.get("risk_identification_date")
-    snap: dict[str, Any] = {
+        warnings += _dropped_control_warnings(sess, previous_controls, library_mapped)
+    window = _assessment_window(risk_input)
+    warnings += treatment_input.collect_register_consistency_warnings(risk_input, window)
+    return {
         **base,
         "threat": threat,
-        "scenario": {
-            "scenario_title": redact(scenario_json.get("scenario_title")),
-            "scenario_statement": redact(scenario_json.get("scenario_statement")),
-            "risk_statement": redact(scenario_json.get("risk_statement")),
-            # The scenario's OWN involved systems. Without these the model must judge
-            # applicable_to_all_subsystems against `supporting_systems` — the session's whole
-            # raw scope — and so is asked to cover systems this scenario already ruled out.
-            # Empty for pre-rename scenarios and for sessions with no supporting systems; the
-            # prompt names that fallback explicitly, so no warning is warranted. A system absent
-            # here is out of scope for this scenario — there is no separate "applicable: false"
-            # entry any more (tasks.py::_ground_entry_points only ever records involvement).
-            "supporting_systems_involved": [
-                {"supporting_system": redact((a or {}).get("supporting_system")),
-                "is_entry_point": bool((a or {}).get("is_entry_point")),
-                "justification": redact((a or {}).get("justification"))}
-                for a in scenario_json.get("supporting_systems_involved") or []
-                if isinstance(a, dict)],
-        },
-        "existing_controls": {
-            "library_mapped": library_mapped,
-            "library_mapped_count": len(library_mapped),
-            # The register's controls, verbatim from the request (the gap-analysis baseline).
-            # Blank-stripped AND deduped HERE, not only in the schema validator: the regenerate
-            # path rebuilds risk_input from the stored snapshot and never re-enters the schema,
-            # so a legacy snapshot's blanks/dupes would otherwise re-enter the baseline forever.
-            "register_controls": list(dict.fromkeys(
-                _clip(c) for c in risk_input.get("existing_controls") or []
-                if (c or "").strip())),
-            "applied_to_all_subsystems": risk_input.get("existing_controls_all_subsystems"),
-            # A justification whose Yes/No answer is absent justifies nothing — dropped rather
-            # than handed to the model as an orphan (the schema does not pair-validate the two).
-            "applied_to_all_subsystems_justification":
-                _clip(risk_input.get("existing_controls_all_subsystems_justification"))
-                if risk_input.get("existing_controls_all_subsystems") is not None else None,
-        },
-        "risk_assessment": {
-            # _num, not the raw value: regenerate rebuilds risk_input from this very blob and
-            # never re-enters the schema, so storing whatever shape arrived would let a bad one
-            # re-enter the baseline on every later regeneration. Normalizing on the way OUT too
-            # heals it instead, and is idempotent, so the stored bytes survive the round trip.
-            "likelihood_rating": _num(_lr),
-            "impact_rating": _num(_ir),
-            "final_risk_rating": _num(_fr),
-            "risk_level": risk_input.get("risk_level"),
-            "impacted_business_division": redact(risk_input.get("impacted_business_division")),
-            # The window the ENTIRE assessment must complete within (request pair, validated
-            # both-or-neither). PROMPT-VISIBLE on purpose: the model must schedule inside it;
-            # _validate_plan then cross-checks the answer against total_days.
-            "assessment_window": _window,
-        },
+        "scenario": treatment_input.build_scenario_block(
+            _loads(scenario_row.get("ScenarioJSON"), {})),
+        "existing_controls": treatment_input.build_existing_controls_block(
+            risk_input, library_mapped),
+        "risk_assessment": treatment_input.build_risk_assessment_block(risk_input, window),
         "treatment_strategy": str(TreatmentStrategy.mitigate),
-        # Echo-only block — stripped from the prompt, injected into PlanJSON at finish.
-        "register": {
-            "risk_identification_date": date.isoformat() if isinstance(date, datetime) else date,
-            "risk_owner": redact(risk_input.get("risk_owner")),
-            "impacted_business_division": redact(risk_input.get("impacted_business_division")),
-        },
+        "register": treatment_input.build_register_echo_block(risk_input),
         "warnings": warnings,
     }
-    return snap
 
 
 # ---------------------------------------------------------------------------
 # Output validation + server-owned keys (worker)
 # ---------------------------------------------------------------------------
-def _as_date(v: Any):
-    """A `date` from a date, a datetime, or an ISO string — None if it is none of those.
-
-    The request path hands ISO STRINGS here: api/treatment.py dumps the body with
-    mode="json", which serializes pydantic's `date` fields to "YYYY-MM-DD". The old code only
-    handled real date objects, so on the ONLY path that actually runs it computed no day count at
-    all (see _assessment_window). Normalizing every accepted shape HERE — rather than changing the
-    one caller's dump mode — is what stops a future caller reintroducing it by choosing a
-    different mode. datetime.fromisoformat (not date.fromisoformat) so a full ISO timestamp
-    parses too, and so no module-level `date` import shadows build_treatment_input's own local.
-    """
-    if isinstance(v, datetime):
-        return v.date()
-    if hasattr(v, "toordinal"):   # a real date; datetime is already handled above
-        return v
-    if isinstance(v, str):
-        try:
-            return datetime.fromisoformat(v).date()
-        except ValueError:
-            return None
-    return None
-
-
-def _dec(v: Any) -> Decimal | None:
-    """A Decimal from an int, float, Decimal or numeric string — None if it is none of those.
-
-    The numeric twin of _as_date above, and for the same reason: api/treatment.py dumps the body
-    with mode="json", which serializes pydantic's Decimal fields to STRINGS, while regenerate feeds
-    back whatever JSON the snapshot holds (int on legacy rows, float on newer ones). Normalizing
-    every accepted shape HERE — rather than making one producer emit a tidier type — is what stops
-    a future caller reintroducing the bug by choosing a different dump mode.
-
-    str() FIRST: Decimal(3.3) is 3.2999999999999998…, Decimal('3.3') is exactly 3.3. Returning None
-    on a malformed legacy blob is deliberate — it folds into build_treatment_input's existing
-    "no scores" guard instead of adding a branch, and instead of raising inside a POST.
-    """
-    try:
-        d = Decimal(str(v))
-        if not d.is_finite():
-            return None
-        # Canonical scale, taken from the VALUE and never from how the caller spelled it. pydantic
-        # keeps a string Decimal's exponent, so "0E+5", "1E+1" and "20.00" all reach here as
-        # written, and the consistency check below compares at _fr's OWN scale: "1E+1" silently
-        # hid a 10.56 mismatch that "10" reports, and "0E+1000000" made quantize() raise (a 500).
-        # Integral values get scale 0; the rest drop trailing zeros. quantize(1) on an integral
-        # value, NOT normalize() - normalize turns 20 into 2E+1, which would compare to the
-        # nearest ten. A corrupt huge exponent overflows here and becomes None, like any junk.
-        return d.quantize(Decimal(1)) if d == d.to_integral_value() else d.normalize()
-    except (InvalidOperation, ValueError, TypeError):
-        return None
-
-
-def _num(d: Decimal | None) -> int | float | None:
-    """A Decimal back to a JSON-native number for the snapshot — int when integral.
-
-    The int branch is not tidiness: prompts.treatment_prompt rule 6 orders the model to cite
-    final_risk_rating VERBATIM, so storing 20.0 where every previous row stored 20 would silently
-    reword every plan an all-integer register generates.
-
-    float is exact ONLY because the schema caps a rating at 15 significant digits (a float's exact
-    limit — see schemas_treatment._RATING); raise that cap and this silently stores other numbers.
-    """
-    if d is None:
-        return None
-    return int(d) if d == d.to_integral_value() else float(d)
-
-
-def _assessment_window(risk_input: dict[str, Any]) -> dict[str, Any] | None:
-    """{timeline_start_date, timeline_end_date, total_days} from the request pair, or None.
-    total_days is computed server-side so the model reasons over one unambiguous number and
-    the post-generation check compares against the same one.
-
-    STORED KEY NAMES STAY timeline_* while the REQUEST fields are mitigation_*, deliberately: the
-    snapshot is a persisted record format — read back by regenerate and served verbatim by the
-    evidence endpoint — so renaming the request contract must not rewrite the shape of every row
-    already in the table. regen_risk_input_from_snapshot translates between the two.
-    """
-    raw_start = risk_input.get("mitigation_start_date")
-    raw_end = risk_input.get("mitigation_end_date")
-    if not raw_start or not raw_end:   # both-or-neither is enforced by the request model
-        return None
-    start, end = _as_date(raw_start), _as_date(raw_end)
-    if start is None or end is None:
-        # Both values were supplied but at least one will not parse — a corrupted snapshot, or a
-        # caller passing a shape _as_date does not know. Say so out loud: returning a silent None
-        # is precisely what hid the original bug, and it disables _window_violations for the whole
-        # plan rather than for one field.
-        log.warning("treatment.assessment_window_unparseable",
-                    start=repr(raw_start), end=repr(raw_end))
-        return None
-    return {"timeline_start_date": start.isoformat(), "timeline_end_date": end.isoformat(),
-            "total_days": (end - start).days}
-
-
-_DURATION_DAYS = re.compile(r"(?<![\d.])(\d+)[\s-]*(day|week|month)", re.IGNORECASE)
-_DURATION_UNIT_DAYS = {"day": 1, "week": 7, "month": 30}
-
-
-def _window_violations(parsed: dict[str, Any], window: dict[str, Any] | None) -> list[str]:
-    """Advisory check that the plan fits the assessment window (Part 3 of the register spec):
-    the overall mitigation_timeline and each action's timeline must be a DATE inside
-    [timeline_start_date, timeline_end_date]. Flags, never blocks, same posture as the
-    vocabulary clamps: the reviewer sees exactly which line falls outside and by which end.
-
-    WHY DATES, and why this check could not work before. Timelines used to be relative
-    durations measured from "the plan's start (day 0)" — an origin the prompt never defined.
-    A duration has no POSITION on a calendar, so the only comparison available was its LENGTH
-    against the window's length: a 60-day plan passed a 91-day window even when 61 of those
-    days had already elapsed and only 30 remained. That was a property of the representation,
-    not a bug in the comparison, so the fix was to change what the model emits. A date is
-    either inside the window or outside it, and there is no origin left to get wrong.
-
-    The bounds are the REGISTER'S OWN dates and nothing else — deliberately not "today".
-    The window is chosen by the risk owner, so a plan schedules inside it even when part of it
-    has already passed; a window opened in the past is a register-data question for a human,
-    never something to silently re-date around.
-
-    LEGACY: plans written before this carry "within 60 days" and are read back by the evidence
-    endpoint and by regenerate. A date-only parser would report every one of them as
-    unparsable, so a relative duration still falls through to the old total_days comparison.
-    """
-    if not window:
-        return []
-    start = _as_date(window.get("timeline_start_date"))
-    end = _as_date(window.get("timeline_end_date"))
-    # `is None`, not falsy: a same-day window is legal (end == start) and yields total_days=0 —
-    # the TIGHTEST budget there is, and exactly the one a falsy guard would switch off.
-    budget = window.get("total_days")
-    budget = int(budget) if budget is not None else None
-    if start is None and end is None and budget is None:
-        return []
-
-    def worst_days(text: str | None) -> int | None:
-        hits = [_DURATION_UNIT_DAYS[u.lower()] * int(n)
-                for n, u in _DURATION_DAYS.findall(str(text or ""))]
-        return max(hits) if hits else None
-
-    def check(label: str, value: Any) -> list[str]:
-        when = _as_date(value)
-        if when is not None:
-            if end is not None and when > end:
-                return [f"{label} ({value!r}) falls AFTER the assessment window closes "
-                        f"({end.isoformat()})"]
-            if start is not None and when < start:
-                return [f"{label} ({value!r}) falls BEFORE the assessment window opens "
-                        f"({start.isoformat()})"]
-            return []
-        # Not a date — a pre-dates-contract plan, or prose. Fall back to the old length check.
-        days = worst_days(value)
-        if days is None:
-            return [f"{label} ({value!r}) is not a date and carries no parsable duration — "
-                    "compliance with the assessment window could not be checked"]
-        if budget is not None and days > budget:
-            return [f"{label} ({value!r}) exceeds the assessment window of {budget} days"]
-        return []
-
-    out: list[str] = check("mitigation_timeline", parsed.get("mitigation_timeline"))
-    for i, act in enumerate(parsed.get("remediation_action_plan") or []):
-        if isinstance(act, dict):
-            out += check(f"remediation_action_plan[{i}].timeline", act.get("timeline"))
-    return out
-
-
 def _coverage_vs_library_warnings(parsed: dict[str, Any],
                                 snapshot: dict[str, Any]) -> list[str]:
     """Advisory: a 'covered' verdict with NO library-mapped controls is vacuously true — there
@@ -596,6 +287,41 @@ def _coverage_vs_library_warnings(parsed: dict[str, Any],
         return ["control_coverage says 'covered' but the scenario has no library-mapped "
                 "controls — there was nothing to cover; the verdict is unverifiable"]
     return []
+
+
+def _register_covered_warnings(parsed: dict[str, Any], snapshot: dict[str, Any]) -> list[str]:
+    """DROP every recommended control the register already holds, and say so; plus one advisory
+    when every mapped control is covered by the register yet the verdict is 'gaps'.
+
+    The snapshot flags a library_mapped row `covered_by_register` when a register entry RESOLVED to
+    the same Control_Library row (treatment_input.build_existing_controls_block) — a fact settled in
+    code before the prompt was built, so a model that still recommends it is not judging the
+    register, it is contradicting it. The drop is by the stamped `control_library_id`, which is why
+    this runs AFTER _resolve_control_library_ids and BEFORE the schedule reads the controls table:
+    a control removed here must not be counted as "recommended but not implemented" there.
+
+    The second check is advisory only (flag, never override, like every other check here): the
+    register's free-text entries are still the model's to judge, so 'gaps' can be right — but a
+    reviewer must see that every code-level match was already covered."""
+    mapped = (snapshot.get("existing_controls") or {}).get("library_mapped") or []
+    covered = {c.get("control_library_id") for c in mapped
+               if isinstance(c, dict) and c.get("covered_by_register")}
+    cti = parsed.get("controls_to_be_implemented") or {}
+    warnings: list[str] = []
+    kept: list[dict] = []
+    for ctl in cti.get("controls") or []:
+        if isinstance(ctl, dict) and ctl.get("control_library_id") in covered:
+            warnings.append(f"recommended control {ctl.get('control_code')!r} is already in the "
+                            "register (matched by library id) and was removed from the plan")
+        else:
+            kept.append(ctl)
+    cti["controls"] = kept
+    if (mapped and all(isinstance(c, dict) and c.get("covered_by_register") for c in mapped)
+            and cti.get("control_coverage") == str(ControlCoverage.gaps)):
+        warnings.append("every library-mapped control is already in the register (matched by "
+                        "library id) but control_coverage says 'gaps' — only the free-text "
+                        "register entries could justify that verdict")
+    return warnings
 
 
 def _risk_alignment_warnings(parsed: dict[str, Any],
@@ -889,13 +615,16 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
         # whose only urgent control was dropped must WARN, not pass on the ghost of that row.
         # (_validate_plan's structural raises are unaffected: injection never removes a table.)
         parsed, dropped_codes = _inject_reserved(parsed, snapshot)
+        # Same rule, one step later: a control the REGISTER already holds (matched by the id just
+        # stamped) leaves the plan before the schedule counts recommendations.
+        register_warnings = _register_covered_warnings(parsed, snapshot)
         warnings = (list(snapshot.get("warnings") or []) + _validate_plan(parsed)
-                    + _window_violations(parsed,
-                                        (snapshot.get("risk_assessment") or {}).get("assessment_window"))
+                    + schedule_remediation_actions(parsed, snapshot)
                     + _risk_alignment_warnings(parsed, snapshot.get("risk_assessment"))
                     + _coverage_vs_library_warnings(parsed, snapshot)
                     + [f"recommended control {c!r} matched no library control and was removed "
-                    "from the plan" for c in dropped_codes])
+                    "from the plan" for c in dropped_codes]
+                    + register_warnings)
         moderation = llm_mod.moderate(_narrative_text(parsed))  # free function, NOT a client method
         validation_json = json.dumps({
             "warnings": warnings,
@@ -1070,6 +799,33 @@ if __name__ == "__main__":  # self-check: pure logic only, no DB, no LLM (SDD §
     # Drift pin: _inject_reserved must set EVERY reserved key — add a key to the tuple without
     # teaching the injector about it and this fails, so the overwrite guarantee can't erode.
     assert set(_RESERVED_PLAN_KEYS) <= set(injected.keys())
+
+    # The register match: a resolved register reference stays an object and flags the mapped row;
+    # the worker then drops the model's recommendation of it (by id) and reports the drop, and says
+    # so when every mapped control was covered yet the verdict is still 'gaps'.
+    _block = treatment_input.build_existing_controls_block(
+        {"existing_controls": [{"control_id": 28, "control_code": "CII-CID-028",
+                                "control_name": "MFA", "domain": "IAM", "control_description": "d"},
+                               "yearly phishing drill", " ", "yearly phishing drill"]},
+        [{"control_library_id": 28, "control_code": "CII-CID-028"},
+         {"control_library_id": 29, "control_code": "CII-CID-029"}])
+    assert _block["register_controls"] == [
+        {"control_id": 28, "control_code": "CII-CID-028", "control_name": "MFA", "domain": "IAM",
+         "control_description": "d"}, "yearly phishing drill"]
+    assert [c["covered_by_register"] for c in _block["library_mapped"]] == [True, False]
+    assert _block["register_matched_count"] == 1
+    assert "control_id" not in prompts.treatment_prompt({"existing_controls": _block})[1]["content"]
+    _plan = {"controls_to_be_implemented": {"control_coverage": "gaps", "controls": [
+        {"control_code": "CII-CID-028"}, {"control_code": "CII-CID-029"}]}}
+    _plan, _ = _inject_reserved(_plan, {"existing_controls": _block})
+    assert _register_covered_warnings(_plan, {"existing_controls": _block}) == [
+        "recommended control 'CII-CID-028' is already in the register (matched by library id) "
+        "and was removed from the plan"]
+    assert [c["control_code"] for c in _plan["controls_to_be_implemented"]["controls"]] == ["CII-CID-029"]
+    _all = {"library_mapped": [{"control_library_id": 28, "covered_by_register": True}]}
+    assert len(_register_covered_warnings(
+        {"controls_to_be_implemented": {"control_coverage": "gaps", "controls": []}},
+        {"existing_controls": _all})) == 1
 
     # treatment_prompt: house shape — 2 messages, closing format directive, framed context;
     # the prompt-hidden blocks must NOT reach the model.

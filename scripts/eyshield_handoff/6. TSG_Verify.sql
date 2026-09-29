@@ -26,8 +26,23 @@ CREATE TABLE #tsg_verify (
 );
 
 -- ---------------------------------------------------------------------------
--- 1. ALL 23 TSG TABLES EXIST
+-- 1. ALL 22 TSG TABLES EXIST
 -- ---------------------------------------------------------------------------
+-- This list is the TABLES app/db/models.py MAPS, not the tables any one script
+-- happens to create, and tests/test_schema_sync.py::
+-- test_verify_script_table_list_matches_create_inventory asserts all three agree
+-- (this list, the handoff CREATE inventory, and the object model).
+--
+-- It used to be pinned to "1. TSG_Core.sql"'s CREATEs alone, which made it a check
+-- between two files that could both be wrong -- and they were. Scenario_Library was
+-- removed from the product in August 2026; TSG_Core.sql kept creating it and this
+-- list kept requiring it, so the two agreed and the guard passed, while a database
+-- built by tsg_remediation_tables.sql or by the generated scripts/tsg_script/
+-- package failed sign-off HERE with a blocking "Table missing: Scenario_Library"
+-- on a perfectly correct schema. The remedy shipped for that was a paragraph
+-- telling the operator to read past one blocking failure from this script -- which
+-- is how a real one gets read past. Anchoring on the object model is what makes an
+-- unmapped table unable to enter either list in the first place.
 DECLARE @tsg_tables TABLE (TableName sysname);
 INSERT INTO @tsg_tables (TableName) VALUES
     (N'API_Client'),
@@ -41,7 +56,6 @@ INSERT INTO @tsg_tables (TableName) VALUES
     (N'Prompt_Log'),
     (N'Risk_Treatment_Plan'),
     (N'Scenario_Audit'),
-    (N'Scenario_Library'),
     (N'Scenario_Session'),
     (N'Scoped_Threat'),
     (N'Subsystem_Stage_State'),
@@ -62,7 +76,7 @@ FROM @tsg_tables t
 WHERE NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES i WHERE i.TABLE_NAME = t.TableName);
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Tables', 'PASS', N'All 23 TSG tables present', N'Nothing missing.'
+SELECT 'Tables', 'PASS', N'All 22 TSG tables present', N'Nothing missing.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Tables');
 
 -- ---------------------------------------------------------------------------
@@ -169,9 +183,21 @@ FROM (VALUES (N'ThreatCategoryID'), (N'GroundingThresholdOrigin'),
 WHERE OBJECT_ID(N'dbo.Identified_Threat') IS NOT NULL
   AND COL_LENGTH(N'dbo.Identified_Threat', x.C) IS NULL;
 
+-- Same shape, different table. ControlMapTh is the MEASURED control-mapping cutoff; it is a
+-- late ALTER for the same reason -- UAT and Prod already have Grounding_Calibration_Run, so the
+-- guarded CREATE skips them and only the ALTER can reach them. Also boot-asserted, because the
+-- application maps it.
+INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
+SELECT 'Columns', 'FAIL', N'Column missing: Grounding_Calibration_Run.ControlMapTh',
+       N'Stores the measured control-mapping relevance cutoff for a model pair, read at run time. '
+     + N'Added by an ALTER in TSG_Core.sql, and asserted by the application at startup -- the app '
+     + N'will refuse to boot without it. Re-run TSG_Core.sql; it is guarded and idempotent.'
+WHERE OBJECT_ID(N'dbo.Grounding_Calibration_Run') IS NOT NULL
+  AND COL_LENGTH(N'dbo.Grounding_Calibration_Run', N'ControlMapTh') IS NULL;
+
 
 INSERT INTO #tsg_verify (Category, Status, Check_, Detail)
-SELECT 'Columns', 'PASS', N'Late-ALTER columns present (Threat_Type.Source, Threat_Catalogue.Source, Identified_Threat.ThreatCategoryID/GroundingThresholdOrigin/ThreatCatalogueID/IsThreatAIGenerated/IsThreatTypeAIGenerated)',
+SELECT 'Columns', 'PASS', N'Late-ALTER columns present (Threat_Type.Source, Threat_Catalogue.Source, Identified_Threat.ThreatCategoryID/GroundingThresholdOrigin/ThreatCatalogueID/IsThreatAIGenerated/IsThreatTypeAIGenerated, Grounding_Calibration_Run.ControlMapTh)',
        N'Confirms Threat_library.sql ran to completion.'
 WHERE NOT EXISTS (SELECT 1 FROM #tsg_verify WHERE Category = 'Columns');
 

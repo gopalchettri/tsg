@@ -33,7 +33,13 @@
     change it.
 
 .PARAMETER Reload
-    Start uvicorn with --reload. Passed through to start.ps1.
+    Start uvicorn with --reload. Passed through to start.ps1. OFF by default: the reloader does
+    not survive its first restart on this machine (it exits and leaves nothing on the port) --
+    see start.ps1's -Reload help for the measurement.
+
+.PARAMETER NoReload
+    Turn -Reload back off. Passed through to start.ps1; with reload already off by default it
+    only matters as an override.
 
 .PARAMETER NoFlower
     Skip the Flower dashboard window. Passed through to start.ps1, where Flower starts by default.
@@ -57,6 +63,7 @@ param(
     [int]$Port = 8000,
     [int]$Concurrency = 10,
     [switch]$Reload,
+    [switch]$NoReload,
     [switch]$NoFlower,
     [int]$FlowerPort = 5555
 )
@@ -106,5 +113,9 @@ if ($Check.IsPresent) {
 }
 
 Write-Host ""
-& (Join-Path $PSScriptRoot 'start.ps1') -SkipDocker -Port $Port -Concurrency $Concurrency -Reload:$Reload `
-    -NoFlower:$NoFlower -FlowerPort $FlowerPort
+# -NoReload is forwarded too, or this wrapper could never turn reload off. `-Reload:$Reload` binds
+# the switch EXPLICITLY (to $false on a plain .\run.ps1), which is why start.ps1 does not express
+# the default as `[switch]$Reload = $true` -- that would be silently cancelled right here. It reads
+# the env file instead, so a plain .\run.ps1 reloads and .\run.ps1 -NoReload does not.
+& (Join-Path $PSScriptRoot 'start.ps1') -SkipDocker -Port $Port -Concurrency $Concurrency `
+    -Reload:$Reload -NoReload:$NoReload -NoFlower:$NoFlower -FlowerPort $FlowerPort

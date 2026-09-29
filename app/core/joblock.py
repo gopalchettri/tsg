@@ -26,6 +26,11 @@ import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 
+# Any, not object, for the injected factory: the module deliberately never imports redis's client
+# type (that would invert the layering this file exists to avoid — see is_held's docstring), and
+# `object` made every `.exists()`/`Lock(...)` call on the result an attr-defined error.
+from typing import Any
+
 from redis.exceptions import LockNotOwnedError
 from redis.lock import Lock
 
@@ -34,17 +39,26 @@ from app.core.logging import get_logger
 log = get_logger(__name__)
 
 
-def _renew_loop(lock: Lock, interval: float, stop_event: threading.Event, key: str) -> None:
-    while not stop_event.wait(interval):
+def _renew_loop(lock: Lock, ttl: int, stop_event: threading.Event, key: str) -> None:
+    """Hold the lock open while the job runs, renewing to the FULL ttl each pass.
+
+    Takes the `int` ttl the caller already has, rather than re-reading `lock.timeout`, which
+    redis-py types `float | None`. That round trip was the fragile part: `job_lock` is called as
+    `ttl=self.time_limit` (celery_app.py:889), and `Task.time_limit` is an int ONLY because of a
+    literal on the task decorator — Celery defaults it to None and the global `task_time_limit`
+    does not populate it. Remove that literal and `Lock(timeout=None)` has no expiry at all,
+    `ttl / 3` raises BEFORE the `try:` so `finally` never releases, and the key is held forever:
+    that feed's every later refresh then returns 0 with no error anywhere."""
+    while not stop_event.wait(ttl / 3):
         try:
-            lock.extend(lock.timeout, replace_ttl=True)  # reset to the full TTL, not additive
+            lock.extend(ttl, replace_ttl=True)  # reset to the full TTL, not additive
         except LockNotOwnedError:  # a stale timeout already let a different caller acquire
             pass
         except Exception:
             log.warning("joblock.renewal_failed", key=key, exc_info=True)
 
 
-def is_held(key: str, *, redis_factory: Callable[[], object]) -> bool:
+def is_held(key: str, *, redis_factory: Callable[[], Any]) -> bool:
     """Best-effort probe: is this lock currently held?
 
     ADVISORY ONLY, and every caller must treat it that way. It cannot be atomic with a later
@@ -60,7 +74,7 @@ def is_held(key: str, *, redis_factory: Callable[[], object]) -> bool:
 
 
 @contextmanager
-def job_lock(key: str, *, ttl: int, busy: Exception, redis_factory: Callable[[], object]):
+def job_lock(key: str, *, ttl: int, busy: Exception, redis_factory: Callable[[], Any]):
     """Hold `key` for the duration of the block, or raise `busy` if someone else holds it.
 
     `ttl` must be an int -- redis-py rejects a float for ex=/EXPIRE.
@@ -76,7 +90,7 @@ def job_lock(key: str, *, ttl: int, busy: Exception, redis_factory: Callable[[],
         raise busy
     stop_event = threading.Event()
     # plain threading.Thread, not gevent.spawn -- same portability reasoning as llm.py's _llm_slot
-    hb = threading.Thread(target=_renew_loop, args=(lock, ttl / 3, stop_event, key), daemon=True)
+    hb = threading.Thread(target=_renew_loop, args=(lock, ttl, stop_event, key), daemon=True)
     hb.start()
     try:
         yield

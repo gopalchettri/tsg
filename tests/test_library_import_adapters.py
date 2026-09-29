@@ -1,13 +1,21 @@
 """Adapter + shape-check behaviour for the open-source library import.
 
-No network, no DB: every case feeds a synthetic payload shaped like the real source. The rule
-these all encode is the one every adapter shares -- an unmappable input is SKIPPED and reported,
+No network. Every adapter case feeds a synthetic payload shaped like the real source. The rule
+they all encode is the one every adapter shares -- an unmappable input is SKIPPED and reported,
 never guessed into a category.
+
+The last case extends that same rule past the adapters and into the WRITE: a record whose name
+another type already holds is unmappable too, and must be skipped and reported rather than folded
+into that other type's row. It is the one case here that needs a real database, because the
+collision is raised by an INDEX -- UX_ThreatCatalogue_NaturalKey, on ThreatName ALONE.
 """
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import create_engine, event, func, select
+from sqlalchemy.orm import sessionmaker
 
+from app.db import models as m
 from app.intel.library_import import (
     ThreatLibraryImportError,
     adapt_atlas,
@@ -16,6 +24,7 @@ from app.intel.library_import import (
     adapt_pytm,
     check_source_shape,
     group_by_type,
+    import_records,
     modal_category,
 )
 
@@ -119,3 +128,88 @@ def test_group_by_type_keeps_every_record():
             {"type_name": "A", "categories": []}]
     grouped = group_by_type(recs)
     assert set(grouped) == {"A", "B"} and len(grouped["A"]) == 2
+
+
+# ------------------------------------------------ a name another type already holds
+# Ids the fixture seeds. OTHER_TYPE is the type the colliding name is already filed under;
+# the import arrives claiming the same name for a type of its own.
+OTHER_TYPE, TAKEN_CAT, TAMPERING = 10, 100, 2
+TAKEN_NAME = "INP01 Buffer overflow via env var"
+
+
+@pytest.fixture
+def sess():
+    engine = create_engine("sqlite://")
+
+    # pysqlite workaround (as in tests/test_promote_scenario_library.py): without it the RELEASE
+    # SAVEPOINT that dal.upsert_threat_catalogue emits silently COMMITS the open transaction, so
+    # a mint this test expects to be rolled back would survive and the assertions below would be
+    # measuring the wrong database.
+    @event.listens_for(engine, "connect")
+    def _no_implicit_txn(dbapi_connection, connection_record):
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(engine, "begin")
+    def _explicit_begin(conn):
+        conn.exec_driver_sql("BEGIN")
+
+    for t in (m.Threat_Category, m.Threat_Type, m.Threat_Catalogue,
+              m.Threat_Catalogue_Category_Map):
+        t.__table__.create(engine, checkfirst=True)
+    with engine.begin() as conn:
+        # The LIVE backstop, as raw DDL so no Index object pollutes the shared table metadata for
+        # other test files. It is not decoration: the whole conflict this test pins is an
+        # IntegrityError against THIS index, so a schema without it would report a clean import
+        # and the test would pass for the wrong reason. (SQLite ignores the production index's
+        # filtered WHERE, which only widens it here.)
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX UX_ThreatCatalogue_NaturalKey ON Threat_Catalogue(ThreatName)")
+
+    s = sessionmaker(bind=engine)()
+    s.add(m.Threat_Category(ThreatCategoryID=TAMPERING, ThreatCategoryName="Tampering",
+                            IsActive=True, IsDeleted=False))
+    s.add(m.Threat_Type(ThreatTypeID=OTHER_TYPE, ThreatTypeName="Embedded Device - Hardware",
+                        ThreatCategoryID=TAMPERING, IsActive=True, IsDeleted=False))
+    s.add(m.Threat_Catalogue(ThreatCatalogueID=TAKEN_CAT, ThreatTypeID=OTHER_TYPE,
+                             ThreatName=TAKEN_NAME, IsActive=True, IsDeleted=False,
+                             Source="mitre_emb3d"))
+    s.commit()
+    return s
+
+
+def _links(sess, catalogue_id: int) -> int:
+    mp = m.Threat_Catalogue_Category_Map
+    return sess.execute(select(func.count()).select_from(mp)
+                        .where(mp.ThreatCatalogueID == catalogue_id)).scalar()
+
+
+def test_a_name_another_type_already_holds_is_skipped_not_quietly_re_filed(sess):
+    """An import must never re-curate a row it does not own.
+
+    The library's names are unique ACROSS types, so when two standards spell one threat the same
+    way there is a single row and it belongs to whichever type got there first. The tempting
+    recovery -- hand the caller that existing row -- writes this import's STRIDE categories onto
+    another type's threat, so a pytm run silently re-classifies an EMB3D row and the mapping back
+    to the source standard rots with no trace in the job result. Skipping costs one record and is
+    reported; re-filing corrupts curated data and is not.
+
+    The rest of the import must still land: one bad record is not a failed import.
+    """
+    result = import_records(sess, [
+        {"type_name": "Input Manipulation", "threat_name": TAKEN_NAME,
+         "categories": ["Tampering"]},
+        {"type_name": "Input Manipulation", "threat_name": "INP07 Unchecked length field",
+         "categories": ["Tampering"]},
+    ], tag="pytm", created_by="auto:pytm", is_active=True)
+
+    assert [r["item"] for r in result["skipped"]] == [TAKEN_NAME]
+    assert "Embedded Device - Hardware" in result["skipped"][0]["reason"], (
+        "the operator has to be told WHICH type holds the name, or the report is unactionable")
+
+    assert result["threats"] == 1, "the count must not claim a record the import refused to write"
+    assert result["threats_created"] == 1, "only the clean record is minted"
+
+    assert _links(sess, TAKEN_CAT) == 0, (
+        "the other type's row must be untouched -- borrowing it would file this import's "
+        "categories under a threat it does not own")
+    assert result["new_category_links"] == 1, "the clean record's link still happened"

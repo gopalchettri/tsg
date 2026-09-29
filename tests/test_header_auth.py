@@ -180,7 +180,20 @@ def _staging_settings():
         "db_dsn": "mssql+pyodbc://@localhost/DB?driver=x&TrustServerCertificate=no",
         "redis_url": "redis://127.0.0.1:6379/0",
         "allow_remote_in_dev": False,
+        "admin_api_key": "",
     })()
+
+
+def test_staging_without_active_api_client_boots_when_admin_key_set(monkeypatch):
+    # The admin must be able to create the FIRST key via POST /v1/tsg/api-clients, which needs
+    # the app running — so an empty table + admin key boots (logs CRITICAL) instead of failing.
+    import app.db.invariants as inv
+    eng = create_engine("sqlite://")
+    m.API_Client.__table__.create(eng)                 # empty — no active key
+    s = _staging_settings()
+    s.admin_api_key = "k"
+    monkeypatch.setattr(inv, "get_settings", lambda: s)
+    inv._assert_api_client_configured(eng)              # must not raise
 
 
 def test_staging_without_active_api_client_fails_boot(monkeypatch):

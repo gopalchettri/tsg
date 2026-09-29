@@ -25,15 +25,132 @@ SET ANSI_NULLS ON;
 
 -- ============================================================
 -- SECTION 0 — Enable RCSI (Read Committed Snapshot Isolation), once.
--- Required so reads never block behind a writer (CAS/lock design).
--- WARNING: forces every other session off the database to apply.
+-- Required so reads never block behind a writer (CAS/lock design), and NOT
+-- advisory: app/db/invariants.py::_assert_rcsi_enabled raises
+-- StartupInvariantError while it is off, so neither the API nor any Celery
+-- worker boots. A run that leaves it off has deployed nothing.
+--
+-- WHY THIS IS NO LONGER `SET SINGLE_USER / SET RCSI / SET MULTI_USER`.
+-- That was THREE statements, and the middle one can fail. SINGLE_USER succeeds
+-- and evicts every other session; one of those sessions reconnects and takes the
+-- single permitted connection; `SET READ_COMMITTED_SNAPSHOT ON` then fails with
+-- "database is in use", the batch aborts, and `SET MULTI_USER` NEVER RUNS. The
+-- database is left SINGLE_USER — and this database also holds the platform tables
+-- TSG only reads (ctm_scan_*, onboarding_*, [user], option, option_value), so
+-- every OTHER application on it is locked out until a DBA restores MULTI_USER by
+-- hand. An outage caused by a schema script, announced as one aborted batch in
+-- the Messages pane.
+--
+-- `SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE` performs the same
+-- eviction in ONE statement: either the setting changes or nothing does. There is
+-- no intermediate state to be stranded in, so there is nothing to restore — which
+-- is why the fix is to delete the dance, not to add a rescue path to it.
+--
+-- READ sys.databases, NEVER DATABASEPROPERTYEX. That property returned NULL on a
+-- SQL Server 2022 Express instance whose setting was demonstrably ON, and every
+-- comparison against NULL is UNKNOWN, so the check silently decided nothing.
+-- is_read_committed_snapshot_on is a non-nullable bit present for every database.
+-- A row this script cannot READ is reported as its own case and never ALTERed
+-- blind, because the command it would otherwise run disconnects people.
+--
+-- @disconnect_others is the ONE LINE in this file you are meant to edit. It is 1
+-- because the setting is required. Set it to 0 to be told who is connected and
+-- have the script stop instead of interrupting them.
+--
+-- KEPT IN STEP ACROSS THE DEPLOY PATHS. The same block, for the same reasons, is
+-- in TSG_Core_UAT.sql, in scripts/tsg_remediation_tables.sql and in
+-- scripts/tsg_script/00_validation/002_enable_isolation_level.sql.
+-- tests/test_tsg_script_package.py::test_no_deploy_script_takes_the_database_single_user
+-- fails the build if any deploy script goes back to the SINGLE_USER dance, and
+-- ::test_the_package_sets_every_database_setting_it_validates reads all four.
 -- ============================================================
 
-IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE database_id = DB_ID() AND is_read_committed_snapshot_on = 1)
+DECLARE @disconnect_others bit = 1;
+
+DECLARE @rcsi bit = (SELECT d.is_read_committed_snapshot_on
+                     FROM sys.databases d WHERE d.database_id = DB_ID());
+
+IF @rcsi = 1
+    PRINT ' [EXISTS]  READ_COMMITTED_SNAPSHOT is already ON. Nothing was changed.';
+
+ELSE IF @rcsi IS NULL
 BEGIN
-    ALTER DATABASE CURRENT SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-    ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON;
-    ALTER DATABASE CURRENT SET MULTI_USER;
+    PRINT ' [ERROR]   Could not read this database''s isolation setting - no visible';
+    PRINT '           sys.databases row for DB_ID(). NOTHING was changed. Check the';
+    PRINT '           setting by hand before deploying, and do NOT run the ALTER blind:';
+    PRINT '           the form that always succeeds disconnects every open session.';
+    RAISERROR('READ_COMMITTED_SNAPSHOT could not be read - stopping before any change.', 16, 1);
+END
+
+ELSE
+BEGIN
+    IF @disconnect_others = 1
+        PRINT ' [WARNING] READ_COMMITTED_SNAPSHOT is OFF. Every OTHER session on this database is about to be disconnected and its in-flight work rolled back.';
+    ELSE
+        PRINT ' [INFO]    READ_COMMITTED_SNAPSHOT is OFF. Turning it on without waiting for anybody, and without disconnecting anybody.';
+
+    -- Two literal statements rather than one built with sp_executesql: dynamic SQL
+    -- would spare the IF, but it would also hide the destructive form inside a
+    -- string, and a schema script has to let a reviewer SEE what it can do.
+    BEGIN TRY
+        IF @disconnect_others = 1
+            ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
+        ELSE
+            ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH NO_WAIT;
+        PRINT ' [FIXED]   READ_COMMITTED_SNAPSHOT is now ON.';
+    END TRY
+    BEGIN CATCH
+        PRINT ' [FAIL]    READ_COMMITTED_SNAPSHOT could not be turned on. NOTHING was';
+        PRINT '           changed, no session was disconnected, and the database is NOT';
+        PRINT '           single-user.';
+        PRINT '           SQL Server said (' + CAST(ERROR_NUMBER() AS varchar(10)) + '): '
+              + ERROR_MESSAGE();
+
+        -- Branch on what is OBSERVABLE, never on the error number. A live run with one
+        -- other session connected raised 5069, which no plausible hand-typed list of
+        -- "database in use" codes contained, so the operator was sent after a
+        -- permissions problem they did not have. sys.dm_exec_sessions answers the real
+        -- question and cannot go stale.
+        IF EXISTS (SELECT 1 FROM sys.dm_exec_sessions s
+                   WHERE s.database_id = DB_ID() AND s.session_id <> @@SPID)
+        BEGIN
+            -- PRINTed, not SELECTed: SSMS sends a SELECT to the Results grid and PRINT to
+            -- the Messages pane, and the operator reading the failure is in Messages.
+            DECLARE @others int, @who nvarchar(max) = N'';
+            SELECT @others = COUNT(*) FROM sys.dm_exec_sessions s
+            WHERE  s.database_id = DB_ID() AND s.session_id <> @@SPID;
+            SELECT @who = @who + CHAR(13) + CHAR(10) + N'               ' +
+                          RIGHT(N'      ' + CAST(s.session_id AS nvarchar(10)), 6) + N'  ' +
+                          LEFT(ISNULL(s.login_name, N'?') + SPACE(30), 30) + N'  ' +
+                          LEFT(ISNULL(s.host_name, N'?') + SPACE(18), 18) + N'  ' +
+                          LEFT(ISNULL(s.program_name, N'?') + SPACE(30), 30)
+            FROM   sys.dm_exec_sessions s
+            WHERE  s.database_id = DB_ID() AND s.session_id <> @@SPID;
+            PRINT '           Somebody else is connected to this database - '
+                  + CAST(@others AS varchar(10)) + ' other session(s):';
+            PRINT '               SPID  LOGIN                           HOST                PROGRAM';
+            PRINT @who;
+            -- PRINT stops at 4000 characters; the COUNT above is always exact.
+            IF @others > 40
+                PRINT '           (the list above is cut off by PRINT; the count is exact)';
+            PRINT '           Two ways forward:';
+            PRINT '             1. Ask them to disconnect, then run this script again.';
+            PRINT '             2. In an agreed window set @disconnect_others to 1 at the top';
+            PRINT '                of THIS script and run it again. It then disconnects the';
+            PRINT '                sessions above and rolls back their in-flight work.';
+        END
+        ELSE
+        BEGIN
+            PRINT '           No other session is visible from this login, so this is most';
+            PRINT '           likely a permissions problem: no ALTER permission on the';
+            PRINT '           database, or no VIEW SERVER STATE - and without that second one';
+            PRINT '           the sessions holding it are HIDDEN from the listing above rather';
+            PRINT '           than absent. Ask a DBA to run:';
+            PRINT '           ALTER DATABASE [' + DB_NAME() + '] SET READ_COMMITTED_SNAPSHOT ON;';
+        END
+
+        RAISERROR('READ_COMMITTED_SNAPSHOT is OFF and could not be turned on - stopping.', 16, 1);
+    END CATCH
 END
 
 GO
@@ -647,6 +764,12 @@ CREATE TABLE Grounding_Calibration_Run (
     RerankerModel      nvarchar(500) NULL,
     Forced             bit           NOT NULL CONSTRAINT DF_GroundingCalibration_Forced DEFAULT 0,
     MatchTh            float         NULL,        -- the cutoff; NULL unless Status='success'
+    -- The same measured cutoff for CONTROL MAPPING, which asks a different question: a scenario
+    -- paragraph against the control library, not a short threat label against the threat library.
+    -- The NON-NULL column is the discriminator - a grounding sweep leaves ControlMapTh NULL, a
+    -- control-map sweep leaves MatchTh NULL - so no 'kind' column is needed and the reader's
+    -- existing MatchTh IS NOT NULL filter keeps working. Nullable: every existing row predates it.
+    ControlMapTh       float         NULL,        -- NULL on a grounding-only run
     Quality            float         NULL,        -- Youden's J at MatchTh, 0-1
     NegativesCount     int           NULL,
     PositivesCount     int           NULL,
@@ -655,6 +778,13 @@ CREATE TABLE Grounding_Calibration_Run (
     NearDuplicatesJSON nvarchar(max) NULL,        -- curation to-do list, not an error
     ErrorMessage       nvarchar(max) NULL
 );
+GO
+
+-- The same column for a database that ALREADY has the table - UAT and Prod do, so the CREATE
+-- above never runs there and this guarded ADD is the only way the column reaches them. Nullable,
+-- so nothing has to be backfilled: no run before this one measured a control-mapping cutoff.
+IF COL_LENGTH('dbo.Grounding_Calibration_Run', 'ControlMapTh') IS NULL
+    ALTER TABLE Grounding_Calibration_Run ADD ControlMapTh float NULL;
 GO
 
 -- WHICH cutoff judged each threat: 'calibrated' | 'static_default' | 'env_pinned'.
@@ -910,6 +1040,19 @@ CREATE UNIQUE INDEX UX_Scenario_ActiveAccepted ON Threat_Scenario(SessionID, Ide
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
 CREATE INDEX IX_PromptLog_Session ON Prompt_Log(SessionID, SubsystemID);
 
+-- The treatment-evidence read (dal_treatment.prompt_logs_for_plan, behind
+-- GET /v1/sessions/{id}/scenarios/{id}/treatment-plan/evidence) filters Prompt_Log on
+-- CorrelationID alone and orders by CreatedAt. Prompt_Log has no other index on that
+-- column, so without this the read SCANS a table that grows by one row per model call:
+-- it never errors and never logs, it just gets slower for the life of the database.
+-- Filtered because session/subsystem rows carry no CorrelationID and are the majority.
+-- This index was created by scripts/tsg_remediation_tables.sql and by the generated
+-- scripts/tsg_script/ package and by NEITHER of the numbered scripts, because no guard
+-- compared the three paths' index inventories. One now does:
+-- tests/test_schema_sync.py::test_every_deploy_path_creates_the_same_indexes.
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Correlation' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
+CREATE INDEX IX_PromptLog_Correlation ON Prompt_Log(CorrelationID, CreatedAt) WHERE CorrelationID IS NOT NULL;
+
 -- (SessionID, SubsystemID, Level) is the row's real identity — the whole CAS/lock design
 -- assumes exactly one row per triple. CREATE FIRST, DROP SECOND: a failed CREATE (duplicate
 -- rows already exist) then leaves the old index in place instead of leaving none at all.
@@ -1074,39 +1217,27 @@ WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME IN (
 
 
 -- ---------------------------------------------------------------------------
--- Scenario_Library - generated scenario text, reused across every asset of one PROFILE
+-- Scenario_Library — REMOVED 2026-08-29, along with the cross-tenant
+-- scenario-reuse feature it backed.
 -- ---------------------------------------------------------------------------
--- ProfileKey is a sha256 of CLASSIFICATION CODES ONLY - never a name, an entity id
--- or free text. That is what makes a row safe to serve across tenants while the
--- asset data it came from stays isolated. See app/pipeline/scenario_profile.py.
+-- It is not in app/db/models.py, nothing under app/ reads or writes it, and
+-- neither of the other two deploy paths (scripts/tsg_remediation_tables.sql and
+-- the generated scripts/tsg_script/ package) creates it. This script kept
+-- creating it anyway, and "6. TSG_Verify.sql" kept requiring it — so a database
+-- built by either of those paths and then verified reported "Table missing:
+-- Scenario_Library" as a BLOCKING failure on a correct database. The shipped
+-- remedy was a paragraph telling the operator to read past one blocking failure
+-- from a script whose other blocking failures are real, which is how a real one
+-- gets read past too. The CREATE, its UX_ScenarioLibrary_Natural index and the
+-- verify entry are all gone instead.
 --
--- SourceNamesJSON is the ordered [asset, system 1, ...] name list live at write
--- time. Serving the row to a different asset swaps those names positionally, and
--- the swap REFUSES rather than guesses if any source name survives it - so a
--- mismatch costs a regeneration, never a register naming the wrong customer's
--- system.
+-- A database that already HAS the table keeps it: it is inert, nothing reads it,
+-- and dropping a table that once held generated text is not a schema script's
+-- decision to make. Drop it by hand when convenient.
 --
--- PromptVersion and ModelID are the invalidation key: a row is only served back to
--- a session running the same prompt and model that produced it.
-IF OBJECT_ID('dbo.Scenario_Library', 'U') IS NULL
-CREATE TABLE Scenario_Library (
-    ScenarioLibraryID  uniqueidentifier NOT NULL CONSTRAINT PK_Scenario_Library PRIMARY KEY,
-    ProfileKey         nvarchar(100)  NOT NULL,   -- sha256 hex; classification codes only
-    ThreatCatalogueID  int            NOT NULL,   -- library threats only: a novel threat has no stable identity to key on
-    ScenarioNumber     int            NOT NULL CONSTRAINT DF_ScenarioLibrary_ScenarioNumber DEFAULT 1,
-    ScenarioJSON       nvarchar(max)  NOT NULL,
-    SourceNamesJSON    nvarchar(max)  NOT NULL,   -- ordered [asset, system 1, ...] at write time
-    PromptVersion      nvarchar(100)  NULL,
-    ModelID            nvarchar(200)  NULL,
-    CreatedAt          datetime2      NULL
-);
-
--- The natural key. UNIQUE so two sessions of the same profile cannot leave two
--- competing texts; the loser's INSERT fails and is discarded, which is correct -
--- either text was valid, and the session keeps its own copy regardless.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ScenarioLibrary_Natural' AND object_id = OBJECT_ID('dbo.Scenario_Library'))
-CREATE UNIQUE INDEX UX_ScenarioLibrary_Natural
-    ON Scenario_Library(ProfileKey, ThreatCatalogueID, ScenarioNumber);
+-- tests/test_schema_sync.py::test_verify_script_table_list_matches_create_inventory
+-- now derives the expected table list from the ORM, so an unmapped table cannot
+-- re-enter this file's CREATE inventory or the verify list again.
 
 
 -- ---------------------------------------------------------------------------

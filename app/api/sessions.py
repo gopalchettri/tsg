@@ -13,12 +13,18 @@ from functools import lru_cache
 from typing import Literal, NamedTuple, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import RowMapping, insert, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import Principal, get_principal
+from app.api.library_references import (
+    ManualThreatNames,
+    resolve_manual_threat_identity,
+    resolve_scenario_control_references,
+)
 from app.api.schemas import (
     UNAVAILABLE_RESPONSES,
     AcceptBody,
@@ -55,13 +61,18 @@ from app.api.schemas import (
     TreatmentPlanResultEvent,
     UnacceptResponse,
 )
+from app.api.schemas_treatment import ManualScenarioIn
 from app.core import tuning
 from app.core.config import get_settings
 from app.core.enums import (
+    ActorType,
     AuditEventType,
+    ContentSource,
     ControlMappingExhaustionReason,
+    LibraryOutcome,
     RegenGranularity,
     ReviewGateReason,
+    SelectionReason,
     SessionMode,
     SessionStatus,
     SSEEventType,
@@ -71,14 +82,16 @@ from app.core.enums import (
     WorkflowStage,
 )
 from app.core.logging import get_logger
-from app.core.naming import display_threat_names
+from app.core.naming import display_threat_names, normalize_name
+from app.core.stride import in_stride_order
 from app.db import dal
 from app.db import models as m
 from app.db.dal import EntityForbidden, IdempotencyKeyConflict, RegenerateConflict, now
 from app.db.engine import db_session
-from app.pipeline import cascade, grounding, library_match, tasks
+from app.pipeline import cascade, grounding, library_match, scoping, tasks
 from app.pipeline.accept import (
     AcceptConflict,
+    accept_new_manual_scenario,
     accept_session,
     ensure_review_gate,
     reject_scenarios,
@@ -87,10 +100,11 @@ from app.pipeline.accept import (
 )
 from app.pipeline.celery_app import next_set_task, regenerate_task, run_pipeline_task
 from app.pipeline.context import gather_asset_details
-from app.pipeline.grounding import stored_actors
+from app.pipeline.grounding import GroundingStatus, stored_actors
 from app.pipeline.llm import get_llm
 from app.pipeline.promote import load_scenario_and_threat, promote_scenario_to_library
 from app.pipeline.tasks import ASSET_UNIT_ID, set_up_progress_tracking
+from app.pipeline.validation import validate_scenario
 from app.sse import bus
 
 log = get_logger(__name__)
@@ -336,6 +350,9 @@ def build_board(sess: Session, scenario_session: dict) -> dict:
         "asset_id": int(scenario_session["AssetID"]), "asset_name": scenario_session["AssetName"],
         "user_id": scenario_session["UserID"],
         "session_status": scenario_session["SessionStatus"],
+        # AUTO or MANUAL — a client must be able to tell a run from a scenario a
+        # person wrote, since regenerate and next-set are refused on the latter.
+        "mode": scenario_session.get("Mode"),
         "current_stage": scenario_session["CurrentStage"],
         "stage_status": _wire_stage_status(scenario_session["StageStatus"]),
         "progress": {
@@ -439,7 +456,7 @@ def _build_session_row(sid: str, tenant: str, body: CreateSessionBody, ctx: dict
 # --- endpoints ---
 @router.post("/sessions", status_code=202, response_model=CreateSessionResponse,
             responses=UNAVAILABLE_RESPONSES,
-            summary="Start a threat-generation run",
+            summary="6.1 · Start a threat-generation run",
             description=(
                 "Starts a new AI run for one asset and returns immediately with a `session_id`.\n\n"
                 "**Before you call:** the asset must have no other active session — one run per asset at a "
@@ -519,8 +536,380 @@ def create_session(
     return CreateSessionResponse(session_id=sid, user_id=principal.user_id)
 
 
+def _manual_body_error(field: str, value, msg: str) -> RequestValidationError:
+    """A 422 in the standard envelope, located inside the request's manual_scenario block."""
+    return RequestValidationError([{"type": "value_error", "msg": msg, "input": value,
+                                    "loc": ("body", "manual_scenario", field)}])
+
+
+def _manual_replay(sess: Session, entity_id: str, idempotency_key: str,
+                   asset_id: int) -> tuple[str, str] | None:
+    """The (session_id, scenario_id) this key already saved, or None when the key is unused.
+
+    The key lives in Scenario_Session.IdempotencyKey — the same (EntityID, key) unique index
+    create_session uses — so a replay is exactly one indexed read and no second table. A key
+    bound to a DIFFERENT asset, or to an AI session, is someone else's request: 409, never a
+    replay of the wrong object (the lookup itself compares both, for both callers)."""
+    existing_id, conflict, _owner = dal.reserve_idempotency_key_or_get_existing(
+        sess, entity_id, idempotency_key, str(asset_id), manual=True)
+    if existing_id is None:
+        return None
+    if conflict:
+        raise IdempotencyKeyConflict(existing_id)
+    scenario_id = sess.execute(select(m.Threat_Scenario.ScenarioID).where(
+        m.Threat_Scenario.SessionID == existing_id)).scalar()
+    return str(existing_id), str(scenario_id)
+
+
+def _library_identity(sess: Session, identity: ManualThreatNames,
+                      category_id: int | None) -> tuple[int | None, int | None]:
+    """(type_id, catalogue_id) the library already holds for this category/type/threat, READING
+    ONLY — or a 422 on the field that contradicts the library, naming the library's value. None
+    means "not in the library yet": the save proposes it as a PENDING 'manual' entry.
+
+    1. A threat the library holds (any live row, pending included, matched by normalize_name)
+       decides its own type: sent with another type -> 422 on threat_type_name.
+    2. Its category must be one the library files it under (its category map or its type's
+       default, dal.library_category_ids) -> else 422 on threat_category_name.
+    3. A new threat under an existing type: the category must be one the library already files
+       that type under -> else 422 on threat_category_name.
+    A library that records no category at all has nothing to contradict, so any is accepted.
+    `category_id` None means the request named NO category: nothing to check, the caller derives
+    one from the type/threat resolved here.
+
+    Takes NAMES (ManualThreatNames), whichever door the caller used: a request that sent
+    `threat_type_id` 42 has already had that id resolved to the library's own wording by
+    api.library_references.resolve_manual_threat_identity, so every rule above applies unchanged to
+    an id-shaped payload. That is the whole point of resolving to names rather than to ids — the
+    combination rules, the pending-row proposals and their 422 messages all speak names, and a second
+    id-shaped path through them would be a second answer to "does the library hold this"."""
+    tc, tt = m.Threat_Catalogue, m.Threat_Type
+    key = normalize_name(identity.threat)
+    holders = sorted((r for r in sess.execute(
+        select(tc.ThreatCatalogueID, tc.ThreatName, tc.ThreatTypeID, tt.ThreatTypeName)
+        .outerjoin(tt, tt.ThreatTypeID == tc.ThreatTypeID).where(tc.IsDeleted == False))
+        if normalize_name(r.ThreatName or "") == key), key=lambda r: r.ThreatCatalogueID)
+    type_id = dal.find_type_id_by_norm_name(sess, identity.threat_type)
+    catalogue_id: int | None = None
+    filed = identity.threat_type          # what the category is checked against, for the message
+    if holders:
+        mine = [r for r in holders if r.ThreatTypeID == type_id]
+        if not mine:
+            raise _manual_body_error(
+                "threat_type_name", identity.threat_type,
+                f"'{holders[0].ThreatName}' is filed under '{holders[0].ThreatTypeName}' in the "
+                "threat library")
+        catalogue_id, filed = mine[0].ThreatCatalogueID, mine[0].ThreatName
+    if type_id is not None and category_id is not None:
+        allowed = dal.library_category_ids(sess, type_id, catalogue_id)
+        if allowed and category_id not in allowed:
+            names = in_stride_order(sess.execute(
+                select(m.Threat_Category.ThreatCategoryName)
+                .where(m.Threat_Category.ThreatCategoryID.in_(allowed))).scalars())
+            raise _manual_body_error(
+                "threat_category_name", identity.threat_category,
+                f"'{filed}' is filed under {', '.join(repr(n) for n in names)} in the threat "
+                "library")
+    return type_id, catalogue_id
+
+
+def save_manual_scenario(manual: ManualScenarioIn, principal: Principal,
+                         idempotency_key: str) -> tuple[str, str, bool]:
+    """Save a scenario a person wrote exactly as TSG stores its own, and accept it. Returns
+    (session_id, scenario_id, replayed).
+
+    One MANUAL session per scenario, parked at REVIEW like a generated session after its run —
+    so accept, the plan routes, the board and the register all work on it unchanged. EVERY row
+    (session, stage rows, library proposals, threat, scoped threat, scenario, its controls, the
+    acceptance and the audit trail) is written in ONE transaction: a save is all or nothing, and
+    can never leave a saved-but-unaccepted scenario behind. `idempotency_key` makes a retry or a
+    double click return the original instead of saving a second copy.
+
+    Codes the caller sent are theirs: no mapping pass can ever re-map or replace them, and TWO
+    guards keep it so. The row's PROVENANCE — both selection points, control_mapping.eligible_outputs
+    and control_mapping.sessions_awaiting_control_mapping, apply
+    `control_mapping._not_hand_written(ScenarioSource)`, which excludes a manual row by what it IS —
+    and the `ControlsMappedAt` stamp written below on EVERY manual row, which keeps the scored pass
+    and the sweep out even before the provenance is consulted.
+
+    Codes NOT sent (D1, 2026-09-25): the stamp still keeps the sweep out, and the plan-launch top-up
+    (control_mapping.top_up_scenario_controls, run by app/api/treatment.py when the first plan is
+    requested) maps the scenario with the matching an AI scenario gets — only when it has no map
+    rows at all, so a person's 1–4 chosen codes are never touched. The stamp is also a FACT this
+    module derives `controls_mapped` from and dal.py derives mapping progress from: a NULL stamp
+    would publish "controls not computed yet" forever on a scenario the sweep will never visit.
+    Pinned by test_remediation_plans.py::test_no_mapping_pass_can_ever_select_a_manual_scenario,
+    which drives both predicates for BOTH kinds of manual row — one with the author's controls and
+    one with none — clearing one guard at a time, rather than trusting this paragraph."""
+    entity_id = str(manual.entity_id)
+    principal.require_entity(entity_id)
+    tenant = principal.tenant_id or get_settings().tenant_id
+    user = principal.user_id
+
+    with db_session() as sess:   # reads only: nothing below is written until the save
+        replay = _manual_replay(sess, entity_id, idempotency_key, manual.asset_id)
+        if replay is not None:
+            return (*replay, True)
+        dal.assert_asset_owned_by_entity(sess, manual.asset_id, entity_id)
+        # The threat triple, whichever door it came through (ids, names, or both), resolved to the
+        # library's own NAMES before anything is written — because every rule the save then applies
+        # speaks names (see _library_identity). It runs HERE, in the read phase, because the
+        # advisory moderation call below needs the type and threat names, and because a 422 on an
+        # id the library does not hold should cost the caller nothing: at this point not one row
+        # has been written, so refusing here is exactly as all-or-nothing as refusing later.
+        identity = resolve_manual_threat_identity(sess, manual)
+        ctx = gather_asset_details(sess, asset_id=manual.asset_id, entity_id=entity_id,
+                                   sector_id=manual.sector_id, user_id=user,
+                                   supporting_system_ids=manual.supporting_system_id,
+                                   subsector_id=manual.subsector_id)
+        try:
+            tuning_snapshot = tuning.resolve_snapshot(dal.active_tuning_overrides(sess))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    sid = dal.guid()
+    # Outside any transaction: moderation is a network call. Both checks are ADVISORY, exactly as
+    # for a generated scenario — they are recorded on the card, never a reason to refuse the save.
+    scenario = tasks._scrub_model_output({
+        # THE THREAT'S OWN NAME IS THE TITLE. `scenario_title` left the request in 2026-09 (the
+        # approved payload has no such field) but the stored ScenarioJSON still carries one: the
+        # board, the register and the plan header all read it (dal_treatment's JSON_VALUE
+        # projections), and validation.validate_scenario counts it as a required field, so a null
+        # would blank every manual row on three screens and add a validation error to every card.
+        # The threat name is the honest substitute — the schema's own reason for dropping the field
+        # was that a title "was a second name for content the scenario already carries in
+        # threat_scenario and in the threat's own name".
+        "scenario_title": identity.threat,
+        "scenario_statement": manual.threat_scenario,
+        "risk_statement": manual.risk_statement,
+        "supporting_systems_involved": [], "plausible_entry_point_ids": [],
+    }, sid, None)
+    report = validate_scenario(
+        scenario, identity.threat_type, identity.threat, asset_name=ctx["asset"]["name"],
+        critical_service=ctx["asset_context"].get("critical_service"))
+    report["moderation"] = tasks._moderation_report(scenario)
+
+    try:
+        with db_session() as sess:
+            scenario_id = _write_manual_scenario(  # resolves category/controls/library itself
+                sess, manual, identity, sid=sid, tenant=tenant, user=user, ctx=ctx,
+                tuning_snapshot=tuning_snapshot, idempotency_key=idempotency_key,
+                scenario=scenario, report=report)
+    except IdempotencyKeyConflict:
+        # A concurrent request with the same key won the insert race (UX_Session_IdempotencyKey):
+        # this whole transaction rolled back. Answer with the winner, like any other replay.
+        with db_session() as sess:
+            replay = _manual_replay(sess, entity_id, idempotency_key, manual.asset_id)
+        if replay is None:
+            raise
+        return (*replay, True)
+    log.info("manual_scenario.saved", session_id=sid, scenario_id=scenario_id, user=user)
+    return sid, scenario_id, False
+
+
+def _write_manual_scenario(sess: Session, manual: ManualScenarioIn, identity: ManualThreatNames,
+                           *, sid: str, tenant: str,
+                           user: str | None, ctx: dict, tuning_snapshot: dict,
+                           idempotency_key: str, scenario: dict, report: dict) -> str:
+    """save_manual_scenario's single transaction — every row, then the acceptance. The caller's
+    db_session commits it all at once or rolls it all back.
+
+    The category, the library combination and the control references are resolved HERE, in the
+    transaction that writes them. Checking them in an earlier read transaction (for a 422 before
+    the moderation call) meant a control retired in between was still saved — check-then-write on
+    curator-owned rows. A 422 now costs one advisory moderation call; nothing else changes.
+
+    `identity` is the threat triple as NAMES — the caller's, or the library's own for any row they
+    named by id (api.library_references.resolve_manual_threat_identity, in the read phase, because
+    the moderation call needs the names). The three checks below re-run against the library inside
+    THIS transaction exactly as they always did, by name, so the id door inherits the same
+    check-then-write protection as the name door rather than a second one of its own."""
+    entity_id = str(manual.entity_id)
+    t = now()
+    # Ownership is re-taken here, not trusted from the read phase: an advisory moderation call
+    # sits between the two, and an asset that left the entity in that window would otherwise be
+    # saved, accepted and planned for its former owner. Same check-then-write rule as the
+    # category, the control codes and the library identity below.
+    dal.assert_asset_owned_by_entity(sess, manual.asset_id, entity_id)
+    # Categories are the six STRIDE masters and are never minted: unknown is the caller's error.
+    # Re-resolved from the NAME even when the caller sent threat_category_id, so this stays the one
+    # answer to "is that a category": grounding.find_category applies the IsActive/IsDeleted filter
+    # the resolver matched the id against, and one function owning the question is what keeps a
+    # category accepted here from being a category rejected two lines later. None = the request
+    # named no category; it is derived from the library's own filing once the type is known below.
+    category_id = None
+    if identity.threat_category is not None:
+        category_id = grounding.find_category(sess, identity.threat_category)
+        if category_id is None:
+            raise _manual_body_error("threat_category_name", identity.threat_category,
+                                     "not a threat-library category")
+    # ONE query for the whole list, never one per entry: these are resolved on the request path,
+    # inside the transaction that writes them. None/[] means a scenario saved with no map rows of
+    # its own; the plan-launch top-up maps it then (see save_manual_scenario).
+    control_ids = resolve_scenario_control_references(sess, manual.mapped_controls)
+    session_row = {
+        # _build_session_row reads only entity_id/asset_id off the body — ManualScenarioIn
+        # extends CreateSessionBody, so the manual session is built by the same recipe.
+        **_build_session_row(sid, tenant, manual, ctx, idempotency_key, user, tuning_snapshot),
+        # Already AT the review barrier: exactly where tasks._send_to_review leaves a run.
+        "Mode": SessionMode.MANUAL, "SessionStatus": SessionStatus.completed,
+        "CurrentStage": WorkflowStage.REVIEW, "StageStatus": StageStatus.AWAITING_DECISION,
+        "CompletedAt": t,
+    }
+    dal.create_session(sess, session_row)
+    set_up_progress_tracking(sess, sid, tenant, entity_id, settled=True)
+
+    # Checked again inside the write transaction: a curator can change the library between
+    # the request arriving and this commit. (No name applock here — that belongs to a later
+    # release; the unique indexes remain the concurrency backstop.)
+    type_id, catalogue_id = _library_identity(sess, identity, category_id)
+    if category_id is None and type_id is not None:
+        # No category sent: the one the library files this threat/type under, when it is
+        # unambiguous; else the type's own default; else none at all (no 422 — a scenario without
+        # a STRIDE bucket is a documented state, ThreatCategoryID is nullable). A type the library
+        # does not hold yet has nothing to derive from and is proposed below without a category.
+        filed = dal.library_category_ids(sess, type_id, catalogue_id)
+        category_id = next(iter(filed)) if len(filed) == 1 else sess.execute(
+            select(m.Threat_Type.ThreatCategoryID)
+            .where(m.Threat_Type.ThreatTypeID == type_id)).scalar()
+    # Identified_Threat.ThreatCategory is NOT NULL text: "" is the honest spelling of "no category".
+    category_name = "" if category_id is None else sess.execute(
+        select(m.Threat_Category.ThreatCategoryName)
+        .where(m.Threat_Category.ThreatCategoryID == category_id)).scalar_one()
+    # DERIVED from the library read, never defaulted. "existing" is a CLAIM that the library
+    # already held this row, and the library_promoted audit row is the only durable record of
+    # what a manual save did to the library. When the curator tombstone below stops the mint,
+    # neither branch runs, so a default of "existing" wrote that claim for a type the library has
+    # never held — next to a null threat_type_id, for a curator reading the trail to answer "why
+    # is this scenario not linked?". Each value is overwritten by its own mint branch when one runs.
+    statuses = {"threat_type": "existing" if type_id is not None else "not_proposed",
+                "threat": "existing" if catalogue_id is not None else "not_proposed"}
+    # EVERY curator tombstone is read BEFORE anything is minted. This is the one caller that
+    # treats "a curator rejected this" as non-fatal and then COMMITS (identification drops the
+    # candidate, promote's 409 rolls its mint back), so a type minted here before the threat's
+    # tombstone is known would stay behind with no threat under it — invisible to the curator
+    # queue, which lists catalogue rows, and unreachable by approve/reject, which take catalogue
+    # ids. The curator's removal would be silently overturned by the next save.
+    if catalogue_id is None and dal.curator_rejected_catalogue_id(sess, identity.threat) is not None:
+        # A curator already rejected this wording. The scenario still saves — the words are the
+        # person's — but nothing goes back into the library. (A pending TYPE with no threats is
+        # cleanup clutter, not a verdict on the name, so it never blocks a fresh proposal.)
+        statuses["threat"] = "rejected_by_curator"
+    proposing = "rejected_by_curator" not in statuses.values()
+    if type_id is None and proposing:
+        type_id, created = dal.upsert_threat_type(
+            sess, identity.threat_type, category_id, source=ContentSource.manual,
+            created_by=user)
+        statuses["threat_type"] = "inserted" if created else "existing"
+    # Falls back to the person's own wording when nothing was minted: the scenario still saves,
+    # carrying the names they typed with no library link (the G9 rule for a rejected threat).
+    type_name = identity.threat_type if type_id is None else sess.execute(
+        select(m.Threat_Type.ThreatTypeName).where(
+            m.Threat_Type.ThreatTypeID == type_id)).scalar_one()
+    if catalogue_id is None and proposing and type_id is not None:
+        # ASK BEFORE MINTING, in this transaction: _library_identity read the library before
+        # the moderation call, and a twin can land under this type in between. Same rung the
+        # promote path runs, and the one the build guard requires beside every mint.
+        catalogue_id = dal.find_catalogue_id_by_norm_name(sess, type_id, identity.threat)
+    if catalogue_id is None and proposing and type_id is not None:
+        # Nothing holds this name and no tombstone forbids it: a new PENDING entry (a threat
+        # cannot be proposed without a type to file it under). No meaning
+        # rung — that is a reranker call, and this request runs none.
+        try:
+            catalogue_id, created = dal.upsert_threat_catalogue(
+                sess, identity.threat, type_id, source=ContentSource.manual, created_by=user)
+        except dal.CatalogueNameTaken as taken:   # _library_identity's check, at the index
+            raise _manual_body_error("threat_type_name", identity.threat_type, str(taken)) from None
+        statuses["threat"] = "inserted" if created else "existing"
+        if created and category_id is not None:
+            dal.link_catalogue_category(sess, catalogue_id, category_id)
+    catalogue = sess.get(m.Threat_Catalogue, catalogue_id) if catalogue_id is not None else None
+
+    # --- threat, scoped threat, scenario: the pipeline's own row builders ---
+    threat_id, scoped_id = dal.guid(), dal.guid()
+    gr = grounding.GroundingResult(
+        # verified = linked to an APPROVED library threat; a pending proposal is not one yet.
+        status=(GroundingStatus.verified if catalogue is not None and catalogue.IsActive
+                else GroundingStatus.unverified),
+        type_id=type_id, catalogue_id=catalogue_id, library_type=type_name,
+        library_name=catalogue.ThreatName if catalogue is not None else None,
+        actors=[], actor_ids=[], actors_validated=False, category_id=category_id,
+        threshold_origin="not_applicable")
+    threat_row, info = tasks._build_threat_records(
+        threat_id, sid, tenant, ASSET_UNIT_ID, identity.threat_type, category_name, identity.threat,
+        gr, entity_id, user, category_id=category_id,
+        # A person wrote it: not AI-generated at either level, whatever the library holds.
+        ai_generated=False, type_ai_generated=False)
+    scored = scoping.Scored(
+        threat_id=threat_id, score=tuning.from_session(session_row).base_score, rank=1,
+        selected=True, reason="manual entry: a person wrote this threat",
+        selection=SelectionReason.manual_entry)
+    out = tasks._build_scenario_output_row(
+        # tasks._EPOCH, not a literal 1: set_up_progress_tracking stamps the stage rows written in
+        # THIS transaction with the same constant (pipeline_common.py), and tasks.write_scenarios
+        # refuses a full run whose epoch is not it. A hard-coded copy would silently diverge from
+        # both the day that constant moves.
+        scoped_id, sid, tenant, ASSET_UNIT_ID, scenario, report, tasks._EPOCH, entity_id, user,
+        info, source=ContentSource.manual, span=(t, t))
+    out.update(
+        # Nothing was generated, so no generation span is published ("not measured").
+        GenStartedAt=None, GenFinishedAt=None,
+        # Stamped on EVERY manual row, codes or none. Codes sent: the caller's controls ARE the
+        # mapping, and this stamp plus the provenance fence (control_mapping._not_hand_written)
+        # are the two guards that keep every mapping pass off them. None sent: the stamp still
+        # keeps the sweep out, and the plan-launch top-up (which reads map rows, not this column)
+        # maps the scenario when its first plan is requested. Either way the stamp is what
+        # controls_mapped and the mapping-progress derivation read, so a NULL here would publish
+        # "controls not computed yet" forever. No fingerprint stamp: that column belongs to the
+        # relevance-sizing work and does not exist here.
+        ControlsMappedAt=t)
+    # Plain executemany inserts, like tasks.write_scenarios: Accepted is written ONLY by
+    # dal.decide_scenarios (below), which the build guard in scripts/test_pipeline_guards.py pins.
+    sess.execute(insert(m.Identified_Threat), [threat_row])
+    sess.execute(insert(m.Scoped_Threat),
+                 [tasks._build_scoped_threat_row(scoped_id, sid, tenant, ASSET_UNIT_ID, scored,
+                                                 entity_id, user)])
+    sess.execute(insert(m.Threat_Scenario), [out])
+    # `if control_ids` is load-bearing, not defensive: `mapped_controls` is optional since 2026-09,
+    # and an executemany with an EMPTY list is an ArgumentError, so the save of a perfectly valid
+    # scenario would 500 after writing the session. Codes sent -> these rows, guarded twice (stamp
+    # + provenance). None sent -> no rows now; the stamp keeps the sweep out and the plan-launch
+    # top-up fills the map when the first plan is requested (see save_manual_scenario).
+    if control_ids:
+        sess.execute(insert(m.Threat_Scenario_Control_Map), [
+            {"ScenarioID": out["ScenarioID"], "ControlLibraryID": cid, "SessionID": sid,
+             "MapRank": rank, "Score": None, "SuggestedControl": None, "CreatedAt": t}
+            for rank, cid in enumerate(control_ids, start=1)])
+
+    # --- the trail: who created it, and any library entry it proposed ---
+    dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant,
+                     EntityID=entity_id, EventType=AuditEventType.session_started,
+                     ActorUserID=user, ScenarioID=out["ScenarioID"],
+                     DetailJSON=json.dumps({"mode": str(SessionMode.MANUAL),
+                                            "scenario_id": out["ScenarioID"],
+                                            "validation_status": report.get("validation_status")}))
+    if set(statuses.values()) != {"existing"}:
+        dal.append_audit(
+            sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant, EntityID=entity_id,
+            EventType=AuditEventType.library_promoted, ActorUserID=user,
+            ActorType=ActorType.user if user else ActorType.system, ThreatTypeRefID=type_id,
+            ScenarioID=out["ScenarioID"],
+            DetailJSON=json.dumps({"scenario_id": out["ScenarioID"], "threat_id": threat_id,
+                                   "threat_type_id": type_id, "catalogue_id": catalogue_id,
+                                   "category_id": category_id, "statuses": statuses,
+                                   "library_source": str(ContentSource.manual),
+                                   "source": "manual-scenario"}))
+
+    # Accepted inside THIS transaction, through the one decision writer and the review gate.
+    board = dal.get_session(sess, sid, entity_id)
+    if board is None:  # inserted above in this same transaction — failing loud rolls it all back
+        raise dal.NotFoundError(f"manual session {sid} not readable inside its own save")
+    accept_new_manual_scenario(sess, board, user)
+    return str(out["ScenarioID"])
+
+
 @router.get("/sessions/{session_id}", response_model=SessionBoard,
-            summary="Check a session's progress",
+            summary="6.2 (or poll) · Check a session's progress",
             description=(
                 "The status board for one session: what stage it is at and whether a human is still needed.\n\n"
                 "**Call it:** repeatedly after creating a session, every 5-10 seconds.\n\n"
@@ -577,7 +966,10 @@ def _scenario_select():
         # ThemeID: null while /results carried it. st.Score/st.ScopeRank are THIS scenario's
         # own scoped row — the same join chain already in use.
         *dal.scenario_threat_columns(),
-        st.Score, st.ScopeRank,
+        # The Scoped_Threat half as ONE tuple — see dal.scoped_threat_columns(). SelectionKind
+        # says whether Score/ScopeRank mean anything, and every select that took the numbers
+        # without the verdict published 60.0 / rank 1 for a threat a person chose.
+        *dal.scoped_threat_columns(),
     ).select_from(out.__table__.outerjoin(st, out.ScopedThreatID == st.ScopedThreatID)
                 .outerjoin(it, st.ThreatID == it.ThreatID)
     # ThreatID first so a threat's coexisting scenarios stay together, then the human-facing
@@ -639,7 +1031,7 @@ def _ancestry(sess: Session, sid: str, scenarios: list[dict]) -> dict[str, list[
 
 
 @router.get("/sessions/{session_id}/results", response_model=SessionResults,
-            summary="Read the generated scenarios",
+            summary="6.3 · Read the generated scenarios",
             description=(
                 "Every scenario generated for this session, each with its threat, its adversaries and its "
                 "mapped security controls.\n\n"
@@ -743,6 +1135,9 @@ def get_results(
                                 for s in scenarios
                                 if s["Accepted"] and s["IdentityHash"] is not None}
 
+        # ONE library read for the whole page, like `controls` above — never one per card.
+        library = dal.library_outcomes_for_scenarios(sess, [s["ScenarioID"] for s in scenarios])
+
         def _nested(chain: list[str]) -> list[ScenarioResult]:
             """The card's own history, oldest-to-newest order preserved from the chain. Built
             without a `replaced` argument, which is what keeps nesting exactly one level deep.
@@ -750,7 +1145,7 @@ def get_results(
             than emitted as an entry with no body — the history truncates, it never lies."""
             return [_scenario_result(by_id[oid], controls.by_output.get(oid),
                                     actor_ids=actor_ids,
-                                    unavailable=controls.unavailable)
+                                    unavailable=controls.unavailable, library=library)
                     for oid in chain if oid in by_id]
 
         return SessionResults(
@@ -767,7 +1162,8 @@ def get_results(
                                         actor_ids=actor_ids,
                                         unavailable=controls.unavailable,
                                         replaces_accepted=_replaces_accepted(
-                                            s, accepted_by_identity))
+                                            s, accepted_by_identity),
+                                        library=library)
                     for s in scenarios],
         )
 
@@ -844,7 +1240,9 @@ def _controls_by_output(sess: Session, scenario_ids: list[str]) -> _Controls:
 def _query_controls(sess: Session, scenario_ids: list[str], cmap, lib) -> dict[str, list[MappedControl]]:
     rows = sess.execute(
         select(cmap.ScenarioID, cmap.MapRank, cmap.Score,
-            lib.ControlLibraryID, lib.ControlCode, lib.Domain, lib.ControlName)
+            lib.ControlLibraryID, lib.ControlCode, lib.Domain, lib.ControlName,
+            # Extra COLUMNS on the join that was already running — not a second round trip.
+            lib.ITOT, lib.ControlDescription)
         .join(lib, lib.ControlLibraryID == cmap.ControlLibraryID)
         .where(cmap.ScenarioID.in_(scenario_ids),
             lib.IsActive == True, lib.IsDeleted == False)
@@ -866,8 +1264,11 @@ def _query_controls(sess: Session, scenario_ids: list[str], cmap, lib) -> dict[s
     for r in rows:
         out.setdefault(r["ScenarioID"], []).append(MappedControl(
             control_id=r["ControlLibraryID"], control_code=r["ControlCode"],
-            domain=r["Domain"], control_name=r["ControlName"], map_rank=r["MapRank"],
-            score=r["Score"],
+            itot=r["ITOT"], domain=r["Domain"], control_name=r["ControlName"],
+            control_description=r["ControlDescription"], map_rank=r["MapRank"],
+            # One value, two published names: `mapping_relevance` is what the Control Mapping
+            # spec calls it, `score` is what older clients read. Same r["Score"] on purpose.
+            score=r["Score"], mapping_relevance=r["Score"],
             standards=std_refs.get(r["ControlLibraryID"], [])))
     return out
 
@@ -919,7 +1320,7 @@ def _actor_ids_from_blobs(sess: Session, blobs: Iterable[str | None]) -> dict[st
     return resolved
 
 
-def _actor_block(threat_row: dict | None,
+def _actor_block(threat_row: RowMapping | dict | None,
                  actor_ids: dict[str, int] | None = None) -> list[dict]:
     """The scenario's adversaries, shaped as list[ThreatActorRef].
 
@@ -935,7 +1336,72 @@ def _actor_block(threat_row: dict | None,
     return [{"actor_id": (actor_ids or {}).get(n), "actor_name": n} for n in actor_names]
 
 
-def _threat_block(threat_row: dict | None) -> dict | None:
+def _library_block(row: RowMapping | dict | None, outcomes: dict[str, dict] | None) -> dict | None:
+    """What a HAND-WRITTEN scenario did to the threat library, shaped as LibraryOutcomeBlock.
+
+    A SIBLING of the threat block, not a field inside it — the rule _actor_block follows, and the
+    reason `name` holds a name while the verdict lives in `status`.
+
+    `outcomes` is the batched read (dal.library_outcomes_for_scenarios), one query per page. None
+    means the caller did not fetch it, and the honest answer is then null — never a guess.
+
+    A MISSING KEY IS `existing`, not unknown: the save writes its audit row only when a status is
+    something other than `existing`, so a manual scenario absent from the map matched the library
+    on both names. Publishing null there would hide the one case a reader most wants confirmed.
+
+    Null for anything the AI wrote: a generated scenario proposes nothing to the library, so the
+    block would be noise on every AI card."""
+    if outcomes is None or not row:
+        return None
+    if str(row.get("ScenarioSource") or "") != str(ContentSource.manual):
+        return None
+    # The names live on the Identified_Threat join, and not every select that reaches this
+    # presenter carries it: dal_treatment.entity_plan_rows adds the threat join only under
+    # ?include_plan=true, so the register's default page has ScenarioSource but no names. Reading
+    # them there produced {"name": "", "status": "existing"} — a positive claim about a library
+    # entry, assembled from columns the query never selected, on the one page a GRC reviewer
+    # signs. It sat beside a `threat` block that was already null for the same reason.
+    #
+    # `in`, not .get(): a column selected and NULL is a real answer ("nothing was linked"); a
+    # column that was never selected is not an answer at all. Same rule this presenter states for
+    # scenario_source at treatment_presenter.py — a row shape with no scenario link publishes
+    # null rather than asserting something about a scenario it never saw. A name field must hold
+    # a name; when it cannot, the honest block is no block.
+    if "ThreatName" not in row:
+        return None
+    statuses = outcomes.get(str(row.get("ScenarioID"))) or {}
+    threat = str(statuses.get("threat") or LibraryOutcome.existing)
+    threat_type = str(statuses.get("threat_type") or LibraryOutcome.existing)
+    return {
+        # The library's own name when linked, else the person's wording — which is exactly the
+        # case where nothing was linked, so there is no library name to show.
+        "threat": {"name": row.get("LibraryThreatName") or row.get("ThreatName") or "",
+                   "status": threat},
+        "threat_type": {"name": row.get("LibraryThreatType") or row.get("ThreatType") or "",
+                        "status": threat_type},
+        "message": _library_message(row.get("ThreatName") or "", threat, threat_type),
+    }
+
+
+def _library_message(threat_name: str, threat: str, threat_type: str) -> str | None:
+    """One sentence for the person, or None when nothing needs acting on.
+
+    Only two situations earn a banner. A refusal, because otherwise the caller resubmits the same
+    wording forever — `grounding_status: unverified` cannot distinguish "declined" from "not
+    looked at yet". And a fresh proposal, because "awaiting review" explains why a brand-new
+    threat is unverified today and may not be tomorrow. Everything else is silence: a UI must not
+    raise a banner to announce that nothing happened."""
+    if threat == LibraryOutcome.rejected_by_curator:
+        return (f"A curator reviewed '{threat_name}' and declined it, so this scenario keeps your "
+                "wording but is not linked to the threat library. Sending it again will not "
+                "re-propose it — choose a different name if you want a library entry.")
+    if LibraryOutcome.inserted in (threat, threat_type):
+        return ("Proposed to the threat library and awaiting a curator's review. The scenario is "
+                "saved either way; it becomes verified only if the curator approves.")
+    return None
+
+
+def _threat_block(threat_row: RowMapping | dict | None) -> dict | None:
     """The FULL threat a card was generated from, every database key included, shaped as
     ThreatResult.
 
@@ -979,13 +1445,21 @@ def _threat_block(threat_row: dict | None) -> dict | None:
         "is_threat_ai_generated": (None if threat_row.get("IsThreatAIGenerated") is None
                                 else bool(threat_row.get("IsThreatAIGenerated"))),
         "grounding_score": threat_row.get("GroundingScore"),
-        "score": threat_row.get("Score"),
-        "scope_rank": threat_row.get("ScopeRank"),
+        # NULL when a PERSON chose this threat. Scoped_Threat.Score and .ScopeRank are NOT NULL,
+        # so a hand-written threat had to be stored with the session's base score and rank 1 — it
+        # was never scored, and `SelectionKind='manual_entry'` is the column that records exactly
+        # that (enums.py: "no scoring ran at all"). Published, those placeholders put a
+        # hand-written threat on the cross-session register at 60.0/rank 1, sorted best-first and
+        # numerically indistinguishable from an AI threat that genuinely landed on the base score.
+        # Nulled HERE, at the presentation boundary: the columns cannot change (no schema change).
+        **({"score": None, "scope_rank": None}
+           if threat_row.get("SelectionKind") == SelectionReason.manual_entry else
+           {"score": threat_row.get("Score"), "scope_rank": threat_row.get("ScopeRank")}),
     }
 
 
 def _scenario_narrative(scenario_json: str | None,
-                        threat_row: dict | None = None) -> dict | None:
+                        threat_row: RowMapping | dict | None = None) -> dict | None:
     """Projects one ScenarioJSON row for the API: the model's own prose, and nothing else.
     Presentation-layer only — ScenarioJSON is never rewritten.
 
@@ -1034,11 +1508,26 @@ def _replaces_accepted(row: dict, accepted_by_identity: dict[tuple, str]) -> str
     return prior if prior is not None and prior != row["ScenarioID"] else None
 
 
+def _published_scenario_source(row: dict) -> str:
+    """Threat_Scenario.ScenarioSource as the wire publishes it, decided in ONE place.
+
+    Three builders render a scenario (the results card, the accepted list, the cross-session
+    list) and each made this call itself, so they drifted: two folded a NULL to "generated" and
+    the third published null — two endpoints answering differently about the SAME row, while the
+    shared field description they all carry (schemas.SCENARIO_SOURCE_DOC) ends "Rows written
+    before this column existed read `generated`."
+
+    .get(), not [...]: more than one select feeds these builders, matching the rule the sibling
+    Gen*/accepted_by fields already follow here."""
+    return row.get("ScenarioSource") or "generated"
+
+
 def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                     replaced: list[ScenarioResult] | None = None,
                     actor_ids: dict[str, int] | None = None,
                     *, unavailable: bool = False,
-                    replaces_accepted: str | None = None) -> ScenarioResult:
+                    replaces_accepted: str | None = None,
+                    library: dict[str, dict] | None = None) -> ScenarioResult:
     controls_mapped = row["ControlsMappedAt"] is not None
     # .get(): not every select feeding this builder carries ControlMapAttempts yet — absent
     # reads as 0 attempts, i.e. never exhausted, same "missing column = safe default" contract
@@ -1054,6 +1543,9 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                         # so they survive an OUTER-join miss that nulls the threat.
                         threat=_threat_block(row),
                         actors=_actor_block(row, actor_ids),
+                        # Another envelope sibling, same reason: what this scenario did to the
+                        # threat library is a fact about the LIBRARY, not about the threat row.
+                        library=_library_block(row, library),
                         controls=controls or [],
                         accepted=bool(row["Accepted"]),
                         # Passed in, not derived here: it is a fact about this card's SIBLINGS,
@@ -1077,7 +1569,7 @@ def _scenario_result(row: dict, controls: list[MappedControl] | None = None,
                         # NULL on every row written before the scenario library existed, and
                         # those were all authored for their own asset — so the legacy reading
                         # is "generated", not "unknown".
-                        scenario_source=row["ScenarioSource"] or "generated",
+                        scenario_source=_published_scenario_source(row),
                         controls_mapped=controls_mapped,
                         # Without this, ControlsMapped=true beside an empty list is the API's
                         # documented "the library genuinely has nothing" — a claim we cannot make
@@ -1114,7 +1606,7 @@ _CONFLICT_RESPONSES: dict[int | str, dict] = {409: {"model": ErrorResponse, "des
 
 
 @router.post("/sessions/{session_id}/accept", response_model=AcceptResponse, responses=_CONFLICT_RESPONSES,
-            summary="Accept scenarios",
+            summary="6.5 · Accept scenarios",
             description=(
                 "Records a reviewer's decision to keep scenarios. Each accepted scenario is stamped with who "
                 "accepted it and when.\n\n"
@@ -1162,7 +1654,7 @@ def post_accept(session_id: str, body: AcceptBody, principal: Principal = Depend
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/promote-to-library",
             response_model=LibraryPromotionResponse, responses=_CONFLICT_RESPONSES,
-            summary="Add a scenario's threat to the library",
+            summary="6.7 (optional) · Add a scenario's threat to the library",
             description=(
                 "Copies one accepted scenario's threat type and threat into the shared threat library, so a "
                 "future session on a similar asset can match it instead of the AI reinventing it.\n\n"
@@ -1242,7 +1734,7 @@ def post_promote_to_library(session_id: str, scenario_id: str,
 
 @router.post("/sessions/{session_id}/scenarios/{scenario_id}/unaccept",
             response_model=UnacceptResponse, responses=_CONFLICT_RESPONSES,
-            summary="Take back an acceptance",
+            summary="As needed · Take back an acceptance",
             description=(
                 "Undoes one acceptance. The scenario becomes undecided again and returns to the review "
                 "queue, where it can be rejected later or accepted again.\n\n"
@@ -1275,7 +1767,7 @@ def post_unaccept_scenario(session_id: str, scenario_id: str,
 
 @router.post("/sessions/{session_id}/scenarios/reject", response_model=RejectResponse,
             responses=_CONFLICT_RESPONSES,
-            summary="Decline scenarios",
+            summary="6.4 (optional) · Decline scenarios",
             description=(
                 "Records a reviewer's decision to decline scenarios. Nothing is deleted — the scenario keeps "
                 "its content and stays visible in the results.\n\n"
@@ -1324,7 +1816,15 @@ def _assert_regen_eligible(sess: Session, scenario_session: dict) -> dict:
     Delegates to the SAME gate the accept route uses, so "is this session decidable?" has exactly
     one answer everywhere — including the liveness check that stops a dead or hung worker being
     reported as "generation still in progress" (see accept.ensure_review_gate). Only the exception
-    type differs, because these routes answer `regenerate_conflict`, not `accept_conflict`."""
+    type differs, because these routes answer `regenerate_conflict`, not `accept_conflict`.
+
+    A MANUAL session is refused OUTRIGHT, before the gate and before any lock: a person wrote
+    that scenario, so the AI never rewrites it or adds to it. Strict subscript — a board row
+    without Mode is a bug in the loader, not a reason to fall through to the AI."""
+    if scenario_session["Mode"] == SessionMode.MANUAL:
+        raise RegenerateConflict(
+            "this scenario was written by a person; the AI never rewrites or adds to it",
+            reason=ReviewGateReason.manual_session)
     try:
         return dict(ensure_review_gate(sess, scenario_session))
     except AcceptConflict as exc:
@@ -1402,7 +1902,7 @@ def _do_regenerate(session_id: str, principal: Principal, subsystem_id: int, gra
 
 @router.post("/sessions/{session_id}/regenerate/scenarios", status_code=202, response_model=RegenerateResponse,
             responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES,
-            summary="Rewrite specific scenarios",
+            summary="6.4 (optional) · Rewrite specific scenarios",
             description=(
                 "Rewrites only the scenarios you name and leaves their siblings untouched.\n\n"
                 "**Before you call:** the session must be at the review point, and the ids must be current "
@@ -1504,7 +2004,7 @@ def _do_next_set(session_id: str, principal: Principal, subsystem_id: int) -> Re
 
 @router.post("/sessions/{session_id}/scenarios/next-set", status_code=202, response_model=RegenerateResponse,
             responses=_CONFLICT_RESPONSES | UNAVAILABLE_RESPONSES,
-            summary="Generate more scenarios",
+            summary="6.4 (optional) · Generate more scenarios",
             description=(
                 "Asks the AI for another batch of brand-new scenarios for the same asset. It adds; it never "
                 "replaces. No request body.\n\n"
@@ -1530,7 +2030,7 @@ def post_next_set_scenarios(session_id: str, principal: Principal = Depends(get_
 
 
 @router.post("/sessions/{session_id}/cancel", response_model=CancelResponse,
-            summary="Cancel a session",
+            summary="As needed · Cancel a session",
             description=(
                 "Aborts a session that is still generating, and frees its asset so a new session can start.\n\n"
                 "**Before you call:** the session must still be `active`. Once generation reaches the review "
@@ -1667,7 +2167,11 @@ _EVENT_STREAM_RESPONSES: dict[int | str, dict] = {
                     "error/heartbeat) are best-effort live progress narration; `error` is "
                     "dual-scope (see its `scope` field) and is NOT necessarily terminal on its "
                     "own — do not tear down UI on `error` alone, wait for "
-                    "session_entered_review or a terminal session status. The 3 advisory result "
+                    "session_entered_review or a terminal session status. On a MANUAL session "
+                    "(mode on the reconcile board) none of those 6 ever fire — it generated "
+                    "nothing — so waiting for session_entered_review there waits forever; the "
+                    "board arrives already finished and treatment_plan_result is the only event "
+                    "left to come. The 3 advisory result "
                     "events are best-effort and never replayed — treat them as a prompt to "
                     "refresh, and trust GET /v1/sessions/{session_id} for durable state. "
                     "A publish failure opens a circuit breaker that suppresses ALL events from "
@@ -1687,7 +2191,7 @@ _EVENT_STREAM_RESPONSES: dict[int | str, dict] = {
 
 @router.get("/sessions/{session_id}/events",
             responses=_EVENT_STREAM_RESPONSES | UNAVAILABLE_RESPONSES,
-            summary="Stream live session progress",
+            summary="6.2 · Stream live session progress",
             description=(
                 "Keeps a connection open and pushes session events as they happen, instead of you polling.\n\n"
                 "**How to connect:** send `Accept: text/event-stream` with the same auth headers as every "
@@ -1695,6 +2199,14 @@ _EVENT_STREAM_RESPONSES: dict[int | str, dict] = {
                 "custom headers — drive it with `fetch()` and a stream reader.\n\n"
                 "**What arrives:** a `reconcile` event immediately with the full current board, then stage "
                 "and result events as work completes, plus periodic heartbeats.\n\n"
+                "**A hand-written scenario's session is different.** A session created by "
+                "`POST /v1/remediation-plans` with `is_manual=true` has `mode: \"MANUAL\"` on the board and "
+                "did no generation, so NO `stage_started`, `stage_completed`, `subsystem_started` or "
+                "`session_entered_review` event will ever arrive on it — there was no work to narrate. The "
+                "`reconcile` snapshot already shows it finished and awaiting its review decision, and the "
+                "only later event is `treatment_plan_result` when its remediation plan commits. Do not wait "
+                "for `session_entered_review` on such a session: it has already happened, before you "
+                "connected.\n\n"
                 "**Watch out:** events are best-effort and are never replayed, so a dropped connection loses "
                 "them silently. Always confirm anything important against the status board, which is durable. "
                 "Some events that genuinely arrive are not listed in the generated schema, so make your event "
@@ -1800,7 +2312,7 @@ def _audit_event(row: dict) -> SessionAuditEvent:
 
 
 @router.get("/sessions/{session_id}/audit", response_model=SessionAuditPage,
-            summary="Read a session's history",
+            summary="As needed · Read a session's history",
             description=(
                 "The session's step-by-step history, oldest first: who did what, to what, and when.\n\n"
                 "**Call it:** any time. This is a plain read and is not gated by session state.\n\n"
@@ -1845,7 +2357,7 @@ def get_session_audit(
 
 
 @router.get("/sessions/{session_id}/accepted-scenarios", response_model=AcceptedScenariosResponse,
-            summary="List a session's accepted scenarios",
+            summary="6.6 · List a session's accepted scenarios",
             description=(
                 "Only the scenarios a reviewer accepted for this session — the clean feed for a risk register "
                 "or downstream GRC tool. Drafts, declined and undecided scenarios never appear.\n\n"
@@ -1865,6 +2377,7 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
         rows = dal.accepted_scenarios(sess, scenario_session["SessionID"])
         controls = _controls_by_output(sess, [r["ScenarioID"] for r in rows])
         actor_ids = _actor_ids_from_blobs(sess, [r["ThreatActorsJSON"] for r in rows])
+        library = dal.library_outcomes_for_scenarios(sess, [r["ScenarioID"] for r in rows])
         return AcceptedScenariosResponse(
             asset_id=int(scenario_session["AssetID"]), entity_id=scenario_session["EntityID"],
             user_id=scenario_session["UserID"],
@@ -1872,6 +2385,7 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
             completed_at=scenario_session["CompletedAt"],
             scenarios=[AcceptedScenario(
                 scenario_id=r["ScenarioID"], subsystem_id=r["SubsystemID"],
+                scenario_source=_published_scenario_source(r),
                 # BOTH spellings, no coalesce: what the model proposed and what it matched
                 # are different facts, and a GRC reviewer defending this register needs to see
                 # the difference rather than a silently-preferred one of the two.
@@ -1879,6 +2393,7 @@ def get_accepted_scenarios(session_id: str, principal: Principal = Depends(get_p
                 scenario=_scenario_narrative(r["ScenarioJSON"], r),
                 threat=_threat_block(r),
                 actors=_actor_block(r, actor_ids),
+                library=_library_block(r, library),
                 controls=controls.by_output.get(r["ScenarioID"], []),
                 # The accepted register is precisely where "who signed this off" belongs.
                 # rejected_* stay null by construction: this endpoint returns accepted rows only,
@@ -1907,14 +2422,21 @@ _SCN_SUPERSEDED = Query(
 
 def _scenario_list_item(row: dict, controls: list[MappedControl],
                         actor_ids: dict[str, int] | None = None,
-                        *, unavailable: bool = False) -> ScenarioListItem:
+                        *, unavailable: bool = False,
+                        library: dict[str, dict] | None = None) -> ScenarioListItem:
     """One dal.scenario_rows/scenario_row row → response item. Same both-spellings rule and
     sibling actors/controls blocks as get_accepted_scenarios above."""
     return ScenarioListItem(
         scenario_id=row["ScenarioID"], subsystem_id=row["SubsystemID"],
+        # .get, like the accepted_by/rejected_at reads below: not every select feeding this
+        # builder carries the column, and a row without it publishes null — never a claim
+        # that the AI wrote it. dal.scenario_rows/scenario_row do carry it, which is what
+        # the single-scenario and list routes serve.
+        scenario_source=_published_scenario_source(row),
         scenario=_scenario_narrative(row["ScenarioJSON"], row),
         threat=_threat_block(row),
         actors=_actor_block(row, actor_ids),
+        library=_library_block(row, library),
         controls=controls,
         session_id=row["SessionID"], entity_id=row["EntityID"], user_id=row["UserID"],
         session_status=row["SessionStatus"], scenario_number=row["ScenarioNumber"],
@@ -1940,12 +2462,14 @@ def _list_scenarios(entity_ids: set[str], user_id: str | None, status: str | Non
                                 include_superseded=include_superseded, limit=limit, offset=offset)
         controls = _controls_by_output(sess, [r["ScenarioID"] for r in rows])  # one batch, no N+1
         actor_ids = _actor_ids_from_blobs(sess, [r["ThreatActorsJSON"] for r in rows])
+        library = dal.library_outcomes_for_scenarios(sess, [r["ScenarioID"] for r in rows])
         return [_scenario_list_item(r, controls.by_output.get(r["ScenarioID"], []), actor_ids,
-                                    unavailable=controls.unavailable) for r in rows]
+                                    unavailable=controls.unavailable, library=library)
+                for r in rows]
 
 
 @scenarios_router.get("/users/{user_id}/scenarios", response_model=list[ScenarioListItem],
-            summary="List scenarios by user",
+            summary="7.2 · List scenarios by user",
             description=(
                 "Every completed scenario one user created, across all their sessions, newest first. "
                 "Scenarios whose generation failed never appear here.\n\n"
@@ -1974,7 +2498,7 @@ def list_user_scenarios(
 
 
 @scenarios_router.get("/entities/{entity_id}/scenarios", response_model=list[ScenarioListItem],
-            summary="List scenarios by entity",
+            summary="7.3 · List scenarios by entity",
             description=(
                 "Every completed scenario belonging to one entity, across all users and sessions, newest "
                 "first. Scenarios whose generation failed never appear here.\n\n"
@@ -1999,7 +2523,7 @@ def list_entity_scenarios(
 
 
 @scenarios_router.get("/sessions/{session_id}/scenarios/{scenario_id}", response_model=ScenarioListItem,
-            summary="Fetch one scenario",
+            summary="7.1 · Fetch one scenario",
             description=(
                 "One specific scenario by id, with its threat, adversaries and mapped controls.\n\n"
                 "**Required:** the `user_id` query parameter, which must be the session's owner. Omitting it "
@@ -2029,5 +2553,7 @@ def get_scenario(
             raise dal.NotFoundError(f"scenario {scenario_id} not found")
         controls = _controls_by_output(sess, [row["ScenarioID"]])
         actor_ids = _actor_ids_from_blobs(sess, [row["ThreatActorsJSON"]])
+        library = dal.library_outcomes_for_scenarios(sess, [row["ScenarioID"]])
         return _scenario_list_item(dict(row), controls.by_output.get(row["ScenarioID"], []),
-                                    actor_ids, unavailable=controls.unavailable)
+                                    actor_ids, unavailable=controls.unavailable,
+                                    library=library)

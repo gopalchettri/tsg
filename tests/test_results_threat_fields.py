@@ -100,7 +100,8 @@ def _seed(Session) -> tuple[str, str]:
         s.execute(m.Control_Library.__table__.insert().values(
             ControlLibraryID=201, ControlCode="CII-CID-201", ITOT="OT",
             Domain="Identification & Authentication", ControlName="Multi-Factor Authentication",
-            ControlDescription="d", IsActive=True, IsDeleted=False))
+            ControlDescription="Require a second authentication factor for remote access.",
+            IsActive=True, IsDeleted=False))
         s.execute(m.Threat_Scenario_Control_Map.__table__.insert().values(
             ScenarioID=scenario_id, ControlLibraryID=201, SessionID=SID, Score=93.0, MapRank=1,
             CreatedAt=NOW))
@@ -180,6 +181,35 @@ def test_get_results_does_not_crash_on_a_real_active_threat(monkeypatch):
     assert not hasattr(control, "StandardNames")   # keyed list only, no un-keyed duplicate
     assert [(s.standard_id, s.standard_name) for s in control.standards] == [
         (7, "ISO 27001:2022"), (3, "NIST SP 800-53 Rev. 5")]
+
+
+def test_a_mapped_control_publishes_itot_description_and_mapping_relevance():
+    """The Control Mapping spec's six-field floor, on the ONE query that builds every control the
+    API publishes. `itot` and `control_description` were missing from every output surface — the
+    description being the field that says what the control actually DOES, so a reviewer reading
+    `controls` could see which control matched but not what implementing it means.
+
+    `mapping_relevance` is the spec's name for the match confidence and `score` is what shipped
+    first; both are published from the same `Score` column ON PURPOSE. That duplication is the
+    contract, so it is asserted rather than left for someone to 'clean up'.
+
+    Driven through `_query_controls` directly: it is the single place the SELECT and the model meet,
+    so a column dropped from either side fails here without the whole get_results scaffold."""
+    import app.api.sessions as sessions_mod
+
+    Session = sessionmaker(bind=_engine(), future=True)
+    _threat_id, scenario_id = _seed(Session)
+    with Session() as s:
+        by_scenario = sessions_mod._query_controls(
+            s, [scenario_id], m.Threat_Scenario_Control_Map, m.Control_Library)
+
+    control = by_scenario[scenario_id][0]
+    assert control.itot == "OT"                       # reported verbatim, not normalized
+    assert control.control_description == (
+        "Require a second authentication factor for remote access.")
+    assert control.mapping_relevance == 93.0
+    assert control.mapping_relevance == control.score, \
+        "mapping_relevance and score are two published names for ONE Score column"
 
 
 def test_failure_card_still_reports_which_threat_failed(monkeypatch):

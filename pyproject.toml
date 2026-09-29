@@ -77,7 +77,11 @@ plugins = ["pydantic.mypy"]
 # taxii2-client is in the same boat, and is additionally an OPTIONAL, lazily-imported dependency
 # (app/intel/taxii_client.py imports it inside the function), so the miss is expected, not a bug.
 [[tool.mypy.overrides]]
-module = ["gevent.*", "celery.*", "taxii2client.*"]
+# ijson joins them for the same reason, verified rather than assumed: the installed package
+# carries no py.typed marker and no stub package exists on PyPI. It is imported by
+# app/intel/library_import.py and app/intel/technique_reference.py to stream large JSON feeds
+# without holding them whole in memory.
+module = ["gevent.*", "celery.*", "taxii2client.*", "ijson.*"]
 ignore_missing_imports = true
 
 # Pins the linter that was already running here unconfigured (the stale .ruff_cache and the

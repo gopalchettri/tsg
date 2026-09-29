@@ -113,9 +113,14 @@ def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_ses
     # "json_object" mode forces a top-level object, so the threats stage (which expects a
     # list) would fail every call once JSON mode is on. This parameter is the single source
     # of truth for which shape is expected.
+    # Hoisted to a typed local: mypy cannot know which keys a non-TypedDict mapping holds, so
+    # a `**{...}` literal is checked against every remaining keyword parameter and reports the
+    # first mismatch. The conditional itself stays — test stage fakes implement chat() without
+    # **kw, so response_schema must not be passed unconditionally.
+    extra: dict[str, Any] = ({"response_schema": response_schema}
+                             if response_schema is not None else {})
     text, prov = llm.chat(messages, temperature=temperature, expected_type=expected_type,
-                          **({"response_schema": response_schema}
-                             if response_schema is not None else {}))
+                          **extra)
     if prov is not None:
         prov.prompt_version = prompts.PROMPT_VERSION
     row = {
@@ -161,12 +166,26 @@ def _send_live_update(session_id: str, sse_type: SSEEventType, subsystem_id: int
     })
 
 
-def set_up_progress_tracking(sess: Session, session_id: str, tenant_id: str, entity_id: str) -> None:
-    """Create the progress-tracking rows for a new session."""
+#: Where a MANUAL session's work levels are BORN: nothing will ever run them, and the review
+#: barrier is exactly where a finished AI run leaves SCENARIOS. IDLE would read as "queued", and
+#: the reaper's unstarted-review sweep looks for precisely that.
+_SETTLED_STATUS = {SubsystemLevel.THREATS: StageStatus.COMPLETE,
+                   SubsystemLevel.SCENARIOS: StageStatus.AWAITING_DECISION}
+
+
+def set_up_progress_tracking(sess: Session, session_id: str, tenant_id: str, entity_id: str,
+                             *, settled: bool = False) -> None:
+    """Create the progress-tracking rows for a new session.
+
+    `settled` is the hand-written save's shape: the stages are finished before the row exists.
+    The LOCK level stays IDLE either way — nothing holds it."""
+    t = now()
     rows = [{
         "StateID": guid(), "SessionID": session_id, "TenantID": tenant_id, "EntityID": str(entity_id),
-        "SubsystemID": ASSET_UNIT_ID, "Level": level, "Status": StageStatus.IDLE,
-        "GenerationEpoch": _EPOCH, "UpdatedAt": now(), "CreatedAt": now(),
+        "SubsystemID": ASSET_UNIT_ID, "Level": level,
+        "Status": _SETTLED_STATUS.get(level, StageStatus.IDLE) if settled else StageStatus.IDLE,
+        "GenerationEpoch": _EPOCH, "UpdatedAt": t, "CreatedAt": t,
+        **({"FinishedAt": t} if settled and level in _SETTLED_STATUS else {}),
     } for level in (*_WORK_LEVELS, SubsystemLevel.LOCK)]
     sess.execute(insert(m.Subsystem_Stage_State), rows)
 

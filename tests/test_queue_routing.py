@@ -42,6 +42,93 @@ def _queues_from_command(argv: list[str]) -> set[str]:
     return out
 
 
+#: The admin-authenticated API modules. Every Celery job they enqueue is an operator job by
+#: definition — it is reachable only with the admin key — so it belongs on the admin queue.
+_ADMIN_API_MODULES = ("app/api/admin.py", "app/api/threat_intel.py")
+
+#: Tasks an admin route can enqueue that nevertheless BELONG on the default queue. Each one is
+#: listed with its reason, because an unexplained entry here is indistinguishable from the accident
+#: this test exists to catch — and the first version of this test found BOTH of these, which is how
+#: the reasoning came to be written down at all.
+#:
+#: `tsg.intel_refresh_feed` — quoted from celery_app.py's own queue-split comment: "deliberately
+#:   STAYS on the default queue -- it is short and I/O-bound, exactly what gevent is for, and beat
+#:   schedules its fan-out."
+#: `tsg.map_controls_sweep` — NOT an operator job despite having an admin route. It is the RETRY
+#:   mechanism that finishes user-facing work: a scenario whose mapping pass was interrupted has no
+#:   controls until the sweep maps them, so this is pipeline completion, not maintenance. Beat
+#:   publishes it on a timer (`map-controls-sweep`) so it runs on the default queue regardless of the
+#:   admin route, and routing the admin path elsewhere would make one trigger behave differently
+#:   from the other for no reason. It is bounded by `control_mapping.SWEEP_LIMIT` (5 scenarios), so
+#:   it cannot monopolise a worker the way an unbounded calibration or a 51 MB STIX parse can.
+_ADMIN_TASKS_ALLOWED_ON_THE_DEFAULT_QUEUE = {"tsg.intel_refresh_feed", "tsg.map_controls_sweep"}
+
+
+def _task_names_by_function() -> dict[str, str]:
+    """`calibrate_control_map_task` -> `tsg.calibrate_control_map`, read from the decorators.
+
+    Static, from the source text, so this needs no broker and cannot be satisfied by a task that
+    merely got imported. The decorator and its `def` can be several lines apart (bind, autoretry_for
+    and time limits all wrap), so the name is carried forward to the next function definition."""
+    source = (_ROOT / "app" / "pipeline" / "celery_app.py").read_text(encoding="utf-8")
+    out: dict[str, str] = {}
+    pending: str | None = None
+    for line in source.splitlines():
+        found = re.search(r'name="(tsg\.[a-z_]+)"', line)
+        if found:
+            pending = found.group(1)
+        defined = re.match(r"def ([a-z_]+_task)\(", line)
+        if defined and pending:
+            out[defined.group(1)] = pending
+            pending = None
+    return out
+
+
+def _tasks_enqueued_from(module: str) -> set[str]:
+    """Every `<something>_task.delay(...)` / `.apply_async(...)` in one module, as function names."""
+    source = (_ROOT / module).read_text(encoding="utf-8")
+    return set(re.findall(r"\b([a-z_]+_task)\s*\.\s*(?:delay|apply_async)\s*\(", source))
+
+
+def test_every_task_an_admin_route_enqueues_runs_on_the_admin_queue() -> None:
+    """THE OTHER DIRECTION. Every other test in this file checks route -> worker: that a queue named
+    in `task_routes` has a consumer somewhere. None of them could see a heavy admin job that was
+    never ROUTED at all — it simply lands on the default queue and competes with live generation,
+    which is the exact harm the split exists to prevent (measured: generation 355s -> 967s).
+
+    That hole was not theoretical. `tsg.calibrate_control_map` shipped with no `task_routes` entry
+    and was caught on 2026-09-25 running 20+ minutes on the DEFAULT queue — holding a user-facing
+    worker slot — while its identical sibling `tsg.calibrate_grounding` was routed correctly. Every
+    test in this file passed throughout, because "is it routed?" was nobody's question.
+
+    Derived from what the admin modules ACTUALLY enqueue, never from a hand-maintained list, so the
+    next admin job is covered the day someone writes its route handler rather than the day someone
+    remembers this file."""
+    names = _task_names_by_function()
+    assert len(names) >= 10, (
+        f"only {len(names)} task names parsed from celery_app.py — the decorator regex has drifted, "
+        "and this test would then pass by finding nothing to check")
+
+    routes = celery_app.conf.task_routes or {}
+    unrouted: list[str] = []
+    for module in _ADMIN_API_MODULES:
+        enqueued = _tasks_enqueued_from(module)
+        assert enqueued, f"no enqueue call found in {module} — the call regex has drifted"
+        for func in sorted(enqueued):
+            task = names.get(func)
+            assert task, (f"{module} enqueues {func}, which has no @celery_app.task name in "
+                          "celery_app.py — one of the two regexes is wrong")
+            if task in _ADMIN_TASKS_ALLOWED_ON_THE_DEFAULT_QUEUE:
+                continue
+            if (routes.get(task) or {}).get("queue") != ADMIN_QUEUE:
+                unrouted.append(f"{task} (enqueued by {module}::{func})")
+    assert not unrouted, (
+        "admin-only jobs are publishing to the DEFAULT queue, where they compete with user-facing "
+        f"generation: {sorted(unrouted)}. Add each to celery_app.task_routes with "
+        "{'queue': ADMIN_QUEUE}, or — if it is genuinely short and I/O-bound — name it in "
+        "_ADMIN_TASKS_ALLOWED_ON_THE_DEFAULT_QUEUE with the reason.")
+
+
 def _compose_workers(path: str) -> dict[str, list[str]]:
     doc = yaml.safe_load((_ROOT / path).read_text(encoding="utf-8"))
     return {name: svc["command"] for name, svc in doc["services"].items()
@@ -287,6 +374,105 @@ def test_every_started_window_can_be_stopped():
         assert not missing, (
             f"{filename} has no entry for window(s) start.ps1 opens: {sorted(missing)} — "
             f"a stop would leave them running (see the Flower note in stop.ps1)")
+
+
+# --- the API must actually RELOAD ------------------------------------------------------------
+# Auto-reload used to be opt-in (`if ($Reload.IsPresent)`), so a plain .\start.ps1 served whatever
+# the code looked like at launch. That is not a comfort feature: a whole session's fixes can be
+# correct on disk and green in this suite while the running API still answers with the old code,
+# which reads as "the fix does not work" rather than "the server was never restarted".
+#
+# There are TWO entry points and they must agree. run.ps1 forwards `-Reload:$Reload`, binding the
+# switch EXPLICITLY — so expressing the default as `[switch]$Reload = $true` in start.ps1 would be
+# silently cancelled on every plain .\run.ps1, which is the launcher that skips Docker and the one
+# most likely to be used. The default therefore lives in a computed $useReload, and these tests
+# pin both halves.
+
+
+def _ps_code(filename: str) -> str:
+    """PowerShell source with comments stripped — the <# .. #> help block and every `#` line.
+
+    These scripts are ~60% commentary and the word "reload" appears all over it. A substring test
+    against the raw text would pass on the help block alone, exactly the trap the worker-launch
+    test at the top of this file documents.
+    """
+    text = (_ROOT / filename).read_text(encoding="utf-8")
+    text = re.sub(r"<#.*?#>", "", text, flags=re.S)
+    return "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
+
+
+def test_the_api_reloads_by_default_and_never_via_uvicorns_own_reloader():
+    """Two things, and the second is the one that bites.
+
+    (1) Auto-reload is ON by default for '.env'. Without it a plain .\\start.ps1 serves whatever
+        the code looked like at launch, so a fix can be correct on disk and green in this suite
+        while the running API still answers with the old code.
+
+    (2) It must NOT be uvicorn's `--reload`. Measured 2026-09-24: uvicorn's in-process reloader
+        dies on its FIRST restart on this machine, taking the console process group with it and
+        leaving nothing on the port — with and without the Tee pipe, with
+        WATCHFILES_FORCE_POLLING=1, and with --reload-delay 1. A five-line ASGI app failed the
+        same way, so it is the environment, not TSG. `watchfiles` supervising uvicorn from
+        outside survives repeated reloads, so that is what the launcher uses.
+
+    Reaching for `--reload` again is the regression this stops: it looks obviously right in a
+    diff and turns the first save of the day into a silent outage.
+    """
+    code = _ps_code("start.ps1")
+
+    launch = [ln for ln in code.splitlines() if "-m uvicorn" in ln]
+    assert launch, "no uvicorn launch line found in start.ps1 — did it move?"
+
+    assert not re.search(r"--reload\b", code), (
+        "start.ps1 passes uvicorn's own --reload. It does not survive a restart on this machine "
+        "(see the -NoReload help); supervise uvicorn with `watchfiles` instead.")
+    assert "-m watchfiles" in code, (
+        "start.ps1 no longer supervises the server with watchfiles — reload is either gone or "
+        "back on uvicorn's broken in-process reloader")
+
+    decision = [ln for ln in code.splitlines()
+                if "$useReload" in ln and "=" in ln and "if (" not in ln]
+    assert decision, "start.ps1 no longer computes $useReload — did the launch shape change?"
+    assert "$isDefaultEnvFile" in decision[0], (
+        f"reload is no longer on by default for .env: {decision[0]}")
+
+    assert re.search(r"\[switch\]\$NoReload", code), (
+        "start.ps1 lost -NoReload; there must be a way to turn the reloader off")
+    assert not re.search(r"\[switch\]\$Reload\s*=\s*\$true", code), (
+        "`[switch]$Reload = $true` cannot express a default: run.ps1 binds `-Reload:$Reload` "
+        "explicitly, so a plain .\\run.ps1 passes -Reload:$false and cancels it. Compute it into "
+        "$useReload instead.")
+
+
+def test_the_run_docs_describe_the_reload_mechanism_that_is_actually_used():
+    """SETUP_AND_RUN_GUIDE.md advertised `uvicorn --reload` as the dev web server. That was
+    accurate once, wrong after the switch to a watchfiles supervisor, and pinned by nothing — so
+    a reader following the guide would reach for the one mechanism that breaks here.
+
+    Docs that describe a launch mechanism have to move with it, the same way the runbooks are
+    already pinned to the queue consumers above.
+    """
+    for name in ("SETUP_AND_RUN_GUIDE.md", "readme_to_run.txt"):
+        text = (_ROOT / name).read_text(encoding="utf-8")
+        if "--reload" not in text:
+            continue
+        assert "watchfiles" in text, (
+            f"{name} still presents `uvicorn --reload` as the way the dev server reloads, with no "
+            "mention of the watchfiles supervisor that start.ps1 actually uses — and uvicorn's "
+            "own reloader does not survive a restart here")
+
+
+def test_the_run_wrapper_cannot_cancel_the_reload_default():
+    code = _ps_code("run.ps1")
+
+    delegation = [ln for ln in code.splitlines() if "start.ps1" in ln]
+    assert delegation, "run.ps1 no longer delegates to start.ps1 — did it move?"
+
+    assert re.search(r"\[switch\]\$NoReload", code), (
+        "run.ps1 lost -NoReload, so the wrapper cannot turn the reloader off at all")
+    assert "-NoReload:$NoReload" in code, (
+        "run.ps1 does not forward -NoReload to start.ps1 — .\\run.ps1 -NoReload would be accepted "
+        "and then silently ignored, which is worse than not offering the switch")
 
 
 def test_the_admin_worker_is_matched_by_its_unique_queue_flag():

@@ -64,6 +64,7 @@ def queued(monkeypatch):
     monkeypatch.setattr(admin_api, "admin_embedding_action_task", _fake_task("embeddings"))
     monkeypatch.setattr(admin_api, "calibrate_grounding_task", _fake_task("calibrate"))
     monkeypatch.setattr(admin_api, "mark_admin_job", lambda *a, **k: None)
+    monkeypatch.setattr(admin_api, "map_controls_sweep_task", _fake_task("control-map-sweep"))
     monkeypatch.setattr(intel_api, "import_threat_library_task", _fake_task("import"))
     monkeypatch.setattr(intel_api, "rebuild_technique_reference_task", _fake_task("techniques"))
     monkeypatch.setattr(intel_api, "mark_admin_job", lambda *a, **k: None)
@@ -208,3 +209,38 @@ def test_refresh_feed_dispatches_only_that_feed(queued):
     intel_api.refresh_feed(feed, _Request(), _principal())
     assert [n for n, _ in queued] == ["refresh"]
     assert queued[0][1]["feeds"] == [feed], "only the named feed"
+
+
+# --------------------------------------------------------- control-mapping sweep (1 route)
+
+def test_control_map_sweep_enqueues_the_task(queued):
+    """The manual drain for the control-mapping retry queue actually reaches the broker."""
+    resp = admin_api.run_control_map_sweep_now(_Request(), _principal())
+
+    assert [n for n, _ in queued] == ["control-map-sweep"]
+    assert resp.job_id == "job-control-map-sweep"
+    # Reported from the app's own config, so the response cannot claim a queue the task did not
+    # go to. The task is absent from task_routes, so this is the DEFAULT queue, not `admin`.
+    assert resp.queue == str(admin_api.celery_app.conf.task_default_queue)
+    # The shadow label is what an operator reads in Flower to tell one sweep from another.
+    assert "admin-1" in queued[0][1]["shadow"]
+
+
+def test_control_map_sweep_runs_even_when_the_schedule_is_disabled(queued, monkeypatch):
+    """THE POINT OF THE ROUTE. TSG_CONTROL_MAP_SWEEP_ENABLED governs the SCHEDULE — whether the
+    sweep runs by itself. This route is the manual override for exactly the case where it is off:
+    gating it on the same flag would recreate the dead end it exists to remove (a retry queue with
+    no automatic consumer AND no way to drain it). The flag may only be logged here, never obeyed.
+    """
+    monkeypatch.setattr(admin_api, "get_settings",
+                        lambda: SimpleNamespace(control_map_sweep_enabled=False))
+
+    resp = admin_api.run_control_map_sweep_now(_Request(), _principal())
+
+    assert [n for n, _ in queued] == ["control-map-sweep"], \
+        "the route refused to queue a sweep while the schedule was off — that is the dead end"
+    assert resp.job_id == "job-control-map-sweep"
+    # AND it must not mark itself as beat's tick. The task declines only for `scheduled=True`, so
+    # passing it here would make this route a silent no-op in the one state it exists for — the
+    # blocker an adversarial audit found after this suite had already passed.
+    assert "scheduled" not in (queued[0][1].get("kwargs") or {}), queued[0][1]

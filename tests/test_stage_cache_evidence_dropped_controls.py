@@ -22,7 +22,7 @@ from app.core.enums import StageStatus, SubsystemLevel
 from app.db import dal
 from app.db import models as m
 from app.db.invariants import ACTIVE_UNIQUE, REQUIRED_INDEXES
-from app.pipeline import treatment
+from app.pipeline import treatment, treatment_input
 
 # ---------------------------------------------------------------------------------------------
 # A1 — every startup-only uniqueness rule has a database index behind it
@@ -129,7 +129,7 @@ def test_a_failed_library_lookup_reports_that_and_nothing_per_control(monkeypatc
     def _boom(sess, sid):
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(treatment, "_library_controls", _boom)
+    monkeypatch.setattr(treatment_input, "_library_controls", _boom)
     snap = treatment.build_treatment_input(
         _RowsSess(), _SESSION_ROW, _SCENARIO_ROW, {"existing_controls": [], "risk_level": "High"},
         previous_controls=_PREV)
@@ -152,7 +152,8 @@ def test_snapshot_controls_keeps_order_ids_and_skips_malformed_entries() -> None
 
 
 def test_regenerate_snapshot_carries_the_warning(monkeypatch) -> None:
-    monkeypatch.setattr(treatment, "_library_controls", lambda sess, sid: list(_CUR))
+    monkeypatch.setattr(treatment_input, "_library_controls",
+                        lambda sess, sid: (list(_CUR), []))
     snap = treatment.build_treatment_input(
         _RowsSess([_lib(1, active=False)]), _SESSION_ROW, _SCENARIO_ROW,
         {"existing_controls": [], "risk_level": "High"}, previous_controls=_PREV)
@@ -161,7 +162,8 @@ def test_regenerate_snapshot_carries_the_warning(monkeypatch) -> None:
 
 def test_first_generation_is_unchanged(monkeypatch) -> None:
     """No previous version, no comparison — the AI first-generation path is untouched."""
-    monkeypatch.setattr(treatment, "_library_controls", lambda sess, sid: list(_CUR))
+    monkeypatch.setattr(treatment_input, "_library_controls",
+                        lambda sess, sid: (list(_CUR), []))
     snap = treatment.build_treatment_input(
         _RowsSess(), _SESSION_ROW, _SCENARIO_ROW, {"existing_controls": [], "risk_level": "High"})
     assert not any("previous version" in w for w in snap["warnings"])
@@ -175,7 +177,7 @@ def _warns_through_the_schema(monkeypatch, likelihood, impact, final) -> bool:
     """The real path: TreatmentPlanBody -> model_dump(mode="json") -> build_treatment_input."""
     from app.api.schemas_treatment import TreatmentPlanBody
 
-    monkeypatch.setattr(treatment, "_library_controls", lambda sess, sid: [])
+    monkeypatch.setattr(treatment_input, "_library_controls", lambda sess, sid: ([], []))
     body = TreatmentPlanBody(existing_controls=[], risk_level="High", likelihood_rating=likelihood,
                              impact_rating=impact, final_risk_rating=final).model_dump(mode="json")
     snap = treatment.build_treatment_input(_RowsSess(), _SESSION_ROW, _SCENARIO_ROW, body)

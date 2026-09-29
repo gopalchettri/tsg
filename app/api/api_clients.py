@@ -37,7 +37,7 @@ log = get_logger(__name__)
 
 
 @router.post("", status_code=201, response_model=ApiClientCreated,
-            summary="Create an API key",
+            summary="1.1 · Create an API key",
             description=(
                 "Generates a new API key. Every entity-scoped and admin endpoint needs one, so this is where "
                 "they come from. The two health probes need no authentication at all, and these three "
@@ -75,7 +75,7 @@ def create_api_client(
 
 
 @router.get("", response_model=list[ApiClientInfo],
-            summary="List API keys",
+            summary="1.2 · List API keys",
             description=(
                 "Every API client with its metadata, newest first: who created it, whether it is still "
                 "active, and who revoked it.\n\n"
@@ -90,7 +90,7 @@ def list_api_clients(module: str | None = Query(default=None)) -> list[ApiClient
 
 
 @router.post("/{client_id}/revoke", status_code=200, response_model=ApiClientRevoked,
-            summary="Revoke an API key",
+            summary="As needed · Revoke an API key",
             description=(
                 "Turns off one API client. The key stops authenticating on its very next use.\n\n"
                 "**Auth:** the admin key, plus `X-User-Id` for attribution — recorded as who revoked it, and "

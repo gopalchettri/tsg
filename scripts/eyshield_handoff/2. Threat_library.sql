@@ -197,10 +197,21 @@ BEGIN
         ALTER TABLE Threat_Type ADD Source nvarchar(50) NULL;
 END
 
+-- nvarchar(100), matching app/db/models.py's Unicode(100), the #want manifest row in
+-- scripts/tsg_remediation_tables.sql and 01_tables/003_Threat_Catalogue.sql in the
+-- generated package. It was nvarchar(50) here and 100 in all three of those, so the
+-- SAME write succeeded on a database built by the consolidated script or the package
+-- and failed with SQL Server 8152 on one built by these numbered scripts. SQLAlchemy
+-- enforces no length client-side, so nothing in the application could see the
+-- difference; the width is only ever compared at deploy time, and until
+-- tests/test_schema_sync.py::test_every_deploy_path_declares_the_same_column_shapes
+-- nothing compared it at all. Threat_Type.Source above stays nvarchar(50) on purpose:
+-- that is what models.py and the manifest both declare for it, and that same guard
+-- would fail if this file widened it unilaterally.
 IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL
 BEGIN
     IF COL_LENGTH('dbo.Threat_Catalogue', 'Source') IS NULL
-        ALTER TABLE Threat_Catalogue ADD Source nvarchar(50) NULL;
+        ALTER TABLE Threat_Catalogue ADD Source nvarchar(100) NULL;
 END
 
 IF OBJECT_ID('dbo.ThreatType_ThreatActor_Map', 'U') IS NULL
@@ -260,14 +271,36 @@ SELECT 'Threat_Catalogue_Category_Map', OBJECT_ID('dbo.Threat_Catalogue_Category
 
 
 -- ---------------------------------------------------------------------------
--- Widen every remaining short nvarchar column to nvarchar(100)
+-- Bring every nvarchar column up to the width the object model declares
 -- ---------------------------------------------------------------------------
--- A blanket floor. A value that outgrows its column fails only on that one value,
--- so the application looks healthy until the first write of it. nvarchar is
--- variable-length, so the headroom costs nothing. Each guarded on the CURRENT
--- width, so re-running is a no-op.
+-- A value that outgrows its column fails only on that ONE value, so the
+-- application looks healthy until the first write of it. nvarchar is
+-- variable-length, so the headroom costs nothing. Each statement is guarded on the
+-- CURRENT width, so re-running is a no-op.
+--
+-- THE TARGET IS THE MODEL'S WIDTH, NOT A FLAT 100. This section used to describe
+-- itself as "widen every remaining short nvarchar column to nvarchar(100) ... a
+-- blanket floor", which was not what it did and not what it should do: an
+-- unconditional floor would push Threat_Type.Source to 100 while
+-- app/db/models.py, the #want manifest in scripts/tsg_remediation_tables.sql and
+-- the generated package all declare it at 50, creating a NEW divergence between
+-- the deploy paths in the act of closing one. And the claim hid the real gap it
+-- was sitting next to: Threat_Catalogue.Source was added at nvarchar(50) two
+-- paragraphs above while every other path declared 100, and this section widened
+-- Threat_Actor.Source only. Both are fixed —
+-- tests/test_schema_sync.py::test_every_deploy_path_declares_the_same_column_shapes
+-- now compares type, length, scale and nullability per column across the paths, so
+-- neither the omission nor an over-eager widening can come back.
 
 IF OBJECT_ID('dbo.Threat_Actor', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.Threat_Actor', 'Source') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Actor'), 'Source', 'CharMaxLen') < 100
     ALTER TABLE Threat_Actor ALTER COLUMN Source nvarchar(100) NULL;
+
+-- Threat_Catalogue.Source: for the databases that already took it at nvarchar(50)
+-- from an earlier run of this script. The ADD above now declares 100, which only
+-- helps a table that does not have the column yet.
+IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NOT NULL
+    AND COL_LENGTH('dbo.Threat_Catalogue', 'Source') IS NOT NULL
+    AND COLUMNPROPERTY(OBJECT_ID('dbo.Threat_Catalogue'), 'Source', 'CharMaxLen') < 100
+    ALTER TABLE Threat_Catalogue ALTER COLUMN Source nvarchar(100) NULL;

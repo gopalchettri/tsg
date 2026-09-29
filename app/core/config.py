@@ -11,7 +11,7 @@ import os
 import socket
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,6 +28,45 @@ def _env_file() -> str:
             f"TSG_ENV_FILE={chosen!r} does not exist (cwd={Path.cwd()}) — refusing to fall back "
             "to .env, which would silently start this deployment on another environment's config")
     return chosen
+
+
+# Env names this project has RETIRED, each mapped to the name that replaces it and what the value
+# means NOW. One line per retirement; Settings._refuse_retired_env_names below reads this table and
+# refuses the boot. Do not add a branch.
+#
+# WHY A REFUSAL AND NOT A DEPRECATION. Deleting a name from this model does not make it an error, it
+# makes it INVISIBLE: pydantic-settings resolves fields, so an unrecognised env name is dropped by
+# extra="ignore" with no exception, no warning and no log line. The operator who kept the old
+# spelling loses their setting to the code default and the run is byte-identical in the logs to a
+# clean one. A RETIRED NAME THAT IS SILENTLY IGNORED IS WORSE THAN ONE THAT IS WRONG — wrong shows up
+# in the audit trail and in behaviour, ignored shows up nowhere — so the only safe outcome is to stop
+# at boot, name the replacement, and say what the value means under it.
+#
+# TSG_CONTROL_MAP_TOP_K earned that the hard way, twice. It originally meant a hard cap of 5 applied
+# as `sorted(...)[:5]`; it was superseded by the control_map_min_count / control_map_max_count pair
+# (one number could not say both "at least this many" and "never more than this many"); and it then
+# spent one release as an AliasChoices entry on control_map_max_count — the CEILING, default 25. So
+# the name said "top K" while supplying a bound five times larger, and an inherited
+# `TSG_CONTROL_MAP_TOP_K=5` line silently reinstated the 5-control truncation the pair exists to
+# remove. THIS DEPLOYMENT SHIPPED THAT WAY ONCE. A name that means the opposite of what it says
+# cannot be documented out of its trap, so on the repo owner's instruction ("delete it, and refuse to
+# boot if it is still set") it is gone from the model entirely.
+#
+# Retiring a name is therefore a THREE-line change: delete the alias, add the entry here, delete the
+# entry line from the env files (scripts/env_comments.py owns its prose). Do not re-add either alias
+# to "restore" it — the alias IS the defect.
+RETIRED_ENV_NAMES: dict[str, str] = {
+    "TSG_CONTROL_MAP_TOP_K":
+        "TSG_CONTROL_MAP_MAX_COUNT, which is a SAFETY CEILING (default 25) and never a target — "
+        "nothing pads a scenario up to it. Copying an old top_k=5 across verbatim re-imposes the "
+        "5-control truncation the min/max pair was introduced to remove; set the ceiling you "
+        "actually want, and set TSG_CONTROL_MAP_MIN_COUNT for how many controls a scenario should "
+        "reach",
+    "TSG_REMEDIATION_CONTROL_MIN_COUNT":
+        "TSG_CONTROL_MAP_MIN_COUNT, the same floor generalised from POST /v1/remediation-plans to "
+        "the whole of Step 4 — it is now a target every mapping pass backfills towards, not only a "
+        "top-up applied when a plan was asked for",
+}
 
 
 # Longest control_name / control_description the API accepts (500 + ": " + 3400 fits the default
@@ -400,12 +439,74 @@ class Settings(BaseSettings):
 
     # --- 11. Controls mapping (Step 4) ------------------------------------------------
 
-    # TSG_CONTROL_MAP_TOP_K — most controls kept per scenario ("up to K", never padded).
-    control_map_top_k: int = Field(5, ge=1)
-    # TSG_CONTROL_MAP_MIN_SCORE — drop matches reranking below this. SET EXPLICITLY once
-    # measured (python scripts/measure_control_map_scores.py — read-only, runs the real path):
-    # the query is a scenario PARAGRAPH, and the unset fallback was calibrated label-vs-label,
-    # risking every match silently dropped (controls=[] reading as a healthy "library gap").
+    # DELETED, deliberately: control_map_top_k, AND ITS ENV SPELLING TSG_CONTROL_MAP_TOP_K, which is
+    # now in RETIRED_ENV_NAMES at the top of this file and REFUSES THE BOOT. The field was superseded
+    # by the control_map_min_count / control_map_max_count pair below (one number could not say both
+    # "at least this many" and "never more than this many", and read as a target it capped every
+    # scenario at 5), and the FIELD was left behind read by nothing but its own boot check. A
+    # declared setting behind no behaviour is not free: that check refused `control_map_shortlist_k=3`
+    # with `control_map_max_count=2` on the grounds that 3 < the dead field's default 5, naming a
+    # setting the operator never set while the two that matter (shortlist >= ceiling) were
+    # consistent. It also ABSORBED the pin for the live guard, because it was evaluated first and
+    # its message carried the same field name, so the only validator test passed on the dead branch
+    # alone.
+    #
+    # THE ENV SPELLING NO LONGER WORKS, and that is the second, separate decision. For one release it
+    # was an AliasChoices entry on control_map_max_count — the CEILING — so a name meaning "top 5"
+    # supplied a bound of 25, and an inherited `TSG_CONTROL_MAP_TOP_K=5` silently pinned the ceiling
+    # back to 5. The repo owner's instruction on that ("delete it, and refuse to boot if it is still
+    # set") is implemented in RETIRED_ENV_NAMES and _refuse_retired_env_names. Do not re-add the
+    # field, and do not re-add the alias: the alias was the trap, not the cure.
+    # TSG_CONTROL_MAP_MIN_SCORE — drop matches reranking below this. It is the BOOTSTRAP cutoff,
+    # not the last word: control_mapping._min_score prefers a STORED measurement over it (order
+    # below). Measure one — `python scripts/measure_control_map_scores.py` (read-only, runs the real
+    # path) or `POST /v1/tsg/control-map/calibrate`, which stores it — because the query here is a
+    # scenario PARAGRAPH while the last-resort fallback was calibrated label-vs-label, so borrowing
+    # risks every match silently dropped (controls=[] reading as a healthy "library gap").
+    #
+    # THE STORED MEASUREMENT OUT-VOTES THIS FIELD. That order was INVERTED on 2026-09-25 by the
+    # repo owner's decision — "final value should consider from database only. if .env file also
+    # have the value and database also have consider database. if no value in database then only
+    # consider .env value", and for the empty-database case "when the system will boot for the ist
+    # time there will be no value in the database. use the .env value but again check the database
+    # if found use the database value". control_mapping._min_score's docstring is the authoritative
+    # statement of the rule; the order it implements is:
+    #   1. the newest SUCCESSFUL Grounding_Calibration_Run.ControlMapTh for the current
+    #      (EmbeddingModel, RerankerModel) pair       -> origin calibrated_for_control_mapping
+    #   2. else this field, when its env name is explicitly present  -> origin env_pinned
+    #   3. else the borrowed threat-grounding threshold
+    #                                  -> origin borrowed_from_threat_grounding_uncalibrated
+    # WHY that way round, so nobody "fixes" it back: this number is a GUESS written before anyone
+    # measured the deployment, while branch 1 is the answer produced by scoring real scenarios
+    # against the real library. An earlier revision of this very comment told operators to comment
+    # the env line out so a calibration could take effect — that instruction is now exactly
+    # backwards and must not be restored.
+    #
+    # STILL WORTH SETTING, AND THE ONLY CUTOFF THERE IS ON A FIRST BOOT. A fresh database holds no
+    # measurement, so branch 2 is what runs until one exists; this line is the bootstrap. Removing
+    # it does NOT "let a measurement decide" — with no stored row it drops an uncalibrated
+    # deployment onto branch 3 (calibrated label-vs-label, and typically much higher). What it does
+    # stop doing is deciding: once a measurement exists for the model pair in use, editing this
+    # number changes NOTHING. To overrule a measurement, supersede it with another measurement, or
+    # clear ControlMapTh on the winning row.
+    #
+    # THIS VALUE IS READ ONLY WHEN THE NAME IS ACTUALLY PRESENT in the environment or an env file.
+    # control_mapping._min_score keys on `"control_map_min_score" in model_fields_set`, which
+    # records whether a value was SUPPLIED, not whether it differs from the default — so a live
+    # `TSG_CONTROL_MAP_MIN_SCORE=60.0` line counts even though 60.0 IS the default below, and
+    # commenting that same line out does NOT leave the cutoff at 60.0. Editing the default below
+    # therefore changes nothing for any deployment that leaves the line commented.
+    #
+    # NO RESTART AND NO REDEPLOY, in either direction: _min_score runs once per mapping PASS, never
+    # once at boot, and is deliberately not memoized, so a newly stored cutoff governs the next
+    # pass. KEYED TO THE MODEL PAIR: a cutoff measured under different embedding/reranker models is
+    # invisible and falls through to this field, which is why a UAT measurement governs production
+    # only while both model names match. ABSENCE IS NULL, NOT ZERO: a measurement whose retrieval
+    # faulted ends `no_signal` with ControlMapTh left NULL and falls through to this field, while a
+    # stored 0.0 is a real measured answer that now beats it — a loud, reviewable outcome under the
+    # calibrated_for_control_mapping origin rather than a silent one. WHICH BRANCH ANSWERED is on
+    # every controls_mapped audit row, as effective_min_score and effective_min_score_origin, so an
+    # operator who edits this line and sees no change reads why in one field instead of guessing.
     control_map_min_score: float = Field(60.0, ge=0.0, le=100.0)
 
     # TSG_CONTROL_MAP_SHORTLIST_K — controls reaching the RERANKER per scenario. SEPARATE from
@@ -415,21 +516,116 @@ class Settings(BaseSettings):
     # Cost: remote reranker = payload per request; local = CPU work scales ~linearly with K.
     control_map_shortlist_k: int = Field(60, ge=1)
 
+    # TSG_CONTROL_MAP_MIN_COUNT — the MINIMUM number of controls a scenario should end up with:
+    # a TARGET to reach, never a cap. Too few clear control_map_min_score, the best remaining
+    # matches backfill up to this number (never below the floor control_map_backfill_ratio sets);
+    # the threshold itself is never lowered, the same shape as threat_relevance_threshold's backfill.
+    # ONE SPELLING ONLY. TSG_REMEDIATION_CONTROL_MIN_COUNT — the remediation-time top-up floor this
+    # generalizes from one endpoint to the whole of Step 4 — was an alias here and is now RETIRED:
+    # it is in RETIRED_ENV_NAMES and refuses the boot rather than being ignored.
+    control_map_min_count: int = Field(5, ge=1)
+    # TSG_CONTROL_MAP_MAX_COUNT — SAFETY CEILING only, not a target: mapping stops here however
+    # many controls still score, so one scenario cannot attach half the library. Nothing pads a
+    # scenario up to it. Keep control_map_shortlist_k at or above it (boot validator below).
+    # ONE SPELLING ONLY. TSG_CONTROL_MAP_TOP_K was an alias here for one release and is now RETIRED —
+    # a name saying "top 5" that supplied a ceiling of 25 could not be documented safe, so it refuses
+    # the boot instead (RETIRED_ENV_NAMES, and the tombstone above control_map_min_score).
+    control_map_max_count: int = Field(25, ge=1)
+    # TSG_CONTROL_MAP_BACKFILL_RATIO — the HARD FLOOR under backfill, as a FRACTION of the cutoff
+    # ACTUALLY IN FORCE. A match scoring below the resolved floor may never be added to reach
+    # control_map_min_count, whatever the shortfall: backfill trades precision for coverage, and
+    # without a floor it would attach whatever ranked last — a control with no relation to the
+    # scenario, presented like a real match.
+    #
+    # A RATIO, NOT AN ABSOLUTE, and that is the whole point. The cutoff is resolved at RUNTIME from
+    # one of three sources, in this order (control_mapping._min_score: the stored
+    # Grounding_Calibration_Run.ControlMapTh for this model pair, else the pinned env value, else the
+    # borrowed threat-grounding threshold), so an absolute floor silently changes meaning every time
+    # that number moves: at
+    # cutoff 60 the old 25.0 was 42% of the cutoff, at cutoff 30 it was 83%, and at any cutoff at or
+    # below 25 the backfill band was EMPTY and control_map_min_count silently unreachable while
+    # looking configured. Expressed as a fraction the band can never vanish, which is why the bounds
+    # below are `gt=0.0, lt=1.0` — those two bounds ARE the guarantee, enforced at boot and covering
+    # all three cutoff sources, which is more than any comparison against control_map_min_score can
+    # do (see _validate_control_map_counts).
+    #
+    # 0.42 reproduces the previous absolute 25.0 against the 60.0 default cutoff (25/60 = 0.4167),
+    # so no deployment's behaviour moves by more than rounding. The resolved absolute is recorded in
+    # every controls_mapped audit row beside the cutoff and its origin.
+    control_map_backfill_ratio: float = Field(0.42, gt=0.0, lt=1.0)
+    # TSG_CONTROL_MAP_BACKFILL_MIN_SCORE — DEPRECATED absolute override of the ratio above, kept so
+    # existing .env files keep loading and an operator who pinned a number keeps it. Honoured ONLY
+    # when the name is actually present in the environment (the model_fields_set idiom
+    # control_map_min_score documents above), and ONLY while it lands strictly below the cutoff in
+    # force — otherwise control_mapping._backfill_floor logs and falls back to the ratio rather than
+    # obey a number that empties the band. The default below is therefore NOT the floor any
+    # deployment uses; editing it changes nothing.
+    #
+    # `gt=0.0`, NOT `ge=0.0`, AND THAT ASYMMETRY WITH THE RATIO WAS THE BUG. This is the deprecated
+    # spelling of a FLOOR, so 0 is not a small floor, it is NO floor — and because 0.0 is strictly
+    # below every possible cutoff, _backfill_floor honours it on the "genuinely below the cutoff"
+    # branch, which is the branch that does NOT log. `TSG_CONTROL_MAP_BACKFILL_MIN_SCORE=0` is a
+    # natural reading of "the lowest score a control may have" for an operator who wants maximum
+    # coverage, and it silently deleted the guarantee the ratio's `gt=0.0, lt=1.0` bounds exist to
+    # make: backfill then attached the worst-ranked reranked controls up to control_map_min_count
+    # with no relevance requirement at all, presented to a reviewer exactly like a real match, and
+    # the run was byte-identical in the logs to a clean one. The replacement knob cannot express
+    # "no floor"; the deprecated one it out-votes must not be able to either. Refusing at boot is
+    # the only place that cannot be missed — the alternative, ignoring the 0 at runtime, hands an
+    # operator who typed a number a different number and a log line they are not reading.
+    control_map_backfill_min_score: float = Field(25.0, gt=0.0, le=100.0)
+    # DELETED, deliberately: control_map_itot_mismatch_penalty and control_map_domain_match_boost.
+    # Both were shipped, range-validated and documented as SCORE MULTIPLIERS, and read by NO code.
+    # IT/OT mismatch and domain match are applied by control_relevance._rank_candidates as a SORT
+    # KEY (itot_demoted, then not domain_preferred, then -score) which never touches a score, so an
+    # operator who set either got silence. They cannot simply be wired up either: a boost that
+    # LIFTS a score can carry a control over control_map_min_score, and domain similarity alone
+    # must not make a control applicable. Re-adding them means re-opening that design decision.
+
+    # TSG_REMEDIATION_CONTROL_TOP_UP_ENABLED — every FIRST plan request maps the scenario it is
+    # about up to at least control_map_min_count controls and never past control_map_max_count
+    # (nearest library matches when none clear control_map_min_score) before planning. Both plan
+    # routes, both kinds of scenario: POST /v1/remediation-plans and the path-based
+    # POST .../scenarios/{scenario_id}/treatment-plan are the same call. A REGENERATE tops up only a
+    # scenario with no controls at all, so a first attempt that matched nothing can be repaired by
+    # asking again without changing scenarios that already have controls. A manual scenario saved
+    # WITHOUT mapped_controls is mapped here the same way an AI one is; a manual scenario carrying
+    # the person's OWN controls is never re-mapped, replaced or added to, however few it has. An AI
+    # scenario whose Step-4 mapping has not settled is mapped at launch and stamped in the same
+    # transaction as its rows — the stamp follows the rows, so a fail-open leaves it for the sweep.
+    remediation_control_top_up_enabled: bool = True
+    # DELETED, deliberately: remediation_control_min_count, AND ITS ONLY ENV SPELLING
+    # TSG_REMEDIATION_CONTROL_MIN_COUNT. The field was unreachable from the environment and read by
+    # nothing, because that spelling was an AliasChoices entry on control_map_min_count above. The
+    # spelling has since been RETIRED too — it is in RETIRED_ENV_NAMES at the top of this file and
+    # REFUSES THE BOOT, naming TSG_CONTROL_MAP_MIN_COUNT, because a name kept alive as an alias is a
+    # name nobody migrates and a name deleted quietly is a setting silently lost. Do not re-add the
+    # field, and do not re-add the alias, to "restore" either.
+
     # TSG_CONTROL_MAP_SWEEP_INTERVAL_SECONDS — retry-queue drain cadence (tsg.map_controls_sweep
     # is the "next run" for outputs mapping deliberately left unstamped). Ticking faster than
     # stage_lease_seconds buys nothing. MUST be > 0 — a Celery beat "schedule" is seconds-between-
     # runs, so 0 does not mean "off", it means "run continuously" (a busy-loop hammering the DB/LLM
     # on every beat tick). Use TSG_CONTROL_MAP_SWEEP_ENABLED=false to turn the sweep off instead.
     control_map_sweep_interval_seconds: float = Field(300.0, gt=0)
-    # TSG_CONTROL_MAP_SWEEP_ENABLED — on/off switch for the beat-scheduled retry sweep
-    # (tsg.map_controls_sweep). Off = the beat entry is not registered at all — outputs left
-    # unstamped by map_controls' "leave it for the next run" paths simply never get a next run
-    # until this is turned back on. There is NO API route that drains the queue: an earlier
-    # version of this comment promised one ("or the endpoint is called directly/manually") and
-    # none exists — the only manual path is
+    # TSG_CONTROL_MAP_SWEEP_ENABLED — on/off switch for the SCHEDULED retry sweep
+    # (tsg.map_controls_sweep). Off = outputs left unstamped by map_controls' "leave it for the
+    # next run" paths get no AUTOMATIC next run until this is turned back on.
+    #
+    # It gates beat's TICK, not the task. The beat entry is registered unconditionally and passes
+    # kwargs={"scheduled": True}; map_controls_sweep_task declines only for that caller. The value
+    # is therefore re-read every tick, and turning it back on needs only the WORKER restarted —
+    # never beat, whose schedule is built once at import, which is exactly what made reading this
+    # flag inside _build_beat_schedule a switch that did not switch.
+    #
+    # BOTH manual drains work regardless of this setting, by construction — they leave `scheduled`
+    # at its default:
+    #   POST /v1/tsg/control-map/sweep   (admin key; this route exists as of 2026-09)
     #   celery -A app.pipeline.celery_app.celery_app call tsg.map_controls_sweep
-    # on a worker host. celery_app._init_worker warns at boot whenever this is off, because a
-    # comment is the wrong place to keep a fact an operator needs while reading logs.
+    # Gating the task itself instead made both of them silent no-ops in the one state they exist
+    # for — hence the parameter, rather than a second check inside each caller.
+    # celery_app._init_worker warns at boot whenever this is off, because a comment is the wrong
+    # place to keep a fact an operator needs while reading logs.
     # No unprefixed alias, deliberately: its sibling control_map_sweep_interval_seconds has
     # none, so accepting a bare CONTROL_MAP_SWEEP_ENABLED here taught operators a spelling that
     # SILENTLY fails on the interval (extra="ignore"). Both now follow env_prefix="TSG_".
@@ -690,7 +886,9 @@ class Settings(BaseSettings):
     # on first). Read once at import — worker restart to change.
     admin_embedding_max_retries: int = Field(10, ge=0)
 
-    # TSG_ACCEPT_NAMED_IN_MESSAGE — offending ids named in the human-readable accept 404 message.
+    # TSG_ACCEPT_NAMED_IN_MESSAGE — when an accept/reject request is refused because some selected
+    # scenarios can't be decided, how many of them the 404 message names individually; the rest
+    # read "and N more". Wording only — never changes what is accepted.
     accept_named_in_message: int = Field(3, ge=1)
 
 
@@ -699,6 +897,48 @@ class Settings(BaseSettings):
     max_proposal_chars: int = Field(3500, ge=1)
 
     # --- Boot validators: coupled-setting invariants (raise = refuse to start) ---------------
+
+    # REFUSE a RETIRED_ENV_NAMES spelling. Read that table's comment for WHY a retired name must stop
+    # the boot rather than be ignored; this is WHERE, and the where is the load-bearing part.
+    #
+    # IT MUST BE `mode="before"` AND IT MUST READ os.environ. The obvious shape — an `mode="after"`
+    # check against model_fields_set, the idiom several settings here already use — CANNOT WORK, and
+    # fails in the direction that looks like success. A retired name has no field and no alias, so
+    # pydantic-settings' EnvSettingsSource never looks it up: that source iterates the MODEL'S FIELDS
+    # and asks the environment for each one, it does not iterate the environment. The name therefore
+    # reaches neither model_fields_set nor model_extra, and a check on either passes happily while
+    # TSG_CONTROL_MAP_TOP_K=5 sits in the pod's Secret. os.environ is the only place a real boot's
+    # retired name exists.
+    #
+    # THE INCOMING VALUES DICT IS CHECKED TOO, for the OTHER supply route: a LIVE line in the env
+    # file. That never reaches os.environ — pydantic reads the file itself — but DotEnvSettingsSource
+    # does pass an unrecognised TSG_-prefixed line through to validation as an extra (prefix stripped,
+    # lower-cased), where extra="ignore" then drops it. So the two sources are disjoint and both are
+    # needed: one covers the Secret and the shell, the other covers the file.
+    #
+    # `mode="before"` also means this runs FIRST, ahead of every field coercion and every other
+    # validator, so an operator holding a retired name is told THAT, not told about some downstream
+    # consequence of the default that replaced it.
+    #
+    # Pinned by tests/test_deprecated_control_map_env_aliases.py, which drives REAL environment
+    # variables. A kwargs probe cannot pin this: populate_by_name=True means Settings(field=…) never
+    # consults an alias or the environment at all, so such a probe passes whatever this validator does.
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_retired_env_names(cls, values: Any) -> Any:
+        supplied = {name.upper() for name in os.environ}
+        if isinstance(values, dict):   # env-file extras + any direct kwargs, prefix stripped
+            supplied |= {n.upper() for n in values} | {f"TSG_{n.upper()}" for n in values}
+        retired = sorted(RETIRED_ENV_NAMES.keys() & supplied)
+        if retired:
+            raise ValueError(
+                "; ".join(f"{name} is RETIRED and supplies nothing — use {RETIRED_ENV_NAMES[name]}"
+                          for name in retired)
+                + ". Refusing to start rather than ignore it: an env name this model does not "
+                "declare is discarded silently (extra='ignore'), so the value you believe you "
+                "pinned would revert to its code default with no error and no log line. Move the "
+                "value to the replacement above, then delete the retired name.")
+        return values
 
     # embed() errors (never truncates) over the limit, which would lose the whole batch.
     @model_validator(mode="after")
@@ -721,17 +961,52 @@ class Settings(BaseSettings):
                 "and overlapping OTX walks would double-work the shared page cursor.")
         return self
 
-    # One scenario-text query per output draws its top-K from a single reranked shortlist, so a
-    # shortlist smaller than top_k silently caps every scenario below the configured count.
+    # One scenario-text query per output draws every control it keeps from a single reranked
+    # shortlist, so a shortlist smaller than the count silently caps every scenario below it.
+    #
+    # THE BACKFILL FLOOR IS NO LONGER CHECKED HERE. config.py cannot import pipeline code
+    # (layering) and the cutoff really applied is resolved at runtime from one of three sources, so
+    # a boot comparison could only ever bound one of them — see the note where that check used to
+    # be, at the end of this validator.
     @model_validator(mode="after")
-    def _validate_shortlist_covers_control_top_k(self) -> Settings:
-        if self.control_map_shortlist_k < self.control_map_top_k:
+    def _validate_control_map_counts(self) -> Settings:
+        # DELETED, deliberately: the `control_map_shortlist_k >= control_map_top_k` branch that
+        # stood first here. control_map_top_k is gone (see the note where it was declared) — it was
+        # read by nothing else, so this branch bounded the shortlist against a number no operator
+        # could change and no code consulted, and it refused coherent configurations on that basis.
+        # Worse, being first and naming control_map_shortlist_k in its message, it satisfied the
+        # only `match=` this validator had, so the live ceiling branch below shipped unpinned. Both
+        # remaining branches now have a test that names the field it actually guards.
+        if self.control_map_shortlist_k < self.control_map_max_count:
             raise ValueError(
                 f"control_map_shortlist_k ({self.control_map_shortlist_k}) must be >= "
-                f"control_map_top_k ({self.control_map_top_k}) — one scenario-text query per "
-                "output draws its top-K controls from a single shortlist, so a smaller "
-                "shortlist silently caps every scenario's mapped controls below the "
-                "configured count.")
+                f"control_map_max_count ({self.control_map_max_count}) — a scenario can only "
+                "keep controls that were reranked, so a shortlist narrower than the ceiling "
+                "makes the ceiling unreachable and caps every scenario at the shortlist width "
+                "instead, silently.")
+        if self.control_map_min_count > self.control_map_max_count:
+            raise ValueError(
+                f"control_map_min_count ({self.control_map_min_count}) must be <= "
+                f"control_map_max_count ({self.control_map_max_count}) — the minimum is a TARGET the "
+                "backfill tries to reach and the maximum is a hard ceiling, so a minimum above it is "
+                "a target that can never be met and every scenario silently stops at the ceiling. "
+                "Raise TSG_CONTROL_MAP_MAX_COUNT (and keep TSG_CONTROL_MAP_SHORTLIST_K at or above "
+                "it), or lower TSG_CONTROL_MAP_MIN_COUNT. The way this used to be reached by "
+                "accident — an inherited TSG_CONTROL_MAP_TOP_K line aliasing the MAXIMUM back down "
+                "to 5 while the minimum was raised — can no longer happen: that name is retired and "
+                "refuses the boot outright (RETIRED_ENV_NAMES).")
+        # DELETED, deliberately: the `control_map_backfill_min_score >= control_map_min_score`
+        # check that used to stand here. It could only bound the EXPLICITLY-PINNED cutoff, and the
+        # cutoff now has THREE sources, in this order (control_mapping._min_score: the stored
+        # Grounding_Calibration_Run.ControlMapTh for this model pair, else the pinned env value, else
+        # the borrowed threat-grounding threshold) — two of which config.py cannot see at all, and
+        # the one it CAN see is no longer even the first consulted. A check covering one of three
+        # sources reads like a guarantee and is not one: it passed happily while a stored
+        # measurement moved the cutoff to 20 and left the band empty. The guarantee is now
+        # structural instead, in two places that DO cover every source: control_map_backfill_ratio's
+        # `gt=0.0, lt=1.0` bounds (a fraction of any positive cutoff is strictly below it), and
+        # control_mapping._backfill_floor, which resolves the floor from whichever cutoff is really
+        # in force and refuses a deprecated absolute override that would empty the band.
         return self
 
     # Unset embedding/reranker providers follow llm_provider=litellm_proxy; explicit values win.

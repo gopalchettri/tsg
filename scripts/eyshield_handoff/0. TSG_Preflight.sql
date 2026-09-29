@@ -42,15 +42,22 @@ SELECT 'Session',
 -- RCSI: the API and every worker REFUSE TO START without it. TSG_Core.sql
 -- enables it, but that forces every other session off the database — if this
 -- says OFF, schedule a maintenance window.
+-- The detail text names the EXACT statement TSG_Core.sql runs. It used to say
+-- SET SINGLE_USER, which stopped being true when that three-statement dance was
+-- replaced by the single atomic ALTER (see TSG_Core.sql Section 0): a preflight
+-- that describes a command the install no longer runs sends the operator to
+-- check the wrong thing.
 INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
 SELECT 'Database',
        CASE WHEN d.is_read_committed_snapshot_on = 1 THEN 'PASS' ELSE 'WARN' END,
        'Read Committed Snapshot Isolation (RCSI) enabled',
        CASE WHEN d.is_read_committed_snapshot_on = 1
             THEN N'Already ON — TSG_Core.sql will skip the change entirely.'
-            ELSE N'OFF. TSG_Core.sql will run ALTER DATABASE SET SINGLE_USER WITH ROLLBACK '
-               + N'IMMEDIATE to enable it, which DISCONNECTS every other session and rolls '
-               + N'back in-flight work. MAINTENANCE WINDOW REQUIRED.'
+            ELSE N'OFF. TSG_Core.sql will run ALTER DATABASE CURRENT SET '
+               + N'READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE to enable it, which '
+               + N'DISCONNECTS every other session and rolls back in-flight work. It never '
+               + N'takes the database SINGLE_USER, so a failure leaves the database exactly '
+               + N'as it is now. MAINTENANCE WINDOW REQUIRED.'
        END
 FROM sys.databases d WHERE d.database_id = DB_ID();
 
@@ -188,25 +195,33 @@ DECLARE @tsg_existing int = (
         N'Config_Tuning', N'Control_Library',
         N'Control_Library_Standard_Map', N'Control_Standard', N'Identified_Threat',
         N'Prompt_Log', N'Risk_Treatment_Plan', N'Scenario_Audit', N'Scenario_Session',
-        N'Scenario_Library', N'Grounding_Calibration_Run',
+        N'Grounding_Calibration_Run',
         N'Scoped_Threat', N'Subsystem_Stage_State',
         N'Threat_Actor', N'Threat_Catalogue', N'Threat_Catalogue_Category_Map',
         N'Threat_Category', N'ThreatType_ThreatActor_Map',
         N'Threat_Scenario_Control_Map', N'Threat_Scenario', N'Threat_Scenario_Output',
         N'Threat_Type'));
--- 22 names, at most 21 present at once: a database carries EITHER
+-- 21 names, at most 20 present at once: a database carries EITHER
 -- Threat_Scenario_Output OR the renamed Threat_Scenario, never both. This runs
--- before TSG_Core.sql renames it, so 21 is the correct expected count.
+-- before TSG_Core.sql renames it, so 20 is the correct expected count.
+--
+-- One name left this list with the feature it belonged to: the removed
+-- scenario-reuse table (2026-08-29). TSG_Core.sql no longer creates it and
+-- "6. TSG_Verify.sql" no longer requires it, so counting it here would make every
+-- correct UPGRADE read as PARTIAL. This is a CENSUS -- "is this a fresh database or
+-- an existing one" -- and deliberately not a completeness list; the completeness
+-- check belongs to "6. TSG_Verify.sql", whose table list is pinned to the object
+-- model by tests/test_schema_sync.py.
 
 INSERT INTO #tsg_preflight (Category, Status, Check_, Detail)
 SELECT 'Install type', 'INFO',
        CASE WHEN @tsg_existing = 0 THEN N'FRESH INSTALL — no TSG tables present'
-            WHEN @tsg_existing = 21 THEN N'UPGRADE — all 21 TSG tables already present'
+            WHEN @tsg_existing = 20 THEN N'UPGRADE — all 20 TSG tables already present'
             ELSE N'PARTIAL — some TSG tables present' END,
-       N'Found ' + CAST(@tsg_existing AS nvarchar(10)) + N' of 21 TSG tables. '
+       N'Found ' + CAST(@tsg_existing AS nvarchar(10)) + N' of 20 TSG tables. '
      + CASE WHEN @tsg_existing = 0
             THEN N'Run all five install scripts in order.'
-            WHEN @tsg_existing = 21
+            WHEN @tsg_existing = 20
             THEN N'Every CREATE is guarded by IF OBJECT_ID(...) IS NULL, so re-running is safe '
                + N'and applies any new columns via the guarded ALTERs.'
             ELSE N'A previous install may have stopped part-way. Re-running the scripts in order '

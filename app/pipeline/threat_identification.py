@@ -193,8 +193,13 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
 def _build_threat_records(tid: str, sid: str, tenant: str, ss: int, ptype: str | None, pcat: str | None,
                         pname: str | None, gr: grounding.GroundingResult, entity_id: str | None,
                         user_id: str | None, generic_name: str | None = None,
-                        category_id: int | None = None) -> tuple[dict, dict]:
-    """Build the database row and the pipeline summary for one threat."""
+                        category_id: int | None = None, ai_generated: bool | None = None,
+                        type_ai_generated: bool | None = None) -> tuple[dict, dict]:
+    """Build the database row and the pipeline summary for one threat.
+
+    `ai_generated` / `type_ai_generated` override the catalogue/type-derived provenance for a
+    caller that KNOWS who wrote the threat — the hand-written save passes False for both, so a
+    person's threat is never reported as the AI's whatever the library lookup returned."""
     row = {
         "ThreatID": tid, "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
         "SubsystemID": ss,
@@ -218,11 +223,13 @@ def _build_threat_records(tid: str, sid: str, tenant: str, ss: int, ptype: str |
         # Immutable provenance, set once here (the ONLY threat-row writer): True <=> not in
         # the catalogue at identification. Promotion stamps ThreatCatalogueID later but
         # must not rewrite history by touching this.
-        "IsThreatAIGenerated": gr.catalogue_id is None,
+        "IsThreatAIGenerated": (gr.catalogue_id is None if ai_generated is None
+                                else ai_generated),
         # Same rule, type-level: True <=> the TYPE was not a library match at identification.
         # A separate fact from the catalogue-level one above — promotion mints ThreatTypeID
         # later but must not rewrite history by touching this either.
-        "IsThreatTypeAIGenerated": gr.type_id is None,
+        "IsThreatTypeAIGenerated": (gr.type_id is None if type_ai_generated is None
+                                    else type_ai_generated),
         "GroundingStatus": gr.status, "GroundingScore": gr.score,
         # WHICH cutoff produced GroundingStatus. Without it, a 78 graded `verified` under the
         # untuned default 75.0 is indistinguishable from one graded under a measured 86.25 — so
@@ -340,7 +347,10 @@ def _classify_rejections(proposals: list, cats: list[str]) -> tuple[list, dict[s
 
     Pure, so the classification is testable without driving a whole gap-generation round.
     """
-    usable, reasons, offenders = [], {}, set()
+    # `reasons` annotated because mypy cannot infer a dict from an empty literal (the sibling
+    # list and set ARE inferred, from the .append/.add below). The signature already says it.
+    reasons: dict[str, int] = {}
+    usable, offenders = [], set()
     for p in proposals:
         if not _usable_proposal(p):
             reason = "malformed"
@@ -1056,7 +1066,9 @@ def _build_fanout_rows(r: _IdentificationRound, subsystems: list[dict], grid_sub
             # A generated threat that GROUNDED to a library type inherits that type's
             # gates; one that grounded to nothing has no narrowing evidence at all, so it
             # reaches everything. Same fail-open rule, applied to weaker evidence.
-            units = gen_attribution.get(t.get("threat_type_id"), grid_subsystem_ids)
+            _tid = t.get("threat_type_id")
+            units = (gen_attribution.get(_tid, grid_subsystem_ids)
+                     if _tid is not None else grid_subsystem_ids)
         for unit in units:
             fanout_rows.append({**row, "ThreatID": guid(), "SubsystemID": unit})
     return fanout_rows

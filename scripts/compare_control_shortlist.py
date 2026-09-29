@@ -17,6 +17,18 @@ It answers three things:
     python scripts/compare_control_shortlist.py --session <id>
     python scripts/compare_control_shortlist.py --k 30 --k 15   # model both widths
 
+THE QUERY MUST BE PRODUCTION'S, or this compares the wrong text. A shortlist width is only
+meaningful for the query that is actually sent: both legs rank against it (BM25 tokenizes it, the
+cosine leg embeds it), so measuring recall on a shorter string answers a question nobody asked.
+This script used to own its own copy of the scenario SELECT and the per-row assembly, and that copy
+drifted TWICE: first onto `control_mapping.collect_control_query`, a wrapper that drops the threat
+category, the actors, the risk statement and all asset and system context; then onto a stale
+positional call to `control_mapping._blob` after that helper gained a required keyword. Both drifts
+needed the copy to exist, so it is gone. Queries now come from
+`grounding.control_map_scenario_queries` — the one function the admin calibration route and
+scripts/measure_control_map_scores.py also measure with, so none of the three can measure text the
+others do not.
+
 READ-ONLY against SQL Server (SELECTs only). It DOES populate the shared MongoDB embedding
 cache through the normal embeddings path, exactly as a real run would — a cache fill, not a
 mutation. It runs NO reranker, so it is cheap: the point is to compare the candidate sets that
@@ -35,8 +47,14 @@ from sqlalchemy import text
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.db.engine import db_session
-from app.pipeline import control_mapping, embeddings, grounding, hybrid_search
+from app.pipeline import embeddings, grounding, hybrid_search
 from app.pipeline.llm import get_llm
+
+#: `control_map_scenario_queries` takes a row limit because its other two callers sample the
+#: newest N scenarios across the whole database. Here the SELECT is already narrowed to ONE
+#: session, and a session holds at most _MAX_BATCH (50) subsystems' worth of scenarios, so this
+#: is 'no limit' spelled as a number rather than a magic one that reads like a sample size.
+_EVERY_SCENARIO_IN_THE_SESSION = 10_000
 
 
 def _legs(llm, query: str, rows: list[dict], s, ck: int) -> tuple[list[int], list[int]]:
@@ -93,13 +111,22 @@ def main() -> int:
         if not sid:
             print("no session with scenarios found")
             return 2
-        rows = sess.execute(text("""
-            SELECT ts.ScenarioID, ts.ScenarioJSON, it.ThreatName, it.ThreatType
-            FROM Threat_Scenario ts
-            LEFT JOIN Scoped_Threat st ON st.ScopedThreatID = ts.ScopedThreatID
-            LEFT JOIN Identified_Threat it ON it.ThreatID = st.ThreatID
-            WHERE ts.SessionID = :sid AND ts.ScenarioJSON IS NOT NULL"""),
-            {"sid": sid}).fetchall()
+        # The queries come from grounding.control_map_scenario_queries — the SAME function the admin
+        # calibration route and measure_control_map_scores.py measure with. This script used to own a
+        # THIRD copy of that SELECT and its per-row assembly, and the copy is the defect: the module
+        # docstring records a copy that went on calling a builder the pipeline had moved off, so the
+        # comparison ranked against a query production no longer sends. A leading threat identity is
+        # worth 1.9 -> 60.6 on a real scenario — far more than the recall gap between the shortlist
+        # widths this script exists to choose between, so the copy could have picked the wrong width
+        # while looking rigorous. It then broke a SECOND time when control_mapping._blob gained a
+        # required `column=` keyword and only the pipeline's own caller was updated.
+        #
+        # One behaviour change rides along with sharing, and it is a correction: the shared SELECT
+        # excludes SUPERSEDED scenarios, where this copy filtered on ScenarioJSON IS NOT NULL alone.
+        # A regenerated scenario's old version still owns map rows, so counting it measured recall
+        # against a mapping production had already replaced.
+        queries = grounding.control_map_scenario_queries(
+            sess, _EVERY_SCENARIO_IN_THE_SESSION, s.max_embed_chars, session_id=sid)
         # What is mapped TODAY — the recall baseline a reviewer can already see on screen.
         stored: dict[str, set[int]] = {}
         for scenario_id, cid in sess.execute(text("""
@@ -117,18 +144,17 @@ def main() -> int:
     if not candidates:
         print("control library returned no candidates — nothing to compare")
         return 2
-    queries = []
-    for scenario_id, blob, tname, ttype in rows:
-        q = control_mapping.collect_control_query(blob, tname, ttype)
-        if q:
-            queries.append((str(scenario_id), q))
     if not queries:
         print("no groundable scenarios in that session")
         return 2
 
     llm = get_llm()
     print(f"session {sid}  |  {len(queries)} scenarios  |  {len(candidates)} controls in pool")
-    print(f"controls already mapped and stored: {sum(len(v) for v in stored.values())}\n")
+    print(f"controls already mapped and stored: {sum(len(v) for v in stored.values())}")
+    # Printed, not claimed: both legs rank against this exact string, so an operator reading a
+    # recall number is entitled to see the text it was measured on.
+    print("query: production's own (grounding.control_map_scenario_queries), e.g.")
+    print(f"  [{queries[0][0][:8]}] {queries[0][1][:200]}\n")
 
     for ck in widths:
         u_pairs = r_pairs = kept = lost = 0

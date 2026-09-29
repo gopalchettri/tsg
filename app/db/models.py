@@ -368,6 +368,23 @@ class Grounding_Calibration_Run(Base):
     RerankerModel: Mapped[str | None] = mapped_column(Unicode(500))
     Forced: Mapped[bool] = mapped_column(Boolean, default=False)   # re-measured over an existing run
     MatchTh: Mapped[float | None] = mapped_column(Float)           # the cutoff; NULL unless success
+    # The SAME kind of measured cutoff for CONTROL MAPPING, which asks a different question: a
+    # scenario PARAGRAPH against the control library, not a short threat label against the threat
+    # library. Different text lengths and a different corpus put the scores on a different scale,
+    # so one number cannot serve both. Everything around it — the model pair it is keyed by, the
+    # provenance columns above, newest-wins — is identical, which is why this is a column here and
+    # not a second table. Keyed by MODEL PAIR, not environment, so one measurement covers UAT and
+    # Prod while dev's different models land on their own row and can never contaminate them.
+    #
+    # THE NON-NULL COLUMN IS THE DISCRIMINATOR. A grounding sweep leaves ControlMapTh NULL; a
+    # control-map sweep leaves MatchTh NULL. So there is no "kind" column or enum to keep in sync,
+    # and grounding.latest_successful_run's existing `Status = success AND MatchTh IS NOT NULL`
+    # filter keeps working untouched — a control-map row is already invisible to it. A control-map
+    # reader is that filter's mirror image, on ControlMapTh IS NOT NULL.
+    #
+    # NULLABLE IS REQUIRED, not a convenience: every row already in the table was written before
+    # this measurement existed, and no backfill can invent a number nobody measured.
+    ControlMapTh: Mapped[float | None] = mapped_column(Float)      # NULL on a grounding-only run
     Quality: Mapped[float | None] = mapped_column(Float)           # Youden's J at MatchTh, 0-1
     NegativesCount: Mapped[int | None] = mapped_column(Integer)
     PositivesCount: Mapped[int | None] = mapped_column(Integer)
@@ -473,10 +490,18 @@ class Threat_Type(Base):
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
     # Provenance: 'functional_team_excel' (curated) | 'ai_auto_promoted' | an import tag
-    # (intel.library_import.SOURCE_TAGS) | 'manual' (CRUD API). Added by a separate ALTER
-    # further down scripts/Threat_library.sql, not this table's own CREATE block (which also
-    # lives there, moved from scripts/TSG_Core.sql 2026-08-04) — see test_schema_sync's
-    # _COLUMN_DEPLOYED_SEPARATELY.
+    # (intel.library_import.SOURCE_TAGS) | 'manual' (CRUD API). Added by a guarded ALTER
+    # further down scripts/eyshield_handoff/"2. Threat_library.sql", not by this table's own
+    # CREATE block (which also lives there, moved from TSG_Core.sql 2026-08-04). That is fully
+    # covered: test_schema_sync's _ddl_columns() unions the CREATE bodies with the guarded
+    # ALTER ... ADDs, so the column guard already sees it.
+    # NO ALLOWLIST ENTRY IS INVOLVED. This note used to point the reader at
+    # test_schema_sync's _COLUMN_DEPLOYED_SEPARATELY, which is an EMPTY frozenset whose own
+    # comment says every entry in it is a hole in the guard — so a developer whose new column
+    # failed the guard was being steered to punch a hole instead of writing the DDL. Nothing
+    # here is exempt from anything;
+    # test_schema_sync.py::test_no_model_comment_claims_an_empty_allowlist_exempts_it keeps
+    # this comment and that frozenset from drifting apart again.
     Source: Mapped[str | None] = mapped_column(Unicode(50))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
@@ -492,8 +517,11 @@ class Threat_Actor(Base):
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
     # Same provenance vocabulary as Threat_Type.Source, but declared directly in this table's own
-    # CREATE block in scripts/Threat_library.sql (moved from scripts/TSG_Core.sql 2026-08-04) —
-    # so unlike the other two it needs no _COLUMN_DEPLOYED_SEPARATELY entry.
+    # CREATE block in scripts/eyshield_handoff/"2. Threat_library.sql" (moved from TSG_Core.sql
+    # 2026-08-04) rather than added by a later guarded ALTER. That is the only difference; it is
+    # NOT an exemption, and neither are the other two. (This line used to read "so unlike the
+    # other two it needs no _COLUMN_DEPLOYED_SEPARATELY entry", which asserted that Threat_Type
+    # and Threat_Catalogue HAD such entries. They never did: that frozenset is empty.)
     Source: Mapped[str | None] = mapped_column(Unicode(100))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))
@@ -513,7 +541,14 @@ class Threat_Catalogue(Base):
     # (sector logic removed 2026-08, user instruction).
     IsActive: Mapped[bool] = mapped_column(Boolean, default=True)
     IsDeleted: Mapped[bool] = mapped_column(Boolean, default=False)
-    # See Threat_Type.Source above — same provenance tracking, same script adds it.
+    # See Threat_Type.Source above — same provenance tracking, same script adds it by guarded
+    # ALTER, same absence of any allowlist entry. Unicode(100) here where Threat_Type.Source is
+    # Unicode(50): the numbered handoff script declared this one at nvarchar(50) while the
+    # consolidated script, the generated package and this line all said 100, so one provenance
+    # tag over 50 characters would have failed on a database built by that path and succeeded on
+    # the other two. Fixed in the script;
+    # test_schema_sync.py::test_every_deploy_path_declares_the_same_column_shapes now compares
+    # every column's type, length, scale and nullability across the deploy paths.
     Source: Mapped[str | None] = mapped_column(Unicode(100))
     CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     CreatedBy: Mapped[str | None] = mapped_column(Unicode(200))

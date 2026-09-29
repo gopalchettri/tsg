@@ -88,7 +88,25 @@ def test_widening_the_control_knob_widens_what_gets_reranked(library):
 
 def test_boot_refuses_a_shortlist_narrower_than_the_controls_it_must_return():
     """The validator has to guard the CONTROL knob now. Checking grounding_shortlist_k would pass
-    while the real limit silently capped every scenario below control_map_top_k."""
+    while the real limit silently capped every scenario below the ceiling it must be able to reach.
+
+    NAMED ON control_map_max_count, DELIBERATELY. This used to read `control_map_top_k=5` and match
+    only on `control_map_shortlist_k` — which every branch of _validate_control_map_counts carries,
+    so it passed on whichever fired first. What fired first was the branch bounding
+    control_map_top_k: a field superseded by the min/max pair and read by nothing else, whose dead
+    check ALSO refused coherent configurations (shortlist 3 with a ceiling of 2, on the grounds that
+    3 < the dead default of 5). Deleting the field left this test green and the live ceiling branch
+    unpinned, which is how one test came to cover a guard it never reached. It names the field it
+    guards now."""
     from app.core.config import Settings
-    with pytest.raises(ValueError, match="control_map_shortlist_k"):
-        Settings(control_map_shortlist_k=2, control_map_top_k=5)
+    with pytest.raises(ValueError, match="control_map_max_count"):
+        Settings(control_map_shortlist_k=2, control_map_max_count=5)
+
+
+def test_boot_accepts_a_narrow_but_coherent_width():
+    """The other half of deleting that dead branch: a shortlist at or above the ceiling is fine,
+    however small both are. The old check refused this — shortlist 3, ceiling 2, minimum 2 — because
+    3 was below a superseded field's default of 5, naming a setting the operator had never set."""
+    from app.core.config import Settings
+    s = Settings(control_map_shortlist_k=3, control_map_max_count=2, control_map_min_count=2)
+    assert (s.control_map_shortlist_k, s.control_map_max_count) == (3, 2)

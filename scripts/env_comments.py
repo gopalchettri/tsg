@@ -408,6 +408,25 @@ COMMENTS: dict[str, str] = {
         milliseconds; running locally on a processor it takes about 2.5 seconds. Expect
         noticeably slower sessions on local.
     """,
+    "TSG_EMBEDDING_BASE_URL": """
+        The address of the embedding service, used only when the embedding provider is set to
+        openai (which covers any OpenAI-compatible endpoint, Azure OpenAI and AI Foundry
+        included).
+
+        Deliberately separate from the main AI endpoint: chat and embeddings routinely live on
+        different resources with different keys, so one shared address would force them onto the
+        same one. Leave it empty on a local or gateway provider.
+
+        There is no default and none is guessed. If the provider is openai and this is blank,
+        startup stops with an error rather than quietly sending embedding work somewhere
+        unintended.
+    """,
+    "TSG_EMBEDDING_API_KEY": """
+        The credential for the embedding service above. Only read when the embedding provider is
+        openai, and separate from the main AI key for the same reason the address is.
+
+        A secret: keep it out of version control and out of any file that gets shared.
+    """,
     "TSG_EMBEDDING_MODEL": """
         Which model turns text into vectors for similarity search. On a local provider this is
         a folder path; through the gateway it is the model's name there.
@@ -620,11 +639,12 @@ COMMENTS: dict[str, str] = {
         This one can also be overridden per session in the Config_Tuning table, with no
         restart — the next session picks up the new value.
     """,
-    "TSG_DEFAULT_RULE_WEIGHT": """
-        Scoping rules add or remove points from a threat's score to decide whether it is worth
-        writing a scenario for. This is how many points a rule contributes when the rule itself
-        does not specify an amount.
-    """,
+    # DELETED, deliberately: TSG_DEFAULT_RULE_WEIGHT. No `Settings` field accepts that name any
+    # more, so this description documented a setting that does nothing — the exact drift this file
+    # exists to end, arriving from the other direction. A stale description is worse than none: the
+    # applier only writes a description above an entry line that already exists, so this one never
+    # reached a file and could not be spotted by reading one. tests/test_env_documents_every_setting
+    # now fails on a key here that matches no setting.
     "TSG_SCOPING_SCORE_THRESHOLD": """
         The score a threat needs to survive scoping and go on to get a scenario. For example
         at 55, a threat scoring 60 passes and one scoring 52 is dropped.
@@ -680,20 +700,45 @@ COMMENTS: dict[str, str] = {
     "TSG_CONTROL_MAP_MIN_SCORE": """
         The score out of 100 a control must reach to be attached to a scenario.
 
-        PIN IT to a real number. Left unset it inherits the threat-matching threshold,
-        which was measured comparing one short label against another. Control matching
-        compares a whole scenario paragraph against a control label, which scores lower by
-        nature. That mismatch once dropped every match and published empty control lists that
-        the API reported as a genuine gap in the library — 7 of 13 scenarios came back with
-        nothing.
+        A STORED MEASUREMENT BEATS THIS LINE. The app looks for one first: the most recent
+        successful control-matching measurement taken for the embedding and reranking models it is
+        running right now. Only when there is none does it read this line, and only when this line
+        is missing too does it fall back to inheriting the threat-matching threshold. The order was
+        inverted on 2026-09-25 by the repo owner's decision — the database is the final say, the
+        file is what runs until the database has an answer — because the number typed here is a
+        guess made before anyone measured the deployment, while the measurement is the answer got
+        by scoring real scenarios against the real control library.
+
+        SET IT ANYWAY. On a first boot nothing has been measured, so this line IS the cutoff, and it
+        is the only thing standing between a new deployment and the inherited threat-matching
+        threshold — which was measured comparing one short label against another, while control
+        matching compares a whole scenario paragraph against a control label and so scores lower by
+        nature. That mismatch once dropped every match and published empty control lists the API
+        reported as a genuine gap in the library: 7 of 13 scenarios came back with nothing.
+
+        AFTER A MEASUREMENT EXISTS, EDITING THIS NUMBER DOES NOTHING for those two models. To change
+        the cutoff then, take another measurement (4.6, and 4.7 to read the result) — the newest one
+        wins — or clear the stored value on the measurement that is winning. Nothing needs a restart
+        in either direction: the cutoff is re-read on every mapping run, so a measurement taken
+        while the app is up applies to the next one.
+
+        A measurement belongs to the two MODELS it was taken on, not to the environment. Swap either
+        model and the stored number becomes invisible and this line is the cutoff again, which is
+        also why a measurement from UAT applies to production only while both model names match.
+
+        A run that found nothing stores nothing rather than storing a zero, so it leaves the cutoff
+        exactly where it was. A measured zero, on the other hand, is a real answer and does win over
+        this line — every control then clears the cutoff, which is meant to be noticed.
+
+        "Present" means the line is LIVE in this file. A live line counts even when it repeats the
+        built-in 60.0, and commenting it out does NOT leave the score at 60.0.
+
+        Which of the three the app actually used is recorded on every control-mapping entry in the
+        audit trail, so an edit here that seems to have no effect can be explained from one field.
 
         Measure it for this environment:
 
           python scripts/measure_control_map_scores.py
-    """,
-    "TSG_CONTROL_MAP_TOP_K": """
-        The most controls kept for one scenario. Fewer may be kept; the list is never padded
-        out to reach this number.
     """,
     "TSG_CONTROL_MAP_SHORTLIST_K": """
         How many controls go to the precise scorer for each scenario.
@@ -702,11 +747,109 @@ COMMENTS: dict[str, str] = {
         cheap first pass is only there to avoid scoring the entire control library, so this
         can be generous — but every extra control is real work for the slow stage.
     """,
+    "TSG_CONTROL_MAP_MIN_COUNT": """
+        The smallest number of controls a scenario should end up with. A target to reach, not a
+        limit: if too few controls reach the score above, the next-best ones are added until this
+        many are attached — but never any scoring below the backfill floor two settings down.
+
+        The score to beat is never lowered to fill this number. A scenario can still come back
+        with fewer controls than this when the library genuinely has nothing else close enough,
+        and that shortfall is a real finding about the library rather than a failure.
+
+        Replaces the older remediation top-up minimum, which only applied when a remediation plan
+        was asked for. That older name — TSG_REMEDIATION_CONTROL_MIN_COUNT — has been RETIRED: the
+        app now refuses to start if it is still set anywhere, and says to use this name instead. It
+        is not ignored on purpose. An unrecognised setting name is thrown away without a word, so
+        leaving the old one in place would quietly put this number back to its built-in default and
+        nothing in any log would say so. Move the value here and delete the old line.
+    """,
+    "TSG_CONTROL_MAP_MAX_COUNT": """
+        The most controls that may be attached to one scenario. A safety ceiling only — nothing is
+        ever padded out to reach it, and the list stops here however many more controls still
+        score well enough.
+
+        It exists so a very broad scenario cannot attach half the control library and leave a
+        reviewer with an unreadable list. Keep the shortlist size above it: a scenario can only
+        keep controls that were scored, so a shortlist narrower than this ceiling quietly becomes
+        the real limit. The app refuses to start if that happens.
+
+        Replaces the older "most controls kept per scenario" setting, which one number had to serve
+        as both the minimum and the maximum. That older name — TSG_CONTROL_MAP_TOP_K — has been
+        RETIRED, and the app now refuses to start if it is still set anywhere.
+
+        It is retired rather than quietly accepted because the name had come to mean the opposite of
+        what it says. It used to mean "keep at most five", and for one release it was accepted as
+        another spelling of THIS setting, the ceiling, whose default is twenty-five — so an old line
+        reading five put the ceiling back to five and reinstated exactly the truncation this pair of
+        settings was introduced to remove. That happened here once. It is not simply ignored either:
+        an unrecognised setting name is thrown away without a word, which would lose the value with
+        no error and no log line. Move the value here and delete the old line.
+    """,
+    "TSG_CONTROL_MAP_BACKFILL_RATIO": """
+        The lowest score a control may have and still be added just to reach the minimum count,
+        given as a FRACTION of the score to beat that is actually in force. At 0.42, with the score
+        to beat at 50, nothing below 21 is ever attached.
+
+        Filling a minimum trades precision for coverage, and without a floor the list would be
+        padded with whatever ranked last — a control with no real connection to the scenario, shown
+        to a reviewer exactly like a genuine match. This is that floor, and it is the setting to
+        turn if the filled-in controls look too weak (lower it for more coverage, raise it for
+        fewer but better).
+
+        A FRACTION RATHER THAN A FIXED SCORE, on purpose. The score to beat is not always the number
+        in the setting above, and not even when that line is live: a stored measurement for the
+        models in use outranks it, and with neither a measurement nor a live line it comes from the
+        threat-matching threshold. A fixed floor therefore meant
+        something different every time that number moved — and any time it landed at or below the
+        floor there was NO band left to fill from, so the minimum count silently could never be
+        reached while the file still looked correctly configured. A fraction between 0 and 1 is
+        always below the score to beat, whichever of the three sources produced it, so the band can
+        never close. Values of 0 and 1 are refused at start-up for that reason.
+
+        Example: with the score to beat at 50 and this at 0.42, controls scoring 50 and over are
+        attached on merit, and a scenario short of the minimum may then be filled from those scoring
+        21 to 49 — never from anything under 21.
+    """,
+    "TSG_CONTROL_MAP_BACKFILL_MIN_SCORE": """
+        DEPRECATED, and only here so files that already set it keep loading. A fixed lowest score
+        out of 100, overriding the fraction above for an operator who had pinned a number before
+        the fraction existed. Prefer the fraction; for a new file, leave this line commented out.
+
+        It is obeyed only while it is genuinely BELOW the score to beat that is in force. Set at or
+        above it, it would leave no band to fill from at all, so it is ignored, the fraction above
+        is used instead, and the worker logs that it did so. Nothing refuses to start over it and
+        nothing else tells you — the deployment simply runs on the fraction, not on the number you
+        typed here. That is the whole reason this setting is deprecated: the score to beat can come
+        from a stored measurement this file cannot see, so a fixed number written here cannot know
+        what it will be compared against.
+
+        Zero is refused at start-up. This is a floor, and zero is not a low floor, it is no floor —
+        it would attach the worst-ranked remaining controls with no relevance requirement at all,
+        and, being below every possible score to beat, it would be obeyed in silence.
+    """,
+    "TSG_REMEDIATION_CONTROL_TOP_UP_ENABLED": """
+        When a remediation plan is requested for a scenario the AI generated, first make sure it
+        has at least the minimum number of mapped controls, adding the closest matches from the
+        control library if it does not. Scenarios a person wrote are never changed.
+
+        Set to false to plan with whatever controls the scenario already has. If the matching
+        service is down the plan still goes ahead, just without the extra controls.
+    """,
 
     # --- Step 6: accepting scenarios into the library -------------------------------------
     "TSG_ACCEPT_NAMED_IN_MESSAGE": """
-        When a bulk accept partly fails, how many of the offending scenarios to name
-        individually in the error message. The rest are summarised as a count.
+        Only affects the wording of one error message. When you accept (or reject) a list of
+        scenarios and some of them cannot be accepted — the id does not exist in that session,
+        it was already rejected, or it was replaced by a newer version — nothing is saved and
+        the request is refused with "not found". This number is how many of those problem
+        scenarios the message names one by one; any others are summed up as "and N more".
+
+        Example: you select 10 scenarios, 6 cannot be accepted, and this is 3. The message names
+        3 of them with the reason for each, then says "and 3 more".
+
+        It never changes what gets accepted. Raise it if testers want to see more of the
+        failing ids in one message; keep it small so a large selection does not produce a huge
+        message.
     """,
 
     # --- Step 7: treatment plans ----------------------------------------------------------
@@ -941,13 +1084,20 @@ COMMENTS: dict[str, str] = {
         the sweep skips anything settled within one lease.
     """,
     "TSG_CONTROL_MAP_SWEEP_ENABLED": """
-        Whether that retry sweep runs at all, independent of the interval above.
+        Whether the SCHEDULED retry sweep runs, independent of the interval above.
 
-        With it off, the retry queue has no consumer: a scenario whose control matching failed
-        stays unmatched and is published with an empty control list, which the API presents as
-        a genuine gap in the control library rather than an error. Drain it by hand with:
+        With it off, the retry queue has no AUTOMATIC consumer: a scenario whose control matching
+        failed stays unmatched and is published with an empty control list, which the API presents
+        as a genuine gap in the control library rather than an error.
 
+        Both manual drains keep working while it is off, because only beat's own tick is gated:
+
+          POST /v1/tsg/control-map/sweep    (admin key; queues one pass on demand)
           celery -A app.pipeline.celery_app.celery_app call tsg.map_controls_sweep
+
+        Beat schedules the task either way and the task declines each scheduled tick while this
+        is off, costing one no-op message per interval. So turning it back on needs only the
+        WORKER restarted - never beat, whose schedule is built once at import.
     """,
     "TSG_CONTROL_MAP_MAX_ATTEMPTS": """
         How many times control matching may be retried for one scenario before it is given up

@@ -34,7 +34,7 @@ def _engine():
     for tbl in (m.Scenario_Session, m.Subsystem_Stage_State, m.Threat_Scenario,
                 m.Threat_Scenario_Control_Map, m.Scenario_Audit,
                 # map_controls joins these to put the THREAT in the control query
-                # (control_mapping.collect_control_query) — without them the join
+                # (control_mapping._retrieval_query) — without them the join
                 # errors and mapping silently degrades to zero controls.
                 m.Scoped_Threat, m.Identified_Threat):
         tbl.__table__.create(engine)

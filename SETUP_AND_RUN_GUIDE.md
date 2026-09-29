@@ -23,7 +23,7 @@ ALTER DATABASE TSG SET READ_COMMITTED_SNAPSHOT ON;
 | Area                | Dev                               | **Production (this guide)**                       |
 | ------------------- | --------------------------------- | ------------------------------------------------------- |
 | Login               | `AUTH_DEV_MODE` header shortcut | **Real JWT** from your SSO (dev mode OFF)         |
-| Web server          | `uvicorn --reload`              | **gunicorn** with uvicorn workers, in a container |
+| Web server          | `uvicorn` supervised by `watchfiles` (auto-reload). NOT `uvicorn --reload` -- it does not survive a restart here; see `start.ps1`'s `-NoReload` help | **gunicorn** with uvicorn workers, in a container |
 | Processes           | started by hand                   | **api + worker + beat** containers                |
 | Reaper (stuck jobs) | not scheduled                     | **runs every 60s** (Celery beat)                  |
 | Secrets             | `.env` file                     | **OpenShift Secrets / Vault** (never committed)   |

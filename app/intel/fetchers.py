@@ -364,7 +364,7 @@ def _dedup(items: Iterable[str]) -> list[str]:
 _PLACEHOLDER_PRODUCTS = frozenset({"multiple products", "multiple", "n/a", "various", "unknown"})
 
 
-def kev_docs(data: dict) -> list[dict]:
+def kev_docs(data: dict | Iterable[dict]) -> list[dict]:
     """Pure normalizer for the KEV catalogue JSON (testable without network).
 
     `published_at` is CISA's `dateAdded` — the day exploitation was confirmed — so "top 5"
@@ -452,7 +452,9 @@ def ics_doc(adv: dict, code: str) -> dict:
     walk((adv.get("product_tree") or {}).get("branches"))
     vulns = adv.get("vulnerabilities") or []
     cves = [v.get("cve") for v in vulns if v.get("cve")]
-    cwes = sorted({(v.get("cwe") or {}).get("id") for v in vulns if (v.get("cwe") or {}).get("id")})
+    # Walrus: the element and the `if` guard used to be the same expression, so None was
+    # already filtered out; binding it once makes that visible to the checker too.
+    cwes = sorted({cid for v in vulns if (cid := (v.get("cwe") or {}).get("id"))})
     severity: float | None = None
     for v in vulns:
         for sc in v.get("scores") or []:

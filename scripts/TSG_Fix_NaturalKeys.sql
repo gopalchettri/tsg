@@ -45,11 +45,17 @@ WHERE  i.object_id = OBJECT_ID('dbo.Threat_Type') AND i.name = 'UX_ThreatType_Na
                WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
                  AND ic.is_included_column = 0 AND c.name <> N'ThreatTypeName');
 
--- Counted with the index's own semantics -- same filter, same column collation --
+-- Counted with the index's own semantics -- SAME FILTER, same column collation --
 -- so this is exactly what CREATE UNIQUE would reject, not a stricter guess.
+-- The filter is IsDeleted = 0, matching the index this script creates below. It read
+-- IsActive = 1 AND IsDeleted = 0 until the predicate was widened on 2026-09-04, and
+-- leaving it behind broke the promise this comment makes: a duplicate among the
+-- IsActive = 0 (promoted, pending review) rows would pass the check, the CREATE
+-- would then fail with Msg 1505, and the operator would get SQL Server's bare
+-- message instead of the merge instructions below.
 SELECT @dupes = COUNT(*), @rows = ISNULL(SUM(n), 0) FROM (
     SELECT COUNT(*) AS n FROM dbo.Threat_Type
-    WHERE IsActive = 1 AND IsDeleted = 0
+    WHERE IsDeleted = 0
     GROUP BY ThreatTypeName HAVING COUNT(*) > 1) d;
 
 IF OBJECT_ID('dbo.Threat_Type', 'U') IS NULL
@@ -77,11 +83,20 @@ BEGIN
     BEGIN TRY
         BEGIN TRAN;
             DROP INDEX UX_ThreatType_NaturalKey ON dbo.Threat_Type;
+            -- WHERE IsDeleted = 0, not IsActive = 1 AND IsDeleted = 0. The predicate was widened
+            -- on 2026-09-04 because promote-to-library inserts IsActive = 0 and a FILTERED index
+            -- only constrains rows that satisfy its own predicate, so the old filter gave those
+            -- rows NO duplicate-name protection at all. That widening reached
+            -- "2. Threat_library.sql" and the Threat_Catalogue half of this script but not this
+            -- line, which meant running this repair UNDID it on Threat_Type -- silently, and with
+            -- the FIXED message below announcing the old rule as the fix.
+            -- tests/test_schema_sync.py::test_no_other_script_creates_a_deploy_path_index_differently
+            -- now compares every CREATE INDEX in scripts/ against the deploy paths' shape.
             CREATE UNIQUE INDEX UX_ThreatType_NaturalKey ON dbo.Threat_Type(ThreatTypeName)
-                WHERE IsActive = 1 AND IsDeleted = 0;
+                WHERE IsDeleted = 0;
         COMMIT;
         INSERT #nk (Target, Status, Detail) VALUES (N'Threat_Type', N'FIXED',
-            N'UX_ThreatType_NaturalKey narrowed to (ThreatTypeName) WHERE IsActive = 1 AND IsDeleted = 0.');
+            N'UX_ThreatType_NaturalKey narrowed to (ThreatTypeName) WHERE IsDeleted = 0.');
     END TRY
     BEGIN CATCH
         IF @@TRANCOUNT > 0 ROLLBACK;
@@ -103,9 +118,12 @@ WHERE  i.object_id = OBJECT_ID('dbo.Threat_Catalogue') AND i.name = 'UX_ThreatCa
                WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
                  AND ic.is_included_column = 0 AND c.name <> N'ThreatName');
 
+-- Same filter as the index created below (IsDeleted = 0), for the reason spelled out
+-- on the Threat_Type count above: a pre-check narrower than the CREATE it guards lets
+-- the CREATE fail with Msg 1505 and replaces the merge instructions with a raw error.
 SELECT @dupes = COUNT(*), @rows = ISNULL(SUM(n), 0) FROM (
     SELECT COUNT(*) AS n FROM dbo.Threat_Catalogue
-    WHERE IsActive = 1 AND IsDeleted = 0
+    WHERE IsDeleted = 0
     GROUP BY ThreatName HAVING COUNT(*) > 1) d;
 
 IF OBJECT_ID('dbo.Threat_Catalogue', 'U') IS NULL
@@ -122,8 +140,8 @@ ELSE IF @dupes > 0
         N'Cannot narrow: ' + CAST(@dupes AS nvarchar(10)) + N' duplicate active ThreatName value(s) across '
       + CAST(@rows AS nvarchar(10)) + N' rows. Merge first -- keep the LOWEST ThreatCatalogueID '
       + N'(dal.find_catalogue_id_by_norm_name already returns min(id)), repoint '
-      + N'Threat_Catalogue_Category_Map.ThreatCatalogueID / Identified_Threat.ThreatCatalogueID / '
-      + N'Scenario_Library.ThreatCatalogueID at the survivor, then set the losers IsActive=0. '
+      + N'Threat_Catalogue_Category_Map.ThreatCatalogueID and Identified_Threat.ThreatCatalogueID '
+      + N'at the survivor, then set the losers IsActive=0. '
       + N'The full list is printed below. NOTHING WAS CHANGED.');
 ELSE
 BEGIN

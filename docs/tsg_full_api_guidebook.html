@@ -375,6 +375,7 @@ data: {&quot;session_id&quot;: &quot;3fa85f64-5717-4562-b3fc-2c963f66afa6&quot;,
       &quot;scenario_id&quot;: &quot;6ba7b810-9dad-11d1-80b4-00c04fd430c8&quot;,
       &quot;scenario_number&quot;: 1,
       &quot;scenario_source&quot;: &quot;generated&quot;,
+      &quot;library&quot;: null,
       &quot;threat&quot;: {
         &quot;grounding_score&quot;: 100.0,
         &quot;grounding_status&quot;: &quot;verified&quot;,
@@ -1242,7 +1243,7 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
   <div class="tables"><span class="tbl">Risk_Treatment_Plan</span><span class="tbl">Scenario_Audit</span><span class="tbl">Scenario_Session</span><span class="tbl">Threat_Scenario</span><span class="tbl">Scoped_Threat</span><span class="tbl">Identified_Threat</span><span class="tbl">Threat_Scenario_Control_Map</span><span class="tbl">Control_Library</span><span class="tbl">Control_Library_Standard_Map</span><span class="tbl">Control_Standard</span></div>
   <details class="notes">
     <summary>Implementation notes &amp; error cases</summary>
-    <p>TreatmentPlanBody uses extra=&quot;forbid&quot;: ONLY these 12 keys are accepted (existing_controls, likelihood_rating, impact_rating, final_risk_rating, risk_level, risk_identification_date, risk_owner, impacted_business_division, existing_controls_all_subsystems, existing_controls_all_subsystems_justification, mitigation_start_date, mitigation_end_date) — any other key, including the retired timeline_start_date/timeline_end_date or user_id/strategy/user_note, 422s with errors[].type==&quot;extra_forbidden&quot;. 202 means &quot;accepted for async generation&quot;, not done — poll GET on this same path (or listen for the advisory treatment_plan_result SSE event) until status is COMPLETE/ERROR. Empty strings on optional fields are silently treated as &quot;not provided&quot; (only risk_level is genuinely required). This whole router is unmounted (plain 404 on every path under it) when settings.risk_module_enabled is False.</p>
+    <p>TreatmentPlanBody uses extra=&quot;forbid&quot;: ONLY these 12 keys are accepted (existing_controls, likelihood_rating, impact_rating, final_risk_rating, risk_level, risk_identification_date, risk_owner, impacted_business_division, existing_controls_all_subsystems, existing_controls_all_subsystems_justification, mitigation_start_date, mitigation_end_date) — any other key, including the retired timeline_start_date/timeline_end_date or user_id/strategy/user_note, 422s with errors[].type==&quot;extra_forbidden&quot;. 202 means &quot;accepted for async generation&quot;, not done — poll GET on this same path (or listen for the advisory treatment_plan_result SSE event) until status is COMPLETE/ERROR. Before the snapshot is frozen, a first plan request tops up a scenario short of the configured minimum of mapped controls (control_map_min_count, default 5) with the same matching an AI scenario gets; controls a person chose are never re-mapped or replaced. Empty strings on optional fields are silently treated as &quot;not provided&quot; (nothing in this body is mandatory). This whole router is unmounted (plain 404 on every path under it) when settings.risk_module_enabled is False.</p>
     <p class="errs"><span class="lbl">Errors</span> 404 if session_id doesn&#x27;t exist, or scenario_id isn&#x27;t a scenario of this session (&quot;scenario not found in this session&quot;); 403 EntityForbidden if X-Entity-Id doesn&#x27;t own the session; 409 scenario_not_accepted if the scenario&#x27;s Accepted flag isn&#x27;t 1; 409 plan_already_exists if ANY plan row (RUNNING/COMPLETE/ERROR) already exists for this scenario — use /regenerate instead; 422 on a schema violation (a rating that is negative, NaN/Infinity, or has more than 4 decimal places or 15 digits in total — ratings have no upper cap, largest 99999999999.9999 — mitigation_end_date before mitigation_start_date, one mitigation date without the other, or any forbidden extra key); 503 if the Celery broker can&#x27;t be reached to enqueue (the row is already committed and parked ERROR/enqueue_failed — regenerate to retry).</p>
   </details>
 </article>
@@ -1359,7 +1360,9 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
     ]
   },
   &quot;scenario_id&quot;: &quot;1a2b3c4d-5e6f-8788-898a-8b8c8d8e8f90&quot;,
-  &quot;scenario_replaced&quot;: false,
+  &quot;scenario_source&quot;: &quot;generated&quot;,
+  &quot;library&quot;: null,
+          &quot;scenario_replaced&quot;: false,
   &quot;session_id&quot;: &quot;5b7c9d21-93a4-4f10-9a83-0f4c113b2a1e&quot;,
   &quot;status&quot;: &quot;COMPLETE&quot;,
   &quot;treatment_strategy&quot;: &quot;Mitigate&quot;,
@@ -1642,6 +1645,8 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
           },
           &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
           &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+          &quot;scenario_source&quot;: &quot;generated&quot;,
+          &quot;library&quot;: null,
           &quot;scenario_replaced&quot;: false,
           &quot;status&quot;: &quot;&lt;status&gt;&quot;,
           &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
@@ -1739,6 +1744,8 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
           },
           &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
           &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+          &quot;scenario_source&quot;: &quot;generated&quot;,
+          &quot;library&quot;: null,
           &quot;scenario_replaced&quot;: false,
           &quot;status&quot;: &quot;&lt;status&gt;&quot;,
           &quot;treatment_strategy&quot;: &quot;&lt;treatment_strategy&gt;&quot;,
@@ -1858,6 +1865,8 @@ SELECT ScenarioID, ReplacesScenarioID, Superseded, GenerationEpoch FROM Threat_S
       &quot;plan_id&quot;: &quot;&lt;plan_id&gt;&quot;,
       &quot;session_id&quot;: &quot;&lt;session_id&gt;&quot;,
       &quot;scenario_id&quot;: &quot;&lt;scenario_id&gt;&quot;,
+      &quot;scenario_source&quot;: &quot;generated&quot;,
+      &quot;library&quot;: null,
       &quot;asset_name&quot;: &quot;&lt;asset_name&gt;&quot;,
       &quot;scenario_title&quot;: &quot;&lt;scenario_title&gt;&quot;,
       &quot;status&quot;: &quot;&lt;status&gt;&quot;,

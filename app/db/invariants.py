@@ -225,24 +225,35 @@ def _assert_stride_categories(engine: Engine) -> None:
 def _assert_api_client_configured(engine: Engine) -> None:
     """staging/prod must have at least one ACTIVE API_Client row, or the header auth model
     (app/api/deps.get_principal) rejects EVERY request as 401 — a silent 100% outage that no
-    other check catches. Fail the boot loudly instead. Local/dev may run keyless (its callers
-    are the developer's own tools)."""
-    if get_settings().app_env not in ("staging", "prod"):
+    other check catches. Local/dev may run keyless (its callers are the developer's own tools).
+
+    With an admin key configured the outage is neither silent nor stuck: the admin creates the
+    first key via POST /v1/tsg/api-clients (X-Admin-Key), which needs the app RUNNING — so boot
+    and log CRITICAL. Only with no admin key either is there no way out; fail the boot then."""
+    s = get_settings()
+    if s.app_env not in ("staging", "prod"):
         return
     with engine.connect() as c:
         active = c.execute(
             text("SELECT COUNT(*) FROM API_Client WHERE Active = 1 AND Module = :module"),
             {"module": API_MODULE},
         ).scalar_one()
-    if not active:
-        raise StartupInvariantError(
-            f"APP_ENV is staging/prod but no ACTIVE API_Client row exists for module "
-            f"'{API_MODULE}' — every request would 401. Seed one (hash in Python, NOT SQL): "
-            "python -c \"import hashlib,secrets; s=secrets.token_hex(32); "
-            "print(s, hashlib.sha256(s.encode()).hexdigest())\"  then  INSERT INTO API_Client "
-            f"(ClientID, KeyHash, Name, Module) VALUES ('shield-<env>', '<keyhash>', 'Shield', "
-            f"'{API_MODULE}'). See scripts/eyshield_handoff/'1. TSG_Core.sql'."
-        )
+    if active:
+        return
+    if s.admin_api_key:
+        log.critical("invariants.no_active_api_client", module=API_MODULE,
+                     note="every non-admin request will 401 until an admin creates a key: "
+                          "POST /v1/tsg/api-clients with X-Admin-Key.")
+        return
+    raise StartupInvariantError(
+        f"APP_ENV is staging/prod, no ACTIVE API_Client row exists for module '{API_MODULE}' "
+        f"and TSG_ADMIN_API_KEY is unset — every request would 401 with no way to create a key. "
+        f"Set TSG_ADMIN_API_KEY and create one via POST /v1/tsg/api-clients, or seed one "
+        "(hash in Python, NOT SQL): python -c \"import hashlib,secrets; s=secrets.token_hex(32); "
+        "print(s, hashlib.sha256(s.encode()).hexdigest())\"  then  INSERT INTO API_Client "
+        f"(ClientID, KeyHash, Name, Module) VALUES ('shield-<env>', '<keyhash>', 'Shield', "
+        f"'{API_MODULE}'). See scripts/eyshield_handoff/'1. TSG_Core.sql'."
+    )
 
 
 def _assert_indexes(engine: Engine) -> None:

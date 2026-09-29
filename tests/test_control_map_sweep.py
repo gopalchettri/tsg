@@ -73,8 +73,13 @@ def _seed(s, *, created_offset_days: int = 1, stage_status: str = StageStatus.AW
 
 
 def _stub_grounding(monkeypatch, *, matches=((1, 91.0), (2, 77.0))):
+    # The pool carries EVERY id the fake reranker scores. control_relevance.validate_control_mapping
+    # refuses a map row for a control that was never in this scenario's candidate set — a real
+    # corruption check — so a stub whose reranker invents an id the pool never held is describing a
+    # state the production path cannot reach.
     monkeypatch.setattr(grounding, "get_control_candidates",
-                        lambda sess, itot: [{"ControlLibraryID": 1, "text": "c1"}])
+                        lambda sess, itot: [{"ControlLibraryID": cid, "ITOT": None, "Domain": None,
+                                            "text": f"c{cid}"} for cid, _sc in matches])
     monkeypatch.setattr(control_mapping, "_min_score",
                         lambda sess, llm, s_: grounding.Threshold(60.0, "test"))
     monkeypatch.setattr(grounding, "ground_control_queries",

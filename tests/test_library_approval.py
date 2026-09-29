@@ -345,6 +345,36 @@ def test_reject_tells_missing_apart_from_already_rejected(db):
         LibraryRejectionStatus.already_rejected, LibraryRejectionStatus.not_found]
 
 
+def test_rejecting_the_last_threat_takes_its_orphan_pending_type_with_it(db):
+    """The CALL SITE, not the helper. A pending type whose last live threat is rejected is
+    unreachable ever after: the curator queue lists CATALOGUE rows, approve and reject both take
+    catalogue ids, and the by-name lookup ignores tombstones — so the row would sit there forever
+    while the very next save minted the same name again. The helper existed and was correct, but
+    nothing asserted that reject_library_threats CALLS it, so deleting the call left the whole
+    suite green while the library quietly regrew the bug."""
+    with db() as s:
+        _seed_pending(s, type_id=76, catalogue_ids=[930])
+
+    result = _reject([930])
+
+    assert result.results[0].type_removed is True
+    with db() as s:
+        assert s.get(m.Threat_Type, 76).IsDeleted, "the childless pending type survived"
+
+
+def test_rejecting_the_last_threat_of_an_active_type_never_removes_it(db):
+    """The other half of the same rule. An ACTIVE type is a curator's published decision and is
+    reachable by name on its own; only a PENDING type with nothing left under it is clutter."""
+    with db() as s:
+        _seed_pending(s, type_id=77, catalogue_ids=[940], type_active=True)
+
+    result = _reject([940])
+
+    assert result.results[0].type_removed is False
+    with db() as s:
+        assert not s.get(m.Threat_Type, 77).IsDeleted, "an approved type was deleted"
+
+
 def test_rejecting_a_threat_leaves_its_type_alone(db):
     """Approving activates the parent type because retrieval needs it active. Rejecting needs
     nothing of the sort, and the type may carry siblings this call was never asked about."""

@@ -11,9 +11,17 @@
   DRY RUN: set PreviewOnly to 1 in Section 0 and the whole script only prints what
   it would do. Nothing is created, altered, renamed, dropped or updated.
 
-  Contents: legacy-name migration, 22 tables, 291 reconciled columns,
-  21 default constraints,
-  3 check constraints, 29 indexes.
+  Contents: legacy-name migration, 22 tables, 297 reconciled columns,
+  22 default constraints,
+  3 check constraints, 31 indexes.
+
+  Those five numbers are PINNED to the statements below them by
+  tests/test_schema_sync.py::test_the_consolidated_header_counts_match_the_script.
+  They were hand-typed and nothing checked them: the edit that added seven columns
+  and one default updated 291 -> 297 and 21 -> 22 and left the index count at 29
+  while Section 6 built 30, so a reviewer reconciling this file against
+  sys.indexes found one index they could not account for and had to decide whether
+  the database or the header was wrong.
 
   ---------------------------------------------------------------------------
   BEFORE YOU RUN
@@ -57,23 +65,24 @@
   WHERE clause all matter. Please create them exactly as written.
 
   ---------------------------------------------------------------------------
-  TWO MESSAGES YOU WILL SEE, BOTH EXPECTED
+  ONE MESSAGE YOU WILL SEE, AND IT IS EXPECTED
   ---------------------------------------------------------------------------
-  1. "Warning! The maximum key length for a nonclustered index is 1700 bytes.
-      The index 'UX_GroundingCalibration_Running' has maximum length of 2000
-      bytes."
-     Expected, and safe to ignore. That index keys two nvarchar(500) model-name
-     columns. An insert only fails if the two names together exceed roughly 850
-     characters; real model names run 30 to 60. The same definition is in
-     "1. TSG_Core.sql". The index is created and works.
+  "Warning! The maximum key length for a nonclustered index is 1700 bytes.
+   The index 'UX_GroundingCalibration_Running' has maximum length of 2000
+   bytes."
+  Expected, and safe to ignore. That index keys two nvarchar(500) model-name
+  columns. An insert only fails if the two names together exceed roughly 850
+  characters; real model names run 30 to 60. The same definition is in
+  "1. TSG_Core.sql". The index is created and works.
 
-  2. Running "6. TSG_Verify.sql" afterwards reports "Table missing:
-     Scenario_Library" as a blocking failure.
-     Expected. Scenario_Library backed a cross-tenant scenario-reuse feature
-     that was removed in August 2026. No application code reads or writes it,
-     and it is absent from the object model, so this script does not create it.
-     The verify script's list has not caught up. Every OTHER check it reports
-     is real, including its seed-data checks.
+  There used to be a second entry here, telling you that "6. TSG_Verify.sql"
+  reports "Table missing: Scenario_Library" as a BLOCKING failure on a database
+  built by this script, and to read past it. That instruction is gone because the
+  cause is: Scenario_Library was removed from the product in August 2026, and the
+  verify script and "1. TSG_Core.sql" have both caught up. Training an operator to
+  ignore one blocking failure from a script whose other blocking failures are real
+  is how a real one gets ignored too. Every blocking failure "6. TSG_Verify.sql"
+  reports is now a genuine one.
 
   ---------------------------------------------------------------------------
   AFTER YOU RUN
@@ -95,20 +104,133 @@ GO
   SECTION 0 — Read-Committed Snapshot Isolation
 
   The application's locking model assumes a plain read never waits behind a
-  concurrent writer. It checks this at start-up and refuses to boot without it.
-  Skipped when already enabled, so re-running never takes the database
-  single-user a second time.
+  concurrent writer. app/db/invariants.py::_assert_rcsi_enabled checks this at
+  start-up and refuses to boot the API and every Celery worker without it, so a
+  run that leaves it off has deployed nothing.
+
+  WHY THIS IS NO LONGER `SET SINGLE_USER / SET RCSI / SET MULTI_USER`.
+  That was THREE statements, and the middle one can fail. SINGLE_USER succeeds
+  and evicts every other session; one of those sessions reconnects and takes the
+  single permitted connection; `SET READ_COMMITTED_SNAPSHOT ON` then fails with
+  "database is in use", the batch aborts, and `SET MULTI_USER` NEVER RUNS. The
+  database is left SINGLE_USER - and this database also holds the platform tables
+  TSG only reads (ctm_scan_*, onboarding_*, [user], option, option_value), so
+  every OTHER application on it is locked out until a DBA restores MULTI_USER by
+  hand. An outage caused by a schema script, announced as one aborted batch in
+  the Messages pane.
+
+  `SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE` performs the same
+  eviction in ONE statement: either the setting changes or nothing does. There is
+  no intermediate state to be stranded in, so there is nothing to restore - which
+  is why the fix is to delete the dance, not to add a rescue path to it.
+
+  READ sys.databases, NEVER DATABASEPROPERTYEX. That property returned NULL on a
+  SQL Server 2022 Express instance whose setting was demonstrably ON, and every
+  comparison against NULL is UNKNOWN, so the check silently decided nothing.
+  is_read_committed_snapshot_on is a non-nullable bit present for every database.
+  A row this script cannot READ is reported as its own case and never ALTERed
+  blind, because the command it would otherwise run disconnects people.
+
+  @disconnect_others is the one line in this section you are meant to edit. It is
+  1 because the setting is required. Set it to 0 to be told who is connected and
+  have the script stop instead of interrupting them. (It is NOT covered by
+  PreviewOnly: that switch is read from #opt, which Section 1 has not created
+  yet.)
+
+  KEPT IN STEP ACROSS THE DEPLOY PATHS. The same block, for the same reasons, is
+  in "1. TSG_Core.sql", in TSG_Core_UAT.sql and in
+  scripts/tsg_script/00_validation/002_enable_isolation_level.sql.
+  tests/test_tsg_script_package.py::test_no_deploy_script_takes_the_database_single_user
+  fails the build if any deploy script goes back to the SINGLE_USER dance, and
+  ::test_the_package_sets_every_database_setting_it_validates reads all four.
 ==============================================================================*/
-IF NOT EXISTS (SELECT 1 FROM sys.databases
-               WHERE database_id = DB_ID() AND is_read_committed_snapshot_on = 1)
+DECLARE @disconnect_others bit = 1;
+
+DECLARE @rcsi bit = (SELECT d.is_read_committed_snapshot_on
+                     FROM sys.databases d WHERE d.database_id = DB_ID());
+
+IF @rcsi = 1
+    PRINT ' [EXISTS]  READ_COMMITTED_SNAPSHOT is already ON. Nothing was changed.';
+
+ELSE IF @rcsi IS NULL
 BEGIN
-    PRINT 'Enabling READ_COMMITTED_SNAPSHOT...';
-    ALTER DATABASE CURRENT SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-    ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON;
-    ALTER DATABASE CURRENT SET MULTI_USER;
+    PRINT ' [ERROR]   Could not read this database''s isolation setting - no visible';
+    PRINT '           sys.databases row for DB_ID(). NOTHING was changed. Check the';
+    PRINT '           setting by hand before deploying, and do NOT run the ALTER blind:';
+    PRINT '           the form that always succeeds disconnects every open session.';
+    RAISERROR('READ_COMMITTED_SNAPSHOT could not be read - stopping before any change.', 16, 1);
 END
+
 ELSE
-    PRINT 'READ_COMMITTED_SNAPSHOT already on - skipped.';
+BEGIN
+    IF @disconnect_others = 1
+        PRINT ' [WARNING] READ_COMMITTED_SNAPSHOT is OFF. Every OTHER session on this database is about to be disconnected and its in-flight work rolled back.';
+    ELSE
+        PRINT ' [INFO]    READ_COMMITTED_SNAPSHOT is OFF. Turning it on without waiting for anybody, and without disconnecting anybody.';
+
+    /* Two literal statements rather than one built with sp_executesql: dynamic SQL
+       would spare the IF, but it would also hide the destructive form inside a
+       string, and a schema script has to let a reviewer SEE what it can do. */
+    BEGIN TRY
+        IF @disconnect_others = 1
+            ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;
+        ELSE
+            ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH NO_WAIT;
+        PRINT ' [FIXED]   READ_COMMITTED_SNAPSHOT is now ON.';
+    END TRY
+    BEGIN CATCH
+        PRINT ' [FAIL]    READ_COMMITTED_SNAPSHOT could not be turned on. NOTHING was';
+        PRINT '           changed, no session was disconnected, and the database is NOT';
+        PRINT '           single-user.';
+        PRINT '           SQL Server said (' + CAST(ERROR_NUMBER() AS varchar(10)) + '): '
+              + ERROR_MESSAGE();
+
+        /* Branch on what is OBSERVABLE, never on the error number. A live run with one
+           other session connected raised 5069, which no plausible hand-typed list of
+           "database in use" codes contained, so the operator was sent after a
+           permissions problem they did not have. sys.dm_exec_sessions answers the real
+           question and cannot go stale. */
+        IF EXISTS (SELECT 1 FROM sys.dm_exec_sessions s
+                   WHERE s.database_id = DB_ID() AND s.session_id <> @@SPID)
+        BEGIN
+            /* PRINTed, not SELECTed: SSMS sends a SELECT to the Results grid and PRINT to
+               the Messages pane, and the operator reading the failure is in Messages. */
+            DECLARE @others int, @who nvarchar(max) = N'';
+            SELECT @others = COUNT(*) FROM sys.dm_exec_sessions s
+            WHERE  s.database_id = DB_ID() AND s.session_id <> @@SPID;
+            SELECT @who = @who + CHAR(13) + CHAR(10) + N'               ' +
+                          RIGHT(N'      ' + CAST(s.session_id AS nvarchar(10)), 6) + N'  ' +
+                          LEFT(ISNULL(s.login_name, N'?') + SPACE(30), 30) + N'  ' +
+                          LEFT(ISNULL(s.host_name, N'?') + SPACE(18), 18) + N'  ' +
+                          LEFT(ISNULL(s.program_name, N'?') + SPACE(30), 30)
+            FROM   sys.dm_exec_sessions s
+            WHERE  s.database_id = DB_ID() AND s.session_id <> @@SPID;
+            PRINT '           Somebody else is connected to this database - '
+                  + CAST(@others AS varchar(10)) + ' other session(s):';
+            PRINT '               SPID  LOGIN                           HOST                PROGRAM';
+            PRINT @who;
+            /* PRINT stops at 4000 characters; the COUNT above is always exact. */
+            IF @others > 40
+                PRINT '           (the list above is cut off by PRINT; the count is exact)';
+            PRINT '           Two ways forward:';
+            PRINT '             1. Ask them to disconnect, then run this script again.';
+            PRINT '             2. In an agreed window set @disconnect_others to 1 at the top';
+            PRINT '                of THIS section and run it again. It then disconnects the';
+            PRINT '                sessions above and rolls back their in-flight work.';
+        END
+        ELSE
+        BEGIN
+            PRINT '           No other session is visible from this login, so this is most';
+            PRINT '           likely a permissions problem: no ALTER permission on the';
+            PRINT '           database, or no VIEW SERVER STATE - and without that second one';
+            PRINT '           the sessions holding it are HIDDEN from the listing above rather';
+            PRINT '           than absent. Ask a DBA to run:';
+            PRINT '           ALTER DATABASE [' + DB_NAME() + '] SET READ_COMMITTED_SNAPSHOT ON;';
+        END
+
+        RAISERROR('READ_COMMITTED_SNAPSHOT is OFF and could not be turned on - stopping.', 16, 1);
+    END CATCH
+END
 GO
 
 -- Findings collect here from Sections 1 and 3; Section 7 lists them at the end.
@@ -640,6 +762,7 @@ CREATE TABLE [dbo].[Grounding_Calibration_Run](
 	[RerankerModel] [nvarchar](500) NULL,
 	[Forced] [bit] NOT NULL,
 	[MatchTh] [float] NULL,
+	[ControlMapTh] [float] NULL,
 	[Quality] [float] NULL,
 	[NegativesCount] [int] NULL,
 	[PositivesCount] [int] NULL,
@@ -832,6 +955,7 @@ CREATE TABLE [dbo].[Scenario_Session](
 	[CompletedAt] [datetime2](7) NULL,
 	[CancelledAt] [datetime2](7) NULL,
 	[CancelledBy] [nvarchar](200) NULL,
+	[ControlMapSeconds] [float] NULL,
  CONSTRAINT [PK_Scenario_Session] PRIMARY KEY CLUSTERED
 (
 	[SessionID] ASC
@@ -884,6 +1008,8 @@ CREATE TABLE [dbo].[Subsystem_Stage_State](
 	[ErrorMessage] [nvarchar](max) NULL,
 	[UpdatedAt] [datetime2](7) NOT NULL,
 	[CreatedAt] [datetime2](7) NULL,
+	[StartedAt] [datetime2](7) NULL,
+	[FinishedAt] [datetime2](7) NULL,
  CONSTRAINT [PK_Subsystem_Stage_State] PRIMARY KEY CLUSTERED
 (
 	[StateID] ASC
@@ -1001,6 +1127,9 @@ CREATE TABLE [dbo].[Threat_Scenario](
 	[AcceptedAt] [datetime2](7) NULL,
 	[AcceptedBy] [nvarchar](200) NULL,
 	[ScenarioSource] [nvarchar](100) NULL,
+	[ControlMapAttempts] [int] NOT NULL,
+	[GenStartedAt] [datetime2](7) NULL,
+	[GenFinishedAt] [datetime2](7) NULL,
  CONSTRAINT [PK_Threat_Scenario] PRIMARY KEY CLUSTERED
 (
 	[ScenarioID] ASC
@@ -1181,6 +1310,7 @@ VALUES
   ('Grounding_Calibration_Run','RerankerModel','nvarchar',500,NULL,1,0,NULL,NULL),
   ('Grounding_Calibration_Run','Forced','bit',NULL,NULL,0,0,'DF_GroundingCalibration_Forced','(0)'),
   ('Grounding_Calibration_Run','MatchTh','float',NULL,NULL,1,0,NULL,NULL),
+  ('Grounding_Calibration_Run','ControlMapTh','float',NULL,NULL,1,0,NULL,NULL),
   ('Grounding_Calibration_Run','Quality','float',NULL,NULL,1,0,NULL,NULL),
   ('Grounding_Calibration_Run','NegativesCount','int',NULL,NULL,1,0,NULL,NULL),
   ('Grounding_Calibration_Run','PositivesCount','int',NULL,NULL,1,0,NULL,NULL),
@@ -1312,6 +1442,7 @@ VALUES
   ('Scenario_Session','CompletedAt','datetime2',NULL,7,1,0,NULL,NULL),
   ('Scenario_Session','CancelledAt','datetime2',NULL,7,1,0,NULL,NULL),
   ('Scenario_Session','CancelledBy','nvarchar',200,NULL,1,0,NULL,NULL),
+  ('Scenario_Session','ControlMapSeconds','float',NULL,NULL,1,0,NULL,NULL),
   -- Scoped_Threat
   ('Scoped_Threat','ScopedThreatID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Scoped_Threat','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
@@ -1345,6 +1476,8 @@ VALUES
   ('Subsystem_Stage_State','ErrorMessage','nvarchar',-1,NULL,1,0,NULL,NULL),
   ('Subsystem_Stage_State','UpdatedAt','datetime2',NULL,7,0,0,NULL,NULL),
   ('Subsystem_Stage_State','CreatedAt','datetime2',NULL,7,1,0,'DF_StageState_CreatedAt','sysutcdatetime()'),
+  ('Subsystem_Stage_State','StartedAt','datetime2',NULL,7,1,0,NULL,NULL),
+  ('Subsystem_Stage_State','FinishedAt','datetime2',NULL,7,1,0,NULL,NULL),
   -- Threat_Actor
   ('Threat_Actor','ThreatActorID','int',NULL,NULL,0,1,NULL,NULL),
   ('Threat_Actor','ThreatActorName','nvarchar',200,NULL,0,0,NULL,NULL),
@@ -1407,6 +1540,9 @@ VALUES
   ('Threat_Scenario','AcceptedAt','datetime2',NULL,7,1,0,NULL,NULL),
   ('Threat_Scenario','AcceptedBy','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Threat_Scenario','ScenarioSource','nvarchar',100,NULL,1,0,NULL,NULL),
+  ('Threat_Scenario','ControlMapAttempts','int',NULL,NULL,0,0,'DF_ThreatScenario_ControlMapAttempts','(0)'),
+  ('Threat_Scenario','GenStartedAt','datetime2',NULL,7,1,0,NULL,NULL),
+  ('Threat_Scenario','GenFinishedAt','datetime2',NULL,7,1,0,NULL,NULL),
   -- Threat_Scenario_Control_Map
   ('Threat_Scenario_Control_Map','ScenarioID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Threat_Scenario_Control_Map','ControlLibraryID','int',NULL,NULL,0,0,NULL,NULL),
@@ -1788,6 +1924,11 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE name = 'DF_Scenario_ScenarioNumber')
     ALTER TABLE [dbo].[Threat_Scenario] ADD CONSTRAINT [DF_Scenario_ScenarioNumber] DEFAULT ((1)) FOR [ScenarioNumber];
 GO
+-- ControlMapAttempts is NOT NULL, so this default is what lets Section 3 add it to a
+-- POPULATED table: existing scenarios start at 0, a full fresh mapping attempt budget.
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE name = 'DF_ThreatScenario_ControlMapAttempts')
+    ALTER TABLE [dbo].[Threat_Scenario] ADD CONSTRAINT [DF_ThreatScenario_ControlMapAttempts] DEFAULT ((0)) FOR [ControlMapAttempts];
+GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE name = 'DF_TypeActorMap_CreatedAt')
     ALTER TABLE [dbo].[ThreatType_ThreatActor_Map] ADD CONSTRAINT [DF_TypeActorMap_CreatedAt] DEFAULT (sysutcdatetime()) FOR [CreatedAt];
@@ -1818,15 +1959,64 @@ GO
 
 
 /*==============================================================================
-  SECTION 6 — Indexes (29)
+  SECTION 6 — Indexes (31)
 
   Please create all of them exactly as written. Index names, column order, the
   UNIQUE keyword and the text of each WHERE clause are all either checked by the
   application at start-up or relied on to reject duplicate concurrent writes.
 ==============================================================================*/
 
+/*------------------------------------------------------------------------------
+  BEFORE the CREATEs: retire a natural-key index still carrying the PRE-2026-09-04
+  filter.
+
+  Every CREATE in this section is guarded IF NOT EXISTS on the index NAME, which is
+  correct for a fresh database and blind on an existing one: an index that already
+  exists under the right name is left exactly as it is, whatever it enforces. The
+  two library natural keys were widened from WHERE IsActive = 1 AND IsDeleted = 0 to
+  WHERE IsDeleted = 0 on 2026-09-04 (see the comment on their CREATEs below), so a
+  database built before that date keeps a UNIQUE index that does not constrain
+  promoted rows at all - silently, and with the sign-off in Section 7 passing,
+  because it compares index NAMES and uniqueness, not predicates.
+
+  DROP only, never DROP-then-CREATE here: the guarded CREATE below is the single
+  place the current predicate is written, and it rebuilds the index in this same
+  run. A DROP whose CREATE then failed on existing duplicates (Msg 1505) would
+  leave the table with NO unique index at all, so the duplicate check comes first
+  and a database that would fail is reported and left alone.
+------------------------------------------------------------------------------*/
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey'
+           AND object_id = OBJECT_ID('dbo.Threat_Type') AND filter_definition LIKE '%IsActive%')
+BEGIN
+    IF NOT EXISTS (SELECT ThreatTypeName FROM dbo.Threat_Type WHERE IsDeleted = 0
+                   GROUP BY ThreatTypeName HAVING COUNT(*) > 1)
+    BEGIN
+        DROP INDEX [UX_ThreatType_NaturalKey] ON [dbo].[Threat_Type];
+        PRINT ' [REBUILD] UX_ThreatType_NaturalKey carried the pre-2026-09-04 filter; dropped, and rebuilt below on WHERE IsDeleted = 0.';
+    END
+    ELSE
+        PRINT ' [BLOCKED] UX_ThreatType_NaturalKey NOT widened: duplicate ThreatTypeName rows exist among IsDeleted = 0 rows, so the rebuild would fail and leave no unique index. Resolve the duplicates, then re-run.';
+END
+GO
+
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCatalogue_NaturalKey'
+           AND object_id = OBJECT_ID('dbo.Threat_Catalogue') AND filter_definition LIKE '%IsActive%')
+BEGIN
+    IF NOT EXISTS (SELECT ThreatName FROM dbo.Threat_Catalogue WHERE IsDeleted = 0
+                   GROUP BY ThreatName HAVING COUNT(*) > 1)
+    BEGIN
+        DROP INDEX [UX_ThreatCatalogue_NaturalKey] ON [dbo].[Threat_Catalogue];
+        PRINT ' [REBUILD] UX_ThreatCatalogue_NaturalKey carried the pre-2026-09-04 filter; dropped, and rebuilt below on WHERE IsDeleted = 0.';
+    END
+    ELSE
+        PRINT ' [BLOCKED] UX_ThreatCatalogue_NaturalKey NOT widened: duplicate ThreatName rows exist among IsDeleted = 0 rows, so the rebuild would fail and leave no unique index. Resolve the duplicates, then re-run.';
+END
+GO
+
 -------------------------------------------------------------------------------
--- 6a. Verified at application start-up (14). A missing, non-unique, disabled or
+-- 6a. Verified at application start-up (15): the 14 in
+--     app/db/invariants.py::REQUIRED_INDEXES plus IX_Session_Active, whose WHERE
+--     literal invariants.FILTERED_INDEX_LITERALS also checks. A missing, non-unique, disabled or
 --     differently-shaped index here stops the API and the workers from booting.
 -------------------------------------------------------------------------------
 
@@ -1891,14 +2081,33 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_GroundingCalibration_R
 GO
 
 /* Library natural keys. Two sessions promoting the same new name at once must
-   not both create it. Filtered so a soft-deleted row releases its name. */
+   not both create it. Filtered so a soft-deleted row releases its name.
+
+   THE PREDICATE IS `WHERE [IsDeleted] = 0`, NOT the older
+   `WHERE [IsActive] = 1 AND [IsDeleted] = 0`. Widened 2026-09-04: promote-to-library
+   inserts AI-authored rows as IsActive = 0 (pending curator review -
+   dal.upsert_threat_type / upsert_threat_catalogue), and a FILTERED index only
+   constrains rows that satisfy its own predicate, so under the old filter an
+   IsActive = 0 insert was NEVER covered. That is not a narrow race: it was ZERO
+   duplicate-name protection for every promoted row, and the library quietly
+   accumulated same-name twins that normalize_name() in Python already treats as one.
+
+   The widening reached "2. Threat_library.sql" for BOTH keys and
+   scripts/tsg_remediation_tables.sql for Threat_Catalogue ONLY - Threat_Type was
+   left at the old predicate there, and the generated scripts/tsg_script/ package
+   inherited it from that file. So a database built by the numbered scripts enforced
+   one rule and a database built by the consolidated script or the package enforced
+   another, on a boot-asserted UNIQUE index, with nothing comparing the two.
+   tests/test_schema_sync.py::test_every_deploy_path_creates_the_same_indexes now
+   compares each index's filter predicate across all three paths - it is the check
+   that found this. */
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatType_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Type'))
     CREATE UNIQUE NONCLUSTERED INDEX [UX_ThreatType_NaturalKey] ON [dbo].[Threat_Type] ([ThreatTypeName])
-        WHERE [IsActive] = 1 AND [IsDeleted] = 0;
+        WHERE [IsDeleted] = 0;
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatCatalogue_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Catalogue'))
     CREATE UNIQUE NONCLUSTERED INDEX [UX_ThreatCatalogue_NaturalKey] ON [dbo].[Threat_Catalogue] ([ThreatName])
-        WHERE [IsDeleted] = 0;   -- widened 2026-09-04; see '2. Threat_library.sql'
+        WHERE [IsDeleted] = 0;
 GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_ThreatActor_NaturalKey' AND object_id = OBJECT_ID('dbo.Threat_Actor'))
     CREATE UNIQUE NONCLUSTERED INDEX [UX_ThreatActor_NaturalKey] ON [dbo].[Threat_Actor] ([ThreatActorName])
@@ -1941,7 +2150,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_API_Client_KeyHash' AN
 GO
 
 -------------------------------------------------------------------------------
--- 6c. Performance (11 with a known reader). Each of these backs a query the
+-- 6c. Performance (12 with a known reader). Each of these backs a query the
 --     application actually runs.
 -------------------------------------------------------------------------------
 
@@ -1966,6 +2175,23 @@ GO
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Scenario_SessionSubActive' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
     CREATE NONCLUSTERED INDEX [IX_Scenario_SessionSubActive] ON [dbo].[Threat_Scenario] ([SessionID], [SubsystemID])
         WHERE [Superseded] = 0;
+GO
+
+/* The reject side of GET /v1/sessions/{id}/results, which re-adds a DECIDED scenario
+   even after a regeneration superseded it. Threat_Scenario has NO unfiltered SessionID
+   index - its key is the GUID id, and every SessionID-leading index above is filtered
+   on Superseded or Accepted - so /results issues one seek per filtered index rather
+   than a single OR. Without this index the reject-side seek degrades into a full table
+   scan on an endpoint clients POLL: correct, and merely slow, which is how a table scan
+   reaches production unnoticed. Filtered over the rejected rows only, so it costs almost
+   nothing. The same statement is in "1. TSG_Core.sql" (canonical) and in
+   scripts/TSG_Migration_RejectedDecisionIndex.sql (for a database already up); it was
+   missing HERE, and from the generated package this file is the source for, because no
+   guard compared the three deploy paths' index inventories. One now does:
+   tests/test_schema_sync.py::test_every_deploy_path_creates_the_same_indexes. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Scenario_RejectedDecision' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
+    CREATE NONCLUSTERED INDEX [IX_Scenario_RejectedDecision] ON [dbo].[Threat_Scenario] ([SessionID])
+        WHERE [RejectedAt] IS NOT NULL;
 GO
 
 /* Backs the cross-session scenario browse feed, which filters entity, then
@@ -2078,6 +2304,7 @@ required_index(idx, tbl) AS (
         ('UX_Scenario_ActiveScoped',               'Threat_Scenario'),
         ('UX_Scenario_ActiveAccepted',             'Threat_Scenario'),
         ('IX_Scenario_SessionSubActive',           'Threat_Scenario'),
+        ('IX_Scenario_RejectedDecision',           'Threat_Scenario'),
         ('UX_SubsystemStageState_SessionSubLevel', 'Subsystem_Stage_State'),
         ('UX_TreatmentPlan_ActiveScenario',        'Risk_Treatment_Plan'),
         ('IX_TreatmentPlan_SessionActive',         'Risk_Treatment_Plan'),

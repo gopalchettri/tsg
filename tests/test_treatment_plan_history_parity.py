@@ -210,7 +210,8 @@ def test_every_plan_column_the_presenter_reads_is_in_the_shared_list():
     src = inspect.getsource(treatment_api._plan_status_from_row)
     reads = set(re.findall(r'row\[\"([A-Za-z]+)\"\]', src)) | set(re.findall(r'row\.get\(\"([A-Za-z]+)\"', src))
     assert reads, "no row reads found — the regex no longer matches the presenter"
-    allowed = {c.key for c in dal.plan_presenter_columns()} | {"ScenarioJSON", "ReviewComment"}
+    allowed = ({c.key for c in dal.plan_presenter_columns()}
+               | {"ScenarioJSON", "ScenarioSource", "ReviewComment"})
     assert reads <= allowed, (
         f"the presenter reads columns no feeding select is guaranteed to carry: "
         f"{sorted(reads - allowed)} — add them to dal.plan_presenter_columns()")

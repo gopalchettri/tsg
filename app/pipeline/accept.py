@@ -13,6 +13,7 @@ from app.core.enums import (
     AuditEventType,
     ReviewGateReason,
     ScenarioDecisionReason,
+    SessionMode,
     SessionStatus,
     StageStatus,
     SubsystemLevel,
@@ -50,7 +51,9 @@ class Replacement(NamedTuple):
 class Accepted(NamedTuple):
     """What an accept call did: rows accepted, and the replacements it really made (empty on
     every ordinary accept). The pair the API and the log both report from."""
-    count: int
+    # shadows tuple.count, which namedtuple explicitly permits (it installs a _tuplegetter);
+    # nothing calls .count(x) on this type, and `count` is the right name for the field.
+    count: int  # type: ignore[assignment]
     replaced: list[Replacement]
 
 
@@ -127,9 +130,15 @@ def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: lis
         pair = pairs.get(oid)
         # NULL IdentityHash = a legacy pre-IdentityHash row, which the filtered index exempts
         # (SQL Server compares NULLs equal) — skip it here for the same reason.
-        if pair is None or pair[0] is None:
+        if pair is None:
             continue
-        prior = already.get(pair)
+        # Unpacked, not `pair[0] is None`: the guard is identical, but mypy cannot narrow a
+        # tuple ELEMENT through a subscript, so the already.get(pair) below still read as
+        # `tuple[str | None, int]` against a `tuple[str, int]` key.
+        ihash, sub_id = pair
+        if ihash is None:
+            continue
+        prior = already.get((ihash, sub_id))
         if prior is not None and prior != oid:
             if not replace_accepted or subset is None:
                 # Two refusals, because the two callers have different ways out. Accept-ALL
@@ -162,7 +171,10 @@ def _assert_one_version_per_scenario(sess: Session, session_id: str, subset: lis
 def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str | None,
                 subset: list[str] | None = None, *,
                 replace_accepted: bool = False) -> Accepted:
-    scenario_session = dal.get_session(sess, session_id, entity_id)
+    # Annotated: the review gate below returns `RowMapping | dict` (it echoes back what it
+    # was given, and accept_new_manual_scenario hands it a freshly-built dict), and this
+    # variable is rebound with that result.
+    scenario_session: RowMapping | dict | None = dal.get_session(sess, session_id, entity_id)
     if scenario_session is None:
         raise EntityForbidden(f"session {session_id} not in entity {entity_id}")
 
@@ -182,7 +194,11 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             # Make the lock visible to concurrent regeneration.
             sess.commit()
 
-        _ensure_threat_data_still_active(sess, session_id, good_subs)
+        # A MANUAL session's library rows were resolved by the save itself, in the transaction
+        # that created them. A curator rejecting a pending entry proposed there must not block
+        # re-accepting the PERSON's scenario — the wording is theirs, not the library's.
+        if scenario_session["Mode"] != SessionMode.MANUAL:
+            _ensure_threat_data_still_active(sess, session_id, good_subs)
 
         if subset is not None:
             # Use canonical ids for checks, writes, and audit data.
@@ -241,7 +257,17 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
                     f"accept-all leaves active scenarios in subsystem(s) {sorted(uncovered)} whose "
                     f"SCENARIOS stage is not AWAITING_DECISION (subsystem stage state out of sync)")
             if matched == 0:
+                # A message must only name an action the API will accept (the rule this file
+                # states at :137-144, after the same defect was fixed there). Regenerate and
+                # next-set are PERMANENTLY 409 on a MANUAL session — the AI never rewrites a
+                # scenario a person wrote — so offering them to one is a dead end with no route
+                # out. A manual session has exactly one scenario and only one way back.
+                manual = scenario_session["Mode"] == SessionMode.MANUAL
                 raise AcceptConflict(
+                    "accept-all found no completed scenarios to accept — this scenario was "
+                    "rejected, and a hand-written scenario is never regenerated; send it again "
+                    "with POST /v1/remediation-plans to record it afresh"
+                    if manual else
                     "accept-all found no completed scenarios to accept — regenerate or request a "
                     "next set first",
                     reason="nothing_to_accept")
@@ -292,6 +318,37 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             log.warning("accept.lock_release_failed", session_id=session_id)
 
 
+def accept_new_manual_scenario(sess: Session, scenario_session: RowMapping | dict,
+                               user_id: str | None) -> int:
+    """Accept the ONE scenario of a manual session, inside the transaction that is creating it.
+
+    The same review gate, decision writer and ledger rows as accept_session, so a manual
+    acceptance reads exactly like a reviewer's in every audit, register and board. What it leaves
+    out is deliberate: no execution lock and no commit. The session is not committed yet, so no
+    other request can see it, let alone race it — and the CALLER's single commit is what makes the
+    save all-or-nothing: a manual save can never leave a saved-but-unaccepted scenario behind. No
+    threat-data liveness check either: the save resolved those library rows in this transaction."""
+    scenario_session = _ensure_session_ready_to_accept(sess, scenario_session)
+    session_id = str(scenario_session["SessionID"])
+    good_subs = dal.subsystem_ids_at_level(
+        sess, session_id, SubsystemLevel.SCENARIOS, status=StageStatus.AWAITING_DECISION)
+    decided = dal.decide_scenarios(
+        sess, session_id, good_subs, decision=AuditDecision.accept,
+        tenant_id=scenario_session["TenantID"], entity_id=str(scenario_session["EntityID"]),
+        user_id=user_id)
+    if decided.count != 1:
+        # Unreachable while the save writes exactly one complete scenario at a settled stage —
+        # and if it ever is, raising here rolls the whole save back rather than leaving it half.
+        raise AcceptConflict(f"a manual session holds exactly one scenario; {decided.count} "
+                             "were decidable — nothing was saved")
+    for event in (AuditEventType.scenarios_accepted, AuditEventType.review_decision):
+        dal.append_audit(sess, AuditID=guid(), SessionID=session_id,
+                         TenantID=scenario_session["TenantID"],
+                         EntityID=str(scenario_session["EntityID"]), EventType=event,
+                         Decision=AuditDecision.accept, ActorUserID=user_id)
+    return decided.count
+
+
 def unaccept_scenario(sess: Session, session_id: str, entity_id: str, user_id: str | None,
                     scenario_id: str) -> None:
     """Take one acceptance back, without adopting anything in its place.
@@ -313,7 +370,10 @@ def unaccept_scenario(sess: Session, session_id: str, entity_id: str, user_id: s
     Same gate, same per-subsystem lock and the same single writer as accept and reject, because
     an unaccept races exactly what they race.
     """
-    scenario_session = dal.get_session(sess, session_id, entity_id)
+    # Annotated: the review gate below returns `RowMapping | dict` (it echoes back what it
+    # was given, and accept_new_manual_scenario hands it a freshly-built dict), and this
+    # variable is rebound with that result.
+    scenario_session: RowMapping | dict | None = dal.get_session(sess, session_id, entity_id)
     if scenario_session is None:
         raise EntityForbidden(f"session {session_id} not in entity {entity_id}")
     # Called here, not inside a helper: scripts/test_pipeline_guards.py walks each function's own
@@ -375,7 +435,10 @@ def reject_scenarios(sess: Session, session_id: str, entity_id: str, user_id: st
     reject races exactly what an accept races. There is no reject-all: declining everything is a
     click no reviewer should be one mis-tap away from, and leaving scenarios pending is already a
     valid resting state."""
-    scenario_session = dal.get_session(sess, session_id, entity_id)
+    # Annotated: the review gate below returns `RowMapping | dict` (it echoes back what it
+    # was given, and accept_new_manual_scenario hands it a freshly-built dict), and this
+    # variable is rebound with that result.
+    scenario_session: RowMapping | dict | None = dal.get_session(sess, session_id, entity_id)
     if scenario_session is None:
         raise EntityForbidden(f"session {session_id} not in entity {entity_id}")
 
@@ -443,6 +506,10 @@ def review_gate_reason(scenario_session: RowMapping | dict) -> tuple[str, str] |
             f"status={scenario_session['StageStatus']}) — generation still in progress"))
 
 
+# Returns RowMapping, not `RowMapping | dict`: BOTH exit paths are one — the argument echoed back
+# when the gate passes, and `fresh` from dal.get_session on the re-read. The `| dict` was only
+# inherited from the parameter, and it made every `session = ensure_review_gate(...)` assignment
+# an error against a variable dal.get_session already types `RowMapping | None`.
 def ensure_review_gate(sess: Session, scenario_session: RowMapping | dict) -> RowMapping | dict:
     """`review_gate_reason`, but reconciled against whether a worker is ACTUALLY alive.
 
@@ -514,7 +581,10 @@ def ensure_review_gate(sess: Session, scenario_session: RowMapping | dict) -> Ro
         reason=ReviewGateReason.generation_abandoned)
 
 
-def _ensure_session_ready_to_accept(sess: Session, scenario_session: RowMapping) -> RowMapping | dict:
+# Parameter matches its delegate (`RowMapping | dict`) and the return narrows to RowMapping, for
+# the same reason as ensure_review_gate below — this is a thin wrapper over it.
+def _ensure_session_ready_to_accept(sess: Session,
+                                    scenario_session: RowMapping | dict) -> RowMapping | dict:
     """The review gate every decision route must pass: is this session AT a review barrier?
 
     Returns the session row to use from here on — recovery may have reloaded it, and the caller

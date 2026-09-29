@@ -18,14 +18,20 @@ does nothing and a run that stops halfway can simply be run again.
 
 WHAT IT CONTAINS
 
-  Section 0   Snapshot isolation, and the two switches for the run
-  Section 1   Legacy names: repairs, renames, and the five removed columns
+  Section 0   Snapshot isolation (and its own @disconnect_others switch)
+  Section 1   The two switches for the run, then legacy names: repairs,
+              renames, and the five removed columns
   Section 2   Tables (22)
-  Section 3   Columns (291), then three one-time data fixes
-  Section 4   Default constraints (21)
+  Section 3   Columns (297), then three one-time data fixes
+  Section 4   Default constraints (22)
   Section 5   Check constraints (3)
-  Section 6   Indexes (29)
+  Section 6   Indexes (31)
   Section 7   Verification
+
+  Those counts are pinned to the script by tests/test_schema_sync.py, along with
+  the identical set in the script's own header. Before that, three of the four had
+  been left behind by hand edits, and a reviewer reconciling this readme against a
+  live database found objects it could not account for.
 
 
 ----------------------------------------------------------------------------
@@ -129,9 +135,8 @@ STOP IF
 
 IGNORE
   "PARTIAL — some TSG tables present" is INFO, not a failure.
-  Two tables may be absent and both are correct:
+  One table may be absent and that is correct:
     Threat_Scenario_Output   the old name, gone once the rename has run
-    Scenario_Library         a removed feature, nothing reads it
 
 
 =========================== STEP 4 — DRY RUN ===============================
@@ -203,11 +208,7 @@ EXPECT
   PASS on: "All <n> boot-asserted indexes present, unique and correct"
   PASS on: the column, scenario-lifecycle and RCSI rows.
 
-IGNORE THIS ONE FAILURE
-  "Table missing: Scenario_Library" — that check is out of date. The table is
-  deliberately not created and nothing reads it.
-
-ALSO IGNORE, ONLY IF THE LIBRARIES ARE MEANT TO BE EMPTY
+IGNORE, ONLY IF THE LIBRARIES ARE MEANT TO BE EMPTY
   Seed-data FAIL rows. If they are not meant to be empty, run
   "3. Seed_to_Threat_library.sql" and "5. Seed_to_Control_library.sql" now.
 

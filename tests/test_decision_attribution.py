@@ -161,6 +161,7 @@ def test_visible_plan_keys_match_the_plan_document_model():
     assert tuple(_VISIBLE_PLAN_KEYS) == (
         "title", "treatment_plan", "action_plan", "applicable_to_all_subsystems",
         "controls_to_be_implemented", "remediation_action_plan", "mitigation_timeline",
+        "mitigation_timeline_days", "mitigation_end_date_planned",
         "mitigation_owner", "risk_owner", "impacted_business_division")
 
 

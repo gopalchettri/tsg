@@ -23,7 +23,7 @@ source .venv/Scripts/activate
 python -m pip install --upgrade pip
 
 # 4. Install all dependencies. pyproject.toml is canonical; requirements.txt
-#    exists too, but only for tooling that can't read pyproject.toml (e.g. Docker).
+#    exists too, but only for tooling that can't read pyproject.toml (e.g. Docker)
 pip install -e ".[dev]"
 
 # EMBEDDING_PROVIDER/RERANKER_PROVIDER default to "local" (see .env.example) -- that
@@ -36,8 +36,15 @@ pip check
 
 # run (needs Redis running; pyodbc needs "ODBC Driver 17 for SQL Server")
 # Easiest: .\start.ps1  -- brings up docker deps + worker + beat + API.
-# By hand, the API only:
-uvicorn app.main:app --reload --port 8000
+#   No Docker? .\run.ps1 checks the native deps and passes -SkipDocker for you.
+#   Both AUTO-RELOAD when the env file is .env, so a code edit takes effect without
+#   restarting the stack. Any other env file (-EnvFile .env.uat) gets a plain server;
+#   -NoReload turns it off for .env too.
+#   The reload is `watchfiles` supervising uvicorn, NOT `uvicorn --reload`: uvicorn's own
+#   in-process reloader dies on its first restart here and takes the console with it
+#   (measured 2026-09-24 -- see start.ps1's -NoReload help).
+# By hand, the API only -- same supervisor, so an edit restarts it:
+python -m watchfiles --filter python "python -m uvicorn app.main:app --port 8000" app
 
 # The Celery worker needs the venv ACTIVATED first. Without it a bare `celery`
 # resolves to whatever global Python is on PATH -- which has celery but no gevent,

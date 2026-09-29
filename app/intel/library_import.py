@@ -614,6 +614,7 @@ def import_records(sess, records: list[dict], tag: str, created_by: str | None,
     known_threats = _existing_catalogue_ids(sess)
     created_types: list[int] = []
     created_threats: list[int] = []
+    conflicts: list[dict] = []          # records whose name another type already holds
     new_links = 0
 
     for type_name, recs in group_by_type(records).items():
@@ -622,9 +623,17 @@ def import_records(sess, records: list[dict], tag: str, created_by: str | None,
         if hit is not None:
             type_id = hit  # re-run fast path: skips a whole-table read inside the DAL
         else:
-            type_id, was_new = dal.upsert_threat_type(
-                sess, bounded, cat_ids[modal_category(recs)], source=tag,
-                created_by=created_by, is_active=is_active)
+            try:
+                type_id, was_new = dal.upsert_threat_type(
+                    sess, bounded, cat_ids[modal_category(recs)], source=tag,
+                    created_by=created_by, is_active=is_active)
+            except dal.BlankLibraryName as blank:
+                # No identity, so neither dedup nor a curator tombstone can ever hold for it and
+                # every re-import would mint another row. Skip the whole group and report each
+                # record — one malformed source row must not abort an import of thousands.
+                conflicts.extend({"reason": f"threat type {blank}", "item": r["threat_name"]}
+                                 for r in recs)
+                continue
             if was_new:
                 created_types.append(type_id)
             known_types[normalize_name(bounded)] = type_id
@@ -636,9 +645,25 @@ def import_records(sess, records: list[dict], tag: str, created_by: str | None,
             if hit is not None:
                 cid = hit  # re-run fast path: no INSERT, so no IntegrityError to recover from
             else:
-                cid, was_new = dal.upsert_threat_catalogue(
-                    sess, bounded_name, type_id, source=tag, created_by=created_by,
-                    is_active=is_active)
+                try:
+                    cid, was_new = dal.upsert_threat_catalogue(
+                        sess, bounded_name, type_id, source=tag, created_by=created_by,
+                        is_active=is_active)
+                except dal.BlankLibraryName as blank:
+                    # See the type mint above: a name with no letters or digits has no identity.
+                    conflicts.append({"reason": str(blank), "item": r["threat_name"]})
+                    continue
+                except dal.CuratorRejected:
+                    # A curator rejected this name; an import must not quietly resurrect it.
+                    conflicts.append({"reason": "rejected by a curator; not re-imported",
+                                      "item": r["threat_name"]})
+                    continue
+                except dal.CatalogueNameTaken as taken:
+                    # One source record must not re-curate another type's row: skipped, and
+                    # reported, rather than silently adding its categories to that row.
+                    conflicts.append({"reason": f"already filed under '{taken.type_name}' in "
+                                                "the threat library", "item": r["threat_name"]})
+                    continue
                 if was_new:
                     created_threats.append(cid)
                 if key[1]:
@@ -646,7 +671,10 @@ def import_records(sess, records: list[dict], tag: str, created_by: str | None,
             for c in r["categories"]:
                 new_links += dal.link_catalogue_category(sess, cid, cat_ids[c])
 
-    return {"types": len(group_by_type(records)), "threats": len(records),
+    return {"types": len(group_by_type(records)), "threats": len(records) - len(conflicts),
+            # Reported, never swallowed: a skipped record is an import outcome the
+            # operator must see, the same way a blank name already is.
+            "skipped": conflicts,
             "new_category_links": new_links,
             "types_created": len(created_types), "threats_created": len(created_threats)}
 
@@ -695,8 +723,17 @@ def run_import(sess, source: str, *, dry_run: bool = False, activate: bool = Tru
             result["warning"] = (f"0 usable actors found for source {source!r} -- check the "
                                  "content matches the selected source")
         elif not dry_run:
+            skipped_actors = []
             for a in actors:
-                dal.upsert_threat_actor(sess, a, source=tag, created_by=created_by)
+                try:
+                    dal.upsert_threat_actor(sess, a, source=tag, created_by=created_by)
+                except dal.BlankLibraryName as blank:
+                    # Same identity rule as the threat mints: an actor name with no letters or
+                    # digits can never be deduped, so it is skipped and counted, not minted.
+                    skipped_actors.append(str(blank))
+            if skipped_actors:
+                result["actors_upserted"] = len(actors) - len(skipped_actors)
+                result["actors_skipped"] = skipped_actors[:RESULT_LIST_CAP]
     else:
         result.update({"types": len(group_by_type(records)), "threats": len(records),
                        "new_category_links": None, "before_count": source_count(sess, tag),
@@ -724,7 +761,9 @@ def run_import(sess, source: str, *, dry_run: bool = False, activate: bool = Tru
                 # unknowable without writing, and must not be guessed at.
                 result["after_count"] = result["before_count"]
             else:
-                result.update(import_records(sess, records, tag, created_by, is_active=activate))
+                imported = import_records(sess, records, tag, created_by, is_active=activate)
+                skipped.extend(imported.pop("skipped"))
+                result.update(imported)
                 result["after_count"] = source_count(sess, tag)
 
     result["skipped_count"] = len(skipped)

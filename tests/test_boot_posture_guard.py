@@ -160,8 +160,16 @@ def test_beat_gates_are_pinned_on_both_sides():
     off = _build_beat_schedule(Settings(_env_file=None, control_map_sweep_enabled=False,
                                         intel_refresh_interval_seconds=0))
 
-    assert on["map-controls-sweep"] == {"task": "tsg.map_controls_sweep", "schedule": 300.0}
-    assert "map-controls-sweep" not in off
+    # map-controls-sweep is NO LONGER gated here, and that is the fix, not a regression. Reading
+    # control_map_sweep_enabled in this builder made it a BOOT-TIME decision: the schedule is
+    # built once at import, so flipping the variable changed nothing until beat itself was
+    # restarted — a switch that did not switch. The gate moved into map_controls_sweep_task,
+    # which re-reads it every tick (see the two tests below). The entry must therefore be present
+    # in BOTH schedules; if it ever vanishes from `off` again, the setting has silently gone back
+    # to being unusable without a beat restart.
+    for schedule in (on, off):
+        assert schedule["map-controls-sweep"]["task"] == "tsg.map_controls_sweep"
+    assert on["map-controls-sweep"]["schedule"] == 300.0
     assert on["intel-refresh"] == {"task": "tsg.intel_refresh_all", "schedule": 86400}
     assert "intel-refresh" not in off
     # An ungated entry must survive both ways — a gate must never take the reaper with it.
@@ -216,3 +224,82 @@ def test_the_installed_sse_starlette_actually_satisfies_the_guard():
     """The other half: the guard must pass against what this environment really has, or it is a
     tripwire that only ever cries wolf."""
     cfg.assert_sse_library_supports_our_calls()
+
+
+def test_the_sweep_task_declines_every_tick_while_disabled(monkeypatch):
+    """The gate in its NEW home, for the SCHEDULED caller only. Beat always schedules the sweep
+    now, so the task is the only thing that can honour TSG_CONTROL_MAP_SWEEP_ENABLED — and it must
+    do so without paying for a tick it will not run: no DB session, no model, no lock. Anything
+    else turns "disabled" into a connection and a reranker load every interval, forever."""
+    from types import SimpleNamespace
+
+    from app.pipeline import celery_app as ca
+
+    def _never(*_a, **_k):
+        raise AssertionError("a disabled tick opened a resource")
+    monkeypatch.setattr(ca, "get_settings",
+                        lambda: SimpleNamespace(control_map_sweep_enabled=False))
+    monkeypatch.setattr(ca, "db_session", _never)
+    monkeypatch.setattr(ca, "get_llm", _never)
+
+    assert ca.map_controls_sweep_task(scheduled=True) == []
+
+
+def test_the_sweep_task_runs_when_enabled(monkeypatch):
+    """The other arm — the gate must not be a permanent off switch. Both arms are pinned because
+    the previous version of this gate had only one reachable in CI, which is exactly how it came
+    to be wrong."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from app.pipeline import celery_app as ca
+
+    @contextmanager
+    def _sess():
+        yield "session"
+    monkeypatch.setattr(ca, "get_settings",
+                        lambda: SimpleNamespace(control_map_sweep_enabled=True))
+    monkeypatch.setattr(ca, "db_session", _sess)
+    monkeypatch.setattr(ca, "get_llm", lambda: "llm")
+    monkeypatch.setattr(ca.cascade, "run_control_map_sweep", lambda s, llm: ["swept-1"])
+
+    assert ca.map_controls_sweep_task() == ["swept-1"]
+
+
+def test_a_manual_sweep_runs_while_the_schedule_is_disabled(monkeypatch):
+    """THE REGRESSION THIS SHAPE EXISTS FOR, and the one an adversarial audit caught after the
+    suite did not. The gate first landed on the TASK, and both manual drains publish that same
+    task — so POST /v1/tsg/control-map/sweep and the documented
+    `celery ... call tsg.map_controls_sweep` silently returned [] whenever the setting was off.
+    A no-op in the exact state they exist for, and a regression of the CLI path, which had no
+    gate at all before. The decline now belongs to the SCHEDULED tick: a caller that does not
+    claim to be beat always runs, by construction rather than by a second code path."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from app.pipeline import celery_app as ca
+
+    @contextmanager
+    def _sess():
+        yield "session"
+    monkeypatch.setattr(ca, "get_settings",
+                        lambda: SimpleNamespace(control_map_sweep_enabled=False))
+    monkeypatch.setattr(ca, "db_session", _sess)
+    monkeypatch.setattr(ca, "get_llm", lambda: "llm")
+    monkeypatch.setattr(ca.cascade, "run_control_map_sweep", lambda s, llm: ["drained-1"])
+
+    # The default — what the admin route and a bare `celery call` produce.
+    assert ca.map_controls_sweep_task() == ["drained-1"]
+    # ...while beat's own tick, which marks itself, still declines.
+    assert ca.map_controls_sweep_task(scheduled=True) == []
+
+
+def test_beat_marks_its_own_tick_as_scheduled():
+    """Without this kwarg the flag governs NOTHING: the task only declines for a scheduled
+    caller, so an entry that omits it would sweep every interval no matter what the setting says.
+    The gate and the entry are two halves of one mechanism."""
+    from app.core.config import Settings
+    from app.pipeline.celery_app import _build_beat_schedule
+
+    entry = _build_beat_schedule(Settings(_env_file=None))["map-controls-sweep"]
+    assert entry["kwargs"] == {"scheduled": True}, entry

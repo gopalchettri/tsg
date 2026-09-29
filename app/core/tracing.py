@@ -38,7 +38,7 @@ import time
 from itertools import count
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
@@ -227,7 +227,10 @@ class trace_step:
         """Record what the step produced. Merged into the END record."""
         self._out.update(fields)
 
-    def __exit__(self, exc_type, exc, _tb) -> bool:
+    # Literal[False], not bool: mypy's [exit-return] check warns that declaring `bool` invites a
+    # future `return True`, which would SILENTLY SWALLOW a pipeline exception. Both returns below
+    # are already False; this makes "never swallow" enforced by the checker, not by the comment.
+    def __exit__(self, exc_type, exc, _tb) -> Literal[False]:
         if not self._sinks:
             return False
         ms = round((time.monotonic() - self._t0) * 1000, 1)

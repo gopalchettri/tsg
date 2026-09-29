@@ -27,8 +27,12 @@ class InfraErrorKind(StrEnum):
 
 
 class SessionMode(StrEnum):
-    AUTO = "AUTO"   # the only implemented mode: both stages run back-to-back per subsystem,
-                    # stopping only at the single REVIEW gate. MANUAL is reserved, no code path
+    AUTO = "AUTO"   # both stages run back-to-back per subsystem, stopping only at the single
+                    # REVIEW gate
+    MANUAL = "MANUAL"   # a person wrote the scenario and sent it to POST /v1/remediation-plans:
+                        # the session is BORN at the review barrier, already accepted, and no AI
+                        # stage ever runs on it (sessions._assert_regen_eligible and
+                        # cascade._refuses_ai_writes both refuse it)
 
 
 class WorkflowStage(StrEnum):
@@ -154,6 +158,39 @@ class SelectionReason(StrEnum):
     has exactly two members. `Reason` prose is DERIVED from this + FactorsJSON, never freehand."""
     verified_match = "verified_match"       # grounding matched an approved library entry
     unverified_match = "unverified_match"   # no confident library match — AI wording kept
+    manual_entry = "manual_entry"           # no scoring ran at all: a person chose this threat
+
+
+class ContentSource(StrEnum):
+    """Who authored a row — `Threat_Scenario.ScenarioSource`, and the `Source` stamped on a
+    library entry a hand-written scenario proposes. ONE spelling for the save, the predicates and
+    promote, so 'manual' can never drift into 'MANUAL' or 'manual-scenario' somewhere."""
+    manual = "manual"
+
+
+class LibraryOutcome(StrEnum):
+    """What a hand-written scenario's threat (and its type) DID to the threat library.
+
+    Computed by the manual save, written into the `library_promoted` audit detail, and published
+    on every response that shows such a scenario. An enum rather than the bare strings that audit
+    detail used to carry, for the reason ContentSource exists: the durable record and the wire
+    then read one vocabulary, and neither can drift into a spelling the other does not know.
+
+    WHY IT IS PUBLISHED AT ALL. Without it a caller sees only `grounding_status: unverified`,
+    which is identical for "brand new, awaiting a curator" and "a curator already said no" — so
+    someone can resubmit rejected wording forever while the decision that explains it sits in an
+    audit row they cannot read."""
+
+    existing = "existing"            # the library already held this name; the scenario links to it
+    inserted = "inserted"            # proposed as a PENDING entry — a curator has yet to review it
+    not_proposed = "not_proposed"    # nothing was minted, and nothing should have been: e.g. the
+                                    # threat itself was refused, so a type to file it under is moot
+    rejected_by_curator = "rejected_by_curator"   # a curator reviewed this exact wording and
+                                    # declined it. The scenario keeps the person's words but is
+                                    # NOT linked, and re-sending never re-proposes it. There is
+                                    # ONE rejection path (the admin-key library reject route), so
+                                    # 'curator' and 'admin' are the same actor here — a second
+                                    # value would be a distinction without a difference.
 
 
 class ScenarioStatus(StrEnum):
@@ -397,6 +434,8 @@ class ReviewGateReason(StrEnum):
     exception's own message, and adding entries would reshape every gate 409 body."""
     session_completed = "session_completed"              # terminal: the session is not at a review barrier
     session_cancelled = "session_cancelled"              # terminal: start a new session for the asset
+    manual_session = "manual_session"                    # terminal: a person wrote this scenario, so the AI
+                                                         # never rewrites or adds to it (SessionMode.MANUAL)
     generation_in_progress = "generation_in_progress"    # transient: the run is working, queued, or
                                                          # between claims. ensure_review_gate PROVES it
                                                          # is not abandoned with reaper.session_is_
