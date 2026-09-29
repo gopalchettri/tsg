@@ -337,6 +337,23 @@ COMMENTS: dict[str, str] = {
         Lower it if the database is growing faster than you would like; raise it if you
         investigate problems weeks after they happen.
     """,
+    "TSG_APPLICATION_LOG_RETENTION_DAYS": """
+        How many days of ordinary log lines to keep, when saving them is switched on.
+
+        Deliberately shorter than the setting above. That one keeps records of things that went
+        wrong, which are rare and worth keeping. This one keeps EVERY line the system writes -
+        hundreds for a single run - so it is a short trail for working out what happened this week,
+        not a long-term record.
+    """,
+    "TSG_DIAGNOSTIC_QUEUE_MAX": """
+        How many records may wait to be written before new ones are DISCARDED. You should not
+        normally need to change this.
+
+        Saving happens in the background so it never slows the system down. If the database cannot
+        keep up, records queue; this is the limit on that queue. Past it, new records are thrown
+        away and a warning is written, rather than the queue growing until the service runs out of
+        memory and stops. Losing some records is a bad day; losing the service is an outage.
+    """,
     "LLM_TEMPERATURE": """
         How much the AI is allowed to vary its wording. 0 gives the most consistent answers, 2
         the most varied. To use the provider's own default, COMMENT THE LINE OUT. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.

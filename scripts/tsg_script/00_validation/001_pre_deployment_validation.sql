@@ -134,7 +134,7 @@ INSERT INTO @owned (name) VALUES
     ('Scenario_Session'), ('Subsystem_Stage_State'), ('Identified_Threat'),
     ('Identified_Duplicate_Threat'), ('Scoped_Threat'), ('Threat_Scenario'),
     ('Threat_Scenario_Control_Map'), ('Risk_Treatment_Plan'),
-    ('Scenario_Audit'), ('Prompt_Log'), ('Diagnostic_Event');
+    ('Scenario_Audit'), ('Prompt_Log'), ('Diagnostic_Event','Application_Log'), ('Application_Log');
 
 DECLARE @total   int = (SELECT COUNT(*) FROM @owned);
 DECLARE @present int = (SELECT COUNT(*) FROM @owned o

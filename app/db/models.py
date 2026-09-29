@@ -674,6 +674,42 @@ class Prompt_Log(Base):
 # ---------------------------------------------------------------------------
 # Audit (append-only)
 # ---------------------------------------------------------------------------
+class Application_Log(Base):
+    """The ordinary log stream, durably. OPERATOR-ONLY, like Diagnostic_Event beside it.
+
+    SEPARATE FROM Diagnostic_Event ON PURPOSE, and the separation is the point. This table takes
+    every line at INFO and above — hundreds per pipeline run, six figures on a busy day. Mixed into
+    the same table as a handful of exception rows, the valuable rows become unfindable and both are
+    forced onto one retention policy. So: two tables, two horizons — long for diagnostics, short
+    for the stream.
+
+    THE FIELDS ARE SPLIT OUT rather than left in the blob because of what an operator actually
+    asks. "Everything for session X" and "errors in the last hour" are the two real queries, so
+    SessionID, Level and CreatedAt are columns; everything else structlog bound to the event stays
+    in FieldsJSON, where it costs nothing until someone reads it.
+
+    NOTE ON WHAT THIS HOLDS. Log lines carry whatever the code logged, which in this system
+    includes asset context and prompt text. Capturing them durably creates a store of personal
+    data that did not exist before, so the `logs` category is left OUT of the production env
+    template deliberately — see the operator guide. UAT ships with it on.
+    """
+
+    __tablename__ = "Application_Log"
+    LogID: Mapped[str] = mapped_column(GUID, primary_key=True)
+    CreatedAt: Mapped[datetime] = mapped_column(DateTime)
+    #: WARNING / ERROR / INFO — the first thing anyone filters on.
+    Level: Mapped[str] = mapped_column(Unicode(20))
+    Logger: Mapped[str | None] = mapped_column(Unicode(200))
+    #: structlog's event name ("pipeline.failed"), which is the stable handle for log queries.
+    Event: Mapped[str | None] = mapped_column(Unicode(500))
+    #: The three pivots, promoted out of the blob because they are what gets searched.
+    SessionID: Mapped[str | None] = mapped_column(Unicode(100))
+    RequestID: Mapped[str | None] = mapped_column(Unicode(100))
+    TaskID: Mapped[str | None] = mapped_column(Unicode(100))
+    #: Everything else the event carried, verbatim.
+    FieldsJSON: Mapped[str | None] = mapped_column(UnicodeText)
+
+
 class Diagnostic_Event(Base):
     """OPERATOR-ONLY failure detail. Never shown to a tenant, never joined by a tenant route.
 

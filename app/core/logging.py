@@ -12,6 +12,20 @@ import structlog
 from app.core.config import get_settings
 
 
+def _capture_log_record(logger, method_name, event_dict):
+    """Bridge to app.core.diagnostics, imported LAZILY and on every call.
+
+    Not a module-level import: diagnostics imports config, config is imported by everything, and
+    logging is configured at import time — a direct import here is a cycle. Wrapped because the
+    logging chain must survive its own capture step being unavailable."""
+    try:
+        from app.core.diagnostics import capture_log_record
+
+        return capture_log_record(logger, method_name, event_dict)
+    except Exception:  # noqa: BLE001 — a log line must never be lost to its own capture
+        return event_dict
+
+
 def configure_logging(level: int | None = None) -> None:
     """Wire structlog's processor chain to stdlib logging and set JSON output. `level`
     defaults to the `LOG_LEVEL` setting. Idempotent — safe to call again from the FastAPI
@@ -63,7 +77,12 @@ def configure_logging(level: int | None = None) -> None:
     root.handlers = handlers  # replace, not add — configure_logging is safely re-callable
     root.setLevel(level)
     structlog.configure(
-        processors=[*shared_processors, structlog.processors.format_exc_info, structlog.processors.JSONRenderer()],
+        # capture_log_record sits BEFORE format_exc_info and the renderer: it needs the event as
+        # a dict, and anything after JSONRenderer never runs at all (the renderer returns a str and
+        # terminates the chain). It returns the dict unchanged on every path, so the rendered line
+        # is byte-identical whether capture is on or off.
+        processors=[*shared_processors, _capture_log_record,
+                    structlog.processors.format_exc_info, structlog.processors.JSONRenderer()],
         wrapper_class=structlog.make_filtering_bound_logger(level),
         logger_factory=structlog.PrintLoggerFactory(file=stream),
         cache_logger_on_first_use=True,

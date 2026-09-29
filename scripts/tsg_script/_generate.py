@@ -64,7 +64,7 @@ TABLE_ORDER = [
     # during a run, so it can be created after everything the pipeline needs. A trail like the two
     # above, but for the operator rather than the tenant — Scenario_Audit is projected into a
     # client timeline, this one never leaves the admin surface.
-    "Diagnostic_Event",
+    "Diagnostic_Event", "Application_Log",
 ]
 
 

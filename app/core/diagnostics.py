@@ -35,6 +35,7 @@ import traceback as _traceback
 from typing import Any
 
 from app.core.config import get_settings
+from app.core.diagnostic_writer import WRITER
 from app.core.enums import DiagnosticKind
 from app.core.logging import get_logger
 
@@ -46,7 +47,18 @@ log = get_logger(__name__)
 _CATEGORIES: dict[str, frozenset[DiagnosticKind]] = {
     "exceptions": frozenset({DiagnosticKind.stage_error, DiagnosticKind.retries_exhausted}),
     "retries": frozenset({DiagnosticKind.transient_retry}),
+    # `logs` is not a DiagnosticKind: it is the raw stream, which lands in Application_Log rather
+    # than Diagnostic_Event. It is a CATEGORY name so one setting governs everything, and it is
+    # checked by name in log_enabled() below.
+    "logs": frozenset(),
 }
+
+#: Loggers whose records are NEVER captured, because capturing them is recursive: the DB layer
+#: emits log records, each captured record becomes an insert, and each insert emits more records.
+#: Left unguarded this is not a slow leak, it is an exponential one that takes the process out.
+#: Prefix match, so `sqlalchemy.engine.Engine` is covered by `sqlalchemy`.
+_NEVER_CAPTURE = ("sqlalchemy", "aioodbc", "pyodbc", "app.core.diagnostic_writer",
+                  "app.core.diagnostics")
 
 
 def _enabled_kinds() -> frozenset[DiagnosticKind]:
@@ -79,9 +91,7 @@ def record(kind: DiagnosticKind, exc: BaseException, *, session_id: str | None =
             return
         # Imported here, not at module import: app.db pulls in the engine, and this module is
         # imported by app.core, which must stay loadable without a database.
-        from app.db import models as m
         from app.db.dal import guid, now
-        from app.db.engine import db_session
 
         tb = "".join(_traceback.format_exception(type(exc), exc, exc.__traceback__))
         client = (client_message or "")[:1000] or None
@@ -97,10 +107,10 @@ def record(kind: DiagnosticKind, exc: BaseException, *, session_id: str | None =
             "ClientMessage": client,
             "ContextJSON": json.dumps(context, default=str) if context else None,
         }
-        # ITS OWN SESSION. Never the caller's: the caller may be mid-rollback, and a diagnostic
-        # must not join, dirty, or be discarded by the transaction it is describing.
-        with db_session() as sess:
-            sess.execute(m.Diagnostic_Event.__table__.insert().values(**row))
+        # QUEUED, never inserted here. Off the caller's thread entirely: the caller may be
+        # mid-rollback, holds a lock, and in the `logs` case is in the middle of a log call that
+        # must not perform IO. diagnostic_writer batches and owns its own connection.
+        WRITER.submit("Diagnostic_Event", row, get_settings().diagnostic_queue_max)
     except Exception as write_failure:  # noqa: BLE001 — see the module docstring
         # stdout is the fallback and is always available. The ORIGINAL exception is logged here
         # too, because losing it is the one outcome worse than losing the diagnostic row.
@@ -120,3 +130,61 @@ def _request_id() -> str | None:
         return structlog.contextvars.get_contextvars().get("request_id")
     except Exception:  # noqa: BLE001 — best-effort, like everything else in this module
         return None
+
+
+def log_enabled() -> bool:
+    """Is the raw log stream being captured? Read per record, so the runtime toggle takes effect
+    without a restart and without this module holding a stale answer."""
+    raw = (get_settings().diagnostic_db_categories or "").strip().lower()
+    return raw == "all" or "logs" in {p.strip() for p in raw.split(",")}
+
+
+def capture_log_record(logger, method_name, event_dict):
+    """structlog processor: queue this event for Application_Log, then pass it through unchanged.
+
+    A PROCESSOR, not a logging handler. structlog uses PrintLoggerFactory here and bypasses stdlib
+    logging entirely, so a stdlib handler would see the FOREIGN records (uvicorn, sqlalchemy) and
+    miss every application event — the opposite of what is wanted. Sitting in the processor chain
+    catches app events, which is the half worth keeping.
+
+    Returns event_dict unchanged on EVERY path, including failure: a processor that raises, or that
+    drops the dict, silences the log line it was meant to record.
+    """
+    try:
+        if not log_enabled():
+            return event_dict
+        name = getattr(logger, "name", "") or event_dict.get("logger") or ""
+        if any(str(name).startswith(p) for p in _NEVER_CAPTURE):
+            return event_dict
+        level = str(event_dict.get("level", method_name) or "").upper()
+        if level not in _CAPTURED_LEVELS:
+            return event_dict
+
+        from app.db.dal import guid, now
+
+        known = {"event", "level", "logger", "timestamp", "session_id", "request_id", "task_id"}
+        WRITER.submit("Application_Log", {
+            "LogID": guid(), "CreatedAt": now(), "Level": level[:20],
+            "Logger": (str(name) or None) and str(name)[:200],
+            "Event": str(event_dict.get("event", ""))[:500] or None,
+            "SessionID": _text(event_dict.get("session_id")),
+            "RequestID": _text(event_dict.get("request_id")),
+            "TaskID": _text(event_dict.get("task_id")),
+            "FieldsJSON": json.dumps({k: v for k, v in event_dict.items() if k not in known},
+                                     default=str) or None,
+        }, get_settings().diagnostic_queue_max)
+    except Exception:  # noqa: BLE001 — a log line must survive its own capture failing
+        pass
+    return event_dict
+
+
+#: INFO and above. DEBUG is deliberately excluded even when someone sets the app to DEBUG: debug
+#: logging is a development tool and would multiply this table's volume for no operator benefit.
+_CAPTURED_LEVELS = frozenset({"INFO", "WARNING", "WARN", "ERROR", "CRITICAL", "EXCEPTION"})
+
+
+def _text(value) -> str | None:
+    """Truncate to the column, and never let a non-string id break the capture."""
+    if value in (None, ""):
+        return None
+    return str(value)[:100]

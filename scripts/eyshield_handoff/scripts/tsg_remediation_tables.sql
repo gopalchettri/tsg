@@ -11,7 +11,7 @@
   DRY RUN: set PreviewOnly to 1 in Section 0 and the whole script only prints what
   it would do. Nothing is created, altered, renamed, dropped or updated.
 
-  Contents: legacy-name migration, 23 tables, 311 reconciled columns,
+  Contents: legacy-name migration, 24 tables, 320 reconciled columns,
   22 default constraints,
   3 check constraints, 31 indexes.
 
@@ -866,6 +866,28 @@ CREATE TABLE [dbo].[Prompt_Log](
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
+/****** Table: Application_Log — the ordinary log stream, durably. OPERATOR-ONLY.
+        Takes every line at INFO and above, so it grows orders of magnitude
+        faster than Diagnostic_Event beside it and is kept for days, not weeks.
+        Written by a background batching writer, never on a request thread. ******/
+IF OBJECT_ID('dbo.Application_Log', 'U') IS NULL
+CREATE TABLE [dbo].[Application_Log](
+	[LogID] [uniqueidentifier] NOT NULL,
+	[CreatedAt] [datetime2](7) NOT NULL,
+	[Level] [nvarchar](20) NOT NULL,
+	[Logger] [nvarchar](200) NULL,
+	[Event] [nvarchar](500) NULL,
+	[SessionID] [nvarchar](100) NULL,
+	[RequestID] [nvarchar](100) NULL,
+	[TaskID] [nvarchar](100) NULL,
+	[FieldsJSON] [nvarchar](max) NULL,
+ CONSTRAINT [PK_Application_Log] PRIMARY KEY CLUSTERED
+(
+	[LogID] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+
 /****** Table: Diagnostic_Event — OPERATOR-ONLY failure detail: the exception
         class, message and traceback behind a run that failed, plus the
         sanitised text the customer was shown so the two can be joined.
@@ -1403,6 +1425,16 @@ VALUES
   ('Prompt_Log','ParseSucceeded','bit',NULL,NULL,0,0,NULL,NULL),
   ('Prompt_Log','CreatedAt','datetime2',NULL,7,0,0,NULL,NULL),
   ('Prompt_Log','CorrelationID','uniqueidentifier',NULL,NULL,1,0,NULL,NULL),
+  -- Application_Log
+  ('Application_Log','LogID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
+  ('Application_Log','CreatedAt','datetime2',NULL,7,0,0,NULL,NULL),
+  ('Application_Log','Level','nvarchar',20,NULL,0,0,NULL,NULL),
+  ('Application_Log','Logger','nvarchar',200,NULL,1,0,NULL,NULL),
+  ('Application_Log','Event','nvarchar',500,NULL,1,0,NULL,NULL),
+  ('Application_Log','SessionID','nvarchar',100,NULL,1,0,NULL,NULL),
+  ('Application_Log','RequestID','nvarchar',100,NULL,1,0,NULL,NULL),
+  ('Application_Log','TaskID','nvarchar',100,NULL,1,0,NULL,NULL),
+  ('Application_Log','FieldsJSON','nvarchar',-1,NULL,1,0,NULL,NULL),
   -- Diagnostic_Event
   ('Diagnostic_Event','DiagnosticID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Diagnostic_Event','CreatedAt','datetime2',NULL,7,0,0,NULL,NULL),

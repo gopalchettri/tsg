@@ -819,6 +819,22 @@ CREATE TABLE Scenario_Audit (
     CreatedAt        datetime2     NOT NULL
 );
 
+-- Application_Log: the ordinary log stream, durably. OPERATOR-ONLY, like Diagnostic_Event.
+-- Every line at INFO and above, so it grows far faster and is kept for days rather than weeks.
+-- Written by a background batching writer, never on a request thread.
+IF OBJECT_ID('dbo.Application_Log', 'U') IS NULL
+CREATE TABLE Application_Log (
+    LogID       uniqueidentifier NOT NULL CONSTRAINT PK_Application_Log PRIMARY KEY,
+    CreatedAt   datetime2(7) NOT NULL,
+    Level       nvarchar(20) NOT NULL,
+    Logger      nvarchar(200) NULL,
+    Event       nvarchar(500) NULL,
+    SessionID   nvarchar(100) NULL,
+    RequestID   nvarchar(100) NULL,
+    TaskID      nvarchar(100) NULL,
+    FieldsJSON  nvarchar(max) NULL
+);
+
 -- Diagnostic_Event: OPERATOR-ONLY failure detail. The exception class, message and traceback
 -- behind a failed run, plus the sanitised text the customer was shown so a report of "it said
 -- stage processing failed" joins to the real cause. No tenant-facing route reads it. Written

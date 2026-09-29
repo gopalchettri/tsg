@@ -54,6 +54,13 @@ if "TSG_DB_DSN" not in os.environ and _dotenv.is_file():
             os.environ["TSG_DB_DSN"] = _line.partition("=")[2].strip().strip('"').strip("'")
             break
 
+# Diagnostics capture OFF by default for the suite. The `logs` category writes EVERY log line to
+# whatever TSG_DB_DSN names, and the writer runs on a background thread that outlives any one test
+# -- so with it on, an ordinary unit test quietly writes to a real database. A test that wants
+# capture turns it on explicitly (tests/test_diagnostics.py, tests/test_diagnostic_writer.py),
+# which is the same rule as every other setting here: declared, never inherited.
+os.environ.setdefault("TSG_DIAGNOSTIC_DB_CATEGORIES", "none")
+
 import pytest  # noqa: E402 -- must follow the env pins above
 
 

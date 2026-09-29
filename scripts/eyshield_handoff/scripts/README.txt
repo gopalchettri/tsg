@@ -21,8 +21,8 @@ WHAT IT CONTAINS
   Section 0   Snapshot isolation (and its own @disconnect_others switch)
   Section 1   The two switches for the run, then legacy names: repairs,
               renames, and the five removed columns
-  Section 2   Tables (23)
-  Section 3   Columns (311), then three one-time data fixes
+  Section 2   Tables (24)
+  Section 3   Columns (320), then three one-time data fixes
   Section 4   Default constraints (22)
   Section 5   Check constraints (3)
   Section 6   Indexes (31)

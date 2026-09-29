@@ -29,6 +29,10 @@ def db(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{path}", future=True)
     m.Diagnostic_Event.__table__.create(engine)
     monkeypatch.setenv("TSG_DB_DSN", f"sqlite:///{path.as_posix()}")
+    # DECLARED, because conftest turns capture off for the suite: the writer runs on a background
+    # thread and would otherwise write to whatever database is configured. A test that wants
+    # capture says so.
+    monkeypatch.setenv("TSG_DIAGNOSTIC_DB_CATEGORIES", "all")
 
     from app.core.config import get_settings
     from app.db.engine import _sessionmaker, get_engine
@@ -40,6 +44,12 @@ def db(tmp_path, monkeypatch):
 
 
 def _rows(Session):
+    """Flush FIRST. Writes are queued and drained on a background thread, so a read that does not
+    wait is racing the writer — and would pass or fail depending on thread scheduling, which is the
+    worst kind of test. flush_now() exists for exactly this and is documented as test-only."""
+    from app.core.diagnostic_writer import WRITER
+
+    WRITER.flush_now()
     with Session() as s:
         return list(s.execute(select(m.Diagnostic_Event)).scalars())
 

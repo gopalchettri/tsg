@@ -122,6 +122,16 @@ class Settings(BaseSettings):
     # bulky and this table only grows.
     diagnostic_retention_days: int = Field(
         30, ge=1, validation_alias=AliasChoices("TSG_DIAGNOSTIC_RETENTION_DAYS"))
+    # TSG_APPLICATION_LOG_RETENTION_DAYS — how long raw log rows are kept. SHORTER than the
+    # diagnostics horizon on purpose: this table takes every line at INFO and above, so it grows
+    # orders of magnitude faster and is a trail rather than a record.
+    application_log_retention_days: int = Field(
+        7, ge=1, validation_alias=AliasChoices("TSG_APPLICATION_LOG_RETENTION_DAYS"))
+    # TSG_DIAGNOSTIC_QUEUE_MAX — rows the background writer will hold before DISCARDING new ones.
+    # A bound, not a target: without it a slow database becomes unbounded memory growth and then
+    # an out-of-memory kill. Losing diagnostics is a bad day; losing the worker is an outage.
+    diagnostic_queue_max: int = Field(
+        10000, ge=100, validation_alias=AliasChoices("TSG_DIAGNOSTIC_QUEUE_MAX"))
     # TSG_TRACE_DIR — where file sinks (and log_file) write; relative = PROJECT ROOT, never CWD.
     trace_dir: str = Field(
         "logs/trace", validation_alias=AliasChoices("TRACE_DIR", "TSG_TRACE_DIR"))

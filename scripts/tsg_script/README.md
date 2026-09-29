@@ -129,7 +129,7 @@ The run            Scenario_Session
                         -> Threat_Scenario -> Threat_Scenario_Control_Map
                         -> Risk_Treatment_Plan
                               |
-Trails             Scenario_Audit . Prompt_Log . Diagnostic_Event
+Trails             Scenario_Audit . Prompt_Log . Diagnostic_Event . Application_Log
 ```
 
 ---
