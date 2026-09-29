@@ -263,3 +263,31 @@ def test_a_pinned_lease_equal_to_the_worst_case_is_refused(monkeypatch):
     with pytest.raises(ValidationError, match="does not exceed the safe floor"):
         Settings(stage_lease_seconds=400)
     assert Settings(stage_lease_seconds=401), "one second of margin is enough to be legal"
+
+
+# --- the worker log must not contradict itself ------------------------------------------------
+def test_a_cancelled_session_is_reported_as_cancelled_not_as_none(monkeypatch):
+    """THE CONTRADICTION: the worker logged `succeeded ... : None` one second after
+    `pipeline.failed`. Both lines were true from their own vantage point — the pipeline recorded
+    the failure itself, so from Celery's side the function returned normally with nothing — and
+    the one an operator needs looks like the noise.
+
+    decide_session_outcome ALREADY computes the answer; it was computed and thrown away. Returning
+    it makes the Celery line read `succeeded ... : cancelled`, which explains itself.
+
+    Pinned as behaviour rather than as a return annotation: a `-> str | None` that still returns
+    None on every path would satisfy a type checker and leave the log exactly as misleading."""
+    monkeypatch.setattr(tasks.dal, "load_session", lambda *a: {
+        "CurrentStage": "THREAT_IDENTIFICATION", "SubsystemsJSON": "[]",
+        "AssetContextJSON": "{}", "SessionStatus": "active"})
+    monkeypatch.setattr(tasks.dal, "acquire_lock", lambda *a: True)
+    monkeypatch.setattr(tasks.dal, "release_lock", lambda *a: True)
+    monkeypatch.setattr(tasks.dal, "active_category_names",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stage failed")))
+    monkeypatch.setattr(tasks, "_record_failure", lambda *a: None)
+    monkeypatch.setattr(tasks, "decide_session_outcome", lambda *a: "cancelled")
+
+    outcome = tasks._process_all_supporting_systems(_Recorder(), "s", llm=None, task_id="t")
+    assert outcome == "cancelled", (
+        "the outcome was computed and discarded — Celery will log `succeeded: None` for a "
+        "session that was cancelled")

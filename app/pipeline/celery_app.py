@@ -646,7 +646,7 @@ def _clear_task_context(**_kw) -> None:
 @celery_app.task(bind=True, name="tsg.run_pipeline",
                 autoretry_for=(LLMSlotUnavailable, *TRANSIENT_INFRA_ERRORS),
                 retry_backoff=True, max_retries=None)
-def run_pipeline_task(self, session_id: str) -> None:
+def run_pipeline_task(self, session_id: str) -> str | None:
     """Runs the whole pipeline for one session; queued by the API on session creation.
     `self.request.id` is the run id stamped into each claimed stage, so the CAS can tell an
     acks_late redelivery from a fresh run.
@@ -656,7 +656,7 @@ def run_pipeline_task(self, session_id: str) -> None:
     `max_retries=None` — AttemptCount's poison-terminal cap is the real ceiling.
     """
     with db_session() as sess:
-        _process_all_supporting_systems(sess, session_id, get_llm(), self.request.id or guid())
+        return _process_all_supporting_systems(sess, session_id, get_llm(), self.request.id or guid())
 
 
 def _retry_or_settle(task, sess, busy: Exception, scenario_session: dict, subsystem_id: int,
@@ -692,7 +692,7 @@ def _retry_or_settle(task, sess, busy: Exception, scenario_session: dict, subsys
                 soft_time_limit=_s.subsystem_task_soft_limit_seconds,
                 time_limit=_s.subsystem_task_hard_limit_seconds)
 def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
-                    target_ids: list[str] | list[int] | None, epoch: int) -> None:
+                    target_ids: list[str] | list[int] | None, epoch: int) -> str | None:
     """Redoes one or more scenarios of a session. Same `autoretry_for` reasoning as above.
     `epoch` is reserved once by the endpoint's session-level CAS and never minted here, so a
     redelivery re-executes at the SAME epoch and the CAS no-ops an already-terminal level."""
@@ -701,7 +701,9 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
         if session is None:
             return  # deleted or never existed by the time this task ran
         try:
-            cascade.run_regeneration(sess, dict(session), subsystem_id,
+            # RETURNED: run_regeneration is already -> str | None and the value was dropped,
+            # so the worker logged `succeeded ... : None` for a run that had cancelled a session.
+            return cascade.run_regeneration(sess, dict(session), subsystem_id,
                                     RegenGranularity(granularity), target_ids, epoch, get_llm(),
                                     self.request.id or guid())
         except cascade.SubsystemBusy as busy:
@@ -721,7 +723,8 @@ def regenerate_task(self, session_id: str, subsystem_id: int, granularity: str,
                 retry_backoff=True, max_retries=None,
                 soft_time_limit=_s.subsystem_task_soft_limit_seconds,
                 time_limit=_s.subsystem_task_hard_limit_seconds)
-def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_epoch: int) -> None:
+def next_set_task(self, session_id: str, subsystem_id: int, epoch: int,
+                  threats_epoch: int) -> str | None:
     """Adds the next batch of unique, accumulating scenarios for one subsystem. Same
     `autoretry_for` and caller-reserved `epoch` reasoning as above. `threats_epoch` is the
     additive-find_threats epoch, also endpoint-reserved and held fixed here, so a redelivery
@@ -731,7 +734,8 @@ def next_set_task(self, session_id: str, subsystem_id: int, epoch: int, threats_
         if session is None:
             return  # deleted or never existed by the time this task ran
         try:
-            cascade.run_next_set(sess, dict(session), subsystem_id, epoch, threats_epoch,
+            # RETURNED, same reason as regenerate above.
+            return cascade.run_next_set(sess, dict(session), subsystem_id, epoch, threats_epoch,
                                 get_llm(), self.request.id or guid())
         except cascade.SubsystemBusy as busy:
             # Same bounded retry as regenerate — and here giving up silently also stranded the

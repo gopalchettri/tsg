@@ -268,3 +268,29 @@ def test_the_message_says_what_to_do_about_it():
 def test_the_repos_own_env_files_have_no_blank_unparseable_values():
     """Regression guard on the real files. Both .env and .env.uat were broken this way."""
     assert _empty_hits(Path(__file__).resolve().parents[1]) == []
+
+
+def test_a_deprecated_setting_pinned_live_is_reported(tmp_path):
+    """A deprecated setting that still WORKS is the dangerous kind.
+
+    control_map_backfill_min_score is obeyed in silence when pinned below the cutoff — only the
+    path where it is IGNORED logs anything. So a machine carrying an old value computed a
+    different backfill floor from every other machine, indefinitely, with nothing saying so. That
+    is how one test passed locally and failed in CI on configuration no test declared.
+
+    Reported on a live .env too, unlike a derived setting: pinning a derived value is an
+    operator's prerogative, carrying a deprecated one is a fact they should be told.
+    """
+    from app.core.env_selfcheck import DEPRECATED_SETTINGS, check
+
+    (tmp_path / ".env").write_text("TSG_CONTROL_MAP_BACKFILL_MIN_SCORE=25.0\n", encoding="utf-8")
+    problems, _ = check(tmp_path)
+    hits = [p for p in problems if "DEPRECATED" in p and "backfill_min_score" in p]
+    assert hits, f"a live deprecated setting was not reported; got {problems}"
+    assert "TSG_CONTROL_MAP_BACKFILL_RATIO" in hits[0], "the report must name the replacement"
+
+    (tmp_path / ".env").write_text("# TSG_CONTROL_MAP_BACKFILL_MIN_SCORE=25.0\n", encoding="utf-8")
+    problems, _ = check(tmp_path)
+    assert not [p for p in problems if "DEPRECATED" in p], "a COMMENTED line must not be reported"
+
+    assert DEPRECATED_SETTINGS, "the table is empty — the rule above can never fire"

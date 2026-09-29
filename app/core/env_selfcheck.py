@@ -37,6 +37,28 @@ from app.core.config import Settings
 
 #: Settings whose value DERIVES from other settings when left unset (model_fields_set
 #: detection) — a live line freezes the derivation. Documented COMMENTED with "LEAVE UNSET".
+#: Settings that still WORK but should no longer be set, mapped to what replaces them.
+#:
+#: Distinct from RETIRED_ENV_NAMES in config.py, which refuses the boot: these are honoured, so
+#: refusing would break running deployments. That is exactly what makes them dangerous — a
+#: deprecated setting that CHANGES BEHAVIOUR while saying nothing.
+#:
+#: control_map_backfill_min_score is the case that earned this rule. Pinned below the cutoff it is
+#: obeyed in SILENCE; only the path where it is IGNORED logs anything. So a machine carrying an old
+#: value computed a different backfill floor from every other machine, indefinitely, with no signal
+#: anywhere — which is how one test passed locally and failed in CI on config no test declared.
+#:
+#: Reported on EVERY file including a live .env, unlike DERIVED_SETTINGS above: pinning a derived
+#: value is an operator's prerogative, but carrying a deprecated one is a fact they should be told.
+DEPRECATED_SETTINGS: dict[str, str] = {
+    "control_map_backfill_min_score":
+        "TSG_CONTROL_MAP_BACKFILL_RATIO, a FRACTION of whichever cutoff is actually in force. The "
+        "absolute could not follow a cutoff that moves (a stored calibration, a pinned value, or "
+        "the borrowed grounding threshold), so it silently meant 42% of one cutoff and 83% of "
+        "another, and emptied the backfill band entirely at any cutoff at or below it",
+}
+
+
 DERIVED_SETTINGS: tuple[str, ...] = (
     "stage_lease_seconds", "reaper_stale_grace_seconds",
     # Derived per environment by Settings._derive_subsystem_task_limits (lease x 2, capped at
@@ -168,6 +190,22 @@ def _derived_problems(fname: str, live: set[str],
     return problems
 
 
+def _deprecated_problems(fname: str, live: set[str],
+                         names_by_field: dict[str, set[str]]) -> list[str]:
+    """Rule: a DEPRECATED setting pinned live changes behaviour and says nothing.
+
+    Checked on every file, .env included — see DEPRECATED_SETTINGS for why this one does not get
+    the "an operator may pin deliberately" exemption that derived settings get."""
+    problems = []
+    for field, replacement in DEPRECATED_SETTINGS.items():
+        hit = sorted(names_by_field.get(field, set()) & live)
+        if hit:
+            problems.append(f"{fname}: DEPRECATED setting `{field}` is a LIVE line ({hit[0]}=…) — "
+                            f"it is still obeyed, silently, so this deployment behaves differently "
+                            f"from one without it. Use {replacement}; then comment this line out")
+    return problems
+
+
 def _empty_value_problems(fname: str, text: str, fields,
                           names_by_field: dict[str, set[str]]) -> list[str]:
     """A live `KEY=` with NOTHING after it is a SUPPLIED empty string, not "unset".
@@ -287,6 +325,7 @@ def check(root: Path) -> tuple[list[str], list[Path]]:
         if path.name == POSTURE_FILE:
             problems += _posture_problems(path.name, text, fields, names_by_field)
         problems += _missing_entry_problems(path.name, documented, names_by_field)
+        problems += _deprecated_problems(path.name, live, names_by_field)
         if path.name != ".env":   # templates only — an operator's live .env may pin deliberately
             problems += _derived_problems(path.name, live, names_by_field)
     return problems + _secret_problems(root, known), files

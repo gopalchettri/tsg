@@ -1555,7 +1555,8 @@ def _summarize_generation(sub_id: int, prov_i: Provenance | None, scen_provs: li
     }
 
 
-def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClient, task_id: str) -> None:
+def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClient,
+                                    task_id: str) -> str | None:
     row = dal.load_session(sess, session_id)
     if row is None:
         return
@@ -1634,4 +1635,9 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
     else:
         log.warning("asset.locked", session_id=session_id, session_status=scenario_session["SessionStatus"])
 
-    decide_session_outcome(sess, scenario_session)
+    # RETURNED, not discarded. decide_session_outcome already works out the answer -- "review",
+    # "cancelled", or None for "not finished" -- and dropping it is why the worker logged
+    # `succeeded ... : None` one second after `pipeline.failed`. Two lines that contradict each
+    # other, and the one an operator needs is the one that looks like noise. Returning it makes
+    # the Celery line read `succeeded ... : cancelled`, which explains itself.
+    return decide_session_outcome(sess, scenario_session)
