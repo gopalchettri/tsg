@@ -156,14 +156,6 @@ def _mentions(needle: str, haystack: str) -> bool:
     return hits >= max(1, math.ceil(len(tokens) / 3))
 
 
-def _normalize_str_list(raw: Any) -> list[str]:
-    """Return a string as a one-item list, or keep only strings from a list."""
-    if isinstance(raw, str):
-        return [raw]
-    if isinstance(raw, list):
-        return [x for x in raw if isinstance(x, str)]
-    return []
-
 def _uncited_advisory_ids(scenario: dict[str, Any], injected_ids: set[str] | None) -> list[str]:
     """Return advisory IDs cited by the scenario but missing from the injected intel IDs.
 
@@ -188,7 +180,6 @@ def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_
 
     Returns a result with ``ok`` or ``warning`` status and an error list; it never raises.
     Reference checks use token overlap. Any one matching value in ``critical_service`` is enough.
-    ``assumptions`` and ``excluded_details`` are returned as lists of strings.
     """
     errors = _check_fields(
         scenario, ("scenario_title", "scenario_statement", "risk_statement"))
@@ -216,6 +207,14 @@ def validate_scenario(scenario: dict[str, Any], threat_type: str | None, threat_
     if invented:
         errors.append("cites advisory identifiers that were not provided in the intel block "
                     f"({', '.join(invented)})")
-    return {**_result(errors),
-            "assumptions": _normalize_str_list(scenario.get("assumptions")),
-            "excluded_details": _normalize_str_list(scenario.get("excluded_details"))}
+    # `assumptions` and `excluded_details` used to be copied into this report too. They were a
+    # VERBATIM second copy of two lists already persisted in the same row: the report lands in
+    # Threat_Scenario.ValidationJSON, beside ScenarioJSON, which holds the whole scenario dict they
+    # were read out of. Nothing ever read them back from here — the only consumers of
+    # ValidationJSON take `moderation`, `validation_status` and `errors` — while the ScenarioJSON
+    # copy is what actually reaches a client, via ScenarioNarrative's extra="allow".
+    #
+    # So they cost bytes on the largest-by-bytes table in the schema and bought nothing: the same
+    # shape as Prompt_Log storing its prompt twice, found in the same audit. Put them back only
+    # alongside a reader that needs them HERE rather than from the scenario.
+    return _result(errors)

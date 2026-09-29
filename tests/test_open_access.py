@@ -74,7 +74,7 @@ def test_the_cross_session_list_is_entity_wide(db):
         s.execute(m.Scenario_Session.__table__.insert().values(
             SessionID=theirs, TenantID="t", EntityID=ENTITY, UserID=COLLEAGUE, AssetID=8,
             AssetName="Payments", SessionStatus="completed", CurrentStage="REVIEW",
-            StageStatus="SCENARIOS_AWAITING_DECISION", Mode="AUTO", CurrentSubsystemIndex=0,
+            StageStatus="SCENARIOS_AWAITING_DECISION", Mode="AUTO",
             SubsystemsJSON="[]", CreatedAt=now, UpdatedAt=now))
         s.commit()
     _scenario(db, theirs, identity="i-theirs", number=1, superseded=0, title="theirs")

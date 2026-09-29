@@ -131,7 +131,7 @@ def _generate(monkeypatch, tmp_path, llm) -> tuple[dict, dict]:
            "AssetID": "1", "SessionStatus": "active", "CurrentStage": "SCENARIO_GENERATION",
            "StageStatus": "RUNNING", "Mode": "AUTO",
            "SubsystemsJSON": json.dumps([{"id": 41, "name": "SCADA HMI", "asset_type": "OT"}]),
-           "SectorIDsJSON": "[]", "CreatedAt": NOW, "UpdatedAt": NOW}
+           "CreatedAt": NOW, "UpdatedAt": NOW}
     with Session() as s:
         s.execute(m.Scenario_Session.__table__.insert().values(**row))
         for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS, SubsystemLevel.LOCK):

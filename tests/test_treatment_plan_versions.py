@@ -71,7 +71,7 @@ def _seed(Session) -> None:
             SessionID=SESSION_ID, TenantID="t", EntityID="86", UserID="u1", AssetID=7,
             AssetName="Citizen Portal", SessionStatus=SessionStatus.completed,
             CurrentStage="APPROVED", StageStatus=StageStatus.COMPLETE, Mode="AUTO",
-            CurrentSubsystemIndex=0, SubsystemsJSON="[]", AssetContextJSON="{}",
+            SubsystemsJSON="[]", AssetContextJSON="{}",
             CreatedAt=_now(), UpdatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
             ScenarioID=SCENARIO_ID, SessionID=SESSION_ID, TenantID="t", EntityID="86",

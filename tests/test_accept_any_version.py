@@ -88,7 +88,7 @@ def _seed_session(Session, *, at_review: bool = True) -> str:
             CompletedAt=_now() if at_review else None,
             CurrentStage=WorkflowStage.REVIEW if at_review else WorkflowStage.SCENARIO_GENERATION,
             StageStatus=StageStatus.AWAITING_DECISION if at_review else StageStatus.RUNNING,
-            Mode="AUTO", CurrentSubsystemIndex=0, SubsystemsJSON="[]",
+            Mode="AUTO", SubsystemsJSON="[]",
             CreatedAt=_now(), UpdatedAt=_now()))
         for level, status in ((SubsystemLevel.LOCK, StageStatus.IDLE),
                               (SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION)):

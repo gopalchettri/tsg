@@ -58,7 +58,7 @@ def _seed(Session, *, status: SessionStatus, stage: WorkflowStage) -> tuple[str,
         s.execute(m.Scenario_Session.__table__.insert().values(
             SessionID=sid, TenantID="t", EntityID="86", UserID="u1", AssetID=7,
             AssetName="Power Generation System", SessionStatus=status, CurrentStage=stage,
-            StageStatus=StageStatus.RUNNING, Mode="AUTO", CurrentSubsystemIndex=0,
+            StageStatus=StageStatus.RUNNING, Mode="AUTO",
             SubsystemsJSON="[]", AssetContextJSON="{}", CreatedAt=NOW, UpdatedAt=NOW))
         # _LOCK is RUNNING: somebody else — the sweep, an accept — holds this subsystem.
         s.execute(m.Subsystem_Stage_State.__table__.insert().values(

@@ -3,7 +3,7 @@
 
   Script:      013_Scenario_Session.sql
   Order:       01_tables / 013
-  Purpose:     Create Scenario_Session, or bring an existing copy up to 22 columns.
+  Purpose:     Create Scenario_Session, or bring an existing copy up to 20 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Scenario_Session
@@ -33,10 +33,8 @@ BEGIN
         [CurrentStage] NVARCHAR(100) NOT NULL,
         [StageStatus] NVARCHAR(100) NOT NULL,
         [Mode] NVARCHAR(100) NOT NULL,
-        [CurrentSubsystemIndex] INT NULL,
         [SubsystemsJSON] NVARCHAR(max) NOT NULL,
         [IdempotencyKey] NVARCHAR(200) NULL,
-        [SectorIDsJSON] NVARCHAR(max) NULL,
         [AssetContextJSON] NVARCHAR(max) NULL,
         [ScoringRulesSnapshotJSON] NVARCHAR(max) NULL,
         [CreatedAt] DATETIME2(7) NULL,
@@ -47,7 +45,7 @@ BEGIN
         [ControlMapSeconds] FLOAT NULL,
         CONSTRAINT [PK_Scenario_Session] PRIMARY KEY CLUSTERED ([SessionID])
     );
-    PRINT ' [CREATED] Table: Scenario_Session (22 columns)';
+    PRINT ' [CREATED] Table: Scenario_Session (20 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Scenario_Session';
@@ -80,14 +78,10 @@ EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'StageSta
      @expected = N'NVARCHAR(100)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'Mode',
      @expected = N'NVARCHAR(100)', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'CurrentSubsystemIndex',
-     @expected = N'INT', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'SubsystemsJSON',
      @expected = N'NVARCHAR(max)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'IdempotencyKey',
      @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'SectorIDsJSON',
-     @expected = N'NVARCHAR(max)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'AssetContextJSON',
      @expected = N'NVARCHAR(max)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'ScoringRulesSnapshotJSON',
@@ -229,5 +223,5 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Scenario_Session', @known = N'SessionID,TenantID,EntityID,UserID,AssetName,AssetID,SessionStatus,CurrentStage,StageStatus,Mode,CurrentSubsystemIndex,SubsystemsJSON,IdempotencyKey,SectorIDsJSON,AssetContextJSON,ScoringRulesSnapshotJSON,CreatedAt,UpdatedAt,CompletedAt,CancelledAt,CancelledBy,ControlMapSeconds';
+EXEC dbo.tsg_report_extra_columns @table = N'Scenario_Session', @known = N'SessionID,TenantID,EntityID,UserID,AssetName,AssetID,SessionStatus,CurrentStage,StageStatus,Mode,SubsystemsJSON,IdempotencyKey,AssetContextJSON,ScoringRulesSnapshotJSON,CreatedAt,UpdatedAt,CompletedAt,CancelledAt,CancelledBy,ControlMapSeconds';
 GO

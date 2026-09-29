@@ -403,7 +403,6 @@ def gather_asset_details(
         "entity_id": str(entity_id),
         "sector": sector,
         "parent_sector": parent_sector,
-        "sector_ids": [s["id"] for s in (sector, parent_sector) if s],
         # audit/history only — not an authz principal; auth uses deps.principal
         "user_id": user_id,
         "subsystems": subsystems,

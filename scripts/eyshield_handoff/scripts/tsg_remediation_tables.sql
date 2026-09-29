@@ -11,7 +11,7 @@
   DRY RUN: set PreviewOnly to 1 in Section 0 and the whole script only prints what
   it would do. Nothing is created, altered, renamed, dropped or updated.
 
-  Contents: legacy-name migration, 24 tables, 319 reconciled columns,
+  Contents: legacy-name migration, 24 tables, 317 reconciled columns,
   22 default constraints,
   3 check constraints, 33 indexes.
 
@@ -594,7 +594,14 @@ BEGIN
       -- 2026-09-05: the last of the three threat descriptions. Nothing read it (promotion had
       -- stopped copying it when Threat_Catalogue.Description went) and the model is no longer
       -- asked for one, so it leaves the product the same way the other two did.
-      ('Identified_Threat', 'Description');
+      ('Identified_Threat', 'Description'),
+      -- 2026-09-29: CurrentSubsystemIndex was written as a literal 0 at session creation and
+      -- never moved - the per-subsystem progress every reader uses is Subsystem_Stage_State.
+      ('Scenario_Session',  'CurrentSubsystemIndex'),
+      -- 2026-09-29: the last survivor of the 2026-08 sector removal that already took
+      -- Threat_Type.SectorID and Threat_Catalogue.SectorID. With no sector-scoped master rows
+      -- left to choose between, nothing read it back.
+      ('Scenario_Session',  'SectorIDsJSON');
 
     DECLARE dead CURSOR LOCAL FAST_FORWARD FOR SELECT TableName, ColumnName FROM @dead;
     OPEN dead;
@@ -1153,10 +1160,8 @@ CREATE TABLE [dbo].[Scenario_Session](
 	[CurrentStage] [nvarchar](100) NOT NULL,
 	[StageStatus] [nvarchar](100) NOT NULL,
 	[Mode] [nvarchar](100) NOT NULL,
-	[CurrentSubsystemIndex] [int] NULL,
 	[SubsystemsJSON] [nvarchar](max) NOT NULL,
 	[IdempotencyKey] [nvarchar](200) NULL,
-	[SectorIDsJSON] [nvarchar](max) NULL,
 	[AssetContextJSON] [nvarchar](max) NULL,
 	[ScoringRulesSnapshotJSON] [nvarchar](max) NULL,
 	[CreatedAt] [datetime2](7) NULL,
@@ -1666,10 +1671,11 @@ VALUES
   ('Scenario_Session','CurrentStage','nvarchar',100,NULL,0,0,NULL,NULL),
   ('Scenario_Session','StageStatus','nvarchar',100,NULL,0,0,NULL,NULL),
   ('Scenario_Session','Mode','nvarchar',100,NULL,0,0,NULL,NULL),
-  ('Scenario_Session','CurrentSubsystemIndex','int',NULL,NULL,1,0,NULL,NULL),
+  -- CurrentSubsystemIndex and SectorIDsJSON are gone: the first was a literal 0 nothing ever
+  -- moved or read (progress lives in Subsystem_Stage_State), the second the last survivor of
+  -- the 2026-08 sector removal. Section 1d drops them where they still exist.
   ('Scenario_Session','SubsystemsJSON','nvarchar',-1,NULL,0,0,NULL,NULL),
   ('Scenario_Session','IdempotencyKey','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Scenario_Session','SectorIDsJSON','nvarchar',-1,NULL,1,0,NULL,NULL),
   ('Scenario_Session','AssetContextJSON','nvarchar',-1,NULL,1,0,NULL,NULL),
   ('Scenario_Session','ScoringRulesSnapshotJSON','nvarchar',-1,NULL,1,0,NULL,NULL),
   ('Scenario_Session','CreatedAt','datetime2',NULL,7,1,0,NULL,NULL),

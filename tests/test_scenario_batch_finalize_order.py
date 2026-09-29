@@ -64,7 +64,7 @@ def _seed(s) -> dict:
            "AssetName": "Pumping Station", "AssetID": "1", "SessionStatus": "active",
            "CurrentStage": "SCENARIO_GENERATION", "StageStatus": "RUNNING", "Mode": "AUTO",
            "SubsystemsJSON": json.dumps([{"id": 41, "name": "SCADA HMI", "asset_type": "OT"}]),
-           "SectorIDsJSON": "[]", "CreatedAt": NOW, "UpdatedAt": NOW}
+           "CreatedAt": NOW, "UpdatedAt": NOW}
     s.execute(m.Scenario_Session.__table__.insert().values(**row))
     for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS, SubsystemLevel.LOCK):
         s.execute(m.Subsystem_Stage_State.__table__.insert().values(

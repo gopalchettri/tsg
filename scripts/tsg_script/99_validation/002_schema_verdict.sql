@@ -3,7 +3,7 @@
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 318 columns and all 34 indexes, down to index key columns and filters.
+  Purpose:     Verify all 316 columns and all 34 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -18,7 +18,7 @@ GO
 
 PRINT '';
 PRINT '==============================================================';
-PRINT ' TSG COLUMN VERDICT   (318 columns across 24 tables)';
+PRINT ' TSG COLUMN VERDICT   (316 columns across 24 tables)';
 PRINT ' Database: ' + DB_NAME();
 PRINT '==============================================================';
 GO
@@ -145,10 +145,8 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Scenario_Session', N'CurrentStage', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Scenario_Session', N'StageStatus', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Scenario_Session', N'Mode', N'nvarchar', N'NVARCHAR(100)', 0),
-    (N'Scenario_Session', N'CurrentSubsystemIndex', N'int', N'INT', 1),
     (N'Scenario_Session', N'SubsystemsJSON', N'nvarchar', N'NVARCHAR(max)', 0),
     (N'Scenario_Session', N'IdempotencyKey', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Scenario_Session', N'SectorIDsJSON', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Session', N'AssetContextJSON', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Session', N'ScoringRulesSnapshotJSON', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Session', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
@@ -684,7 +682,7 @@ END;
 PRINT '';
 PRINT 'SCHEMA VERDICT';
 PRINT '--------------';
-PRINT ' [INFO]    Columns expected:   318';
+PRINT ' [INFO]    Columns expected:   316';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));

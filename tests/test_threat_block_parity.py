@@ -124,7 +124,7 @@ def _seeded_session(tmp_path):
         s.execute(m.Scenario_Session.__table__.insert().values(
             SessionID=sid, TenantID="t", EntityID="e", UserID="u", AssetName="Asset",
             AssetID="1", SessionStatus="completed", CurrentStage="SCENARIO_GENERATION",
-            StageStatus="COMPLETE", Mode="AUTO", SubsystemsJSON="[]", SectorIDsJSON="[]",
+            StageStatus="COMPLETE", Mode="AUTO", SubsystemsJSON="[]",
             CreatedAt=NOW, UpdatedAt=NOW))
         s.execute(m.Identified_Threat.__table__.insert().values(**row))
         s.execute(m.Scoped_Threat.__table__.insert().values(

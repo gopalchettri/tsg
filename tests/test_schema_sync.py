@@ -1283,6 +1283,10 @@ _DROPPED_COLUMNS = {
     ("Threat_Type", "Description"), ("Threat_Type", "SectorID"),
     ("Threat_Catalogue", "Description"), ("Threat_Catalogue", "SectorID"),
     ("Identified_Threat", "Description"),          # 2026-09-05
+    # 2026-09-29: written and never read. CurrentSubsystemIndex never left the literal 0 it was
+    # created with (progress lives in Subsystem_Stage_State); SectorIDsJSON was the last column
+    # left by the 2026-08 sector removal.
+    ("Scenario_Session", "CurrentSubsystemIndex"), ("Scenario_Session", "SectorIDsJSON"),
 }
 _CREATE_HEAD_RE = re.compile(r"CREATE\s+TABLE\s+(?:\[?dbo\]?\.)?\[?(\w+)\]?", re.I)
 _COLUMN_LINE_RE = re.compile(rf"^\s*\[?(\w+)\]?\s+\[?(?:{_TYPES})\b", re.I)

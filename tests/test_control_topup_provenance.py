@@ -68,7 +68,7 @@ def _seed(Session, *, controls_mapped_at, mapped=(), asset_context=None,
         s.execute(m.Scenario_Session.__table__.insert().values(
             SessionID=SESSION_ID, TenantID="t", EntityID="86", UserID="u1", AssetID=7,
             AssetName="Plant", SessionStatus="completed", CurrentStage="APPROVED",
-            StageStatus="COMPLETE", Mode="AUTO", CurrentSubsystemIndex=0,
+            StageStatus="COMPLETE", Mode="AUTO",
             SubsystemsJSON="[]", AssetContextJSON=json.dumps(asset_context or {}),
             CreatedAt=_now(), UpdatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(

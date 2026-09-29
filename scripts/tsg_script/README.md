@@ -13,9 +13,9 @@ Written against the application itself: `app/db/models.py` for tables and column
 
 | Object | Count |
 |---|---:|
-| Tables TSG owns | 22 |
-| Columns | 296 |
-| Primary keys | 22 |
+| Tables TSG owns | 24 |
+| Columns | 316 |
+| Primary keys | 24 |
 | Non-PK indexes | 33 |
 | Default constraints | 22 |
 | Check constraints | 3 |
@@ -38,13 +38,13 @@ Run in this order. Each step is safe to re-run.
 | 1 | `00_validation/000_helpers.sql` | Install the two reconcile procedures | nothing |
 | 2 | `00_validation/001_pre_deployment_validation.sql` | Read-only report: fresh or upgrade, data at risk | nothing |
 | 3 | `00_validation/002_enable_isolation_level.sql` | Turn `READ_COMMITTED_SNAPSHOT` **on** — the application does not boot without it | nothing |
-| 4 | `01_tables/001…022_*.sql` | Create or reconcile each table, in order | step 1 |
+| 4 | `01_tables/001…024_*.sql` | Create or reconcile each table, in order | step 1 |
 | 5 | `02_constraints/001_default_constraints.sql` | 22 default constraints | step 4 |
 | 6 | `02_constraints/002_check_constraints.sql` | 3 check constraints | step 4 |
 | 7 | `02_constraints/003_unique_constraints.sql` | 1 unique constraint — `UQ_Config_Tuning_Key` | step 4 |
-| 8 | `03_indexes/001…019_*_indexes.sql` | 33 indexes | steps 4-7 |
+| 8 | `03_indexes/001…018_*_indexes.sql` | 33 indexes | steps 4-7 |
 | 9 | `99_validation/001_post_deployment_validation.sql` | Objects: tables, PKs, indexes, constraints, isolation | steps 4-8 |
-| 10 | `99_validation/002_schema_verdict.sql` | **The final sign-off** — 296 columns, 32 index shapes, 22 defaults, 6 identity columns, collation | step 9 |
+| 10 | `99_validation/002_schema_verdict.sql` | **The final sign-off** — 316 columns, 33 index shapes, 22 defaults, 6 identity columns, collation | step 9 |
 | 11 | *(separate)* seed the libraries | Threat and control master data | step 10 |
 
 > **Step 3 has the only line in this package you are meant to edit.** By default

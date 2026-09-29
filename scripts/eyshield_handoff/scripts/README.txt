@@ -22,7 +22,7 @@ WHAT IT CONTAINS
   Section 1   The two switches for the run, then legacy names: repairs,
               renames, the five removed columns, and Prompt_Log.Messages
   Section 2   Tables (24)
-  Section 3   Columns (319), then three one-time data fixes
+  Section 3   Columns (317), then three one-time data fixes
   Section 4   Default constraints (22)
   Section 5   Check constraints (3)
   Section 6   Indexes (33), then the re-clustering and PAGE compression of the

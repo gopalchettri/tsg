@@ -177,7 +177,7 @@ def _seed_session(s, sid: str) -> dict:
     row = {"SessionID": sid, "TenantID": "t", "EntityID": "e", "UserID": "u",
            "AssetName": "Water Pumping Station", "AssetID": "1", "SessionStatus": "active",
            "CurrentStage": "THREAT_IDENTIFICATION", "StageStatus": "IDLE", "Mode": "AUTO",
-           "SubsystemsJSON": json.dumps(SUBSYSTEMS), "SectorIDsJSON": json.dumps([]),
+           "SubsystemsJSON": json.dumps(SUBSYSTEMS),
            "CreatedAt": NOW, "UpdatedAt": NOW}
     s.execute(m.Scenario_Session.__table__.insert().values(**row))
     set_up_progress_tracking(s, sid, "t", "e")

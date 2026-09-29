@@ -3612,7 +3612,7 @@ GO
 
   Script:      013_Scenario_Session.sql
   Order:       01_tables / 013
-  Purpose:     Create Scenario_Session, or bring an existing copy up to 22 columns.
+  Purpose:     Create Scenario_Session, or bring an existing copy up to 20 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Scenario_Session
@@ -3666,10 +3666,8 @@ BEGIN
         [CurrentStage] NVARCHAR(100) NOT NULL,
         [StageStatus] NVARCHAR(100) NOT NULL,
         [Mode] NVARCHAR(100) NOT NULL,
-        [CurrentSubsystemIndex] INT NULL,
         [SubsystemsJSON] NVARCHAR(max) NOT NULL,
         [IdempotencyKey] NVARCHAR(200) NULL,
-        [SectorIDsJSON] NVARCHAR(max) NULL,
         [AssetContextJSON] NVARCHAR(max) NULL,
         [ScoringRulesSnapshotJSON] NVARCHAR(max) NULL,
         [CreatedAt] DATETIME2(7) NULL,
@@ -3680,7 +3678,7 @@ BEGIN
         [ControlMapSeconds] FLOAT NULL,
         CONSTRAINT [PK_Scenario_Session] PRIMARY KEY CLUSTERED ([SessionID])
     );
-    PRINT ' [CREATED] Table: Scenario_Session (22 columns)';
+    PRINT ' [CREATED] Table: Scenario_Session (20 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Scenario_Session';
@@ -3737,14 +3735,10 @@ EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'StageSta
      @expected = N'NVARCHAR(100)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'Mode',
      @expected = N'NVARCHAR(100)', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'CurrentSubsystemIndex',
-     @expected = N'INT', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'SubsystemsJSON',
      @expected = N'NVARCHAR(max)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'IdempotencyKey',
      @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'SectorIDsJSON',
-     @expected = N'NVARCHAR(max)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'AssetContextJSON',
      @expected = N'NVARCHAR(max)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Session', @column = N'ScoringRulesSnapshotJSON',
@@ -3934,7 +3928,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Scenario_Session', @known = N'SessionID,TenantID,EntityID,UserID,AssetName,AssetID,SessionStatus,CurrentStage,StageStatus,Mode,CurrentSubsystemIndex,SubsystemsJSON,IdempotencyKey,SectorIDsJSON,AssetContextJSON,ScoringRulesSnapshotJSON,CreatedAt,UpdatedAt,CompletedAt,CancelledAt,CancelledBy,ControlMapSeconds';
+EXEC dbo.tsg_report_extra_columns @table = N'Scenario_Session', @known = N'SessionID,TenantID,EntityID,UserID,AssetName,AssetID,SessionStatus,CurrentStage,StageStatus,Mode,SubsystemsJSON,IdempotencyKey,AssetContextJSON,ScoringRulesSnapshotJSON,CreatedAt,UpdatedAt,CompletedAt,CancelledAt,CancelledBy,ControlMapSeconds';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -10205,7 +10199,7 @@ BEGIN
     PRINT 'deployment that printed [BLOCKED] on a narrowing change, or added a NOT NULL column';
     PRINT 'as NULL because the table had rows, reaches this line looking clean.';
     PRINT '';
-    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 318 columns, all 32';
+    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 316 columns, all 33';
     PRINT 'index shapes, 21 defaults, 6 identity columns and the collation, then prints the';
     PRINT 'FINAL SIGN-OFF. Then confirm the threat and control libraries hold data';
     PRINT '(README step 11) before starting the application.';
@@ -10263,7 +10257,7 @@ GO
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 318 columns and all 34 indexes, down to index key columns and filters.
+  Purpose:     Verify all 316 columns and all 34 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -10290,7 +10284,7 @@ GO
 
 PRINT '';
 PRINT '==============================================================';
-PRINT ' TSG COLUMN VERDICT   (318 columns across 24 tables)';
+PRINT ' TSG COLUMN VERDICT   (316 columns across 24 tables)';
 PRINT ' Database: ' + DB_NAME();
 PRINT '==============================================================';
 GO
@@ -10429,10 +10423,8 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Scenario_Session', N'CurrentStage', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Scenario_Session', N'StageStatus', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Scenario_Session', N'Mode', N'nvarchar', N'NVARCHAR(100)', 0),
-    (N'Scenario_Session', N'CurrentSubsystemIndex', N'int', N'INT', 1),
     (N'Scenario_Session', N'SubsystemsJSON', N'nvarchar', N'NVARCHAR(max)', 0),
     (N'Scenario_Session', N'IdempotencyKey', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Scenario_Session', N'SectorIDsJSON', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Session', N'AssetContextJSON', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Session', N'ScoringRulesSnapshotJSON', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Session', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
@@ -10968,7 +10960,7 @@ END;
 PRINT '';
 PRINT 'SCHEMA VERDICT';
 PRINT '--------------';
-PRINT ' [INFO]    Columns expected:   318';
+PRINT ' [INFO]    Columns expected:   316';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));

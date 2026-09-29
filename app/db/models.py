@@ -75,10 +75,14 @@ class Scenario_Session(Base):
     CurrentStage: Mapped[str] = mapped_column(Unicode(100))
     StageStatus: Mapped[str] = mapped_column(Unicode(100))
     Mode: Mapped[str] = mapped_column(Unicode(100))
-    CurrentSubsystemIndex: Mapped[int | None] = mapped_column(Integer)
+    # CurrentSubsystemIndex was DROPPED 2026-09-29: written as a literal 0 at session creation
+    # and never updated or read. Per-subsystem progress is tracked in Subsystem_Stage_State,
+    # which is where every reader already looks.
     SubsystemsJSON: Mapped[str] = mapped_column(UnicodeText)
     IdempotencyKey: Mapped[str | None] = mapped_column(Unicode(200))
-    SectorIDsJSON: Mapped[str | None] = mapped_column(UnicodeText)
+    # SectorIDsJSON was DROPPED the same day - the last survivor of the 2026-08 sector removal
+    # that already took Threat_Type.SectorID and Threat_Catalogue.SectorID. With no sector-scoped
+    # master rows left to pick between, nothing read it back.
     AssetContextJSON: Mapped[str | None] = mapped_column(UnicodeText)
     # The session's frozen tuning rulebook (core.tuning.resolve_snapshot), written once at
     # creation. NULL = pre-feature session: workers resolve from config instead.

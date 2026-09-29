@@ -116,7 +116,7 @@ def _seed_reviewable_session(client) -> tuple[str, str, str]:
             AssetName="E2E Historian", SessionStatus=SessionStatus.completed,
             CompletedAt=_now(), CurrentStage=WorkflowStage.REVIEW,
             StageStatus=StageStatus.AWAITING_DECISION, Mode="AUTO",
-            CurrentSubsystemIndex=0, SubsystemsJSON="[]",
+            SubsystemsJSON="[]",
             CreatedAt=_now(), UpdatedAt=_now()))
         for level, status in ((SubsystemLevel.LOCK, StageStatus.IDLE),
                               (SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION)):
@@ -304,7 +304,7 @@ def test_cancel_session_over_real_http(client):
             SessionID=sid, TenantID=TENANT, EntityID=ENTITY, UserID=USER, AssetID=9,
             AssetName="E2E Demo In-Progress", SessionStatus=SessionStatus.active,
             CurrentStage=WorkflowStage.THREAT_IDENTIFICATION, StageStatus=StageStatus.IDLE,
-            Mode="AUTO", CurrentSubsystemIndex=0, SubsystemsJSON="[]",
+            Mode="AUTO", SubsystemsJSON="[]",
             CreatedAt=_now(), UpdatedAt=_now()))
         s.commit()
 

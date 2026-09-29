@@ -253,10 +253,8 @@ CREATE TABLE Scenario_Session (
     CurrentStage          nvarchar(100)   NOT NULL,
     StageStatus           nvarchar(100)   NOT NULL,
     Mode                  nvarchar(100)   NOT NULL,
-    CurrentSubsystemIndex int            NULL,
     SubsystemsJSON        nvarchar(max)  NOT NULL,
     IdempotencyKey        nvarchar(200)  NULL,
-    SectorIDsJSON         nvarchar(max)  NULL,
     AssetContextJSON      nvarchar(max)  NULL,
     ScoringRulesSnapshotJSON    nvarchar(max)  NULL,               -- frozen tuning rulebook (core.tuning); NULL = pre-feature session
     CreatedAt             datetime2      NULL,
@@ -265,6 +263,20 @@ CREATE TABLE Scenario_Session (
     ControlMapSeconds     float          NULL,               -- seconds ACTUALLY SPENT mapping, summed over every sweep pass; NOT a span (mapping resumes across ticks 300s apart, so a span would be mostly waiting)
     CONSTRAINT CK_Session_Status CHECK (SessionStatus IN ('active', 'completed', 'cancelled'))
 );
+
+-- Drops CurrentSubsystemIndex and SectorIDsJSON for databases created before 2026-09-29.
+-- CurrentSubsystemIndex was written as a literal 0 at session creation and never moved; the
+-- per-subsystem progress every reader actually uses lives in Subsystem_Stage_State.
+-- SectorIDsJSON is the last survivor of the 2026-08 sector removal that already took
+-- Threat_Type.SectorID and Threat_Catalogue.SectorID - with no sector-scoped master rows left
+-- to choose between, nothing read it back. Both are NULLable, so an application that has
+-- already stopped writing them keeps inserting either way; this only reclaims the bytes.
+-- Guarded, so re-running against an already-dropped database is a provable no-op.
+IF COL_LENGTH('dbo.Scenario_Session', 'CurrentSubsystemIndex') IS NOT NULL
+    ALTER TABLE Scenario_Session DROP COLUMN CurrentSubsystemIndex;
+
+IF COL_LENGTH('dbo.Scenario_Session', 'SectorIDsJSON') IS NOT NULL
+    ALTER TABLE Scenario_Session DROP COLUMN SectorIDsJSON;
 
 -- ScoringRulesSnapshotJSON: frozen Config_Tuning snapshot at session creation. NULL = pre-feature session.
 IF OBJECT_ID('dbo.Scenario_Session', 'U') IS NOT NULL
