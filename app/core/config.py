@@ -1187,6 +1187,47 @@ class Settings(BaseSettings):
                 "Keep stale_after at least 2x heartbeat.")
         return self
 
+    @model_validator(mode="after")
+    def _sweep_must_finish_inside_the_busy_retry_window(self) -> Settings:
+        """The bounded busy-retry exists to outlast the usual lock holder, which is the control-map
+        sweep. If the sweep runs longer than the window, the retry gives up while the lock is still
+        held and the click is dropped — the exact failure the retry was added to prevent.
+
+        A VALIDATOR, not a test. The two numbers are independent: one is a code constant, the other
+        an operator setting, and nothing connected them. On defaults they were equal (300 = 300), so
+        the invariant was violated in every deployment that did not narrow the sweep, and the single
+        test asserting it passed only on machines that did. Same posture as the stage-lease floor
+        above: refuse the boot rather than run a configuration whose guarantee does not hold."""
+        window = busy_retry_window_seconds()
+        if self.control_map_sweep_interval_seconds >= window:
+            raise ValueError(
+                f"control_map_sweep_interval_seconds ({self.control_map_sweep_interval_seconds}s) "
+                f"is not shorter than the busy-retry window ({window}s = "
+                f"{BUSY_RETRY_SECONDS}s x 1..{BUSY_MAX_RETRIES}) — the retry would give up while "
+                "the sweep still holds the lock, dropping the click it exists to chase. Lower the "
+                "sweep interval.")
+        return self
+
+
+#: How long a dropped click is worth chasing, and the shape of that chase. cascade.py imports
+#: these; they live HERE because the boot validator below is what keeps them honest, and a
+#: constant whose only job is to beat a setting belongs beside that setting.
+#:
+#: THE BUG THIS ENCODES. The window is sum(BUSY_RETRY_SECONDS * n for n in 1..BUSY_MAX_RETRIES).
+#: At 20s x 5 that is exactly 300s -- identical to control_map_sweep_interval_seconds' default,
+#: while the comment describing it said "comfortably more". It read as comfortable only because
+#: the machine it was written on sets the sweep to 60s. On DEFAULTS the retry gave up at the same
+#: instant the sweep it exists to outlast finished, and one test asserted the inequality while
+#: nothing enforced it for any deployment.
+BUSY_MAX_RETRIES = 5
+BUSY_RETRY_SECONDS = 30
+
+
+def busy_retry_window_seconds() -> int:
+    """Total wall-clock the bounded busy-retry spends before handing the stage back."""
+    return sum(BUSY_RETRY_SECONDS * (attempt + 1) for attempt in range(BUSY_MAX_RETRIES))
+
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings()

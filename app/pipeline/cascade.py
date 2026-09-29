@@ -109,12 +109,12 @@ class SubsystemBusy(Exception):
 
 
 #: How long a dropped click is worth chasing. The usual holder is the control-map sweep
-#: (run_control_map_sweep, every control_map_sweep_seconds), so the window must outlast one sweep
-#: run: 5 attempts at a linearly growing delay is ~5 minutes, comfortably more, while still
-#: ending. Constants rather than Settings — nothing here is environment-shaped, and an operator
-#: has no reason to tune a number whose only job is to be longer than a sweep.
-BUSY_MAX_RETRIES = 5
-BUSY_RETRY_SECONDS = 20
+#: (run_control_map_sweep, every control_map_sweep_interval_seconds), so the window must outlast
+#: one sweep run. Re-exported from config, where the boot validator that ENFORCES that is: the two
+#: numbers were independent, and at 20s x 5 the window was exactly 300s against a sweep default of
+#: exactly 300s -- equal, not longer, so the retry gave up at the instant the sweep finished. The
+#: names stay here because every caller already imports them from cascade.
+from app.core.config import BUSY_MAX_RETRIES, BUSY_RETRY_SECONDS  # noqa: E402,F401 — re-export
 
 
 def _refuses_ai_writes(scenario_session: dict) -> bool:

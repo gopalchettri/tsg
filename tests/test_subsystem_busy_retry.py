@@ -153,11 +153,32 @@ def test_giving_up_releases_the_asset_a_next_set_had_reserved(monkeypatch):
 def test_the_retry_window_outlasts_a_control_map_sweep():
     """The numbers are part of the fix. A window shorter than the usual lock holder would give up
     while the sweep is still running, which is the very case this exists for."""
-    from app.core.config import get_settings
+    from app.core.config import busy_retry_window_seconds, get_settings
 
     window = sum(cascade.BUSY_RETRY_SECONDS * (attempt + 1)
                 for attempt in range(cascade.BUSY_MAX_RETRIES))
+    assert window == busy_retry_window_seconds(), (
+        "cascade's constants and the shape config validates against have drifted apart")
     assert window > get_settings().control_map_sweep_interval_seconds
+
+
+def test_a_sweep_that_outlasts_the_retry_window_is_refused_at_boot():
+    """The invariant above must be ENFORCED, not merely true today.
+
+    It was true only by accident: the window is a code constant, the sweep an operator setting,
+    nothing connected them, and on DEFAULTS they were equal (300 = 300) — so the guarantee failed
+    in every deployment that did not narrow the sweep, while the assertion above passed on the one
+    machine that did. Asserting a number and enforcing a relationship are different things; this
+    test is the second one, and it is why a future edit to either number cannot quietly break it."""
+    from pydantic import ValidationError
+
+    from app.core.config import Settings, busy_retry_window_seconds
+
+    just_inside = float(busy_retry_window_seconds() - 1)
+    assert Settings(control_map_sweep_interval_seconds=just_inside)
+
+    with pytest.raises(ValidationError, match="busy-retry window"):
+        Settings(control_map_sweep_interval_seconds=float(busy_retry_window_seconds()))
 
 
 # --------------------------------------------------------------------------- the task's handler

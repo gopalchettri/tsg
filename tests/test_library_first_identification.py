@@ -853,3 +853,53 @@ def test_coverage_reporting_enabled_restores_the_prior_shape(monkeypatch):
         assert "units" in summary and "coverage" in summary
         assert summary["units"][0] == 0  # ASSET_UNIT_ID leads the grid, same as before
         assert "cells" in summary["coverage"] and "unexplained" in summary["coverage"]
+
+
+def test_the_supersede_shares_a_transaction_with_the_insert_that_replaces_it():
+    """A destructive write must never become durable before its replacement exists.
+
+    THE BUG. `dal.supersede` used to run at the TOP of find_threats. Everything between commits —
+    _ask_ai commits before each slow LLM call, the grounding loop commits per proposal, both to
+    release row locks — so the retirement was durable minutes before the replacement rows were
+    written. Any failure in that window (a timeout, a cancelled task, a crash) left the subsystem
+    with ZERO active threats and nothing to restore them from. Session 6174F288 failed inside
+    exactly that window, and a second route to the same state existed: when finish_stage loses its
+    CAS, the rollback discards the new rows while the supersede stays committed.
+
+    Checked on the SOURCE ORDER rather than by driving a failure, deliberately. The property is
+    "no commit happens between these two statements", and the commits are in functions several
+    layers down (_ask_ai, _ground_and_admit_proposals); a behavioural test would pin one failure
+    mode while the hazard is the gap itself. This fails the moment the supersede moves back above
+    the work — which is the only way the bug returns. Same idea as test_step_timings' AST checks
+    on call ordering.
+
+    It must also not drift the OTHER way: `supersede` filters on (SessionID, SubsystemID) with no
+    time fence, so run after the insert it would retire the rows just written.
+    """
+    import ast
+    import inspect
+
+    from app.pipeline import threat_identification as ti
+
+    fn = ast.parse(inspect.getsource(ti.find_threats)).body[0]
+    supersede_at = insert_at = grounding_at = None
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = ast.unparse(node.func)
+        if name == "dal.supersede":
+            supersede_at = node.lineno
+        elif name == "sess.execute" and "insert(m.Identified_Threat)" in ast.unparse(node):
+            insert_at = node.lineno
+        elif name == "_ground_and_admit_proposals":
+            grounding_at = node.lineno
+
+    assert supersede_at and insert_at and grounding_at, (
+        f"find_threats no longer has the three calls this pins "
+        f"(supersede={supersede_at}, insert={insert_at}, grounding={grounding_at})")
+    assert supersede_at > grounding_at, (
+        "dal.supersede runs BEFORE the grounding loop, which commits per proposal — the old "
+        "threats would be retired and durable before their replacements exist")
+    assert supersede_at < insert_at, (
+        "dal.supersede runs after the insert — it filters on (SessionID, SubsystemID) with no "
+        "time fence, so it would retire the rows just written")

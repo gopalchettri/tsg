@@ -1192,11 +1192,9 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     _apply_relevance_gate(r, sess, llm, sid, candidates, subsystems, asset_context, s_cfg,
                     queries, qvs, gate_threshold)
 
-    if supersede:
-        # Every unit the fan-out writes to, not just the asset: a stale subsystem row left
-        # active from the previous round would double-count on the coverage grid.
-        for unit in (ss, *grid_subsystem_ids):
-            dal.supersede(sess, m.Identified_Threat, sid, unit)
+    # NOTE: the supersede itself runs immediately above the insert, NOT here — see the comment
+    # there. Only the identity map is decided at this point, and it is decided from the FLAG,
+    # never from what the table currently holds, which is what makes that move safe.
     r.existing_identities = (dal.active_identified_threat_identities(sess, sid, ss)
                             if not supersede else {})
 
@@ -1238,6 +1236,29 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
                     requested=max_threats, delivered=delivered, llm_failed=gap.llm_failed)
 
     fanout_rows = _build_fanout_rows(r, subsystems, grid_subsystem_ids, retrieved_ids)
+    if supersede:
+        # RETIRE THE OLD ROUND HERE, in the same transaction as the insert below — never earlier.
+        #
+        # This used to run at the top of the round. Everything between committed: _ask_ai commits
+        # before each (slow) LLM call, and the grounding loop commits per proposal, both to release
+        # row locks. So the retirement became durable minutes before its replacements existed, and
+        # ANY failure in that window — a timeout, a cancelled task, a crash — left the subsystem
+        # with ZERO active threats and nothing to restore them from. Session 6174F288 failed inside
+        # exactly that window.
+        #
+        # Nothing needs it earlier. Every reader in between decides from the `supersede` flag, not
+        # from the table: active_identified_threat_identities is behind `if not supersede`, and
+        # _held_category_counts returns {} on this path. Nor can the rows coexist harmfully —
+        # Identified_Threat has no unique constraint, and db/invariants.py records that it is MEANT
+        # to hold many active rows per subsystem, guarded by the epoch CAS rather than uniqueness.
+        #
+        # And it must not move any later: `supersede` filters on (SessionID, SubsystemID) with no
+        # time fence, so run after the insert it would retire the rows just written.
+        #
+        # Every unit the fan-out writes to, not just the asset: a stale subsystem row left active
+        # from the previous round would double-count on the coverage grid.
+        for unit in (ss, *grid_subsystem_ids):
+            dal.supersede(sess, m.Identified_Threat, sid, unit)
     if r.rows:
         sess.execute(insert(m.Identified_Threat), r.rows + fanout_rows)
     if not dal.finish_stage(sess, sid, ss, SubsystemLevel.THREATS, StageStatus.COMPLETE, epoch, task_id):
