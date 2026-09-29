@@ -9,6 +9,93 @@ timeout) took a pasted screen log to diagnose. This page is how that is answered
 
 ---
 
+## 0. First-time setup — do these in order
+
+Five steps. Steps 1 and 2 are required; nothing works without them.
+
+### Step 1 — Create the two tables
+
+**Do this before deploying the code.** The application reads its schema at boot, so it will not
+start against a database that lacks these tables.
+
+```bash
+sqlcmd -S <host> -d <database> -i "scripts/tsg_script/TSG_Deploy_All.sql"
+```
+
+Safe to re-run: every statement checks whether the object already exists first. It creates
+`Diagnostic_Event`, `Application_Log` and four indexes, and changes nothing else.
+
+**Check it worked.** The last section of that script prints a verdict, which must say:
+
+```
+Tables: 24   Columns: 319   Indexes: 36
+```
+
+If any number is lower, stop — the script did not finish, and the application will refuse to boot
+rather than run against a half-built schema.
+
+### Step 2 — Set the two settings that matter
+
+In the environment file for that deployment:
+
+```bash
+TSG_DIAGNOSTIC_DB_CATEGORIES=all
+TSG_DIAGNOSTIC_PUBLIC_DETAIL=true
+```
+
+The first decides **what is recorded**; `all` includes ordinary log lines. The second decides
+**how much a lookup shows**; without it you get the summary but not the error trace, which is
+usually not enough to act on.
+
+Both have working defaults, so a missing line will not break anything — but left at the defaults
+you get capture without detail, which reads as "the feature does not work".
+
+**Read section 6 before setting these on a system holding real customer data.** `all` plus
+`true` means anyone with the web address can read saved log lines, and those can contain contract
+details, landlord and tenant information and Emirates ID numbers.
+
+### Step 3 — Restart
+
+Both the API and the workers. Settings are read at startup, so a worker that was not restarted
+carries on with the old configuration and records nothing — and because the others are working,
+that is easy to miss.
+
+### Step 4 — Confirm it is on
+
+```bash
+curl "https://<host>/v1/tsg/diagnostics/config"
+```
+
+Look for:
+
+| Field | Should say | If it does not |
+|---|---|---|
+| `effective` | `all` | The setting did not reach this process — check the file and restart |
+| `redis_reachable` | `true` | Runtime switching is unavailable; everything else still works |
+| `dropped_rows` | `0` | Records are being discarded — the database cannot keep up |
+
+This reports **the process that answered**, not the whole system. Ask twice; if the API and a
+worker disagree, one of them was not restarted.
+
+### Step 5 — Prove it records a real failure
+
+Do not wait for a real incident to find out it is not working.
+
+1. Start any run and let it fail, or pick the id of a run that already failed.
+2. Look it up:
+
+```bash
+curl "https://<host>/v1/tsg/diagnostics?session_id=<the-run-id>"
+```
+
+3. You should get a row naming the actual error — for example `"exception_class": "Timeout"` —
+   next to `"client_message": "stage processing failed"`, which is the vague text the customer saw.
+
+**That pairing is the whole point.** If you see it, the setup is complete. An empty result means
+capture is off, the wrong process was restarted, or the failure happened before the change.
+
+---
+
 ## 1. What gets recorded
 
 Five kinds, each independently switchable.
