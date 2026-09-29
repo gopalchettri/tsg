@@ -454,7 +454,18 @@ def _seed_library(*, categories=(), types=(), maps=()):
 
 def _refused_on(r, field: str, says: str) -> None:
     """A 422 on manual_scenario.<field> whose message names the library's value — and nothing
-    saved."""
+    saved.
+
+    `field` is checked against the MODEL first, deliberately. It used to be a bare string compared
+    to the error's `loc`, so when the payload renamed threat_type -> threat_type_name the three
+    callers below failed with a confusing "'threat_type_name' == 'threat_type'" mismatch that reads
+    like the ROUTE regressed, when the route was right and the test was stale. Asserting the field
+    exists turns that into "no such field", which names the real problem and cannot be misread."""
+    from app.api.schemas_references import ManualThreatIdentity
+
+    assert field in ManualThreatIdentity.model_fields, (
+        f"{field!r} is not a field of ManualThreatIdentity — the payload was renamed and this test "
+        f"was not updated. Fields: {sorted(ManualThreatIdentity.model_fields)}")
     assert r.status_code == 422, r.text
     (err,) = r.json()["details"]["errors"]
     assert err["loc"][-1] == field and says in err["msg"], err
@@ -467,7 +478,7 @@ def test_a_library_threat_sent_with_another_type_is_refused_naming_its_type(clie
     Malware/Ransomware row."""
     _seed_library(types=[(PHISHING_TYPE_ID, "Phishing")])
     r = _post(client, _manual_body(threat_type_name="Phishing"))
-    _refused_on(r, "threat_type", "filed under 'Malware/Ransomware'")
+    _refused_on(r, "threat_type_name", "filed under 'Malware/Ransomware'")
     assert _count(m.Threat_Type) == 2 and _count(m.Threat_Catalogue) == 1
 
 
@@ -475,7 +486,7 @@ def test_a_category_the_library_does_not_file_the_threat_under_is_refused(client
     """P1 rule 2: Spoofing + Malware/Ransomware + a threat the library files under Tampering."""
     _seed_library(categories=[(SPOOFING_ID, "Spoofing")])
     r = _post(client, _manual_body(threat_category_name="Spoofing"))
-    _refused_on(r, "threat_category", "'Tampering'")
+    _refused_on(r, "threat_category_name", "'Tampering'")
 
 
 def test_a_twin_filed_under_another_type_after_the_library_read_is_still_refused(
@@ -518,7 +529,7 @@ def test_a_twin_filed_under_another_type_after_the_library_read_is_still_refused
                                    threat_name="Backdoored PLC firmware update"))
 
     assert landed == [600], "the twin never landed: the save never reached the mint"
-    _refused_on(r, "threat_type", "filed under 'Malware/Ransomware'")
+    _refused_on(r, "threat_type_name", "filed under 'Malware/Ransomware'")
     assert _count(m.Threat_Catalogue) == 1, "the twin, or a mint under Phishing, survived the 422"
 
 

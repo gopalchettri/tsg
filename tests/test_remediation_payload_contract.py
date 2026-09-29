@@ -333,7 +333,9 @@ def test_an_id_and_a_name_that_disagree_are_both_carried_to_the_resolver():
 
 
 @pytest.mark.parametrize("pair, blanked", [
-    ("threat_category_id or threat_category_name", {"threat_category_name": "   "}),
+    # The CATEGORY pair is deliberately absent from this list: unlike the type and the threat, it
+    # is optional, and the route derives it from the library's own filing once the type is known.
+    # It was listed here once, and the row passed only while the model still demanded it.
     ("threat_type_id or threat_type_name", {"threat_type_name": ""}),
     ("threat_id or threat_name", {"threat_name": None}),
 ])
@@ -341,6 +343,21 @@ def test_a_threat_row_named_by_neither_key_is_refused_naming_that_pair(pair, bla
     refusal = _refusal({"is_manual": True,
                         "manual_scenario": {**SMALLEST_MANUAL_SCENARIO, **blanked}})
     assert pair in refusal
+
+
+def test_a_category_named_by_neither_key_is_accepted_and_left_to_the_library():
+    """The other half of the rule above, and the half nothing pinned.
+
+    A caller who names no category is not making a mistake — the route resolves the type and the
+    threat against the library and takes the filing from there, and a scenario with no STRIDE
+    bucket is a documented state (ThreatCategoryID is nullable). This test exists because the
+    ONLY thing asserting anything about a blank category used to assert the opposite, so the day
+    the model made it optional the suite reported the feature broken rather than the test stale.
+    Both directions are pinned now."""
+    scenario = ManualScenarioIn.model_validate(
+        {**SMALLEST_MANUAL_SCENARIO, "threat_category_name": "   "})
+    assert (scenario.threat_category_id, scenario.threat_category_name) == (None, None), (
+        "a blank category must normalise to absent, not survive as whitespace")
 
 
 @pytest.mark.parametrize("field", ["threat_category_id", "threat_type_id", "threat_id"])

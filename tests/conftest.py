@@ -9,8 +9,52 @@ test must not bleed into the next -- so every cache is cleared both before and a
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
-import pytest
+# ---------------------------------------------------------------------------------------------
+# Pin the env file BEFORE anything imports app.core.config.
+#
+# Settings resolves `env_file` ONCE, at class-definition time (config.py's model_config calls
+# _env_file()), so this cannot be a fixture -- by the time a fixture runs, model_config already
+# says ".env". It has to be module level in conftest, which pytest imports before any test module,
+# and it is why nothing above this line imports from `app`.
+#
+# WHAT IT FIXES. .env is machine-local and not in git, so every test that reached production code
+# silently took that machine's configuration. The visible half was a suite green in CI and red
+# locally (TSG_CONTROL_MAP_BACKFILL_MIN_SCORE=25.0, a DEPRECATED override this machine still had
+# enabled, pinned a backfill floor the test expected to be derived). The dangerous half is the
+# other direction: a test PASSING locally for a reason no test declares, which nothing reports.
+#
+# A test that needs a setting now says so -- monkeypatch.setenv, or Settings(field=...). Ambient
+# configuration is no longer an input to any result.
+os.environ["TSG_ENV_FILE"] = str(Path(__file__).with_name("testing.env"))
+
+# ONE EXCEPTION, carried across explicitly: the database DSN.
+#
+# Five tests (test_api_contract, test_subsystem_busy_retry, test_library_first_identification,
+# test_treatment_plan_versions, test_e2e_full_flow) never declare a database and fall through to
+# whatever TSG_DB_DSN names -- on this machine, a REAL LOCAL SQL SERVER. They pass only because it
+# holds the TSG schema, so they cannot pass on a machine without it, and they read and write a
+# real database during `pytest` while nothing in them says so.
+#
+# That is a genuine defect, but it is a defect IN THOSE FIVE TESTS, not one this file can fix: a
+# throwaway sqlite was tried, and with the schema created they still fail on seed data and dialect
+# differences. So the dependency is carried across deliberately and named HERE, where it is one
+# visible line, instead of being an invisible property of whoever's machine is running the suite.
+# Making them hermetic is tracked separately.
+#
+# Read straight out of .env rather than left to leak: the pin above means Settings no longer sees
+# that file at all, so without this the five would fail on the placeholder default instead. Every
+# OTHER setting stays isolated, which is the whole point.
+_dotenv = Path(__file__).resolve().parents[1] / ".env"
+if "TSG_DB_DSN" not in os.environ and _dotenv.is_file():
+    for _line in _dotenv.read_text(encoding="utf-8", errors="replace").splitlines():
+        if _line.startswith("TSG_DB_DSN="):
+            os.environ["TSG_DB_DSN"] = _line.partition("=")[2].strip().strip('"').strip("'")
+            break
+
+import pytest  # noqa: E402 -- must follow the env pins above
 
 
 def register_sqlite_json_value(engine) -> None:

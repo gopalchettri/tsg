@@ -132,35 +132,52 @@ def test_the_scored_mapping_pass_can_still_claim_that_scenario(monkeypatch):
 
 
 @pytest.mark.parametrize("scenario_source", [None, "", "generated", "library", "manual"])
-def test_both_manual_guards_read_provenance_the_same_way(scenario_source):
+@pytest.mark.parametrize("already_mapped", [False, True], ids=["no-rows", "has-rows"])
+def test_both_manual_guards_read_provenance_the_same_way(monkeypatch, scenario_source,
+                                                         already_mapped):
     """Two ways into a control map, one provenance rule each — and they must never disagree.
 
     The scored path decides in SQL (`_not_hand_written`, applied by eligible_outputs AND by
-    sessions_awaiting_control_mapping); the top-up decides in Python (`_top_up_refused`). One row
-    classified `manual` by one and not by the other is how a hand-written scenario would get
-    controls added to it by the path that guessed wrong, so this drives BOTH against the same
-    stored value, including the values that are not literal strings.
+    sessions_awaiting_control_mapping); the top-up decides in Python. One row classified `manual`
+    by one and not by the other is how a hand-written scenario would get controls added to it by
+    the path that guessed wrong, so this drives BOTH against the same stored value, including the
+    values that are not literal strings.
 
     NULL IS THE ONE THAT MATTERS. It means "generated" everywhere that reads it, so both guards
     must treat it as mappable. `ScenarioSource != 'manual'` alone would not: in SQL that is NULL,
     not TRUE, so every AI scenario with an unset source would silently vanish from both selections
     — the permanent empty control list the retry sweep exists to prevent, reintroduced by a guard
     meant to protect manual rows.
-    """
+
+    MANUAL IS NOT A FLAT REFUSAL, which is why `already_mapped` is a dimension here. Owner decision
+    D1 (2026-09-25): a manual scenario saved with ZERO controls is mapped by this path and only
+    this path; one that already carries map rows is never added to. The rule is
+    `refused == manual AND has rows`, not `refused == manual`.
+
+    AND IT DRIVES THE PUBLIC ENTRY POINT. This test used to call `_top_up_refused` directly. When
+    D1 moved the provenance check out of that helper into `_read_top_up_plan`, the behaviour stayed
+    correct and the test broke anyway — it was pinned to where the rule lived rather than to the
+    rule itself. Driving `top_up_scenario_controls` means the next such move cannot break it, the
+    same correction the R2 block below already made for the ranking tests."""
     Session = sessionmaker(bind=_engine(), future=True)
-    _seed(Session, controls_mapped_at=None, scenario_source=scenario_source)
+    _library(Session, [(1, "IT", "Network"), (2, "IT", "Network")])
+    _seed(Session, controls_mapped_at=None, scenario_source=scenario_source,
+          mapped=[(1, 1, 90.0)] if already_mapped else ())
     hand_written = scenario_source == "manual"
 
     with Session() as s:
         selectable = [r[0] for r in control_mapping.eligible_outputs(s, SESSION_ID)]
-        # The stamp is what the top-up gate additionally requires (see _top_up_refused), so it is
-        # set HERE rather than on the row: this asserts about provenance, not about the stamp.
-        refused = control_mapping._top_up_refused(
-            s, SESSION_ID, SCENARIO_ID,
-            {"Accepted": 1, "ScenarioSource": scenario_source, "ControlsMappedAt": _now()})
+    added = _drive_top_up(monkeypatch, Session, added=[(2, "IT", 95.0)], min_count=2)
 
-    assert bool(selectable) is not hand_written, f"scored path disagrees on {scenario_source!r}"
-    assert refused is hand_written, f"top-up path disagrees on {scenario_source!r}"
+    # The scored path is asserted only on the unmapped rows, where provenance is the SOLE
+    # discriminator. A scenario that already carries map rows is excluded from it for a reason
+    # that has nothing to do with provenance, and folding both into one assertion would let a
+    # provenance regression hide behind the already-mapped exclusion.
+    if not already_mapped:
+        assert bool(selectable) is not hand_written, (
+            f"scored path disagrees on {scenario_source!r}")
+    assert (added == 0) is (hand_written and already_mapped), (
+        f"top-up path disagrees on {scenario_source!r} with already_mapped={already_mapped}")
 
 
 # --- R2 -------------------------------------------------------------------------------------
