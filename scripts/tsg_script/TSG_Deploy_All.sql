@@ -9880,7 +9880,7 @@ GO
 
   Script:      018_Diagnostic_Event_indexes.sql
   Order:       03_indexes / 018
-  Purpose:     3 index(es) on Diagnostic_Event.
+  Purpose:     2 index(es) on Diagnostic_Event.
   Depends on:  01_tables/ *_Diagnostic_Event.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    indexes on dbo.Diagnostic_Event
@@ -9970,48 +9970,6 @@ GO
 BEGIN TRY
 BEGIN TRANSACTION;
 IF EXISTS (SELECT 1 FROM sys.indexes i
-        WHERE i.name = N'IX_DiagnosticEvent_Created' AND i.object_id = OBJECT_ID(N'dbo.Diagnostic_Event')
-          AND (i.is_unique <> 0 OR i.has_filter <> 0
-          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 1
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'CreatedAt')))
-BEGIN
-    PRINT ' [REBUILD] Diagnostic_Event.IX_DiagnosticEvent_Created exists with the wrong shape - recreating it on (CreatedAt).';
-    DROP INDEX [IX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event];
-END;
-/* Two readers, not one: "what has been failing lately" with no session filter,
-   AND the retention purge, which deletes by age. The purge is why this is not
-   optional - without it the scheduled DELETE scans the whole table to find the
-   old rows, on a table whose entire purpose is to keep growing. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
-    CREATE NONCLUSTERED INDEX [IX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event] ([CreatedAt] DESC);
-COMMIT;
-END TRY
-BEGIN CATCH
-    IF @@TRANCOUNT > 0 ROLLBACK;
-    PRINT ' [ERROR]   Could not create or rebuild Diagnostic_Event.IX_DiagnosticEvent_Created on (CreatedAt).';
-    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
-    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
-    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    RAISERROR('Index IX_DiagnosticEvent_Created could not be created - deployment stopped.', 16, 1);
-END CATCH;
-GO
-IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
-BEGIN
-    PRINT '';
-    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
-    PRINT '!!! line above it names the script. NOTHING after this point ran.';
-    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
-    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
-    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    SET NOEXEC ON;
-END
-GO
-
-BEGIN TRY
-BEGIN TRANSACTION;
-IF EXISTS (SELECT 1 FROM sys.indexes i
         WHERE i.name = N'CIX_DiagnosticEvent_Created' AND i.object_id = OBJECT_ID(N'dbo.Diagnostic_Event')
           AND (i.is_unique <> 0 OR i.has_filter <> 0
           OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
@@ -10074,7 +10032,7 @@ GO
 
   Script:      019_Application_Log_indexes.sql
   Order:       03_indexes / 019
-  Purpose:     3 index(es) on Application_Log.
+  Purpose:     2 index(es) on Application_Log.
   Depends on:  01_tables/ *_Application_Log.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    indexes on dbo.Application_Log
@@ -10101,48 +10059,6 @@ GO
 
 PRINT '';
 PRINT '--- indexes: Application_Log ---';
-GO
-IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
-BEGIN
-    PRINT '';
-    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
-    PRINT '!!! line above it names the script. NOTHING after this point ran.';
-    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
-    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
-    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    SET NOEXEC ON;
-END
-GO
-
-BEGIN TRY
-BEGIN TRANSACTION;
-IF EXISTS (SELECT 1 FROM sys.indexes i
-        WHERE i.name = N'IX_ApplicationLog_Created' AND i.object_id = OBJECT_ID(N'dbo.Application_Log')
-          AND (i.is_unique <> 0 OR i.has_filter <> 0
-          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 1
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'CreatedAt')))
-BEGIN
-    PRINT ' [REBUILD] Application_Log.IX_ApplicationLog_Created exists with the wrong shape - recreating it on (CreatedAt).';
-    DROP INDEX [IX_ApplicationLog_Created] ON [dbo].[Application_Log];
-END;
-/* The same pair on the log stream, where they matter MORE rather than less:
-   this table takes every line at INFO and above - hundreds per run, six figures
-   on a busy day - so an unindexed read or purge here is not a slow query, it is
-   an outage. CreatedAt leads because every read is time-bounded first. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
-    CREATE NONCLUSTERED INDEX [IX_ApplicationLog_Created] ON [dbo].[Application_Log] ([CreatedAt] DESC);
-COMMIT;
-END TRY
-BEGIN CATCH
-    IF @@TRANCOUNT > 0 ROLLBACK;
-    PRINT ' [ERROR]   Could not create or rebuild Application_Log.IX_ApplicationLog_Created on (CreatedAt).';
-    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
-    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
-    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    RAISERROR('Index IX_ApplicationLog_Created could not be created - deployment stopped.', 16, 1);
-END CATCH;
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -10452,7 +10368,7 @@ DECLARE @d int = (SELECT COUNT(*) FROM sys.default_constraints dc
                   WHERE tb.name IN (SELECT name FROM @owned));
 PRINT ' [INFO]    Tables:              ' + CAST(@t AS varchar(10)) + ' of 22';
 PRINT ' [INFO]    Non-PK indexes:      ' + CAST(@i AS varchar(10)) +
-      '  (39 expected: 38 from 03_indexes + UQ_Config_Tuning_Key)';
+      '  (37 expected: 36 from 03_indexes + UQ_Config_Tuning_Key)';
 PRINT ' [INFO]    Default constraints: ' + CAST(@d AS varchar(10)) + '  (22 expected)';
 
 /*-------------------------- the verdict --------------------------*/
@@ -10534,7 +10450,7 @@ GO
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 318 columns and all 39 indexes, down to index key columns and filters.
+  Purpose:     Verify all 318 columns and all 37 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -11011,8 +10927,6 @@ INSERT INTO @ix (name, tbl, is_unique, is_filtered, cols) VALUES
     (N'IX_ThreatType_Category_Active', N'Threat_Type', 0, 1, N'ThreatCategoryID'),
     (N'IX_PromptLog_Correlation', N'Prompt_Log', 0, 1, N'CorrelationID,CreatedAt'),
     (N'IX_DiagnosticEvent_Session', N'Diagnostic_Event', 0, 1, N'SessionID,CreatedAt'),
-    (N'IX_DiagnosticEvent_Created', N'Diagnostic_Event', 0, 0, N'CreatedAt'),
-    (N'IX_ApplicationLog_Created', N'Application_Log', 0, 0, N'CreatedAt'),
     (N'IX_ApplicationLog_Session', N'Application_Log', 0, 1, N'SessionID,CreatedAt'),
     (N'IX_IdentifiedDuplicateThreat_Session', N'Identified_Duplicate_Threat', 0, 0, N'SessionID'),
     (N'IX_PromptLog_Session', N'Prompt_Log', 0, 0, N'SessionID,SubsystemID'),
@@ -11248,7 +11162,7 @@ PRINT ' [INFO]    Columns expected:   318';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));
-PRINT ' [INFO]    Indexes expected:   39';
+PRINT ' [INFO]    Indexes expected:   37';
 PRINT ' [INFO]    Missing/disabled:   ' + CAST(@ix_missing AS varchar(10));
 PRINT ' [INFO]    Wrong shape:        ' + CAST(@ix_shape   AS varchar(10));
 PRINT ' [INFO]    Primary keys wrong: ' + CAST(@pk_wrong   AS varchar(10));

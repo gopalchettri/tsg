@@ -1155,18 +1155,25 @@ CREATE INDEX IX_PromptLog_Correlation ON Prompt_Log(CorrelationID, CreatedAt) WH
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Session' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
 CREATE INDEX IX_DiagnosticEvent_Session ON Diagnostic_Event(SessionID, CreatedAt DESC) WHERE SessionID IS NOT NULL;
 
--- Two readers: "what has been failing lately" with no session filter, AND the retention
--- purge, which deletes by age. The purge is why this is not optional -- without it the
--- scheduled DELETE scans the whole table to find the old rows, on a table whose entire
--- purpose is to keep growing.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
-CREATE INDEX IX_DiagnosticEvent_Created ON Diagnostic_Event(CreatedAt DESC);
+-- RETIRED, and dropped where they still exist. Both were nonclustered on (CreatedAt DESC).
+-- Section 3 below now CLUSTERS these two tables on (CreatedAt, id), so the table itself is
+-- held in that order -- and a clustered index is scanned backwards as cheaply as forwards,
+-- carrying the whole row, so it answers every query these did without a key lookup.
+-- That made them a second copy of an ordering the table already has, maintained on every
+-- INSERT, on the two hottest insert paths in the system.
+-- DROPPED rather than merely un-created: otherwise an upgraded database keeps paying for
+-- them forever while a fresh one does not, and the two deploy paths diverge in silence.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_DiagnosticEvent_Created - covered by the clustered index.';
+    DROP INDEX IX_DiagnosticEvent_Created ON Diagnostic_Event;
+END;
 
--- The same pair on the log stream, where they matter MORE rather than less: this table takes
--- every line at INFO and above, so an unindexed read or purge here is not a slow query, it is
--- an outage.
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
-CREATE INDEX IX_ApplicationLog_Created ON Application_Log(CreatedAt DESC);
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_ApplicationLog_Created - covered by the clustered index.';
+    DROP INDEX IX_ApplicationLog_Created ON Application_Log;
+END;
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Session' AND object_id = OBJECT_ID('dbo.Application_Log'))
 CREATE INDEX IX_ApplicationLog_Session ON Application_Log(SessionID, CreatedAt DESC) WHERE SessionID IS NOT NULL;
@@ -1262,12 +1269,11 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_DiagnosticEvent_Creat
 CREATE CLUSTERED INDEX CIX_DiagnosticEvent_Created ON Diagnostic_Event(CreatedAt, DiagnosticID) WITH (DATA_COMPRESSION = PAGE);
 GO
 
--- NOT DROPPED, and now redundant: IX_ApplicationLog_Created and IX_DiagnosticEvent_Created
--- are nonclustered on (CreatedAt DESC), which the clustered indexes above already cover --
--- a clustered index is scanned backwards as cheaply as forwards. They cost write
--- throughput on the two hottest insert paths and save nothing. Retiring an index means
--- retiring it from all three deploy paths, the verify script and the header counts in one
--- change; that is a decision to take deliberately, not as a side effect of this one.
+-- The two nonclustered (CreatedAt DESC) indexes these replace are RETIRED above, and dropped
+-- from databases that still carry them. The IX_*_Session indexes are KEPT on purpose: they
+-- lead on SessionID, which no clustered index here covers, so "everything for session X"
+-- would otherwise scan. Redundancy is decided by the LEADING column, not by whether
+-- CreatedAt appears somewhere in the key.
 
 -- PAGE compression for a database that ALREADY EXISTS. The CREATE TABLEs above declare it,
 -- which only ever covers a FRESH database: compression is a property of a stored index and

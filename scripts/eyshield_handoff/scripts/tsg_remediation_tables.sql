@@ -13,7 +13,7 @@
 
   Contents: legacy-name migration, 24 tables, 319 reconciled columns,
   22 default constraints,
-  3 check constraints, 38 indexes.
+  3 check constraints, 36 indexes.
 
   Those five numbers are PINNED to the statements below them by
   tests/test_schema_sync.py::test_the_consolidated_header_counts_match_the_script.
@@ -2194,7 +2194,7 @@ GO
 
 
 /*==============================================================================
-  SECTION 6 — Indexes (38)
+  SECTION 6 — Indexes (36)
 
   Please create all of them exactly as written. Index names, column order, the
   UNIQUE keyword and the text of each WHERE clause are all either checked by the
@@ -2385,7 +2385,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_API_Client_KeyHash' AN
 GO
 
 -------------------------------------------------------------------------------
--- 6c. Performance (16 with a known reader). Each of these backs a query the
+-- 6c. Performance (14 with a known reader). Each of these backs a query the
 --     application actually runs.
 -------------------------------------------------------------------------------
 
@@ -2482,20 +2482,36 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Sessio
         WHERE [SessionID] IS NOT NULL;
 GO
 
-/* Two readers, not one: "what has been failing lately" with no session filter,
-   AND the retention purge, which deletes by age. The purge is why this is not
-   optional - without it the scheduled DELETE scans the whole table to find the
-   old rows, on a table whose entire purpose is to keep growing. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
-    CREATE NONCLUSTERED INDEX [IX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event] ([CreatedAt] DESC);
+/* RETIRED, and dropped from databases that still carry them.
+   IX_DiagnosticEvent_Created and IX_ApplicationLog_Created were nonclustered on
+   ([CreatedAt] DESC) and served two readers: "what has been failing lately" and
+   the retention purge. Section 6e now CLUSTERS both tables on (CreatedAt, id),
+   so the table itself is held in that order and a clustered index is scanned
+   backwards as cheaply as forwards. Every query they answered, the clustered
+   index answers - without a key lookup, because the clustered index carries the
+   whole row.
+
+   So they became a second copy of an ordering the table already has, maintained
+   on every INSERT, on the two hottest insert paths in the system. Keeping a
+   redundant index is not free and not neutral: it is write amplification with no
+   read to pay for it.
+
+   Dropped rather than merely un-created, or an upgraded database keeps paying for
+   them forever while a fresh one does not - the two deploy paths would diverge
+   silently, which is the failure test_every_deploy_path_creates_the_same_indexes
+   exists to catch. */
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_DiagnosticEvent_Created - the clustered index on (CreatedAt, DiagnosticID) covers it.';
+    DROP INDEX [IX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event];
+END;
 GO
 
-/* The same pair on the log stream, where they matter MORE rather than less:
-   this table takes every line at INFO and above - hundreds per run, six figures
-   on a busy day - so an unindexed read or purge here is not a slow query, it is
-   an outage. CreatedAt leads because every read is time-bounded first. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
-    CREATE NONCLUSTERED INDEX [IX_ApplicationLog_Created] ON [dbo].[Application_Log] ([CreatedAt] DESC);
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_ApplicationLog_Created - the clustered index on (CreatedAt, LogID) covers it.';
+    DROP INDEX [IX_ApplicationLog_Created] ON [dbo].[Application_Log];
+END;
 GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Session' AND object_id = OBJECT_ID('dbo.Application_Log'))
@@ -2665,14 +2681,12 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_DiagnosticEvent_Creat
         WITH (DATA_COMPRESSION = PAGE);
 GO
 
-/* NOT DROPPED, and it is now redundant: IX_ApplicationLog_Created and
-   IX_DiagnosticEvent_Created are nonclustered on ([CreatedAt] DESC), which the
-   clustered indexes above now cover - a clustered index is scanned backwards as
-   cheaply as forwards. They cost write throughput on the two hottest insert paths
-   and save nothing. They are left in place because retiring an index means
-   retiring it from all three deploy paths, the verify script and the header
-   counts in one change, and that is a decision to take deliberately rather than
-   as a side effect of this one. Raise it as its own change. */
+/* The two nonclustered (CreatedAt DESC) indexes these replace are RETIRED in
+   section 6c above, and dropped from databases that still carry them. Kept, on
+   purpose: IX_*_Session leads on SessionID, which no clustered index above
+   covers, so "everything for session X" would otherwise scan. Redundancy is
+   decided by the LEADING column, not by whether CreatedAt appears somewhere in
+   the key. */
 
 -------------------------------------------------------------------------------
 -- 6f. PAGE compression (0 indexes: it rebuilds the ones above, it creates none).
