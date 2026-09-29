@@ -27,6 +27,30 @@ more than it sounds: retries make outages survivable, and therefore invisible.
 
 **`logs` is different from the other four**, and is treated differently everywhere below. See §6.
 
+### The one that catches an outage before it becomes one
+
+`retries` records each recovered hiccup. On its own that is a trail, not a warning — nobody reads
+a warning stream closely enough to notice a rate change. So the retries are also **counted across
+the whole deployment**, and when the count crosses a threshold inside one window, a single
+`infra.degraded` event is written:
+
+```bash
+TSG_INFRA_DEGRADED_THRESHOLD=20        # retries in one window before it is called degrading; 0 = off
+TSG_INFRA_DEGRADED_WINDOW_SECONDS=300  # the window, in seconds
+```
+
+**Why this exists.** Retrying a slow AI service is the right behaviour, but it means an outage no
+longer announces itself. It used to: runs failed and people complained. Now the same outage is
+absorbed quietly until the retries run out — and only then do runs start failing. This is what
+turns that silence back into one signal.
+
+**One alarm per window for the entire system**, not one per retry and not one per worker. Find it
+with:
+
+```bash
+curl "https://<host>/v1/tsg/diagnostics?kind=degraded_outcome"
+```
+
 ---
 
 ## 2. Where it goes
@@ -37,7 +61,7 @@ more than it sounds: retries make outages survivable, and therefore invisible.
 | **Standard output** | Nothing — always on | Structured JSON. **Cannot be switched off**; it is the fallback when everything else fails |
 | **Grafana** | Point it at the database | **No code, no setting.** Grafana reads SQL Server natively |
 | **Loki / Fluent Bit / Vector** | Collect container output | **No code, no setting.** It is already JSON and always on |
-| **Prometheus / OpenTelemetry / Sentry** | One module each, not yet written | Deliberately not built — see §7 |
+| **Prometheus / OpenTelemetry / Sentry** | One module each, not yet written | The seam is built; the modules are not — see §7 |
 
 The cheapest win here needs nothing from this page: your logs are already structured JSON on
 stdout, so any container log shipper collects them as they are.
@@ -185,6 +209,28 @@ day; losing the service is an outage.
 | **Sentry** | One module. Subsumes `exceptions` with grouping; complements the table rather than replacing it |
 
 The first two are worth doing first, and neither needs anything from this page.
+
+**What "one module" actually means.** Every recorded event is handed to a registry of
+destinations as one normalised value, so a new destination reads that value and never touches the
+pipeline. It needs a name, a check for whether its prerequisites are met, a per-category filter,
+and a non-blocking `emit`. Nothing else in the system changes.
+
+**A destination is ON as soon as it is available** — there is no second switch to remember. That is
+deliberate: an opt-in list is how someone installs a tool, configures it, sees no data, and spends
+an afternoon hunting for the setting they were also supposed to change. Configuring the tool *is*
+the opt-in.
+
+To switch one back off without removing it:
+
+```bash
+TSG_DIAGNOSTIC_BACKENDS_DISABLED=prometheus
+```
+
+That is the strongest switch there is — a name listed there cannot be re-enabled from the admin
+endpoint, only by editing the environment, which is what makes it usable mid-incident.
+`GET /v1/tsg/diagnostics/config` lists every destination including the disabled and unavailable
+ones, with a `failures` count, so a destination that is silently absent is visible rather than
+guessed at.
 
 ---
 

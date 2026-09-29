@@ -171,6 +171,27 @@ class Settings(BaseSettings):
     # call that eventually succeeds leaves no other trace.
     diagnostic_slow_step_ms: int = Field(
         5000, ge=1, validation_alias=AliasChoices("TSG_DIAGNOSTIC_SLOW_STEP_MS"))
+    # TSG_INFRA_DEGRADED_THRESHOLD / TSG_INFRA_DEGRADED_WINDOW_SECONDS — how many transient
+    # retries inside one window mean "a provider is degrading", and how long that window is.
+    # 0 disables the signal entirely.
+    #
+    # THE PROBLEM THESE EXIST FOR, and it is one this codebase CREATED. Making provider outages
+    # survivable also made them INVISIBLE: before the retry fix, a reranker outage cancelled
+    # sessions and people complained, which is a crude alert but an alert. Now the same outage is
+    # absorbed silently until the attempt cap is reached, so the change traded a loud failure for
+    # a quiet one — and a quiet failure is the kind that runs for a week.
+    #
+    # A single retry is not news; thousands of individually unremarkable retries are. Nothing was
+    # counting them, so no amount of log-reading would surface the aggregate. Crossing this
+    # threshold emits ONE deduplicated event per window across the whole deployment.
+    #
+    # COUNTED IN REDIS, not per process: retries spread across every worker, so a per-process
+    # counter would sit below any meaningful threshold while the deployment as a whole was on
+    # fire.
+    infra_degraded_threshold: int = Field(
+        20, ge=0, validation_alias=AliasChoices("TSG_INFRA_DEGRADED_THRESHOLD"))
+    infra_degraded_window_seconds: int = Field(
+        300, ge=30, validation_alias=AliasChoices("TSG_INFRA_DEGRADED_WINDOW_SECONDS"))
     # TSG_TRACE_DIR — where file sinks (and log_file) write; relative = PROJECT ROOT, never CWD.
     trace_dir: str = Field(
         "logs/trace", validation_alias=AliasChoices("TRACE_DIR", "TSG_TRACE_DIR"))

@@ -18,6 +18,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.core import diagnostics
+from app.core.config import get_settings
 from app.core.enums import DiagnosticKind, InfraErrorKind, SSEEventType, StageStatus, SubsystemLevel
 from app.core.logging import get_logger
 from app.db import dal
@@ -76,6 +77,23 @@ def log_transient_infra_retry(*, site: str, session_id: str, subsystem_id: int |
     # mark anywhere. This is how a degrading reranker is spotted BEFORE it cancels anything.
     diagnostics.record(DiagnosticKind.transient_retry, exc, session_id=session_id,
                        subsystem_id=subsystem_id, context={"site": site})
+    # AND THE AGGREGATE, which is the half a per-event trail cannot give you. One retry is not
+    # news; thousands of individually unremarkable retries are, and nobody reads a warning stream
+    # closely enough to notice the rate change that precedes an outage. The counter is
+    # deployment-wide and the alarm fires ONCE per window, so this stays one line rather than
+    # becoming a second flood on top of the first.
+    #
+    # EMITTED HERE, not inside diagnostics: that module's own logger is on the recursion denylist,
+    # so an alarm raised there would be filtered straight out of the capture it is meant to land
+    # in — and would have looked like it was working.
+    total = diagnostics.transient_retry_rate_exceeded(str(kind))
+    if total is not None:
+        log.error("infra.degraded",
+                  error_kind=str(kind), retries_in_window=total,
+                  window_seconds=get_settings().infra_degraded_window_seconds,
+                  latest_error=f"{type(exc).__name__}: {exc}"[:300],
+                  note="runs are still completing — this is the warning that arrives BEFORE the "
+                       "retry budget runs out and runs start failing outright")
 
 
 _EPOCH = 1

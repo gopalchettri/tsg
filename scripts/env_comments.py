@@ -345,6 +345,32 @@ COMMENTS: dict[str, str] = {
         hundreds for a single run - so it is a short trail for working out what happened this week,
         not a long-term record.
     """,
+    "TSG_INFRA_DEGRADED_THRESHOLD": """
+        How many automatic retries inside one time window mean a service is going bad. Set to 0 to
+        switch the warning off entirely.
+
+        WHY THIS EXISTS, and it is worth reading once. The system recovers from a slow or
+        unreachable AI service by retrying, which is the right behaviour - but it also means an
+        outage no longer announces itself. It used to: runs failed and people complained. Now the
+        same outage is absorbed quietly until the retries run out, and only then do runs start
+        failing. A problem that is survived in silence is the kind that runs for a week.
+
+        One retry is normal and means nothing. Hundreds of them in a few minutes is a service
+        degrading in front of you. Nothing was adding them up, so there was no way to see the
+        difference - this is what adds them up.
+
+        When the count crosses this number, ONE warning is written for the whole system for that
+        window, not one per retry. Raise it if your environment is noisy; lower it to be told
+        sooner.
+    """,
+    "TSG_INFRA_DEGRADED_WINDOW_SECONDS": """
+        How long the counting window above is, in seconds. Default 300, which is five minutes.
+
+        Shorter windows react faster and are more easily tripped by a brief blip; longer windows
+        are calmer but take longer to tell you. Five minutes is long enough that a momentary
+        network hiccup will not reach the threshold, and short enough to notice a real problem
+        while it is still only a problem.
+    """,
     "TSG_DIAGNOSTIC_BACKENDS_DISABLED": """
         Names of places that should STOP receiving problem records, comma separated. Normally
         empty.

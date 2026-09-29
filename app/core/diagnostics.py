@@ -66,6 +66,10 @@ _DEGRADED_EVENTS = frozenset({
     "llm.fallback_model_used",           # answered by the second model, not the configured one
     "rerank_many.item_failed",           # one item dropped out of a rerank batch
     "controls.rerank_item_failed",       # same, on the control-mapping side
+    # The AGGREGATE alarm, raised by pipeline_common when the deployment-wide retry rate crosses
+    # its threshold. Listed here so the P1 signal lands in a queryable table and not only in a log
+    # stream somebody has to be watching -- the whole complaint that started this work.
+    "infra.degraded",
 })
 
 #: Matched on the LAST dotted segment, not the whole name, because these events are built with an
@@ -246,6 +250,54 @@ def record(kind: DiagnosticKind, exc: BaseException, *, session_id: str | None =
         log.warning("diagnostic.write_failed", kind=str(kind),
                     write_error=f"{type(write_failure).__name__}: {write_failure}"[:300],
                     original_error=f"{type(exc).__name__}: {exc}"[:300])
+
+
+def transient_retry_rate_exceeded(error_kind: str) -> int | None:
+    """Count one recovered hiccup. Returns the running count IF this call is the one that should
+    raise the alarm, and None every other time. Never raises.
+
+    THE PROBLEM THIS SOLVES IS ONE THIS CODEBASE CREATED. Making provider outages survivable also
+    made them invisible: before the retry fix a reranker outage cancelled sessions and people
+    complained — crude, but an alert. Now the same outage is absorbed silently until the attempt
+    cap is reached, so a loud failure became a quiet one, and a quiet failure runs for a week.
+
+    A single retry is not news. Thousands of individually unremarkable retries are, and nothing
+    was counting them — so no amount of log-reading would ever surface the aggregate, because the
+    aggregate did not exist anywhere.
+
+    THREE DESIGN POINTS, each of them load-bearing:
+
+      * COUNTED IN REDIS. Retries spread across every worker, so a per-process counter would sit
+        comfortably below any useful threshold while the deployment as a whole was on fire.
+      * ONE ALARM PER WINDOW, DEPLOYMENT-WIDE. The `nx` latch below is what makes that true: every
+        worker crosses the threshold at nearly the same moment, and without it an outage would
+        produce a second flood on top of the first.
+      * IT RETURNS RATHER THAN LOGS. The caller logs, because this module's own logger is on the
+        recursion denylist — an alarm emitted from here would be filtered out of the capture it is
+        supposed to land in, and would have looked like it worked.
+    """
+    try:
+        s = get_settings()
+        threshold = s.infra_degraded_threshold
+        if threshold <= 0:                       # explicitly switched off
+            return None
+        window = s.infra_degraded_window_seconds
+        r = _override_redis()
+        # A FIXED time bucket, not a sliding window. A sliding window needs a sorted set and a
+        # prune on every retry; this needs one INCR. During an outage the retry path is the
+        # hottest path there is, and it is the worst possible moment to make it more expensive.
+        key = f"tsg:infra_retry:{error_kind}:{int(time.time() // window)}"
+        count = int(r.incr(key))
+        if count == 1:
+            r.expire(key, window * 2)            # self-cleaning: no purge, no growth
+        if count < threshold:
+            return None
+        # The latch. `nx` means exactly one caller in the deployment gets True per bucket.
+        if not r.set(f"{key}:alarmed", "1", nx=True, ex=window * 2):
+            return None
+        return count
+    except Exception:  # noqa: BLE001 — the retry path must never fail because counting failed
+        return None
 
 
 def record_slow_step(*, step: str, duration_ms: float, session_id: str | None = None,

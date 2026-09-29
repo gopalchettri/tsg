@@ -347,3 +347,151 @@ def test_a_fast_step_is_not_recorded(registry, monkeypatch):
         pass
 
     assert fake.seen == [], "a step well under the threshold was recorded as slow"
+
+
+# --- the aggregate alarm: the P1 signal the retry fix otherwise removed --------------------------
+
+class _CountingRedis:
+    """Enough Redis for a counter and a latch. The two operations this feature is built on are
+    INCR and SET NX, and both have to behave exactly as Redis does or the alarm either never
+    fires or fires once per worker."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    def incr(self, key):
+        self.store[key] = str(int(self.store.get(key, 0)) + 1)
+        return int(self.store[key])
+
+    def expire(self, key, seconds):
+        return True
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return None                    # Redis returns nil when NX loses
+        self.store[key] = value
+        return True
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def delete(self, key):
+        self.store.pop(key, None)
+
+
+@pytest.fixture
+def counting_redis(monkeypatch):
+    from app.core import diagnostics
+
+    fake = _CountingRedis()
+    monkeypatch.setattr(diagnostics, "_override_redis", lambda: fake)
+    return fake
+
+
+def test_a_handful_of_retries_says_nothing(counting_redis, monkeypatch):
+    """One hiccup is not news, and an alarm that fires on one would be ignored within a week —
+    which is the same as not having one."""
+    monkeypatch.setenv("TSG_INFRA_DEGRADED_THRESHOLD", "20")
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+    from app.core import diagnostics
+
+    fired = [diagnostics.transient_retry_rate_exceeded("llm_transient") for _ in range(19)]
+
+    assert fired == [None] * 19, "the alarm fired below its threshold"
+
+
+def test_crossing_the_threshold_raises_the_alarm_exactly_once(counting_redis, monkeypatch):
+    """THE WHOLE POINT, and the dedup is half of it. Every worker crosses the threshold within
+    milliseconds of every other, so without the latch an outage produces a second flood on top of
+    the first — and the flood is what makes the original outage hard to read."""
+    monkeypatch.setenv("TSG_INFRA_DEGRADED_THRESHOLD", "20")
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+    from app.core import diagnostics
+
+    fired = [diagnostics.transient_retry_rate_exceeded("llm_transient") for _ in range(100)]
+
+    raised = [f for f in fired if f is not None]
+    assert raised == [20], (
+        f"expected exactly one alarm, at the 20th retry; got {raised}. More than one is a flood; "
+        "none means an outage passes in silence")
+
+
+def test_the_counter_is_shared_rather_than_per_process(counting_redis, monkeypatch):
+    """THE MULTI-PROCESS PROPERTY. Retries spread across every Celery worker, so a per-process
+    counter would sit comfortably below any useful threshold while the deployment as a whole was
+    on fire. Simulated by driving the same shared store from interleaved 'workers'."""
+    monkeypatch.setenv("TSG_INFRA_DEGRADED_THRESHOLD", "10")
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+    from app.core import diagnostics
+
+    # Five workers, two retries each: no single worker reaches ten, the deployment reaches ten.
+    fired = [diagnostics.transient_retry_rate_exceeded("llm_transient")
+             for _worker in range(5) for _retry in range(2)]
+
+    assert any(f is not None for f in fired), (
+        "ten retries spread across five workers raised nothing — a per-process counter would "
+        "behave exactly this way, and the outage would be invisible")
+
+
+def test_the_alarm_can_be_switched_off(counting_redis, monkeypatch):
+    """0 means off. An operator in the middle of a known, accepted degradation must be able to
+    stop the alarm without stopping the retries that are keeping the system up."""
+    monkeypatch.setenv("TSG_INFRA_DEGRADED_THRESHOLD", "0")
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+    from app.core import diagnostics
+
+    assert all(diagnostics.transient_retry_rate_exceeded("llm_transient") is None
+               for _ in range(100))
+
+
+def test_counting_never_breaks_the_retry_path(monkeypatch):
+    """This runs inside the handler that keeps a session alive during a provider outage. If
+    counting could raise, the observability feature would convert a survivable outage into the
+    cancelled sessions it was built to prevent."""
+    from app.core import diagnostics
+
+    class _Broken:
+        def incr(self, *_a, **_k):
+            raise ConnectionError("redis is down")
+
+    monkeypatch.setattr(diagnostics, "_override_redis", lambda: _Broken())
+    assert diagnostics.transient_retry_rate_exceeded("llm_transient") is None   # must not raise
+
+
+def test_the_alarm_lands_where_an_operator_can_query_it(counting_redis, monkeypatch, registry):
+    """A log line nobody is watching is not an alert. The alarm has to reach the durable table the
+    public read endpoint serves — otherwise this is the same "it is in the container logs"
+    non-answer that started the whole investigation.
+
+    It is emitted from pipeline_common rather than from diagnostics for exactly this reason:
+    diagnostics' own logger is on the recursion denylist, so an alarm raised there would be
+    filtered out of the capture it is meant to land in, and would have looked like it worked."""
+    monkeypatch.setenv("TSG_INFRA_DEGRADED_THRESHOLD", "2")
+    monkeypatch.setenv("TSG_DIAGNOSTIC_DB_CATEGORIES", "all")
+    from app.core.config import get_settings
+    get_settings.cache_clear()
+
+    fake = _FakeBackend()
+    _only(registry, fake)
+
+    from app.pipeline.llm import TransientProviderError
+    from app.pipeline.pipeline_common import log_transient_infra_retry
+
+    for _ in range(3):
+        log_transient_infra_retry(site="grounding.rerank", session_id="s-1", subsystem_id=1,
+                                  exc=TransientProviderError("rerank timed out"))
+
+    # Filtered to the `degraded` category deliberately: the alarm is ALSO captured as an ordinary
+    # log line, which is the dual-recording rule three tests above pin. What matters here is that
+    # it reached the structured table an operator queries, exactly once.
+    degraded = [e for e in fake.seen
+                if e.event == "infra.degraded" and e.category == "degraded"]
+    assert len(degraded) == 1, (
+        f"expected one queryable alarm row, got {len(degraded)} — none means the alarm exists "
+        "only in a log stream somebody has to already be watching; more than one means an outage "
+        "produces a flood on top of the flood")
+    assert degraded[0].kind == str(DiagnosticKind.degraded_outcome)
