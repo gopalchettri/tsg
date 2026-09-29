@@ -60,6 +60,11 @@ TABLE_ORDER = [
     "Threat_Scenario_Control_Map", "Risk_Treatment_Plan",
     # trails
     "Scenario_Audit", "Prompt_Log",
+    # Operator-only failure detail. LAST on purpose: nothing references it and nothing reads it
+    # during a run, so it can be created after everything the pipeline needs. A trail like the two
+    # above, but for the operator rather than the tenant — Scenario_Audit is projected into a
+    # client timeline, this one never leaves the admin surface.
+    "Diagnostic_Event",
 ]
 
 

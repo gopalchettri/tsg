@@ -43,6 +43,7 @@ END
 ELSE
 BEGIN
     /* No FOREIGN KEYs exist between these tables, so any order works. */
+    IF OBJECT_ID('dbo.Diagnostic_Event', 'U')            IS NOT NULL DROP TABLE dbo.Diagnostic_Event;
     IF OBJECT_ID('dbo.Scenario_Audit', 'U')              IS NOT NULL DROP TABLE dbo.Scenario_Audit;
     IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U')         IS NOT NULL DROP TABLE dbo.Risk_Treatment_Plan;
     IF OBJECT_ID('dbo.Threat_Scenario', 'U')             IS NOT NULL DROP TABLE dbo.Threat_Scenario;
@@ -86,7 +87,7 @@ FROM sys.tables
 WHERE name IN ('Scenario_Session','Subsystem_Stage_State','Identified_Threat',
                'Identified_Duplicate_Threat','Scoped_Threat','Threat_Scenario',
                'Threat_Scenario_Output',
-               'Threat_Library_Import_Run','Scenario_Audit','Prompt_Log',
+               'Threat_Library_Import_Run','Scenario_Audit','Prompt_Log','Diagnostic_Event',
                'Threat_Candidate_Review','Risk_Treatment_Plan','Config_Tuning','API_Client')
 ORDER BY name;
 GO

@@ -134,7 +134,7 @@ INSERT INTO @owned (name) VALUES
     ('Scenario_Session'), ('Subsystem_Stage_State'), ('Identified_Threat'),
     ('Identified_Duplicate_Threat'), ('Scoped_Threat'), ('Threat_Scenario'),
     ('Threat_Scenario_Control_Map'), ('Risk_Treatment_Plan'),
-    ('Scenario_Audit'), ('Prompt_Log');
+    ('Scenario_Audit'), ('Prompt_Log'), ('Diagnostic_Event');
 
 DECLARE @total   int = (SELECT COUNT(*) FROM @owned);
 DECLARE @present int = (SELECT COUNT(*) FROM @owned o
@@ -174,7 +174,7 @@ WHERE    t.name IN ('Threat_Category','Threat_Type','Threat_Catalogue','Threat_A
                     'Scenario_Session','Subsystem_Stage_State','Identified_Threat',
                     'Identified_Duplicate_Threat','Scoped_Threat','Threat_Scenario',
                     'Threat_Scenario_Control_Map','Risk_Treatment_Plan',
-                    'Scenario_Audit','Prompt_Log')
+                    'Scenario_Audit','Prompt_Log','Diagnostic_Event')
 GROUP BY t.name
 HAVING   SUM(p.rows) > 0
 ORDER BY SUM(p.rows) DESC;

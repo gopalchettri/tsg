@@ -109,6 +109,19 @@ class Settings(BaseSettings):
     # empty (default) = off. RESTART-ONLY: get_settings() is @lru_cache'd.
     trace_sinks: str = Field(
         "", validation_alias=AliasChoices("TRACE_SINKS", "TSG_TRACE_SINKS"))
+    # TSG_DIAGNOSTIC_DB_CATEGORIES — which kinds of problem are saved to Diagnostic_Event.
+    # Comma list of exceptions|retries, or "all" / "none". Default "all".
+    #
+    # `retries` is deliberately on by default and is the non-obvious half: once a provider outage
+    # is survivable it becomes INVISIBLE, and a session that retried four times and then worked
+    # leaves no other trace. That trail is how a degrading reranker is spotted before it cancels
+    # anything.
+    diagnostic_db_categories: str = Field(
+        "all", validation_alias=AliasChoices("TSG_DIAGNOSTIC_DB_CATEGORIES"))
+    # TSG_DIAGNOSTIC_RETENTION_DAYS — how long Diagnostic_Event rows are kept. Tracebacks are
+    # bulky and this table only grows.
+    diagnostic_retention_days: int = Field(
+        30, ge=1, validation_alias=AliasChoices("TSG_DIAGNOSTIC_RETENTION_DAYS"))
     # TSG_TRACE_DIR — where file sinks (and log_file) write; relative = PROJECT ROOT, never CWD.
     trace_dir: str = Field(
         "logs/trace", validation_alias=AliasChoices("TRACE_DIR", "TSG_TRACE_DIR"))

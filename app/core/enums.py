@@ -27,6 +27,14 @@ class InfraErrorKind(StrEnum):
     llm_transient = "llm_transient"             # llm.TransientProviderError: provider/gateway timeout, dropped connection, 5xx
 
 
+class DiagnosticKind(StrEnum):
+    """What a Diagnostic_Event row records. Operator-facing only; never published to a tenant."""
+
+    stage_error = "stage_error"                # a stage failed and the session was settled
+    transient_retry = "transient_retry"        # a hiccup that RECOVERED — see the class docstring
+    retries_exhausted = "retries_exhausted"    # the retry budget ran out
+
+
 class SessionMode(StrEnum):
     AUTO = "AUTO"   # both stages run back-to-back per subsystem, stopping only at the single
                     # REVIEW gate

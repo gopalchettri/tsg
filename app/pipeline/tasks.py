@@ -9,10 +9,11 @@ from typing import Any, NamedTuple
 from sqlalchemy import func, insert, update
 from sqlalchemy.orm import Session
 
-from app.core import tuning
+from app.core import diagnostics, tuning
 from app.core.config import get_settings
 from app.core.enums import (
     AuditEventType,
+    DiagnosticKind,
     ScenarioStatus,
     ScopingRejection,
     SelectionReason,
@@ -1429,6 +1430,16 @@ def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, ex
     # ~20 frames down is unattributable. exc, not True: the raise site is a caller, not here.
     log.error("stage.error", session_id=sid, subsystem=subsystem_id, error=repr(exc),
             exc_info=exc)
+    # AND a durable, queryable copy. The log line above is the only surface that keeps the real
+    # exception -- ErrorMessage, the audit row and the SSE event all carry client_msg, which
+    # collapses anything unrecognised to "stage processing failed". That is correct for those
+    # three (they are tenant-visible) and useless for whoever has to diagnose UAT, where stdout
+    # dies with the container. Best-effort by construction: see app/core/diagnostics.py.
+    diagnostics.record(DiagnosticKind.stage_error, exc, session_id=sid,
+                       tenant_id=scenario_session.get("TenantID"),
+                       entity_id=scenario_session.get("EntityID"),
+                       subsystem_id=subsystem_id, client_message=client_msg,
+                       context={"stage": "work", **(extra or {})})
 
 
 def decide_session_outcome(sess: Session, scenario_session: dict) -> str | None:

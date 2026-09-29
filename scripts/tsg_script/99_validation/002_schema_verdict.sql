@@ -3,7 +3,7 @@
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 296 columns and all 32 indexes, down to index key columns and filters.
+  Purpose:     Verify all 310 columns and all 32 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -18,7 +18,7 @@ GO
 
 PRINT '';
 PRINT '==============================================================';
-PRINT ' TSG COLUMN VERDICT   (296 columns across 22 tables)';
+PRINT ' TSG COLUMN VERDICT   (310 columns across 23 tables)';
 PRINT ' Database: ' + DB_NAME();
 PRINT '==============================================================';
 GO
@@ -321,7 +321,21 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Prompt_Log', N'ModelVersion', N'nvarchar', N'NVARCHAR(100)', 1),
     (N'Prompt_Log', N'ParseSucceeded', N'bit', N'BIT', 0),
     (N'Prompt_Log', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 0),
-    (N'Prompt_Log', N'CorrelationID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1);
+    (N'Prompt_Log', N'CorrelationID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
+    (N'Diagnostic_Event', N'DiagnosticID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
+    (N'Diagnostic_Event', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 0),
+    (N'Diagnostic_Event', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
+    (N'Diagnostic_Event', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
+    (N'Diagnostic_Event', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
+    (N'Diagnostic_Event', N'SubsystemID', N'int', N'INT', 1),
+    (N'Diagnostic_Event', N'TaskID', N'nvarchar', N'NVARCHAR(100)', 1),
+    (N'Diagnostic_Event', N'RequestID', N'nvarchar', N'NVARCHAR(100)', 1),
+    (N'Diagnostic_Event', N'Kind', N'nvarchar', N'NVARCHAR(50)', 0),
+    (N'Diagnostic_Event', N'ExceptionClass', N'nvarchar', N'NVARCHAR(200)', 0),
+    (N'Diagnostic_Event', N'ExceptionMessage', N'nvarchar', N'NVARCHAR(4000)', 1),
+    (N'Diagnostic_Event', N'Traceback', N'nvarchar', N'NVARCHAR(max)', 1),
+    (N'Diagnostic_Event', N'ClientMessage', N'nvarchar', N'NVARCHAR(1000)', 1),
+    (N'Diagnostic_Event', N'ContextJSON', N'nvarchar', N'NVARCHAR(max)', 1);
 
 DECLARE @missing int = 0, @wrong_type int = 0, @wrong_null int = 0;
 
@@ -516,7 +530,8 @@ INSERT INTO @pk (tbl, cols) VALUES
     (N'Threat_Scenario_Control_Map', N'ScenarioID,ControlLibraryID'),
     (N'Risk_Treatment_Plan', N'PlanID'),
     (N'Scenario_Audit', N'AuditID'),
-    (N'Prompt_Log', N'LogID');
+    (N'Prompt_Log', N'LogID'),
+    (N'Diagnostic_Event', N'DiagnosticID');
 
 DECLARE @pk_wrong int = 0;
 DECLARE @pk_actual TABLE (tbl sysname, cols nvarchar(900));
@@ -658,7 +673,7 @@ END;
 PRINT '';
 PRINT 'SCHEMA VERDICT';
 PRINT '--------------';
-PRINT ' [INFO]    Columns expected:   296';
+PRINT ' [INFO]    Columns expected:   310';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));

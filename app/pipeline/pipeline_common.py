@@ -17,7 +17,8 @@ from sqlalchemy import insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from app.core.enums import InfraErrorKind, SSEEventType, StageStatus, SubsystemLevel
+from app.core import diagnostics
+from app.core.enums import DiagnosticKind, InfraErrorKind, SSEEventType, StageStatus, SubsystemLevel
 from app.core.logging import get_logger
 from app.db import dal
 from app.db import models as m
@@ -70,6 +71,11 @@ def log_transient_infra_retry(*, site: str, session_id: str, subsystem_id: int |
                 # The instance, not True: this helper is called from OUTSIDE the except
                 # block, where True has no current exception to capture (ruff LOG014).
                 exc_info=exc)
+    # A DURABLE trail for the hiccups that RECOVER. Fix 1 made provider outages survivable, which
+    # also made them invisible: a session that retried four times and then worked leaves no other
+    # mark anywhere. This is how a degrading reranker is spotted BEFORE it cancels anything.
+    diagnostics.record(DiagnosticKind.transient_retry, exc, session_id=session_id,
+                       subsystem_id=subsystem_id, context={"site": site})
 
 
 _EPOCH = 1

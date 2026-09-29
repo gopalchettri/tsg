@@ -11,7 +11,7 @@
   DRY RUN: set PreviewOnly to 1 in Section 0 and the whole script only prints what
   it would do. Nothing is created, altered, renamed, dropped or updated.
 
-  Contents: legacy-name migration, 22 tables, 297 reconciled columns,
+  Contents: legacy-name migration, 23 tables, 311 reconciled columns,
   22 default constraints,
   3 check constraints, 31 indexes.
 
@@ -866,6 +866,34 @@ CREATE TABLE [dbo].[Prompt_Log](
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
+/****** Table: Diagnostic_Event — OPERATOR-ONLY failure detail: the exception
+        class, message and traceback behind a run that failed, plus the
+        sanitised text the customer was shown so the two can be joined.
+        Never read by a tenant-facing route. Written best-effort, so a failure
+        to write it never turns a diagnosable error into an undiagnosable one. ******/
+IF OBJECT_ID('dbo.Diagnostic_Event', 'U') IS NULL
+CREATE TABLE [dbo].[Diagnostic_Event](
+	[DiagnosticID] [uniqueidentifier] NOT NULL,
+	[CreatedAt] [datetime2](7) NOT NULL,
+	[SessionID] [uniqueidentifier] NULL,
+	[TenantID] [nvarchar](200) NULL,
+	[EntityID] [nvarchar](200) NULL,
+	[SubsystemID] [int] NULL,
+	[TaskID] [nvarchar](100) NULL,
+	[RequestID] [nvarchar](100) NULL,
+	[Kind] [nvarchar](50) NOT NULL,
+	[ExceptionClass] [nvarchar](200) NOT NULL,
+	[ExceptionMessage] [nvarchar](4000) NULL,
+	[Traceback] [nvarchar](max) NULL,
+	[ClientMessage] [nvarchar](1000) NULL,
+	[ContextJSON] [nvarchar](max) NULL,
+ CONSTRAINT [PK_Diagnostic_Event] PRIMARY KEY CLUSTERED
+(
+	[DiagnosticID] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+
 /****** Table: Risk_Treatment_Plan — one remediation plan attempt per accepted
         scenario. At most one active row per scenario. ******/
 IF OBJECT_ID('dbo.Risk_Treatment_Plan', 'U') IS NULL
@@ -1375,6 +1403,21 @@ VALUES
   ('Prompt_Log','ParseSucceeded','bit',NULL,NULL,0,0,NULL,NULL),
   ('Prompt_Log','CreatedAt','datetime2',NULL,7,0,0,NULL,NULL),
   ('Prompt_Log','CorrelationID','uniqueidentifier',NULL,NULL,1,0,NULL,NULL),
+  -- Diagnostic_Event
+  ('Diagnostic_Event','DiagnosticID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
+  ('Diagnostic_Event','CreatedAt','datetime2',NULL,7,0,0,NULL,NULL),
+  ('Diagnostic_Event','SessionID','uniqueidentifier',NULL,NULL,1,0,NULL,NULL),
+  ('Diagnostic_Event','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
+  ('Diagnostic_Event','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
+  ('Diagnostic_Event','SubsystemID','int',NULL,NULL,1,0,NULL,NULL),
+  ('Diagnostic_Event','TaskID','nvarchar',100,NULL,1,0,NULL,NULL),
+  ('Diagnostic_Event','RequestID','nvarchar',100,NULL,1,0,NULL,NULL),
+  ('Diagnostic_Event','Kind','nvarchar',50,NULL,0,0,NULL,NULL),
+  ('Diagnostic_Event','ExceptionClass','nvarchar',200,NULL,0,0,NULL,NULL),
+  ('Diagnostic_Event','ExceptionMessage','nvarchar',4000,NULL,1,0,NULL,NULL),
+  ('Diagnostic_Event','Traceback','nvarchar',-1,NULL,1,0,NULL,NULL),
+  ('Diagnostic_Event','ClientMessage','nvarchar',1000,NULL,1,0,NULL,NULL),
+  ('Diagnostic_Event','ContextJSON','nvarchar',-1,NULL,1,0,NULL,NULL),
   -- Risk_Treatment_Plan
   ('Risk_Treatment_Plan','PlanID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Risk_Treatment_Plan','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),

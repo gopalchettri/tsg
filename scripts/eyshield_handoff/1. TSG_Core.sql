@@ -819,6 +819,28 @@ CREATE TABLE Scenario_Audit (
     CreatedAt        datetime2     NOT NULL
 );
 
+-- Diagnostic_Event: OPERATOR-ONLY failure detail. The exception class, message and traceback
+-- behind a failed run, plus the sanitised text the customer was shown so a report of "it said
+-- stage processing failed" joins to the real cause. No tenant-facing route reads it. Written
+-- best-effort, so failing to write it never turns a diagnosable error into an undiagnosable one.
+IF OBJECT_ID('dbo.Diagnostic_Event', 'U') IS NULL
+CREATE TABLE Diagnostic_Event (
+    DiagnosticID     uniqueidentifier NOT NULL CONSTRAINT PK_Diagnostic_Event PRIMARY KEY,
+    CreatedAt        datetime2(7) NOT NULL,
+    SessionID        uniqueidentifier NULL,
+    TenantID         nvarchar(200) NULL,
+    EntityID         nvarchar(200) NULL,
+    SubsystemID      int NULL,
+    TaskID           nvarchar(100) NULL,
+    RequestID        nvarchar(100) NULL,
+    Kind             nvarchar(50) NOT NULL,
+    ExceptionClass   nvarchar(200) NOT NULL,
+    ExceptionMessage nvarchar(4000) NULL,
+    Traceback        nvarchar(max) NULL,
+    ClientMessage    nvarchar(1000) NULL,
+    ContextJSON      nvarchar(max) NULL
+);
+
 IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NULL
 CREATE TABLE Prompt_Log (
     LogID           uniqueidentifier NOT NULL CONSTRAINT PK_Prompt_Log PRIMARY KEY,

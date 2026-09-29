@@ -674,6 +674,51 @@ class Prompt_Log(Base):
 # ---------------------------------------------------------------------------
 # Audit (append-only)
 # ---------------------------------------------------------------------------
+class Diagnostic_Event(Base):
+    """OPERATOR-ONLY failure detail. Never shown to a tenant, never joined by a tenant route.
+
+    WHY IT EXISTS. When a stage fails, _record_failure writes to four places. Three of them —
+    Subsystem_Stage_State.ErrorMessage, the stage_error audit row, and the SSE error event — carry
+    _failure_client_message(exc), which collapses anything that is not a parse or guardrail case to
+    the literal string "stage processing failed". The fourth is a log line. That sanitising is
+    CORRECT: those three surfaces are tenant-visible, and sessions._audit_event reads the audit
+    row's DetailJSON straight into a client timeline, so a traceback stored there would leak.
+
+    The defect was never the sanitising. It was that there was only ONE surface. Two audiences have
+    opposite needs — the tenant must see nothing internal, the operator must see everything — and
+    only the tenant was served. Diagnosing session 6174F288 took a pasted container log, because in
+    UAT the cause existed nowhere a support engineer could query.
+
+    So: a SEPARATE TABLE, not a key in Scenario_Audit, precisely because that table is projected to
+    tenants. ClientMessage records what the user was actually shown, so a report of "it said stage
+    processing failed" joins to the real cause in one query.
+    """
+
+    __tablename__ = "Diagnostic_Event"
+    DiagnosticID: Mapped[str] = mapped_column(GUID, primary_key=True)
+    CreatedAt: Mapped[datetime] = mapped_column(DateTime)
+    #: Every id an operator might pivot on. All nullable: a diagnostic must never fail to record
+    #: because the failure happened somewhere that lacks one of them.
+    SessionID: Mapped[str | None] = mapped_column(GUID)
+    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
+    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
+    SubsystemID: Mapped[int | None] = mapped_column(Integer)
+    #: The Celery task and the HTTP request, so a user's "it failed" turns into one lookup.
+    TaskID: Mapped[str | None] = mapped_column(Unicode(100))
+    RequestID: Mapped[str | None] = mapped_column(Unicode(100))
+    #: enums.DiagnosticKind — stage_error | transient_retry | retries_exhausted.
+    Kind: Mapped[str] = mapped_column(Unicode(50))
+    #: ALWAYS set, even when the classifier does not recognise the failure. The class name alone
+    #: would have ended the 6174F288 investigation in seconds: "Timeout: Connection timed out
+    #: after 120.0 seconds" instead of "stage processing failed".
+    ExceptionClass: Mapped[str] = mapped_column(Unicode(200))
+    ExceptionMessage: Mapped[str | None] = mapped_column(Unicode(4000))
+    Traceback: Mapped[str | None] = mapped_column(UnicodeText)
+    #: The sanitised text the tenant saw, so the two halves can be joined.
+    ClientMessage: Mapped[str | None] = mapped_column(Unicode(1000))
+    ContextJSON: Mapped[str | None] = mapped_column(UnicodeText)
+
+
 class Scenario_Audit(Base):
     __tablename__ = "Scenario_Audit"
     AuditID: Mapped[str] = mapped_column(GUID, primary_key=True)

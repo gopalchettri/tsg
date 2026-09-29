@@ -311,6 +311,32 @@ COMMENTS: dict[str, str] = {
         call timeout. The application allows for that automatically when it works out how long a
         stage may run, so a higher number here will not get a slow stage cancelled by mistake.
     """,
+    "TSG_DIAGNOSTIC_DB_CATEGORIES": """
+        Which kinds of problem are saved into the database so you can look them up later. Use
+        "all" (the default), "none", or a comma-separated list of:
+
+          exceptions  a failure, with the full error and where in the code it happened
+          retries     something went wrong and recovered by itself, such as the AI service not
+                      answering in time
+
+        WHY THIS EXISTS. When a run fails, the message stored against it is deliberately vague -
+        "stage processing failed" - because that text is shown to the customer and must never
+        contain internal detail. The real error used to exist only in the server's screen output,
+        which disappears when the service restarts and needs server access to read at all. One
+        real incident took a pasted screen log to diagnose. The detail now also goes to a separate
+        table that only administrators can read.
+
+        Leave "retries" on. Once a hiccup is recovered from automatically it leaves no other
+        trace, so this is the only way to notice a service that is slowly getting worse BEFORE it
+        starts failing runs outright.
+    """,
+    "TSG_DIAGNOSTIC_RETENTION_DAYS": """
+        How many days of saved problem detail to keep. Each record holds a full error trace, so
+        this table grows steadily and is not meant to be kept forever.
+
+        Lower it if the database is growing faster than you would like; raise it if you
+        investigate problems weeks after they happen.
+    """,
     "LLM_TEMPERATURE": """
         How much the AI is allowed to vary its wording. 0 gives the most consistent answers, 2
         the most varied. To use the provider's own default, COMMENT THE LINE OUT. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.

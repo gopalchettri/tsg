@@ -1,8 +1,8 @@
 /*==============================================================================
-  TSG SCHEMA - COMPLETE DEPLOYMENT IN ONE FILE (47 scripts)
+  TSG SCHEMA - COMPLETE DEPLOYMENT IN ONE FILE (48 scripts)
 
   Script:      TSG_Deploy_All.sql
-  Order:       all 47 scripts of this package, in execution order
+  Order:       all 48 scripts of this package, in execution order
   Purpose:     Deploy or reconcile the entire TSG schema, then prove it.
   Depends on:  Nothing. It contains every script it needs.
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
@@ -51,10 +51,10 @@ EXEC sp_set_session_context N'tsg_deploy_failed', 0;
 GO
 
 /*============================================================================
-  >>> 1 of 47   00_validation/000_helpers.sql
+  >>> 1 of 48   00_validation/000_helpers.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [1/47] 00_validation/000_helpers.sql';
+PRINT '>>> [1/48] 00_validation/000_helpers.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -886,10 +886,10 @@ END
 GO
 
 /*============================================================================
-  >>> 2 of 47   00_validation/001_pre_deployment_validation.sql
+  >>> 2 of 48   00_validation/001_pre_deployment_validation.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [2/47] 00_validation/001_pre_deployment_validation.sql';
+PRINT '>>> [2/48] 00_validation/001_pre_deployment_validation.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -1148,7 +1148,7 @@ INSERT INTO @owned (name) VALUES
     ('Scenario_Session'), ('Subsystem_Stage_State'), ('Identified_Threat'),
     ('Identified_Duplicate_Threat'), ('Scoped_Threat'), ('Threat_Scenario'),
     ('Threat_Scenario_Control_Map'), ('Risk_Treatment_Plan'),
-    ('Scenario_Audit'), ('Prompt_Log');
+    ('Scenario_Audit'), ('Prompt_Log'), ('Diagnostic_Event');
 
 DECLARE @total   int = (SELECT COUNT(*) FROM @owned);
 DECLARE @present int = (SELECT COUNT(*) FROM @owned o
@@ -1212,7 +1212,7 @@ WHERE    t.name IN ('Threat_Category','Threat_Type','Threat_Catalogue','Threat_A
                     'Scenario_Session','Subsystem_Stage_State','Identified_Threat',
                     'Identified_Duplicate_Threat','Scoped_Threat','Threat_Scenario',
                     'Threat_Scenario_Control_Map','Risk_Treatment_Plan',
-                    'Scenario_Audit','Prompt_Log')
+                    'Scenario_Audit','Prompt_Log','Diagnostic_Event')
 GROUP BY t.name
 HAVING   SUM(p.rows) > 0
 ORDER BY SUM(p.rows) DESC;
@@ -1329,10 +1329,10 @@ END
 GO
 
 /*============================================================================
-  >>> 3 of 47   00_validation/002_enable_isolation_level.sql
+  >>> 3 of 48   00_validation/002_enable_isolation_level.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [3/47] 00_validation/002_enable_isolation_level.sql';
+PRINT '>>> [3/48] 00_validation/002_enable_isolation_level.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -1606,10 +1606,10 @@ END
 GO
 
 /*============================================================================
-  >>> 4 of 47   01_tables/001_Threat_Category.sql
+  >>> 4 of 48   01_tables/001_Threat_Category.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [4/47] 01_tables/001_Threat_Category.sql';
+PRINT '>>> [4/48] 01_tables/001_Threat_Category.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -1768,10 +1768,10 @@ END
 GO
 
 /*============================================================================
-  >>> 5 of 47   01_tables/002_Threat_Type.sql
+  >>> 5 of 48   01_tables/002_Threat_Type.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [5/47] 01_tables/002_Threat_Type.sql';
+PRINT '>>> [5/48] 01_tables/002_Threat_Type.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -1936,10 +1936,10 @@ END
 GO
 
 /*============================================================================
-  >>> 6 of 47   01_tables/003_Threat_Catalogue.sql
+  >>> 6 of 48   01_tables/003_Threat_Catalogue.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [6/47] 01_tables/003_Threat_Catalogue.sql';
+PRINT '>>> [6/48] 01_tables/003_Threat_Catalogue.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2104,10 +2104,10 @@ END
 GO
 
 /*============================================================================
-  >>> 7 of 47   01_tables/004_Threat_Actor.sql
+  >>> 7 of 48   01_tables/004_Threat_Actor.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [7/47] 01_tables/004_Threat_Actor.sql';
+PRINT '>>> [7/48] 01_tables/004_Threat_Actor.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2272,10 +2272,10 @@ END
 GO
 
 /*============================================================================
-  >>> 8 of 47   01_tables/005_Threat_Catalogue_Category_Map.sql
+  >>> 8 of 48   01_tables/005_Threat_Catalogue_Category_Map.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [8/47] 01_tables/005_Threat_Catalogue_Category_Map.sql';
+PRINT '>>> [8/48] 01_tables/005_Threat_Catalogue_Category_Map.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2419,10 +2419,10 @@ END
 GO
 
 /*============================================================================
-  >>> 9 of 47   01_tables/006_ThreatType_ThreatActor_Map.sql
+  >>> 9 of 48   01_tables/006_ThreatType_ThreatActor_Map.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [9/47] 01_tables/006_ThreatType_ThreatActor_Map.sql';
+PRINT '>>> [9/48] 01_tables/006_ThreatType_ThreatActor_Map.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2566,10 +2566,10 @@ END
 GO
 
 /*============================================================================
-  >>> 10 of 47   01_tables/007_Control_Standard.sql
+  >>> 10 of 48   01_tables/007_Control_Standard.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [10/47] 01_tables/007_Control_Standard.sql';
+PRINT '>>> [10/48] 01_tables/007_Control_Standard.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2731,10 +2731,10 @@ END
 GO
 
 /*============================================================================
-  >>> 11 of 47   01_tables/008_Control_Library.sql
+  >>> 11 of 48   01_tables/008_Control_Library.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [11/47] 01_tables/008_Control_Library.sql';
+PRINT '>>> [11/48] 01_tables/008_Control_Library.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2911,10 +2911,10 @@ END
 GO
 
 /*============================================================================
-  >>> 12 of 47   01_tables/009_Control_Library_Standard_Map.sql
+  >>> 12 of 48   01_tables/009_Control_Library_Standard_Map.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [12/47] 01_tables/009_Control_Library_Standard_Map.sql';
+PRINT '>>> [12/48] 01_tables/009_Control_Library_Standard_Map.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3058,10 +3058,10 @@ END
 GO
 
 /*============================================================================
-  >>> 13 of 47   01_tables/010_API_Client.sql
+  >>> 13 of 48   01_tables/010_API_Client.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [13/47] 01_tables/010_API_Client.sql';
+PRINT '>>> [13/48] 01_tables/010_API_Client.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3223,10 +3223,10 @@ END
 GO
 
 /*============================================================================
-  >>> 14 of 47   01_tables/011_Config_Tuning.sql
+  >>> 14 of 48   01_tables/011_Config_Tuning.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [14/47] 01_tables/011_Config_Tuning.sql';
+PRINT '>>> [14/48] 01_tables/011_Config_Tuning.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3394,10 +3394,10 @@ END
 GO
 
 /*============================================================================
-  >>> 15 of 47   01_tables/012_Grounding_Calibration_Run.sql
+  >>> 15 of 48   01_tables/012_Grounding_Calibration_Run.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [15/47] 01_tables/012_Grounding_Calibration_Run.sql';
+PRINT '>>> [15/48] 01_tables/012_Grounding_Calibration_Run.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3589,10 +3589,10 @@ END
 GO
 
 /*============================================================================
-  >>> 16 of 47   01_tables/013_Scenario_Session.sql
+  >>> 16 of 48   01_tables/013_Scenario_Session.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [16/47] 01_tables/013_Scenario_Session.sql';
+PRINT '>>> [16/48] 01_tables/013_Scenario_Session.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3950,10 +3950,10 @@ END
 GO
 
 /*============================================================================
-  >>> 17 of 47   01_tables/014_Subsystem_Stage_State.sql
+  >>> 17 of 48   01_tables/014_Subsystem_Stage_State.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [17/47] 01_tables/014_Subsystem_Stage_State.sql';
+PRINT '>>> [17/48] 01_tables/014_Subsystem_Stage_State.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4139,10 +4139,10 @@ END
 GO
 
 /*============================================================================
-  >>> 18 of 47   01_tables/015_Identified_Threat.sql
+  >>> 18 of 48   01_tables/015_Identified_Threat.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [18/47] 01_tables/015_Identified_Threat.sql';
+PRINT '>>> [18/48] 01_tables/015_Identified_Threat.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4432,10 +4432,10 @@ END
 GO
 
 /*============================================================================
-  >>> 19 of 47   01_tables/016_Identified_Duplicate_Threat.sql
+  >>> 19 of 48   01_tables/016_Identified_Duplicate_Threat.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [19/47] 01_tables/016_Identified_Duplicate_Threat.sql';
+PRINT '>>> [19/48] 01_tables/016_Identified_Duplicate_Threat.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4615,10 +4615,10 @@ END
 GO
 
 /*============================================================================
-  >>> 20 of 47   01_tables/017_Scoped_Threat.sql
+  >>> 20 of 48   01_tables/017_Scoped_Threat.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [20/47] 01_tables/017_Scoped_Threat.sql';
+PRINT '>>> [20/48] 01_tables/017_Scoped_Threat.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4801,10 +4801,10 @@ END
 GO
 
 /*============================================================================
-  >>> 21 of 47   01_tables/018_Threat_Scenario.sql
+  >>> 21 of 48   01_tables/018_Threat_Scenario.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [21/47] 01_tables/018_Threat_Scenario.sql';
+PRINT '>>> [21/48] 01_tables/018_Threat_Scenario.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -5267,10 +5267,10 @@ END
 GO
 
 /*============================================================================
-  >>> 22 of 47   01_tables/019_Threat_Scenario_Control_Map.sql
+  >>> 22 of 48   01_tables/019_Threat_Scenario_Control_Map.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [22/47] 01_tables/019_Threat_Scenario_Control_Map.sql';
+PRINT '>>> [22/48] 01_tables/019_Threat_Scenario_Control_Map.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -5512,10 +5512,10 @@ END
 GO
 
 /*============================================================================
-  >>> 23 of 47   01_tables/020_Risk_Treatment_Plan.sql
+  >>> 23 of 48   01_tables/020_Risk_Treatment_Plan.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [23/47] 01_tables/020_Risk_Treatment_Plan.sql';
+PRINT '>>> [23/48] 01_tables/020_Risk_Treatment_Plan.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -5838,10 +5838,10 @@ END
 GO
 
 /*============================================================================
-  >>> 24 of 47   01_tables/021_Scenario_Audit.sql
+  >>> 24 of 48   01_tables/021_Scenario_Audit.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [24/47] 01_tables/021_Scenario_Audit.sql';
+PRINT '>>> [24/48] 01_tables/021_Scenario_Audit.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6131,10 +6131,10 @@ END
 GO
 
 /*============================================================================
-  >>> 25 of 47   01_tables/022_Prompt_Log.sql
+  >>> 25 of 48   01_tables/022_Prompt_Log.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [25/47] 01_tables/022_Prompt_Log.sql';
+PRINT '>>> [25/48] 01_tables/022_Prompt_Log.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6317,10 +6317,190 @@ END
 GO
 
 /*============================================================================
-  >>> 26 of 47   02_constraints/001_default_constraints.sql
+  >>> 26 of 48   01_tables/023_Diagnostic_Event.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [26/47] 02_constraints/001_default_constraints.sql';
+PRINT '>>> [26/48] 01_tables/023_Diagnostic_Event.sql';
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
+/*==============================================================================
+  TABLE: Diagnostic_Event
+
+  Script:      023_Diagnostic_Event.sql
+  Order:       01_tables / 023
+  Purpose:     Create Diagnostic_Event, or bring an existing copy up to 14 columns.
+  Depends on:  00_validation/001_pre_deployment_validation.sql
+  Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
+  Modifies:    dbo.Diagnostic_Event
+
+  GENERATED FILE - do not edit by hand.
+  Regenerate:  python scripts/tsg_script/_generate.py
+  Sources:     app/db/models.py (columns), tsg_remediation_tables.sql (indexes, constraints)
+==============================================================================*/
+SET NOCOUNT ON;
+SET QUOTED_IDENTIFIER ON;   -- required: several indexes are filtered
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
+PRINT '';
+PRINT '--- Diagnostic_Event ---';
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
+IF OBJECT_ID('dbo.Diagnostic_Event', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.[Diagnostic_Event] (
+        [DiagnosticID] UNIQUEIDENTIFIER NOT NULL,
+        [CreatedAt] DATETIME2(7) NOT NULL,
+        [SessionID] UNIQUEIDENTIFIER NULL,
+        [TenantID] NVARCHAR(200) NULL,
+        [EntityID] NVARCHAR(200) NULL,
+        [SubsystemID] INT NULL,
+        [TaskID] NVARCHAR(100) NULL,
+        [RequestID] NVARCHAR(100) NULL,
+        [Kind] NVARCHAR(50) NOT NULL,
+        [ExceptionClass] NVARCHAR(200) NOT NULL,
+        [ExceptionMessage] NVARCHAR(4000) NULL,
+        [Traceback] NVARCHAR(max) NULL,
+        [ClientMessage] NVARCHAR(1000) NULL,
+        [ContextJSON] NVARCHAR(max) NULL,
+        CONSTRAINT [PK_Diagnostic_Event] PRIMARY KEY CLUSTERED ([DiagnosticID])
+    );
+    PRINT ' [CREATED] Table: Diagnostic_Event (14 columns)';
+END
+ELSE
+    PRINT ' [EXISTS]  Table: Diagnostic_Event';
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
+/* Reconcile every column the application reads or writes. Adds what is missing; reports a type
+   difference instead of applying it blind. */
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'DiagnosticID',
+     @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'CreatedAt',
+     @expected = N'DATETIME2(7)', @nullable = 0;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'SessionID',
+     @expected = N'UNIQUEIDENTIFIER', @nullable = 1;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'TenantID',
+     @expected = N'NVARCHAR(200)', @nullable = 1;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'EntityID',
+     @expected = N'NVARCHAR(200)', @nullable = 1;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'SubsystemID',
+     @expected = N'INT', @nullable = 1;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'TaskID',
+     @expected = N'NVARCHAR(100)', @nullable = 1;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'RequestID',
+     @expected = N'NVARCHAR(100)', @nullable = 1;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'Kind',
+     @expected = N'NVARCHAR(50)', @nullable = 0;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'ExceptionClass',
+     @expected = N'NVARCHAR(200)', @nullable = 0;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'ExceptionMessage',
+     @expected = N'NVARCHAR(4000)', @nullable = 1;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'Traceback',
+     @expected = N'NVARCHAR(max)', @nullable = 1;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'ClientMessage',
+     @expected = N'NVARCHAR(1000)', @nullable = 1;
+EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'ContextJSON',
+     @expected = N'NVARCHAR(max)', @nullable = 1;
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
+/* The primary key the application expects - an older table may carry another. */
+EXEC dbo.tsg_reconcile_primary_key @table = N'Diagnostic_Event', @columns = N'DiagnosticID';
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
+/* Columns in the database that this application does not know about. Never dropped - they may
+   belong to another release or another team. One NOT NULL with no default is made NULL-able,
+   because the application never writes it and every insert would fail. */
+EXEC dbo.tsg_report_extra_columns @table = N'Diagnostic_Event', @known = N'DiagnosticID,CreatedAt,SessionID,TenantID,EntityID,SubsystemID,TaskID,RequestID,Kind,ExceptionClass,ExceptionMessage,Traceback,ClientMessage,ContextJSON';
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
+/*============================================================================
+  >>> 27 of 48   02_constraints/001_default_constraints.sql
+============================================================================*/
+PRINT '';
+PRINT '>>> [27/48] 02_constraints/001_default_constraints.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6830,10 +7010,10 @@ END
 GO
 
 /*============================================================================
-  >>> 27 of 47   02_constraints/002_check_constraints.sql
+  >>> 28 of 48   02_constraints/002_check_constraints.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [27/47] 02_constraints/002_check_constraints.sql';
+PRINT '>>> [28/48] 02_constraints/002_check_constraints.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6952,10 +7132,10 @@ END
 GO
 
 /*============================================================================
-  >>> 28 of 47   02_constraints/003_unique_constraints.sql
+  >>> 29 of 48   02_constraints/003_unique_constraints.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [28/47] 02_constraints/003_unique_constraints.sql';
+PRINT '>>> [29/48] 02_constraints/003_unique_constraints.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7058,10 +7238,10 @@ END
 GO
 
 /*============================================================================
-  >>> 29 of 47   03_indexes/001_Threat_Category_indexes.sql
+  >>> 30 of 48   03_indexes/001_Threat_Category_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [29/47] 03_indexes/001_Threat_Category_indexes.sql';
+PRINT '>>> [30/48] 03_indexes/001_Threat_Category_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7162,10 +7342,10 @@ END
 GO
 
 /*============================================================================
-  >>> 30 of 47   03_indexes/002_Threat_Type_indexes.sql
+  >>> 31 of 48   03_indexes/002_Threat_Type_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [30/47] 03_indexes/002_Threat_Type_indexes.sql';
+PRINT '>>> [31/48] 03_indexes/002_Threat_Type_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7326,10 +7506,10 @@ END
 GO
 
 /*============================================================================
-  >>> 31 of 47   03_indexes/003_Threat_Catalogue_indexes.sql
+  >>> 32 of 48   03_indexes/003_Threat_Catalogue_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [31/47] 03_indexes/003_Threat_Catalogue_indexes.sql';
+PRINT '>>> [32/48] 03_indexes/003_Threat_Catalogue_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7430,10 +7610,10 @@ END
 GO
 
 /*============================================================================
-  >>> 32 of 47   03_indexes/004_Threat_Actor_indexes.sql
+  >>> 33 of 48   03_indexes/004_Threat_Actor_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [32/47] 03_indexes/004_Threat_Actor_indexes.sql';
+PRINT '>>> [33/48] 03_indexes/004_Threat_Actor_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7534,10 +7714,10 @@ END
 GO
 
 /*============================================================================
-  >>> 33 of 47   03_indexes/005_Control_Standard_indexes.sql
+  >>> 34 of 48   03_indexes/005_Control_Standard_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [33/47] 03_indexes/005_Control_Standard_indexes.sql';
+PRINT '>>> [34/48] 03_indexes/005_Control_Standard_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7640,10 +7820,10 @@ END
 GO
 
 /*============================================================================
-  >>> 34 of 47   03_indexes/006_Control_Library_indexes.sql
+  >>> 35 of 48   03_indexes/006_Control_Library_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [34/47] 03_indexes/006_Control_Library_indexes.sql';
+PRINT '>>> [35/48] 03_indexes/006_Control_Library_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7744,10 +7924,10 @@ END
 GO
 
 /*============================================================================
-  >>> 35 of 47   03_indexes/007_API_Client_indexes.sql
+  >>> 36 of 48   03_indexes/007_API_Client_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [35/47] 03_indexes/007_API_Client_indexes.sql';
+PRINT '>>> [36/48] 03_indexes/007_API_Client_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7850,10 +8030,10 @@ END
 GO
 
 /*============================================================================
-  >>> 36 of 47   03_indexes/008_Grounding_Calibration_Run_indexes.sql
+  >>> 37 of 48   03_indexes/008_Grounding_Calibration_Run_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [36/47] 03_indexes/008_Grounding_Calibration_Run_indexes.sql';
+PRINT '>>> [37/48] 03_indexes/008_Grounding_Calibration_Run_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7959,10 +8139,10 @@ END
 GO
 
 /*============================================================================
-  >>> 37 of 47   03_indexes/009_Scenario_Session_indexes.sql
+  >>> 38 of 48   03_indexes/009_Scenario_Session_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [37/47] 03_indexes/009_Scenario_Session_indexes.sql';
+PRINT '>>> [38/48] 03_indexes/009_Scenario_Session_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8193,10 +8373,10 @@ END
 GO
 
 /*============================================================================
-  >>> 38 of 47   03_indexes/010_Subsystem_Stage_State_indexes.sql
+  >>> 39 of 48   03_indexes/010_Subsystem_Stage_State_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [38/47] 03_indexes/010_Subsystem_Stage_State_indexes.sql';
+PRINT '>>> [39/48] 03_indexes/010_Subsystem_Stage_State_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8300,10 +8480,10 @@ END
 GO
 
 /*============================================================================
-  >>> 39 of 47   03_indexes/011_Identified_Threat_indexes.sql
+  >>> 40 of 48   03_indexes/011_Identified_Threat_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [39/47] 03_indexes/011_Identified_Threat_indexes.sql';
+PRINT '>>> [40/48] 03_indexes/011_Identified_Threat_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8405,10 +8585,10 @@ END
 GO
 
 /*============================================================================
-  >>> 40 of 47   03_indexes/012_Identified_Duplicate_Threat_indexes.sql
+  >>> 41 of 48   03_indexes/012_Identified_Duplicate_Threat_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [40/47] 03_indexes/012_Identified_Duplicate_Threat_indexes.sql';
+PRINT '>>> [41/48] 03_indexes/012_Identified_Duplicate_Threat_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8509,10 +8689,10 @@ END
 GO
 
 /*============================================================================
-  >>> 41 of 47   03_indexes/013_Scoped_Threat_indexes.sql
+  >>> 42 of 48   03_indexes/013_Scoped_Threat_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [41/47] 03_indexes/013_Scoped_Threat_indexes.sql';
+PRINT '>>> [42/48] 03_indexes/013_Scoped_Threat_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8657,10 +8837,10 @@ END
 GO
 
 /*============================================================================
-  >>> 42 of 47   03_indexes/014_Threat_Scenario_indexes.sql
+  >>> 43 of 48   03_indexes/014_Threat_Scenario_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [42/47] 03_indexes/014_Threat_Scenario_indexes.sql';
+PRINT '>>> [43/48] 03_indexes/014_Threat_Scenario_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8938,10 +9118,10 @@ END
 GO
 
 /*============================================================================
-  >>> 43 of 47   03_indexes/015_Risk_Treatment_Plan_indexes.sql
+  >>> 44 of 48   03_indexes/015_Risk_Treatment_Plan_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [43/47] 03_indexes/015_Risk_Treatment_Plan_indexes.sql';
+PRINT '>>> [44/48] 03_indexes/015_Risk_Treatment_Plan_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9125,10 +9305,10 @@ END
 GO
 
 /*============================================================================
-  >>> 44 of 47   03_indexes/016_Scenario_Audit_indexes.sql
+  >>> 45 of 48   03_indexes/016_Scenario_Audit_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [44/47] 03_indexes/016_Scenario_Audit_indexes.sql';
+PRINT '>>> [45/48] 03_indexes/016_Scenario_Audit_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9315,10 +9495,10 @@ END
 GO
 
 /*============================================================================
-  >>> 45 of 47   03_indexes/017_Prompt_Log_indexes.sql
+  >>> 46 of 48   03_indexes/017_Prompt_Log_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [45/47] 03_indexes/017_Prompt_Log_indexes.sql';
+PRINT '>>> [46/48] 03_indexes/017_Prompt_Log_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9464,10 +9644,10 @@ END
 GO
 
 /*============================================================================
-  >>> 46 of 47   99_validation/001_post_deployment_validation.sql
+  >>> 47 of 48   99_validation/001_post_deployment_validation.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [46/47] 99_validation/001_post_deployment_validation.sql';
+PRINT '>>> [47/48] 99_validation/001_post_deployment_validation.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9701,7 +9881,7 @@ BEGIN
     PRINT 'deployment that printed [BLOCKED] on a narrowing change, or added a NOT NULL column';
     PRINT 'as NULL because the table had rows, reaches this line looking clean.';
     PRINT '';
-    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 296 columns, all 31';
+    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 310 columns, all 32';
     PRINT 'index shapes, 21 defaults, 6 identity columns and the collation, then prints the';
     PRINT 'FINAL SIGN-OFF. Then confirm the threat and control libraries hold data';
     PRINT '(README step 11) before starting the application.';
@@ -9736,10 +9916,10 @@ END
 GO
 
 /*============================================================================
-  >>> 47 of 47   99_validation/002_schema_verdict.sql
+  >>> 48 of 48   99_validation/002_schema_verdict.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [47/47] 99_validation/002_schema_verdict.sql';
+PRINT '>>> [48/48] 99_validation/002_schema_verdict.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9759,7 +9939,7 @@ GO
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 296 columns and all 32 indexes, down to index key columns and filters.
+  Purpose:     Verify all 310 columns and all 32 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -9786,7 +9966,7 @@ GO
 
 PRINT '';
 PRINT '==============================================================';
-PRINT ' TSG COLUMN VERDICT   (296 columns across 22 tables)';
+PRINT ' TSG COLUMN VERDICT   (310 columns across 23 tables)';
 PRINT ' Database: ' + DB_NAME();
 PRINT '==============================================================';
 GO
@@ -10101,7 +10281,21 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Prompt_Log', N'ModelVersion', N'nvarchar', N'NVARCHAR(100)', 1),
     (N'Prompt_Log', N'ParseSucceeded', N'bit', N'BIT', 0),
     (N'Prompt_Log', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 0),
-    (N'Prompt_Log', N'CorrelationID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1);
+    (N'Prompt_Log', N'CorrelationID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
+    (N'Diagnostic_Event', N'DiagnosticID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
+    (N'Diagnostic_Event', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 0),
+    (N'Diagnostic_Event', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
+    (N'Diagnostic_Event', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
+    (N'Diagnostic_Event', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
+    (N'Diagnostic_Event', N'SubsystemID', N'int', N'INT', 1),
+    (N'Diagnostic_Event', N'TaskID', N'nvarchar', N'NVARCHAR(100)', 1),
+    (N'Diagnostic_Event', N'RequestID', N'nvarchar', N'NVARCHAR(100)', 1),
+    (N'Diagnostic_Event', N'Kind', N'nvarchar', N'NVARCHAR(50)', 0),
+    (N'Diagnostic_Event', N'ExceptionClass', N'nvarchar', N'NVARCHAR(200)', 0),
+    (N'Diagnostic_Event', N'ExceptionMessage', N'nvarchar', N'NVARCHAR(4000)', 1),
+    (N'Diagnostic_Event', N'Traceback', N'nvarchar', N'NVARCHAR(max)', 1),
+    (N'Diagnostic_Event', N'ClientMessage', N'nvarchar', N'NVARCHAR(1000)', 1),
+    (N'Diagnostic_Event', N'ContextJSON', N'nvarchar', N'NVARCHAR(max)', 1);
 
 DECLARE @missing int = 0, @wrong_type int = 0, @wrong_null int = 0;
 
@@ -10296,7 +10490,8 @@ INSERT INTO @pk (tbl, cols) VALUES
     (N'Threat_Scenario_Control_Map', N'ScenarioID,ControlLibraryID'),
     (N'Risk_Treatment_Plan', N'PlanID'),
     (N'Scenario_Audit', N'AuditID'),
-    (N'Prompt_Log', N'LogID');
+    (N'Prompt_Log', N'LogID'),
+    (N'Diagnostic_Event', N'DiagnosticID');
 
 DECLARE @pk_wrong int = 0;
 DECLARE @pk_actual TABLE (tbl sysname, cols nvarchar(900));
@@ -10438,7 +10633,7 @@ END;
 PRINT '';
 PRINT 'SCHEMA VERDICT';
 PRINT '--------------';
-PRINT ' [INFO]    Columns expected:   296';
+PRINT ' [INFO]    Columns expected:   310';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));
@@ -10502,7 +10697,7 @@ END
 ELSE
 BEGIN
     PRINT '';
-    PRINT '>>> all 47 scripts have run. Read the two verdicts above:';
+    PRINT '>>> all 48 scripts have run. Read the two verdicts above:';
     PRINT '>>>   Objects: PASS   then   FINAL SIGN-OFF';
     PRINT '>>> Anything else means the deployment is NOT complete.';
 END
