@@ -11,9 +11,9 @@
   DRY RUN: set PreviewOnly to 1 in Section 0 and the whole script only prints what
   it would do. Nothing is created, altered, renamed, dropped or updated.
 
-  Contents: legacy-name migration, 24 tables, 320 reconciled columns,
+  Contents: legacy-name migration, 24 tables, 319 reconciled columns,
   22 default constraints,
-  3 check constraints, 35 indexes.
+  3 check constraints, 38 indexes.
 
   Those five numbers are PINNED to the statements below them by
   tests/test_schema_sync.py::test_the_consolidated_header_counts_match_the_script.
@@ -36,7 +36,7 @@
     entirely if RCSI is already on.
 
   ---------------------------------------------------------------------------
-  TWO THINGS THAT LOOK LIKE MISTAKES AND ARE NOT
+  THREE THINGS THAT LOOK LIKE MISTAKES AND ARE NOT
   ---------------------------------------------------------------------------
   1. NO FOREIGN KEYS, deliberately. Rows are retired by setting Superseded = 1
      rather than deleted, several columns reference tables in a schema TSG does
@@ -47,6 +47,44 @@
   2. Config_Tuning uses CreateDate / UpdateDate where every other table uses
      CreatedAt / UpdatedAt. That is intentional and the application depends on
      it. Please do not rename them for consistency.
+
+  3. Prompt_Log, Application_Log and Diagnostic_Event declare their PRIMARY KEY
+     as NONCLUSTERED and are CLUSTERED on (CreatedAt, <id>) instead. Every other
+     table in this file is clustered on its primary key, so these three read as
+     an oversight. They are not.
+
+     Their key is a random uniqueidentifier, so on a clustered primary key every
+     single insert lands in the MIDDLE of the index - the three most
+     append-heavy tables in the system splitting pages on every write, and
+     fragmenting as fast as they grow. Clustered on time the inserts become pure
+     appends, every "last N hours" read and every retention purge becomes a range
+     seek instead of a scan, and the key stays unique because PK_<table> survives
+     as a NONCLUSTERED PRIMARY KEY on exactly the column it always constrained.
+     Nothing that references the key changes; only where the rows physically sit.
+
+     Scenario_Audit is deliberately NOT in that list. It is the compliance
+     ledger, it is read through seven customer-facing paths keyed on its own
+     ids, and it is not where the write pressure is.
+
+  ---------------------------------------------------------------------------
+  EVERY LOG TABLE IS PAGE COMPRESSED
+  ---------------------------------------------------------------------------
+  Prompt_Log, Application_Log, Diagnostic_Event and Scenario_Audit carry
+  DATA_COMPRESSION = PAGE. Their rows repeat heavily - the same module, kind,
+  stage, session and entity over and over - which is the exact shape page
+  compression is for: it typically recovers 40-60% of the stored bytes at
+  negligible CPU cost, and fewer pages also means fewer reads.
+
+  This is INVISIBLE TO THE APPLICATION. No query, no column and no type changes;
+  it is a storage property of the table and its indexes.
+
+  A table that already exists cannot be compressed by a CREATE, so Section 6
+  rebuilds it in place, guarded on sys.partitions.data_compression so a second
+  run reports [EXISTS] and rebuilds nothing.
+
+  DATA_COMPRESSION = PAGE needs SQL Server 2016 SP1 or later on any edition. This
+  script already requires 2019 or later elsewhere (OPTIMIZE_FOR_SEQUENTIAL_KEY in
+  every index option list below), so it is available wherever this script runs.
 
   ---------------------------------------------------------------------------
   THE INDEXES ARE NOT OPTIONAL
@@ -640,6 +678,105 @@ ELSE
 GO
 
 
+/*----------------------------------------------------------------------------
+  1e. Prompt_Log.Messages — the second copy of the prompt.
+
+  Prompt_Log stored the prompt TWICE: Messages (the wire JSON as sent) and Prompt
+  (the same content flattened). Messages has NO READER anywhere in the
+  application; Prompt is what the customer evidence endpoint returns. Two columns
+  holding one value on the fastest-growing table in the database is pure storage,
+  written on every model call and read by nothing.
+
+  NOT GOVERNED BY DropRemovedColumns, unlike 1d above, and that is deliberate.
+  Messages is declared NOT NULL. Once the application stops writing it - which is
+  what makes it removable - every INSERT into Prompt_Log fails on a database that
+  still has it. "Keep the column" is therefore not a safe option here the way it
+  is for the nullable columns in 1d: it is an outage on the next model call.
+
+  THE BACKFILL RUNS FIRST, AND IT IS NOT OPTIONAL. Prompt was added on
+  2026-08-03; rows written before that have Prompt = NULL and Messages holding
+  the only copy of the prompt. Dropping Messages without copying it forward would
+  silently empty the evidence endpoint for every legacy row - the one read this
+  table exists to serve. The UPDATE matches nothing on a second run.
+
+  Both statements are guarded on the columns still existing, so a second run
+  reports [EXISTS] and touches nothing.
+
+  EVERY STATEMENT THAT NAMES A COLUMN GOES THROUGH sp_executesql, like 1d above.
+  SQL Server binds column names when it COMPILES a batch, not when it reaches the
+  statement, so a plain `WHERE Prompt IS NULL` sitting inside an IF that is never
+  taken still aborts the whole batch with Msg 207 on a database that has not got
+  the column yet. The guard would be there and would not have run.
+----------------------------------------------------------------------------*/
+DECLARE @pvMsg bit = (SELECT PreviewOnly FROM #opt), @unflattened int = 0;
+
+IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NOT NULL
+   AND COL_LENGTH('dbo.Prompt_Log', 'Messages') IS NOT NULL
+BEGIN
+    /* Section 3 adds Prompt to a pre-2026-08-03 database, which is too late: the
+       backfill below needs somewhere to copy to NOW. Adding it here as well costs
+       nothing - Section 3 then finds it present and does nothing. */
+    IF COL_LENGTH('dbo.Prompt_Log', 'Prompt') IS NULL
+    BEGIN
+        IF @pvMsg = 1
+            PRINT '  would add Prompt_Log.Prompt first, so Messages has somewhere to go.';
+        ELSE
+        BEGIN TRY
+            EXEC sys.sp_executesql N'ALTER TABLE dbo.Prompt_Log ADD [Prompt] nvarchar(max) NULL;';
+            PRINT '  added Prompt_Log.Prompt (pre-2026-08-03 database).';
+        END TRY
+        BEGIN CATCH INSERT #report VALUES ('CHANGE FAILED', 'Prompt_Log.Prompt', ERROR_MESSAGE()); END CATCH
+    END
+
+    IF COL_LENGTH('dbo.Prompt_Log', 'Prompt') IS NOT NULL
+    BEGIN
+        EXEC sys.sp_executesql
+             N'SELECT @n = COUNT(*) FROM dbo.Prompt_Log WHERE [Prompt] IS NULL;',
+             N'@n int OUTPUT', @n = @unflattened OUTPUT;
+
+        IF @unflattened > 0 AND @pvMsg = 1
+            PRINT '  would copy Messages into Prompt on ' + CAST(@unflattened AS varchar(10))
+                + ' pre-2026-08-03 row(s) before dropping Messages.';
+        ELSE IF @unflattened > 0
+        BEGIN TRY
+            EXEC sys.sp_executesql N'UPDATE dbo.Prompt_Log SET [Prompt] = [Messages] WHERE [Prompt] IS NULL;';
+            PRINT '  copied Messages into Prompt on ' + CAST(@unflattened AS varchar(10))
+                + ' pre-2026-08-03 row(s); the evidence endpoint can still read them.';
+            SET @unflattened = 0;   -- copied, so the drop below is safe
+        END TRY
+        BEGIN CATCH
+            INSERT #report VALUES ('BACKFILL FAILED', 'Prompt_Log.Prompt', ERROR_MESSAGE());
+        END CATCH
+
+        IF @pvMsg = 1
+            PRINT '  would PERMANENTLY DELETE column Prompt_Log.Messages (duplicate of Prompt, no reader).';
+        ELSE IF @unflattened > 0
+            /* The backfill did not finish, so Messages is still the only copy of those
+               prompts. Report and KEEP the column: a failing insert is recoverable by
+               re-running this script, a deleted prompt is not. */
+            INSERT #report VALUES ('COLUMN KEPT, STILL THE ONLY COPY', 'Prompt_Log.Messages',
+                'Not dropped. Prompt is NULL on at least one row, so Messages holds the only copy '
+                + 'of that prompt. The BACKFILL FAILED finding above says why; fix it and re-run.');
+        ELSE
+        BEGIN TRY
+            EXEC sys.sp_executesql N'ALTER TABLE dbo.Prompt_Log DROP COLUMN [Messages];';
+            PRINT '  removed column Prompt_Log.Messages (the prompt is kept in Prompt).';
+        END TRY
+        BEGIN CATCH
+            INSERT #report VALUES ('DROP FAILED', 'Prompt_Log.Messages', ERROR_MESSAGE());
+        END CATCH
+    END
+    ELSE IF @pvMsg = 1
+        /* A preview run did not really add Prompt, so the two statements above had
+           nothing to read. Say what they would do rather than falling silent on the
+           one database where this block has the most to do. */
+        PRINT '  would then copy Messages into Prompt, and PERMANENTLY DELETE Prompt_Log.Messages.';
+END
+ELSE
+    PRINT ' [EXISTS]  Prompt_Log has no Messages column. Nothing was changed.';
+GO
+
+
 /*==============================================================================
   SECTION 2 — Tables
 ==============================================================================*/
@@ -840,7 +977,17 @@ GO
 
 /****** Table: Prompt_Log — one row per model call, prompt and raw reply. The
         only place raw model output is stored, and the fastest-growing table
-        here. Read back only through CorrelationID. ******/
+        here. Read back only through CorrelationID.
+
+        The prompt is held ONCE, in Prompt. It used to be held twice - Messages
+        carried the wire JSON and Prompt the same content flattened - and Messages
+        had no reader anywhere in the application while Prompt is what the
+        customer evidence endpoint returns. Section 1e copies it forward on legacy
+        rows and drops it from databases that still have it.
+
+        PRIMARY KEY NONCLUSTERED, clustered on (CreatedAt, LogID): see the header.
+        LogID is the tie-breaker, so the clustering key stays unique and the
+        nonclustered indexes below do not carry a hidden uniquifier. ******/
 IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NULL
 CREATE TABLE [dbo].[Prompt_Log](
 	[LogID] [uniqueidentifier] NOT NULL,
@@ -851,7 +998,6 @@ CREATE TABLE [dbo].[Prompt_Log](
 	[SubsystemID] [int] NOT NULL,
 	[Stage] [nvarchar](100) NOT NULL,
 	[PromptVersion] [nvarchar](100) NOT NULL,
-	[Messages] [nvarchar](max) NOT NULL,
 	[Prompt] [nvarchar](max) NULL,
 	[ResponseText] [nvarchar](max) NULL,
 	[Model] [nvarchar](200) NULL,
@@ -859,17 +1005,21 @@ CREATE TABLE [dbo].[Prompt_Log](
 	[ParseSucceeded] [bit] NOT NULL,
 	[CreatedAt] [datetime2](7) NOT NULL,
 	[CorrelationID] [uniqueidentifier] NULL,
- CONSTRAINT [PK_Prompt_Log] PRIMARY KEY CLUSTERED
+ CONSTRAINT [PK_Prompt_Log] PRIMARY KEY NONCLUSTERED
 (
 	[LogID] ASC
-)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF, DATA_COMPRESSION = PAGE) ON [PRIMARY]
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
 /****** Table: Application_Log — the ordinary log stream, durably. OPERATOR-ONLY.
         Takes every line at INFO and above, so it grows orders of magnitude
         faster than Diagnostic_Event beside it and is kept for days, not weeks.
-        Written by a background batching writer, never on a request thread. ******/
+        Written by a background batching writer, never on a request thread.
+
+        PRIMARY KEY NONCLUSTERED, clustered on (CreatedAt, LogID): see the header.
+        This is the hottest insert path in the system, so it is the table that
+        paid the most for a random clustering key. ******/
 IF OBJECT_ID('dbo.Application_Log', 'U') IS NULL
 CREATE TABLE [dbo].[Application_Log](
 	[LogID] [uniqueidentifier] NOT NULL,
@@ -881,10 +1031,10 @@ CREATE TABLE [dbo].[Application_Log](
 	[RequestID] [nvarchar](100) NULL,
 	[TaskID] [nvarchar](100) NULL,
 	[FieldsJSON] [nvarchar](max) NULL,
- CONSTRAINT [PK_Application_Log] PRIMARY KEY CLUSTERED
+ CONSTRAINT [PK_Application_Log] PRIMARY KEY NONCLUSTERED
 (
 	[LogID] ASC
-)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF, DATA_COMPRESSION = PAGE) ON [PRIMARY]
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
@@ -892,7 +1042,11 @@ GO
         class, message and traceback behind a run that failed, plus the
         sanitised text the customer was shown so the two can be joined.
         Never read by a tenant-facing route. Written best-effort, so a failure
-        to write it never turns a diagnosable error into an undiagnosable one. ******/
+        to write it never turns a diagnosable error into an undiagnosable one.
+
+        PRIMARY KEY NONCLUSTERED, clustered on (CreatedAt, DiagnosticID): see the
+        header. Both readers of this table - "why did session X fail" and the
+        retention purge - are bounded by time first. ******/
 IF OBJECT_ID('dbo.Diagnostic_Event', 'U') IS NULL
 CREATE TABLE [dbo].[Diagnostic_Event](
 	[DiagnosticID] [uniqueidentifier] NOT NULL,
@@ -909,10 +1063,10 @@ CREATE TABLE [dbo].[Diagnostic_Event](
 	[Traceback] [nvarchar](max) NULL,
 	[ClientMessage] [nvarchar](1000) NULL,
 	[ContextJSON] [nvarchar](max) NULL,
- CONSTRAINT [PK_Diagnostic_Event] PRIMARY KEY CLUSTERED
+ CONSTRAINT [PK_Diagnostic_Event] PRIMARY KEY NONCLUSTERED
 (
 	[DiagnosticID] ASC
-)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF, DATA_COMPRESSION = PAGE) ON [PRIMARY]
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
@@ -955,7 +1109,12 @@ CREATE TABLE [dbo].[Risk_Treatment_Plan](
 GO
 
 /****** Table: Scenario_Audit — append-only ledger. SubsystemID 0 means the
-        asset, NULL means session-wide; neither is a broken reference. ******/
+        asset, NULL means session-wide; neither is a broken reference.
+
+        PAGE compressed like the three log tables, and the ONLY one of the four
+        whose clustering is left alone: it is the compliance ledger, seven
+        customer-facing read paths seek it by AuditID and by the ids beside it,
+        and it is not where the write pressure is. ******/
 IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NULL
 CREATE TABLE [dbo].[Scenario_Audit](
 	[AuditID] [uniqueidentifier] NOT NULL,
@@ -977,7 +1136,7 @@ CREATE TABLE [dbo].[Scenario_Audit](
  CONSTRAINT [PK_Scenario_Audit] PRIMARY KEY CLUSTERED
 (
 	[AuditID] ASC
-)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF, DATA_COMPRESSION = PAGE) ON [PRIMARY]
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
@@ -1417,7 +1576,8 @@ VALUES
   ('Prompt_Log','SubsystemID','int',NULL,NULL,0,0,NULL,NULL),
   ('Prompt_Log','Stage','nvarchar',100,NULL,0,0,NULL,NULL),
   ('Prompt_Log','PromptVersion','nvarchar',100,NULL,0,0,NULL,NULL),
-  ('Prompt_Log','Messages','nvarchar',-1,NULL,0,0,NULL,NULL),
+  -- Messages is gone: it held the same prompt as Prompt and nothing read it.
+  -- Section 1e copies it forward and drops it, before this manifest is built.
   ('Prompt_Log','Prompt','nvarchar',-1,NULL,1,0,NULL,NULL),
   ('Prompt_Log','ResponseText','nvarchar',-1,NULL,1,0,NULL,NULL),
   ('Prompt_Log','Model','nvarchar',200,NULL,1,0,NULL,NULL),
@@ -2034,7 +2194,7 @@ GO
 
 
 /*==============================================================================
-  SECTION 6 — Indexes (35)
+  SECTION 6 — Indexes (38)
 
   Please create all of them exactly as written. Index names, column order, the
   UNIQUE keyword and the text of each WHERE clause are all either checked by the
@@ -2374,6 +2534,206 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Plan' AN
         WHERE [PlanID] IS NOT NULL;
 GO
 
+-------------------------------------------------------------------------------
+-- 6e. Where the rows physically sit (3). The three log tables are CLUSTERED ON
+--     TIME instead of on their primary key.
+--
+--     Their key is a random uniqueidentifier. On a clustered primary key that
+--     means every insert lands in the MIDDLE of the index: a page split on the
+--     three most append-heavy tables in the system, on every write, for the life
+--     of the database - and fragmentation that grows as fast as the table does.
+--     Clustered on (CreatedAt, <id>) the inserts become pure appends, and every
+--     "last N hours" read and every retention purge becomes a range seek instead
+--     of a scan of a table whose whole purpose is to keep growing.
+--
+--     THE PRIMARY KEY SURVIVES. PK_<table> is re-created as a NONCLUSTERED
+--     PRIMARY KEY on exactly the column it always constrained, so uniqueness and
+--     anything that references the key are unchanged. Only the clustering moves.
+--
+--     <id> is the second key column so the clustering key stays unique. Without
+--     it SQL Server adds a hidden 4-byte uniquifier to duplicate CreatedAt values
+--     and carries it in every nonclustered index on the table.
+--
+--     Scenario_Audit is deliberately absent: the compliance ledger, read through
+--     seven customer-facing paths, and not where the write pressure is.
+-------------------------------------------------------------------------------
+
+/*------------------------------------------------------------------------------
+  First, move each primary key off the clustered index, in one transaction per
+  table so the key is never missing outside it. DROP-then-ADD, not sp_rename:
+  a constraint cannot be converted in place.
+
+  Guarded on the primary key still BEING clustered, so a second run finds it
+  nonclustered and reports [EXISTS] without touching the table. This rebuilds
+  every nonclustered index on the table and needs log space proportional to it;
+  run it in the same window as the rest of this script, not against a live API.
+------------------------------------------------------------------------------*/
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Prompt_Log')
+           AND is_primary_key = 1 AND type_desc = 'CLUSTERED')
+BEGIN
+    IF (SELECT PreviewOnly FROM #opt) = 1
+        PRINT '  would move PK_Prompt_Log to NONCLUSTERED so the clustered index can take (CreatedAt, LogID).';
+    ELSE
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        ALTER TABLE [dbo].[Prompt_Log] DROP CONSTRAINT [PK_Prompt_Log];
+        ALTER TABLE [dbo].[Prompt_Log] ADD CONSTRAINT [PK_Prompt_Log] PRIMARY KEY NONCLUSTERED ([LogID] ASC)
+            WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF, DATA_COMPRESSION = PAGE) ON [PRIMARY];
+        COMMIT TRANSACTION;
+        PRINT ' [REBUILD] PK_Prompt_Log is now NONCLUSTERED on LogID.';
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        INSERT #report VALUES ('RECLUSTER FAILED', 'Prompt_Log', ERROR_MESSAGE());
+    END CATCH
+END
+ELSE
+    PRINT ' [EXISTS]  PK_Prompt_Log is already NONCLUSTERED.';
+GO
+
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Application_Log')
+           AND is_primary_key = 1 AND type_desc = 'CLUSTERED')
+BEGIN
+    IF (SELECT PreviewOnly FROM #opt) = 1
+        PRINT '  would move PK_Application_Log to NONCLUSTERED so the clustered index can take (CreatedAt, LogID).';
+    ELSE
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        ALTER TABLE [dbo].[Application_Log] DROP CONSTRAINT [PK_Application_Log];
+        ALTER TABLE [dbo].[Application_Log] ADD CONSTRAINT [PK_Application_Log] PRIMARY KEY NONCLUSTERED ([LogID] ASC)
+            WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF, DATA_COMPRESSION = PAGE) ON [PRIMARY];
+        COMMIT TRANSACTION;
+        PRINT ' [REBUILD] PK_Application_Log is now NONCLUSTERED on LogID.';
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        INSERT #report VALUES ('RECLUSTER FAILED', 'Application_Log', ERROR_MESSAGE());
+    END CATCH
+END
+ELSE
+    PRINT ' [EXISTS]  PK_Application_Log is already NONCLUSTERED.';
+GO
+
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Diagnostic_Event')
+           AND is_primary_key = 1 AND type_desc = 'CLUSTERED')
+BEGIN
+    IF (SELECT PreviewOnly FROM #opt) = 1
+        PRINT '  would move PK_Diagnostic_Event to NONCLUSTERED so the clustered index can take (CreatedAt, DiagnosticID).';
+    ELSE
+    BEGIN TRY
+        BEGIN TRANSACTION;
+        ALTER TABLE [dbo].[Diagnostic_Event] DROP CONSTRAINT [PK_Diagnostic_Event];
+        ALTER TABLE [dbo].[Diagnostic_Event] ADD CONSTRAINT [PK_Diagnostic_Event] PRIMARY KEY NONCLUSTERED ([DiagnosticID] ASC)
+            WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF, DATA_COMPRESSION = PAGE) ON [PRIMARY];
+        COMMIT TRANSACTION;
+        PRINT ' [REBUILD] PK_Diagnostic_Event is now NONCLUSTERED on DiagnosticID.';
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        INSERT #report VALUES ('RECLUSTER FAILED', 'Diagnostic_Event', ERROR_MESSAGE());
+    END CATCH
+END
+ELSE
+    PRINT ' [EXISTS]  PK_Diagnostic_Event is already NONCLUSTERED.';
+GO
+
+/*------------------------------------------------------------------------------
+  Then the clustered indexes themselves.
+
+  The second guard - no clustered index of ANY name on the table - is what keeps
+  this statement from ABORTING the run on a database whose primary key could not
+  be moved above. Without it the statement fails with Msg 1902 (a table may have
+  only one clustered index), the batch stops, and every section after this one is
+  skipped over a table that was already reported as a finding. With it the index
+  is simply not created, and Section 7 reports it as MISSING INDEX.
+------------------------------------------------------------------------------*/
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_PromptLog_Created' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Prompt_Log') AND type_desc = 'CLUSTERED')
+    CREATE CLUSTERED INDEX [CIX_PromptLog_Created] ON [dbo].[Prompt_Log] ([CreatedAt], [LogID])
+        WITH (DATA_COMPRESSION = PAGE);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Application_Log') AND type_desc = 'CLUSTERED')
+    CREATE CLUSTERED INDEX [CIX_ApplicationLog_Created] ON [dbo].[Application_Log] ([CreatedAt], [LogID])
+        WITH (DATA_COMPRESSION = PAGE);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Diagnostic_Event') AND type_desc = 'CLUSTERED')
+    CREATE CLUSTERED INDEX [CIX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event] ([CreatedAt], [DiagnosticID])
+        WITH (DATA_COMPRESSION = PAGE);
+GO
+
+/* NOT DROPPED, and it is now redundant: IX_ApplicationLog_Created and
+   IX_DiagnosticEvent_Created are nonclustered on ([CreatedAt] DESC), which the
+   clustered indexes above now cover - a clustered index is scanned backwards as
+   cheaply as forwards. They cost write throughput on the two hottest insert paths
+   and save nothing. They are left in place because retiring an index means
+   retiring it from all three deploy paths, the verify script and the header
+   counts in one change, and that is a decision to take deliberately rather than
+   as a side effect of this one. Raise it as its own change. */
+
+-------------------------------------------------------------------------------
+-- 6f. PAGE compression (0 indexes: it rebuilds the ones above, it creates none).
+--
+--     Log rows repeat heavily - the same module, kind, stage, session and entity,
+--     over and over - which is exactly the shape page compression is for. It
+--     typically recovers 40-60% of the stored bytes at negligible CPU cost, and
+--     fewer pages also means fewer reads. It is invisible to the application:
+--     no query, no column and no type changes.
+--
+--     Section 2 declares it on the four tables, which covers a FRESH database.
+--     It cannot cover a database that already exists - compression is a property
+--     of a stored index, and an index that is already there is never re-created -
+--     so each table is rebuilt in place here instead, guarded on
+--     sys.partitions.data_compression so a second run reports [EXISTS].
+--
+--     ALTER INDEX ALL, not ALTER TABLE ... REBUILD: the latter compresses only
+--     the table's own data and would leave every nonclustered index on it
+--     uncompressed, and on these four tables the nonclustered indexes are a large
+--     part of the bytes. index_id > 0 skips a heap, which can only exist here if
+--     the clustered index above failed - Section 7 already reports that.
+--
+--     This rewrites the whole table. It is offline and it needs log space; run it
+--     in the same maintenance window as the rest of this script.
+-------------------------------------------------------------------------------
+DECLARE @cmpTable sysname, @cmpSql nvarchar(max), @cmpPreview bit = (SELECT PreviewOnly FROM #opt);
+
+DECLARE cmp CURSOR LOCAL FAST_FORWARD FOR
+    SELECT tbl FROM (VALUES ('Prompt_Log'), ('Application_Log'),
+                            ('Diagnostic_Event'), ('Scenario_Audit')) v(tbl);
+OPEN cmp;
+FETCH NEXT FROM cmp INTO @cmpTable;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    IF OBJECT_ID('dbo.' + QUOTENAME(@cmpTable), 'U') IS NOT NULL
+    BEGIN
+        IF EXISTS (SELECT 1 FROM sys.partitions
+                   WHERE object_id = OBJECT_ID('dbo.' + QUOTENAME(@cmpTable))
+                     AND index_id > 0 AND data_compression <> 2)   -- 2 = PAGE
+        BEGIN
+            SET @cmpSql = N'ALTER INDEX ALL ON dbo.' + QUOTENAME(@cmpTable)
+                        + N' REBUILD WITH (DATA_COMPRESSION = PAGE);';
+            IF @cmpPreview = 1
+                PRINT '  would run: ' + @cmpSql;
+            ELSE
+            BEGIN TRY
+                EXEC sys.sp_executesql @cmpSql;
+                PRINT ' [FIXED]   ' + @cmpTable + ' and every index on it are now PAGE compressed.';
+            END TRY
+            BEGIN CATCH
+                INSERT #report VALUES ('COMPRESSION FAILED', @cmpTable, ERROR_MESSAGE());
+            END CATCH
+        END
+        ELSE
+            PRINT ' [EXISTS]  ' + @cmpTable + ' is already PAGE compressed.';
+    END
+    FETCH NEXT FROM cmp INTO @cmpTable;
+END
+CLOSE cmp; DEALLOCATE cmp;
+GO
+
 
 /*==============================================================================
   SECTION 7 — Verification
@@ -2437,6 +2797,13 @@ required_index(idx, tbl) AS (
         ('IX_ScopedThreat_SessionActiveScores',    'Scoped_Threat'),
         ('IX_PromptLog_Correlation',               'Prompt_Log'),
         ('IX_PromptLog_Session',                   'Prompt_Log'),
+        /* The three clustered indexes from 6e. Checked here because their absence
+           is the one failure of that change that is otherwise silent: the table
+           still works, as a HEAP, and every insert and every time-bounded read
+           goes back to being a scan. */
+        ('CIX_PromptLog_Created',                  'Prompt_Log'),
+        ('CIX_ApplicationLog_Created',             'Application_Log'),
+        ('CIX_DiagnosticEvent_Created',            'Diagnostic_Event'),
         ('IX_ScenarioAudit_SessionSubEvent',       'Scenario_Audit'),
         ('IX_ScenarioAudit_Scenario',              'Scenario_Audit'),
         ('IX_ScenarioAudit_Plan',                  'Scenario_Audit')

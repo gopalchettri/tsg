@@ -39,16 +39,23 @@ rather than run against a half-built schema.
 In the environment file for that deployment:
 
 ```bash
-TSG_DIAGNOSTIC_DB_CATEGORIES=all
+TSG_DIAGNOSTIC_DB_CATEGORIES=exceptions,retries,degraded,slow
 TSG_DIAGNOSTIC_PUBLIC_DETAIL=true
 ```
 
-The first decides **what is recorded**; `all` includes ordinary log lines. The second decides
-**how much a lookup shows**; without it you get the summary but not the error trace, which is
-usually not enough to act on.
+The first decides **what is recorded**. Note what is NOT in that list: `logs`, the ordinary line
+stream. It is left out on purpose — see section 6 — and switched on for an investigation rather
+than left running. The second decides **how much a lookup shows**; without it you get the summary
+but not the error trace, which is usually not enough to act on.
 
-Both have working defaults, so a missing line will not break anything — but left at the defaults
-you get capture without detail, which reads as "the feature does not work".
+**Do not rely on the built-in defaults for the first one.** If the line is absent the code falls
+back to `all`, which INCLUDES `logs` — so an environment deployed from a secret store that never
+sets it will quietly start writing every log line to the database, which is the one outcome
+section 6 exists to prevent. The shipped `.env` files set it explicitly for exactly this reason;
+set it explicitly wherever those files are not the source.
+
+The second one defaults to off, which gives you capture without detail — a lookup that answers
+"something failed" but not what, which reads as "the feature does not work".
 
 **Read section 6 before setting these on a system holding real customer data.** `all` plus
 `true` means anyone with the web address can read saved log lines, and those can contain contract
@@ -159,12 +166,15 @@ stdout, so any container log shipper collects them as they are.
 
 Three blocks, copy-paste.
 
-**Record everything (UAT):**
+**Record everything, for one investigation (UAT):**
 
 ```bash
 TSG_DIAGNOSTIC_DB_CATEGORIES=all
 TSG_DIAGNOSTIC_PUBLIC_DETAIL=true
 ```
+
+`all` includes `logs`, which writes every line to the database. Prefer switching it on at runtime
+with a time limit (section 4) rather than setting it here, where nothing turns it off again.
 
 **Problems only (production):**
 
@@ -265,14 +275,19 @@ So:
 - Retention is enforced, not aspirational — the scheduled reaper deletes past the horizon:
 
 ```bash
-TSG_DIAGNOSTIC_RETENTION_DAYS=30
-TSG_APPLICATION_LOG_RETENTION_DAYS=7
+TSG_DIAGNOSTIC_RETENTION_DAYS=90
+TSG_APPLICATION_LOG_RETENTION_DAYS=0
+TSG_PROMPT_LOG_RETENTION_DAYS=0
 ```
 
-The first covers failures, which are rare and worth keeping. The second covers the log stream — a
-short trail for working out what happened this week, not a long-term record. The horizons differ
-because the tables differ, which is the whole reason there are two of them: one table would have
-forced one policy on both and buried the valuable rows in the volume.
+**`0` means never delete.** It is a value rather than missing code on purpose: with the cleanup
+branch removed, turning retention back on would be a code change, a review and a release — while
+the thing prompting it is a disk filling up tonight. As a value it is one setting and a restart.
+
+Failures are kept 90 days. The log stream and the AI receipts are kept indefinitely, which is a
+decision with a cost: at around 2,000 runs a day the log table adds roughly 100 GB a year, and it
+grows in every backup too. The way out is not to delete rows faster but to stop writing them —
+leave `logs` out of the categories above, and use a log collector for the stream instead.
 
 ```bash
 TSG_DIAGNOSTIC_QUEUE_MAX=10000

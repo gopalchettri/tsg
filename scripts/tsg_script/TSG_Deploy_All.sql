@@ -6154,7 +6154,7 @@ GO
 
   Script:      022_Prompt_Log.sql
   Order:       01_tables / 022
-  Purpose:     Create Prompt_Log, or bring an existing copy up to 16 columns.
+  Purpose:     Create Prompt_Log, or bring an existing copy up to 15 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Prompt_Log
@@ -6206,7 +6206,6 @@ BEGIN
         [SubsystemID] INT NOT NULL,
         [Stage] NVARCHAR(100) NOT NULL,
         [PromptVersion] NVARCHAR(100) NOT NULL,
-        [Messages] NVARCHAR(max) NOT NULL,
         [Prompt] NVARCHAR(max) NULL,
         [ResponseText] NVARCHAR(max) NULL,
         [Model] NVARCHAR(200) NULL,
@@ -6216,7 +6215,7 @@ BEGIN
         [CorrelationID] UNIQUEIDENTIFIER NULL,
         CONSTRAINT [PK_Prompt_Log] PRIMARY KEY CLUSTERED ([LogID])
     );
-    PRINT ' [CREATED] Table: Prompt_Log (16 columns)';
+    PRINT ' [CREATED] Table: Prompt_Log (15 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Prompt_Log';
@@ -6252,8 +6251,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'Stage',
      @expected = N'NVARCHAR(100)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'PromptVersion',
      @expected = N'NVARCHAR(100)', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'Messages',
-     @expected = N'NVARCHAR(max)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'Prompt',
      @expected = N'NVARCHAR(max)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'ResponseText',
@@ -6301,7 +6298,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Prompt_Log', @known = N'LogID,SessionID,TenantID,EntityID,UserID,SubsystemID,Stage,PromptVersion,Messages,Prompt,ResponseText,Model,ModelVersion,ParseSucceeded,CreatedAt,CorrelationID';
+EXEC dbo.tsg_report_extra_columns @table = N'Prompt_Log', @known = N'LogID,SessionID,TenantID,EntityID,UserID,SubsystemID,Stage,PromptVersion,Prompt,ResponseText,Model,ModelVersion,ParseSucceeded,CreatedAt,CorrelationID';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9683,7 +9680,7 @@ GO
 
   Script:      017_Prompt_Log_indexes.sql
   Order:       03_indexes / 017
-  Purpose:     2 index(es) on Prompt_Log.
+  Purpose:     3 index(es) on Prompt_Log.
   Depends on:  01_tables/ *_Prompt_Log.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    indexes on dbo.Prompt_Log
@@ -9808,6 +9805,57 @@ BEGIN
 END
 GO
 
+BEGIN TRY
+BEGIN TRANSACTION;
+IF EXISTS (SELECT 1 FROM sys.indexes i
+        WHERE i.name = N'CIX_PromptLog_Created' AND i.object_id = OBJECT_ID(N'dbo.Prompt_Log')
+          AND (i.is_unique <> 0 OR i.has_filter <> 0
+          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'CreatedAt')
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'LogID')))
+BEGIN
+    PRINT ' [REBUILD] Prompt_Log.CIX_PromptLog_Created exists with the wrong shape - recreating it on (CreatedAt, LogID).';
+    DROP INDEX [CIX_PromptLog_Created] ON [dbo].[Prompt_Log];
+END;
+/*------------------------------------------------------------------------------
+  Then the clustered indexes themselves.
+
+  The second guard - no clustered index of ANY name on the table - is what keeps
+  this statement from ABORTING the run on a database whose primary key could not
+  be moved above. Without it the statement fails with Msg 1902 (a table may have
+  only one clustered index), the batch stops, and every section after this one is
+  skipped over a table that was already reported as a finding. With it the index
+  is simply not created, and Section 7 reports it as MISSING INDEX.
+------------------------------------------------------------------------------*/
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_PromptLog_Created' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Prompt_Log') AND type_desc = 'CLUSTERED')
+    CREATE CLUSTERED INDEX [CIX_PromptLog_Created] ON [dbo].[Prompt_Log] ([CreatedAt], [LogID])
+        WITH (DATA_COMPRESSION = PAGE);
+COMMIT;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK;
+    PRINT ' [ERROR]   Could not create or rebuild Prompt_Log.CIX_PromptLog_Created on (CreatedAt, LogID).';
+    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
+    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
+    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    RAISERROR('Index CIX_PromptLog_Created could not be created - deployment stopped.', 16, 1);
+END CATCH;
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
 /*============================================================================
   >>> 48 of 51   03_indexes/018_Diagnostic_Event_indexes.sql
 ============================================================================*/
@@ -9832,7 +9880,7 @@ GO
 
   Script:      018_Diagnostic_Event_indexes.sql
   Order:       03_indexes / 018
-  Purpose:     2 index(es) on Diagnostic_Event.
+  Purpose:     3 index(es) on Diagnostic_Event.
   Depends on:  01_tables/ *_Diagnostic_Event.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    indexes on dbo.Diagnostic_Event
@@ -9961,6 +10009,47 @@ BEGIN
 END
 GO
 
+BEGIN TRY
+BEGIN TRANSACTION;
+IF EXISTS (SELECT 1 FROM sys.indexes i
+        WHERE i.name = N'CIX_DiagnosticEvent_Created' AND i.object_id = OBJECT_ID(N'dbo.Diagnostic_Event')
+          AND (i.is_unique <> 0 OR i.has_filter <> 0
+          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'CreatedAt')
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'DiagnosticID')))
+BEGIN
+    PRINT ' [REBUILD] Diagnostic_Event.CIX_DiagnosticEvent_Created exists with the wrong shape - recreating it on (CreatedAt, DiagnosticID).';
+    DROP INDEX [CIX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event];
+END;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Diagnostic_Event') AND type_desc = 'CLUSTERED')
+    CREATE CLUSTERED INDEX [CIX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event] ([CreatedAt], [DiagnosticID])
+        WITH (DATA_COMPRESSION = PAGE);
+COMMIT;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK;
+    PRINT ' [ERROR]   Could not create or rebuild Diagnostic_Event.CIX_DiagnosticEvent_Created on (CreatedAt, DiagnosticID).';
+    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
+    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
+    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    RAISERROR('Index CIX_DiagnosticEvent_Created could not be created - deployment stopped.', 16, 1);
+END CATCH;
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
 /*============================================================================
   >>> 49 of 51   03_indexes/019_Application_Log_indexes.sql
 ============================================================================*/
@@ -9985,7 +10074,7 @@ GO
 
   Script:      019_Application_Log_indexes.sql
   Order:       03_indexes / 019
-  Purpose:     2 index(es) on Application_Log.
+  Purpose:     3 index(es) on Application_Log.
   Depends on:  01_tables/ *_Application_Log.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    indexes on dbo.Application_Log
@@ -10093,6 +10182,47 @@ BEGIN CATCH
     PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
     EXEC sp_set_session_context N'tsg_deploy_failed', 1;
     RAISERROR('Index IX_ApplicationLog_Session could not be created - deployment stopped.', 16, 1);
+END CATCH;
+GO
+IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
+BEGIN
+    PRINT '';
+    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
+    PRINT '!!! line above it names the script. NOTHING after this point ran.';
+    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
+    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
+    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    SET NOEXEC ON;
+END
+GO
+
+BEGIN TRY
+BEGIN TRANSACTION;
+IF EXISTS (SELECT 1 FROM sys.indexes i
+        WHERE i.name = N'CIX_ApplicationLog_Created' AND i.object_id = OBJECT_ID(N'dbo.Application_Log')
+          AND (i.is_unique <> 0 OR i.has_filter <> 0
+          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'CreatedAt')
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'LogID')))
+BEGIN
+    PRINT ' [REBUILD] Application_Log.CIX_ApplicationLog_Created exists with the wrong shape - recreating it on (CreatedAt, LogID).';
+    DROP INDEX [CIX_ApplicationLog_Created] ON [dbo].[Application_Log];
+END;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Application_Log') AND type_desc = 'CLUSTERED')
+    CREATE CLUSTERED INDEX [CIX_ApplicationLog_Created] ON [dbo].[Application_Log] ([CreatedAt], [LogID])
+        WITH (DATA_COMPRESSION = PAGE);
+COMMIT;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK;
+    PRINT ' [ERROR]   Could not create or rebuild Application_Log.CIX_ApplicationLog_Created on (CreatedAt, LogID).';
+    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
+    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
+    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
+    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
+    RAISERROR('Index CIX_ApplicationLog_Created could not be created - deployment stopped.', 16, 1);
 END CATCH;
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
@@ -10322,7 +10452,7 @@ DECLARE @d int = (SELECT COUNT(*) FROM sys.default_constraints dc
                   WHERE tb.name IN (SELECT name FROM @owned));
 PRINT ' [INFO]    Tables:              ' + CAST(@t AS varchar(10)) + ' of 22';
 PRINT ' [INFO]    Non-PK indexes:      ' + CAST(@i AS varchar(10)) +
-      '  (36 expected: 35 from 03_indexes + UQ_Config_Tuning_Key)';
+      '  (39 expected: 38 from 03_indexes + UQ_Config_Tuning_Key)';
 PRINT ' [INFO]    Default constraints: ' + CAST(@d AS varchar(10)) + '  (22 expected)';
 
 /*-------------------------- the verdict --------------------------*/
@@ -10346,7 +10476,7 @@ BEGIN
     PRINT 'deployment that printed [BLOCKED] on a narrowing change, or added a NOT NULL column';
     PRINT 'as NULL because the table had rows, reaches this line looking clean.';
     PRINT '';
-    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 319 columns, all 32';
+    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 318 columns, all 32';
     PRINT 'index shapes, 21 defaults, 6 identity columns and the collation, then prints the';
     PRINT 'FINAL SIGN-OFF. Then confirm the threat and control libraries hold data';
     PRINT '(README step 11) before starting the application.';
@@ -10404,7 +10534,7 @@ GO
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 319 columns and all 36 indexes, down to index key columns and filters.
+  Purpose:     Verify all 318 columns and all 39 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -10431,7 +10561,7 @@ GO
 
 PRINT '';
 PRINT '==============================================================';
-PRINT ' TSG COLUMN VERDICT   (319 columns across 24 tables)';
+PRINT ' TSG COLUMN VERDICT   (318 columns across 24 tables)';
 PRINT ' Database: ' + DB_NAME();
 PRINT '==============================================================';
 GO
@@ -10739,7 +10869,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Prompt_Log', N'SubsystemID', N'int', N'INT', 0),
     (N'Prompt_Log', N'Stage', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Prompt_Log', N'PromptVersion', N'nvarchar', N'NVARCHAR(100)', 0),
-    (N'Prompt_Log', N'Messages', N'nvarchar', N'NVARCHAR(max)', 0),
     (N'Prompt_Log', N'Prompt', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Prompt_Log', N'ResponseText', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Prompt_Log', N'Model', N'nvarchar', N'NVARCHAR(200)', 1),
@@ -10888,6 +11017,9 @@ INSERT INTO @ix (name, tbl, is_unique, is_filtered, cols) VALUES
     (N'IX_IdentifiedDuplicateThreat_Session', N'Identified_Duplicate_Threat', 0, 0, N'SessionID'),
     (N'IX_PromptLog_Session', N'Prompt_Log', 0, 0, N'SessionID,SubsystemID'),
     (N'IX_ScenarioAudit_Plan', N'Scenario_Audit', 0, 1, N'PlanID,CreatedAt'),
+    (N'CIX_PromptLog_Created', N'Prompt_Log', 0, 0, N'CreatedAt,LogID'),
+    (N'CIX_ApplicationLog_Created', N'Application_Log', 0, 0, N'CreatedAt,LogID'),
+    (N'CIX_DiagnosticEvent_Created', N'Diagnostic_Event', 0, 0, N'CreatedAt,DiagnosticID'),
     (N'UQ_Config_Tuning_Key', N'Config_Tuning', 1, 0, N'TuningKey');
 
 DECLARE @ix_missing int = 0, @ix_shape int = 0;
@@ -11112,11 +11244,11 @@ END;
 PRINT '';
 PRINT 'SCHEMA VERDICT';
 PRINT '--------------';
-PRINT ' [INFO]    Columns expected:   319';
+PRINT ' [INFO]    Columns expected:   318';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));
-PRINT ' [INFO]    Indexes expected:   36';
+PRINT ' [INFO]    Indexes expected:   39';
 PRINT ' [INFO]    Missing/disabled:   ' + CAST(@ix_missing AS varchar(10));
 PRINT ' [INFO]    Wrong shape:        ' + CAST(@ix_shape   AS varchar(10));
 PRINT ' [INFO]    Primary keys wrong: ' + CAST(@pk_wrong   AS varchar(10));

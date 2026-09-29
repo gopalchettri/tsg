@@ -110,23 +110,61 @@ class Settings(BaseSettings):
     trace_sinks: str = Field(
         "", validation_alias=AliasChoices("TRACE_SINKS", "TSG_TRACE_SINKS"))
     # TSG_DIAGNOSTIC_DB_CATEGORIES — which kinds of problem are saved to Diagnostic_Event.
-    # Comma list of exceptions|retries, or "all" / "none". Default "all".
+    # Comma list of exceptions|retries|degraded|slow|logs, or "all" / "none". Default "all".
+    #
+    # The four shipped env files name the first four EXPLICITLY rather than saying "all", and the
+    # difference is `logs`: it captures every line at INFO and above into Application_Log — asset
+    # context and prompt text included — so "all" quietly turns a default into a store of personal
+    # data. It is switched on per investigation through the runtime override, which takes a TTL so
+    # a forgotten toggle expires by itself; this default cannot.
     #
     # `retries` is deliberately on by default and is the non-obvious half: once a provider outage
     # is survivable it becomes INVISIBLE, and a session that retried four times and then worked
     # leaves no other trace. That trail is how a degrading reranker is spotted before it cancels
     # anything.
+    #
+    # THE DEFAULT EXCLUDES `logs`, AND THAT IS THE POINT OF THE DEFAULT. `logs` writes every line
+    # at INFO and above into Application_Log — hundreds per run, and at ~2000 runs a day roughly
+    # 100 GB a year, in the database and in every backup taken from it. It is an investigation
+    # mode, switched on for as long as it takes to reproduce something (PATCH
+    # /v1/tsg/diagnostics/config with ttl_seconds) and off again by itself.
+    #
+    # The shipped .env files set this explicitly too, but a default only matters when nothing sets
+    # it — which is exactly the case this guards: an environment whose configuration comes from a
+    # secret store rather than a file, where one line nobody knew was load-bearing does not get
+    # copied. With `all` as the default that environment quietly starts filling its database and
+    # nothing reports it; the symptom arrives weeks later as an unexplained 80 GB table.
+    #
+    # `all` still works, and still includes `logs`. It just has to be asked for.
     diagnostic_db_categories: str = Field(
-        "all", validation_alias=AliasChoices("TSG_DIAGNOSTIC_DB_CATEGORIES"))
+        "exceptions,retries,degraded,slow",
+        validation_alias=AliasChoices("TSG_DIAGNOSTIC_DB_CATEGORIES"))
+    # THE THREE HORIZONS BELOW ALL TAKE 0, AND 0 MEANS "NEVER PURGE" — the table is skipped
+    # outright, not swept with a cutoff of today. Kept as a VALUE rather than expressed by
+    # deleting the purge branch, because the two are not equivalent when someone changes their
+    # mind: with the branch gone, turning retention back on for one deployment is a code change, a
+    # review and a release, while the thing that prompted it is a disk filling up tonight. As a
+    # value it is one env var and a restart. The branch costs one comparison per reaper tick.
     # TSG_DIAGNOSTIC_RETENTION_DAYS — how long Diagnostic_Event rows are kept. Tracebacks are
-    # bulky and this table only grows.
+    # bulky and this table only grows. 90 days, not 30: the report that sends anyone back to this
+    # table ("it was doing that a while ago too") arrives weeks after the run, and a horizon that
+    # lapses before the question is asked buys disk at the cost of the one row worth having.
     diagnostic_retention_days: int = Field(
-        30, ge=1, validation_alias=AliasChoices("TSG_DIAGNOSTIC_RETENTION_DAYS"))
-    # TSG_APPLICATION_LOG_RETENTION_DAYS — how long raw log rows are kept. SHORTER than the
-    # diagnostics horizon on purpose: this table takes every line at INFO and above, so it grows
-    # orders of magnitude faster and is a trail rather than a record.
+        90, ge=0, validation_alias=AliasChoices("TSG_DIAGNOSTIC_RETENTION_DAYS"))
+    # TSG_APPLICATION_LOG_RETENTION_DAYS — how long raw log rows are kept. 0 by default because
+    # the shipped category list no longer includes `logs`, so nothing writes here at all until an
+    # operator switches it on for an investigation — and a purge of an empty table is work that
+    # only ever runs. Switching capture on is the moment to set a horizon with it; leaving this at
+    # 0 with `logs` on is how a table that takes every line at INFO and above grows without bound.
     application_log_retention_days: int = Field(
-        7, ge=1, validation_alias=AliasChoices("TSG_APPLICATION_LOG_RETENTION_DAYS"))
+        0, ge=0, validation_alias=AliasChoices("TSG_APPLICATION_LOG_RETENTION_DAYS"))
+    # TSG_PROMPT_LOG_RETENTION_DAYS — how long Prompt_Log rows are kept. 0 by default because
+    # these rows are EVIDENCE, not housekeeping: the customer evidence endpoint serves them back
+    # for plan versions replaced long ago, so a horizon here silently empties an API response
+    # rather than reclaiming a log. It exists because the same rows hold prompt text, and a
+    # deployment that must bound how long it keeps that needs a number, not a patch.
+    prompt_log_retention_days: int = Field(
+        0, ge=0, validation_alias=AliasChoices("TSG_PROMPT_LOG_RETENTION_DAYS"))
     # TSG_DIAGNOSTIC_QUEUE_MAX — rows the background writer will hold before DISCARDING new ones.
     # A bound, not a target: without it a slow database becomes unbounded memory growth and then
     # an out-of-memory kill. Losing diagnostics is a bad day; losing the worker is an outage.

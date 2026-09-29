@@ -136,13 +136,19 @@ Re-runnable; every statement checks first. Post-deployment validation must repor
 | Setting | Default |
 |---|---|
 | `TSG_EMBEDDING_MAX_RETRIES`, `TSG_RERANKER_MAX_RETRIES` | follow `TSG_LLM_MAX_RETRIES` |
-| `TSG_DIAGNOSTIC_DB_CATEGORIES` | `all` |
+| `TSG_DIAGNOSTIC_DB_CATEGORIES` | `all` — **superseded**, see note below |
 | `TSG_DIAGNOSTIC_PUBLIC_DETAIL` | `false` |
-| `TSG_DIAGNOSTIC_RETENTION_DAYS` / `TSG_APPLICATION_LOG_RETENTION_DAYS` | 30 / 7 |
+| `TSG_DIAGNOSTIC_RETENTION_DAYS` / `TSG_APPLICATION_LOG_RETENTION_DAYS` | 30 / 7 — **superseded** |
 | `TSG_DIAGNOSTIC_QUEUE_MAX` | 10000 |
 | `TSG_DIAGNOSTIC_SLOW_STEP_MS` | 5000 |
 | `TSG_DIAGNOSTIC_BACKENDS_DISABLED` | *(empty)* |
 | `TSG_INFRA_DEGRADED_THRESHOLD` / `_WINDOW_SECONDS` | 20 / 300 |
+
+> **Superseded by the storage-optimization pass.** The values above are what shipped on
+> 2026-09-29 and are left as the historical record. They were changed afterwards: retention became
+> 90 days for `Diagnostic_Event` and `0` (never) for `Application_Log` and the new
+> `TSG_PROMPT_LOG_RETENTION_DAYS`, and the env files stopped shipping `logs` in the categories.
+> [`DIAGNOSTICS_CONFIGURATION.md`](DIAGNOSTICS_CONFIGURATION.md) is the current reference.
 
 **The stage lease derives itself** from the retry budget, so the retry change cannot outrun it.
 Verified against `.env`: worst case 360s, lease 720s. With a fallback model configured: 720s and

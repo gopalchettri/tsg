@@ -3,7 +3,7 @@
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 319 columns and all 36 indexes, down to index key columns and filters.
+  Purpose:     Verify all 318 columns and all 39 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -18,7 +18,7 @@ GO
 
 PRINT '';
 PRINT '==============================================================';
-PRINT ' TSG COLUMN VERDICT   (319 columns across 24 tables)';
+PRINT ' TSG COLUMN VERDICT   (318 columns across 24 tables)';
 PRINT ' Database: ' + DB_NAME();
 PRINT '==============================================================';
 GO
@@ -314,7 +314,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Prompt_Log', N'SubsystemID', N'int', N'INT', 0),
     (N'Prompt_Log', N'Stage', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Prompt_Log', N'PromptVersion', N'nvarchar', N'NVARCHAR(100)', 0),
-    (N'Prompt_Log', N'Messages', N'nvarchar', N'NVARCHAR(max)', 0),
     (N'Prompt_Log', N'Prompt', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Prompt_Log', N'ResponseText', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Prompt_Log', N'Model', N'nvarchar', N'NVARCHAR(200)', 1),
@@ -463,6 +462,9 @@ INSERT INTO @ix (name, tbl, is_unique, is_filtered, cols) VALUES
     (N'IX_IdentifiedDuplicateThreat_Session', N'Identified_Duplicate_Threat', 0, 0, N'SessionID'),
     (N'IX_PromptLog_Session', N'Prompt_Log', 0, 0, N'SessionID,SubsystemID'),
     (N'IX_ScenarioAudit_Plan', N'Scenario_Audit', 0, 1, N'PlanID,CreatedAt'),
+    (N'CIX_PromptLog_Created', N'Prompt_Log', 0, 0, N'CreatedAt,LogID'),
+    (N'CIX_ApplicationLog_Created', N'Application_Log', 0, 0, N'CreatedAt,LogID'),
+    (N'CIX_DiagnosticEvent_Created', N'Diagnostic_Event', 0, 0, N'CreatedAt,DiagnosticID'),
     (N'UQ_Config_Tuning_Key', N'Config_Tuning', 1, 0, N'TuningKey');
 
 DECLARE @ix_missing int = 0, @ix_shape int = 0;
@@ -687,11 +689,11 @@ END;
 PRINT '';
 PRINT 'SCHEMA VERDICT';
 PRINT '--------------';
-PRINT ' [INFO]    Columns expected:   319';
+PRINT ' [INFO]    Columns expected:   318';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));
-PRINT ' [INFO]    Indexes expected:   36';
+PRINT ' [INFO]    Indexes expected:   39';
 PRINT ' [INFO]    Missing/disabled:   ' + CAST(@ix_missing AS varchar(10));
 PRINT ' [INFO]    Wrong shape:        ' + CAST(@ix_shape   AS varchar(10));
 PRINT ' [INFO]    Primary keys wrong: ' + CAST(@pk_wrong   AS varchar(10));

@@ -9,7 +9,6 @@ Layering is one-directional: this module never imports threat_identification or 
 """
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, overload
 
@@ -163,7 +162,6 @@ def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_ses
         "LogID": guid(), "SessionID": scenario_session["SessionID"], "TenantID": scenario_session["TenantID"],
         "EntityID": scenario_session["EntityID"], "UserID": scenario_session.get("UserID"),
         "SubsystemID": subsystem_id, "Stage": stage, "PromptVersion": prompts.PROMPT_VERSION,
-        "Messages": json.dumps(messages),
         "Prompt": "\n\n".join(f"[{msg['role']}]\n{msg.get('content') or ''}" for msg in messages),
         "ResponseText": text,
         "Model": prov.model if prov else None, "ModelVersion": prov.model_version if prov else None,

@@ -66,6 +66,12 @@ def purge_expired_diagnostics(sess: Session) -> dict[str, int]:
     purge, the table added to make failures diagnosable eventually becomes the failure. It is also
     the enforcement half of the personal-data retention promise — a horizon nothing acts on is a
     statement, not a control.
+
+    EACH TABLE READS ITS OWN SETTING, and nothing here derives one horizon from another. The
+    failure that guards against is quiet: a shared cutoff, or one setting standing in for a table
+    that has no setting of its own, re-times a second table the moment somebody tunes the first —
+    so an operator who lengthens the diagnostics horizon finds they have also started keeping
+    prompt text for a quarter, and nothing in the change says so.
     """
     s = get_settings()
     removed = {
@@ -73,11 +79,14 @@ def purge_expired_diagnostics(sess: Session) -> dict[str, int]:
             sess, m.Diagnostic_Event, s.diagnostic_retention_days),
         m.Application_Log.__tablename__: _purge_older_than(
             sess, m.Application_Log, s.application_log_retention_days),
+        m.Prompt_Log.__tablename__: _purge_older_than(
+            sess, m.Prompt_Log, s.prompt_log_retention_days),
     }
     if any(removed.values()):
         log.info("diagnostics.purged", **removed,
                  diagnostic_retention_days=s.diagnostic_retention_days,
-                 application_log_retention_days=s.application_log_retention_days)
+                 application_log_retention_days=s.application_log_retention_days,
+                 prompt_log_retention_days=s.prompt_log_retention_days)
     return removed
 
 
@@ -91,7 +100,15 @@ def _purge_older_than(sess: Session, table, days: int) -> int:
     for the same deadlock it was avoiding.
 
     NEVER RAISES: retention is housekeeping, and a failed purge that aborted the tick would take
-    session recovery down with it — the reaper's actual job, and far more important than disk."""
+    session recovery down with it — the reaper's actual job, and far more important than disk.
+
+    `days == 0` MEANS NEVER, and returns before issuing any statement at all. Not a cutoff of
+    today, which would read as "keep nothing" and delete the table on the next tick — the same
+    number, opposite meaning, and no way to tell which one an operator meant from the row count
+    afterwards. Guarded here rather than at each call site so a horizon added later cannot be the
+    one that forgets."""
+    if days == 0:
+        return 0
     key = table.__table__.primary_key.columns.keys()[0]
     cutoff = now() - timedelta(days=days)
     deleted = 0

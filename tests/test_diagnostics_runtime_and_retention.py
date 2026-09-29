@@ -200,7 +200,42 @@ def db(tmp_path):
     engine = create_engine(f"sqlite:///{(tmp_path / 'purge.db').as_posix()}", future=True)
     m.Diagnostic_Event.__table__.create(engine)
     m.Application_Log.__table__.create(engine)
+    m.Prompt_Log.__table__.create(engine)
     return sessionmaker(engine, future=True)
+
+
+@pytest.fixture
+def horizons(monkeypatch):
+    """Set ALL THREE horizons, on every test that sets any.
+
+    A test that pins one and inherits the rest cannot tell a horizon that was applied from one
+    that merely happened to match the default — which is exactly the coupling these tests exist
+    to catch."""
+    def _set(*, diagnostics_days: int, log_days: int, prompt_days: int):
+        monkeypatch.setenv("TSG_DIAGNOSTIC_RETENTION_DAYS", str(diagnostics_days))
+        monkeypatch.setenv("TSG_APPLICATION_LOG_RETENTION_DAYS", str(log_days))
+        monkeypatch.setenv("TSG_PROMPT_LOG_RETENTION_DAYS", str(prompt_days))
+        from app.core.config import get_settings
+        get_settings.cache_clear()
+    return _set
+
+
+class _CountingSession:
+    """A real session that counts the statements put through it.
+
+    "Nothing was deleted" is NOT the claim a horizon of 0 makes. A cutoff of today deletes nothing
+    either, on a table whose newest row is an hour old — and then empties it tomorrow. The claim
+    is that no statement is issued at all, and only counting can tell the two apart."""
+
+    def __init__(self, inner):
+        self.inner, self.statements = inner, 0
+
+    def execute(self, *a, **kw):
+        self.statements += 1
+        return self.inner.execute(*a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
 
 def _add(sess, table, age_days: int):
@@ -208,6 +243,10 @@ def _add(sess, table, age_days: int):
     if table is m.Diagnostic_Event:
         sess.add(m.Diagnostic_Event(DiagnosticID=str(uuid.uuid4()), CreatedAt=stamp,
                                     Kind="stage_error", ExceptionClass="Timeout"))
+    elif table is m.Prompt_Log:
+        sess.add(m.Prompt_Log(LogID=str(uuid.uuid4()), CreatedAt=stamp,
+                              SessionID=str(uuid.uuid4()), SubsystemID=1, Stage="scenario",
+                              PromptVersion="1.0", ParseSucceeded=True))
     else:
         sess.add(m.Application_Log(LogID=str(uuid.uuid4()), CreatedAt=stamp, Level="INFO"))
 
@@ -279,5 +318,82 @@ def test_a_failing_purge_never_takes_the_reaper_down_with_it():
 
     removed = purge_expired_diagnostics(_BrokenSession())     # must not raise
 
-    assert removed == {"Diagnostic_Event": 0, "Application_Log": 0}, (
+    assert removed == {"Diagnostic_Event": 0, "Application_Log": 0, "Prompt_Log": 0}, (
         "a failed purge must report nothing removed, not pretend it worked")
+
+
+def test_a_horizon_of_zero_purges_nothing_and_asks_nothing(db, horizons):
+    """0 MEANS NEVER, not "keep zero days".
+
+    The same number reads just as naturally as a cutoff of today, and from the outside the two are
+    indistinguishable on the first tick — both delete nothing — right up until the second one
+    empties the table. So this pins the stronger property: with every horizon at 0 the purge issues
+    NO statement at all, however old the rows are."""
+    horizons(diagnostics_days=0, log_days=0, prompt_days=0)
+    from app.pipeline.reaper import purge_expired_diagnostics
+
+    with db() as sess:
+        for table in (m.Diagnostic_Event, m.Application_Log, m.Prompt_Log):
+            _add(sess, table, 3650)          # ten years old: no row is too new to be at risk
+        sess.commit()
+
+        counting = _CountingSession(sess)
+        removed = purge_expired_diagnostics(counting)
+
+        assert counting.statements == 0, (
+            "0 was treated as a horizon to sweep rather than as 'never' — a table an operator "
+            "switched purging OFF for is being queried, and one cutoff change from being emptied")
+        assert removed == {"Diagnostic_Event": 0, "Application_Log": 0, "Prompt_Log": 0}
+        for table in (m.Diagnostic_Event, m.Application_Log, m.Prompt_Log):
+            assert _count(sess, table) == 1, f"{table.__tablename__} was purged at a horizon of 0"
+
+
+def test_ninety_days_drops_the_old_row_and_keeps_the_recent_one(db, horizons):
+    """The shipped diagnostics horizon, at both of its edges in one pass. It was 30 days: the
+    report that sends anyone back to this table ("it was doing that a while ago too") arrives
+    weeks after the run, and the 100-day-old row below is exactly the one 30 days had already
+    thrown away."""
+    horizons(diagnostics_days=90, log_days=0, prompt_days=0)
+    from app.pipeline.reaper import purge_expired_diagnostics
+
+    with db() as sess:
+        _add(sess, m.Diagnostic_Event, 100)      # past 90 days -> purged
+        _add(sess, m.Diagnostic_Event, 10)       # inside 90    -> kept
+        sess.commit()
+
+        removed = purge_expired_diagnostics(sess)
+
+        assert removed["Diagnostic_Event"] == 1
+        assert _count(sess, m.Diagnostic_Event) == 1, (
+            "the 90-day horizon was not applied as written — either the 100-day-old row outlived "
+            "its retention, or the 10-day-old one was destroyed mid-investigation")
+
+
+def test_setting_one_horizon_never_re_times_another(db, horizons):
+    """THE FAILURE THIS SHAPE EXISTS TO PREVENT, and it is silent by construction.
+
+    Three tables, three settings, each read on its own. A shared cutoff — or one table quietly
+    borrowing another's number because it had none of its own — would mean an operator who
+    lengthens the diagnostics horizon has also, without being told, started keeping prompt text
+    for a quarter. Nothing in that change says so and nothing raises; the only way to find out is
+    to notice.
+
+    So: one long horizon, one short, one off, against rows of the SAME age. Each table's fate must
+    follow its own number and no other's."""
+    horizons(diagnostics_days=90, log_days=1, prompt_days=0)
+    from app.pipeline.reaper import purge_expired_diagnostics
+
+    with db() as sess:
+        for table in (m.Diagnostic_Event, m.Application_Log, m.Prompt_Log):
+            _add(sess, table, 30)            # one age, three different answers
+        sess.commit()
+
+        purge_expired_diagnostics(sess)
+
+        assert _count(sess, m.Diagnostic_Event) == 1, (
+            "a 30-day-old diagnostic died under a 90-day horizon — it was purged on some other "
+            "table's number")
+        assert _count(sess, m.Application_Log) == 0, "the 1-day log horizon was not applied"
+        assert _count(sess, m.Prompt_Log) == 1, (
+            "prompt receipts were purged although their own horizon is 0 (never) — the customer "
+            "evidence endpoint has silently lost every plan older than someone else's setting")

@@ -659,9 +659,12 @@ class Prompt_Log(Base):
     SubsystemID: Mapped[int] = mapped_column(Integer)
     Stage: Mapped[str] = mapped_column(Unicode(100))           # 'threats' | 'scenario'
     PromptVersion: Mapped[str] = mapped_column(Unicode(100))
-    Messages: Mapped[str] = mapped_column(UnicodeText)        # exact prompt sent, as the wire JSON structure
-    # The same prompt flattened to one readable string. Nullable: rows written before this column
-    # existed have no value, and TSG_Core.sql never backfills row data.
+    # The prompt, flattened to one readable string, and now the ONLY copy kept. It used to sit
+    # beside a `Messages` column holding the same prompt as the wire JSON envelope — two copies of
+    # the same bytes on the highest-volume table here, one row per LLM call. The envelope is
+    # deliberately not kept: role and content both survive in the flattened form, which is what the
+    # evidence endpoint shows, and nothing ever read the JSON. Nullable: rows written before this
+    # column existed have no value, and TSG_Core.sql never backfills row data.
     Prompt: Mapped[str | None] = mapped_column(UnicodeText)
     ResponseText: Mapped[str | None] = mapped_column(UnicodeText)                    # raw LLM reply, including malformed ones
     Model: Mapped[str | None] = mapped_column(Unicode(200))

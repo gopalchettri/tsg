@@ -20,12 +20,13 @@ WHAT IT CONTAINS
 
   Section 0   Snapshot isolation (and its own @disconnect_others switch)
   Section 1   The two switches for the run, then legacy names: repairs,
-              renames, and the five removed columns
+              renames, the five removed columns, and Prompt_Log.Messages
   Section 2   Tables (24)
-  Section 3   Columns (320), then three one-time data fixes
+  Section 3   Columns (319), then three one-time data fixes
   Section 4   Default constraints (22)
   Section 5   Check constraints (3)
-  Section 6   Indexes (35)
+  Section 6   Indexes (38), then the re-clustering and PAGE compression of the
+              four log tables
   Section 7   Verification
 
   Those counts are pinned to the script by tests/test_schema_sync.py, along with
@@ -189,7 +190,30 @@ EXPECT
   Lines beginning "renamed:", "repaired:", "applied:" that match what step 4
   said it would do.
   "DropRemovedColumns = 0: the five removed columns are left in place."
+  "removed column Prompt_Log.Messages (the prompt is kept in Prompt)." — see
+  the note below; this one does NOT wait for step 8.
+  "[REBUILD] PK_<table> is now NONCLUSTERED on ..." for Prompt_Log,
+  Application_Log and Diagnostic_Event, on a database built before this change.
+  "[FIXED]   <table> and every index on it are now PAGE compressed." for those
+  three and Scenario_Audit. Both lines read "[EXISTS] ..." on a later run.
   Two result sets at the end. Both should be empty.
+
+ONE COLUMN IS DROPPED HERE, NOT IN STEP 8
+  Prompt_Log.Messages held the same prompt as Prompt_Log.Prompt and nothing read
+  it. It is declared NOT NULL, so once the application stops writing it every
+  INSERT into Prompt_Log fails while the column is still there — "keep it for
+  now" is an outage on the next model call, not a safe default. Section 1e
+  therefore copies it into Prompt on any row that has not got one yet, and then
+  drops it, whatever the DropRemovedColumns switch says. If that copy fails the
+  column is KEPT and the first result set says so.
+
+THE FOUR LOG TABLES ARE REBUILT
+  Prompt_Log, Application_Log, Diagnostic_Event and Scenario_Audit are rewritten
+  in place: the first three are re-clustered on time instead of on their random
+  GUID key, and all four become PAGE compressed. Nothing about the data, the
+  columns or the queries changes. It is offline and it needs log space
+  proportional to the tables, so this step belongs in a maintenance window. A
+  second run reports "[EXISTS]" and rebuilds nothing.
 
 STOP IF
   sqlcmd returns a non-zero exit code, or the first result set has rows.
