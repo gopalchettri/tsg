@@ -33,6 +33,12 @@ class DiagnosticKind(StrEnum):
     stage_error = "stage_error"                # a stage failed and the session was settled
     transient_retry = "transient_retry"        # a hiccup that RECOVERED — see the class docstring
     retries_exhausted = "retries_exhausted"    # the retry budget ran out
+    # Neither of the two below is a failure, and that is exactly why they are recorded. A run that
+    # returns LESS than it was asked for, or a step that takes far longer than it should, raises
+    # nothing and settles normally — so without a row here the only evidence is a log line that
+    # scrolls away. These are the shapes that degrade quietly for weeks.
+    degraded_outcome = "degraded_outcome"      # finished, but delivered less or worse than asked
+    slow_step = "slow_step"                    # a step over the configured duration threshold
 
 
 class SessionMode(StrEnum):

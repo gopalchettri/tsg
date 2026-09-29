@@ -51,6 +51,7 @@ from app.api.deps import require_admin
 from app.api.schemas import UNAVAILABLE_RESPONSES, ApiModel
 from app.core import diagnostics
 from app.core.config import get_settings
+from app.core.diagnostic_backends import backend_status
 from app.core.logging import get_logger
 from app.db import models as m
 from app.db.dal import now
@@ -155,6 +156,11 @@ class DiagnosticConfig(ApiModel):
     #: Every accepted category name, read from the capture module rather than hand-listed, so this
     #: cannot describe a set the code no longer implements.
     known_categories: list[str]
+    #: Every registered destination, INCLUDING the disabled and unavailable ones. A destination
+    #: that is silently absent is the hardest observability problem there is to debug — someone
+    #: configures Prometheus, sees no data, and has nothing to look at. This is that something.
+    #: `failures` above zero means that destination is losing events right now.
+    backends: list[dict] = Field(default_factory=list)
 
 
 class DiagnosticConfigPatch(ApiModel):
@@ -286,7 +292,8 @@ def get_config() -> DiagnosticConfig:
     status = diagnostics.override_status()
     if not _detail():
         status["redis_error"] = None      # names hosts and ports; see the field comment
-    return DiagnosticConfig(known_categories=list(diagnostics.known_categories()), **status)
+    return DiagnosticConfig(known_categories=list(diagnostics.known_categories()),
+                            backends=backend_status(), **status)
 
 
 @router.patch("/config", response_model=DiagnosticConfig, responses=UNAVAILABLE_RESPONSES,

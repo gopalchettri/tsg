@@ -36,6 +36,7 @@ import traceback as _traceback
 from typing import Any
 
 from app.core.config import get_settings
+from app.core import diagnostic_backends as backends
 from app.core.diagnostic_writer import WRITER
 from app.core.enums import DiagnosticKind
 from app.core.logging import get_logger
@@ -45,21 +46,39 @@ log = get_logger(__name__)
 #: Category names an operator can switch on, mapped to the kinds each covers. `retries` is its own
 #: category because it is the one whose VOLUME an operator might want to decline: exceptions are
 #: rare by definition, retries spike during an outage.
-_CATEGORIES: dict[str, frozenset[DiagnosticKind]] = {
-    "exceptions": frozenset({DiagnosticKind.stage_error, DiagnosticKind.retries_exhausted}),
-    "retries": frozenset({DiagnosticKind.transient_retry}),
-    # `logs` is not a DiagnosticKind: it is the raw stream, which lands in Application_Log rather
-    # than Diagnostic_Event. It is a CATEGORY name so one setting governs everything, and it is
-    # checked by name in log_enabled() below.
-    "logs": frozenset(),
+#: Which CATEGORY each kind belongs to. One direction only — kind -> category — because a kind
+#: belongs to exactly one category and the reverse mapping is derivable. Two hand-maintained
+#: dictionaries pointing at each other is how a new kind ends up switchable by nothing.
+_KIND_CATEGORY: dict[DiagnosticKind, str] = {
+    DiagnosticKind.stage_error: "exceptions",
+    DiagnosticKind.retries_exhausted: "exceptions",
+    DiagnosticKind.transient_retry: "retries",
+    DiagnosticKind.degraded_outcome: "degraded",
+    DiagnosticKind.slow_step: "slow",
 }
+
+#: Log EVENT NAMES that mean "it finished, but worse than asked". Curated rather than inferred:
+#: every one of these is already being logged by the pipeline, so `degraded` costs no new
+#: instrumentation — it is a filter over a stream that already exists, which is what makes the
+#: category cheap enough to leave on permanently.
+_DEGRADED_EVENTS = frozenset({
+    "threats.partial_delivery",          # fewer threats admitted than the subsystem asked for
+    "llm.fallback_model_used",           # answered by the second model, not the configured one
+    "rerank_many.item_failed",           # one item dropped out of a rerank batch
+    "controls.rerank_item_failed",       # same, on the control-mapping side
+})
+
+#: Matched on the LAST dotted segment, not the whole name, because these events are built with an
+#: f-string prefix (`f"{kind}.lock_lost"` in cascade.py). A literal list would silently miss every
+#: prefix nobody thought to enumerate — which is the same open-list mistake that cancelled 6174F288.
+_DEGRADED_SEGMENT_PREFIXES = ("claim_lost", "lock_lost")
 
 #: Loggers whose records are NEVER captured, because capturing them is recursive: the DB layer
 #: emits log records, each captured record becomes an insert, and each insert emits more records.
 #: Left unguarded this is not a slow leak, it is an exponential one that takes the process out.
 #: Prefix match, so `sqlalchemy.engine.Engine` is covered by `sqlalchemy`.
 _NEVER_CAPTURE = ("sqlalchemy", "aioodbc", "pyodbc", "app.core.diagnostic_writer",
-                  "app.core.diagnostics")
+                  "app.core.diagnostics", "app.core.diagnostic_backends")
 
 
 #: Redis key holding the runtime override. ONE key, shared by the API process and every Celery
@@ -172,26 +191,22 @@ def override_status() -> dict[str, Any]:
 
 
 def known_categories() -> tuple[str, ...]:
-    """The accepted category names, so the admin endpoint validates against this module rather
-    than against a second hand-copied list that would drift the moment a category is added."""
-    return tuple(_CATEGORIES)
+    """The accepted category names, so the admin endpoint validates against the implementation
+    rather than a hand-copied list that would drift the moment a category is added.
+
+    Delegates to the backends module, which is where the list actually lives now: the API, the
+    operator guide and every backend must agree on it, and three copies is three chances to
+    disagree."""
+    from app.core.diagnostic_backends import CATEGORIES
+
+    return CATEGORIES
 
 
-def _enabled_kinds() -> frozenset[DiagnosticKind]:
-    """Which kinds the current configuration saves.
-
-    Resolved per call, deliberately: a cached settings lookup plus a cached override read. Reading
-    it live is what lets the runtime toggle take effect without some code path holding the old
-    answer for the life of the process."""
-    raw = active_categories()
-    if raw in {"", "none"}:
-        return frozenset()
-    if raw == "all":
-        return frozenset().union(*_CATEGORIES.values())
-    wanted = {part.strip() for part in raw.split(",") if part.strip()}
-    if not wanted:
-        return frozenset()
-    return frozenset().union(*(_CATEGORIES.get(name, frozenset()) for name in wanted))
+def _category_of(kind: DiagnosticKind) -> str:
+    """Which switch governs this kind. An unmapped kind falls under `exceptions` rather than
+    silently under nothing: a new kind that nobody can see is worse than one filed slightly wrong,
+    and `exceptions` is the category that is always on."""
+    return _KIND_CATEGORY.get(kind, "exceptions")
 
 
 def record(kind: DiagnosticKind, exc: BaseException, *, session_id: str | None = None,
@@ -203,37 +218,56 @@ def record(kind: DiagnosticKind, exc: BaseException, *, session_id: str | None =
     `client_message` is the sanitised text the tenant was shown. Storing it is what turns a report
     of "it said stage processing failed" into one query rather than a conversation.
     """
+    category = _category_of(kind)
     try:
-        if kind not in _enabled_kinds():
+        # The CHEAP gate first, before any formatting. Building a traceback string for an event
+        # nobody is recording is pure waste, and `retries` fires in bursts during exactly the
+        # outage when there is least headroom to waste.
+        if not backends.wants_any(category):
             return
         # Imported here, not at module import: app.db pulls in the engine, and this module is
         # imported by app.core, which must stay loadable without a database.
-        from app.db.dal import guid, now
+        from app.db.dal import now
 
-        tb = "".join(_traceback.format_exception(type(exc), exc, exc.__traceback__))
-        client = (client_message or "")[:1000] or None
-        row = {
-            "DiagnosticID": guid(), "CreatedAt": now(), "SessionID": session_id,
-            "TenantID": tenant_id, "EntityID": entity_id, "SubsystemID": subsystem_id,
-            "TaskID": task_id, "RequestID": _request_id(), "Kind": str(kind),
+        backends.emit(backends.DiagnosticEvent(
+            ts=now(), category=category, kind=str(kind), level="ERROR",
+            session_id=session_id, tenant_id=tenant_id, entity_id=entity_id,
+            subsystem_id=subsystem_id, task_id=task_id, request_id=_request_id(),
             # ALWAYS the class, whatever the classifier made of it. For 6174F288 this alone would
             # have said "Timeout" where every durable surface said "stage processing failed".
-            "ExceptionClass": type(exc).__name__,
-            "ExceptionMessage": str(exc)[:4000] or None,
-            "Traceback": tb,
-            "ClientMessage": client,
-            "ContextJSON": json.dumps(context, default=str) if context else None,
-        }
-        # QUEUED, never inserted here. Off the caller's thread entirely: the caller may be
-        # mid-rollback, holds a lock, and in the `logs` case is in the middle of a log call that
-        # must not perform IO. diagnostic_writer batches and owns its own connection.
-        WRITER.submit("Diagnostic_Event", row, get_settings().diagnostic_queue_max)
+            exception_class=type(exc).__name__,
+            exception_message=str(exc)[:4000] or None,
+            traceback="".join(_traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            client_message=client_message,
+            context=context or {}))
     except Exception as write_failure:  # noqa: BLE001 — see the module docstring
         # stdout is the fallback and is always available. The ORIGINAL exception is logged here
         # too, because losing it is the one outcome worse than losing the diagnostic row.
         log.warning("diagnostic.write_failed", kind=str(kind),
                     write_error=f"{type(write_failure).__name__}: {write_failure}"[:300],
                     original_error=f"{type(exc).__name__}: {exc}"[:300])
+
+
+def record_slow_step(*, step: str, duration_ms: float, session_id: str | None = None,
+                     context: dict[str, Any] | None = None) -> None:
+    """Record one step that took longer than the configured threshold. Never raises.
+
+    THE EARLY WARNING THE RETRY FIX OTHERWISE REMOVES. A provider that has gone from 2s to 80s is
+    still succeeding, so nothing fails, nothing retries, and no other surface says a word — until
+    it crosses the timeout and starts cancelling sessions. The step that is merely slow is the one
+    observation that arrives before the incident does."""
+    try:
+        if not backends.wants_any("slow"):
+            return
+        from app.db.dal import now
+
+        backends.emit(backends.DiagnosticEvent(
+            ts=now(), category="slow", kind=str(DiagnosticKind.slow_step), level="WARNING",
+            event=step, session_id=session_id, duration_ms=duration_ms,
+            exception_message=f"{step} took {duration_ms:.0f} ms",
+            context={**(context or {}), "duration_ms": duration_ms}))
+    except Exception:  # noqa: BLE001 — observability must never break what it observes
+        pass
 
 
 def _request_id() -> str | None:
@@ -250,46 +284,78 @@ def _request_id() -> str | None:
 
 
 def log_enabled() -> bool:
-    """Is the raw log stream being captured? Read per record, so the runtime toggle takes effect
-    without a restart and without this module holding a stale answer."""
-    raw = active_categories()
-    return raw == "all" or "logs" in {p.strip() for p in raw.split(",")}
+    """Is the raw log stream being captured by ANY destination?
+
+    Asks the backends rather than parsing the setting itself — with a second destination present,
+    "is it enabled" stops being a question about one config string, and a local answer would be
+    right only by accident."""
+    return backends.wants_any("logs")
+
+
+def is_degraded_event(event_name: str) -> bool:
+    """Does this log event mean "it finished, but worse than asked"?
+
+    Matched on the LAST dotted segment as well as the whole name, because some of these are built
+    with an f-string prefix. An exact-name list would silently miss every prefix nobody thought to
+    enumerate — the same open-list mistake that let a timeout cancel 6174F288."""
+    if event_name in _DEGRADED_EVENTS:
+        return True
+    return event_name.rsplit(".", 1)[-1].startswith(_DEGRADED_SEGMENT_PREFIXES)
 
 
 def capture_log_record(logger, method_name, event_dict):
-    """structlog processor: queue this event for Application_Log, then pass it through unchanged.
+    """structlog processor: record this event, then pass it through unchanged.
 
     A PROCESSOR, not a logging handler. structlog uses PrintLoggerFactory here and bypasses stdlib
     logging entirely, so a stdlib handler would see the FOREIGN records (uvicorn, sqlalchemy) and
     miss every application event — the opposite of what is wanted. Sitting in the processor chain
     catches app events, which is the half worth keeping.
 
+    TWO CATEGORIES COME OUT OF ONE STREAM. Most lines are `logs`. A curated few also mean the run
+    delivered less than it was asked for, and those are additionally recorded as `degraded` — which
+    is why that category costs no new instrumentation anywhere in the pipeline. It is a filter over
+    a stream that already exists.
+
+    RECORDED UNDER BOTH when both are enabled, deliberately. Routing a degraded line to `degraded`
+    INSTEAD of `logs` would punch silent holes in a stream whose whole contract is "every line at
+    INFO and above" — and a stream with holes you cannot see is worse than a few duplicated rows.
+
     Returns event_dict unchanged on EVERY path, including failure: a processor that raises, or that
     drops the dict, silences the log line it was meant to record.
     """
     try:
-        if not log_enabled():
-            return event_dict
+        wants_logs = backends.wants_any("logs")
         name = getattr(logger, "name", "") or event_dict.get("logger") or ""
+        event_name = str(event_dict.get("event", "") or "")
+        degraded = backends.wants_any("degraded") and is_degraded_event(event_name)
+        if not (wants_logs or degraded):
+            return event_dict
+        # The RECURSION GUARD, and it has to sit above every emit below. The DB layer emits log
+        # records; capturing them turns one insert into more records into more inserts. Unguarded
+        # this is exponential, not a leak.
         if any(str(name).startswith(p) for p in _NEVER_CAPTURE):
             return event_dict
         level = str(event_dict.get("level", method_name) or "").upper()
         if level not in _CAPTURED_LEVELS:
             return event_dict
 
-        from app.db.dal import guid, now
+        from app.db.dal import now
 
         known = {"event", "level", "logger", "timestamp", "session_id", "request_id", "task_id"}
-        WRITER.submit("Application_Log", {
-            "LogID": guid(), "CreatedAt": now(), "Level": level[:20],
-            "Logger": (str(name) or None) and str(name)[:200],
-            "Event": str(event_dict.get("event", ""))[:500] or None,
-            "SessionID": _text(event_dict.get("session_id")),
-            "RequestID": _text(event_dict.get("request_id")),
-            "TaskID": _text(event_dict.get("task_id")),
-            "FieldsJSON": json.dumps({k: v for k, v in event_dict.items() if k not in known},
-                                     default=str) or None,
-        }, get_settings().diagnostic_queue_max)
+        common = {
+            "ts": now(), "level": level, "logger": str(name)[:200] or None,
+            "event": event_name[:500] or None,
+            "session_id": _text(event_dict.get("session_id")),
+            "request_id": _text(event_dict.get("request_id")),
+            "task_id": _text(event_dict.get("task_id")),
+            "context": {k: v for k, v in event_dict.items() if k not in known},
+        }
+        if wants_logs:
+            backends.emit(backends.DiagnosticEvent(category="logs", **common))
+        if degraded:
+            backends.emit(backends.DiagnosticEvent(
+                category="degraded", kind=str(DiagnosticKind.degraded_outcome),
+                exception_message=event_name[:4000] or None, **common))
     except Exception:  # noqa: BLE001 — a log line must survive its own capture failing
         pass
     return event_dict

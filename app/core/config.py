@@ -151,6 +151,26 @@ class Settings(BaseSettings):
     # rather than a default.
     diagnostic_public_detail: bool = Field(
         False, validation_alias=AliasChoices("TSG_DIAGNOSTIC_PUBLIC_DETAIL"))
+    # TSG_DIAGNOSTIC_BACKENDS_DISABLED — destinations that must stop receiving diagnostics,
+    # comma separated. Normally empty.
+    #
+    # THE INVERSION, and it is deliberate. A destination is ON as soon as it is available —
+    # registered, with its prerequisites met — rather than waiting to be named in an allowlist.
+    # Configuring the prerequisite IS the opt-in; an allowlist means someone installs Prometheus,
+    # configures the scrape, sees no data, and spends an afternoon finding the second switch they
+    # were also supposed to set. This is the kill switch for the other direction, and it is the
+    # HIGHEST precedence there is: a name here cannot be re-enabled by any runtime override, which
+    # is what makes it usable during an incident.
+    diagnostic_backends_disabled: str = Field(
+        "", validation_alias=AliasChoices("TSG_DIAGNOSTIC_BACKENDS_DISABLED"))
+    # TSG_DIAGNOSTIC_SLOW_STEP_MS — how long one traced step may take before it is recorded under
+    # the `slow` category. Only has an effect while `slow` is being captured.
+    #
+    # Default 5000. A step waiting on an unresponsive AI service usually appears here FIRST, before
+    # it fails outright — which is the early warning the whole retry fix otherwise removes, since a
+    # call that eventually succeeds leaves no other trace.
+    diagnostic_slow_step_ms: int = Field(
+        5000, ge=1, validation_alias=AliasChoices("TSG_DIAGNOSTIC_SLOW_STEP_MS"))
     # TSG_TRACE_DIR — where file sinks (and log_file) write; relative = PROJECT ROOT, never CWD.
     trace_dir: str = Field(
         "logs/trace", validation_alias=AliasChoices("TRACE_DIR", "TSG_TRACE_DIR"))

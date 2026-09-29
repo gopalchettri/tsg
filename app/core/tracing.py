@@ -68,9 +68,34 @@ _RULE = "-" * 76
 
 
 def active_sinks() -> frozenset[str]:
-    """The enabled sink names. Empty frozenset = tracing off."""
+    """The enabled sink names. Empty frozenset = tracing off.
+
+    `diag` is a FOURTH SINK that nobody configures in TSG_TRACE_SINKS: it switches itself on
+    whenever the `slow` diagnostic category is being captured. That indirection closes a real gap —
+    a step is only measured when at least one sink is live, and all three configurable sinks are
+    OFF by default in every environment. Deriving `slow` from them would have meant the category
+    appeared in the settings, in the API and in the operator guide while recording nothing at all,
+    anywhere, unless somebody had separately thought to turn tracing on.
+    """
     raw = get_settings().trace_sinks or ""
-    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+    sinks = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if _slow_capture_enabled():
+        sinks.add("diag")
+    return frozenset(sinks)
+
+
+def _slow_capture_enabled() -> bool:
+    """Is any destination recording slow steps right now?
+
+    Imported lazily and wrapped: this module must not import app.core.logging at module level
+    (logging.py imports open_rotating_writer from HERE, and the dependency has to run one way),
+    and tracing must never be the thing that breaks because diagnostics is unhappy."""
+    try:
+        from app.core import diagnostic_backends
+
+        return diagnostic_backends.wants_any("slow")
+    except Exception:  # noqa: BLE001 — degrades to the configured sinks, never to an error
+        return False
 
 
 def trace_dir() -> Path:
@@ -257,6 +282,29 @@ class trace_step:
         if "log" in self._sinks:
             getattr(structlog.get_logger().bind(logger="app.core.tracing"), level)(
                 "trace.step", **self._record(phase, fields, status, duration_ms))
+        # END only, and only over the threshold. A BEGIN has no duration, and recording every
+        # finished step would put this table on the same volume curve as the raw log stream —
+        # which is the one thing the `slow` category exists to avoid being.
+        if ("diag" in self._sinks and phase == "END" and duration_ms is not None
+                and duration_ms >= get_settings().diagnostic_slow_step_ms):
+            self._record_slow(fields, status, duration_ms)
+
+    def _record_slow(self, fields: dict[str, Any], status: str | None,
+                     duration_ms: float) -> None:
+        """Hand one over-threshold step to diagnostics. Never raises, never blocks.
+
+        WHAT THIS CATCHES THAT NOTHING ELSE DOES. A provider that has gone from 2s to 80s is still
+        SUCCEEDING — nothing fails, nothing retries, and no other surface says a word — right up
+        until it crosses the timeout and starts cancelling sessions. The step that is merely slow
+        is the only observation that arrives before the incident does."""
+        try:
+            from app.core.diagnostics import record_slow_step
+
+            record_slow_step(step=self._step, duration_ms=duration_ms, session_id=self._sid,
+                             context={"status": status, "loc": self._loc,
+                                      **{k: v for k, v in fields.items() if k != "error"}})
+        except Exception:  # noqa: BLE001 — tracing must never break the step it is timing
+            pass
 
     def _record(self, phase: str, fields: dict[str, Any], status: str | None,
                 duration_ms: float | None) -> dict[str, Any]:
