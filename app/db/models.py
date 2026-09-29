@@ -108,10 +108,12 @@ class Scenario_Session(Base):
 
 class Subsystem_Stage_State(Base):
     __tablename__ = "Subsystem_Stage_State"
+    # TenantID/EntityID were unrefreshed copies of Scenario_Session's, which SessionID (NOT NULL
+    # here) already reaches; nothing ever filtered them, so a copy that drifted could only mislead
+    # an investigator into trusting the wrong tenancy. CreatedAt was stamped for every level at
+    # once by set_up_progress_tracking, so it answered session-creation time, never this row's.
     StateID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
-    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
-    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
     Level: Mapped[str] = mapped_column(Unicode(100))
     Status: Mapped[str] = mapped_column(Unicode(100))
@@ -121,13 +123,15 @@ class Subsystem_Stage_State(Base):
     HeartbeatAt: Mapped[datetime | None] = mapped_column(DateTime)
     AttemptCount: Mapped[int] = mapped_column(Integer, default=0)
     ErrorMessage: Mapped[str | None] = mapped_column(UnicodeText)
+    # Touched by every stage write, and NOT dead bookkeeping: control_mapping's step-4 sweep both
+    # filters on it (`UpdatedAt < cutoff`, the settle window that keeps a just-finished stage out
+    # of the queue) and orders the queue by it, oldest first. Drop it and that sweep loses the only
+    # column that makes its TOP-N deterministic, which is how a doomed session starves the rest.
     UpdatedAt: Mapped[datetime] = mapped_column(DateTime)
-    # Nullable so the seeds' explicit column lists stay valid; the DDL defaults it.
-    CreatedAt: Mapped[datetime | None] = mapped_column(DateTime)
     # The stage's wall-clock span, and the ONLY source the API uses for per-stage duration.
     # UpdatedAt cannot substitute: claim_stage, renew_lease, lease_keeper, release_lock AND
-    # finish_stage all overwrite it. CreatedAt cannot either: pipeline_common.set_up_progress_
-    # tracking stamps every level at once, so it is a session-creation time.
+    # finish_stage all overwrite it — which is exactly what makes it the sweep's staleness clock
+    # above, and useless as a span.
     # StartedAt is the start of the attempt that produced the CURRENT result, not a first-attempt
     # stamp - claim_stage overwrites it on a re-claim, in step with AttemptCount, and clears
     # FinishedAt at the same time; reset_stage_for_regen clears both. EVERY terminal write stamps
@@ -137,20 +141,21 @@ class Subsystem_Stage_State(Base):
     FinishedAt: Mapped[datetime | None] = mapped_column(DateTime)
 
 # ---------------------------------------------------------------------------
-# Pipeline outputs (entity resolved via the session; carry TenantID+SubsystemID)
+# Pipeline outputs (entity and tenancy resolved via the session; carry SubsystemID)
 #
-# `UserID` here is PROVENANCE inherited from Scenario_Session.UserID — the accountable session
-# owner, never the author: every row is worker-written from LLM output. Hence no ActorType
-# companion; it would read 'system' on 100% of rows. Scenario_Audit needs one because it is the
-# only table where human- and worker-written rows share a column.
+# TenantID/EntityID/UserID USED TO BE DUPLICATED onto every table below, copied from
+# Scenario_Session at insert and never refreshed afterwards. All four tables have SessionID NOT
+# NULL, so the session's own columns — the NOT NULL authz truth — are one join away and always
+# current. Keeping the copies bought nothing: no query in this codebase ever filtered them, so
+# their only reachable future was to disagree with the session they were copied from and send a
+# reader to the wrong tenant. Authorization is enforced on Scenario_Session.EntityID; read it
+# there. SubsystemID stays — it is a real per-row fact, filtered in a dozen queries and the
+# second key of three indexes.
 # ---------------------------------------------------------------------------
 class Identified_Threat(Base):
     __tablename__ = "Identified_Threat"
     ThreatID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
-    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
-    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
-    UserID: Mapped[str | None] = mapped_column(Unicode(200))
     # 0 = the asset itself (tasks.ASSET_UNIT_ID); >= 1 = one supporting system.
     # ONE threat produces SEVERAL rows: the asset row plus a copy, with its own ThreatID, on
     # every supporting system a tech_gate does not rule out. The asset row is the WORKING row
@@ -215,9 +220,6 @@ class Identified_Duplicate_Threat(Base):
     __tablename__ = "Identified_Duplicate_Threat"
     DuplicateThreatID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
-    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
-    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
-    UserID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
     ThreatCategory: Mapped[str] = mapped_column(Unicode(200))
     ThreatType: Mapped[str] = mapped_column(Unicode(300))
@@ -235,9 +237,6 @@ class Scoped_Threat(Base):
     __tablename__ = "Scoped_Threat"
     ScopedThreatID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
-    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
-    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
-    UserID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
     ThreatID: Mapped[str] = mapped_column(GUID)
     Score: Mapped[float] = mapped_column(Float)
@@ -270,9 +269,6 @@ class Threat_Scenario(Base):
     )
     ScenarioID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
-    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
-    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
-    UserID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int] = mapped_column(Integer)
     ScopedThreatID: Mapped[str] = mapped_column(GUID)
     Status: Mapped[str] = mapped_column(Unicode(100))
@@ -423,10 +419,15 @@ class Risk_Treatment_Plan(Base):
     PlanID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
     ScenarioID: Mapped[str] = mapped_column(GUID)               # the accepted Threat_Scenario
-    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
+    # TenantID went the way of every other copy of it — nothing filtered it, and its only consumer
+    # was the Scenario_Audit copy that went at the same time. EntityID STAYS, though it looks like
+    # exactly the same kind of column: the treatment audit writers (api/treatment.py ~891/991/1010
+    # and pipeline/treatment.py ~585) read it off THIS row to stamp Scenario_Audit.EntityID, and
+    # the entity-wide compliance feed filters on that. No code performs the SessionID join that
+    # would replace it, so dropping it would silently empty that feed for every entity.
+    # CrmRiskIdentificationID was written as the literal None on every row that ever existed.
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))  # copied from the session (authz boundary)
     UserID: Mapped[str | None] = mapped_column(Unicode(200))    # requesting principal (provenance)
-    CrmRiskIdentificationID: Mapped[int | None] = mapped_column(Integer)  # reserved; unused — the register sends risk data in the request body, no lookup
     TreatmentStrategy: Mapped[str] = mapped_column(Unicode(100))   # 'Mitigate' only in v1
     Status: Mapped[str] = mapped_column(Unicode(100))         # StageStatus subset: RUNNING | COMPLETE | ERROR
     ActiveTaskID: Mapped[str | None] = mapped_column(Unicode(100))  # Celery claim / redelivery fence
@@ -655,12 +656,20 @@ class Config_Tuning(Base):
 # NEVER put in ErrorMessage/audit/SSE (all client-visible) — only here.
 class Prompt_Log(Base):
     __tablename__ = "Prompt_Log"
+    # TenantID/EntityID/UserID were unrefreshed copies of Scenario_Session's, reachable through
+    # SessionID (NOT NULL here) and filtered by nothing. SubsystemID went too: this is the ONE
+    # table where it is not a real fact — elsewhere it is filtered in a dozen queries and keys
+    # three indexes, but an LLM call is correlated by CorrelationID, so it only ever recorded which
+    # code path happened to be running.
+    #
+    # Stage STAYS, by the owner's explicit instruction, and the reason is worth recording because
+    # no application query justifies it: docs/API_Smoke_Testing_Simple_Guide.md tells an operator to
+    # run `SELECT Stage, ParseSucceeded, Model, CreatedAt FROM Prompt_Log WHERE SessionID=...` when
+    # checking a run by hand. That is a real consumer this schema is not free to break — it is
+    # simply one that lives in a document rather than in code, which is exactly the kind of reader
+    # a grep of app/ cannot see. Keep this table narrow otherwise: one row per LLM call.
     LogID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
-    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
-    EntityID: Mapped[str | None] = mapped_column(Unicode(200))
-    UserID: Mapped[str | None] = mapped_column(Unicode(200))  # provenance — see pipeline outputs above
-    SubsystemID: Mapped[int] = mapped_column(Integer)
     Stage: Mapped[str] = mapped_column(Unicode(100))           # 'threats' | 'scenario'
     PromptVersion: Mapped[str] = mapped_column(Unicode(100))
     # The prompt, flattened to one readable string, and now the ONLY copy kept. It used to sit
@@ -742,8 +751,13 @@ class Diagnostic_Event(Base):
     CreatedAt: Mapped[datetime] = mapped_column(DateTime)
     #: Every id an operator might pivot on. All nullable: a diagnostic must never fail to record
     #: because the failure happened somewhere that lacks one of them.
+    # TenantID went, and its published `tenant_id` response field went with it rather than being
+    # left to answer null forever — an always-null field cannot be told apart from "no tenant", and
+    # support reads this route during an incident. EntityID STAYS: SessionID is NULLABLE here
+    # (a diagnostic must record even when the failure had no session), so unlike every other table
+    # in this change there is no join back to Scenario_Session, and on a session-less row EntityID
+    # is the only scoping id there is.
     SessionID: Mapped[str | None] = mapped_column(GUID)
-    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
     SubsystemID: Mapped[int | None] = mapped_column(Integer)
     #: The Celery task and the HTTP request, so a user's "it failed" turns into one lookup.
@@ -764,9 +778,15 @@ class Diagnostic_Event(Base):
 
 class Scenario_Audit(Base):
     __tablename__ = "Scenario_Audit"
+    # TenantID went: it was never a predicate anywhere, and tenancy is enforced on EntityID.
+    # EntityID STAYS and is load-bearing — entity_treatment_audit_rows filters it to build the
+    # entity-wide compliance export, so every writer must keep stamping it. Granularity went
+    # because it was written, SELECTed, and then dropped before serialization — a pure round trip
+    # that looked like a published field; ThreatTypeRefID appeared in no SELECT at all. Neither
+    # loss is recoverable from DetailJSON, which is why nothing may start reading them again
+    # without adding the column back deliberately.
     AuditID: Mapped[str] = mapped_column(GUID, primary_key=True)
     SessionID: Mapped[str] = mapped_column(GUID)
-    TenantID: Mapped[str | None] = mapped_column(Unicode(200))
     EntityID: Mapped[str | None] = mapped_column(Unicode(200))
     # WorkflowStage this event belongs to. NULL on events that are not a stage transition
     # (session_started, subsystem_advanced) and on stage_error, which cannot know which of the
@@ -793,9 +813,6 @@ class Scenario_Audit(Base):
     # written, the index comes back with it. NULL on every non-plan event.
     PlanID: Mapped[str | None] = mapped_column(GUID)
     Decision: Mapped[str | None] = mapped_column(Unicode(100))  # accept only — AuditDecision; NULL elsewhere
-    Granularity: Mapped[str | None] = mapped_column(Unicode(100))  # regeneration_completed only
-    ThreatTypeRefID: Mapped[int | None] = mapped_column(Integer)  # library_promoted +
-    # candidate_reconciled (approvals: the minted/linked type)
     # WHO ACTUALLY DID IT: the authenticated principal on human actions, NULL on worker-written
     # rows. NULL is INFORMATION, not missing data — read ActorType beside it. This used to be
     # back-filled from Scenario_Session.UserID, which stamped every pipeline step with the session

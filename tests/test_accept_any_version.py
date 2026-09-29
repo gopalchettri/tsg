@@ -93,10 +93,10 @@ def _seed_session(Session, *, at_review: bool = True) -> str:
         for level, status in ((SubsystemLevel.LOCK, StageStatus.IDLE),
                               (SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION)):
             s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-                StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="86",
+                StateID=str(uuid.uuid4()), SessionID=sid,
                 SubsystemID=0, Level=level, Status=status, GenerationEpoch=1,
                 LeaseExpiresAt=_now() + timedelta(minutes=10), AttemptCount=1,
-                UpdatedAt=_now(), CreatedAt=_now()))
+                UpdatedAt=_now()))
         s.commit()
     return sid
 
@@ -107,7 +107,7 @@ def _scenario(Session, sid: str, *, identity: str, number: int = 1, superseded: 
     oid = str(uuid.uuid4())
     with Session() as s:
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=oid, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=oid, SessionID=sid,
             SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=status,
             ScenarioJSON=json.dumps({"scenario_title": title, "scenario_statement": "s",
                                      "risk_statement": "r"}),
@@ -286,7 +286,7 @@ def test_plan_board_and_history_see_accepted_superseded_row(monkeypatch):
         assert [r["ScenarioID"] for r in board] == [b]
         # board-form history: a retired plan row hanging off the ACCEPTED (superseded) scenario
         s.execute(m.Risk_Treatment_Plan.__table__.insert().values(
-            PlanID=str(uuid.uuid4()), SessionID=sid, ScenarioID=b, TenantID="t", EntityID="86",
+            PlanID=str(uuid.uuid4()), SessionID=sid, ScenarioID=b, EntityID="86",
             Status=str(StageStatus.COMPLETE), TreatmentStrategy="Mitigate", Superseded=1,
             CreatedAt=_now(), UpdatedAt=_now()))
         s.commit()

@@ -3,7 +3,7 @@
 
   Script:      016_Identified_Duplicate_Threat.sql
   Order:       01_tables / 016
-  Purpose:     Create Identified_Duplicate_Threat, or bring an existing copy up to 15 columns.
+  Purpose:     Create Identified_Duplicate_Threat, or bring an existing copy up to 12 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Identified_Duplicate_Threat
@@ -25,9 +25,6 @@ BEGIN
     CREATE TABLE dbo.[Identified_Duplicate_Threat] (
         [DuplicateThreatID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
-        [UserID] NVARCHAR(200) NULL,
         [SubsystemID] INT NOT NULL,
         [ThreatCategory] NVARCHAR(200) NOT NULL,
         [ThreatType] NVARCHAR(300) NOT NULL,
@@ -40,7 +37,7 @@ BEGIN
         [CreatedAt] DATETIME2(7) NULL,
         CONSTRAINT [PK_Identified_Duplicate_Threat] PRIMARY KEY CLUSTERED ([DuplicateThreatID])
     );
-    PRINT ' [CREATED] Table: Identified_Duplicate_Threat (15 columns)';
+    PRINT ' [CREATED] Table: Identified_Duplicate_Threat (12 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Identified_Duplicate_Threat';
@@ -52,12 +49,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column =
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'UserID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'SubsystemID',
      @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'ThreatCategory',
@@ -87,5 +78,5 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Identified_Duplicate_Threat', @known = N'DuplicateThreatID,SessionID,TenantID,EntityID,UserID,SubsystemID,ThreatCategory,ThreatType,ThreatName,GenericName,ThreatActorsJSON,DuplicateOfThreatID,DuplicateReason,SimilarityScore,CreatedAt';
+EXEC dbo.tsg_report_extra_columns @table = N'Identified_Duplicate_Threat', @known = N'DuplicateThreatID,SessionID,SubsystemID,ThreatCategory,ThreatType,ThreatName,GenericName,ThreatActorsJSON,DuplicateOfThreatID,DuplicateReason,SimilarityScore,CreatedAt';
 GO

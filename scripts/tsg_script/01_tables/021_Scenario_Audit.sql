@@ -3,7 +3,7 @@
 
   Script:      021_Scenario_Audit.sql
   Order:       01_tables / 021
-  Purpose:     Create Scenario_Audit, or bring an existing copy up to 16 columns.
+  Purpose:     Create Scenario_Audit, or bring an existing copy up to 13 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Scenario_Audit
@@ -25,7 +25,6 @@ BEGIN
     CREATE TABLE dbo.[Scenario_Audit] (
         [AuditID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
         [EntityID] NVARCHAR(200) NULL,
         [Stage] NVARCHAR(100) NULL,
         [SubsystemID] INT NULL,
@@ -33,15 +32,13 @@ BEGIN
         [ScenarioID] UNIQUEIDENTIFIER NULL,
         [PlanID] UNIQUEIDENTIFIER NULL,
         [Decision] NVARCHAR(100) NULL,
-        [Granularity] NVARCHAR(100) NULL,
-        [ThreatTypeRefID] INT NULL,
         [ActorUserID] NVARCHAR(200) NULL,
         [ActorType] NVARCHAR(100) NULL,
         [DetailJSON] NVARCHAR(max) NULL,
         [CreatedAt] DATETIME2(7) NOT NULL,
         CONSTRAINT [PK_Scenario_Audit] PRIMARY KEY CLUSTERED ([AuditID])
     );
-    PRINT ' [CREATED] Table: Scenario_Audit (16 columns)';
+    PRINT ' [CREATED] Table: Scenario_Audit (13 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Scenario_Audit';
@@ -66,8 +63,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'AuditID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'EntityID',
      @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'Stage',
@@ -82,10 +77,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'PlanID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'Decision',
      @expected = N'NVARCHAR(100)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'Granularity',
-     @expected = N'NVARCHAR(100)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'ThreatTypeRefID',
-     @expected = N'INT', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'ActorUserID',
      @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'ActorType',
@@ -161,5 +152,5 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Scenario_Audit', @known = N'AuditID,SessionID,TenantID,EntityID,Stage,SubsystemID,EventType,ScenarioID,PlanID,Decision,Granularity,ThreatTypeRefID,ActorUserID,ActorType,DetailJSON,CreatedAt';
+EXEC dbo.tsg_report_extra_columns @table = N'Scenario_Audit', @known = N'AuditID,SessionID,EntityID,Stage,SubsystemID,EventType,ScenarioID,PlanID,Decision,ActorUserID,ActorType,DetailJSON,CreatedAt';
 GO

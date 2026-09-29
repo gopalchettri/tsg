@@ -74,8 +74,7 @@ def _seed(Session) -> None:
             SubsystemsJSON="[]", AssetContextJSON="{}",
             CreatedAt=_now(), UpdatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=SCENARIO_ID, SessionID=SESSION_ID, TenantID="t", EntityID="86",
-            UserID="u1", SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status="complete",
+            ScenarioID=SCENARIO_ID, SessionID=SESSION_ID, SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status="complete",
             ScenarioJSON=json.dumps({"scenario_title": "T", "scenario_statement": "s",
                                      "risk_statement": "r"}),
             Accepted=1, Superseded=0, IdentityHash="a" * 64, ScenarioNumber=1,
@@ -626,7 +625,7 @@ def test_index_arbitrates_double_active_insert():
     _seed(Session)
 
     def _plan_row(plan_id):
-        return dict(PlanID=plan_id, SessionID=SESSION_ID, ScenarioID=SCENARIO_ID, TenantID="t",
+        return dict(PlanID=plan_id, SessionID=SESSION_ID, ScenarioID=SCENARIO_ID,
                     EntityID="86", Status=str(StageStatus.RUNNING),
                     TreatmentStrategy="Mitigate", InputSnapshotJSON="{}", Superseded=0,
                     CreatedAt=_now(), UpdatedAt=_now())

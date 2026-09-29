@@ -190,9 +190,9 @@ def _semantic_duplicates(llm: LLMClient, sid: str, ss: int,
     return dupes
 
 
-def _build_threat_records(tid: str, sid: str, tenant: str, ss: int, ptype: str | None, pcat: str | None,
-                        pname: str | None, gr: grounding.GroundingResult, entity_id: str | None,
-                        user_id: str | None, generic_name: str | None = None,
+def _build_threat_records(tid: str, sid: str, ss: int, ptype: str | None, pcat: str | None,
+                        pname: str | None, gr: grounding.GroundingResult,
+                        generic_name: str | None = None,
                         category_id: int | None = None, ai_generated: bool | None = None,
                         type_ai_generated: bool | None = None) -> tuple[dict, dict]:
     """Build the database row and the pipeline summary for one threat.
@@ -201,8 +201,7 @@ def _build_threat_records(tid: str, sid: str, tenant: str, ss: int, ptype: str |
     caller that KNOWS who wrote the threat — the hand-written save passes False for both, so a
     person's threat is never reported as the AI's whatever the library lookup returned."""
     row = {
-        "ThreatID": tid, "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
-        "SubsystemID": ss,
+        "ThreatID": tid, "SessionID": sid, "SubsystemID": ss,
         "ThreatCategory": pcat, "ThreatType": ptype,
         "ThreatName": pname,
         # A generic (library-ready) version of ThreatName, saved so that later triage (when
@@ -265,7 +264,6 @@ def _duplicate_row(row: dict, reason: DuplicateReason, *,
     was dropped and (when known) what it matched. Audit-only; never read by the pipeline."""
     return {
         "DuplicateThreatID": row["ThreatID"], "SessionID": row["SessionID"],
-        "TenantID": row["TenantID"], "EntityID": row["EntityID"], "UserID": row["UserID"],
         "SubsystemID": row["SubsystemID"],
         "ThreatCategory": row["ThreatCategory"], "ThreatType": row["ThreatType"],
         "ThreatName": row["ThreatName"], "GenericName": row["GenericName"],
@@ -415,8 +413,7 @@ def _reconcile_proposal_categories(proposals: list, canonical: dict[str, list[st
     return moved
 
 
-def _build_retrieved_records(cand: dict, sid: str, tenant: str, ss: int,
-                            scenario_session: dict, assigned_category: str,
+def _build_retrieved_records(cand: dict, sid: str, ss: int, assigned_category: str,
                             category_id: int | None = None) -> tuple[dict, dict]:
     """Build the database row and summary for a gate-admitted library candidate.
 
@@ -449,9 +446,8 @@ def _build_retrieved_records(cand: dict, sid: str, tenant: str, ss: int,
         threshold_origin="not_applicable")
     pcat = (assigned_category or "")[:200]
     row, summary = _build_threat_records(
-        guid(), sid, tenant, ss, cand["type_name"][:300], pcat, cand["threat_name"][:500],
-        gr, scenario_session["EntityID"], scenario_session.get("UserID"),
-        generic_name=cand["threat_name"],
+        guid(), sid, ss, cand["type_name"][:300], pcat, cand["threat_name"][:500],
+        gr, generic_name=cand["threat_name"],
         category_id=category_id)
     # Additive keys, ignored by _dedup_key/scoring: full multi-category membership for the
     # coverage grid, plus retrieval/gate provenance for the audit trail.
@@ -655,16 +651,15 @@ def _select_library_candidates(sid: str, r: _IdentificationRound, target: dict[s
     return selected
 
 
-def _admit_selected_candidates(r: _IdentificationRound, sess: Session, sid: str, tenant: str, ss: int,
-                    scenario_session: dict, selected: list[tuple[dict, str]]) -> None:
+def _admit_selected_candidates(r: _IdentificationRound, sess: Session, sid: str, ss: int,
+                    selected: list[tuple[dict, str]]) -> None:
     """Save the picked candidates into the round, skipping ones already held.
 
     Build records for the pass-1 winners, identity-deduped: a candidate already active
     on the session (an additive round re-retrieving the library) is a no-op, not an
     audit-worthy duplicate."""
     for cand, assigned_category in selected:
-        row, summary = _build_retrieved_records(cand, sid, tenant, ss, scenario_session,
-                                                assigned_category,
+        row, summary = _build_retrieved_records(cand, sid, ss, assigned_category,
                                                 category_id=r.resolve_category_id(sess, assigned_category))
         identity = dal.identity_hash(sid, ss, summary)
         if identity in r.existing_identities:
@@ -829,7 +824,7 @@ def _generate_gap_proposals(r: _IdentificationRound, sess: Session, llm: LLMClie
     return _GapGenerationResult(proposals, prov, llm_failed, gap_ask)
 
 
-def _ground_and_admit_proposals(r: _IdentificationRound, sess: Session, llm: LLMClient, sid: str, tenant: str,
+def _ground_and_admit_proposals(r: _IdentificationRound, sess: Session, llm: LLMClient, sid: str,
                     ss: int, scenario_session: dict, proposals: list,
                     epoch: int, task_id: str) -> None:
     """Match each proposal against the library and admit the new ones.
@@ -864,8 +859,7 @@ def _ground_and_admit_proposals(r: _IdentificationRound, sess: Session, llm: LLM
             gr = grounding.find_threat_in_library(sess, llm, gp, cache=grounding_cache)
             _t.result(grounding_result=gr)
         tid = guid()
-        row, summary = _build_threat_records(tid, sid, tenant, ss, ptype, pcat, pname, gr,
-                                        scenario_session["EntityID"], scenario_session.get("UserID"),
+        row, summary = _build_threat_records(tid, sid, ss, ptype, pcat, pname, gr,
                                         generic_name=gp.get("name") if isinstance(gp, dict) else None,
                                         category_id=gr.category_id)
         # (The old GAP-B "validator reversal" block is gone with the validator itself: a
@@ -957,7 +951,7 @@ def _finalize_stride_selection(r: _IdentificationRound, sess: Session, target: d
     return final_pairs, kept_ids, surplus
 
 
-def _backfill_to_count(r: _IdentificationRound, sess: Session, llm: LLMClient, sid: str, tenant: str,
+def _backfill_to_count(r: _IdentificationRound, sess: Session, llm: LLMClient, sid: str,
                     ss: int, scenario_session: dict, tn,
                     prior_threats: list[dict] | None, target: dict[str, int],
                     final_pairs: list, kept_ids: set[str], surplus: list[dict],
@@ -1029,8 +1023,7 @@ def _backfill_to_count(r: _IdentificationRound, sess: Session, llm: LLMClient, s
         identity = dal.identity_hash(sid, ss, {"catalogue_id": cand["catalogue_id"]})
         if identity in r.existing_identities:
             continue
-        row, summary = _build_retrieved_records(cand, sid, tenant, ss, scenario_session,
-                                                bf_category,
+        row, summary = _build_retrieved_records(cand, sid, ss, bf_category,
                                                 category_id=r.resolve_category_id(sess, bf_category))
         r.existing_identities[identity] = row["ThreatID"]
         r.attribution[row["ThreatID"]] = cand.get("subsystem_ids") or []
@@ -1167,7 +1160,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     The caller already has both, so passing them in costs no extra query. An
     infrastructure failure in retrieval PROPAGATES to the Celery stage retry — never
     silently read as "library empty"."""
-    sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
+    sid, ss = scenario_session["SessionID"], ASSET_UNIT_ID
     with trace_step("ASSET CONTEXT", sid, asset_context=asset_context,
                     subsystems=subsystems):
         pass          # input-only marker: the context is already built when find_threats runs
@@ -1201,19 +1194,19 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
     held = _held_category_counts(sess, sid, ss, supersede, prior_threats)
     target = stride.allocate(max_threats, cats, existing=held)
     selected = _select_library_candidates(sid, r, target, max_threats)
-    _admit_selected_candidates(r, sess, sid, tenant, ss, scenario_session, selected)
+    _admit_selected_candidates(r, sess, sid, ss, selected)
     _drop_prior_paraphrases(r, llm, sid, ss, scenario_session, tn, prior_threats)
 
     quantity_gap, coverage_missing, gap_need = _evaluate_coverage(r, target, max_threats)
     gap = _generate_gap_proposals(r, sess, llm, sid, ss, scenario_session, subsystems, asset_context,
                         cats, held, exclude, quantity_gap, coverage_missing, gap_need,
                         epoch, task_id, s_cfg, max_threats)
-    _ground_and_admit_proposals(r, sess, llm, sid, tenant, ss, scenario_session, gap.proposals,
+    _ground_and_admit_proposals(r, sess, llm, sid, ss, scenario_session, gap.proposals,
                     epoch, task_id)
     near_dupes = _drop_generated_duplicates(r, llm, sid, ss, scenario_session, tn,
                                             prior_threats)
     final_pairs, kept_ids, surplus = _finalize_stride_selection(r, sess, target, max_threats)
-    backfilled, blocked = _backfill_to_count(r, sess, llm, sid, tenant, ss,
+    backfilled, blocked = _backfill_to_count(r, sess, llm, sid, ss,
                                             scenario_session, tn, prior_threats, target,
                                             final_pairs, kept_ids, surplus, max_threats)
 
@@ -1266,7 +1259,7 @@ def find_threats(sess: Session, scenario_session: dict, subsystems: list[dict], 
         log.warning("stage.claim_lost", session_id=sid, subsystem=ss, stage="THREATS", epoch=epoch)
         return [], None
     coverage_detail = _build_coverage_detail(sess, sid, ss, cats, grid_subsystem_ids)
-    dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
+    dal.append_audit(sess, AuditID=guid(), SessionID=sid, EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.THREAT_IDENTIFICATION, SubsystemID=ss,
                     EventType=AuditEventType.grounding_summary,
                     DetailJSON=json.dumps(_build_audit_payload(

@@ -57,12 +57,12 @@ def _seed(s, *, created_offset_days: int = 1, stage_status: str = StageStatus.AW
     for level, status, task in ((SubsystemLevel.SCENARIOS, stage_status, None),
                                 (SubsystemLevel.LOCK, lock_status, lock_task)):
         s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-            StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="e",
+            StateID=str(uuid.uuid4()), SessionID=sid,
             SubsystemID=0, Level=level, Status=status, GenerationEpoch=EPOCH,
             ActiveTaskID=task, AttemptCount=1,
             UpdatedAt=now - timedelta(seconds=settled_secs_ago)))
     s.execute(m.Threat_Scenario.__table__.insert().values(
-        ScenarioID=scenario_id, SessionID=sid, TenantID="t", EntityID="e", UserID="u",
+        ScenarioID=scenario_id, SessionID=sid,
         SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
         ScenarioJSON=json.dumps({"scenario_title": "Setpoint manipulation on the HMI",
                                 "scenario_statement": "An attacker writes an unsafe setpoint."}),

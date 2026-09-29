@@ -46,13 +46,13 @@ def _seed(s, session_id: str, task_id: str) -> str:
         StageStatus="RUNNING", Mode="full", SubsystemsJSON="[]",
     ))
     s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-        StateID=str(uuid.uuid4()), SessionID=session_id, TenantID="t", EntityID="e",
+        StateID=str(uuid.uuid4()), SessionID=session_id,
         SubsystemID=0, Level=SubsystemLevel.SCENARIOS, Status=StageStatus.RUNNING,
         GenerationEpoch=1, ActiveTaskID=task_id,
         LeaseExpiresAt=now + timedelta(minutes=10), HeartbeatAt=now, AttemptCount=1, UpdatedAt=now,
     ))
     s.execute(m.Threat_Scenario.__table__.insert().values(
-        ScenarioID=scenario_id, SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
+        ScenarioID=scenario_id, SessionID=session_id,
         SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
         ScenarioJSON=json.dumps({"scenario_title": "Credential theft against the HMI",
                                 "scenario_statement": "An attacker replays operator credentials."}),
@@ -95,13 +95,13 @@ def test_map_controls_actually_threads_the_threat_into_the_query(monkeypatch):
                 .where(m.Threat_Scenario.ScenarioID == scenario_id)
                 .values(ScopedThreatID=scoped_id))
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="e",
+            ScopedThreatID=scoped_id, SessionID=sid,
             SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=1, Selected=1,
             Superseded=0, CreatedAt=now))
         # Proposed vs library spelling deliberately DIFFER, so the assertion below proves the
         # curator's wording wins — the library is what the controls were written against.
         s.execute(m.Identified_Threat.__table__.insert().values(
-            ThreatID=threat_id, SessionID=sid, TenantID="t", EntityID="e", SubsystemID=0,
+            ThreatID=threat_id, SessionID=sid, SubsystemID=0,
             ThreatCategory="Tampering", ThreatType="model wording for the type",
             ThreatName="model wording for the name",
             LibraryThreatType="Supply Chain Compromise",

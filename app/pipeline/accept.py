@@ -219,13 +219,13 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
             if displace:
                 undone = dal.decide_scenarios(
                     sess, session_id, good_subs, decision=AuditDecision.unaccept,
-                    subset=list(displace), tenant_id=scenario_session["TenantID"],
+                    subset=list(displace),
                     entity_id=str(entity_id), user_id=user_id,
                     details={old: {"replaced_by": new} for old, new in displace.items()})
                 replaced = [Replacement(displace[old], old) for old in undone.changed]
             decided = dal.decide_scenarios(
                 sess, session_id, good_subs, decision=AuditDecision.accept, subset=subset,
-                tenant_id=scenario_session["TenantID"], entity_id=str(entity_id), user_id=user_id,
+                entity_id=str(entity_id), user_id=user_id,
                 # The other half of the link: from the version that GAINED the decision, name the
                 # one it displaced. Without it the trail walked old → new only, and after a switch
                 # back the scenario rows cannot answer it either.
@@ -291,7 +291,7 @@ def accept_session(sess: Session, session_id: str, entity_id: str, user_id: str 
         events = ((AuditEventType.review_decision,) if decision == AuditDecision.reject
                 else (AuditEventType.scenarios_accepted, AuditEventType.review_decision))
         for event in events:
-            dal.append_audit(sess, AuditID=guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
+            dal.append_audit(sess, AuditID=guid(), SessionID=session_id,
                             EntityID=str(entity_id), EventType=event, Decision=decision, ActorUserID=user_id,
                             DetailJSON=json.dumps({"subset": subset}) if subset is not None else None)
         sess.commit()
@@ -334,7 +334,7 @@ def accept_new_manual_scenario(sess: Session, scenario_session: RowMapping | dic
         sess, session_id, SubsystemLevel.SCENARIOS, status=StageStatus.AWAITING_DECISION)
     decided = dal.decide_scenarios(
         sess, session_id, good_subs, decision=AuditDecision.accept,
-        tenant_id=scenario_session["TenantID"], entity_id=str(scenario_session["EntityID"]),
+        entity_id=str(scenario_session["EntityID"]),
         user_id=user_id)
     if decided.count != 1:
         # Unreachable while the save writes exactly one complete scenario at a settled stage —
@@ -343,7 +343,6 @@ def accept_new_manual_scenario(sess: Session, scenario_session: RowMapping | dic
                              "were decidable — nothing was saved")
     for event in (AuditEventType.scenarios_accepted, AuditEventType.review_decision):
         dal.append_audit(sess, AuditID=guid(), SessionID=session_id,
-                         TenantID=scenario_session["TenantID"],
                          EntityID=str(scenario_session["EntityID"]), EventType=event,
                          Decision=AuditDecision.accept, ActorUserID=user_id)
     return decided.count
@@ -395,7 +394,7 @@ def unaccept_scenario(sess: Session, session_id: str, entity_id: str, user_id: s
         oid = dal.canonical_guid(scenario_id)
         if dal.decide_scenarios(
                 sess, session_id, good_subs, decision=AuditDecision.unaccept, subset=[oid],
-                tenant_id=scenario_session["TenantID"], entity_id=str(entity_id),
+                entity_id=str(entity_id),
                 user_id=user_id).count != 1:
             # Nothing to undo. Reported as the SAME 409 envelope accept uses, with its own reason:
             # an unaccept is a decision on a scenario, and a second error code would only make a
@@ -463,7 +462,7 @@ def reject_scenarios(sess: Session, session_id: str, entity_id: str, user_id: st
         # Decided is always empty here and naming it would only invite someone to read it.
         matched = dal.decide_scenarios(
             sess, session_id, good_subs, decision=AuditDecision.reject, subset=subset,
-            tenant_id=scenario_session["TenantID"], entity_id=str(entity_id), user_id=user_id).count
+            entity_id=str(entity_id), user_id=user_id).count
         requested = len(set(subset))
         if matched != requested:
             raise _undecidable_subset(sess, session_id, subset, good_subs,

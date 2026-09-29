@@ -3,7 +3,7 @@
 
   Script:      020_Risk_Treatment_Plan.sql
   Order:       01_tables / 020
-  Purpose:     Create Risk_Treatment_Plan, or bring an existing copy up to 27 columns.
+  Purpose:     Create Risk_Treatment_Plan, or bring an existing copy up to 25 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Risk_Treatment_Plan
@@ -26,10 +26,8 @@ BEGIN
         [PlanID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
         [ScenarioID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
         [EntityID] NVARCHAR(200) NULL,
         [UserID] NVARCHAR(200) NULL,
-        [CrmRiskIdentificationID] INT NULL,
         [TreatmentStrategy] NVARCHAR(100) NOT NULL,
         [Status] NVARCHAR(100) NOT NULL,
         [ActiveTaskID] NVARCHAR(100) NULL,
@@ -52,7 +50,7 @@ BEGIN
         [ErrorReason] NVARCHAR(max) NULL,
         CONSTRAINT [PK_Risk_Treatment_Plan] PRIMARY KEY CLUSTERED ([PlanID])
     );
-    PRINT ' [CREATED] Table: Risk_Treatment_Plan (27 columns)';
+    PRINT ' [CREATED] Table: Risk_Treatment_Plan (25 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Risk_Treatment_Plan';
@@ -79,14 +77,10 @@ EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'Sessi
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'ScenarioID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'EntityID',
      @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'UserID',
      @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'CrmRiskIdentificationID',
-     @expected = N'INT', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'TreatmentStrategy',
      @expected = N'NVARCHAR(100)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'Status',
@@ -194,5 +188,5 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Risk_Treatment_Plan', @known = N'PlanID,SessionID,ScenarioID,TenantID,EntityID,UserID,CrmRiskIdentificationID,TreatmentStrategy,Status,ActiveTaskID,RiskIdentificationDate,InputSnapshotJSON,PlanJSON,ValidationJSON,ErrorMessage,Superseded,CreatedAt,UpdatedAt,CompletedAt,RiskLevel,ReviewStatus,ReviewComment,ReviewedBy,ReviewedAt,CancelledAt,CancelledBy,ErrorReason';
+EXEC dbo.tsg_report_extra_columns @table = N'Risk_Treatment_Plan', @known = N'PlanID,SessionID,ScenarioID,EntityID,UserID,TreatmentStrategy,Status,ActiveTaskID,RiskIdentificationDate,InputSnapshotJSON,PlanJSON,ValidationJSON,ErrorMessage,Superseded,CreatedAt,UpdatedAt,CompletedAt,RiskLevel,ReviewStatus,ReviewComment,ReviewedBy,ReviewedAt,CancelledAt,CancelledBy,ErrorReason';
 GO

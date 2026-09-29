@@ -556,11 +556,9 @@ def _generate_one_scenario(sess: Session, scenario_session: dict, base_ctx: dict
     return scenario, report, prov
 
 
-def _build_scoped_threat_row(scoped_id: str, sid: str, tenant: str, ss: int, sc: scoping.Scored,
-                        entity_id: str | None, user_id: str | None) -> dict:
+def _build_scoped_threat_row(scoped_id: str, sid: str, ss: int, sc: scoping.Scored) -> dict:
     return {
-        "ScopedThreatID": scoped_id, "SessionID": sid, "TenantID": tenant, "EntityID": entity_id,
-        "UserID": user_id, "SubsystemID": ss,
+        "ScopedThreatID": scoped_id, "SessionID": sid, "SubsystemID": ss,
         "ThreatID": sc.threat_id, "Score": sc.score, "ScopeRank": sc.rank,
         "Selected": 1 if sc.selected else 0, "Reason": sc.reason, "RejectionKind": sc.rejection,
         "SelectionKind": sc.selection,
@@ -609,8 +607,8 @@ def _stamp_generation_span(started: datetime, step) -> tuple[datetime, datetime]
     return started, finished
 
 
-def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, scenario: dict, report: dict,
-                            epoch: int, entity_id: str | None, user_id: str | None, info: dict,
+def _build_scenario_output_row(scoped_id: str, sid: str, ss: int, scenario: dict, report: dict,
+                            epoch: int, info: dict,
                             scenario_number: int = 1, replaces_scenario_id: str | None = None,
                             source: str = "generated", *,
                             span: tuple[datetime, datetime], identity: str | None = None) -> dict:
@@ -627,8 +625,7 @@ def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, s
     scenario = _scrub_model_output(scenario, sid, info.get("threat_id"))
     identity = identity or dal.identity_hash(sid, ss, info)
     return {
-        "ScenarioID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
-        "SubsystemID": ss,
+        "ScenarioID": guid(), "SessionID": sid, "SubsystemID": ss,
         "ScopedThreatID": scoped_id, "Status": ScenarioStatus.complete,
         "ScenarioJSON": json.dumps(scenario),
         "ValidationJSON": json.dumps(report),
@@ -647,13 +644,12 @@ def _build_scenario_output_row(scoped_id: str, sid: str, tenant: str, ss: int, s
     }
 
 
-def _build_error_output_row(scoped_id: str, sid: str, tenant: str, ss: int, client_msg: str,
-                            epoch: int, entity_id: str | None, user_id: str | None, info: dict,
+def _build_error_output_row(scoped_id: str, sid: str, ss: int, client_msg: str,
+                            epoch: int, info: dict,
                             scenario_number: int = 1, replaces_scenario_id: str | None = None,
                             *, span: tuple[datetime, datetime]) -> dict:
     return {
-        "ScenarioID": guid(), "SessionID": sid, "TenantID": tenant, "EntityID": entity_id, "UserID": user_id,
-        "SubsystemID": ss,
+        "ScenarioID": guid(), "SessionID": sid, "SubsystemID": ss,
         "ScopedThreatID": scoped_id, "Status": ScenarioStatus.error,
         "ScenarioJSON": None, "ValidationJSON": None,
         "Accepted": 0, "Superseded": 0,
@@ -698,8 +694,8 @@ def _select_unique_top_n(scoped: list[scoping.Scored], enriched: dict, top_n: in
     return deduped
 
 
-def _mark_next_set_targets_rescored_out(sess: Session, sid: str, ss: int, pairs: list, excluded_ids: set[str],
-                                    tenant: str, entity_id: str | None, user_id: str | None) -> None:
+def _mark_next_set_targets_rescored_out(sess: Session, sid: str, ss: int, pairs: list,
+                                    excluded_ids: set[str]) -> None:
     excluded_needing_marker = (excluded_ids - dal.threats_with_active_scenario(sess, sid, ss, excluded_ids)
                             if excluded_ids else set())
     if not excluded_needing_marker:
@@ -712,12 +708,11 @@ def _mark_next_set_targets_rescored_out(sess: Session, sid: str, ss: int, pairs:
     dal.supersede_outputs_for_threats(sess, sid, ss, excluded_needing_marker)
     dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, excluded_needing_marker)
     sess.execute(insert(m.Scoped_Threat), [
-        _build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)
+        _build_scoped_threat_row(scoped_id, sid, ss, sc)
         for sc, scoped_id, _t in pairs if sc.threat_id in excluded_needing_marker])
 
 
-def _begin_full_run_attempt(sess: Session, sid: str, ss: int, tenant: str,
-                            entity_id: str | None, user_id: str | None,
+def _begin_full_run_attempt(sess: Session, sid: str, ss: int,
                             pairs: list, epoch: int) -> set[str]:
     if epoch != _EPOCH:
         raise ValueError(
@@ -727,7 +722,7 @@ def _begin_full_run_attempt(sess: Session, sid: str, ss: int, tenant: str,
     if attempt == 1:
         dal.supersede(sess, m.Scoped_Threat, sid, ss)
         dal.supersede(sess, m.Threat_Scenario, sid, ss)
-        not_selected = [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)
+        not_selected = [_build_scoped_threat_row(scoped_id, sid, ss, sc)
                         for sc, scoped_id, _t in pairs if not sc.selected]
         if not_selected:
             sess.execute(insert(m.Scoped_Threat), not_selected)
@@ -737,8 +732,7 @@ def _begin_full_run_attempt(sess: Session, sid: str, ss: int, tenant: str,
         sess, sid, ss, {sc.threat_id for sc, _scoped_id, _t in pairs if sc.selected})
 
 
-def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
-                            entity_id: str | None, user_id: str | None,
+def _reconcile_targeted_regen(sess: Session, sid: str, ss: int,
                             pairs: list, scenarios: dict, enriched: dict,
                             epoch: int, task_id: str, *, regen_mode: bool,
                             failed_ids: set[str] | None = None,
@@ -767,7 +761,7 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
                     threat_ids=sorted(failed_ids))
 
     if not regen_mode:
-        _mark_next_set_targets_rescored_out(sess, sid, ss, pairs, excluded_ids, tenant, entity_id, user_id)
+        _mark_next_set_targets_rescored_out(sess, sid, ss, pairs, excluded_ids)
 
     if not generated_ids:
         if not dal.finish_stage(sess, sid, ss, SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION, epoch, task_id):
@@ -809,13 +803,13 @@ def _reconcile_targeted_regen(sess: Session, sid: str, ss: int, tenant: str,
             continue
         if target is not None:
             target_of[scoped_id] = target.scenario_id
-        scoped_rows.append(_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id))
+        scoped_rows.append(_build_scoped_threat_row(scoped_id, sid, ss, sc))
         if scoped_id not in scenarios:
             continue
         scenario, report, span = scenarios[scoped_id]
         number = target.scenario_number if target is not None else 1
-        output_rows.append(_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
-                                                    entity_id, user_id, enriched.get(sc.threat_id, {}),
+        output_rows.append(_build_scenario_output_row(scoped_id, sid, ss, scenario, report, epoch,
+                                                    enriched.get(sc.threat_id, {}),
                                                     scenario_number=number, source="generated",
                                                     span=span,
                                                     # A regeneration keeps its target's identity —
@@ -931,22 +925,20 @@ def _retire_prior_card(sess: Session, sid: str, ss: int, info: dict) -> str | No
     return dal.supersede_by_identity_hashes(sess, sid, ss, {identity}, scenario_number=1).get(identity)
 
 
-def _persist_full_run_failure(sess: Session, sid: str, ss: int, tenant: str, entity_id: str | None,
-                            user_id: str | None, sc, scoped_id: str, info: dict,
+def _persist_full_run_failure(sess: Session, sid: str, ss: int, sc, scoped_id: str, info: dict,
                             client_msg: str, epoch: int, span: tuple[datetime, datetime]) -> None:
     retired_card = _retire_prior_card(sess, sid, ss, info)
     dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, {sc.threat_id})
     sess.execute(insert(m.Scoped_Threat),
-                [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
+                [_build_scoped_threat_row(scoped_id, sid, ss, sc)])
     sess.execute(insert(m.Threat_Scenario),
-                [_build_error_output_row(scoped_id, sid, tenant, ss, client_msg, epoch,
-                                        entity_id, user_id, info, replaces_scenario_id=retired_card,
+                [_build_error_output_row(scoped_id, sid, ss, client_msg, epoch,
+                                        info, replaces_scenario_id=retired_card,
                                         span=span)])
     sess.commit()
 
 
-def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, entity_id: str | None,
-                            user_id: str | None, sc, scoped_id: str, info: dict,
+def _persist_full_run_scenario(sess: Session, sid: str, ss: int, sc, scoped_id: str, info: dict,
                             scenario: dict, report: dict, epoch: int, *,
                             span: tuple[datetime, datetime], source: str = "generated") -> None:
     retired_card = _retire_prior_card(sess, sid, ss, info)
@@ -956,10 +948,10 @@ def _persist_full_run_scenario(sess: Session, sid: str, ss: int, tenant: str, en
     # the same threat, silently breaking the "one active row per threat" rule.
     dal.supersede_by_threats(sess, m.Scoped_Threat, sid, ss, {sc.threat_id})
     sess.execute(insert(m.Scoped_Threat),
-                [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
+                [_build_scoped_threat_row(scoped_id, sid, ss, sc)])
     sess.execute(insert(m.Threat_Scenario),
-                [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
-                                            entity_id, user_id, info, replaces_scenario_id=retired_card,
+                [_build_scenario_output_row(scoped_id, sid, ss, scenario, report, epoch,
+                                            info, replaces_scenario_id=retired_card,
                                             source=source, span=span)])
     sess.commit()
 
@@ -1062,8 +1054,7 @@ def _persist_batch_results(sess: Session, scenario_session: dict, work: list, by
     contract - including the span every item now carries - lives in one function of readable
     size; the stage transition (finish_stage) and the control-mapping tail stay in the caller.
     """
-    sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
-    entity_id, user_id = scenario_session["EntityID"], scenario_session.get("UserID")
+    sid, ss = scenario_session["SessionID"], ASSET_UNIT_ID
     provs: list[Provenance | None] = []
     scenarios: dict[str, tuple[dict, dict, tuple[datetime, datetime]]] = {}
     failures: list[str] = []
@@ -1088,7 +1079,7 @@ def _persist_batch_results(sess: Session, scenario_session: dict, work: list, by
             log.warning("scenario.generation_failed", session_id=sid, subsystem=ss,
                         threat_id=sc.threat_id, error=repr(exc))
             if not targeted:
-                _persist_full_run_failure(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
+                _persist_full_run_failure(sess, sid, ss, sc, scoped_id,
                                         enriched.get(sc.threat_id, {}), client_msg, epoch, span)
             continue
         scenario, report, prov = result
@@ -1099,7 +1090,7 @@ def _persist_batch_results(sess: Session, scenario_session: dict, work: list, by
                 log.warning("stage.claim_lost_midbatch", session_id=sid, subsystem=ss,
                             stage="SCENARIOS", epoch=epoch, committed=len(provs) - 1)
                 break
-            _persist_full_run_scenario(sess, sid, ss, tenant, entity_id, user_id, sc, scoped_id,
+            _persist_full_run_scenario(sess, sid, ss, sc, scoped_id,
                                     enriched.get(sc.threat_id, {}), scenario, report, epoch,
                                     span=span, source="generated")
         else:
@@ -1116,8 +1107,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
                 unresolved_targets: dict | None = None,
                 session_factory: Callable[[], Any] | None = None) -> list[Provenance | None]:
 
-    sid, ss, tenant = scenario_session["SessionID"], ASSET_UNIT_ID, scenario_session["TenantID"]
-    entity_id, user_id = scenario_session["EntityID"], scenario_session.get("UserID")
+    sid, ss = scenario_session["SessionID"], ASSET_UNIT_ID
     if require_lock and not dal.holds_lock(sess, sid, ss, task_id):
         log.warning("subsystem.lock_lost_before_scenarios", session_id=sid, subsystem=ss)
         return []
@@ -1136,7 +1126,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
 
     already_done: set[str] = set()
     if not targeted:
-        already_done = _begin_full_run_attempt(sess, sid, ss, tenant, entity_id, user_id, pairs, epoch)
+        already_done = _begin_full_run_attempt(sess, sid, ss, pairs, epoch)
     work = [(sc, scoped_id, target) for sc, scoped_id, target in pairs
             if sc.selected and sc.threat_id not in already_done]
     # Same rule as the row builder: a regeneration reuses its target's stored identity, so the
@@ -1189,7 +1179,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
                     committed=len(provs))
         raise slot_unavailable
 
-    dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=tenant, EntityID=scenario_session["EntityID"],
+    dal.append_audit(sess, AuditID=guid(), SessionID=sid, EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.SCENARIO_GENERATION, SubsystemID=ss,
                     EventType=AuditEventType.scoping_complete,
                     # entry_points: 0 means nothing in this batch could get a second scenario —
@@ -1200,7 +1190,7 @@ def write_scenarios(sess: Session, scenario_session: dict, subsystems: list[dict
     log.info("scenarios.deduped", session_id=sid, subsystem=ss, deduped=deduped, kept=len(provs))
 
     if targeted and not _reconcile_targeted_regen(
-            sess, sid, ss, tenant, entity_id, user_id,
+            sess, sid, ss,
             pairs, scenarios, enriched, epoch, task_id,
             regen_mode=regen_targets is not None, failed_ids=failed_ids,
             unresolved_targets=unresolved_targets):
@@ -1261,8 +1251,7 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
                             exclude_threat_ids: set[str] | None = None) -> int:
     from sqlalchemy.exc import IntegrityError
 
-    sid, ss, tenant = scenario_session["SessionID"], subsystem_id, scenario_session["TenantID"]
-    entity_id, user_id = scenario_session["EntityID"], scenario_session.get("UserID")
+    sid, ss = scenario_session["SessionID"], subsystem_id
     fold = _fold_scenario_rows(dal.active_scenario_rows(sess, sid, ss))
     eligible = dal.variant_eligible_primaries(
         sess, sid, max_variants, rows=fold.rows,
@@ -1335,10 +1324,10 @@ def write_variant_scenarios(sess: Session, scenario_session: dict, subsystem_id:
             continue
         try:
             sess.execute(insert(m.Scoped_Threat),
-                        [_build_scoped_threat_row(scoped_id, sid, tenant, ss, sc, entity_id, user_id)])
+                        [_build_scoped_threat_row(scoped_id, sid, ss, sc)])
             sess.execute(insert(m.Threat_Scenario),
-                        [_build_scenario_output_row(scoped_id, sid, tenant, ss, scenario, report, epoch,
-                                                    entity_id, user_id, info,
+                        [_build_scenario_output_row(scoped_id, sid, ss, scenario, report, epoch,
+                                                    info,
                                                     scenario_number=item["next_number"],
                                                     span=span)])
             sess.commit()
@@ -1415,7 +1404,7 @@ def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, ex
     detail = {"error": client_msg, "subsystem_id": subsystem_id}
     if extra:
         detail.update(extra)
-    dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"], EntityID=scenario_session["EntityID"],
+    dal.append_audit(sess, AuditID=guid(), SessionID=sid, EntityID=scenario_session["EntityID"],
                     SubsystemID=subsystem_id, EventType=AuditEventType.stage_error,
                     DetailJSON=json.dumps(detail))
     sess.commit()
@@ -1436,7 +1425,6 @@ def _record_failure(sess: Session, scenario_session: dict, subsystem_id: int, ex
     # three (they are tenant-visible) and useless for whoever has to diagnose UAT, where stdout
     # dies with the container. Best-effort by construction: see app/core/diagnostics.py.
     diagnostics.record(DiagnosticKind.stage_error, exc, session_id=sid,
-                       tenant_id=scenario_session.get("TenantID"),
                        entity_id=scenario_session.get("EntityID"),
                        subsystem_id=subsystem_id, client_message=client_msg,
                        context={"stage": "work", **(extra or {})})
@@ -1513,7 +1501,7 @@ def _send_to_review(sess: Session, scenario_session: dict, epoch: int = _EPOCH) 
     )
     if res.rowcount != 1:
         return False
-    dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
+    dal.append_audit(sess, AuditID=guid(), SessionID=sid,
                     EntityID=scenario_session["EntityID"], Stage=WorkflowStage.REVIEW, EventType=AuditEventType.entered_review)
     sess.commit()
     bus.publish(sid, {"type": str(SSEEventType.session_entered_review), "session_id": sid,
@@ -1535,7 +1523,7 @@ def _mark_session_failed(sess: Session, scenario_session: dict) -> bool:
     )
     if res.rowcount != 1:
         return False
-    dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"], EntityID=scenario_session["EntityID"],
+    dal.append_audit(sess, AuditID=guid(), SessionID=sid, EntityID=scenario_session["EntityID"],
                     EventType=AuditEventType.session_cancelled, DetailJSON=json.dumps({"reason": "all subsystems failed"}))
     sess.commit()
     # Item 27: explicit "scope" — see the typed ErrorEvent model (schemas.py) for the full contract.
@@ -1549,7 +1537,7 @@ def _announce_generation_started(sess: Session, scenario_session: dict, subsyste
     if not dal.subsystem_has_pending_work(sess, scenario_session["SessionID"], subsystem_id):
         return
     sid = scenario_session["SessionID"]
-    dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
+    dal.append_audit(sess, AuditID=guid(), SessionID=sid,
                     EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
                     EventType=AuditEventType.subsystem_advanced,
                     DetailJSON=json.dumps({"subsystem_id": subsystem_id}))
@@ -1612,7 +1600,7 @@ def _process_all_supporting_systems(sess: Session, session_id: str, llm: LLMClie
                                             # generation. Tests passing session_factory=None still
                                             # get the sequential branch.
                                             session_factory=db_session)
-                dal.append_audit(sess, AuditID=guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
+                dal.append_audit(sess, AuditID=guid(), SessionID=session_id,
                                 EntityID=scenario_session["EntityID"], Stage=WorkflowStage.SCENARIO_GENERATION,
                                 SubsystemID=ASSET_UNIT_ID, EventType=AuditEventType.generation_complete,
                                 DetailJSON=json.dumps(_summarize_generation(ASSET_UNIT_ID, prov_i, scen_provs)))

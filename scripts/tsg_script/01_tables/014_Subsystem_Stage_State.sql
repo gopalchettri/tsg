@@ -3,7 +3,7 @@
 
   Script:      014_Subsystem_Stage_State.sql
   Order:       01_tables / 014
-  Purpose:     Create Subsystem_Stage_State, or bring an existing copy up to 17 columns.
+  Purpose:     Create Subsystem_Stage_State, or bring an existing copy up to 14 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Subsystem_Stage_State
@@ -25,8 +25,6 @@ BEGIN
     CREATE TABLE dbo.[Subsystem_Stage_State] (
         [StateID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
         [SubsystemID] INT NOT NULL,
         [Level] NVARCHAR(100) NOT NULL,
         [Status] NVARCHAR(100) NOT NULL,
@@ -37,12 +35,11 @@ BEGIN
         [AttemptCount] INT NOT NULL,
         [ErrorMessage] NVARCHAR(max) NULL,
         [UpdatedAt] DATETIME2(7) NOT NULL,
-        [CreatedAt] DATETIME2(7) NULL,
         [StartedAt] DATETIME2(7) NULL,
         [FinishedAt] DATETIME2(7) NULL,
         CONSTRAINT [PK_Subsystem_Stage_State] PRIMARY KEY CLUSTERED ([StateID])
     );
-    PRINT ' [CREATED] Table: Subsystem_Stage_State (17 columns)';
+    PRINT ' [CREATED] Table: Subsystem_Stage_State (14 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Subsystem_Stage_State';
@@ -54,10 +51,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'Sta
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'SubsystemID',
      @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'Level',
@@ -78,8 +71,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'Err
      @expected = N'NVARCHAR(max)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'UpdatedAt',
      @expected = N'DATETIME2(7)', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'CreatedAt',
-     @expected = N'DATETIME2(7)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'StartedAt',
      @expected = N'DATETIME2(7)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'FinishedAt',
@@ -93,5 +84,5 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Subsystem_Stage_State', @known = N'StateID,SessionID,TenantID,EntityID,SubsystemID,Level,Status,GenerationEpoch,ActiveTaskID,LeaseExpiresAt,HeartbeatAt,AttemptCount,ErrorMessage,UpdatedAt,CreatedAt,StartedAt,FinishedAt';
+EXEC dbo.tsg_report_extra_columns @table = N'Subsystem_Stage_State', @known = N'StateID,SessionID,SubsystemID,Level,Status,GenerationEpoch,ActiveTaskID,LeaseExpiresAt,HeartbeatAt,AttemptCount,ErrorMessage,UpdatedAt,StartedAt,FinishedAt';
 GO

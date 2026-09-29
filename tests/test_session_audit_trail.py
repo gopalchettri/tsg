@@ -56,7 +56,7 @@ def _event(Session, sid: str, event: str, *, actor=None, scenario_id=None, detai
     or DESC. Mutation-testing caught exactly that — the ordering test was vacuous until the
     timestamps were made distinct."""
     with Session() as s:
-        row = dal.audit_row(s, AuditID=dal.guid(), SessionID=sid, TenantID="t", EntityID="86",
+        row = dal.audit_row(s, AuditID=dal.guid(), SessionID=sid, EntityID="86",
                             EventType=event, ActorUserID=actor, ScenarioID=scenario_id,
                             DetailJSON=detail)
         if at is not None:

@@ -83,7 +83,6 @@ class DiagnosticEvent:
     #: structlog's event name ("pipeline.failed") — the stable handle for log queries.
     event: str | None = None
     session_id: str | None = None
-    tenant_id: str | None = None
     entity_id: str | None = None
     subsystem_id: int | None = None
     task_id: str | None = None
@@ -190,7 +189,7 @@ class _DbBackend:
             return
         WRITER.submit("Diagnostic_Event", {
             "DiagnosticID": guid(), "CreatedAt": event.ts, "SessionID": event.session_id,
-            "TenantID": event.tenant_id, "EntityID": event.entity_id,
+            "EntityID": event.entity_id,
             "SubsystemID": event.subsystem_id, "TaskID": event.task_id,
             "RequestID": event.request_id, "Kind": event.kind or event.category,
             # NEVER NULL, and for a row with no exception it names what the row IS (SlowStep,

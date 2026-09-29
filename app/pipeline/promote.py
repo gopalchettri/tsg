@@ -361,10 +361,9 @@ def promote_scenario_to_library(sess: Session, scenario_session: dict, scenario_
     # The tracking record (user rule): who promoted, when, and the per-item outcome — the same
     # facts the API response carries, durably.
     dal.append_audit(
-        sess, AuditID=guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
+        sess, AuditID=guid(), SessionID=session_id,
         EntityID=str(scenario_session["EntityID"]), EventType=AuditEventType.library_promoted,
         ActorUserID=user_id, ActorType=ActorType.user if user_id else ActorType.system,
-        ThreatTypeRefID=type_id,
         DetailJSON=json.dumps({"scenario_id": str(scenario_id), "threat_id": str(threat.ThreatID),
                             "threat_type_id": type_id,
                             "catalogue_id": threat_entry["id"],

@@ -337,8 +337,6 @@ IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NULL
 CREATE TABLE Subsystem_Stage_State (
     StateID          uniqueidentifier NOT NULL CONSTRAINT PK_Subsystem_Stage_State PRIMARY KEY,
     SessionID        uniqueidentifier NOT NULL,
-    TenantID         nvarchar(200) NULL,
-    EntityID         nvarchar(200) NULL,
     SubsystemID      int           NOT NULL,
     Level            nvarchar(100)  NOT NULL,                -- THREATS|SCENARIOS|_LOCK
     Status           nvarchar(100)  NOT NULL,
@@ -349,15 +347,9 @@ CREATE TABLE Subsystem_Stage_State (
     AttemptCount     int           NOT NULL CONSTRAINT DF_SSS_AttemptCount DEFAULT 0,
     ErrorMessage     nvarchar(max) NULL,
     UpdatedAt        datetime2     NOT NULL,
-    CreatedAt datetime2 NULL CONSTRAINT DF_StageState_CreatedAt DEFAULT SYSUTCDATETIME(),
     StartedAt        datetime2     NULL,                     -- stage span start, written by dal.claim_stage; the ONLY source of per-stage duration
     FinishedAt       datetime2     NULL                      -- stage span end, written by dal.finish_stage. UpdatedAt cannot substitute: every lease renewal overwrites it
 );
-
--- Adds CreatedAt for pre-2026-07-30 databases.
-IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Subsystem_Stage_State', 'CreatedAt') IS NULL
-    ALTER TABLE Subsystem_Stage_State ADD CreatedAt datetime2 NULL CONSTRAINT DF_StageState_CreatedAt DEFAULT SYSUTCDATETIME();
 
 -- Per-stage timing span (threat identification / scenarios). Existing rows stay NULL: there is no
 -- historical start or finish to backfill, and the API reports NULL rather than inventing one.
@@ -386,9 +378,6 @@ IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NULL
 CREATE TABLE Identified_Threat (
     ThreatID           uniqueidentifier NOT NULL CONSTRAINT PK_Identified_Threat PRIMARY KEY,
     SessionID          uniqueidentifier NOT NULL,
-    TenantID           nvarchar(200) NULL,
-    EntityID           nvarchar(200) NULL,
-    UserID             nvarchar(200) NULL,
     SubsystemID        int           NOT NULL,
     ThreatCategory     nvarchar(200) NOT NULL,
     ThreatType         nvarchar(300) NOT NULL,
@@ -416,9 +405,6 @@ IF OBJECT_ID('dbo.Identified_Duplicate_Threat', 'U') IS NULL
 CREATE TABLE Identified_Duplicate_Threat (
     DuplicateThreatID  uniqueidentifier NOT NULL CONSTRAINT PK_Identified_Duplicate_Threat PRIMARY KEY,
     SessionID          uniqueidentifier NOT NULL,
-    TenantID           nvarchar(200) NULL,
-    EntityID           nvarchar(200) NULL,
-    UserID             nvarchar(200) NULL,
     SubsystemID        int           NOT NULL,
     ThreatCategory     nvarchar(200) NOT NULL,
     ThreatType         nvarchar(300) NOT NULL,
@@ -445,9 +431,6 @@ IF OBJECT_ID('dbo.Scoped_Threat', 'U') IS NULL
 CREATE TABLE Scoped_Threat (
     ScopedThreatID  uniqueidentifier NOT NULL CONSTRAINT PK_Scoped_Threat PRIMARY KEY,
     SessionID       uniqueidentifier NOT NULL,
-    TenantID        nvarchar(200) NULL,
-    EntityID        nvarchar(200) NULL,
-    UserID          nvarchar(200) NULL,
     SubsystemID     int           NOT NULL,
     ThreatID        uniqueidentifier NOT NULL,
     Score           float         NOT NULL,
@@ -515,9 +498,6 @@ IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NULL
 CREATE TABLE Threat_Scenario (
     ScenarioID           uniqueidentifier NOT NULL CONSTRAINT PK_Threat_Scenario PRIMARY KEY,
     SessionID            uniqueidentifier NOT NULL,
-    TenantID             nvarchar(200) NULL,
-    EntityID             nvarchar(200) NULL,
-    UserID               nvarchar(200) NULL,
     SubsystemID          int           NOT NULL,
     ScopedThreatID       uniqueidentifier NOT NULL,
     Status               nvarchar(100)  NOT NULL,
@@ -836,7 +816,6 @@ IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NULL
 CREATE TABLE Scenario_Audit (
     AuditID          uniqueidentifier NOT NULL CONSTRAINT PK_Scenario_Audit PRIMARY KEY WITH (DATA_COMPRESSION = PAGE),
     SessionID        uniqueidentifier NOT NULL,
-    TenantID         nvarchar(200) NULL,
     EntityID         nvarchar(200) NULL,
     Stage            nvarchar(100)  NULL,
     SubsystemID      int           NULL,
@@ -846,8 +825,6 @@ CREATE TABLE Scenario_Audit (
     ScenarioID       uniqueidentifier NULL,
     PlanID           uniqueidentifier NULL,
     Decision         nvarchar(100)  NULL,
-    Granularity      nvarchar(100)  NULL,
-    ThreatTypeRefID  int           NULL,
     ActorUserID      nvarchar(200) NULL,   -- who is ACCOUNTABLE (back-filled to the session owner)
     ActorType        nvarchar(100)  NULL,   -- who PERFORMED it: 'user' | 'system'
     DetailJSON       nvarchar(max) NULL,
@@ -885,7 +862,6 @@ CREATE TABLE Diagnostic_Event (
     DiagnosticID     uniqueidentifier NOT NULL CONSTRAINT PK_Diagnostic_Event PRIMARY KEY NONCLUSTERED WITH (DATA_COMPRESSION = PAGE),
     CreatedAt        datetime2(7) NOT NULL,
     SessionID        uniqueidentifier NULL,
-    TenantID         nvarchar(200) NULL,
     EntityID         nvarchar(200) NULL,
     SubsystemID      int NULL,
     TaskID           nvarchar(100) NULL,
@@ -907,10 +883,6 @@ IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NULL
 CREATE TABLE Prompt_Log (
     LogID           uniqueidentifier NOT NULL CONSTRAINT PK_Prompt_Log PRIMARY KEY NONCLUSTERED WITH (DATA_COMPRESSION = PAGE),
     SessionID       uniqueidentifier NOT NULL,
-    TenantID        nvarchar(200) NULL,
-    EntityID        nvarchar(200) NULL,
-    UserID          nvarchar(200) NULL,
-    SubsystemID     int           NOT NULL,
     Stage           nvarchar(100)  NOT NULL,
     PromptVersion   nvarchar(100)  NOT NULL,
     Prompt          nvarchar(max) NULL,
@@ -971,10 +943,8 @@ CREATE TABLE Risk_Treatment_Plan (
     PlanID                  uniqueidentifier NOT NULL CONSTRAINT PK_Risk_Treatment_Plan PRIMARY KEY,
     SessionID               uniqueidentifier NOT NULL,
     ScenarioID              uniqueidentifier NOT NULL,  -- the accepted Threat_Scenario row
-    TenantID                nvarchar(200) NULL,
     EntityID                nvarchar(200) NULL,         -- copied from the session (authz boundary)
     UserID                  nvarchar(200) NULL,         -- requesting principal (provenance)
-    CrmRiskIdentificationID int           NULL,         -- reserved; unused (no register lookup)
     TreatmentStrategy       nvarchar(100) NOT NULL,     -- 'Mitigate' only in v1
     Status                  nvarchar(100) NOT NULL,     -- StageStatus subset: RUNNING | COMPLETE | ERROR
     ActiveTaskID            nvarchar(100) NULL,         -- Celery claim / redelivery fence
@@ -1542,3 +1512,115 @@ IF OBJECT_ID('dbo.API_Client', 'U') IS NOT NULL
     AND COL_LENGTH('dbo.API_Client', 'Module') IS NOT NULL
     AND COLUMNPROPERTY(OBJECT_ID('dbo.API_Client'), 'Module', 'CharMaxLen') < 100
     ALTER TABLE API_Client ALTER COLUMN Module nvarchar(100) NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- 2026-09-30: 25 columns no query reads.
+--
+-- Twenty of them are TenantID/EntityID/UserID copied from Scenario_Session at insert and never
+-- refreshed again. SessionID is NOT NULL on every table below, so the session's own columns
+-- answer the same question and cannot drift; tenancy is enforced on EntityID, and TenantID was
+-- never a predicate anywhere in the application. The rest were written and never read back.
+--
+-- Guarded on the column still existing, so re-running against an already-dropped database is a
+-- provable no-op.
+--
+-- WHAT DELIBERATELY STAYS, because each one IS read:
+--   Subsystem_Stage_State.UpdatedAt  - the step-4 control-mapping sweep filters its queue on it
+--                                      (UpdatedAt < cutoff) and orders by it, oldest first.
+--   Risk_Treatment_Plan.EntityID     - the treatment audit rows are stamped from it, and the
+--                                      entity-wide compliance feed filters on that stamp.
+--   Scenario_Audit.EntityID          - that same feed's predicate.
+--   Diagnostic_Event.EntityID        - SessionID is NULLable there, so a session-less diagnostic
+--                                      has no join home and this is its only scoping id.
+--   Scenario_Session's own TenantID/EntityID/UserID - the NOT NULL authz truth all the copies
+--                                      above were redundant against.
+--   SubsystemID everywhere except Prompt_Log - filtered in a dozen queries, keys three indexes.
+--
+-- NOT OPTIONAL for one of them. Prompt_Log.SubsystemID is NOT NULL, so once the application
+-- stops writing it every INSERT into Prompt_Log fails while the column is still there - one row
+-- per LLM call. It is dropped here for the same reason Prompt_Log.Messages was.
+-- Prompt_Log.Stage is deliberately NOT dropped: the application still writes it, and the
+-- smoke-testing guide tells an operator to select it by hand.
+-- ---------------------------------------------------------------------------
+-- Subsystem_Stage_State.CreatedAt carries DF_StageState_CreatedAt; a DEFAULT bound to a column
+-- refuses the DROP outright (msg 5074), so the constraint goes first.
+IF COL_LENGTH('dbo.Subsystem_Stage_State', 'CreatedAt') IS NOT NULL
+   AND EXISTS (SELECT 1 FROM sys.default_constraints WHERE name = 'DF_StageState_CreatedAt')
+    ALTER TABLE Subsystem_Stage_State DROP CONSTRAINT DF_StageState_CreatedAt;
+
+IF COL_LENGTH('dbo.Subsystem_Stage_State', 'TenantID') IS NOT NULL
+    ALTER TABLE Subsystem_Stage_State DROP COLUMN TenantID;
+
+IF COL_LENGTH('dbo.Subsystem_Stage_State', 'EntityID') IS NOT NULL
+    ALTER TABLE Subsystem_Stage_State DROP COLUMN EntityID;
+
+IF COL_LENGTH('dbo.Subsystem_Stage_State', 'CreatedAt') IS NOT NULL
+    ALTER TABLE Subsystem_Stage_State DROP COLUMN CreatedAt;
+
+IF COL_LENGTH('dbo.Identified_Threat', 'TenantID') IS NOT NULL
+    ALTER TABLE Identified_Threat DROP COLUMN TenantID;
+
+IF COL_LENGTH('dbo.Identified_Threat', 'EntityID') IS NOT NULL
+    ALTER TABLE Identified_Threat DROP COLUMN EntityID;
+
+IF COL_LENGTH('dbo.Identified_Threat', 'UserID') IS NOT NULL
+    ALTER TABLE Identified_Threat DROP COLUMN UserID;
+
+IF COL_LENGTH('dbo.Identified_Duplicate_Threat', 'TenantID') IS NOT NULL
+    ALTER TABLE Identified_Duplicate_Threat DROP COLUMN TenantID;
+
+IF COL_LENGTH('dbo.Identified_Duplicate_Threat', 'EntityID') IS NOT NULL
+    ALTER TABLE Identified_Duplicate_Threat DROP COLUMN EntityID;
+
+IF COL_LENGTH('dbo.Identified_Duplicate_Threat', 'UserID') IS NOT NULL
+    ALTER TABLE Identified_Duplicate_Threat DROP COLUMN UserID;
+
+IF COL_LENGTH('dbo.Scoped_Threat', 'TenantID') IS NOT NULL
+    ALTER TABLE Scoped_Threat DROP COLUMN TenantID;
+
+IF COL_LENGTH('dbo.Scoped_Threat', 'EntityID') IS NOT NULL
+    ALTER TABLE Scoped_Threat DROP COLUMN EntityID;
+
+IF COL_LENGTH('dbo.Scoped_Threat', 'UserID') IS NOT NULL
+    ALTER TABLE Scoped_Threat DROP COLUMN UserID;
+
+IF COL_LENGTH('dbo.Threat_Scenario', 'TenantID') IS NOT NULL
+    ALTER TABLE Threat_Scenario DROP COLUMN TenantID;
+
+IF COL_LENGTH('dbo.Threat_Scenario', 'EntityID') IS NOT NULL
+    ALTER TABLE Threat_Scenario DROP COLUMN EntityID;
+
+IF COL_LENGTH('dbo.Threat_Scenario', 'UserID') IS NOT NULL
+    ALTER TABLE Threat_Scenario DROP COLUMN UserID;
+
+IF COL_LENGTH('dbo.Risk_Treatment_Plan', 'TenantID') IS NOT NULL
+    ALTER TABLE Risk_Treatment_Plan DROP COLUMN TenantID;
+
+IF COL_LENGTH('dbo.Risk_Treatment_Plan', 'CrmRiskIdentificationID') IS NOT NULL
+    ALTER TABLE Risk_Treatment_Plan DROP COLUMN CrmRiskIdentificationID;
+
+IF COL_LENGTH('dbo.Prompt_Log', 'TenantID') IS NOT NULL
+    ALTER TABLE Prompt_Log DROP COLUMN TenantID;
+
+IF COL_LENGTH('dbo.Prompt_Log', 'EntityID') IS NOT NULL
+    ALTER TABLE Prompt_Log DROP COLUMN EntityID;
+
+IF COL_LENGTH('dbo.Prompt_Log', 'UserID') IS NOT NULL
+    ALTER TABLE Prompt_Log DROP COLUMN UserID;
+
+IF COL_LENGTH('dbo.Prompt_Log', 'SubsystemID') IS NOT NULL
+    ALTER TABLE Prompt_Log DROP COLUMN SubsystemID;
+
+IF COL_LENGTH('dbo.Diagnostic_Event', 'TenantID') IS NOT NULL
+    ALTER TABLE Diagnostic_Event DROP COLUMN TenantID;
+
+IF COL_LENGTH('dbo.Scenario_Audit', 'TenantID') IS NOT NULL
+    ALTER TABLE Scenario_Audit DROP COLUMN TenantID;
+
+IF COL_LENGTH('dbo.Scenario_Audit', 'Granularity') IS NOT NULL
+    ALTER TABLE Scenario_Audit DROP COLUMN Granularity;
+
+IF COL_LENGTH('dbo.Scenario_Audit', 'ThreatTypeRefID') IS NOT NULL
+    ALTER TABLE Scenario_Audit DROP COLUMN ThreatTypeRefID;
+
+GO

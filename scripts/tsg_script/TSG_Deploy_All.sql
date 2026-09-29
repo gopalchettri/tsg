@@ -3967,7 +3967,7 @@ GO
 
   Script:      014_Subsystem_Stage_State.sql
   Order:       01_tables / 014
-  Purpose:     Create Subsystem_Stage_State, or bring an existing copy up to 17 columns.
+  Purpose:     Create Subsystem_Stage_State, or bring an existing copy up to 14 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Subsystem_Stage_State
@@ -4013,8 +4013,6 @@ BEGIN
     CREATE TABLE dbo.[Subsystem_Stage_State] (
         [StateID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
         [SubsystemID] INT NOT NULL,
         [Level] NVARCHAR(100) NOT NULL,
         [Status] NVARCHAR(100) NOT NULL,
@@ -4025,12 +4023,11 @@ BEGIN
         [AttemptCount] INT NOT NULL,
         [ErrorMessage] NVARCHAR(max) NULL,
         [UpdatedAt] DATETIME2(7) NOT NULL,
-        [CreatedAt] DATETIME2(7) NULL,
         [StartedAt] DATETIME2(7) NULL,
         [FinishedAt] DATETIME2(7) NULL,
         CONSTRAINT [PK_Subsystem_Stage_State] PRIMARY KEY CLUSTERED ([StateID])
     );
-    PRINT ' [CREATED] Table: Subsystem_Stage_State (17 columns)';
+    PRINT ' [CREATED] Table: Subsystem_Stage_State (14 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Subsystem_Stage_State';
@@ -4054,10 +4051,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'Sta
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'SubsystemID',
      @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'Level',
@@ -4078,8 +4071,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'Err
      @expected = N'NVARCHAR(max)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'UpdatedAt',
      @expected = N'DATETIME2(7)', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'CreatedAt',
-     @expected = N'DATETIME2(7)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'StartedAt',
      @expected = N'DATETIME2(7)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Subsystem_Stage_State', @column = N'FinishedAt',
@@ -4117,7 +4108,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Subsystem_Stage_State', @known = N'StateID,SessionID,TenantID,EntityID,SubsystemID,Level,Status,GenerationEpoch,ActiveTaskID,LeaseExpiresAt,HeartbeatAt,AttemptCount,ErrorMessage,UpdatedAt,CreatedAt,StartedAt,FinishedAt';
+EXEC dbo.tsg_report_extra_columns @table = N'Subsystem_Stage_State', @known = N'StateID,SessionID,SubsystemID,Level,Status,GenerationEpoch,ActiveTaskID,LeaseExpiresAt,HeartbeatAt,AttemptCount,ErrorMessage,UpdatedAt,StartedAt,FinishedAt';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4156,7 +4147,7 @@ GO
 
   Script:      015_Identified_Threat.sql
   Order:       01_tables / 015
-  Purpose:     Create Identified_Threat, or bring an existing copy up to 23 columns.
+  Purpose:     Create Identified_Threat, or bring an existing copy up to 20 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Identified_Threat
@@ -4202,9 +4193,6 @@ BEGIN
     CREATE TABLE dbo.[Identified_Threat] (
         [ThreatID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
-        [UserID] NVARCHAR(200) NULL,
         [SubsystemID] INT NOT NULL,
         [ThreatCategory] NVARCHAR(200) NOT NULL,
         [ThreatType] NVARCHAR(300) NOT NULL,
@@ -4225,7 +4213,7 @@ BEGIN
         [CreatedAt] DATETIME2(7) NULL,
         CONSTRAINT [PK_Identified_Threat] PRIMARY KEY CLUSTERED ([ThreatID])
     );
-    PRINT ' [CREATED] Table: Identified_Threat (23 columns)';
+    PRINT ' [CREATED] Table: Identified_Threat (20 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Identified_Threat';
@@ -4265,12 +4253,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Identified_Threat', @column = N'ThreatI
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Identified_Threat', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Identified_Threat', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Identified_Threat', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Identified_Threat', @column = N'UserID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Identified_Threat', @column = N'SubsystemID',
      @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Identified_Threat', @column = N'ThreatCategory',
@@ -4410,7 +4392,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Identified_Threat', @known = N'ThreatID,SessionID,TenantID,EntityID,UserID,SubsystemID,ThreatCategory,ThreatType,ThreatName,GenericName,ThreatCategoryID,ThreatActorsJSON,LibraryThreatType,LibraryThreatName,ThreatTypeID,ThreatCatalogueID,IsThreatAIGenerated,IsThreatTypeAIGenerated,GroundingStatus,GroundingScore,GroundingThresholdOrigin,Superseded,CreatedAt';
+EXEC dbo.tsg_report_extra_columns @table = N'Identified_Threat', @known = N'ThreatID,SessionID,SubsystemID,ThreatCategory,ThreatType,ThreatName,GenericName,ThreatCategoryID,ThreatActorsJSON,LibraryThreatType,LibraryThreatName,ThreatTypeID,ThreatCatalogueID,IsThreatAIGenerated,IsThreatTypeAIGenerated,GroundingStatus,GroundingScore,GroundingThresholdOrigin,Superseded,CreatedAt';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4449,7 +4431,7 @@ GO
 
   Script:      016_Identified_Duplicate_Threat.sql
   Order:       01_tables / 016
-  Purpose:     Create Identified_Duplicate_Threat, or bring an existing copy up to 15 columns.
+  Purpose:     Create Identified_Duplicate_Threat, or bring an existing copy up to 12 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Identified_Duplicate_Threat
@@ -4495,9 +4477,6 @@ BEGIN
     CREATE TABLE dbo.[Identified_Duplicate_Threat] (
         [DuplicateThreatID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
-        [UserID] NVARCHAR(200) NULL,
         [SubsystemID] INT NOT NULL,
         [ThreatCategory] NVARCHAR(200) NOT NULL,
         [ThreatType] NVARCHAR(300) NOT NULL,
@@ -4510,7 +4489,7 @@ BEGIN
         [CreatedAt] DATETIME2(7) NULL,
         CONSTRAINT [PK_Identified_Duplicate_Threat] PRIMARY KEY CLUSTERED ([DuplicateThreatID])
     );
-    PRINT ' [CREATED] Table: Identified_Duplicate_Threat (15 columns)';
+    PRINT ' [CREATED] Table: Identified_Duplicate_Threat (12 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Identified_Duplicate_Threat';
@@ -4534,12 +4513,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column =
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'UserID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'SubsystemID',
      @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Identified_Duplicate_Threat', @column = N'ThreatCategory',
@@ -4593,7 +4566,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Identified_Duplicate_Threat', @known = N'DuplicateThreatID,SessionID,TenantID,EntityID,UserID,SubsystemID,ThreatCategory,ThreatType,ThreatName,GenericName,ThreatActorsJSON,DuplicateOfThreatID,DuplicateReason,SimilarityScore,CreatedAt';
+EXEC dbo.tsg_report_extra_columns @table = N'Identified_Duplicate_Threat', @known = N'DuplicateThreatID,SessionID,SubsystemID,ThreatCategory,ThreatType,ThreatName,GenericName,ThreatActorsJSON,DuplicateOfThreatID,DuplicateReason,SimilarityScore,CreatedAt';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4632,7 +4605,7 @@ GO
 
   Script:      017_Scoped_Threat.sql
   Order:       01_tables / 017
-  Purpose:     Create Scoped_Threat, or bring an existing copy up to 16 columns.
+  Purpose:     Create Scoped_Threat, or bring an existing copy up to 13 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Scoped_Threat
@@ -4678,9 +4651,6 @@ BEGIN
     CREATE TABLE dbo.[Scoped_Threat] (
         [ScopedThreatID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
-        [UserID] NVARCHAR(200) NULL,
         [SubsystemID] INT NOT NULL,
         [ThreatID] UNIQUEIDENTIFIER NOT NULL,
         [Score] FLOAT NOT NULL,
@@ -4694,7 +4664,7 @@ BEGIN
         [CreatedAt] DATETIME2(7) NULL,
         CONSTRAINT [PK_Scoped_Threat] PRIMARY KEY CLUSTERED ([ScopedThreatID])
     );
-    PRINT ' [CREATED] Table: Scoped_Threat (16 columns)';
+    PRINT ' [CREATED] Table: Scoped_Threat (13 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Scoped_Threat';
@@ -4718,12 +4688,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'ScopedThrea
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'UserID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'SubsystemID',
      @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'ThreatID',
@@ -4779,7 +4743,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Scoped_Threat', @known = N'ScopedThreatID,SessionID,TenantID,EntityID,UserID,SubsystemID,ThreatID,Score,ScopeRank,Selected,Reason,RejectionKind,SelectionKind,FactorsJSON,Superseded,CreatedAt';
+EXEC dbo.tsg_report_extra_columns @table = N'Scoped_Threat', @known = N'ScopedThreatID,SessionID,SubsystemID,ThreatID,Score,ScopeRank,Selected,Reason,RejectionKind,SelectionKind,FactorsJSON,Superseded,CreatedAt';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4818,7 +4782,7 @@ GO
 
   Script:      018_Threat_Scenario.sql
   Order:       01_tables / 018
-  Purpose:     Create Threat_Scenario, or bring an existing copy up to 28 columns.
+  Purpose:     Create Threat_Scenario, or bring an existing copy up to 25 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Threat_Scenario
@@ -4915,9 +4879,6 @@ BEGIN
     CREATE TABLE dbo.[Threat_Scenario] (
         [ScenarioID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
-        [UserID] NVARCHAR(200) NULL,
         [SubsystemID] INT NOT NULL,
         [ScopedThreatID] UNIQUEIDENTIFIER NOT NULL,
         [Status] NVARCHAR(100) NOT NULL,
@@ -4943,7 +4904,7 @@ BEGIN
         [AcceptedBy] NVARCHAR(200) NULL,
         CONSTRAINT [PK_Threat_Scenario] PRIMARY KEY CLUSTERED ([ScenarioID])
     );
-    PRINT ' [CREATED] Table: Threat_Scenario (28 columns)';
+    PRINT ' [CREATED] Table: Threat_Scenario (25 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Threat_Scenario';
@@ -5020,12 +4981,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Threat_Scenario', @column = N'ScenarioI
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Threat_Scenario', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Threat_Scenario', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Threat_Scenario', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Threat_Scenario', @column = N'UserID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Threat_Scenario', @column = N'SubsystemID',
      @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Threat_Scenario', @column = N'ScopedThreatID',
@@ -5245,7 +5200,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Threat_Scenario', @known = N'ScenarioID,SessionID,TenantID,EntityID,UserID,SubsystemID,ScopedThreatID,Status,ScenarioJSON,ValidationJSON,AcceptedSubsetJSON,Accepted,Superseded,IdentityHash,ScenarioNumber,ReplacesScenarioID,GenerationEpoch,ErrorMessage,CreatedAt,ControlsMappedAt,ControlMapAttempts,GenStartedAt,GenFinishedAt,ScenarioSource,RejectedAt,RejectedBy,AcceptedAt,AcceptedBy';
+EXEC dbo.tsg_report_extra_columns @table = N'Threat_Scenario', @known = N'ScenarioID,SessionID,SubsystemID,ScopedThreatID,Status,ScenarioJSON,ValidationJSON,AcceptedSubsetJSON,Accepted,Superseded,IdentityHash,ScenarioNumber,ReplacesScenarioID,GenerationEpoch,ErrorMessage,CreatedAt,ControlsMappedAt,ControlMapAttempts,GenStartedAt,GenFinishedAt,ScenarioSource,RejectedAt,RejectedBy,AcceptedAt,AcceptedBy';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -5529,7 +5484,7 @@ GO
 
   Script:      020_Risk_Treatment_Plan.sql
   Order:       01_tables / 020
-  Purpose:     Create Risk_Treatment_Plan, or bring an existing copy up to 27 columns.
+  Purpose:     Create Risk_Treatment_Plan, or bring an existing copy up to 25 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Risk_Treatment_Plan
@@ -5576,10 +5531,8 @@ BEGIN
         [PlanID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
         [ScenarioID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
         [EntityID] NVARCHAR(200) NULL,
         [UserID] NVARCHAR(200) NULL,
-        [CrmRiskIdentificationID] INT NULL,
         [TreatmentStrategy] NVARCHAR(100) NOT NULL,
         [Status] NVARCHAR(100) NOT NULL,
         [ActiveTaskID] NVARCHAR(100) NULL,
@@ -5602,7 +5555,7 @@ BEGIN
         [ErrorReason] NVARCHAR(max) NULL,
         CONSTRAINT [PK_Risk_Treatment_Plan] PRIMARY KEY CLUSTERED ([PlanID])
     );
-    PRINT ' [CREATED] Table: Risk_Treatment_Plan (27 columns)';
+    PRINT ' [CREATED] Table: Risk_Treatment_Plan (25 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Risk_Treatment_Plan';
@@ -5665,14 +5618,10 @@ EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'Sessi
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'ScenarioID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'EntityID',
      @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'UserID',
      @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'CrmRiskIdentificationID',
-     @expected = N'INT', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'TreatmentStrategy',
      @expected = N'NVARCHAR(100)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Risk_Treatment_Plan', @column = N'Status',
@@ -5816,7 +5765,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Risk_Treatment_Plan', @known = N'PlanID,SessionID,ScenarioID,TenantID,EntityID,UserID,CrmRiskIdentificationID,TreatmentStrategy,Status,ActiveTaskID,RiskIdentificationDate,InputSnapshotJSON,PlanJSON,ValidationJSON,ErrorMessage,Superseded,CreatedAt,UpdatedAt,CompletedAt,RiskLevel,ReviewStatus,ReviewComment,ReviewedBy,ReviewedAt,CancelledAt,CancelledBy,ErrorReason';
+EXEC dbo.tsg_report_extra_columns @table = N'Risk_Treatment_Plan', @known = N'PlanID,SessionID,ScenarioID,EntityID,UserID,TreatmentStrategy,Status,ActiveTaskID,RiskIdentificationDate,InputSnapshotJSON,PlanJSON,ValidationJSON,ErrorMessage,Superseded,CreatedAt,UpdatedAt,CompletedAt,RiskLevel,ReviewStatus,ReviewComment,ReviewedBy,ReviewedAt,CancelledAt,CancelledBy,ErrorReason';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -5855,7 +5804,7 @@ GO
 
   Script:      021_Scenario_Audit.sql
   Order:       01_tables / 021
-  Purpose:     Create Scenario_Audit, or bring an existing copy up to 16 columns.
+  Purpose:     Create Scenario_Audit, or bring an existing copy up to 13 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Scenario_Audit
@@ -5901,7 +5850,6 @@ BEGIN
     CREATE TABLE dbo.[Scenario_Audit] (
         [AuditID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
         [EntityID] NVARCHAR(200) NULL,
         [Stage] NVARCHAR(100) NULL,
         [SubsystemID] INT NULL,
@@ -5909,15 +5857,13 @@ BEGIN
         [ScenarioID] UNIQUEIDENTIFIER NULL,
         [PlanID] UNIQUEIDENTIFIER NULL,
         [Decision] NVARCHAR(100) NULL,
-        [Granularity] NVARCHAR(100) NULL,
-        [ThreatTypeRefID] INT NULL,
         [ActorUserID] NVARCHAR(200) NULL,
         [ActorType] NVARCHAR(100) NULL,
         [DetailJSON] NVARCHAR(max) NULL,
         [CreatedAt] DATETIME2(7) NOT NULL,
         CONSTRAINT [PK_Scenario_Audit] PRIMARY KEY CLUSTERED ([AuditID])
     );
-    PRINT ' [CREATED] Table: Scenario_Audit (16 columns)';
+    PRINT ' [CREATED] Table: Scenario_Audit (13 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Scenario_Audit';
@@ -5978,8 +5924,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'AuditID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'EntityID',
      @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'Stage',
@@ -5994,10 +5938,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'PlanID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'Decision',
      @expected = N'NVARCHAR(100)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'Granularity',
-     @expected = N'NVARCHAR(100)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'ThreatTypeRefID',
-     @expected = N'INT', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'ActorUserID',
      @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scenario_Audit', @column = N'ActorType',
@@ -6109,7 +6049,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Scenario_Audit', @known = N'AuditID,SessionID,TenantID,EntityID,Stage,SubsystemID,EventType,ScenarioID,PlanID,Decision,Granularity,ThreatTypeRefID,ActorUserID,ActorType,DetailJSON,CreatedAt';
+EXEC dbo.tsg_report_extra_columns @table = N'Scenario_Audit', @known = N'AuditID,SessionID,EntityID,Stage,SubsystemID,EventType,ScenarioID,PlanID,Decision,ActorUserID,ActorType,DetailJSON,CreatedAt';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6148,7 +6088,7 @@ GO
 
   Script:      022_Prompt_Log.sql
   Order:       01_tables / 022
-  Purpose:     Create Prompt_Log, or bring an existing copy up to 15 columns.
+  Purpose:     Create Prompt_Log, or bring an existing copy up to 11 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Prompt_Log
@@ -6194,10 +6134,6 @@ BEGIN
     CREATE TABLE dbo.[Prompt_Log] (
         [LogID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
-        [UserID] NVARCHAR(200) NULL,
-        [SubsystemID] INT NOT NULL,
         [Stage] NVARCHAR(100) NOT NULL,
         [PromptVersion] NVARCHAR(100) NOT NULL,
         [Prompt] NVARCHAR(max) NULL,
@@ -6209,7 +6145,7 @@ BEGIN
         [CorrelationID] UNIQUEIDENTIFIER NULL,
         CONSTRAINT [PK_Prompt_Log] PRIMARY KEY CLUSTERED ([LogID])
     );
-    PRINT ' [CREATED] Table: Prompt_Log (15 columns)';
+    PRINT ' [CREATED] Table: Prompt_Log (11 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Prompt_Log';
@@ -6233,14 +6169,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'LogID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'UserID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'SubsystemID',
-     @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'Stage',
      @expected = N'NVARCHAR(100)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'PromptVersion',
@@ -6292,7 +6220,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Prompt_Log', @known = N'LogID,SessionID,TenantID,EntityID,UserID,SubsystemID,Stage,PromptVersion,Prompt,ResponseText,Model,ModelVersion,ParseSucceeded,CreatedAt,CorrelationID';
+EXEC dbo.tsg_report_extra_columns @table = N'Prompt_Log', @known = N'LogID,SessionID,Stage,PromptVersion,Prompt,ResponseText,Model,ModelVersion,ParseSucceeded,CreatedAt,CorrelationID';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6331,7 +6259,7 @@ GO
 
   Script:      023_Diagnostic_Event.sql
   Order:       01_tables / 023
-  Purpose:     Create Diagnostic_Event, or bring an existing copy up to 14 columns.
+  Purpose:     Create Diagnostic_Event, or bring an existing copy up to 13 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Diagnostic_Event
@@ -6378,7 +6306,6 @@ BEGIN
         [DiagnosticID] UNIQUEIDENTIFIER NOT NULL,
         [CreatedAt] DATETIME2(7) NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NULL,
-        [TenantID] NVARCHAR(200) NULL,
         [EntityID] NVARCHAR(200) NULL,
         [SubsystemID] INT NULL,
         [TaskID] NVARCHAR(100) NULL,
@@ -6391,7 +6318,7 @@ BEGIN
         [ContextJSON] NVARCHAR(max) NULL,
         CONSTRAINT [PK_Diagnostic_Event] PRIMARY KEY CLUSTERED ([DiagnosticID])
     );
-    PRINT ' [CREATED] Table: Diagnostic_Event (14 columns)';
+    PRINT ' [CREATED] Table: Diagnostic_Event (13 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Diagnostic_Event';
@@ -6417,8 +6344,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'CreatedA
      @expected = N'DATETIME2(7)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'EntityID',
      @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Diagnostic_Event', @column = N'SubsystemID',
@@ -6472,7 +6397,7 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Diagnostic_Event', @known = N'DiagnosticID,CreatedAt,SessionID,TenantID,EntityID,SubsystemID,TaskID,RequestID,Kind,ExceptionClass,ExceptionMessage,Traceback,ClientMessage,ContextJSON';
+EXEC dbo.tsg_report_extra_columns @table = N'Diagnostic_Event', @known = N'DiagnosticID,CreatedAt,SessionID,EntityID,SubsystemID,TaskID,RequestID,Kind,ExceptionClass,ExceptionMessage,Traceback,ClientMessage,ContextJSON';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6676,7 +6601,7 @@ GO
 
   Script:      001_default_constraints.sql
   Order:       02_constraints / 001
-  Purpose:     22 default constraints.
+  Purpose:     21 default constraints.
   Depends on:  01_tables/ *
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    default constraints
@@ -7051,26 +6976,6 @@ IF NOT EXISTS (SELECT 1 FROM sys.default_constraints dc
                WHERE dc.parent_object_id = OBJECT_ID('dbo.Subsystem_Stage_State')
                  AND c.name = 'AttemptCount')
     ALTER TABLE [dbo].[Subsystem_Stage_State] ADD CONSTRAINT [DF_SSS_AttemptCount] DEFAULT ((0)) FOR [AttemptCount];
-GO
-IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
-BEGIN
-    PRINT '';
-    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
-    PRINT '!!! line above it names the script. NOTHING after this point ran.';
-    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
-    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
-    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    SET NOEXEC ON;
-END
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.default_constraints dc
-               JOIN sys.columns c ON c.object_id = dc.parent_object_id
-                                 AND c.column_id = dc.parent_column_id
-               WHERE dc.parent_object_id = OBJECT_ID('dbo.Subsystem_Stage_State')
-                 AND c.name = 'CreatedAt')
-    ALTER TABLE [dbo].[Subsystem_Stage_State] ADD CONSTRAINT [DF_StageState_CreatedAt] DEFAULT (sysutcdatetime()) FOR [CreatedAt];
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -10176,7 +10081,7 @@ DECLARE @d int = (SELECT COUNT(*) FROM sys.default_constraints dc
 PRINT ' [INFO]    Tables:              ' + CAST(@t AS varchar(10)) + ' of 22';
 PRINT ' [INFO]    Non-PK indexes:      ' + CAST(@i AS varchar(10)) +
       '  (34 expected: 33 from 03_indexes + UQ_Config_Tuning_Key)';
-PRINT ' [INFO]    Default constraints: ' + CAST(@d AS varchar(10)) + '  (22 expected)';
+PRINT ' [INFO]    Default constraints: ' + CAST(@d AS varchar(10)) + '  (21 expected)';
 
 /*-------------------------- the verdict --------------------------*/
 PRINT '';
@@ -10199,7 +10104,7 @@ BEGIN
     PRINT 'deployment that printed [BLOCKED] on a narrowing change, or added a NOT NULL column';
     PRINT 'as NULL because the table had rows, reaches this line looking clean.';
     PRINT '';
-    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 316 columns, all 33';
+    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 291 columns, all 33';
     PRINT 'index shapes, 21 defaults, 6 identity columns and the collation, then prints the';
     PRINT 'FINAL SIGN-OFF. Then confirm the threat and control libraries hold data';
     PRINT '(README step 11) before starting the application.';
@@ -10257,7 +10162,7 @@ GO
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 316 columns and all 34 indexes, down to index key columns and filters.
+  Purpose:     Verify all 291 columns and all 34 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -10284,7 +10189,7 @@ GO
 
 PRINT '';
 PRINT '==============================================================';
-PRINT ' TSG COLUMN VERDICT   (316 columns across 24 tables)';
+PRINT ' TSG COLUMN VERDICT   (291 columns across 24 tables)';
 PRINT ' Database: ' + DB_NAME();
 PRINT '==============================================================';
 GO
@@ -10435,8 +10340,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Scenario_Session', N'ControlMapSeconds', N'float', N'FLOAT', 1),
     (N'Subsystem_Stage_State', N'StateID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Subsystem_Stage_State', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Subsystem_Stage_State', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Subsystem_Stage_State', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Subsystem_Stage_State', N'SubsystemID', N'int', N'INT', 0),
     (N'Subsystem_Stage_State', N'Level', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Subsystem_Stage_State', N'Status', N'nvarchar', N'NVARCHAR(100)', 0),
@@ -10447,14 +10350,10 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Subsystem_Stage_State', N'AttemptCount', N'int', N'INT', 0),
     (N'Subsystem_Stage_State', N'ErrorMessage', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Subsystem_Stage_State', N'UpdatedAt', N'datetime2', N'DATETIME2(7)', 0),
-    (N'Subsystem_Stage_State', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Subsystem_Stage_State', N'StartedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Subsystem_Stage_State', N'FinishedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Identified_Threat', N'ThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Identified_Threat', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Identified_Threat', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Identified_Threat', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Identified_Threat', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Identified_Threat', N'SubsystemID', N'int', N'INT', 0),
     (N'Identified_Threat', N'ThreatCategory', N'nvarchar', N'NVARCHAR(200)', 0),
     (N'Identified_Threat', N'ThreatType', N'nvarchar', N'NVARCHAR(300)', 0),
@@ -10475,9 +10374,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Identified_Threat', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Identified_Duplicate_Threat', N'DuplicateThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Identified_Duplicate_Threat', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Identified_Duplicate_Threat', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Identified_Duplicate_Threat', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Identified_Duplicate_Threat', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Identified_Duplicate_Threat', N'SubsystemID', N'int', N'INT', 0),
     (N'Identified_Duplicate_Threat', N'ThreatCategory', N'nvarchar', N'NVARCHAR(200)', 0),
     (N'Identified_Duplicate_Threat', N'ThreatType', N'nvarchar', N'NVARCHAR(300)', 0),
@@ -10490,9 +10386,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Identified_Duplicate_Threat', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Scoped_Threat', N'ScopedThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Scoped_Threat', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Scoped_Threat', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Scoped_Threat', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Scoped_Threat', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Scoped_Threat', N'SubsystemID', N'int', N'INT', 0),
     (N'Scoped_Threat', N'ThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Scoped_Threat', N'Score', N'float', N'FLOAT', 0),
@@ -10506,9 +10399,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Scoped_Threat', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Threat_Scenario', N'ScenarioID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Threat_Scenario', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Threat_Scenario', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Threat_Scenario', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Threat_Scenario', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Threat_Scenario', N'SubsystemID', N'int', N'INT', 0),
     (N'Threat_Scenario', N'ScopedThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Threat_Scenario', N'Status', N'nvarchar', N'NVARCHAR(100)', 0),
@@ -10542,10 +10432,8 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Risk_Treatment_Plan', N'PlanID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Risk_Treatment_Plan', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Risk_Treatment_Plan', N'ScenarioID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Risk_Treatment_Plan', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Risk_Treatment_Plan', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Risk_Treatment_Plan', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Risk_Treatment_Plan', N'CrmRiskIdentificationID', N'int', N'INT', 1),
     (N'Risk_Treatment_Plan', N'TreatmentStrategy', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Risk_Treatment_Plan', N'Status', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Risk_Treatment_Plan', N'ActiveTaskID', N'nvarchar', N'NVARCHAR(100)', 1),
@@ -10568,7 +10456,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Risk_Treatment_Plan', N'ErrorReason', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Audit', N'AuditID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Scenario_Audit', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Scenario_Audit', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Scenario_Audit', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Scenario_Audit', N'Stage', N'nvarchar', N'NVARCHAR(100)', 1),
     (N'Scenario_Audit', N'SubsystemID', N'int', N'INT', 1),
@@ -10576,18 +10463,12 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Scenario_Audit', N'ScenarioID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
     (N'Scenario_Audit', N'PlanID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
     (N'Scenario_Audit', N'Decision', N'nvarchar', N'NVARCHAR(100)', 1),
-    (N'Scenario_Audit', N'Granularity', N'nvarchar', N'NVARCHAR(100)', 1),
-    (N'Scenario_Audit', N'ThreatTypeRefID', N'int', N'INT', 1),
     (N'Scenario_Audit', N'ActorUserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Scenario_Audit', N'ActorType', N'nvarchar', N'NVARCHAR(100)', 1),
     (N'Scenario_Audit', N'DetailJSON', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Audit', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 0),
     (N'Prompt_Log', N'LogID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Prompt_Log', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Prompt_Log', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Prompt_Log', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Prompt_Log', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Prompt_Log', N'SubsystemID', N'int', N'INT', 0),
     (N'Prompt_Log', N'Stage', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Prompt_Log', N'PromptVersion', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Prompt_Log', N'Prompt', N'nvarchar', N'NVARCHAR(max)', 1),
@@ -10600,7 +10481,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Diagnostic_Event', N'DiagnosticID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Diagnostic_Event', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 0),
     (N'Diagnostic_Event', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
-    (N'Diagnostic_Event', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Diagnostic_Event', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Diagnostic_Event', N'SubsystemID', N'int', N'INT', 1),
     (N'Diagnostic_Event', N'TaskID', N'nvarchar', N'NVARCHAR(100)', 1),
@@ -10874,7 +10754,6 @@ INSERT INTO @df (name, tbl, col) VALUES
     (N'DF_IdentifiedThreat_IsThreatTypeAIGenerated', N'Identified_Threat', N'IsThreatTypeAIGenerated'),
     (N'DF_TreatmentPlan_Superseded', N'Risk_Treatment_Plan', N'Superseded'),
     (N'DF_SSS_AttemptCount', N'Subsystem_Stage_State', N'AttemptCount'),
-    (N'DF_StageState_CreatedAt', N'Subsystem_Stage_State', N'CreatedAt'),
     (N'DF_CatCategoryMap_CreatedAt', N'Threat_Catalogue_Category_Map', N'CreatedAt'),
     (N'DF_Scenario_ScenarioNumber', N'Threat_Scenario', N'ScenarioNumber'),
     (N'DF_ThreatScenario_ControlMapAttempts', N'Threat_Scenario', N'ControlMapAttempts'),
@@ -10960,7 +10839,7 @@ END;
 PRINT '';
 PRINT 'SCHEMA VERDICT';
 PRINT '--------------';
-PRINT ' [INFO]    Columns expected:   316';
+PRINT ' [INFO]    Columns expected:   291';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));
@@ -10968,7 +10847,7 @@ PRINT ' [INFO]    Indexes expected:   34';
 PRINT ' [INFO]    Missing/disabled:   ' + CAST(@ix_missing AS varchar(10));
 PRINT ' [INFO]    Wrong shape:        ' + CAST(@ix_shape   AS varchar(10));
 PRINT ' [INFO]    Primary keys wrong: ' + CAST(@pk_wrong   AS varchar(10));
-PRINT ' [INFO]    Defaults expected:  22';
+PRINT ' [INFO]    Defaults expected:  21';
 PRINT ' [INFO]    Missing defaults:   ' + CAST(@df_missing AS varchar(10));
 PRINT ' [INFO]    Identity expected:  6';
 PRINT ' [INFO]    Missing identity:   ' + CAST(@id_missing AS varchar(10));

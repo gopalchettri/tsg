@@ -20,10 +20,10 @@ WHAT IT CONTAINS
 
   Section 0   Snapshot isolation (and its own @disconnect_others switch)
   Section 1   The two switches for the run, then legacy names: repairs,
-              renames, the five removed columns, and Prompt_Log.Messages
+              renames, the 33 removed columns, and Prompt_Log.Messages
   Section 2   Tables (24)
-  Section 3   Columns (317), then three one-time data fixes
-  Section 4   Default constraints (22)
+  Section 3   Columns (292), then three one-time data fixes
+  Section 4   Default constraints (21)
   Section 5   Check constraints (3)
   Section 6   Indexes (33), then the re-clustering and PAGE compression of the
               four log tables
@@ -66,14 +66,14 @@ WHAT TO CHANGE
 
        VALUES ( A , B )
                 A = PreviewOnly         1 = dry run, 0 = do the work
-                B = DropRemovedColumns  1 = delete the five columns for good
+                B = DropRemovedColumns  1 = delete the 33 columns for good
                                         0 = keep them, only list them
 
   Save the file after each change.
 
 THE FOUR COMBINATIONS
        VALUES (1, 0)   dry run, changes nothing            used in step 4
-       VALUES (0, 0)   do the work, keep the five columns  used in step 5
+       VALUES (0, 0)   do the work, keep the 33 columns  used in step 5
        VALUES (0, 1)   do the work and delete them         used in step 8
        VALUES (1, 1)   dry run that also shows deletions   optional
 
@@ -189,7 +189,7 @@ READ
 EXPECT
   Lines beginning "renamed:", "repaired:", "applied:" that match what step 4
   said it would do.
-  "DropRemovedColumns = 0: the five removed columns are left in place."
+  "DropRemovedColumns = 0: the 33 removed columns are left in place."
   "removed column Prompt_Log.Messages (the prompt is kept in Prompt)." — see
   the note below; this one does NOT wait for step 8.
   "[REBUILD] PK_<table> is now NONCLUSTERED on ..." for Prompt_Log,
@@ -277,7 +277,7 @@ STOP IF
 =================== STEP 8 — THE DELETIONS (LATER) =========================
 
 Do this only after step 7 has passed, and only when you are ready to accept
-that five columns are gone for good.
+that 33 columns are gone for good.
 
 EDIT the switch line one last time. Same search:  EDIT THIS LINE
 

@@ -14,10 +14,10 @@ Written against the application itself: `app/db/models.py` for tables and column
 | Object | Count |
 |---|---:|
 | Tables TSG owns | 24 |
-| Columns | 316 |
+| Columns | 291 |
 | Primary keys | 24 |
 | Non-PK indexes | 33 |
-| Default constraints | 22 |
+| Default constraints | 21 |
 | Check constraints | 3 |
 | **Foreign keys** | **0 — deliberate, see section 6** |
 
@@ -39,12 +39,12 @@ Run in this order. Each step is safe to re-run.
 | 2 | `00_validation/001_pre_deployment_validation.sql` | Read-only report: fresh or upgrade, data at risk | nothing |
 | 3 | `00_validation/002_enable_isolation_level.sql` | Turn `READ_COMMITTED_SNAPSHOT` **on** — the application does not boot without it | nothing |
 | 4 | `01_tables/001…024_*.sql` | Create or reconcile each table, in order | step 1 |
-| 5 | `02_constraints/001_default_constraints.sql` | 22 default constraints | step 4 |
+| 5 | `02_constraints/001_default_constraints.sql` | 21 default constraints | step 4 |
 | 6 | `02_constraints/002_check_constraints.sql` | 3 check constraints | step 4 |
 | 7 | `02_constraints/003_unique_constraints.sql` | 1 unique constraint — `UQ_Config_Tuning_Key` | step 4 |
 | 8 | `03_indexes/001…018_*_indexes.sql` | 33 indexes | steps 4-7 |
 | 9 | `99_validation/001_post_deployment_validation.sql` | Objects: tables, PKs, indexes, constraints, isolation | steps 4-8 |
-| 10 | `99_validation/002_schema_verdict.sql` | **The final sign-off** — 316 columns, 33 index shapes, 22 defaults, 6 identity columns, collation | step 9 |
+| 10 | `99_validation/002_schema_verdict.sql` | **The final sign-off** — 291 columns, 33 index shapes, 21 defaults, 6 identity columns, collation | step 9 |
 | 11 | *(separate)* seed the libraries | Threat and control master data | step 10 |
 
 > **Step 3 has the only line in this package you are meant to edit.** By default
@@ -211,11 +211,11 @@ The relationships still exist; they are simply not declared. Section 3 is the li
 | Area | Result | Note |
 |---|---|---|
 | Tables | PASS | 22 owned tables, generated from `models.py` |
-| Columns | PASS | 296 columns, types compiled by SQLAlchemy, not hand-typed |
+| Columns | PASS | 291 columns, types compiled by SQLAlchemy, not hand-typed |
 | Datatypes | PASS | `INTEGER` normalised to `INT` so the check matches `sys.columns` |
 | Primary keys | PASS | 22, key columns reconciled on every run and verified in the sign-off |
 | Foreign keys | N/A | None by design — section 6 |
-| Constraints | PASS | 22 defaults, 3 checks, 1 unique, all existence-guarded |
+| Constraints | PASS | 21 defaults, 3 checks, 1 unique, all existence-guarded |
 | Indexes | PASS | 32 (31 + `UQ_Config_Tuning_Key`), including all 15 the application needs to boot |
 | API queries | PASS | Every table the ORM maps has a script; the ORM is what the API reads through |
 | Dependencies | PASS | Reference data before the pipeline; no script needs a later one |

@@ -578,18 +578,18 @@ def run_treatment_generation(sess: Session, plan_id: str, llm: LLMClient, task_i
     if row is None:  # defensive only — the claim CAS just matched this PlanID
         log.warning("treatment.row_vanished", plan_id=plan_id)
         return
-    # The four columns _ask_ai reads for its Prompt_Log row — all denormalized onto the plan
-    # row at insert, so no Scenario_Session re-read is needed here. Scenario_Audit has no
-    # UserID column (only ActorUserID, which stays NULL on these worker rows), hence the
-    # narrower dict.
-    audit_ident = {"SessionID": row["SessionID"], "TenantID": row["TenantID"],
-                "EntityID": row["EntityID"], "UserID": row["UserID"]}
+    # Both consumers need only these two, and both are denormalized onto the plan row at insert,
+    # so no Scenario_Session re-read is needed here. _ask_ai stamps its Prompt_Log receipt from
+    # SessionID alone; EntityID rides along because the entity-wide treatment compliance feed
+    # filters the audit rows on it, and this worker is one of the writers that has to stamp it.
+    # Scenario_Audit has no UserID column — only ActorUserID, which stays NULL on worker rows.
+    audit_ident = {"SessionID": row["SessionID"], "EntityID": row["EntityID"]}
     # ScenarioID included: without it these worker-written treatment_plan_outcome rows leave the
     # indexed column NULL, stay OUTSIDE the filtered IX_ScenarioAudit_Scenario, and cannot say WHICH
     # scenario they belong to — so the per-scenario trail had to fetch a whole session and discard
     # the rest in Python. It is not an optimisation: a row that cannot name its subject is unusable
     # in a timeline. The API-side writes were stamped already; these two were the gap.
-    audit_cols = {k: audit_ident[k] for k in ("SessionID", "TenantID", "EntityID")}
+    audit_cols = {k: audit_ident[k] for k in ("SessionID", "EntityID")}
     audit_cols["ScenarioID"] = row["ScenarioID"]
     audit_cols["PlanID"] = plan_id   # the plan dimension, same reason as ScenarioID
     try:

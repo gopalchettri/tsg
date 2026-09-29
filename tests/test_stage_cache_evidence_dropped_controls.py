@@ -285,9 +285,9 @@ def _seed(maker, *, status="active", stage="THREAT_IDENTIFICATION", stage_status
             SubsystemsJSON="[]", CreatedAt=_NOW, UpdatedAt=_NOW))
         for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS):
             s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-                StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="e",
+                StateID=str(uuid.uuid4()), SessionID=sid,
                 SubsystemID=0, Level=level, Status=StageStatus.IDLE, GenerationEpoch=1,
-                LeaseExpiresAt=_NOW + timedelta(minutes=30), UpdatedAt=_NOW, CreatedAt=_NOW))
+                LeaseExpiresAt=_NOW + timedelta(minutes=30), UpdatedAt=_NOW))
         s.commit()
     return sid
 

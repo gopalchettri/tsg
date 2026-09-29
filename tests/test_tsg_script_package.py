@@ -203,11 +203,11 @@ def test_the_sign_off_verifies_every_column_and_index_shape() -> None:
         assert name in actual, f"{name} is not in the index verdict"
 
     # DEFAULTS. 001 only PRINTS a count as [INFO] and never fails on it, so before this the
-    # package could create 22 defaults and verify none. A column that loses its default does not
+    # package could create 21 defaults and verify none. A column that loses its default does not
     # error — it silently stores whatever the insert omitted. Checked BY COLUMN, because a
     # correct database may carry the default under an auto-generated name.
     dfs = gen.default_definitions()
-    assert len(dfs) == 22, f"expected 22 defaults parsed from the reviewed DDL, got {len(dfs)}"
+    assert len(dfs) == 21, f"expected 21 defaults parsed from the reviewed DDL, got {len(dfs)}"
     assert f"Defaults expected:  {len(dfs)}" in actual, "the verdict does not count the defaults"
     assert "@df_missing" in actual and "no DEFAULT on" in actual, (
         "the verdict no longer FAILS on a missing default")
@@ -379,8 +379,8 @@ def test_every_script_is_valid_t_sql_the_server_will_accept() -> None:
     assert "WHERE name = 'DF_" not in defaults, (
         "a default is guarded by constraint NAME. SQL Server permits one default per COLUMN, so "
         "a column already holding an auto-named default fails with Msg 1781. Guard on the column.")
-    assert defaults.count("dc.parent_object_id = OBJECT_ID") == 22, (
-        "expected all 22 defaults to be guarded on their column")
+    assert defaults.count("dc.parent_object_id = OBJECT_ID") == 21, (
+        "expected all 21 defaults to be guarded on their column")
 
 
 def test_every_unique_column_in_the_orm_is_created_by_the_package() -> None:

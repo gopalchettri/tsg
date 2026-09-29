@@ -329,9 +329,9 @@ def _seed_session(maker, *, stage="THREAT_IDENTIFICATION", stage_status="IDLE", 
             SubsystemsJSON="[]", CreatedAt=touched or t, UpdatedAt=touched or t))
         for level, st, lease in rows:
             s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-                StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="78",
+                StateID=str(uuid.uuid4()), SessionID=sid,
                 SubsystemID=0, Level=level, Status=st, GenerationEpoch=1,
-                LeaseExpiresAt=None if lease is None else t + lease, UpdatedAt=t, CreatedAt=t))
+                LeaseExpiresAt=None if lease is None else t + lease, UpdatedAt=t))
         s.commit()
     return sid
 

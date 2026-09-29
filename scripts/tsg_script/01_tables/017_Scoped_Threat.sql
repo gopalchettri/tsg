@@ -3,7 +3,7 @@
 
   Script:      017_Scoped_Threat.sql
   Order:       01_tables / 017
-  Purpose:     Create Scoped_Threat, or bring an existing copy up to 16 columns.
+  Purpose:     Create Scoped_Threat, or bring an existing copy up to 13 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Scoped_Threat
@@ -25,9 +25,6 @@ BEGIN
     CREATE TABLE dbo.[Scoped_Threat] (
         [ScopedThreatID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
-        [UserID] NVARCHAR(200) NULL,
         [SubsystemID] INT NOT NULL,
         [ThreatID] UNIQUEIDENTIFIER NOT NULL,
         [Score] FLOAT NOT NULL,
@@ -41,7 +38,7 @@ BEGIN
         [CreatedAt] DATETIME2(7) NULL,
         CONSTRAINT [PK_Scoped_Threat] PRIMARY KEY CLUSTERED ([ScopedThreatID])
     );
-    PRINT ' [CREATED] Table: Scoped_Threat (16 columns)';
+    PRINT ' [CREATED] Table: Scoped_Threat (13 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Scoped_Threat';
@@ -53,12 +50,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'ScopedThrea
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'UserID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
 EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'SubsystemID',
      @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Scoped_Threat', @column = N'ThreatID',
@@ -90,5 +81,5 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Scoped_Threat', @known = N'ScopedThreatID,SessionID,TenantID,EntityID,UserID,SubsystemID,ThreatID,Score,ScopeRank,Selected,Reason,RejectionKind,SelectionKind,FactorsJSON,Superseded,CreatedAt';
+EXEC dbo.tsg_report_extra_columns @table = N'Scoped_Threat', @known = N'ScopedThreatID,SessionID,SubsystemID,ThreatID,Score,ScopeRank,Selected,Reason,RejectionKind,SelectionKind,FactorsJSON,Superseded,CreatedAt';
 GO

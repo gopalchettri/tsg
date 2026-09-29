@@ -244,7 +244,7 @@ def _settle_next_set_click(sess: Session, scenario_session: dict, subsystem_id: 
     detail = json.dumps({"outcome": str(outcome), "requested": requested, "delivered": delivered,
                         "variants": variants, "reason": reason, "epoch": epoch,
                         "subsystem_id": subsystem_id})
-    dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
+    dal.append_audit(sess, AuditID=guid(), SessionID=sid,
                     EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
                     Stage=WorkflowStage.SCENARIO_GENERATION,
                     EventType=AuditEventType.next_set_outcome, DetailJSON=detail)
@@ -462,10 +462,10 @@ def run_regeneration(sess: Session, scenario_session: dict, subsystem_id: int, g
 
             # Commit the audit row with the scenario transaction.
             def _stage_regen_audit(_provs) -> None:
-                dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
+                dal.append_audit(sess, AuditID=guid(), SessionID=sid,
                                 EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
                                 Stage=WorkflowStage.SCENARIO_GENERATION,
-                                EventType=AuditEventType.regeneration_completed, Granularity=str(granularity),
+                                EventType=AuditEventType.regeneration_completed,
                                 DetailJSON=_build_regen_audit_detail(
                                     {t.threat_id for t in targets.values()}, target_ids, epoch,
                                     replacements=[p for p in _regen_replacements(sess, sid, subsystem_id, epoch)
@@ -551,7 +551,7 @@ def _top_up_with_variants(sess: Session, scenario_session: dict, subsystem_id: i
                                                 asset_context, llm, task_id, epoch,
                                                 max_variants=shortfall, exclude_threat_ids=exclude)
         if created:
-            dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
+            dal.append_audit(sess, AuditID=guid(), SessionID=sid,
                             EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
                             Stage=WorkflowStage.SCENARIO_GENERATION,
                             EventType=AuditEventType.generation_complete,
@@ -586,7 +586,7 @@ def _settle_next_set_conflict(sess: Session, scenario_session: dict, subsystem_i
                                                 subsystems, asset_context, llm, task_id,
                                                 next_set_size)
     if not created:
-        dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
+        dal.append_audit(sess, AuditID=guid(), SessionID=sid,
                         EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
                         Stage=WorkflowStage.SCENARIO_GENERATION,
                         EventType=AuditEventType.generation_complete,
@@ -675,7 +675,7 @@ def run_next_set(sess: Session, scenario_session: dict, subsystem_id: int, epoch
 
             # Commit the audit row with the scenario transaction.
             def _stage_next_set_audit(provs) -> None:
-                dal.append_audit(sess, AuditID=guid(), SessionID=sid, TenantID=scenario_session["TenantID"],
+                dal.append_audit(sess, AuditID=guid(), SessionID=sid,
                                 EntityID=scenario_session["EntityID"], SubsystemID=subsystem_id,
                                 Stage=WorkflowStage.SCENARIO_GENERATION,
                                 EventType=AuditEventType.generation_complete,

@@ -81,8 +81,8 @@ def _gr(catalogue_id=None):
 
 def _record(gr):
     row, summary = tasks._build_threat_records(
-        str(uuid.uuid4()), str(uuid.uuid4()), "t", 0, "Tampering type", "Tampering",
-        "Setpoint change", gr, "e", "u", generic_name="Setpoint change",
+        str(uuid.uuid4()), str(uuid.uuid4()), 0, "Tampering type", "Tampering",
+        "Setpoint change", gr, generic_name="Setpoint change",
         category_id=6)
     return row, summary
 
@@ -128,11 +128,11 @@ def _seeded_session(tmp_path):
             CreatedAt=NOW, UpdatedAt=NOW))
         s.execute(m.Identified_Threat.__table__.insert().values(**row))
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="e",
+            ScopedThreatID=scoped_id, SessionID=sid,
             SubsystemID=0, ThreatID=row["ThreatID"], Score=77.0, ScopeRank=1, Selected=1,
             Superseded=0, CreatedAt=NOW))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=scenario_id, SessionID=sid, TenantID="t", EntityID="e", SubsystemID=0,
+            ScenarioID=scenario_id, SessionID=sid, SubsystemID=0,
             ScopedThreatID=scoped_id, Status="complete", ScenarioJSON="{}",
             Accepted=1, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW,
             # accepted() implies the filtered index's WHOLE predicate: Accepted=1 AND

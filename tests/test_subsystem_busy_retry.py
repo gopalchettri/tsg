@@ -62,25 +62,24 @@ def _seed(Session, *, status: SessionStatus, stage: WorkflowStage) -> tuple[str,
             SubsystemsJSON="[]", AssetContextJSON="{}", CreatedAt=NOW, UpdatedAt=NOW))
         # _LOCK is RUNNING: somebody else — the sweep, an accept — holds this subsystem.
         s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-            StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            StateID=str(uuid.uuid4()), SessionID=sid, SubsystemID=0,
             Level=SubsystemLevel.LOCK, Status=StageStatus.RUNNING, GenerationEpoch=1,
             ActiveTaskID=str(uuid.uuid4()), LeaseExpiresAt=NOW + timedelta(minutes=10),
-            AttemptCount=1, UpdatedAt=NOW, CreatedAt=NOW))
+            AttemptCount=1, UpdatedAt=NOW))
         s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-            StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            StateID=str(uuid.uuid4()), SessionID=sid, SubsystemID=0,
             Level=SubsystemLevel.SCENARIOS, Status=StageStatus.IDLE, GenerationEpoch=2,
-            AttemptCount=0, LeaseExpiresAt=NOW + timedelta(minutes=10), UpdatedAt=NOW,
-            CreatedAt=NOW))
+            AttemptCount=0, LeaseExpiresAt=NOW + timedelta(minutes=10), UpdatedAt=NOW))
         # A real, regeneratable target: get_threat_id_to_redo resolves the scenario THROUGH its
         # Scoped_Threat row, and an unresolvable id is refused before the lock is ever touched —
         # which would make this test pass for the wrong reason.
         scoped_id, oid = str(uuid.uuid4()), str(uuid.uuid4())
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ScopedThreatID=scoped_id, SessionID=sid, SubsystemID=0,
             ThreatID=str(uuid.uuid4()), Score=9.0, ScopeRank=1, Selected=1, Superseded=0,
             CreatedAt=NOW))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=oid, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=oid, SessionID=sid,
             SubsystemID=0, ScopedThreatID=scoped_id, Status="complete",
             ScenarioJSON=json.dumps({"scenario_title": "x"}), Accepted=0, Superseded=0,
             IdentityHash="h" * 64, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW))

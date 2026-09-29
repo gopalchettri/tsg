@@ -64,14 +64,14 @@ def _seed(Session) -> tuple[str, str]:
             Mode="AUTO", SubsystemsJSON="[]", CreatedAt=NOW, UpdatedAt=NOW))
         for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS, SubsystemLevel.LOCK):
             s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-                StateID=str(uuid.uuid4()), SessionID=SID, TenantID="t", EntityID=ENTITY,
+                StateID=str(uuid.uuid4()), SessionID=SID,
                 SubsystemID=0, Level=level, Status=StageStatus.COMPLETE, GenerationEpoch=1,
-                UpdatedAt=NOW, CreatedAt=NOW))
+                UpdatedAt=NOW))
         # Every field Phase 4 added to ThreatResult, populated with a REAL value each -- a
         # missing SELECT column reads back as a KeyError, not a None, so this only proves
         # anything if every field genuinely round-trips.
         s.execute(m.Identified_Threat.__table__.insert().values(
-            ThreatID=threat_id, SessionID=SID, TenantID="t", EntityID=ENTITY, SubsystemID=0,
+            ThreatID=threat_id, SessionID=SID, SubsystemID=0,
             ThreatCategory="Denial of Service", ThreatType="Ransomware on OT support systems",
             ThreatName="Ransomware on OT support systems",
             ThreatTypeID=57, ThreatCatalogueID=418, ThreatCategoryID=5,
@@ -85,11 +85,11 @@ def _seed(Session) -> tuple[str, str]:
             ThreatActorID=7, ThreatActorName="Nation-state/APT",
             IsActive=True, IsDeleted=False))
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=scoped_id, SessionID=SID, TenantID="t", EntityID=ENTITY,
+            ScopedThreatID=scoped_id, SessionID=SID,
             SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=1, Selected=1,
             Superseded=0, CreatedAt=NOW))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=scenario_id, SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
+            ScenarioID=scenario_id, SessionID=SID,
             SubsystemID=0, ScopedThreatID=scoped_id, Status=ScenarioStatus.complete,
             ScenarioJSON=json.dumps({"scenario_title": "t", "scenario_statement": "s",
                                     "risk_statement": "r"}),
@@ -233,11 +233,11 @@ def test_failure_card_still_reports_which_threat_failed(monkeypatch):
     with Session() as s:
         # A second scoped row off the SAME threat, carrying an error card: ScenarioJSON NULL.
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=failed_scoped, SessionID=SID, TenantID="t", EntityID=ENTITY,
+            ScopedThreatID=failed_scoped, SessionID=SID,
             SubsystemID=0, ThreatID=threat_id, Score=90.0, ScopeRank=2, Selected=1,
             Superseded=0, CreatedAt=NOW))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=failed_output, SessionID=SID, TenantID="t", EntityID=ENTITY, UserID="u",
+            ScenarioID=failed_output, SessionID=SID,
             SubsystemID=0, ScopedThreatID=failed_scoped, Status=ScenarioStatus.error,
             ScenarioJSON=None, ErrorMessage="LLM call failed",
             Accepted=0, Superseded=0, ScenarioNumber=1, GenerationEpoch=1, CreatedAt=NOW))

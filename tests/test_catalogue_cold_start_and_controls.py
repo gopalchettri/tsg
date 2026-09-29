@@ -82,7 +82,7 @@ def _cold_engine():
 
 def _seed_stage(s, sid: str) -> None:
     s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-        StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="e",
+        StateID=str(uuid.uuid4()), SessionID=sid,
         SubsystemID=0, Level=SubsystemLevel.THREATS, Status=StageStatus.IDLE,
         GenerationEpoch=1, AttemptCount=0, UpdatedAt=datetime.now(UTC)))
     s.commit()

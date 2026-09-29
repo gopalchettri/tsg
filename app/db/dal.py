@@ -1554,7 +1554,7 @@ def _decidable_where(session_id: str, subsystem_ids: list[int], decision: AuditD
 
 def decide_scenarios(
     sess: Session, session_id: str, subsystem_ids: list[int], *, decision: AuditDecision,
-    subset: list[str] | None = None, tenant_id: str | None = None, entity_id: str | None = None,
+    subset: list[str] | None = None, entity_id: str | None = None,
     user_id: str | None = None, details: dict[str, dict] | None = None,
 ) -> Decided:
     """Record ONE reviewer decision per scenario — the row write and its ledger entry, together.
@@ -1646,7 +1646,7 @@ def decide_scenarios(
         actor = user_id
         detail = details or {}
         sess.execute(insert(m.Scenario_Audit), [
-            audit_row(sess, AuditID=guid(), SessionID=session_id, TenantID=tenant_id,
+            audit_row(sess, AuditID=guid(), SessionID=session_id,
                     EntityID=entity_id, ScenarioID=oid, EventType=event_type, Decision=decision,
                     ActorUserID=actor,
                     DetailJSON=json.dumps(detail[oid]) if oid in detail else None)
@@ -2837,7 +2837,7 @@ def session_audit_rows(sess: Session, session_id: str, *, scenario_id: str | Non
     it. `scenario_id` seeks the separate filtered IX_ScenarioAudit_Scenario instead."""
     a = m.Scenario_Audit
     stmt = select(a.AuditID, a.SessionID, a.EventType, a.Stage, a.SubsystemID, a.ScenarioID,
-                a.PlanID, a.Decision, a.Granularity, a.ActorUserID, a.ActorType,
+                a.PlanID, a.Decision, a.ActorUserID, a.ActorType,
                 a.DetailJSON, a.CreatedAt).where(a.SessionID == session_id)
     if scenario_id is not None:
         stmt = stmt.where(a.ScenarioID == scenario_id)

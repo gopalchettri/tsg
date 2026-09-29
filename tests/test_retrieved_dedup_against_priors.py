@@ -140,7 +140,7 @@ def _seed_session(s) -> dict:
            "SubsystemsJSON": json.dumps(SUBSYSTEMS),
            "CreatedAt": NOW, "UpdatedAt": NOW}
     s.execute(m.Scenario_Session.__table__.insert().values(**row))
-    set_up_progress_tracking(s, SID, "t", "e")
+    set_up_progress_tracking(s, SID)
     s.commit()
     return row
 

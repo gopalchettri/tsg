@@ -61,7 +61,7 @@ def _gid(label: str) -> str:
 
 def _threat(label, subsystem_id, *, category, catalogue_id=None, superseded=0):
     return {
-        "ThreatID": _gid(label), "SessionID": SID, "TenantID": "t", "EntityID": "e",
+        "ThreatID": _gid(label), "SessionID": SID,
         "SubsystemID": subsystem_id, "ThreatCategory": category, "ThreatType": "t",
         "ThreatName": "n", "ThreatTypeID": None, "ThreatCatalogueID": catalogue_id,
         "GroundingStatus": "verified", "GroundingScore": 100.0,

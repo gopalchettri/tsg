@@ -68,9 +68,9 @@ def _seed(s) -> dict:
     s.execute(m.Scenario_Session.__table__.insert().values(**row))
     for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS, SubsystemLevel.LOCK):
         s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-            StateID=str(uuid.uuid4()), SessionID=SID, TenantID="t", EntityID="e", SubsystemID=0,
+            StateID=str(uuid.uuid4()), SessionID=SID, SubsystemID=0,
             Level=level, Status=StageStatus.IDLE, GenerationEpoch=1,
-            LeaseExpiresAt=NOW + timedelta(minutes=30), UpdatedAt=NOW, CreatedAt=NOW))
+            LeaseExpiresAt=NOW + timedelta(minutes=30), UpdatedAt=NOW))
     s.commit()
     return row
 

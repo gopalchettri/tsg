@@ -112,17 +112,17 @@ def _seed(sf, *, accepted=1, rejected_at=None, superseded_out=0, superseded_thre
     sid, tid, oid, stid = _guid(), _guid(), _guid(), _guid()
     with sf() as s:
         s.add(m.Identified_Threat(
-            ThreatID=tid, SessionID=sid, TenantID="t", EntityID="e", UserID="u", SubsystemID=0,
+            ThreatID=tid, SessionID=sid, SubsystemID=0,
             ThreatCategory="Tampering", ThreatCategoryID=CAT_ID, ThreatType="Ransomware",
             ThreatName="Ransomware encrypts the ACME Historian", GenericName=generic_name,
             ThreatTypeID=type_id, ThreatCatalogueID=catalogue_id,
             ThreatActorsJSON=actors_json, GroundingStatus="unverified",
             Superseded=superseded_threat))
-        s.add(m.Scoped_Threat(ScopedThreatID=stid, SessionID=sid, TenantID="t", EntityID="e",
-                              UserID="u", SubsystemID=0, ThreatID=tid, Score=1.0, ScopeRank=1,
+        s.add(m.Scoped_Threat(ScopedThreatID=stid, SessionID=sid,
+                              SubsystemID=0, ThreatID=tid, Score=1.0, ScopeRank=1,
                               Selected=1))
         s.add(m.Threat_Scenario(
-            ScenarioID=oid, SessionID=sid, TenantID="t", EntityID="e", UserID="u", SubsystemID=0,
+            ScenarioID=oid, SessionID=sid, SubsystemID=0,
             ScopedThreatID=stid, Status=status, ScenarioJSON="{}", Accepted=accepted,
             RejectedAt=rejected_at, IdentityHash="h", ScenarioNumber=1,
             Superseded=superseded_out))

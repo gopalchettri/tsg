@@ -3,7 +3,7 @@
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 316 columns and all 34 indexes, down to index key columns and filters.
+  Purpose:     Verify all 291 columns and all 34 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -18,7 +18,7 @@ GO
 
 PRINT '';
 PRINT '==============================================================';
-PRINT ' TSG COLUMN VERDICT   (316 columns across 24 tables)';
+PRINT ' TSG COLUMN VERDICT   (291 columns across 24 tables)';
 PRINT ' Database: ' + DB_NAME();
 PRINT '==============================================================';
 GO
@@ -157,8 +157,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Scenario_Session', N'ControlMapSeconds', N'float', N'FLOAT', 1),
     (N'Subsystem_Stage_State', N'StateID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Subsystem_Stage_State', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Subsystem_Stage_State', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Subsystem_Stage_State', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Subsystem_Stage_State', N'SubsystemID', N'int', N'INT', 0),
     (N'Subsystem_Stage_State', N'Level', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Subsystem_Stage_State', N'Status', N'nvarchar', N'NVARCHAR(100)', 0),
@@ -169,14 +167,10 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Subsystem_Stage_State', N'AttemptCount', N'int', N'INT', 0),
     (N'Subsystem_Stage_State', N'ErrorMessage', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Subsystem_Stage_State', N'UpdatedAt', N'datetime2', N'DATETIME2(7)', 0),
-    (N'Subsystem_Stage_State', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Subsystem_Stage_State', N'StartedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Subsystem_Stage_State', N'FinishedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Identified_Threat', N'ThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Identified_Threat', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Identified_Threat', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Identified_Threat', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Identified_Threat', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Identified_Threat', N'SubsystemID', N'int', N'INT', 0),
     (N'Identified_Threat', N'ThreatCategory', N'nvarchar', N'NVARCHAR(200)', 0),
     (N'Identified_Threat', N'ThreatType', N'nvarchar', N'NVARCHAR(300)', 0),
@@ -197,9 +191,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Identified_Threat', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Identified_Duplicate_Threat', N'DuplicateThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Identified_Duplicate_Threat', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Identified_Duplicate_Threat', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Identified_Duplicate_Threat', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Identified_Duplicate_Threat', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Identified_Duplicate_Threat', N'SubsystemID', N'int', N'INT', 0),
     (N'Identified_Duplicate_Threat', N'ThreatCategory', N'nvarchar', N'NVARCHAR(200)', 0),
     (N'Identified_Duplicate_Threat', N'ThreatType', N'nvarchar', N'NVARCHAR(300)', 0),
@@ -212,9 +203,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Identified_Duplicate_Threat', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Scoped_Threat', N'ScopedThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Scoped_Threat', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Scoped_Threat', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Scoped_Threat', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Scoped_Threat', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Scoped_Threat', N'SubsystemID', N'int', N'INT', 0),
     (N'Scoped_Threat', N'ThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Scoped_Threat', N'Score', N'float', N'FLOAT', 0),
@@ -228,9 +216,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Scoped_Threat', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 1),
     (N'Threat_Scenario', N'ScenarioID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Threat_Scenario', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Threat_Scenario', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Threat_Scenario', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Threat_Scenario', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Threat_Scenario', N'SubsystemID', N'int', N'INT', 0),
     (N'Threat_Scenario', N'ScopedThreatID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Threat_Scenario', N'Status', N'nvarchar', N'NVARCHAR(100)', 0),
@@ -264,10 +249,8 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Risk_Treatment_Plan', N'PlanID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Risk_Treatment_Plan', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Risk_Treatment_Plan', N'ScenarioID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Risk_Treatment_Plan', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Risk_Treatment_Plan', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Risk_Treatment_Plan', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Risk_Treatment_Plan', N'CrmRiskIdentificationID', N'int', N'INT', 1),
     (N'Risk_Treatment_Plan', N'TreatmentStrategy', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Risk_Treatment_Plan', N'Status', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Risk_Treatment_Plan', N'ActiveTaskID', N'nvarchar', N'NVARCHAR(100)', 1),
@@ -290,7 +273,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Risk_Treatment_Plan', N'ErrorReason', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Audit', N'AuditID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Scenario_Audit', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Scenario_Audit', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Scenario_Audit', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Scenario_Audit', N'Stage', N'nvarchar', N'NVARCHAR(100)', 1),
     (N'Scenario_Audit', N'SubsystemID', N'int', N'INT', 1),
@@ -298,18 +280,12 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Scenario_Audit', N'ScenarioID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
     (N'Scenario_Audit', N'PlanID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
     (N'Scenario_Audit', N'Decision', N'nvarchar', N'NVARCHAR(100)', 1),
-    (N'Scenario_Audit', N'Granularity', N'nvarchar', N'NVARCHAR(100)', 1),
-    (N'Scenario_Audit', N'ThreatTypeRefID', N'int', N'INT', 1),
     (N'Scenario_Audit', N'ActorUserID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Scenario_Audit', N'ActorType', N'nvarchar', N'NVARCHAR(100)', 1),
     (N'Scenario_Audit', N'DetailJSON', N'nvarchar', N'NVARCHAR(max)', 1),
     (N'Scenario_Audit', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 0),
     (N'Prompt_Log', N'LogID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Prompt_Log', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
-    (N'Prompt_Log', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Prompt_Log', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Prompt_Log', N'UserID', N'nvarchar', N'NVARCHAR(200)', 1),
-    (N'Prompt_Log', N'SubsystemID', N'int', N'INT', 0),
     (N'Prompt_Log', N'Stage', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Prompt_Log', N'PromptVersion', N'nvarchar', N'NVARCHAR(100)', 0),
     (N'Prompt_Log', N'Prompt', N'nvarchar', N'NVARCHAR(max)', 1),
@@ -322,7 +298,6 @@ INSERT INTO @expected (tbl, col, base_type, full_type, is_nullable) VALUES
     (N'Diagnostic_Event', N'DiagnosticID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 0),
     (N'Diagnostic_Event', N'CreatedAt', N'datetime2', N'DATETIME2(7)', 0),
     (N'Diagnostic_Event', N'SessionID', N'uniqueidentifier', N'UNIQUEIDENTIFIER', 1),
-    (N'Diagnostic_Event', N'TenantID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Diagnostic_Event', N'EntityID', N'nvarchar', N'NVARCHAR(200)', 1),
     (N'Diagnostic_Event', N'SubsystemID', N'int', N'INT', 1),
     (N'Diagnostic_Event', N'TaskID', N'nvarchar', N'NVARCHAR(100)', 1),
@@ -596,7 +571,6 @@ INSERT INTO @df (name, tbl, col) VALUES
     (N'DF_IdentifiedThreat_IsThreatTypeAIGenerated', N'Identified_Threat', N'IsThreatTypeAIGenerated'),
     (N'DF_TreatmentPlan_Superseded', N'Risk_Treatment_Plan', N'Superseded'),
     (N'DF_SSS_AttemptCount', N'Subsystem_Stage_State', N'AttemptCount'),
-    (N'DF_StageState_CreatedAt', N'Subsystem_Stage_State', N'CreatedAt'),
     (N'DF_CatCategoryMap_CreatedAt', N'Threat_Catalogue_Category_Map', N'CreatedAt'),
     (N'DF_Scenario_ScenarioNumber', N'Threat_Scenario', N'ScenarioNumber'),
     (N'DF_ThreatScenario_ControlMapAttempts', N'Threat_Scenario', N'ControlMapAttempts'),
@@ -682,7 +656,7 @@ END;
 PRINT '';
 PRINT 'SCHEMA VERDICT';
 PRINT '--------------';
-PRINT ' [INFO]    Columns expected:   316';
+PRINT ' [INFO]    Columns expected:   291';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));
@@ -690,7 +664,7 @@ PRINT ' [INFO]    Indexes expected:   34';
 PRINT ' [INFO]    Missing/disabled:   ' + CAST(@ix_missing AS varchar(10));
 PRINT ' [INFO]    Wrong shape:        ' + CAST(@ix_shape   AS varchar(10));
 PRINT ' [INFO]    Primary keys wrong: ' + CAST(@pk_wrong   AS varchar(10));
-PRINT ' [INFO]    Defaults expected:  22';
+PRINT ' [INFO]    Defaults expected:  21';
 PRINT ' [INFO]    Missing defaults:   ' + CAST(@df_missing AS varchar(10));
 PRINT ' [INFO]    Identity expected:  6';
 PRINT ' [INFO]    Missing identity:   ' + CAST(@id_missing AS varchar(10));

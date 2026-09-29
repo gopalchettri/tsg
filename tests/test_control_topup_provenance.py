@@ -72,7 +72,7 @@ def _seed(Session, *, controls_mapped_at, mapped=(), asset_context=None,
             SubsystemsJSON="[]", AssetContextJSON=json.dumps(asset_context or {}),
             CreatedAt=_now(), UpdatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=SCENARIO_ID, SessionID=SESSION_ID, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=SCENARIO_ID, SessionID=SESSION_ID,
             SubsystemID=0, ScopedThreatID="7c9e6679-7425-40de-944b-e07fc1f90ae7",
             Status="complete", Accepted=1, Superseded=0, IdentityHash="a" * 64,
             ScenarioNumber=1, GenerationEpoch=1, CreatedAt=_now(), ControlMapAttempts=0,

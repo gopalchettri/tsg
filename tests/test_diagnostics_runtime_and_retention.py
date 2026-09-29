@@ -245,7 +245,7 @@ def _add(sess, table, age_days: int):
                                     Kind="stage_error", ExceptionClass="Timeout"))
     elif table is m.Prompt_Log:
         sess.add(m.Prompt_Log(LogID=str(uuid.uuid4()), CreatedAt=stamp,
-                              SessionID=str(uuid.uuid4()), SubsystemID=1, Stage="scenario",
+                              SessionID=str(uuid.uuid4()), Stage="scenario",
                               PromptVersion="1.0", ParseSucceeded=True))
     else:
         sess.add(m.Application_Log(LogID=str(uuid.uuid4()), CreatedAt=stamp, Level="INFO"))

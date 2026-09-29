@@ -214,7 +214,7 @@ def _category_of(kind: DiagnosticKind) -> str:
 
 
 def record(kind: DiagnosticKind, exc: BaseException, *, session_id: str | None = None,
-           tenant_id: str | None = None, entity_id: str | None = None,
+           entity_id: str | None = None,
            subsystem_id: int | None = None, task_id: str | None = None,
            client_message: str | None = None, context: dict[str, Any] | None = None) -> None:
     """Save one operator-visible diagnostic. Never raises, never reports a failure to its caller.
@@ -235,7 +235,7 @@ def record(kind: DiagnosticKind, exc: BaseException, *, session_id: str | None =
 
         backends.emit(backends.DiagnosticEvent(
             ts=now(), category=category, kind=str(kind), level="ERROR",
-            session_id=session_id, tenant_id=tenant_id, entity_id=entity_id,
+            session_id=session_id, entity_id=entity_id,
             subsystem_id=subsystem_id, task_id=task_id, request_id=_request_id(),
             # ALWAYS the class, whatever the classifier made of it. For 6174F288 this alone would
             # have said "Timeout" where every durable surface said "stage processing failed".

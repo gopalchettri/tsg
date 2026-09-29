@@ -170,7 +170,7 @@ DECLARE @d int = (SELECT COUNT(*) FROM sys.default_constraints dc
 PRINT ' [INFO]    Tables:              ' + CAST(@t AS varchar(10)) + ' of 22';
 PRINT ' [INFO]    Non-PK indexes:      ' + CAST(@i AS varchar(10)) +
       '  (34 expected: 33 from 03_indexes + UQ_Config_Tuning_Key)';
-PRINT ' [INFO]    Default constraints: ' + CAST(@d AS varchar(10)) + '  (22 expected)';
+PRINT ' [INFO]    Default constraints: ' + CAST(@d AS varchar(10)) + '  (21 expected)';
 
 /*-------------------------- the verdict --------------------------*/
 PRINT '';
@@ -193,7 +193,7 @@ BEGIN
     PRINT 'deployment that printed [BLOCKED] on a narrowing change, or added a NOT NULL column';
     PRINT 'as NULL because the table had rows, reaches this line looking clean.';
     PRINT '';
-    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 316 columns, all 33';
+    PRINT 'Run 99_validation/002_schema_verdict.sql now. It checks all 291 columns, all 33';
     PRINT 'index shapes, 21 defaults, 6 identity columns and the collation, then prints the';
     PRINT 'FINAL SIGN-OFF. Then confirm the threat and control libraries hold data';
     PRINT '(README step 11) before starting the application.';

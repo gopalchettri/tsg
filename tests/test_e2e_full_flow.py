@@ -121,23 +121,23 @@ def _seed_reviewable_session(client) -> tuple[str, str, str]:
         for level, status in ((SubsystemLevel.LOCK, StageStatus.IDLE),
                               (SubsystemLevel.SCENARIOS, StageStatus.AWAITING_DECISION)):
             s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-                StateID=str(uuid.uuid4()), SessionID=sid, TenantID=TENANT, EntityID=ENTITY,
+                StateID=str(uuid.uuid4()), SessionID=sid,
                 SubsystemID=0, Level=level, Status=status, GenerationEpoch=1,
                 LeaseExpiresAt=_now() + timedelta(minutes=10), AttemptCount=1,
-                UpdatedAt=_now(), CreatedAt=_now()))
+                UpdatedAt=_now()))
         s.execute(m.Identified_Threat.__table__.insert().values(
-            ThreatID=tid, SessionID=sid, TenantID=TENANT, EntityID=ENTITY, UserID=USER,
+            ThreatID=tid, SessionID=sid,
             SubsystemID=0, ThreatCategory="Tampering", ThreatType="Ransomware",
             ThreatName="Ransomware encrypts historian data", GenericName="Ransomware encrypts data",
             ThreatTypeID=7, ThreatCatalogueID=None,
             ThreatActorsJSON=json.dumps({"actors": [], "actor_ids": [], "validated": True}),
             GroundingStatus="unverified", Superseded=0, CreatedAt=_now()))
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=stid, SessionID=sid, TenantID=TENANT, EntityID=ENTITY, UserID=USER,
+            ScopedThreatID=stid, SessionID=sid,
             SubsystemID=0, ThreatID=tid, Score=80.0, ScopeRank=1, Selected=1,
             Superseded=0, CreatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=oid, SessionID=sid, TenantID=TENANT, EntityID=ENTITY, UserID=USER,
+            ScenarioID=oid, SessionID=sid,
             SubsystemID=0, ScopedThreatID=stid, Status="complete",
             ScenarioJSON=json.dumps({"scenario_title": "Ransomware locks the historian",
                                     "scenario_statement": "An attacker encrypts stored data.",

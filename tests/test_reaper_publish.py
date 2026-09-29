@@ -27,11 +27,11 @@ def _engine():
 def _stage_row(session_id: str, level: str, lease_expired: bool) -> dict:
     now = datetime.now(UTC)
     return dict(
-        StateID=str(uuid.uuid4()), SessionID=session_id, TenantID="t", EntityID="e",
+        StateID=str(uuid.uuid4()), SessionID=session_id,
         SubsystemID=0, Level=level, Status=StageStatus.RUNNING, GenerationEpoch=1,
         ActiveTaskID=str(uuid.uuid4()),
         LeaseExpiresAt=now - timedelta(minutes=1) if lease_expired else now + timedelta(minutes=10),
-        AttemptCount=1, UpdatedAt=now, CreatedAt=now,
+        AttemptCount=1, UpdatedAt=now,
     )
 
 

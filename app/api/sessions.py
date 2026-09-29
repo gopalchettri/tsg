@@ -512,8 +512,8 @@ def create_session(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         dal.create_session(sess, _build_session_row(sid, tenant, body, ctx, idempotency_key,
                                                     principal.user_id, tuning_snapshot))
-        set_up_progress_tracking(sess, sid, tenant, str(body.entity_id))
-        dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant, EntityID=str(body.entity_id),
+        set_up_progress_tracking(sess, sid)
+        dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, EntityID=str(body.entity_id),
                         EventType=AuditEventType.session_started, ActorUserID=principal.user_id)
     try:
         enqueue_pipeline(sid, str(body.entity_id), principal.user_id)
@@ -757,7 +757,7 @@ def _write_manual_scenario(sess: Session, manual: ManualScenarioIn, identity: Ma
         "CompletedAt": t,
     }
     dal.create_session(sess, session_row)
-    set_up_progress_tracking(sess, sid, tenant, entity_id, settled=True)
+    set_up_progress_tracking(sess, sid, settled=True)
 
     # Checked again inside the write transaction: a curator can change the library between
     # the request arriving and this commit. (No name applock here — that belongs to a later
@@ -836,8 +836,8 @@ def _write_manual_scenario(sess: Session, manual: ManualScenarioIn, identity: Ma
         actors=[], actor_ids=[], actors_validated=False, category_id=category_id,
         threshold_origin="not_applicable")
     threat_row, info = tasks._build_threat_records(
-        threat_id, sid, tenant, ASSET_UNIT_ID, identity.threat_type, category_name, identity.threat,
-        gr, entity_id, user, category_id=category_id,
+        threat_id, sid, ASSET_UNIT_ID, identity.threat_type, category_name, identity.threat,
+        gr, category_id=category_id,
         # A person wrote it: not AI-generated at either level, whatever the library holds.
         ai_generated=False, type_ai_generated=False)
     scored = scoping.Scored(
@@ -849,7 +849,7 @@ def _write_manual_scenario(sess: Session, manual: ManualScenarioIn, identity: Ma
         # THIS transaction with the same constant (pipeline_common.py), and tasks.write_scenarios
         # refuses a full run whose epoch is not it. A hard-coded copy would silently diverge from
         # both the day that constant moves.
-        scoped_id, sid, tenant, ASSET_UNIT_ID, scenario, report, tasks._EPOCH, entity_id, user,
+        scoped_id, sid, ASSET_UNIT_ID, scenario, report, tasks._EPOCH,
         info, source=ContentSource.manual, span=(t, t))
     out.update(
         # Nothing was generated, so no generation span is published ("not measured").
@@ -867,8 +867,7 @@ def _write_manual_scenario(sess: Session, manual: ManualScenarioIn, identity: Ma
     # dal.decide_scenarios (below), which the build guard in scripts/test_pipeline_guards.py pins.
     sess.execute(insert(m.Identified_Threat), [threat_row])
     sess.execute(insert(m.Scoped_Threat),
-                 [tasks._build_scoped_threat_row(scoped_id, sid, tenant, ASSET_UNIT_ID, scored,
-                                                 entity_id, user)])
+                 [tasks._build_scoped_threat_row(scoped_id, sid, ASSET_UNIT_ID, scored)])
     sess.execute(insert(m.Threat_Scenario), [out])
     # `if control_ids` is load-bearing, not defensive: `mapped_controls` is optional since 2026-09,
     # and an executemany with an EMPTY list is an ArgumentError, so the save of a perfectly valid
@@ -882,7 +881,7 @@ def _write_manual_scenario(sess: Session, manual: ManualScenarioIn, identity: Ma
             for rank, cid in enumerate(control_ids, start=1)])
 
     # --- the trail: who created it, and any library entry it proposed ---
-    dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant,
+    dal.append_audit(sess, AuditID=dal.guid(), SessionID=sid,
                      EntityID=entity_id, EventType=AuditEventType.session_started,
                      ActorUserID=user, ScenarioID=out["ScenarioID"],
                      DetailJSON=json.dumps({"mode": str(SessionMode.MANUAL),
@@ -890,9 +889,9 @@ def _write_manual_scenario(sess: Session, manual: ManualScenarioIn, identity: Ma
                                             "validation_status": report.get("validation_status")}))
     if set(statuses.values()) != {"existing"}:
         dal.append_audit(
-            sess, AuditID=dal.guid(), SessionID=sid, TenantID=tenant, EntityID=entity_id,
+            sess, AuditID=dal.guid(), SessionID=sid, EntityID=entity_id,
             EventType=AuditEventType.library_promoted, ActorUserID=user,
-            ActorType=ActorType.user if user else ActorType.system, ThreatTypeRefID=type_id,
+            ActorType=ActorType.user if user else ActorType.system,
             ScenarioID=out["ScenarioID"],
             DetailJSON=json.dumps({"scenario_id": out["ScenarioID"], "threat_id": threat_id,
                                    "threat_type_id": type_id, "catalogue_id": catalogue_id,
@@ -2053,7 +2052,7 @@ def post_cancel(session_id: str, principal: Principal = Depends(get_principal)) 
         # the same value the session_cancelled audit row below carries.
         if not dal.cancel_session(sess, session_id, principal.user_id):
             raise dal.CancelConflict(f"session {session_id} is no longer active")
-        dal.append_audit(sess, AuditID=dal.guid(), SessionID=session_id, TenantID=scenario_session["TenantID"],
+        dal.append_audit(sess, AuditID=dal.guid(), SessionID=session_id,
                         EntityID=scenario_session["EntityID"], EventType=AuditEventType.session_cancelled,
                         ActorUserID=principal.user_id)
     # Fast path only (item 1/item 30's sentinel-tick status check in stream_events() is the

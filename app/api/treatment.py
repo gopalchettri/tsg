@@ -532,9 +532,8 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
         try:
             dal.insert_row(sess, m.Risk_Treatment_Plan, {
                 "PlanID": plan_id, "SessionID": session_id, "ScenarioID": scn["ScenarioID"],
-                "TenantID": session_row["TenantID"], "EntityID": session_row["EntityID"],
+                "EntityID": session_row["EntityID"],
                 "UserID": principal.user_id,
-                "CrmRiskIdentificationID": None,  # reserved — no register lookup in this design
                 "TreatmentStrategy": str(TreatmentStrategy.mitigate),  # server stamp, not a body field
                 "RiskLevel": risk_level,  # denormalized for the register's SQL filter
                 "Status": str(StageStatus.RUNNING), "ActiveTaskID": None,
@@ -549,8 +548,7 @@ def _launch_generation(session_id: str, scenario_id: str, principal: Principal, 
             sess.rollback()
             raise _conflict(TreatmentGateReason.generation_in_progress) from None
         dal.append_audit(
-            sess, AuditID=dal.guid(), SessionID=session_id,
-            TenantID=session_row["TenantID"], EntityID=session_row["EntityID"],
+            sess, AuditID=dal.guid(), SessionID=session_id, EntityID=session_row["EntityID"],
             SubsystemID=ASSET_UNIT_ID, EventType=AuditEventType.treatment_plan_requested,
             ActorUserID=principal.user_id,
             # scenario_id on the COLUMN, not only inside DetailJSON. IX_ScenarioAudit_Scenario is a
@@ -887,7 +885,7 @@ def post_cancel_treatment_plan(session_id: str, scenario_id: str,
                 cancelled_by=principal.user_id):
             raise _conflict(TreatmentGateReason.not_in_progress)
         dal.append_audit(
-            sess, AuditID=dal.guid(), SessionID=session_id, TenantID=row["TenantID"],
+            sess, AuditID=dal.guid(), SessionID=session_id,
             EntityID=row["EntityID"], SubsystemID=ASSET_UNIT_ID,
             EventType=AuditEventType.treatment_plan_cancelled, ActorUserID=principal.user_id,
             ScenarioID=scenario_id, PlanID=row["PlanID"],
@@ -987,7 +985,7 @@ def post_review_treatment_plan(session_id: str, scenario_id: str, body: Treatmen
                 raise _conflict(TreatmentGateReason.not_complete)
             plan_id = target_id
             dal.append_audit(
-                sess, AuditID=dal.guid(), SessionID=session_id, TenantID=row["TenantID"],
+                sess, AuditID=dal.guid(), SessionID=session_id,
                 EntityID=row["EntityID"], SubsystemID=ASSET_UNIT_ID,
                 EventType=AuditEventType.treatment_plan_version_restored,
                 ActorUserID=principal.user_id,
@@ -1006,7 +1004,7 @@ def post_review_treatment_plan(session_id: str, scenario_id: str, body: Treatmen
             sess.rollback()  # on the swap branch this also undoes the swap — all-or-nothing
             raise _conflict(TreatmentGateReason.not_complete)
         dal.append_audit(
-            sess, AuditID=dal.guid(), SessionID=session_id, TenantID=row["TenantID"],
+            sess, AuditID=dal.guid(), SessionID=session_id,
             EntityID=row["EntityID"], SubsystemID=ASSET_UNIT_ID,
             EventType=AuditEventType.treatment_plan_reviewed, ActorUserID=principal.user_id,
             ScenarioID=scenario_id, PlanID=plan_id,

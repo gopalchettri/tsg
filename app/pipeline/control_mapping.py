@@ -1051,8 +1051,7 @@ def _record_control_mapping(sess: Session, scenario_session: dict, subsystem_id:
                 # measurement moves the cutoff and the floor with it, with no config change.
                 "effective_backfill_min_score": round(backfill_min_score, 4),
                 "warning_count": len(warnings)}
-    dal.append_audit(sess, AuditID=guid(), SessionID=scenario_session["SessionID"],
-                    TenantID=scenario_session["TenantID"], EntityID=scenario_session["EntityID"],
+    dal.append_audit(sess, AuditID=guid(), SessionID=scenario_session["SessionID"], EntityID=scenario_session["EntityID"],
                     Stage=WorkflowStage.SCENARIO_GENERATION, SubsystemID=subsystem_id,
                     EventType=AuditEventType.controls_mapped,
                     DetailJSON=json.dumps({**log_fields, "warnings": warnings[:20]}))
@@ -1570,7 +1569,7 @@ def _read_top_up_plan(sess: Session, session_id: str, scenario_id: str, s,
         # The floor is a FRACTION of that cutoff, resolved in the same place for the same reason
         # `_read_mapping_pass` resolves it there: the two are one decision.
         backfill_min_score=_backfill_floor(cutoff.value, s),
-        audit_columns={"TenantID": session_row["TenantID"], "EntityID": session_row["EntityID"],
+        audit_columns={"EntityID": session_row["EntityID"],
                     "SubsystemID": scn["SubsystemID"]})
 
 

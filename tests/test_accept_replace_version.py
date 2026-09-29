@@ -53,7 +53,7 @@ def _plan(Session, sid: str, oid: str, *, review_status: str | None = "approved"
     plan_id = str(uuid.uuid4())
     with Session() as s:
         s.execute(m.Risk_Treatment_Plan.__table__.insert().values(
-            PlanID=plan_id, SessionID=sid, ScenarioID=oid, TenantID="t", EntityID="86",
+            PlanID=plan_id, SessionID=sid, ScenarioID=oid, EntityID="86",
             Status=str(StageStatus.COMPLETE), TreatmentStrategy="Mitigate",
             ReviewStatus=review_status, RiskLevel="Critical", Superseded=0,
             CreatedAt=_now(), UpdatedAt=_now()))
@@ -66,7 +66,7 @@ def _plan_history(Session, sid: str, oid: str) -> str:
     plan_id = str(uuid.uuid4())
     with Session() as s:
         s.execute(m.Risk_Treatment_Plan.__table__.insert().values(
-            PlanID=plan_id, SessionID=sid, ScenarioID=oid, TenantID="t", EntityID="86",
+            PlanID=plan_id, SessionID=sid, ScenarioID=oid, EntityID="86",
             Status=str(StageStatus.COMPLETE), TreatmentStrategy="Mitigate",
             ReviewStatus="rejected", RiskLevel="Critical", Superseded=1,
             CreatedAt=_now(), UpdatedAt=_now()))

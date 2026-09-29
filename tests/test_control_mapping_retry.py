@@ -51,7 +51,7 @@ def _seed(s, session_id: str, task_id: str, n_outputs: int = 3,
         SessionStatus="active", CurrentStage="SCENARIOS", StageStatus="RUNNING", Mode="full",
         SubsystemsJSON="[]"))
     s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-        StateID=str(uuid.uuid4()), SessionID=session_id, TenantID="t", EntityID="e",
+        StateID=str(uuid.uuid4()), SessionID=session_id,
         SubsystemID=0, Level=SubsystemLevel.SCENARIOS, Status=StageStatus.RUNNING,
         GenerationEpoch=1, ActiveTaskID=task_id, LeaseExpiresAt=NOW + timedelta(minutes=10),
         HeartbeatAt=NOW, AttemptCount=1, UpdatedAt=NOW))
@@ -60,7 +60,7 @@ def _seed(s, session_id: str, task_id: str, n_outputs: int = 3,
         oid = str(uuid.uuid4())
         ids.append(oid)
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=oid, SessionID=session_id, TenantID="t", EntityID="e", UserID="u",
+            ScenarioID=oid, SessionID=session_id,
             SubsystemID=0, ScopedThreatID=str(uuid.uuid4()), Status=ScenarioStatus.complete,
             ScenarioJSON=json.dumps({"scenario_title": f"title {i}",
                                     "scenario_statement": f"statement {i}"}),

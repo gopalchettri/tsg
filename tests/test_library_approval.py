@@ -121,10 +121,10 @@ def _promote_a_found_threat(Session) -> tuple[str, int, int]:
             ThreatTypeID=None, ThreatCatalogueID=None, ThreatCategoryID=None,
             GroundingStatus="unverified", Superseded=0, CreatedAt=_now()))
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ScopedThreatID=scoped_id, SessionID=sid, SubsystemID=0,
             ThreatID=tid, Score=9.5, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=oid, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=oid, SessionID=sid,
             SubsystemID=0, ScopedThreatID=scoped_id, Status=str(ScenarioStatus.complete),
             ScenarioJSON=json.dumps({"scenario_title": "Firmware swap",
                                     "scenario_statement": "An insider flashes vendor firmware."}),

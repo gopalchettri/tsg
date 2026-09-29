@@ -11,8 +11,8 @@
   DRY RUN: set PreviewOnly to 1 in Section 0 and the whole script only prints what
   it would do. Nothing is created, altered, renamed, dropped or updated.
 
-  Contents: legacy-name migration, 24 tables, 317 reconciled columns,
-  22 default constraints,
+  Contents: legacy-name migration, 24 tables, 292 reconciled columns,
+  21 default constraints,
   3 check constraints, 33 indexes.
 
   Those five numbers are PINNED to the statements below them by
@@ -288,7 +288,7 @@ GO
         VALUES ( A , B )
                  |   |
                  |   +---- B is DropRemovedColumns
-                 |           0 = keep the five removed columns, only list them
+                 |           0 = keep the 33 removed columns, only list them
                  |           1 = DELETE them for good. This cannot be undone.
                  |
                  +-------- A is PreviewOnly
@@ -298,8 +298,8 @@ GO
    The only four combinations you need:
 
         VALUES (1, 0)   Dry run. Nothing is changed. START HERE.
-        VALUES (0, 0)   Do the work, but keep the five columns.
-        VALUES (0, 1)   Do the work AND delete the five columns for good.
+        VALUES (0, 0)   Do the work, but keep the 33 columns.
+        VALUES (0, 1)   Do the work AND delete the 33 columns for good.
         VALUES (1, 1)   Dry run that also shows the deletions it would make.
 
    Every section of this script reads these two numbers from here.
@@ -325,7 +325,7 @@ GO
     1a  repair a database where both the old and the new name already exist
     1b  drop the one index whose filter blocks a column rename
     1c  rename every old object to its current name
-    1d  drop the five columns the product no longer has
+    1d  drop the 33 columns the product no longer has
 
   Every guard tests only its own object, so a partially migrated database is fine:
   whatever is already current is left alone.
@@ -342,7 +342,7 @@ SELECT @preview = PreviewOnly, @dropRemoved = DropRemovedColumns FROM #opt;
 DECLARE @sql nvarchar(max), @rows int, @ixname sysname, @tbl sysname,
         @oldcol sysname, @newcol sysname, @newIsNullable bit,
         @kind varchar(10), @objtype varchar(2), @oldname sysname, @newname sysname,
-        @blockingUx sysname;
+        @blockingUx sysname, @defName sysname;
 
 PRINT 'Section 1: checking for legacy names...'
     + CASE WHEN @preview = 1 THEN '  [PREVIEW - nothing will be changed]' ELSE '' END;
@@ -572,7 +572,7 @@ END
 CLOSE ren; DEALLOCATE ren;
 
 /*----------------------------------------------------------------------------
-  1d. Drop the five columns the product no longer has.
+  1d. Drop the 33 columns the product no longer has.
 
   The only drops in this script, and the only thing here that cannot be undone.
   Each is guarded on the column still existing, so it fires once. An index over one
@@ -601,7 +601,58 @@ BEGIN
       -- 2026-09-29: the last survivor of the 2026-08 sector removal that already took
       -- Threat_Type.SectorID and Threat_Catalogue.SectorID. With no sector-scoped master rows
       -- left to choose between, nothing read it back.
-      ('Scenario_Session',  'SectorIDsJSON');
+      ('Scenario_Session',  'SectorIDsJSON'),
+      -- 2026-09-30: 25 columns that no query reads. Twenty of them are TenantID/EntityID/UserID
+      -- copied from Scenario_Session at insert and never refreshed again: SessionID is NOT NULL
+      -- on every table below, so the session's own columns answer the same question and cannot
+      -- go stale. Tenancy is enforced on EntityID, and TenantID was never a predicate anywhere.
+      --
+      -- READ THIS BEFORE SETTING DropRemovedColumns = 0: Prompt_Log.SubsystemID is declared NOT
+      -- NULL. The application has stopped writing it, so on a database that still HAS it every
+      -- Prompt_Log INSERT fails with "cannot insert NULL" — one row per LLM call, i.e. the whole
+      -- pipeline. For that one, keeping the column is not the safe option it is for the nullable
+      -- ones; drop it or make it nullable by hand. Stage is NOT in this position: the application
+      -- still writes it.
+      ('Subsystem_Stage_State',       'TenantID'),
+      ('Subsystem_Stage_State',       'EntityID'),
+      -- CreatedAt here was stamped for every level at once by set_up_progress_tracking, so it
+      -- answered session-creation time, never this row's. UpdatedAt is NOT in this list: the
+      -- step-4 control-mapping sweep filters and orders its queue by it.
+      ('Subsystem_Stage_State',       'CreatedAt'),
+      ('Identified_Threat',           'TenantID'),
+      ('Identified_Threat',           'EntityID'),
+      ('Identified_Threat',           'UserID'),
+      ('Identified_Duplicate_Threat', 'TenantID'),
+      ('Identified_Duplicate_Threat', 'EntityID'),
+      ('Identified_Duplicate_Threat', 'UserID'),
+      ('Scoped_Threat',               'TenantID'),
+      ('Scoped_Threat',               'EntityID'),
+      ('Scoped_Threat',               'UserID'),
+      ('Threat_Scenario',             'TenantID'),
+      ('Threat_Scenario',             'EntityID'),
+      ('Threat_Scenario',             'UserID'),
+      ('Risk_Treatment_Plan',         'TenantID'),
+      -- Always the literal NULL: the register sends risk data in the request body, so no lookup
+      -- id was ever resolved to put here. Risk_Treatment_Plan.EntityID and .UserID STAY — the
+      -- treatment audit rows are stamped from them.
+      ('Risk_Treatment_Plan',         'CrmRiskIdentificationID'),
+      ('Prompt_Log',                  'TenantID'),
+      ('Prompt_Log',                  'EntityID'),
+      ('Prompt_Log',                  'UserID'),
+      -- SubsystemID only. A receipt is found by SessionID or CorrelationID, and no reader ever
+      -- narrowed one by subsystem. Prompt_Log.Stage is deliberately NOT here: the smoke-testing
+      -- guide tells an operator to select it by hand, which is a real consumer even though no
+      -- application query is.
+      ('Prompt_Log',                  'SubsystemID'),
+      -- Diagnostic_Event.EntityID STAYS: SessionID is nullable on that table, so a session-less
+      -- diagnostic has no join back to Scenario_Session and EntityID is its only scoping id.
+      ('Diagnostic_Event',            'TenantID'),
+      ('Scenario_Audit',              'TenantID'),
+      -- Written, SELECTed, then dropped before serialization — a pure round trip. ThreatTypeRefID
+      -- appeared in no SELECT at all. Scenario_Audit.EntityID STAYS: the entity-wide treatment
+      -- compliance feed filters on it.
+      ('Scenario_Audit',              'Granularity'),
+      ('Scenario_Audit',              'ThreatTypeRefID');
 
     DECLARE dead CURSOR LOCAL FAST_FORWARD FOR SELECT TableName, ColumnName FROM @dead;
     OPEN dead;
@@ -641,6 +692,26 @@ BEGIN
         ELSE IF OBJECT_ID('dbo.' + QUOTENAME(@tbl), 'U') IS NOT NULL
            AND COL_LENGTH('dbo.' + QUOTENAME(@tbl), @oldcol) IS NOT NULL
         BEGIN
+            /* A DEFAULT constraint bound to the column refuses the DROP COLUMN outright
+               (msg 5074), and the TRY/CATCH below would file that as DROP FAILED and move on,
+               leaving the column in place for good. Found through the catalogue rather than by
+               name so this keeps working for whatever is dropped next. */
+            SET @defName = NULL;
+            SELECT @defName = dc.name
+            FROM sys.default_constraints dc
+            JOIN sys.columns c ON c.object_id = dc.parent_object_id
+                              AND c.column_id = dc.parent_column_id
+            WHERE dc.parent_object_id = OBJECT_ID('dbo.' + QUOTENAME(@tbl)) AND c.name = @oldcol;
+            IF @defName IS NOT NULL
+            BEGIN
+                SET @sql = N'ALTER TABLE dbo.' + QUOTENAME(@tbl)
+                         + N' DROP CONSTRAINT ' + QUOTENAME(@defName) + N';';
+                IF @preview = 1 PRINT '  would run: ' + @sql;
+                ELSE
+                BEGIN TRY EXEC sys.sp_executesql @sql; PRINT '  applied: ' + @sql; END TRY
+                BEGIN CATCH INSERT #report VALUES ('DROP FAILED', @tbl + '.' + @oldcol, ERROR_MESSAGE()); END CATCH
+            END
+
             -- Only non-unique indexes are dropped here; Section 6 rebuilds them.
             DECLARE deadix CURSOR LOCAL FAST_FORWARD FOR
                 SELECT DISTINCT i.name
@@ -681,7 +752,7 @@ BEGIN
     CLOSE dead; DEALLOCATE dead;
 END
 ELSE
-    PRINT '  DropRemovedColumns = 0: the five removed columns are left in place.';
+    PRINT '  DropRemovedColumns = 0: the 33 removed columns are left in place.';
 GO
 
 
@@ -927,9 +998,6 @@ IF OBJECT_ID('dbo.Identified_Duplicate_Threat', 'U') IS NULL
 CREATE TABLE [dbo].[Identified_Duplicate_Threat](
 	[DuplicateThreatID] [uniqueidentifier] NOT NULL,
 	[SessionID] [uniqueidentifier] NOT NULL,
-	[TenantID] [nvarchar](200) NULL,
-	[EntityID] [nvarchar](200) NULL,
-	[UserID] [nvarchar](200) NULL,
 	[SubsystemID] [int] NOT NULL,
 	[ThreatCategory] [nvarchar](200) NOT NULL,
 	[ThreatType] [nvarchar](300) NOT NULL,
@@ -954,9 +1022,6 @@ IF OBJECT_ID('dbo.Identified_Threat', 'U') IS NULL
 CREATE TABLE [dbo].[Identified_Threat](
 	[ThreatID] [uniqueidentifier] NOT NULL,
 	[SessionID] [uniqueidentifier] NOT NULL,
-	[TenantID] [nvarchar](200) NULL,
-	[EntityID] [nvarchar](200) NULL,
-	[UserID] [nvarchar](200) NULL,
 	[SubsystemID] [int] NOT NULL,
 	[ThreatCategory] [nvarchar](200) NOT NULL,
 	[ThreatType] [nvarchar](300) NOT NULL,
@@ -999,10 +1064,6 @@ IF OBJECT_ID('dbo.Prompt_Log', 'U') IS NULL
 CREATE TABLE [dbo].[Prompt_Log](
 	[LogID] [uniqueidentifier] NOT NULL,
 	[SessionID] [uniqueidentifier] NOT NULL,
-	[TenantID] [nvarchar](200) NULL,
-	[EntityID] [nvarchar](200) NULL,
-	[UserID] [nvarchar](200) NULL,
-	[SubsystemID] [int] NOT NULL,
 	[Stage] [nvarchar](100) NOT NULL,
 	[PromptVersion] [nvarchar](100) NOT NULL,
 	[Prompt] [nvarchar](max) NULL,
@@ -1059,7 +1120,6 @@ CREATE TABLE [dbo].[Diagnostic_Event](
 	[DiagnosticID] [uniqueidentifier] NOT NULL,
 	[CreatedAt] [datetime2](7) NOT NULL,
 	[SessionID] [uniqueidentifier] NULL,
-	[TenantID] [nvarchar](200) NULL,
 	[EntityID] [nvarchar](200) NULL,
 	[SubsystemID] [int] NULL,
 	[TaskID] [nvarchar](100) NULL,
@@ -1084,10 +1144,8 @@ CREATE TABLE [dbo].[Risk_Treatment_Plan](
 	[PlanID] [uniqueidentifier] NOT NULL,
 	[SessionID] [uniqueidentifier] NOT NULL,
 	[ScenarioID] [uniqueidentifier] NOT NULL,
-	[TenantID] [nvarchar](200) NULL,
 	[EntityID] [nvarchar](200) NULL,
 	[UserID] [nvarchar](200) NULL,
-	[CrmRiskIdentificationID] [int] NULL,
 	[TreatmentStrategy] [nvarchar](100) NOT NULL,
 	[Status] [nvarchar](100) NOT NULL,
 	[ActiveTaskID] [nvarchar](100) NULL,
@@ -1126,7 +1184,6 @@ IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NULL
 CREATE TABLE [dbo].[Scenario_Audit](
 	[AuditID] [uniqueidentifier] NOT NULL,
 	[SessionID] [uniqueidentifier] NOT NULL,
-	[TenantID] [nvarchar](200) NULL,
 	[EntityID] [nvarchar](200) NULL,
 	[Stage] [nvarchar](100) NULL,
 	[SubsystemID] [int] NULL,
@@ -1134,8 +1191,6 @@ CREATE TABLE [dbo].[Scenario_Audit](
 	[ScenarioID] [uniqueidentifier] NULL,
 	[PlanID] [uniqueidentifier] NULL,
 	[Decision] [nvarchar](100) NULL,
-	[Granularity] [nvarchar](100) NULL,
-	[ThreatTypeRefID] [int] NULL,
 	[ActorUserID] [nvarchar](200) NULL,
 	[ActorType] [nvarchar](100) NULL,
 	[DetailJSON] [nvarchar](max) NULL,
@@ -1182,9 +1237,6 @@ IF OBJECT_ID('dbo.Scoped_Threat', 'U') IS NULL
 CREATE TABLE [dbo].[Scoped_Threat](
 	[ScopedThreatID] [uniqueidentifier] NOT NULL,
 	[SessionID] [uniqueidentifier] NOT NULL,
-	[TenantID] [nvarchar](200) NULL,
-	[EntityID] [nvarchar](200) NULL,
-	[UserID] [nvarchar](200) NULL,
 	[SubsystemID] [int] NOT NULL,
 	[ThreatID] [uniqueidentifier] NOT NULL,
 	[Score] [float] NOT NULL,
@@ -1209,8 +1261,6 @@ IF OBJECT_ID('dbo.Subsystem_Stage_State', 'U') IS NULL
 CREATE TABLE [dbo].[Subsystem_Stage_State](
 	[StateID] [uniqueidentifier] NOT NULL,
 	[SessionID] [uniqueidentifier] NOT NULL,
-	[TenantID] [nvarchar](200) NULL,
-	[EntityID] [nvarchar](200) NULL,
 	[SubsystemID] [int] NOT NULL,
 	[Level] [nvarchar](100) NOT NULL,
 	[Status] [nvarchar](100) NOT NULL,
@@ -1221,7 +1271,6 @@ CREATE TABLE [dbo].[Subsystem_Stage_State](
 	[AttemptCount] [int] NOT NULL,
 	[ErrorMessage] [nvarchar](max) NULL,
 	[UpdatedAt] [datetime2](7) NOT NULL,
-	[CreatedAt] [datetime2](7) NULL,
 	[StartedAt] [datetime2](7) NULL,
 	[FinishedAt] [datetime2](7) NULL,
  CONSTRAINT [PK_Subsystem_Stage_State] PRIMARY KEY CLUSTERED
@@ -1318,9 +1367,6 @@ IF OBJECT_ID('dbo.Threat_Scenario', 'U') IS NULL
 CREATE TABLE [dbo].[Threat_Scenario](
 	[ScenarioID] [uniqueidentifier] NOT NULL,
 	[SessionID] [uniqueidentifier] NOT NULL,
-	[TenantID] [nvarchar](200) NULL,
-	[EntityID] [nvarchar](200) NULL,
-	[UserID] [nvarchar](200) NULL,
 	[SubsystemID] [int] NOT NULL,
 	[ScopedThreatID] [uniqueidentifier] NOT NULL,
 	[Status] [nvarchar](100) NOT NULL,
@@ -1535,9 +1581,6 @@ VALUES
   -- Identified_Duplicate_Threat
   ('Identified_Duplicate_Threat','DuplicateThreatID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Identified_Duplicate_Threat','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
-  ('Identified_Duplicate_Threat','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Identified_Duplicate_Threat','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Identified_Duplicate_Threat','UserID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Identified_Duplicate_Threat','SubsystemID','int',NULL,NULL,0,0,NULL,NULL),
   ('Identified_Duplicate_Threat','ThreatCategory','nvarchar',200,NULL,0,0,NULL,NULL),
   ('Identified_Duplicate_Threat','ThreatType','nvarchar',300,NULL,0,0,NULL,NULL),
@@ -1551,9 +1594,6 @@ VALUES
   -- Identified_Threat
   ('Identified_Threat','ThreatID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Identified_Threat','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
-  ('Identified_Threat','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Identified_Threat','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Identified_Threat','UserID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Identified_Threat','SubsystemID','int',NULL,NULL,0,0,NULL,NULL),
   ('Identified_Threat','ThreatCategory','nvarchar',200,NULL,0,0,NULL,NULL),
   ('Identified_Threat','ThreatType','nvarchar',300,NULL,0,0,NULL,NULL),
@@ -1575,10 +1615,6 @@ VALUES
   -- Prompt_Log
   ('Prompt_Log','LogID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Prompt_Log','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
-  ('Prompt_Log','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Prompt_Log','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Prompt_Log','UserID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Prompt_Log','SubsystemID','int',NULL,NULL,0,0,NULL,NULL),
   ('Prompt_Log','Stage','nvarchar',100,NULL,0,0,NULL,NULL),
   ('Prompt_Log','PromptVersion','nvarchar',100,NULL,0,0,NULL,NULL),
   -- Messages is gone: it held the same prompt as Prompt and nothing read it.
@@ -1604,7 +1640,6 @@ VALUES
   ('Diagnostic_Event','DiagnosticID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Diagnostic_Event','CreatedAt','datetime2',NULL,7,0,0,NULL,NULL),
   ('Diagnostic_Event','SessionID','uniqueidentifier',NULL,NULL,1,0,NULL,NULL),
-  ('Diagnostic_Event','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Diagnostic_Event','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Diagnostic_Event','SubsystemID','int',NULL,NULL,1,0,NULL,NULL),
   ('Diagnostic_Event','TaskID','nvarchar',100,NULL,1,0,NULL,NULL),
@@ -1619,10 +1654,8 @@ VALUES
   ('Risk_Treatment_Plan','PlanID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Risk_Treatment_Plan','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Risk_Treatment_Plan','ScenarioID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
-  ('Risk_Treatment_Plan','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Risk_Treatment_Plan','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Risk_Treatment_Plan','UserID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Risk_Treatment_Plan','CrmRiskIdentificationID','int',NULL,NULL,1,0,NULL,NULL),
   ('Risk_Treatment_Plan','TreatmentStrategy','nvarchar',100,NULL,0,0,NULL,NULL),
   ('Risk_Treatment_Plan','Status','nvarchar',100,NULL,0,0,NULL,NULL),
   ('Risk_Treatment_Plan','ActiveTaskID','nvarchar',100,NULL,1,0,NULL,NULL),
@@ -1646,7 +1679,6 @@ VALUES
   -- Scenario_Audit
   ('Scenario_Audit','AuditID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Scenario_Audit','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
-  ('Scenario_Audit','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Scenario_Audit','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Scenario_Audit','Stage','nvarchar',100,NULL,1,0,NULL,NULL),
   ('Scenario_Audit','SubsystemID','int',NULL,NULL,1,0,NULL,NULL),
@@ -1654,8 +1686,6 @@ VALUES
   ('Scenario_Audit','ScenarioID','uniqueidentifier',NULL,NULL,1,0,NULL,NULL),
   ('Scenario_Audit','PlanID','uniqueidentifier',NULL,NULL,1,0,NULL,NULL),
   ('Scenario_Audit','Decision','nvarchar',100,NULL,1,0,NULL,NULL),
-  ('Scenario_Audit','Granularity','nvarchar',100,NULL,1,0,NULL,NULL),
-  ('Scenario_Audit','ThreatTypeRefID','int',NULL,NULL,1,0,NULL,NULL),
   ('Scenario_Audit','ActorUserID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Scenario_Audit','ActorType','nvarchar',100,NULL,1,0,NULL,NULL),
   ('Scenario_Audit','DetailJSON','nvarchar',-1,NULL,1,0,NULL,NULL),
@@ -1687,9 +1717,6 @@ VALUES
   -- Scoped_Threat
   ('Scoped_Threat','ScopedThreatID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Scoped_Threat','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
-  ('Scoped_Threat','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Scoped_Threat','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Scoped_Threat','UserID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Scoped_Threat','SubsystemID','int',NULL,NULL,0,0,NULL,NULL),
   ('Scoped_Threat','ThreatID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Scoped_Threat','Score','float',NULL,NULL,0,0,NULL,NULL),
@@ -1704,8 +1731,6 @@ VALUES
   -- Subsystem_Stage_State
   ('Subsystem_Stage_State','StateID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Subsystem_Stage_State','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
-  ('Subsystem_Stage_State','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Subsystem_Stage_State','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Subsystem_Stage_State','SubsystemID','int',NULL,NULL,0,0,NULL,NULL),
   ('Subsystem_Stage_State','Level','nvarchar',100,NULL,0,0,NULL,NULL),
   ('Subsystem_Stage_State','Status','nvarchar',100,NULL,0,0,NULL,NULL),
@@ -1716,7 +1741,6 @@ VALUES
   ('Subsystem_Stage_State','AttemptCount','int',NULL,NULL,0,0,'DF_SSS_AttemptCount','(0)'),
   ('Subsystem_Stage_State','ErrorMessage','nvarchar',-1,NULL,1,0,NULL,NULL),
   ('Subsystem_Stage_State','UpdatedAt','datetime2',NULL,7,0,0,NULL,NULL),
-  ('Subsystem_Stage_State','CreatedAt','datetime2',NULL,7,1,0,'DF_StageState_CreatedAt','sysutcdatetime()'),
   ('Subsystem_Stage_State','StartedAt','datetime2',NULL,7,1,0,NULL,NULL),
   ('Subsystem_Stage_State','FinishedAt','datetime2',NULL,7,1,0,NULL,NULL),
   -- Threat_Actor
@@ -1758,9 +1782,6 @@ VALUES
   -- Threat_Scenario
   ('Threat_Scenario','ScenarioID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Threat_Scenario','SessionID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
-  ('Threat_Scenario','TenantID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Threat_Scenario','EntityID','nvarchar',200,NULL,1,0,NULL,NULL),
-  ('Threat_Scenario','UserID','nvarchar',200,NULL,1,0,NULL,NULL),
   ('Threat_Scenario','SubsystemID','int',NULL,NULL,0,0,NULL,NULL),
   ('Threat_Scenario','ScopedThreatID','uniqueidentifier',NULL,NULL,0,0,NULL,NULL),
   ('Threat_Scenario','Status','nvarchar',100,NULL,0,0,NULL,NULL),
@@ -2153,9 +2174,6 @@ GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE name = 'DF_SSS_AttemptCount')
     ALTER TABLE [dbo].[Subsystem_Stage_State] ADD CONSTRAINT [DF_SSS_AttemptCount] DEFAULT ((0)) FOR [AttemptCount];
-GO
-IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE name = 'DF_StageState_CreatedAt')
-    ALTER TABLE [dbo].[Subsystem_Stage_State] ADD CONSTRAINT [DF_StageState_CreatedAt] DEFAULT (sysutcdatetime()) FOR [CreatedAt];
 GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE name = 'DF_CatCategoryMap_CreatedAt')
@@ -2829,11 +2847,9 @@ required_index(idx, tbl) AS (
         ('UX_Control_Library_Code',                'Control_Library'),
         ('UX_API_Client_KeyHash',                  'API_Client'),
         ('IX_IdentifiedThreat_SessionSubActive',   'Identified_Threat'),
-        ('IX_IdentifiedDuplicateThreat_Session',   'Identified_Duplicate_Threat'),
         ('IX_ScopedThreat_SessionSubActive',       'Scoped_Threat'),
         ('IX_ScopedThreat_SessionActiveScores',    'Scoped_Threat'),
         ('IX_PromptLog_Correlation',               'Prompt_Log'),
-        ('IX_PromptLog_Session',                   'Prompt_Log'),
         /* The three clustered indexes from 6e. Checked here because their absence
            is the one failure of that change that is otherwise silent: the table
            still works, as a HEAP, and every insert and every time-bounded read
@@ -2842,8 +2858,7 @@ required_index(idx, tbl) AS (
         ('CIX_ApplicationLog_Created',             'Application_Log'),
         ('CIX_DiagnosticEvent_Created',            'Diagnostic_Event'),
         ('IX_ScenarioAudit_SessionSubEvent',       'Scenario_Audit'),
-        ('IX_ScenarioAudit_Scenario',              'Scenario_Audit'),
-        ('IX_ScenarioAudit_Plan',                  'Scenario_Audit')
+        ('IX_ScenarioAudit_Scenario',              'Scenario_Audit')
     ) v(idx, tbl)
 )
 SELECT 'MISSING TABLE' AS Problem, tbl AS ObjectName

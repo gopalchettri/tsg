@@ -60,8 +60,8 @@ def _scored(threat_id: str = _TID) -> scoping.Scored:
 
 def _row(sid: str, scoped_id: str, *, identity: str | None):
     return tasks._build_scenario_output_row(
-        scoped_id, sid, "t", 0, {"scenario_title": "rewrite", "scenario_statement": "s"}, {},
-        2, "86", "u1", _INFO_AFTER_PROMOTION, scenario_number=1, source="generated",
+        scoped_id, sid, 0, {"scenario_title": "rewrite", "scenario_statement": "s"}, {},
+        2, _INFO_AFTER_PROMOTION, scenario_number=1, source="generated",
         span=(_now(), _now()), identity=identity)
 
 
@@ -89,10 +89,10 @@ def test_a_regeneration_retires_the_version_it_replaced_after_a_promotion():
     old_id = str(uuid.uuid4())
     with Session() as s:
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=old_scoped, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ScopedThreatID=old_scoped, SessionID=sid, SubsystemID=0,
             ThreatID=_TID, Score=9.5, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=old_id, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=old_id, SessionID=sid,
             SubsystemID=0, ScopedThreatID=old_scoped, Status=str(ScenarioStatus.complete),
             ScenarioJSON=json.dumps({"scenario_title": "phishing"}),
             Accepted=1, Superseded=0, IdentityHash=HASH_10, ScenarioNumber=1,
@@ -103,7 +103,7 @@ def test_a_regeneration_retires_the_version_it_replaced_after_a_promotion():
                             scenario_number=1, identity_hash=HASH_10)
     with Session() as s:
         assert tasks._reconcile_targeted_regen(
-            s, sid, 0, "t", "86", "u1",
+            s, sid, 0,
             pairs=[(_scored(), new_scoped, target)],
             scenarios={new_scoped: ({"scenario_title": "usb export"}, {}, (_now(), _now()))},
             enriched={_TID: _INFO_AFTER_PROMOTION}, epoch=2, task_id="task-1",
@@ -138,10 +138,10 @@ def test_a_target_with_no_stored_identity_is_still_retired():
     old_id = str(uuid.uuid4())
     with Session() as s:
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=old_scoped, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ScopedThreatID=old_scoped, SessionID=sid, SubsystemID=0,
             ThreatID=_TID, Score=9.5, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=old_id, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=old_id, SessionID=sid,
             SubsystemID=0, ScopedThreatID=old_scoped, Status=str(ScenarioStatus.complete),
             ScenarioJSON=json.dumps({"scenario_title": "legacy"}),
             Accepted=0, Superseded=0, IdentityHash=None, ScenarioNumber=1,
@@ -152,7 +152,7 @@ def test_a_target_with_no_stored_identity_is_still_retired():
                             scenario_number=1, identity_hash=None)
     with Session() as s:
         assert tasks._reconcile_targeted_regen(
-            s, sid, 0, "t", "86", "u1",
+            s, sid, 0,
             pairs=[(_scored(), new_scoped, target)],
             scenarios={new_scoped: ({"scenario_title": "rewritten"}, {}, (_now(), _now()))},
             enriched={_TID: _INFO_AFTER_PROMOTION}, epoch=2, task_id="task-1",
@@ -197,14 +197,14 @@ def test_a_rewrite_is_not_asked_to_differ_from_its_own_text(monkeypatch, tmp_pat
             CreatedAt=_now(), UpdatedAt=_now()))
         for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS, SubsystemLevel.LOCK):
             s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-                StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="86",
+                StateID=str(uuid.uuid4()), SessionID=sid,
                 SubsystemID=0, Level=level, Status=StageStatus.IDLE, GenerationEpoch=1,
-                LeaseExpiresAt=_now() + timedelta(minutes=30), UpdatedAt=_now(), CreatedAt=_now()))
+                LeaseExpiresAt=_now() + timedelta(minutes=30), UpdatedAt=_now()))
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=old_scoped, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ScopedThreatID=old_scoped, SessionID=sid, SubsystemID=0,
             ThreatID=_TID, Score=9.5, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=old_id, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=old_id, SessionID=sid,
             SubsystemID=0, ScopedThreatID=old_scoped, Status=str(ScenarioStatus.complete),
             ScenarioJSON=json.dumps({"scenario_title": "USB swap", "scenario_statement": own_text}),
             # Written before the promotion: the identity of that moment, not of the threat now.
@@ -273,10 +273,10 @@ def _promoted_session(Session):
             ThreatTypeID=None, ThreatCatalogueID=None, ThreatCategoryID=None,
             GroundingStatus="unverified", Superseded=0, CreatedAt=_now()))
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ScopedThreatID=scoped_id, SessionID=sid, SubsystemID=0,
             ThreatID=tid, Score=9.5, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=oid, SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=oid, SessionID=sid,
             SubsystemID=0, ScopedThreatID=scoped_id, Status=str(ScenarioStatus.complete),
             ScenarioJSON=json.dumps({"scenario_title": "USB export",
                                     "scenario_statement": "An agent copies the payment list."}),
@@ -319,7 +319,7 @@ def test_promote_then_regenerate_leaves_exactly_one_live_version(monkeypatch):
         # regeneration would fold a fresh identity from if it re-derived one.
         enriched = {t["threat_id"]: t for t in dal.active_threats(s, sid, 0)}
         assert tasks._reconcile_targeted_regen(
-            s, sid, 0, "t", "86", "u1",
+            s, sid, 0,
             pairs=[(_scored(tid), new_scoped, target)],
             scenarios={new_scoped: ({"scenario_title": "rewritten"}, {}, (_now(), _now()))},
             enriched=enriched, epoch=2, task_id="task-1", regen_mode=True) is True
@@ -380,10 +380,10 @@ def test_next_set_leaves_alone_a_threat_that_already_has_a_scenario():
             ThreatTypeID=5, ThreatCatalogueID=77,  # stamped by promote-to-library
             GroundingStatus="verified", Superseded=0, CreatedAt=_now()))
         s.execute(m.Scoped_Threat.__table__.insert().values(
-            ScopedThreatID=scoped_id, SessionID=sid, TenantID="t", EntityID="86", SubsystemID=0,
+            ScopedThreatID=scoped_id, SessionID=sid, SubsystemID=0,
             ThreatID=_TID, Score=9.5, ScopeRank=1, Selected=1, Superseded=0, CreatedAt=_now()))
         s.execute(m.Threat_Scenario.__table__.insert().values(
-            ScenarioID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="86", UserID="u1",
+            ScenarioID=str(uuid.uuid4()), SessionID=sid,
             SubsystemID=0, ScopedThreatID=scoped_id, Status=str(ScenarioStatus.complete),
             ScenarioJSON=json.dumps({"scenario_title": "usb export"}),
             # Written BEFORE the promotion, so it carries the identity of that moment.

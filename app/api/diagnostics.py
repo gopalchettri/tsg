@@ -87,7 +87,10 @@ class DiagnosticRow(ApiModel):
     #: stage processing failed" becomes one lookup instead of a conversation.
     client_message: str | None = None
     session_id: str | None = None
-    tenant_id: str | None = None
+    #: `tenant_id` was REMOVED from this response, with the Diagnostic_Event column behind it.
+    #: Deliberately not kept as an always-null field: a consumer cannot tell "no tenant" from
+    #: "not recorded", and this is the route support reads mid-incident. Scope a row by
+    #: `entity_id`, which is what tenancy is actually enforced on everywhere else.
     entity_id: str | None = None
     subsystem_id: int | None = None
     task_id: str | None = None
@@ -389,7 +392,7 @@ def _to_diagnostic(row, detail: bool) -> DiagnosticRow:
         traceback=row.Traceback if detail else None,
         client_message=row.ClientMessage,
         session_id=str(row.SessionID) if row.SessionID else None,
-        tenant_id=row.TenantID, entity_id=row.EntityID, subsystem_id=row.SubsystemID,
+        entity_id=row.EntityID, subsystem_id=row.SubsystemID,
         task_id=row.TaskID, request_id=row.RequestID,
         context=_json(row.ContextJSON) if detail else None,
         detail_redacted=not detail)

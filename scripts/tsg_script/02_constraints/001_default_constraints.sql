@@ -3,7 +3,7 @@
 
   Script:      001_default_constraints.sql
   Order:       02_constraints / 001
-  Purpose:     22 default constraints.
+  Purpose:     21 default constraints.
   Depends on:  01_tables/ *
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    default constraints
@@ -162,14 +162,6 @@ IF NOT EXISTS (SELECT 1 FROM sys.default_constraints dc
                WHERE dc.parent_object_id = OBJECT_ID('dbo.Subsystem_Stage_State')
                  AND c.name = 'AttemptCount')
     ALTER TABLE [dbo].[Subsystem_Stage_State] ADD CONSTRAINT [DF_SSS_AttemptCount] DEFAULT ((0)) FOR [AttemptCount];
-GO
-
-IF NOT EXISTS (SELECT 1 FROM sys.default_constraints dc
-               JOIN sys.columns c ON c.object_id = dc.parent_object_id
-                                 AND c.column_id = dc.parent_column_id
-               WHERE dc.parent_object_id = OBJECT_ID('dbo.Subsystem_Stage_State')
-                 AND c.name = 'CreatedAt')
-    ALTER TABLE [dbo].[Subsystem_Stage_State] ADD CONSTRAINT [DF_StageState_CreatedAt] DEFAULT (sysutcdatetime()) FOR [CreatedAt];
 GO
 
 IF NOT EXISTS (SELECT 1 FROM sys.default_constraints dc

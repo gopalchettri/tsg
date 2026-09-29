@@ -1287,6 +1287,37 @@ _DROPPED_COLUMNS = {
     # created with (progress lives in Subsystem_Stage_State); SectorIDsJSON was the last column
     # left by the 2026-08 sector removal.
     ("Scenario_Session", "CurrentSubsystemIndex"), ("Scenario_Session", "SectorIDsJSON"),
+    # 2026-09-30: 25 columns no query reads. Twenty are TenantID/EntityID/UserID copied from
+    # Scenario_Session at insert and never refreshed; SessionID is NOT NULL on every table here,
+    # so the session's own columns answer the same question without being able to drift.
+    #
+    # The near-misses are the reason this list is explicit rather than derived. Each of these
+    # STAYS and must never be added below: Subsystem_Stage_State.UpdatedAt (the control-mapping
+    # sweep filters and orders its queue on it), Risk_Treatment_Plan.EntityID and
+    # Scenario_Audit.EntityID (the entity-wide treatment compliance feed is stamped from the
+    # first and filters on the second), Diagnostic_Event.EntityID (SessionID is nullable there,
+    # so a session-less row has no join home), Scenario_Session's own three, and SubsystemID on
+    # every table but Prompt_Log.
+    #
+    # Prompt_Log.Stage is the loudest near-miss and is deliberately NOT below. No application
+    # query reads it, but docs/API_Smoke_Testing_Simple_Guide.md tells an operator to SELECT it
+    # by hand, so models.py keeps it by the owner's explicit instruction. Listing it here would
+    # make this guard demand a drop that models.py contradicts, and the two column tests above
+    # would then fail on the deploy scripts that (correctly) still create it.
+    ("Subsystem_Stage_State", "TenantID"), ("Subsystem_Stage_State", "EntityID"),
+    ("Subsystem_Stage_State", "CreatedAt"),
+    ("Identified_Threat", "TenantID"), ("Identified_Threat", "EntityID"),
+    ("Identified_Threat", "UserID"),
+    ("Identified_Duplicate_Threat", "TenantID"), ("Identified_Duplicate_Threat", "EntityID"),
+    ("Identified_Duplicate_Threat", "UserID"),
+    ("Scoped_Threat", "TenantID"), ("Scoped_Threat", "EntityID"), ("Scoped_Threat", "UserID"),
+    ("Threat_Scenario", "TenantID"), ("Threat_Scenario", "EntityID"), ("Threat_Scenario", "UserID"),
+    ("Risk_Treatment_Plan", "TenantID"), ("Risk_Treatment_Plan", "CrmRiskIdentificationID"),
+    ("Prompt_Log", "TenantID"), ("Prompt_Log", "EntityID"), ("Prompt_Log", "UserID"),
+    ("Prompt_Log", "SubsystemID"),
+    ("Diagnostic_Event", "TenantID"),
+    ("Scenario_Audit", "TenantID"), ("Scenario_Audit", "Granularity"),
+    ("Scenario_Audit", "ThreatTypeRefID"),
 }
 _CREATE_HEAD_RE = re.compile(r"CREATE\s+TABLE\s+(?:\[?dbo\]?\.)?\[?(\w+)\]?", re.I)
 _COLUMN_LINE_RE = re.compile(rf"^\s*\[?(\w+)\]?\s+\[?(?:{_TYPES})\b", re.I)

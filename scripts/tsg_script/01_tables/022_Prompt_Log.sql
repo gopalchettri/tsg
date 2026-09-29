@@ -3,7 +3,7 @@
 
   Script:      022_Prompt_Log.sql
   Order:       01_tables / 022
-  Purpose:     Create Prompt_Log, or bring an existing copy up to 15 columns.
+  Purpose:     Create Prompt_Log, or bring an existing copy up to 11 columns.
   Depends on:  00_validation/001_pre_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    dbo.Prompt_Log
@@ -25,10 +25,6 @@ BEGIN
     CREATE TABLE dbo.[Prompt_Log] (
         [LogID] UNIQUEIDENTIFIER NOT NULL,
         [SessionID] UNIQUEIDENTIFIER NOT NULL,
-        [TenantID] NVARCHAR(200) NULL,
-        [EntityID] NVARCHAR(200) NULL,
-        [UserID] NVARCHAR(200) NULL,
-        [SubsystemID] INT NOT NULL,
         [Stage] NVARCHAR(100) NOT NULL,
         [PromptVersion] NVARCHAR(100) NOT NULL,
         [Prompt] NVARCHAR(max) NULL,
@@ -40,7 +36,7 @@ BEGIN
         [CorrelationID] UNIQUEIDENTIFIER NULL,
         CONSTRAINT [PK_Prompt_Log] PRIMARY KEY CLUSTERED ([LogID])
     );
-    PRINT ' [CREATED] Table: Prompt_Log (15 columns)';
+    PRINT ' [CREATED] Table: Prompt_Log (11 columns)';
 END
 ELSE
     PRINT ' [EXISTS]  Table: Prompt_Log';
@@ -52,14 +48,6 @@ EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'LogID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'SessionID',
      @expected = N'UNIQUEIDENTIFIER', @nullable = 0;
-EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'TenantID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'EntityID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'UserID',
-     @expected = N'NVARCHAR(200)', @nullable = 1;
-EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'SubsystemID',
-     @expected = N'INT', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'Stage',
      @expected = N'NVARCHAR(100)', @nullable = 0;
 EXEC dbo.tsg_reconcile_column @table = N'Prompt_Log', @column = N'PromptVersion',
@@ -87,5 +75,5 @@ GO
 /* Columns in the database that this application does not know about. Never dropped - they may
    belong to another release or another team. One NOT NULL with no default is made NULL-able,
    because the application never writes it and every insert would fail. */
-EXEC dbo.tsg_report_extra_columns @table = N'Prompt_Log', @known = N'LogID,SessionID,TenantID,EntityID,UserID,SubsystemID,Stage,PromptVersion,Prompt,ResponseText,Model,ModelVersion,ParseSucceeded,CreatedAt,CorrelationID';
+EXEC dbo.tsg_report_extra_columns @table = N'Prompt_Log', @known = N'LogID,SessionID,Stage,PromptVersion,Prompt,ResponseText,Model,ModelVersion,ParseSucceeded,CreatedAt,CorrelationID';
 GO

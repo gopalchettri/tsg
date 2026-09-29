@@ -217,10 +217,11 @@ def active_plan_row(sess: Session, session_id: str, output_id: str) -> RowMappin
     st, it = m.Scoped_Threat, m.Identified_Threat
     return sess.execute(
         # THE shared presenter list (plan_presenter_columns) plus this select's route-only
-        # extras: TenantID/EntityID for audit rows, ActiveTaskID for the cancel fence, and
+        # extras: EntityID for audit rows, ActiveTaskID for the cancel fence, and
         # ReviewComment — wire-hidden, hauled only here so the poll GET keeps its
-        # one-flag-unhide contract.
-        select(*plan_presenter_columns(), p.TenantID, p.EntityID, p.ActiveTaskID, p.ReviewComment,
+        # one-flag-unhide contract. EntityID is NOT decoration: the cancel/restore/review audit
+        # rows are stamped from it, and the entity-wide compliance feed filters on that stamp.
+        select(*plan_presenter_columns(), p.EntityID, p.ActiveTaskID, p.ReviewComment,
             # Accepted: the review route's gate. A verdict may only land on the plan of the
             # version the register carries — see api/treatment.py::post_review_treatment_plan.
             out.Accepted,

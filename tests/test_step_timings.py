@@ -215,9 +215,9 @@ def test_a_failed_generation_still_reports_its_span(monkeypatch) -> None:
 
 def test_failure_and_success_rows_carry_the_span_in_columns_not_json() -> None:
     span = (T0, T0 + timedelta(seconds=7.5))
-    ok = tasks._build_scenario_output_row("sc1", "s", "t", 0, {"scenario_statement": "x"},
-                                          {"errors": []}, 1, "e", "u", {}, span=span)
-    bad = tasks._build_error_output_row("sc1", "s", "t", 0, "boom", 1, "e", "u", {}, span=span)
+    ok = tasks._build_scenario_output_row("sc1", "s", 0, {"scenario_statement": "x"},
+                                          {"errors": []}, 1, {}, span=span)
+    bad = tasks._build_error_output_row("sc1", "s", 0, "boom", 1, {}, span=span)
     for row in (ok, bad):
         assert (row["GenStartedAt"], row["GenFinishedAt"]) == span
     assert "gen_started_at" not in ok["ValidationJSON"]

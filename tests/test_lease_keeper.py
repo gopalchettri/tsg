@@ -53,9 +53,9 @@ def _seed(maker, task_id: str, *, level=SubsystemLevel.SCENARIOS, status="RUNNIN
     with maker() as s:
         for lvl in (SubsystemLevel.LOCK, level):
             s.execute(ss.__table__.insert().values(
-                StateID=str(uuid.uuid4()), SessionID=sid, TenantID="t", EntityID="78",
+                StateID=str(uuid.uuid4()), SessionID=sid,
                 SubsystemID=0, Level=lvl, Status=status, GenerationEpoch=1, ActiveTaskID=task_id,
-                LeaseExpiresAt=t + lease, HeartbeatAt=t, UpdatedAt=t, CreatedAt=t))
+                LeaseExpiresAt=t + lease, HeartbeatAt=t, UpdatedAt=t))
         s.commit()
     return sid
 

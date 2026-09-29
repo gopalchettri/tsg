@@ -159,9 +159,8 @@ def _ask_ai(sess: Session, llm: LLMClient, messages: list[dict], *, scenario_ses
     if prov is not None:
         prov.prompt_version = prompts.PROMPT_VERSION
     row = {
-        "LogID": guid(), "SessionID": scenario_session["SessionID"], "TenantID": scenario_session["TenantID"],
-        "EntityID": scenario_session["EntityID"], "UserID": scenario_session.get("UserID"),
-        "SubsystemID": subsystem_id, "Stage": stage, "PromptVersion": prompts.PROMPT_VERSION,
+        "LogID": guid(), "SessionID": scenario_session["SessionID"],
+        "Stage": stage, "PromptVersion": prompts.PROMPT_VERSION,
         "Prompt": "\n\n".join(f"[{msg['role']}]\n{msg.get('content') or ''}" for msg in messages),
         "ResponseText": text,
         "Model": prov.model if prov else None, "ModelVersion": prov.model_version if prov else None,
@@ -207,18 +206,23 @@ _SETTLED_STATUS = {SubsystemLevel.THREATS: StageStatus.COMPLETE,
                    SubsystemLevel.SCENARIOS: StageStatus.AWAITING_DECISION}
 
 
-def set_up_progress_tracking(sess: Session, session_id: str, tenant_id: str, entity_id: str,
-                             *, settled: bool = False) -> None:
+def set_up_progress_tracking(sess: Session, session_id: str, *, settled: bool = False) -> None:
     """Create the progress-tracking rows for a new session.
 
     `settled` is the hand-written save's shape: the stages are finished before the row exists.
-    The LOCK level stays IDLE either way — nothing holds it."""
+    The LOCK level stays IDLE either way — nothing holds it.
+
+    Took tenant_id/entity_id until the stage row stopped carrying its own copies of them; the
+    session they belong to owns those, and this function never had a use for them beyond storage."""
     t = now()
     rows = [{
-        "StateID": guid(), "SessionID": session_id, "TenantID": tenant_id, "EntityID": str(entity_id),
+        "StateID": guid(), "SessionID": session_id,
         "SubsystemID": ASSET_UNIT_ID, "Level": level,
         "Status": _SETTLED_STATUS.get(level, StageStatus.IDLE) if settled else StageStatus.IDLE,
-        "GenerationEpoch": _EPOCH, "UpdatedAt": t, "CreatedAt": t,
+        # NOT NULL, and the birth stamp matters beyond the constraint: the step-4 control-mapping
+        # sweep admits a stage only once UpdatedAt has aged past its settle window, so a row that
+        # started life without one could never become eligible.
+        "GenerationEpoch": _EPOCH, "UpdatedAt": t,
         **({"FinishedAt": t} if settled and level in _SETTLED_STATUS else {}),
     } for level in (*_WORK_LEVELS, SubsystemLevel.LOCK)]
     sess.execute(insert(m.Subsystem_Stage_State), rows)

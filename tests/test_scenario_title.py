@@ -136,9 +136,9 @@ def _generate(monkeypatch, tmp_path, llm) -> tuple[dict, dict]:
         s.execute(m.Scenario_Session.__table__.insert().values(**row))
         for level in (SubsystemLevel.THREATS, SubsystemLevel.SCENARIOS, SubsystemLevel.LOCK):
             s.execute(m.Subsystem_Stage_State.__table__.insert().values(
-                StateID=str(uuid.uuid4()), SessionID=SID, TenantID="t", EntityID="e",
+                StateID=str(uuid.uuid4()), SessionID=SID,
                 SubsystemID=0, Level=level, Status=StageStatus.IDLE, GenerationEpoch=1,
-                LeaseExpiresAt=NOW + timedelta(minutes=30), UpdatedAt=NOW, CreatedAt=NOW))
+                LeaseExpiresAt=NOW + timedelta(minutes=30), UpdatedAt=NOW))
         s.commit()
         tasks.write_scenarios(s, row, json.loads(row["SubsystemsJSON"]),
                               {"name": ASSET, "asset_type": "OT"}, [THREAT], llm, TASK_ID)
