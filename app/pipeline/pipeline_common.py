@@ -23,7 +23,7 @@ from app.db import dal
 from app.db import models as m
 from app.db.dal import guid, now
 from app.pipeline import grounding, prompts, validation
-from app.pipeline.llm import LLMClient, Provenance
+from app.pipeline.llm import LLMClient, Provenance, TransientProviderError
 
 # The asset-name matcher lives in validation (a text module with no app imports) so the scenario
 # title check can share it; importers of it from here keep working.
@@ -35,10 +35,15 @@ log = get_logger(__name__)
 #: Exception classes that mean "the infrastructure hiccuped — retry the stage", never
 #: "the work is wrong". Re-raised past the per-subsystem failure handlers so Celery's
 #: autoretry_for re-runs the stage cleanly (the same contract as LLMSlotUnavailable; the
-#: stage CAS makes the retry idempotent). Deliberately ONLY OperationalError: anything
-#: broader (DBAPIError) would also retry genuine SQL bugs — ProgrammingError is a
-#: DBAPIError — and those must keep failing loudly.
-TRANSIENT_INFRA_ERRORS: tuple[type[Exception], ...] = (OperationalError,)
+#: stage CAS makes the retry idempotent).
+#:
+#: Two members, one per side of the infrastructure. DB: deliberately ONLY OperationalError —
+#: anything broader (DBAPIError) would also retry genuine SQL bugs, ProgrammingError being a
+#: DBAPIError, and those must keep failing loudly. PROVIDER: a purpose-built class rather than the
+#: raw openai ones, because openai.APIStatusError would drag in every 4xx and this tuple feeds
+#: `autoretry_for=`, where a predicate cannot go. Until it joined, an LLM read-timeout fell past
+#: every handler into `except Exception` and CANCELLED the session (6174F288).
+TRANSIENT_INFRA_ERRORS: tuple[type[Exception], ...] = (OperationalError, TransientProviderError)
 
 
 def log_transient_infra_retry(*, site: str, session_id: str, subsystem_id: int | None,
@@ -48,10 +53,17 @@ def log_transient_infra_retry(*, site: str, session_id: str, subsystem_id: int |
     One shared emitter so the retry sites cannot drift into vague one-off messages: the
     event name is stable for log queries, `error_kind` is enum-valued, and the exception
     class, message and traceback all travel with it — the failure stays fully
-    diagnosable even though the stage retries and (usually) succeeds."""
+    diagnosable even though the stage retries and (usually) succeeds.
+
+    The kind is DERIVED from the exception, not passed in: every call site already has the
+    exception and none should have to remember which half of TRANSIENT_INFRA_ERRORS it caught. A
+    provider timeout filed as `database_transient` sends whoever reads the dashboard to the wrong
+    system."""
+    kind = (InfraErrorKind.llm_transient if isinstance(exc, TransientProviderError)
+            else InfraErrorKind.database_transient)
     log.warning("pipeline.transient_infra_error_retrying",
                 site=site, session_id=session_id, subsystem=subsystem_id,
-                error_kind=str(InfraErrorKind.database_transient),
+                error_kind=str(kind),
                 error_class=type(exc).__name__,
                 error_detail=str(exc)[:500],
                 action="re-raised for Celery autoretry (stage CAS resumes cleanly)",

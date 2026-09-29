@@ -15,7 +15,14 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings
-from app.pipeline.llm import LiteLLMClient, LLMRefusal, LLMResponseTruncated, LLMSlotUnavailable, _litellm_call_budget
+from app.pipeline.llm import (
+    LiteLLMClient,
+    LLMRefusal,
+    LLMResponseTruncated,
+    LLMSlotUnavailable,
+    TransientProviderError,
+    _litellm_call_budget,
+)
 
 _REQ = httpx.Request("POST", "http://proxy.test/v1/chat/completions")
 _OK = {"model": "served", "choices": [{"message": {"content": "hello"}}]}
@@ -94,7 +101,7 @@ def test_non_retryable_4xx_never_falls_back(monkeypatch):
 
 def test_unset_fallback_keeps_existing_behaviour(monkeypatch):
     calls = _stub_litellm(monkeypatch, [_rate_limit()])
-    with pytest.raises(LLMSlotUnavailable):  # 429 -> _provider_429_retryable, exactly as before
+    with pytest.raises(LLMSlotUnavailable):  # 429 -> _provider_transient_retryable, exactly as before
         LiteLLMClient(_settings(monkeypatch, TSG_INFERENCE_FALLBACK_MODEL="")).chat(_MSG)
     assert len(calls) == 1
 
@@ -123,12 +130,17 @@ def test_fallback_equal_to_primary_is_inert(monkeypatch):
 
 
 def test_azure_never_falls_back(monkeypatch):
-    """Azure addresses a fixed deployment; a 'fallback' would re-call the same deployment."""
+    """Azure addresses a fixed deployment; a 'fallback' would re-call the same deployment.
+
+    The timeout still leaves as TransientProviderError, not the raw openai class: no fallback does
+    not mean no retry. _provider_transient_retryable maps it on the way out so the STAGE retries —
+    the same treatment embed and rerank get, which also have no fallback. What this test pins is
+    that no SECOND MODEL was called."""
     calls = _stub_litellm(monkeypatch, [_timeout()])
     s = _settings(monkeypatch, TSG_LLM_PROVIDER="azure_openai",
                 AZURE_OPENAI_DEPLOYMENT_NAME="dep", AZURE_OPENAI_ENDPOINT="http://a",
                 AZURE_OPENAI_API_KEY="k")
-    with pytest.raises(openai.APITimeoutError):
+    with pytest.raises(TransientProviderError):
         LiteLLMClient(s).chat(_MSG)
     assert len(calls) == 1
 

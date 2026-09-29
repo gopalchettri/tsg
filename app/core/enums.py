@@ -24,6 +24,7 @@ class InfraErrorKind(StrEnum):
     stays stable for Loki/Promtail queries; extend it when a new exception class joins
     the transient contract."""
     database_transient = "database_transient"  # sqlalchemy OperationalError: deadlock, connection reset, timeout
+    llm_transient = "llm_transient"             # llm.TransientProviderError: provider/gateway timeout, dropped connection, 5xx
 
 
 class SessionMode(StrEnum):

@@ -52,7 +52,7 @@ from app.db import dal
 from app.db.dal import guid
 from app.db.engine import db_session
 from app.pipeline import cascade, embeddings, grounding, treatment
-from app.pipeline.llm import LLMSlotUnavailable, get_llm
+from app.pipeline.llm import LLMSlotUnavailable, TransientProviderError, get_llm
 from app.pipeline.pipeline_common import TRANSIENT_INFRA_ERRORS
 from app.pipeline.reaper import clean_up_abandoned_sessions
 from app.pipeline.selfcheck import run_self_checks
@@ -404,7 +404,11 @@ def _publish_grounding_job_event(job_id: str | None, state: CeleryJobState, **fi
 # exhaustion must not retry a MULTI-MINUTE sweep forever. Reuses that cap rather than inventing
 # a second knob for the identical failure mode.
 @celery_app.task(bind=True, name="tsg.calibrate_grounding",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True,
+                # TransientProviderError explicitly: this task does not read
+                # TRANSIENT_INFRA_ERRORS, so it inherits nothing. Both of the tasks
+                # spelled this way are embedding-heavy -- a provider timeout is exactly
+                # the failure they meet, and without this they alone kept cancelling on it.
+                autoretry_for=(LLMSlotUnavailable, TransientProviderError), retry_backoff=True,
                 max_retries=_s.admin_embedding_max_retries)
 def calibrate_grounding_task(self, force: bool = False, started_by: str | None = None,
                             client_id: str | None = None, run_id: str | None = None) -> dict:
@@ -765,10 +769,16 @@ def generate_treatment_plan_task(self, plan_id: str) -> None:
         if self.request.retries < self.max_retries:
             raise  # attempts remain — autoretry_for backs off and re-runs
         transient = isinstance(exc, TRANSIENT_INFRA_ERRORS)
-        message = ("a database issue interrupted every attempt — regenerate the plan "
-                "(POST .../treatment-plan/regenerate)" if transient else
-                "the AI service stayed busy for every attempt — regenerate the plan "
-                "(POST .../treatment-plan/regenerate)")
+        # THREE causes exhaust the same budget and send an operator to three different places.
+        # Checked before the tuple: a provider timeout IS in TRANSIENT_INFRA_ERRORS now, and
+        # "a database issue" would be a lie.
+        if isinstance(exc, TransientProviderError):
+            cause = "the AI service was unreachable for every attempt"
+        elif transient:
+            cause = "a database issue interrupted every attempt"
+        else:
+            cause = "the AI service stayed busy for every attempt"
+        message = f"{cause} — regenerate the plan (POST .../treatment-plan/regenerate)"
         with db_session() as sess:
             dal.finish_plan(sess, plan_id, status=StageStatus.ERROR, task_id=task_id,
                             error_message=message,
@@ -799,7 +809,11 @@ def _publish_emb_job_event(job_id: str | None, state: CeleryJobState, **fields) 
 # route's AsyncResult backstop surfaces to the poller. Decorator-time read, like the beat
 # schedule's _s.* intervals above — a changed .env needs a worker restart to take effect.
 @celery_app.task(bind=True, name="tsg.admin_embedding_action",
-                autoretry_for=(LLMSlotUnavailable,), retry_backoff=True,
+                # TransientProviderError explicitly: this task does not read
+                # TRANSIENT_INFRA_ERRORS, so it inherits nothing. Both of the tasks
+                # spelled this way are embedding-heavy -- a provider timeout is exactly
+                # the failure they meet, and without this they alone kept cancelling on it.
+                autoretry_for=(LLMSlotUnavailable, TransientProviderError), retry_backoff=True,
                 max_retries=_s.admin_embedding_max_retries)
 def admin_embedding_action_task(self, action: str, group: str | None, names: list[str] | None,
                                 strict: bool = True) -> dict:

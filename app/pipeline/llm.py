@@ -56,7 +56,7 @@ class LLMSlotUnavailable(Exception):
     semantic: (1) Redis POSITIVELY CONFIRMED the concurrent-call limit is still exhausted for
     the full wait window — never an unreachable/erroring Redis (that fails open, see _llm_slot);
     (2) the PROVIDER answered 429 (rate limit) even after litellm's own num_retries — e.g.
-    kimi-k2.5's platform-wide rpm=192 being consumed by other teams (_provider_429_retryable).
+    kimi-k2.5's platform-wide rpm=192 being consumed by other teams (_provider_transient_retryable).
     Callers let it propagate past their per-subsystem handler so Celery's autoretry_for retries
     the whole stage via the same claim_stage CAS crash-redelivery uses."""
 
@@ -83,26 +83,84 @@ class LLMRefusal(Exception):
     reason a client must NOT auto-retry), never as invalid_plan."""
 
 
-@contextmanager
-def _provider_429_retryable():
-    """Maps a provider-side rate limit onto LLMSlotUnavailable, so a 429 that survives litellm's
-    own num_retries lands in the SAME retry-not-fail machinery the internal slot limiter already
-    has (Celery autoretry_for on every task, errors.py's 429+Retry-After for inline calls) —
-    instead of a generic exception that _record_failure turns into a permanent session ERROR.
-    The concrete case: kimi-k2.5's rpm=192 is shared across every team on the proxy, so TSG can
-    be throttled by someone else's traffic; that must delay work, never fail it.
+class TransientProviderError(Exception):
+    """The provider, or the gateway in front of it, hiccuped — timeout, connection drop or 5xx —
+    and the work is NOT wrong. LLMSlotUnavailable's sibling for the failures a 429 mapping does not
+    cover, joined to pipeline_common.TRANSIENT_INFRA_ERRORS so the per-subsystem handlers re-raise
+    it for Celery's autoretry instead of letting _record_failure CANCEL the session.
 
-    openai.RateLimitError is the right catch for all four call paths: litellm.RateLimitError
-    subclasses it (chat/embed/rerank). moderate() swallows it internally — advisory work
-    after a billed call must never trigger a generation retry.
-    Imported lazily, same pattern as the per-method litellm imports — a stub-only test run
-    never needs the package."""
+    Session 6174F288 was cancelled when one rerank call read-timed out while grounding its first
+    proposal. chat() has a fallback model to try; embed() and rerank() have none, so without this
+    class a reranker outage was indistinguishable from bad work."""
+
+
+#: 4xx statuses that are TEMPORARY despite being 4xx. Everything else in 400..499 is permanent.
+#: 408 Request Timeout and 425 Too Early are both emitted by gateways in front of a slow upstream,
+#: and filing either as permanent would cancel a session over a timeout -- precisely the bug this
+#: module is being changed to fix, reintroduced by the fix. 429 is handled before this is consulted.
+_TRANSIENT_4XX = frozenset({408, 425})
+
+
+def is_transient_provider_error(exc: Exception) -> bool:
+    """Is this provider failure worth another attempt?
+
+    THE RULE IS INVERTED, deliberately, and that is the whole point. Listing which failures are
+    temporary cannot ever be finished -- timeouts, resets, 5xx, gateway 502/503/504, CDN 520-524,
+    DNS, and whatever a future litellm introduces -- and the day something is missing from that
+    list it cancels a session. The PERMANENT list is closed: 4xx is a fixed, specified set. So
+    enumerate the closed one and let everything else default to temporary.
+
+    Consequence worth stating: an unknown provider error costs at most a bounded set of retries,
+    where under the old direction it cost the session. That asymmetry is the argument.
+
+    Non-provider exceptions are NOT judged here. Our own fail-loud guards (a misaligned rerank
+    batch, a short embed response) are real bugs and must surface on the first attempt.
+
+    One predicate, two consumers -- _fallback_applies and _provider_transient_retryable. Written
+    twice, the chat path and the embed/rerank paths drifted about what "temporary" meant, and that
+    drift is what let a rerank timeout through as permanent."""
+    import openai
+
+    if not isinstance(exc, openai.APIError):
+        return False                                    # ours, not theirs — fail loudly
+    if isinstance(exc, openai.RateLimitError):          # before the status branch: 429 is a 4xx
+        return True
+    status = getattr(exc, "status_code", None) or 0
+    if 400 <= status < 500:
+        return status in _TRANSIENT_4XX
+    return True                                         # timeouts, 5xx, and anything unrecognised
+
+
+@contextmanager
+def _provider_transient_retryable():
+    """Maps a provider-side failure the work did not cause onto the retry-not-fail machinery: a 429
+    onto LLMSlotUnavailable, anything else temporary onto TransientProviderError. Either lands in
+    what already handles it (Celery autoretry_for on every task, errors.py's 429+Retry-After for
+    inline calls) instead of a generic exception that _record_failure turns into a permanent ERROR.
+
+    The 429 case: kimi-k2.5's rpm=192 is shared across every team on the proxy, so TSG can be
+    throttled by someone else's traffic; that must delay work, never fail it. The timeout case: one
+    rerank read-timeout cancelled session 6174F288 outright.
+
+    openai's classes are the right catch for all four call paths: litellm's exceptions subclass
+    them. moderate() swallows both internally — advisory work after a billed call must never
+    trigger a generation retry. On the chat path _complete's own `except Exception` sits INSIDE
+    this manager, so _fallback_applies still sees the raw exception and the one-shot model fallback
+    is unaffected; only what escapes it is mapped here.
+
+    Imported lazily, same pattern as the per-method litellm imports — a stub-only test run never
+    needs the package."""
     import openai
 
     try:
         yield
     except openai.RateLimitError as exc:
         raise LLMSlotUnavailable(f"provider rate limit (429) persisted through retries: {exc}") from exc
+    except Exception as exc:
+        if not is_transient_provider_error(exc):
+            raise  # permanent: auth, bad request, a malformed reply — must keep failing loudly
+        raise TransientProviderError(
+            f"provider call failed transiently ({type(exc).__name__}): {exc}") from exc
 
 
 @lru_cache
@@ -346,6 +404,39 @@ def _litellm_call_budget(s: Settings) -> dict[str, Any]:
     return {"timeout": s.llm_timeout_seconds, "num_retries": s.llm_max_retries, "max_retries": 0}
 
 
+def _retry_transient(s: Settings, what: str, call):
+    """Run `call()` with the retry budget `llm_max_retries` PROMISES, for the two methods litellm
+    does not give it to.
+
+    litellm's `num_retries` is honoured on the chat path and SILENTLY IGNORED on embedding and
+    rerank. Measured on the installed version with num_retries=2: chat reached the provider 3
+    times, embedding once, rerank once. So the budget every other part of this file is written
+    around — and that the boot line advertises — held for one of the three call types.
+
+    It cost a session. 6174F288 was cancelled by ONE rerank read-timeout, with three layers of
+    retry that all failed to run: no in-call retry (this), no fallback model (embed and rerank
+    have none, only chat does), and no stage retry (the transient classifier did not recognise a
+    timeout).
+
+    Only transient failures are retried, on the same rule the rest of this file uses: a permanent
+    4xx must fail on the first attempt rather than burn the budget before reporting a bad key. The
+    backoff is the same exponential shape litellm applies to chat, so the three call types now
+    behave alike — which is the property `llm_max_retries` claims merely by existing."""
+    import time
+
+    attempts = s.llm_max_retries + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if attempt == attempts or not is_transient_provider_error(exc):
+                raise
+            log.warning("llm.transient_retry", call=what, attempt=attempt, of=attempts,
+                        error=f"{type(exc).__name__}: {exc}"[:300])
+            time.sleep(min(2 ** (attempt - 1), 8))
+    raise AssertionError("unreachable: the loop returns or raises")  # pragma: no cover
+
+
 def _litellm_http_headers(s: Settings) -> dict[str, str]:
     """Same dual-header reasoning as _litellm_key_header, for this file's own httpx calls."""
     headers = {"Authorization": f"Bearer {s.litellm_api_key}"}
@@ -547,7 +638,7 @@ class LiteLLMClient:
                         messages=len(messages), prompt_chars=total_chars,
                         expected_type=getattr(expected_type, "__name__", None),
                         response_schema=getattr(response_schema, "__name__", None)) as _t:
-            with _llm_slot(self.s), _provider_429_retryable():
+            with _llm_slot(self.s), _provider_transient_retryable():
                 try:
                     resp = _complete(kwargs)
                 except Exception as exc:
@@ -556,7 +647,7 @@ class LiteLLMClient:
                     # Only for calls that did not pin an explicit model — a pinned model is a
                     # deliberate choice (boot probes, calibration) that must fail as itself.
                     # If the fallback also rate-limits, the raise lands in
-                    # _provider_429_retryable and becomes LLMSlotUnavailable exactly as before.
+                    # _provider_transient_retryable and becomes LLMSlotUnavailable exactly as before.
                     fb = self.s.inference_fallback_model
                     if model is not None or not self._fallback_applies(fb, kwargs["model"], exc):
                         raise
@@ -627,31 +718,18 @@ class LiteLLMClient:
     def _fallback_applies(self, fb: str, primary: str, exc: Exception) -> bool:
         """Should this failed primary chat call be retried on `inference_fallback_model`?
 
-        Only for failures a DIFFERENT healthy model could plausibly answer: timeouts and
-        connection drops, a 429 that survived litellm's own num_retries (the primary is
-        saturated — its shared rpm may be consumed by other teams), and 5xx. Any other 4xx
-        (auth, bad request, content policy) fails identically on every model — falling back
-        would double the cost of the same error and hide its cause. Azure is excluded
-        wholesale: _chat_kwargs addresses a fixed DEPLOYMENT and ignores per-call models, so a
-        "fallback" there would silently re-call the same deployment and learn nothing.
+        Only for failures a DIFFERENT healthy model could plausibly answer — the shared
+        is_transient_provider_error rule: timeouts and connection drops, a 429 that survived
+        litellm's own num_retries (the primary is saturated — its shared rpm may be consumed by
+        other teams), and 5xx. Everything that predicate calls permanent (auth, bad request,
+        content policy) fails identically on every model, so falling back would double the cost of
+        the same error and hide its cause. Azure is excluded wholesale: _chat_kwargs addresses a
+        fixed DEPLOYMENT and ignores per-call models, so a "fallback" there would silently re-call
+        the same deployment and learn nothing.
         """
         if not fb or fb == primary or self.s.llm_provider == "azure_openai":
             return False
-        import openai
-
-        if isinstance(exc, openai.RateLimitError):  # checked before APIStatusError: 429 < 500
-            return True
-        if isinstance(exc, openai.APIConnectionError):  # includes APITimeoutError
-            return True
-        if isinstance(exc, openai.APIStatusError):
-            return exc.status_code >= 500
-        # litellm wraps statuses it has no specific mapping for (501/505, CDN/gateway 520-524)
-        # in litellm.APIError, which subclasses openai.APIError but NOT APIStatusError — a
-        # gateway melting down in front of the proxy is exactly the failure a second model can
-        # answer. It always carries status_code; anything below 500 (or absent) stays no-fallback.
-        if isinstance(exc, openai.APIError):
-            return (getattr(exc, "status_code", 0) or 0) >= 500
-        return False
+        return is_transient_provider_error(exc)
 
     def embed(self, texts, *, model=None, kind="query"):
         """Batch text → vectors, via `embedding_provider` ('local' runs in-process, so the
@@ -710,9 +788,12 @@ class LiteLLMClient:
         # it lands. That buys durability at the price of more acquisitions, and it is safe
         # precisely because a preemption there costs only the batch in flight. Do not "optimise"
         # that caller back into a single call without also moving its write-back.
-        with _llm_slot(self.s), _provider_429_retryable():
+        with _llm_slot(self.s), _provider_transient_retryable():
             for i in range(0, len(texts), batch):
-                vecs.extend(self._embed_one_batch(texts[i:i + batch], model))
+                chunk = texts[i:i + batch]
+                # _retry_transient, not litellm's num_retries: it is ignored on this path.
+                vecs.extend(_retry_transient(self.s, "embed",
+                                             lambda c=chunk: self._embed_one_batch(c, model)))
         return vecs
 
     def _embed_one_batch(self, texts: list[str], model: str) -> list[list[float]]:
@@ -761,14 +842,16 @@ class LiteLLMClient:
         import litellm
 
         model = model or self.s.reranker_model
-        with _llm_slot(self.s), _provider_429_retryable():
-            resp = litellm.rerank(
+        with _llm_slot(self.s), _provider_transient_retryable():
+            # _retry_transient, not litellm's num_retries: it is ignored on this path. This is the
+            # call that cost session 6174F288 -- one read-timeout, no retry anywhere.
+            resp = _retry_transient(self.s, "rerank", lambda: litellm.rerank(
                 model=model, query=query, documents=list(docs),
                 custom_llm_provider="litellm_proxy",  # see _chat_kwargs
                 api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,
                 **_litellm_key_header(self.s),  # gateway-safe alternate auth header, when configured
                 **_litellm_call_budget(self.s),  # same bounds as chat, from one source
-            )
+            ))
         by_index = {r["index"]: float(r["relevance_score"]) * 100.0 for r in resp["results"]}
         missing = [i for i in range(len(docs)) if i not in by_index]
         if missing:
@@ -869,7 +952,7 @@ def moderate(text: str, *, settings: Settings | None = None) -> ModerationResult
     try:
         client = _moderation_client(s.litellm_api_key, f"{s.litellm_base_url.rstrip('/')}/v1",
                                     s.llm_timeout_seconds, s.llm_max_retries)
-        with _llm_slot(s), _provider_429_retryable():
+        with _llm_slot(s), _provider_transient_retryable():
             resp = client.moderations.create(**kwargs)
         # Parsing stays INSIDE the try: an empty resp.results (or any unexpected shape) would
         # otherwise raise past this function's never-raises contract, turning a malformed
@@ -1066,11 +1149,11 @@ def _verify_embedding_dimensions(s: Settings) -> None:
 
     probe = [f"dimension check {i}" for i in range(s.embedding_batch_size)]
     try:
-        # _provider_429_retryable, same as embed(): without it a boot-time rate limit surfaces as
+        # _provider_transient_retryable, same as embed(): without it a boot-time rate limit surfaces as
         # a raw RateLimitError that nobody catches. Mapped to LLMSlotUnavailable it becomes a
         # retry _init_worker already knows how to back off on — which matters most when a whole
         # replica set boots at once and contends for the same proxy.
-        with _llm_slot(s), _provider_429_retryable():
+        with _llm_slot(s), _provider_transient_retryable():
             resp = litellm.embedding(
                 model=s.embedding_model, input=probe,
                 **_embedding_call_kwargs(s),  # the SAME endpoint _embed_one_batch will use
