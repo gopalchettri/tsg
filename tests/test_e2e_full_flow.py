@@ -77,8 +77,15 @@ def client(tmp_path, monkeypatch):
     engine.dispose()  # the app's own get_engine() opens the real pooled connections from here
 
     from app.api.deps import Principal, get_principal
+    from app.core.config import get_settings
     from app.main import create_app
 
+    # DECLARED, not inherited. risk_module_enabled defaults to FALSE and decides whether
+    # app/api/treatment.py is mounted at all, so without this every treatment path in the
+    # lifecycle below is a 404. This test passed only on a machine whose .env turned the module
+    # on — a green that said nothing about the code and everything about the developer.
+    monkeypatch.setenv("TSG_RISK_MODULE_ENABLED", "true")
+    get_settings.cache_clear()
     app = create_app()
     app.dependency_overrides[get_principal] = lambda: Principal(
         claims={"sub": USER}, entities={ENTITY}, client_id="e2e-test", tenant_id=TENANT)

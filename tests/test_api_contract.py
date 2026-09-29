@@ -30,7 +30,25 @@ _PUBLIC = {("/health", "get"), ("/ready", "get")}
 
 @pytest.fixture(scope="module")
 def schema() -> dict:
-    return create_app().openapi()
+    """The WHOLE surface, so the treatment routes are in it.
+
+    risk_module_enabled defaults to FALSE and gates whether app/api/treatment.py is mounted at all
+    (app/main.py). Without this, every treatment path is simply absent from the schema and the
+    contract checks below silently cover a smaller API than the one that ships — which is exactly
+    what happened: they passed on a machine whose .env turned the module on, and nowhere else. A
+    contract test that describes a different API depending on who runs it is not a contract test.
+    """
+    import os
+    from unittest.mock import patch
+
+    from app.core.config import get_settings
+
+    with patch.dict(os.environ, {"TSG_RISK_MODULE_ENABLED": "true"}):
+        get_settings.cache_clear()
+        try:
+            return create_app().openapi()
+        finally:
+            get_settings.cache_clear()
 
 
 def _operations(schema: dict):

@@ -87,6 +87,18 @@ def client(tmp_path, monkeypatch):
     db_path = tmp_path / "remediation.db"
     monkeypatch.setenv("TSG_DB_DSN", f"sqlite:///{db_path}")
     monkeypatch.setenv("TSG_RISK_MODULE_ENABLED", "true")
+    # The CUTOFF these tests' outcomes depend on, declared rather than inherited.
+    #
+    # Unset, control_map_min_score derives to the borrowed GROUNDING threshold — 75 by static
+    # default — so the backfill floor becomes 0.42 x 75 = 31.5 and every top-up candidate falls
+    # below it ("controls.top_up_nothing_above_the_floor"). The top-up tests below then map one
+    # control where they assert five. They passed only because this machine's .env carries
+    # TSG_CONTROL_MAP_MIN_SCORE=50, a number no test mentions and CI does not have.
+    #
+    # 50 is that same value, pinned here: what these tests are about is the top-up filling to
+    # control_map_min_count, not the cutoff, so the cutoff has to be a constant of the test rather
+    # than a property of whoever runs it.
+    monkeypatch.setenv("TSG_CONTROL_MAP_MIN_SCORE", "50")
     from app.core.config import get_settings
     from app.db.engine import _sessionmaker, get_engine
     get_settings.cache_clear()
