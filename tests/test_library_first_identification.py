@@ -35,7 +35,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import get_settings
-from app.core.enums import GroundingStatus, StageStatus, SubsystemLevel
+from app.core.enums import GroundingStatus, InfraErrorKind, StageStatus, SubsystemLevel
 from app.db import models as m
 from app.pipeline import embeddings, tasks, threat_identification, threat_retrieval
 from app.pipeline.tasks import find_threats, set_up_progress_tracking
@@ -628,10 +628,11 @@ def test_next_set_size_at_production_scale_reuses_funnel_without_duplicating(mon
         assert round2_summary["delivered"] < 10
 
 
-def test_transient_db_error_retries_instead_of_cancelling_session(monkeypatch, caplog):
+def test_transient_db_error_retries_instead_of_cancelling_session(monkeypatch):
     """A transient DB error (deadlock/connection reset) during the pipeline must re-raise
     for the Celery stage retry — NOT route into _record_failure and cancel the session —
     and must log the enum-classified transient-infra event with full detail."""
+    captured = _record_transient_retries(monkeypatch)
     from sqlalchemy.exc import OperationalError
 
     monkeypatch.setattr(tasks.bus, "publish", lambda *a, **k: None)
@@ -663,10 +664,17 @@ def test_transient_db_error_retries_instead_of_cancelling_session(monkeypatch, c
             tasks._process_all_supporting_systems(s, sid, FakeLLM(), TASK_ID)
         row = s.execute(select(m.Scenario_Session)).scalar_one()
         assert row.SessionStatus == "active", "a transient blip must never cancel a session"
-    assert any("transient_infra_error_retrying" in r.getMessage()
-               and "database_transient" in r.getMessage()
-               and "OperationalError" in r.getMessage() for r in caplog.records), \
-        "the transient-infra retry must be logged with enum kind and exception class"
+    # structlog.testing.capture_logs, NOT caplog. App events go to stdout through
+    # PrintLoggerFactory and BYPASS stdlib logging entirely (app/core/logging.py says so), so
+    # caplog.records is empty for them — EXCEPT when TSG_LOG_FILE=true happens to tee output
+    # through a stdlib logger as a side effect. This assertion therefore passed only on a machine
+    # whose .env enabled file logging. Matching a rendered substring hid that; capture_logs yields
+    # the EVENT DICT, so the kind and the exception class are checked as fields, not as text that
+    # happens to appear somewhere in the line.
+    hits = [e for e in captured if e.get("event") == "pipeline.transient_infra_error_retrying"]
+    assert hits, f"the retry was not logged; saw {[e.get('event') for e in captured]}"
+    assert hits[0]["error_kind"] == str(InfraErrorKind.database_transient)
+    assert hits[0]["error_class"] == "OperationalError"
 
 
 def test_transient_db_error_propagates_from_next_set_round(monkeypatch):
@@ -903,3 +911,28 @@ def test_the_supersede_shares_a_transaction_with_the_insert_that_replaces_it():
     assert supersede_at < insert_at, (
         "dal.supersede runs after the insert — it filters on (SessionID, SubsystemID) with no "
         "time fence, so it would retire the rows just written")
+
+
+def _record_transient_retries(monkeypatch) -> list[dict]:
+    """Capture what log_transient_infra_retry emits, without touching structlog's global state.
+
+    NOT structlog.testing.capture_logs and NOT caplog. caplog cannot see these at all -- app
+    events go to stdout through PrintLoggerFactory and bypass stdlib logging (app/core/logging.py
+    says so), so caplog only ever saw them when TSG_LOG_FILE=true teed output through a stdlib
+    logger as a side effect, which is why the old assertion passed on one machine's .env and
+    nowhere else. capture_logs is no better here: configure_logging sets
+    cache_logger_on_first_use=True, so a module-level `log` bound by an EARLIER test keeps the old
+    configuration and capture_logs cannot hook it -- the test then passes alone and fails in a
+    full run, which is worse than failing consistently.
+
+    Patching the emitter is deterministic under any ordering, and yields the event as FIELDS, so
+    the kind and the exception class are asserted as data rather than as text that happens to
+    appear somewhere in a rendered line.
+    """
+    from app.pipeline import pipeline_common
+
+    seen: list[dict] = []
+    real = pipeline_common.log.warning
+    monkeypatch.setattr(pipeline_common.log, "warning",
+                        lambda event, **kw: (seen.append({"event": event, **kw}), real(event, **kw))[0])
+    return seen

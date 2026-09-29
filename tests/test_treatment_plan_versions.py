@@ -27,6 +27,7 @@ from app.api.deps import Principal
 from app.api.schemas import TreatmentPlanBody, TreatmentPlanRegenerateBody, TreatmentReviewBody
 from app.core.enums import (
     AuditEventType,
+    InfraErrorKind,
     SessionStatus,
     StageStatus,
     TreatmentGateReason,
@@ -637,10 +638,11 @@ def test_index_arbitrates_double_active_insert():
         s.flush()
 
 
-def test_generation_retries_transient_infra_error_instead_of_failing_the_plan(monkeypatch, caplog):
+def test_generation_retries_transient_infra_error_instead_of_failing_the_plan(monkeypatch):
     """A transient DB error (deadlock/connection reset) mid-attempt must re-raise for Celery's
     autoretry — NOT be parked as a permanent ERROR — and the row must stay claimable under the
     SAME task id, the retry path. Same contract as run_pipeline/next_set/regenerate."""
+    captured = _record_transient_retries(monkeypatch)
     engine = _engine()
     Session = sessionmaker(bind=engine, future=True)
     _seed(Session)
@@ -663,10 +665,13 @@ def test_generation_retries_transient_infra_error_instead_of_failing_the_plan(mo
         assert dal.claim_plan(s, plan_id, task_id, treatment_mod._stale_cutoff()), \
             "plan must stay claimable under the same task id for Celery's retry"
 
-    assert any("transient_infra_error_retrying" in r.getMessage()
-               and "database_transient" in r.getMessage()
-               and "OperationalError" in r.getMessage() for r in caplog.records), \
-        "the transient-infra retry must be logged with enum kind and exception class"
+    # capture_logs, NOT caplog — app events bypass stdlib logging (see the note in
+    # test_library_first_identification); caplog only ever saw them when TSG_LOG_FILE=true teed
+    # output through a stdlib logger, so this passed on one machine's .env and nowhere else.
+    hits = [e for e in captured if e.get("event") == "pipeline.transient_infra_error_retrying"]
+    assert hits, f"the retry was not logged; saw {[e.get('event') for e in captured]}"
+    assert hits[0]["error_kind"] == str(InfraErrorKind.database_transient)
+    assert hits[0]["error_class"] == "OperationalError"
 
 
 def test_generate_treatment_plan_task_autoretries_transient_infra_errors():
@@ -789,3 +794,28 @@ def test_generation_declares_the_strict_plan_schema(monkeypatch):
     assert action["duration_days"] == 14 and {"start_date", "end_date", "timeline"} <= set(action)
     assert stored["mitigation_timeline_days"] == 14
     assert "mitigation_end_date_planned" in stored and stored["mitigation_timeline"]
+
+
+def _record_transient_retries(monkeypatch) -> list[dict]:
+    """Capture what log_transient_infra_retry emits, without touching structlog's global state.
+
+    NOT structlog.testing.capture_logs and NOT caplog. caplog cannot see these at all -- app
+    events go to stdout through PrintLoggerFactory and bypass stdlib logging (app/core/logging.py
+    says so), so caplog only ever saw them when TSG_LOG_FILE=true teed output through a stdlib
+    logger as a side effect, which is why the old assertion passed on one machine's .env and
+    nowhere else. capture_logs is no better here: configure_logging sets
+    cache_logger_on_first_use=True, so a module-level `log` bound by an EARLIER test keeps the old
+    configuration and capture_logs cannot hook it -- the test then passes alone and fails in a
+    full run, which is worse than failing consistently.
+
+    Patching the emitter is deterministic under any ordering, and yields the event as FIELDS, so
+    the kind and the exception class are asserted as data rather than as text that happens to
+    appear somewhere in a rendered line.
+    """
+    from app.pipeline import pipeline_common
+
+    seen: list[dict] = []
+    real = pipeline_common.log.warning
+    monkeypatch.setattr(pipeline_common.log, "warning",
+                        lambda event, **kw: (seen.append({"event": event, **kw}), real(event, **kw))[0])
+    return seen
