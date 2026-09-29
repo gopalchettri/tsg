@@ -1064,9 +1064,14 @@ class Settings(BaseSettings):
         floor = self.llm_timeout_seconds * (worst_retries + 1) * chains
         if "stage_lease_seconds" not in self.model_fields_set:
             self.stage_lease_seconds = int(floor * 2)
-        elif self.stage_lease_seconds < floor:
+        elif self.stage_lease_seconds <= floor:
+            # <=, NOT <. The floor IS the worst case, so a lease equal to it expires at the exact
+            # instant a legitimately slow call finishes — a coin toss the reaper sometimes wins,
+            # cancelling a session that was working. "Equal is not longer" is the same mistake the
+            # busy-retry window made against the sweep interval, where the two were also exactly
+            # equal on defaults and the guarantee silently did not hold.
             raise ValueError(
-                f"stage_lease_seconds ({self.stage_lease_seconds}s) is below the safe floor "
+                f"stage_lease_seconds ({self.stage_lease_seconds}s) does not exceed the safe floor "
                 f"({floor:.0f}s = llm_timeout_seconds * (largest retry budget + 1)) — a genuinely "
                 "slow (not crashed) call could be wrongly reaped. Raise it above the floor.")
         if "treatment_stale_seconds" not in self.model_fields_set:

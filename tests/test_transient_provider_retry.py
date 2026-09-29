@@ -242,3 +242,24 @@ def test_the_stage_lease_covers_the_LARGEST_retry_budget_not_chat_s(monkeypatch)
                        TSG_RERANKER_MAX_RETRIES="3").stage_lease_seconds
     assert longer > short, (
         "the derived lease ignored reranker_max_retries — a long reranker chain would outlive it")
+
+
+def test_a_pinned_lease_equal_to_the_worst_case_is_refused(monkeypatch):
+    """"Equal" is not "longer", and this is the third place that mistake was found.
+
+    The floor IS the worst case: llm_timeout_seconds x (largest retry budget + 1). A lease equal
+    to it expires at the exact instant a legitimately slow call finishes, so whether the session
+    survives is a race the reaper sometimes wins. The check read `<`, so it accepted exactly that.
+
+    It matters most in the case this test names: an operator who pins the lease AND raises a
+    per-call-type budget gets no warning at all, because the derived path that would have grown
+    the lease is skipped for a pinned value."""
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("TSG_LLM_TIMEOUT_SECONDS", "100")
+    monkeypatch.setenv("TSG_LLM_MAX_RETRIES", "1")
+    monkeypatch.setenv("TSG_RERANKER_MAX_RETRIES", "3")      # worst case becomes 100 * 4 = 400
+
+    with pytest.raises(ValidationError, match="does not exceed the safe floor"):
+        Settings(stage_lease_seconds=400)
+    assert Settings(stage_lease_seconds=401), "one second of margin is enough to be legal"
