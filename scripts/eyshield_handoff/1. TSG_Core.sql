@@ -404,8 +404,13 @@ CREATE TABLE Identified_Duplicate_Threat (
     CreatedAt          datetime2     NULL
 );
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_IdentifiedDuplicateThreat_Session' AND object_id = OBJECT_ID('dbo.Identified_Duplicate_Threat'))
-CREATE INDEX IX_IdentifiedDuplicateThreat_Session ON Identified_Duplicate_Threat(SessionID);
+-- RETIRED: no query reads this. Dropped rather than uncreated, or an upgraded database
+-- keeps paying for it while a fresh one does not, and the deploy paths diverge in silence.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_IdentifiedDuplicateThreat_Session' AND object_id = OBJECT_ID('dbo.Identified_Duplicate_Threat'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_IdentifiedDuplicateThreat_Session - no query reads this table.';
+    DROP INDEX IX_IdentifiedDuplicateThreat_Session ON Identified_Duplicate_Threat;
+END;
 -- Without this, "which threats were dropped in which session" is a full scan. No
 -- filter predicate: every row here is permanent audit history, never superseded.
 
@@ -1117,8 +1122,13 @@ CREATE UNIQUE INDEX UX_Scenario_ActiveScoped ON Threat_Scenario(SessionID, Scope
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Scenario_ActiveAccepted' AND object_id = OBJECT_ID('dbo.Threat_Scenario'))
 CREATE UNIQUE INDEX UX_Scenario_ActiveAccepted ON Threat_Scenario(SessionID, IdentityHash, ScenarioNumber) WHERE Accepted = 1 AND IdentityHash IS NOT NULL;
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
-CREATE INDEX IX_PromptLog_Session ON Prompt_Log(SessionID, SubsystemID);
+-- RETIRED: no query reads this. Dropped rather than uncreated, or an upgraded database
+-- keeps paying for it while a fresh one does not, and the deploy paths diverge in silence.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_PromptLog_Session - the prompt log is only read by CorrelationID.';
+    DROP INDEX IX_PromptLog_Session ON Prompt_Log;
+END;
 
 -- The treatment-evidence read (dal_treatment.prompt_logs_for_plan, behind
 -- GET /v1/sessions/{id}/scenarios/{id}/treatment-plan/evidence) filters Prompt_Log on
@@ -1346,10 +1356,13 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Scenario
 
 -- Same shape for the plan dimension, filtered for the same reason: session- and scenario-scoped
 -- rows carry no PlanID and are the overwhelming majority of the ledger.
-IF OBJECT_ID('dbo.Scenario_Audit', 'U') IS NOT NULL
-    AND COL_LENGTH('dbo.Scenario_Audit', 'PlanID') IS NOT NULL
-    AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Plan')
-    EXEC('CREATE INDEX IX_ScenarioAudit_Plan ON Scenario_Audit(PlanID, CreatedAt DESC) WHERE PlanID IS NOT NULL');
+-- RETIRED: no query reads this. Dropped rather than uncreated, or an upgraded database
+-- keeps paying for it while a fresh one does not, and the deploy paths diverge in silence.
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Plan' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_ScenarioAudit_Plan - no query filters the audit table by PlanID.';
+    DROP INDEX IX_ScenarioAudit_Plan ON Scenario_Audit;
+END;
 -- Speeds up dal.latest_next_set_outcome, polled on every status check. Not in
 -- invariants.REQUIRED_INDEXES: that list is for correctness, not performance.
 

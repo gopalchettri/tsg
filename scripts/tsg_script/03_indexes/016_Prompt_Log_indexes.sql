@@ -1,9 +1,9 @@
 /*==============================================================================
   INDEXES: Prompt_Log
 
-  Script:      017_Prompt_Log_indexes.sql
-  Order:       03_indexes / 017
-  Purpose:     3 index(es) on Prompt_Log.
+  Script:      016_Prompt_Log_indexes.sql
+  Order:       03_indexes / 016
+  Purpose:     2 index(es) on Prompt_Log.
   Depends on:  01_tables/ *_Prompt_Log.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    indexes on dbo.Prompt_Log
@@ -48,35 +48,6 @@ BEGIN CATCH
     PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
     EXEC sp_set_session_context N'tsg_deploy_failed', 1;
     RAISERROR('Index IX_PromptLog_Correlation could not be created - deployment stopped.', 16, 1);
-END CATCH;
-GO
-
-BEGIN TRY
-BEGIN TRANSACTION;
-IF EXISTS (SELECT 1 FROM sys.indexes i
-        WHERE i.name = N'IX_PromptLog_Session' AND i.object_id = OBJECT_ID(N'dbo.Prompt_Log')
-          AND (i.is_unique <> 0 OR i.has_filter <> 0
-          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'SessionID')
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'SubsystemID')))
-BEGIN
-    PRINT ' [REBUILD] Prompt_Log.IX_PromptLog_Session exists with the wrong shape - recreating it on (SessionID, SubsystemID).';
-    DROP INDEX [IX_PromptLog_Session] ON [dbo].[Prompt_Log];
-END;
-/* No reader: the prompt log is only ever read by CorrelationID, which
-   IX_PromptLog_Correlation above now serves. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
-    CREATE NONCLUSTERED INDEX [IX_PromptLog_Session] ON [dbo].[Prompt_Log] ([SessionID], [SubsystemID]);
-COMMIT;
-END TRY
-BEGIN CATCH
-    IF @@TRANCOUNT > 0 ROLLBACK;
-    PRINT ' [ERROR]   Could not create or rebuild Prompt_Log.IX_PromptLog_Session on (SessionID, SubsystemID).';
-    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
-    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
-    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    RAISERROR('Index IX_PromptLog_Session could not be created - deployment stopped.', 16, 1);
 END CATCH;
 GO
 

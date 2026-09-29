@@ -1,8 +1,8 @@
 /*==============================================================================
   INDEXES: Scoped_Threat
 
-  Script:      013_Scoped_Threat_indexes.sql
-  Order:       03_indexes / 013
+  Script:      012_Scoped_Threat_indexes.sql
+  Order:       03_indexes / 012
   Purpose:     2 index(es) on Scoped_Threat.
   Depends on:  01_tables/ *_Scoped_Threat.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].

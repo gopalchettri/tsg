@@ -13,7 +13,7 @@
 
   Contents: legacy-name migration, 24 tables, 319 reconciled columns,
   22 default constraints,
-  3 check constraints, 36 indexes.
+  3 check constraints, 33 indexes.
 
   Those five numbers are PINNED to the statements below them by
   tests/test_schema_sync.py::test_the_consolidated_header_counts_match_the_script.
@@ -2194,7 +2194,7 @@ GO
 
 
 /*==============================================================================
-  SECTION 6 — Indexes (36)
+  SECTION 6 — Indexes (33)
 
   Please create all of them exactly as written. Index names, column order, the
   UNIQUE keyword and the text of each WHERE clause are all either checked by the
@@ -2526,28 +2526,45 @@ GO
    time window is not selective enough. */
 
 -------------------------------------------------------------------------------
--- 6d. NO CURRENT READER (3). Kept so this database matches the ones already
---     deployed, and because a future query may want them. As of this script no
---     application query filters on their columns, so they cost write time
---     without saving read time. Review before adding more of the same shape.
+-- 6d. RETIRED (0 indexes). Three indexes lived here, each documented as having
+--     no reader. They are now DROPPED rather than merely uncreated.
+--
+--     WHY THEY EXISTED AND WHY THEY GO. Each was written for a query somebody
+--     expected to need: "duplicates for this session", "prompts for this
+--     session", "this plan's audit history". None of those queries was ever
+--     written. An index with no reader is not neutral - it is maintained on
+--     every INSERT, so it is pure write amplification, and two of the three sat
+--     on tables that take a row per model call and a row per audited event.
+--
+--     DROPPED, not just uncreated: otherwise an upgraded database keeps paying
+--     for them forever while a fresh one does not, and the two deploy paths
+--     diverge silently - which is the failure
+--     test_every_deploy_path_creates_the_same_indexes exists to catch.
+--
+--     If one of those queries is ever built, the index comes back with it. That
+--     is the right order: an index earns its place by having a reader, not by
+--     anticipating one.
 -------------------------------------------------------------------------------
 
-/* No reader: nothing selects from Identified_Duplicate_Threat at all. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_IdentifiedDuplicateThreat_Session' AND object_id = OBJECT_ID('dbo.Identified_Duplicate_Threat'))
-    CREATE NONCLUSTERED INDEX [IX_IdentifiedDuplicateThreat_Session] ON [dbo].[Identified_Duplicate_Threat] ([SessionID]);
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_IdentifiedDuplicateThreat_Session' AND object_id = OBJECT_ID('dbo.Identified_Duplicate_Threat'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_IdentifiedDuplicateThreat_Session - no query reads this table.';
+    DROP INDEX [IX_IdentifiedDuplicateThreat_Session] ON [dbo].[Identified_Duplicate_Threat];
+END;
 GO
 
-/* No reader: the prompt log is only ever read by CorrelationID, which
-   IX_PromptLog_Correlation above now serves. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
-    CREATE NONCLUSTERED INDEX [IX_PromptLog_Session] ON [dbo].[Prompt_Log] ([SessionID], [SubsystemID]);
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_PromptLog_Session - the prompt log is only read by CorrelationID.';
+    DROP INDEX [IX_PromptLog_Session] ON [dbo].[Prompt_Log];
+END;
 GO
 
-/* No reader: the treatment audit feed filters session, event type and scenario.
-   No query filters the audit table by PlanID; the column is output only. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Plan' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
-    CREATE NONCLUSTERED INDEX [IX_ScenarioAudit_Plan] ON [dbo].[Scenario_Audit] ([PlanID], [CreatedAt] DESC)
-        WHERE [PlanID] IS NOT NULL;
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Plan' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
+BEGIN
+    PRINT ' [FIXED]   Dropping IX_ScenarioAudit_Plan - no query filters the audit table by PlanID.';
+    DROP INDEX [IX_ScenarioAudit_Plan] ON [dbo].[Scenario_Audit];
+END;
 GO
 
 -------------------------------------------------------------------------------

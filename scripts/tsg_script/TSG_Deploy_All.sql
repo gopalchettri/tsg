@@ -1,8 +1,8 @@
 /*==============================================================================
-  TSG SCHEMA - COMPLETE DEPLOYMENT IN ONE FILE (51 scripts)
+  TSG SCHEMA - COMPLETE DEPLOYMENT IN ONE FILE (50 scripts)
 
   Script:      TSG_Deploy_All.sql
-  Order:       all 51 scripts of this package, in execution order
+  Order:       all 50 scripts of this package, in execution order
   Purpose:     Deploy or reconcile the entire TSG schema, then prove it.
   Depends on:  Nothing. It contains every script it needs.
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
@@ -51,10 +51,10 @@ EXEC sp_set_session_context N'tsg_deploy_failed', 0;
 GO
 
 /*============================================================================
-  >>> 1 of 51   00_validation/000_helpers.sql
+  >>> 1 of 50   00_validation/000_helpers.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [1/51] 00_validation/000_helpers.sql';
+PRINT '>>> [1/50] 00_validation/000_helpers.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -886,10 +886,10 @@ END
 GO
 
 /*============================================================================
-  >>> 2 of 51   00_validation/001_pre_deployment_validation.sql
+  >>> 2 of 50   00_validation/001_pre_deployment_validation.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [2/51] 00_validation/001_pre_deployment_validation.sql';
+PRINT '>>> [2/50] 00_validation/001_pre_deployment_validation.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -1329,10 +1329,10 @@ END
 GO
 
 /*============================================================================
-  >>> 3 of 51   00_validation/002_enable_isolation_level.sql
+  >>> 3 of 50   00_validation/002_enable_isolation_level.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [3/51] 00_validation/002_enable_isolation_level.sql';
+PRINT '>>> [3/50] 00_validation/002_enable_isolation_level.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -1606,10 +1606,10 @@ END
 GO
 
 /*============================================================================
-  >>> 4 of 51   01_tables/001_Threat_Category.sql
+  >>> 4 of 50   01_tables/001_Threat_Category.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [4/51] 01_tables/001_Threat_Category.sql';
+PRINT '>>> [4/50] 01_tables/001_Threat_Category.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -1768,10 +1768,10 @@ END
 GO
 
 /*============================================================================
-  >>> 5 of 51   01_tables/002_Threat_Type.sql
+  >>> 5 of 50   01_tables/002_Threat_Type.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [5/51] 01_tables/002_Threat_Type.sql';
+PRINT '>>> [5/50] 01_tables/002_Threat_Type.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -1936,10 +1936,10 @@ END
 GO
 
 /*============================================================================
-  >>> 6 of 51   01_tables/003_Threat_Catalogue.sql
+  >>> 6 of 50   01_tables/003_Threat_Catalogue.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [6/51] 01_tables/003_Threat_Catalogue.sql';
+PRINT '>>> [6/50] 01_tables/003_Threat_Catalogue.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2104,10 +2104,10 @@ END
 GO
 
 /*============================================================================
-  >>> 7 of 51   01_tables/004_Threat_Actor.sql
+  >>> 7 of 50   01_tables/004_Threat_Actor.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [7/51] 01_tables/004_Threat_Actor.sql';
+PRINT '>>> [7/50] 01_tables/004_Threat_Actor.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2272,10 +2272,10 @@ END
 GO
 
 /*============================================================================
-  >>> 8 of 51   01_tables/005_Threat_Catalogue_Category_Map.sql
+  >>> 8 of 50   01_tables/005_Threat_Catalogue_Category_Map.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [8/51] 01_tables/005_Threat_Catalogue_Category_Map.sql';
+PRINT '>>> [8/50] 01_tables/005_Threat_Catalogue_Category_Map.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2419,10 +2419,10 @@ END
 GO
 
 /*============================================================================
-  >>> 9 of 51   01_tables/006_ThreatType_ThreatActor_Map.sql
+  >>> 9 of 50   01_tables/006_ThreatType_ThreatActor_Map.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [9/51] 01_tables/006_ThreatType_ThreatActor_Map.sql';
+PRINT '>>> [9/50] 01_tables/006_ThreatType_ThreatActor_Map.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2566,10 +2566,10 @@ END
 GO
 
 /*============================================================================
-  >>> 10 of 51   01_tables/007_Control_Standard.sql
+  >>> 10 of 50   01_tables/007_Control_Standard.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [10/51] 01_tables/007_Control_Standard.sql';
+PRINT '>>> [10/50] 01_tables/007_Control_Standard.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2731,10 +2731,10 @@ END
 GO
 
 /*============================================================================
-  >>> 11 of 51   01_tables/008_Control_Library.sql
+  >>> 11 of 50   01_tables/008_Control_Library.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [11/51] 01_tables/008_Control_Library.sql';
+PRINT '>>> [11/50] 01_tables/008_Control_Library.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -2911,10 +2911,10 @@ END
 GO
 
 /*============================================================================
-  >>> 12 of 51   01_tables/009_Control_Library_Standard_Map.sql
+  >>> 12 of 50   01_tables/009_Control_Library_Standard_Map.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [12/51] 01_tables/009_Control_Library_Standard_Map.sql';
+PRINT '>>> [12/50] 01_tables/009_Control_Library_Standard_Map.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3058,10 +3058,10 @@ END
 GO
 
 /*============================================================================
-  >>> 13 of 51   01_tables/010_API_Client.sql
+  >>> 13 of 50   01_tables/010_API_Client.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [13/51] 01_tables/010_API_Client.sql';
+PRINT '>>> [13/50] 01_tables/010_API_Client.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3223,10 +3223,10 @@ END
 GO
 
 /*============================================================================
-  >>> 14 of 51   01_tables/011_Config_Tuning.sql
+  >>> 14 of 50   01_tables/011_Config_Tuning.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [14/51] 01_tables/011_Config_Tuning.sql';
+PRINT '>>> [14/50] 01_tables/011_Config_Tuning.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3394,10 +3394,10 @@ END
 GO
 
 /*============================================================================
-  >>> 15 of 51   01_tables/012_Grounding_Calibration_Run.sql
+  >>> 15 of 50   01_tables/012_Grounding_Calibration_Run.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [15/51] 01_tables/012_Grounding_Calibration_Run.sql';
+PRINT '>>> [15/50] 01_tables/012_Grounding_Calibration_Run.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3589,10 +3589,10 @@ END
 GO
 
 /*============================================================================
-  >>> 16 of 51   01_tables/013_Scenario_Session.sql
+  >>> 16 of 50   01_tables/013_Scenario_Session.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [16/51] 01_tables/013_Scenario_Session.sql';
+PRINT '>>> [16/50] 01_tables/013_Scenario_Session.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -3950,10 +3950,10 @@ END
 GO
 
 /*============================================================================
-  >>> 17 of 51   01_tables/014_Subsystem_Stage_State.sql
+  >>> 17 of 50   01_tables/014_Subsystem_Stage_State.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [17/51] 01_tables/014_Subsystem_Stage_State.sql';
+PRINT '>>> [17/50] 01_tables/014_Subsystem_Stage_State.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4139,10 +4139,10 @@ END
 GO
 
 /*============================================================================
-  >>> 18 of 51   01_tables/015_Identified_Threat.sql
+  >>> 18 of 50   01_tables/015_Identified_Threat.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [18/51] 01_tables/015_Identified_Threat.sql';
+PRINT '>>> [18/50] 01_tables/015_Identified_Threat.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4432,10 +4432,10 @@ END
 GO
 
 /*============================================================================
-  >>> 19 of 51   01_tables/016_Identified_Duplicate_Threat.sql
+  >>> 19 of 50   01_tables/016_Identified_Duplicate_Threat.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [19/51] 01_tables/016_Identified_Duplicate_Threat.sql';
+PRINT '>>> [19/50] 01_tables/016_Identified_Duplicate_Threat.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4615,10 +4615,10 @@ END
 GO
 
 /*============================================================================
-  >>> 20 of 51   01_tables/017_Scoped_Threat.sql
+  >>> 20 of 50   01_tables/017_Scoped_Threat.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [20/51] 01_tables/017_Scoped_Threat.sql';
+PRINT '>>> [20/50] 01_tables/017_Scoped_Threat.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -4801,10 +4801,10 @@ END
 GO
 
 /*============================================================================
-  >>> 21 of 51   01_tables/018_Threat_Scenario.sql
+  >>> 21 of 50   01_tables/018_Threat_Scenario.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [21/51] 01_tables/018_Threat_Scenario.sql';
+PRINT '>>> [21/50] 01_tables/018_Threat_Scenario.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -5267,10 +5267,10 @@ END
 GO
 
 /*============================================================================
-  >>> 22 of 51   01_tables/019_Threat_Scenario_Control_Map.sql
+  >>> 22 of 50   01_tables/019_Threat_Scenario_Control_Map.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [22/51] 01_tables/019_Threat_Scenario_Control_Map.sql';
+PRINT '>>> [22/50] 01_tables/019_Threat_Scenario_Control_Map.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -5512,10 +5512,10 @@ END
 GO
 
 /*============================================================================
-  >>> 23 of 51   01_tables/020_Risk_Treatment_Plan.sql
+  >>> 23 of 50   01_tables/020_Risk_Treatment_Plan.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [23/51] 01_tables/020_Risk_Treatment_Plan.sql';
+PRINT '>>> [23/50] 01_tables/020_Risk_Treatment_Plan.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -5838,10 +5838,10 @@ END
 GO
 
 /*============================================================================
-  >>> 24 of 51   01_tables/021_Scenario_Audit.sql
+  >>> 24 of 50   01_tables/021_Scenario_Audit.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [24/51] 01_tables/021_Scenario_Audit.sql';
+PRINT '>>> [24/50] 01_tables/021_Scenario_Audit.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6131,10 +6131,10 @@ END
 GO
 
 /*============================================================================
-  >>> 25 of 51   01_tables/022_Prompt_Log.sql
+  >>> 25 of 50   01_tables/022_Prompt_Log.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [25/51] 01_tables/022_Prompt_Log.sql';
+PRINT '>>> [25/50] 01_tables/022_Prompt_Log.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6314,10 +6314,10 @@ END
 GO
 
 /*============================================================================
-  >>> 26 of 51   01_tables/023_Diagnostic_Event.sql
+  >>> 26 of 50   01_tables/023_Diagnostic_Event.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [26/51] 01_tables/023_Diagnostic_Event.sql';
+PRINT '>>> [26/50] 01_tables/023_Diagnostic_Event.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6494,10 +6494,10 @@ END
 GO
 
 /*============================================================================
-  >>> 27 of 51   01_tables/024_Application_Log.sql
+  >>> 27 of 50   01_tables/024_Application_Log.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [27/51] 01_tables/024_Application_Log.sql';
+PRINT '>>> [27/50] 01_tables/024_Application_Log.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -6659,10 +6659,10 @@ END
 GO
 
 /*============================================================================
-  >>> 28 of 51   02_constraints/001_default_constraints.sql
+  >>> 28 of 50   02_constraints/001_default_constraints.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [28/51] 02_constraints/001_default_constraints.sql';
+PRINT '>>> [28/50] 02_constraints/001_default_constraints.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7172,10 +7172,10 @@ END
 GO
 
 /*============================================================================
-  >>> 29 of 51   02_constraints/002_check_constraints.sql
+  >>> 29 of 50   02_constraints/002_check_constraints.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [29/51] 02_constraints/002_check_constraints.sql';
+PRINT '>>> [29/50] 02_constraints/002_check_constraints.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7294,10 +7294,10 @@ END
 GO
 
 /*============================================================================
-  >>> 30 of 51   02_constraints/003_unique_constraints.sql
+  >>> 30 of 50   02_constraints/003_unique_constraints.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [30/51] 02_constraints/003_unique_constraints.sql';
+PRINT '>>> [30/50] 02_constraints/003_unique_constraints.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7400,10 +7400,10 @@ END
 GO
 
 /*============================================================================
-  >>> 31 of 51   03_indexes/001_Threat_Category_indexes.sql
+  >>> 31 of 50   03_indexes/001_Threat_Category_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [31/51] 03_indexes/001_Threat_Category_indexes.sql';
+PRINT '>>> [31/50] 03_indexes/001_Threat_Category_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7504,10 +7504,10 @@ END
 GO
 
 /*============================================================================
-  >>> 32 of 51   03_indexes/002_Threat_Type_indexes.sql
+  >>> 32 of 50   03_indexes/002_Threat_Type_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [32/51] 03_indexes/002_Threat_Type_indexes.sql';
+PRINT '>>> [32/50] 03_indexes/002_Threat_Type_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7668,10 +7668,10 @@ END
 GO
 
 /*============================================================================
-  >>> 33 of 51   03_indexes/003_Threat_Catalogue_indexes.sql
+  >>> 33 of 50   03_indexes/003_Threat_Catalogue_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [33/51] 03_indexes/003_Threat_Catalogue_indexes.sql';
+PRINT '>>> [33/50] 03_indexes/003_Threat_Catalogue_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7772,10 +7772,10 @@ END
 GO
 
 /*============================================================================
-  >>> 34 of 51   03_indexes/004_Threat_Actor_indexes.sql
+  >>> 34 of 50   03_indexes/004_Threat_Actor_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [34/51] 03_indexes/004_Threat_Actor_indexes.sql';
+PRINT '>>> [34/50] 03_indexes/004_Threat_Actor_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7876,10 +7876,10 @@ END
 GO
 
 /*============================================================================
-  >>> 35 of 51   03_indexes/005_Control_Standard_indexes.sql
+  >>> 35 of 50   03_indexes/005_Control_Standard_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [35/51] 03_indexes/005_Control_Standard_indexes.sql';
+PRINT '>>> [35/50] 03_indexes/005_Control_Standard_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -7982,10 +7982,10 @@ END
 GO
 
 /*============================================================================
-  >>> 36 of 51   03_indexes/006_Control_Library_indexes.sql
+  >>> 36 of 50   03_indexes/006_Control_Library_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [36/51] 03_indexes/006_Control_Library_indexes.sql';
+PRINT '>>> [36/50] 03_indexes/006_Control_Library_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8086,10 +8086,10 @@ END
 GO
 
 /*============================================================================
-  >>> 37 of 51   03_indexes/007_API_Client_indexes.sql
+  >>> 37 of 50   03_indexes/007_API_Client_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [37/51] 03_indexes/007_API_Client_indexes.sql';
+PRINT '>>> [37/50] 03_indexes/007_API_Client_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8192,10 +8192,10 @@ END
 GO
 
 /*============================================================================
-  >>> 38 of 51   03_indexes/008_Grounding_Calibration_Run_indexes.sql
+  >>> 38 of 50   03_indexes/008_Grounding_Calibration_Run_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [38/51] 03_indexes/008_Grounding_Calibration_Run_indexes.sql';
+PRINT '>>> [38/50] 03_indexes/008_Grounding_Calibration_Run_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8301,10 +8301,10 @@ END
 GO
 
 /*============================================================================
-  >>> 39 of 51   03_indexes/009_Scenario_Session_indexes.sql
+  >>> 39 of 50   03_indexes/009_Scenario_Session_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [39/51] 03_indexes/009_Scenario_Session_indexes.sql';
+PRINT '>>> [39/50] 03_indexes/009_Scenario_Session_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8535,10 +8535,10 @@ END
 GO
 
 /*============================================================================
-  >>> 40 of 51   03_indexes/010_Subsystem_Stage_State_indexes.sql
+  >>> 40 of 50   03_indexes/010_Subsystem_Stage_State_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [40/51] 03_indexes/010_Subsystem_Stage_State_indexes.sql';
+PRINT '>>> [40/50] 03_indexes/010_Subsystem_Stage_State_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8642,10 +8642,10 @@ END
 GO
 
 /*============================================================================
-  >>> 41 of 51   03_indexes/011_Identified_Threat_indexes.sql
+  >>> 41 of 50   03_indexes/011_Identified_Threat_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [41/51] 03_indexes/011_Identified_Threat_indexes.sql';
+PRINT '>>> [41/50] 03_indexes/011_Identified_Threat_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8747,114 +8747,10 @@ END
 GO
 
 /*============================================================================
-  >>> 42 of 51   03_indexes/012_Identified_Duplicate_Threat_indexes.sql
+  >>> 42 of 50   03_indexes/012_Scoped_Threat_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [42/51] 03_indexes/012_Identified_Duplicate_Threat_indexes.sql';
-GO
-IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
-BEGIN
-    PRINT '';
-    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
-    PRINT '!!! line above it names the script. NOTHING after this point ran.';
-    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
-    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
-    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    SET NOEXEC ON;
-END
-GO
-
-/*==============================================================================
-  INDEXES: Identified_Duplicate_Threat
-
-  Script:      012_Identified_Duplicate_Threat_indexes.sql
-  Order:       03_indexes / 012
-  Purpose:     1 index(es) on Identified_Duplicate_Threat.
-  Depends on:  01_tables/ *_Identified_Duplicate_Threat.sql
-  Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
-  Modifies:    indexes on dbo.Identified_Duplicate_Threat
-
-  GENERATED FILE - do not edit by hand.
-  Regenerate:  python scripts/tsg_script/_generate.py
-  Sources:     app/db/models.py (columns), tsg_remediation_tables.sql (indexes, constraints)
-==============================================================================*/
-SET NOCOUNT ON;
-SET QUOTED_IDENTIFIER ON;   -- required: several indexes are filtered
-GO
-IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
-BEGIN
-    PRINT '';
-    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
-    PRINT '!!! line above it names the script. NOTHING after this point ran.';
-    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
-    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
-    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    SET NOEXEC ON;
-END
-GO
-
-PRINT '';
-PRINT '--- indexes: Identified_Duplicate_Threat ---';
-GO
-IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
-BEGIN
-    PRINT '';
-    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
-    PRINT '!!! line above it names the script. NOTHING after this point ran.';
-    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
-    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
-    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    SET NOEXEC ON;
-END
-GO
-
-BEGIN TRY
-BEGIN TRANSACTION;
-IF EXISTS (SELECT 1 FROM sys.indexes i
-        WHERE i.name = N'IX_IdentifiedDuplicateThreat_Session' AND i.object_id = OBJECT_ID(N'dbo.Identified_Duplicate_Threat')
-          AND (i.is_unique <> 0 OR i.has_filter <> 0
-          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 1
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'SessionID')))
-BEGIN
-    PRINT ' [REBUILD] Identified_Duplicate_Threat.IX_IdentifiedDuplicateThreat_Session exists with the wrong shape - recreating it on (SessionID).';
-    DROP INDEX [IX_IdentifiedDuplicateThreat_Session] ON [dbo].[Identified_Duplicate_Threat];
-END;
-/* No reader: nothing selects from Identified_Duplicate_Threat at all. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_IdentifiedDuplicateThreat_Session' AND object_id = OBJECT_ID('dbo.Identified_Duplicate_Threat'))
-    CREATE NONCLUSTERED INDEX [IX_IdentifiedDuplicateThreat_Session] ON [dbo].[Identified_Duplicate_Threat] ([SessionID]);
-COMMIT;
-END TRY
-BEGIN CATCH
-    IF @@TRANCOUNT > 0 ROLLBACK;
-    PRINT ' [ERROR]   Could not create or rebuild Identified_Duplicate_Threat.IX_IdentifiedDuplicateThreat_Session on (SessionID).';
-    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
-    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
-    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    RAISERROR('Index IX_IdentifiedDuplicateThreat_Session could not be created - deployment stopped.', 16, 1);
-END CATCH;
-GO
-IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
-BEGIN
-    PRINT '';
-    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
-    PRINT '!!! line above it names the script. NOTHING after this point ran.';
-    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
-    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
-    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    SET NOEXEC ON;
-END
-GO
-
-/*============================================================================
-  >>> 43 of 51   03_indexes/013_Scoped_Threat_indexes.sql
-============================================================================*/
-PRINT '';
-PRINT '>>> [43/51] 03_indexes/013_Scoped_Threat_indexes.sql';
+PRINT '>>> [42/50] 03_indexes/012_Scoped_Threat_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -8872,8 +8768,8 @@ GO
 /*==============================================================================
   INDEXES: Scoped_Threat
 
-  Script:      013_Scoped_Threat_indexes.sql
-  Order:       03_indexes / 013
+  Script:      012_Scoped_Threat_indexes.sql
+  Order:       03_indexes / 012
   Purpose:     2 index(es) on Scoped_Threat.
   Depends on:  01_tables/ *_Scoped_Threat.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
@@ -8999,10 +8895,10 @@ END
 GO
 
 /*============================================================================
-  >>> 44 of 51   03_indexes/014_Threat_Scenario_indexes.sql
+  >>> 43 of 50   03_indexes/013_Threat_Scenario_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [44/51] 03_indexes/014_Threat_Scenario_indexes.sql';
+PRINT '>>> [43/50] 03_indexes/013_Threat_Scenario_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9020,8 +8916,8 @@ GO
 /*==============================================================================
   INDEXES: Threat_Scenario
 
-  Script:      014_Threat_Scenario_indexes.sql
-  Order:       03_indexes / 014
+  Script:      013_Threat_Scenario_indexes.sql
+  Order:       03_indexes / 013
   Purpose:     5 index(es) on Threat_Scenario.
   Depends on:  01_tables/ *_Threat_Scenario.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
@@ -9280,10 +9176,10 @@ END
 GO
 
 /*============================================================================
-  >>> 45 of 51   03_indexes/015_Risk_Treatment_Plan_indexes.sql
+  >>> 44 of 50   03_indexes/014_Risk_Treatment_Plan_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [45/51] 03_indexes/015_Risk_Treatment_Plan_indexes.sql';
+PRINT '>>> [44/50] 03_indexes/014_Risk_Treatment_Plan_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9301,8 +9197,8 @@ GO
 /*==============================================================================
   INDEXES: Risk_Treatment_Plan
 
-  Script:      015_Risk_Treatment_Plan_indexes.sql
-  Order:       03_indexes / 015
+  Script:      014_Risk_Treatment_Plan_indexes.sql
+  Order:       03_indexes / 014
   Purpose:     3 index(es) on Risk_Treatment_Plan.
   Depends on:  01_tables/ *_Risk_Treatment_Plan.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
@@ -9467,10 +9363,10 @@ END
 GO
 
 /*============================================================================
-  >>> 46 of 51   03_indexes/016_Scenario_Audit_indexes.sql
+  >>> 45 of 50   03_indexes/015_Scenario_Audit_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [46/51] 03_indexes/016_Scenario_Audit_indexes.sql';
+PRINT '>>> [45/50] 03_indexes/015_Scenario_Audit_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9488,9 +9384,9 @@ GO
 /*==============================================================================
   INDEXES: Scenario_Audit
 
-  Script:      016_Scenario_Audit_indexes.sql
-  Order:       03_indexes / 016
-  Purpose:     3 index(es) on Scenario_Audit.
+  Script:      015_Scenario_Audit_indexes.sql
+  Order:       03_indexes / 015
+  Purpose:     2 index(es) on Scenario_Audit.
   Depends on:  01_tables/ *_Scenario_Audit.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    indexes on dbo.Scenario_Audit
@@ -9614,53 +9510,11 @@ BEGIN
 END
 GO
 
-BEGIN TRY
-BEGIN TRANSACTION;
-IF EXISTS (SELECT 1 FROM sys.indexes i
-        WHERE i.name = N'IX_ScenarioAudit_Plan' AND i.object_id = OBJECT_ID(N'dbo.Scenario_Audit')
-          AND (i.is_unique <> 0 OR i.has_filter <> 1
-          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'PlanID')
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'CreatedAt')))
-BEGIN
-    PRINT ' [REBUILD] Scenario_Audit.IX_ScenarioAudit_Plan exists with the wrong shape - recreating it on (PlanID, CreatedAt).';
-    DROP INDEX [IX_ScenarioAudit_Plan] ON [dbo].[Scenario_Audit];
-END;
-/* No reader: the treatment audit feed filters session, event type and scenario.
-   No query filters the audit table by PlanID; the column is output only. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ScenarioAudit_Plan' AND object_id = OBJECT_ID('dbo.Scenario_Audit'))
-    CREATE NONCLUSTERED INDEX [IX_ScenarioAudit_Plan] ON [dbo].[Scenario_Audit] ([PlanID], [CreatedAt] DESC)
-        WHERE [PlanID] IS NOT NULL;
-COMMIT;
-END TRY
-BEGIN CATCH
-    IF @@TRANCOUNT > 0 ROLLBACK;
-    PRINT ' [ERROR]   Could not create or rebuild Scenario_Audit.IX_ScenarioAudit_Plan on (PlanID, CreatedAt).';
-    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
-    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
-    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    RAISERROR('Index IX_ScenarioAudit_Plan could not be created - deployment stopped.', 16, 1);
-END CATCH;
-GO
-IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
-BEGIN
-    PRINT '';
-    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
-    PRINT '!!! line above it names the script. NOTHING after this point ran.';
-    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
-    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
-    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    SET NOEXEC ON;
-END
-GO
-
 /*============================================================================
-  >>> 47 of 51   03_indexes/017_Prompt_Log_indexes.sql
+  >>> 46 of 50   03_indexes/016_Prompt_Log_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [47/51] 03_indexes/017_Prompt_Log_indexes.sql';
+PRINT '>>> [46/50] 03_indexes/016_Prompt_Log_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9678,9 +9532,9 @@ GO
 /*==============================================================================
   INDEXES: Prompt_Log
 
-  Script:      017_Prompt_Log_indexes.sql
-  Order:       03_indexes / 017
-  Purpose:     3 index(es) on Prompt_Log.
+  Script:      016_Prompt_Log_indexes.sql
+  Order:       03_indexes / 016
+  Purpose:     2 index(es) on Prompt_Log.
   Depends on:  01_tables/ *_Prompt_Log.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    indexes on dbo.Prompt_Log
@@ -9767,47 +9621,6 @@ GO
 BEGIN TRY
 BEGIN TRANSACTION;
 IF EXISTS (SELECT 1 FROM sys.indexes i
-        WHERE i.name = N'IX_PromptLog_Session' AND i.object_id = OBJECT_ID(N'dbo.Prompt_Log')
-          AND (i.is_unique <> 0 OR i.has_filter <> 0
-          OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'SessionID')
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'SubsystemID')))
-BEGIN
-    PRINT ' [REBUILD] Prompt_Log.IX_PromptLog_Session exists with the wrong shape - recreating it on (SessionID, SubsystemID).';
-    DROP INDEX [IX_PromptLog_Session] ON [dbo].[Prompt_Log];
-END;
-/* No reader: the prompt log is only ever read by CorrelationID, which
-   IX_PromptLog_Correlation above now serves. */
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_PromptLog_Session' AND object_id = OBJECT_ID('dbo.Prompt_Log'))
-    CREATE NONCLUSTERED INDEX [IX_PromptLog_Session] ON [dbo].[Prompt_Log] ([SessionID], [SubsystemID]);
-COMMIT;
-END TRY
-BEGIN CATCH
-    IF @@TRANCOUNT > 0 ROLLBACK;
-    PRINT ' [ERROR]   Could not create or rebuild Prompt_Log.IX_PromptLog_Session on (SessionID, SubsystemID).';
-    PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
-    PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
-    PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    RAISERROR('Index IX_PromptLog_Session could not be created - deployment stopped.', 16, 1);
-END CATCH;
-GO
-IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
-BEGIN
-    PRINT '';
-    PRINT '!!! DEPLOYMENT STOPPED. The error just above is the cause; the last ">>> [n/total]"';
-    PRINT '!!! line above it names the script. NOTHING after this point ran.';
-    PRINT '!!! Fix the cause, then run this WHOLE file again - it is re-runnable.';
-    PRINT '!!! Any "Invalid column name" errors after this are NOT new problems: the skipped';
-    PRINT '!!! steps are still compiled (not run) against columns that were never added.';
-    EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    SET NOEXEC ON;
-END
-GO
-
-BEGIN TRY
-BEGIN TRANSACTION;
-IF EXISTS (SELECT 1 FROM sys.indexes i
         WHERE i.name = N'CIX_PromptLog_Created' AND i.object_id = OBJECT_ID(N'dbo.Prompt_Log')
           AND (i.is_unique <> 0 OR i.has_filter <> 0
           OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
@@ -9857,10 +9670,10 @@ END
 GO
 
 /*============================================================================
-  >>> 48 of 51   03_indexes/018_Diagnostic_Event_indexes.sql
+  >>> 47 of 50   03_indexes/017_Diagnostic_Event_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [48/51] 03_indexes/018_Diagnostic_Event_indexes.sql';
+PRINT '>>> [47/50] 03_indexes/017_Diagnostic_Event_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -9878,8 +9691,8 @@ GO
 /*==============================================================================
   INDEXES: Diagnostic_Event
 
-  Script:      018_Diagnostic_Event_indexes.sql
-  Order:       03_indexes / 018
+  Script:      017_Diagnostic_Event_indexes.sql
+  Order:       03_indexes / 017
   Purpose:     2 index(es) on Diagnostic_Event.
   Depends on:  01_tables/ *_Diagnostic_Event.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
@@ -10009,10 +9822,10 @@ END
 GO
 
 /*============================================================================
-  >>> 49 of 51   03_indexes/019_Application_Log_indexes.sql
+  >>> 48 of 50   03_indexes/018_Application_Log_indexes.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [49/51] 03_indexes/019_Application_Log_indexes.sql';
+PRINT '>>> [48/50] 03_indexes/018_Application_Log_indexes.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -10030,8 +9843,8 @@ GO
 /*==============================================================================
   INDEXES: Application_Log
 
-  Script:      019_Application_Log_indexes.sql
-  Order:       03_indexes / 019
+  Script:      018_Application_Log_indexes.sql
+  Order:       03_indexes / 018
   Purpose:     2 index(es) on Application_Log.
   Depends on:  01_tables/ *_Application_Log.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
@@ -10155,10 +9968,10 @@ END
 GO
 
 /*============================================================================
-  >>> 50 of 51   99_validation/001_post_deployment_validation.sql
+  >>> 49 of 50   99_validation/001_post_deployment_validation.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [50/51] 99_validation/001_post_deployment_validation.sql';
+PRINT '>>> [49/50] 99_validation/001_post_deployment_validation.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -10368,7 +10181,7 @@ DECLARE @d int = (SELECT COUNT(*) FROM sys.default_constraints dc
                   WHERE tb.name IN (SELECT name FROM @owned));
 PRINT ' [INFO]    Tables:              ' + CAST(@t AS varchar(10)) + ' of 22';
 PRINT ' [INFO]    Non-PK indexes:      ' + CAST(@i AS varchar(10)) +
-      '  (37 expected: 36 from 03_indexes + UQ_Config_Tuning_Key)';
+      '  (34 expected: 33 from 03_indexes + UQ_Config_Tuning_Key)';
 PRINT ' [INFO]    Default constraints: ' + CAST(@d AS varchar(10)) + '  (22 expected)';
 
 /*-------------------------- the verdict --------------------------*/
@@ -10427,10 +10240,10 @@ END
 GO
 
 /*============================================================================
-  >>> 51 of 51   99_validation/002_schema_verdict.sql
+  >>> 50 of 50   99_validation/002_schema_verdict.sql
 ============================================================================*/
 PRINT '';
-PRINT '>>> [51/51] 99_validation/002_schema_verdict.sql';
+PRINT '>>> [50/50] 99_validation/002_schema_verdict.sql';
 GO
 IF @@ERROR <> 0 OR SESSION_CONTEXT(N'tsg_deploy_failed') = 1
 BEGIN
@@ -10450,7 +10263,7 @@ GO
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 318 columns and all 37 indexes, down to index key columns and filters.
+  Purpose:     Verify all 318 columns and all 34 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -10928,9 +10741,6 @@ INSERT INTO @ix (name, tbl, is_unique, is_filtered, cols) VALUES
     (N'IX_PromptLog_Correlation', N'Prompt_Log', 0, 1, N'CorrelationID,CreatedAt'),
     (N'IX_DiagnosticEvent_Session', N'Diagnostic_Event', 0, 1, N'SessionID,CreatedAt'),
     (N'IX_ApplicationLog_Session', N'Application_Log', 0, 1, N'SessionID,CreatedAt'),
-    (N'IX_IdentifiedDuplicateThreat_Session', N'Identified_Duplicate_Threat', 0, 0, N'SessionID'),
-    (N'IX_PromptLog_Session', N'Prompt_Log', 0, 0, N'SessionID,SubsystemID'),
-    (N'IX_ScenarioAudit_Plan', N'Scenario_Audit', 0, 1, N'PlanID,CreatedAt'),
     (N'CIX_PromptLog_Created', N'Prompt_Log', 0, 0, N'CreatedAt,LogID'),
     (N'CIX_ApplicationLog_Created', N'Application_Log', 0, 0, N'CreatedAt,LogID'),
     (N'CIX_DiagnosticEvent_Created', N'Diagnostic_Event', 0, 0, N'CreatedAt,DiagnosticID'),
@@ -11162,7 +10972,7 @@ PRINT ' [INFO]    Columns expected:   318';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));
-PRINT ' [INFO]    Indexes expected:   37';
+PRINT ' [INFO]    Indexes expected:   34';
 PRINT ' [INFO]    Missing/disabled:   ' + CAST(@ix_missing AS varchar(10));
 PRINT ' [INFO]    Wrong shape:        ' + CAST(@ix_shape   AS varchar(10));
 PRINT ' [INFO]    Primary keys wrong: ' + CAST(@pk_wrong   AS varchar(10));
@@ -11222,7 +11032,7 @@ END
 ELSE
 BEGIN
     PRINT '';
-    PRINT '>>> all 51 scripts have run. Read the two verdicts above:';
+    PRINT '>>> all 50 scripts have run. Read the two verdicts above:';
     PRINT '>>>   Objects: PASS   then   FINAL SIGN-OFF';
     PRINT '>>> Anything else means the deployment is NOT complete.';
 END

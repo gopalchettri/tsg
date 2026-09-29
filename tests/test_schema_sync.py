@@ -843,8 +843,11 @@ def test_the_index_parser_finds_the_ddl() -> None:
     # pattern and of _normalise_predicate still fires, which a bare count cannot.
     assert ddl.get("UX_Session_ActiveAsset") == (
         "Scenario_Session", ("EntityID", "AssetID"), True, "sessionstatus = 'active'")
-    assert ddl.get("IX_PromptLog_Session") == ("Prompt_Log", ("SessionID", "SubsystemID"),
-                                               False, "")
+    # Plain: not unique, not filtered, no INCLUDE — and its trailing `CreatedAt DESC` proves the
+    # sort-direction suffix is stripped from the key list rather than carried into a column name.
+    # (This probe was IX_PromptLog_Session until that index was retired for having no reader.)
+    assert ddl.get("IX_ScenarioAudit_SessionSubEvent") == (
+        "Scenario_Audit", ("SessionID", "SubsystemID", "EventType", "CreatedAt"), False, "")
     assert ddl.get("IX_ScopedThreat_SessionActiveScores") == (
         "Scoped_Threat", ("SessionID", "Superseded"), False, ""), (
         "the INCLUDE branch stopped matching, so an index's filter is read off its INCLUDE list")

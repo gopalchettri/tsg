@@ -1082,9 +1082,50 @@ GO
 """
 
 
+#: Directories whose ENTIRE contents this script generates, and therefore the only ones the
+#: orphan sweep may delete from. Everything in 00_validation/ and all of 99_validation/ except
+#: 002_schema_verdict.sql is hand-maintained and lives in the same tree.
+_GENERATED_DIRS = ("01_tables", "02_constraints", "03_indexes")
+
+#: Every path this run produced, so the sweep can tell "no longer generated" from "never was".
+_WRITTEN: set[Path] = set()
+
+
 def write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\r\n")   # sqlcmd and SSMS prefer CRLF
+    _WRITTEN.add(path.resolve())
+
+
+def _sweep_orphans() -> list[Path]:
+    """Delete every .sql in the generated directories that this run did not write.
+
+    THE FAILURE THIS PREVENTS. The per-table scripts are NUMBERED and the numbering is positional,
+    so removing the last index from a table does not merely drop one file — it RENUMBERS every
+    file after it. Without a sweep the old numbering stays on disk beside the new:
+    `017_Prompt_Log_indexes.sql` and `017_Diagnostic_Event_indexes.sql` both present, one of them
+    describing a schema that no longer exists.
+
+    That is worse than untidy. TSG_Deploy_All.sql is a concatenation of what main() wrote, so it
+    stays correct — but an operator following the README runs the NUMBERED files, and would run an
+    orphan that recreates an index this package deliberately retired. The deploy paths then
+    disagree, which is what test_every_deploy_path_creates_the_same_indexes exists to catch, and
+    it did catch it.
+
+    SCOPED TO _GENERATED_DIRS, AND THAT SCOPE IS THE WHOLE SAFETY OF THIS FUNCTION. The first
+    version swept OUT.rglob("*.sql") and deleted four hand-maintained scripts —
+    00_validation/000_helpers.sql, 001_pre_deployment_validation.sql,
+    002_enable_isolation_level.sql and 99_validation/001_post_deployment_validation.sql. A cleanup
+    that silently removes work nobody generated is a worse bug than the staleness it fixes, so it
+    deletes only where it is the sole author.
+    """
+    removed = []
+    for folder in _GENERATED_DIRS:
+        for path in sorted((OUT / folder).glob("*.sql")):
+            if path.resolve() not in _WRITTEN:
+                path.unlink()
+                removed.append(path)
+    return removed
 
 
 COMBINED_NAME = "TSG_Deploy_All.sql"
@@ -1324,6 +1365,15 @@ ELSE
 
     # LAST, so it concatenates what the writes above just produced. Anything added to main()
     # after this point would be missing from the single-file deployment and nothing would say so.
+    # BEFORE the combined write, and the order is load-bearing: combined_script() concatenates
+    # whatever is on disk, so sweeping afterwards would leave TSG_Deploy_All.sql carrying the very
+    # scripts just deleted — a single-file deployment that runs an index this package retired, and
+    # a `:r` instruction pointing at a file that no longer exists. Safe here because the sweep
+    # touches only _GENERATED_DIRS, and the combined file is not in one.
+    for gone in _sweep_orphans():
+        print(f"removed  : {gone.relative_to(OUT)} (no longer generated)")
+
+    # LAST, so it concatenates what survives the sweep.
     write(OUT / COMBINED_NAME, combined_script())
 
     print(f"tables   : {len(TABLE_ORDER)}")

@@ -781,9 +781,12 @@ class Scenario_Audit(Base):
     # A real column rather than a DetailJSON key: IX_ScenarioAudit_Scenario makes "the decision
     # history of this scenario" a seek, which is the query a GRC reviewer actually runs.
     ScenarioID: Mapped[str | None] = mapped_column(GUID)
-    # The plan a treatment event concerns — a real column for the same reason as ScenarioID above:
-    # IX_ScenarioAudit_Plan makes "this plan's history" a seek, where a DetailJSON key forced the
-    # caller to fetch a whole session and filter in Python. NULL on every non-plan event.
+    # The plan a treatment event concerns. A real column rather than a DetailJSON key so that
+    # "this plan's history" CAN be a seek — but note that no query does it: the treatment audit
+    # feed filters on SessionID and EventType, and every `PlanID ==` in the codebase is against
+    # Risk_Treatment_Plan's own primary key. IX_ScenarioAudit_Plan was written for this and
+    # retired unused. The column stays because it is cheap and correct; if that query is ever
+    # written, the index comes back with it. NULL on every non-plan event.
     PlanID: Mapped[str | None] = mapped_column(GUID)
     Decision: Mapped[str | None] = mapped_column(Unicode(100))  # accept only — AuditDecision; NULL elsewhere
     Granularity: Mapped[str | None] = mapped_column(Unicode(100))  # regeneration_completed only

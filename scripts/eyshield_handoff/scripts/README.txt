@@ -25,7 +25,7 @@ WHAT IT CONTAINS
   Section 3   Columns (319), then three one-time data fixes
   Section 4   Default constraints (22)
   Section 5   Check constraints (3)
-  Section 6   Indexes (36), then the re-clustering and PAGE compression of the
+  Section 6   Indexes (33), then the re-clustering and PAGE compression of the
               four log tables
   Section 7   Verification
 

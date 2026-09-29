@@ -3,7 +3,7 @@
 
   Script:      002_schema_verdict.sql
   Order:       99_validation / 002   (run LAST, after 001)
-  Purpose:     Verify all 318 columns and all 37 indexes, down to index key columns and filters.
+  Purpose:     Verify all 318 columns and all 34 indexes, down to index key columns and filters.
   Depends on:  99_validation/001_post_deployment_validation.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
   Modifies:    NOTHING. Catalog views only.
@@ -457,9 +457,6 @@ INSERT INTO @ix (name, tbl, is_unique, is_filtered, cols) VALUES
     (N'IX_PromptLog_Correlation', N'Prompt_Log', 0, 1, N'CorrelationID,CreatedAt'),
     (N'IX_DiagnosticEvent_Session', N'Diagnostic_Event', 0, 1, N'SessionID,CreatedAt'),
     (N'IX_ApplicationLog_Session', N'Application_Log', 0, 1, N'SessionID,CreatedAt'),
-    (N'IX_IdentifiedDuplicateThreat_Session', N'Identified_Duplicate_Threat', 0, 0, N'SessionID'),
-    (N'IX_PromptLog_Session', N'Prompt_Log', 0, 0, N'SessionID,SubsystemID'),
-    (N'IX_ScenarioAudit_Plan', N'Scenario_Audit', 0, 1, N'PlanID,CreatedAt'),
     (N'CIX_PromptLog_Created', N'Prompt_Log', 0, 0, N'CreatedAt,LogID'),
     (N'CIX_ApplicationLog_Created', N'Application_Log', 0, 0, N'CreatedAt,LogID'),
     (N'CIX_DiagnosticEvent_Created', N'Diagnostic_Event', 0, 0, N'CreatedAt,DiagnosticID'),
@@ -691,7 +688,7 @@ PRINT ' [INFO]    Columns expected:   318';
 PRINT ' [INFO]    Missing:            ' + CAST(@missing    AS varchar(10));
 PRINT ' [INFO]    Wrong type:         ' + CAST(@wrong_type AS varchar(10));
 PRINT ' [INFO]    Wrong nullability:  ' + CAST(@wrong_null AS varchar(10));
-PRINT ' [INFO]    Indexes expected:   37';
+PRINT ' [INFO]    Indexes expected:   34';
 PRINT ' [INFO]    Missing/disabled:   ' + CAST(@ix_missing AS varchar(10));
 PRINT ' [INFO]    Wrong shape:        ' + CAST(@ix_shape   AS varchar(10));
 PRINT ' [INFO]    Primary keys wrong: ' + CAST(@pk_wrong   AS varchar(10));

@@ -1,12 +1,12 @@
 /*==============================================================================
-  INDEXES: Application_Log
+  INDEXES: Diagnostic_Event
 
-  Script:      019_Application_Log_indexes.sql
-  Order:       03_indexes / 019
-  Purpose:     2 index(es) on Application_Log.
-  Depends on:  01_tables/ *_Application_Log.sql
+  Script:      017_Diagnostic_Event_indexes.sql
+  Order:       03_indexes / 017
+  Purpose:     2 index(es) on Diagnostic_Event.
+  Depends on:  01_tables/ *_Diagnostic_Event.sql
   Re-runnable: YES. Every statement checks first; a second run reports [EXISTS].
-  Modifies:    indexes on dbo.Application_Log
+  Modifies:    indexes on dbo.Diagnostic_Event
 
   GENERATED FILE - do not edit by hand.
   Regenerate:  python scripts/tsg_script/_generate.py
@@ -17,62 +17,68 @@ SET QUOTED_IDENTIFIER ON;   -- required: several indexes are filtered
 GO
 
 PRINT '';
-PRINT '--- indexes: Application_Log ---';
+PRINT '--- indexes: Diagnostic_Event ---';
 GO
 
 BEGIN TRY
 BEGIN TRANSACTION;
 IF EXISTS (SELECT 1 FROM sys.indexes i
-        WHERE i.name = N'IX_ApplicationLog_Session' AND i.object_id = OBJECT_ID(N'dbo.Application_Log')
+        WHERE i.name = N'IX_DiagnosticEvent_Session' AND i.object_id = OBJECT_ID(N'dbo.Diagnostic_Event')
           AND (i.is_unique <> 0 OR i.has_filter <> 1
           OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
           OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'SessionID')
           OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'CreatedAt')))
 BEGIN
-    PRINT ' [REBUILD] Application_Log.IX_ApplicationLog_Session exists with the wrong shape - recreating it on (SessionID, CreatedAt).';
-    DROP INDEX [IX_ApplicationLog_Session] ON [dbo].[Application_Log];
+    PRINT ' [REBUILD] Diagnostic_Event.IX_DiagnosticEvent_Session exists with the wrong shape - recreating it on (SessionID, CreatedAt).';
+    DROP INDEX [IX_DiagnosticEvent_Session] ON [dbo].[Diagnostic_Event];
 END;
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ApplicationLog_Session' AND object_id = OBJECT_ID('dbo.Application_Log'))
-    CREATE NONCLUSTERED INDEX [IX_ApplicationLog_Session] ON [dbo].[Application_Log] ([SessionID], [CreatedAt] DESC)
+/* "Why did session X fail" is THE query the diagnostics table exists to answer,
+   and it is asked by a support engineer while someone waits. Without this index
+   it scans every row ever recorded. CreatedAt is the second key because the
+   answer is always read newest-first, so the ordering comes from the index
+   rather than from a sort over the matched rows. Filtered, because a failure
+   that happened before any session was resolved has none. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_DiagnosticEvent_Session' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+    CREATE NONCLUSTERED INDEX [IX_DiagnosticEvent_Session] ON [dbo].[Diagnostic_Event] ([SessionID], [CreatedAt] DESC)
         WHERE [SessionID] IS NOT NULL;
 COMMIT;
 END TRY
 BEGIN CATCH
     IF @@TRANCOUNT > 0 ROLLBACK;
-    PRINT ' [ERROR]   Could not create or rebuild Application_Log.IX_ApplicationLog_Session on (SessionID, CreatedAt).';
+    PRINT ' [ERROR]   Could not create or rebuild Diagnostic_Event.IX_DiagnosticEvent_Session on (SessionID, CreatedAt).';
     PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
     PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
     PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
     EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    RAISERROR('Index IX_ApplicationLog_Session could not be created - deployment stopped.', 16, 1);
+    RAISERROR('Index IX_DiagnosticEvent_Session could not be created - deployment stopped.', 16, 1);
 END CATCH;
 GO
 
 BEGIN TRY
 BEGIN TRANSACTION;
 IF EXISTS (SELECT 1 FROM sys.indexes i
-        WHERE i.name = N'CIX_ApplicationLog_Created' AND i.object_id = OBJECT_ID(N'dbo.Application_Log')
+        WHERE i.name = N'CIX_DiagnosticEvent_Created' AND i.object_id = OBJECT_ID(N'dbo.Diagnostic_Event')
           AND (i.is_unique <> 0 OR i.has_filter <> 0
           OR (SELECT COUNT(*) FROM sys.index_columns ic WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND ic.key_ordinal > 0) <> 2
           OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 1 AND c.name = N'CreatedAt')
-          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'LogID')))
+          OR NOT EXISTS (SELECT 1 FROM sys.index_columns ic, sys.columns c WHERE i.object_id = ic.object_id AND i.index_id = ic.index_id AND c.object_id = ic.object_id AND c.column_id = ic.column_id AND ic.key_ordinal = 2 AND c.name = N'DiagnosticID')))
 BEGIN
-    PRINT ' [REBUILD] Application_Log.CIX_ApplicationLog_Created exists with the wrong shape - recreating it on (CreatedAt, LogID).';
-    DROP INDEX [CIX_ApplicationLog_Created] ON [dbo].[Application_Log];
+    PRINT ' [REBUILD] Diagnostic_Event.CIX_DiagnosticEvent_Created exists with the wrong shape - recreating it on (CreatedAt, DiagnosticID).';
+    DROP INDEX [CIX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event];
 END;
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_ApplicationLog_Created' AND object_id = OBJECT_ID('dbo.Application_Log'))
-   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Application_Log') AND type_desc = 'CLUSTERED')
-    CREATE CLUSTERED INDEX [CIX_ApplicationLog_Created] ON [dbo].[Application_Log] ([CreatedAt], [LogID])
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'CIX_DiagnosticEvent_Created' AND object_id = OBJECT_ID('dbo.Diagnostic_Event'))
+   AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.Diagnostic_Event') AND type_desc = 'CLUSTERED')
+    CREATE CLUSTERED INDEX [CIX_DiagnosticEvent_Created] ON [dbo].[Diagnostic_Event] ([CreatedAt], [DiagnosticID])
         WITH (DATA_COMPRESSION = PAGE);
 COMMIT;
 END TRY
 BEGIN CATCH
     IF @@TRANCOUNT > 0 ROLLBACK;
-    PRINT ' [ERROR]   Could not create or rebuild Application_Log.CIX_ApplicationLog_Created on (CreatedAt, LogID).';
+    PRINT ' [ERROR]   Could not create or rebuild Diagnostic_Event.CIX_DiagnosticEvent_Created on (CreatedAt, DiagnosticID).';
     PRINT '          Database error ' + CAST(ERROR_NUMBER() AS varchar(20)) + ': ' + ERROR_MESSAGE();
     PRINT '          Nothing was changed - an existing index was kept. For a UNIQUE index this';
     PRINT '          usually means duplicate values in those columns: remove them, then re-run.';
     EXEC sp_set_session_context N'tsg_deploy_failed', 1;
-    RAISERROR('Index CIX_ApplicationLog_Created could not be created - deployment stopped.', 16, 1);
+    RAISERROR('Index CIX_DiagnosticEvent_Created could not be created - deployment stopped.', 16, 1);
 END CATCH;
 GO
