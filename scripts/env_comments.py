@@ -287,6 +287,30 @@ COMMENTS: dict[str, str] = {
         multiplied. One real run made about 16 attempts and spent 1,268 seconds on a single
         scenario while this setting read "3". Both loops are now controlled by this one value.
     """,
+    "TSG_EMBEDDING_MAX_RETRIES": """
+        How many times to retry one embedding call, if you want a different number from the one
+        above. Total attempts = this number plus one. LEAVE IT COMMENTED OUT to use the same
+        number as ordinary AI calls, which is what almost every deployment wants.
+
+        It is separate because embedding calls are retried by this application rather than by the
+        underlying library. The library honours the retry setting for chat and silently ignores it
+        for embedding and reranking: measured with the setting at 2, a chat call reached the
+        service three times and an embedding call reached it once. That gap cancelled a real
+        session. Since the retrying is now ours, the number can be ours to choose too.
+    """,
+    "TSG_RERANKER_MAX_RETRIES": """
+        How many times to retry one reranking call, if you want a different number from the one
+        above. Total attempts = this number plus one. LEAVE IT COMMENTED OUT to use the same
+        number as ordinary AI calls.
+
+        Same reason as the embedding setting above. Worth raising only if the reranker runs
+        somewhere slower or less reliable than the rest of the AI service, which is common when it
+        sits on its own machine.
+
+        Raising it costs waiting time in the worst case: each extra attempt can take up to the
+        call timeout. The application allows for that automatically when it works out how long a
+        stage may run, so a higher number here will not get a slow stage cancelled by mistake.
+    """,
     "LLM_TEMPERATURE": """
         How much the AI is allowed to vary its wording. 0 gives the most consistent answers, 2
         the most varied. To use the provider's own default, COMMENT THE LINE OUT. Do not write it with a blank value: a blank is a SUPPLIED empty string, which this setting cannot parse, and the app will not start.

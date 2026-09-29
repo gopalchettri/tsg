@@ -404,7 +404,7 @@ def _litellm_call_budget(s: Settings) -> dict[str, Any]:
     return {"timeout": s.llm_timeout_seconds, "num_retries": s.llm_max_retries, "max_retries": 0}
 
 
-def _retry_transient(s: Settings, what: str, call):
+def _retry_transient(s: Settings, what: str, call, *, attempts: int | None = None):
     """Run `call()` with the retry budget `llm_max_retries` PROMISES, for the two methods litellm
     does not give it to.
 
@@ -424,7 +424,7 @@ def _retry_transient(s: Settings, what: str, call):
     behave alike — which is the property `llm_max_retries` claims merely by existing."""
     import time
 
-    attempts = s.llm_max_retries + 1
+    attempts = (s.llm_max_retries if attempts is None else attempts) + 1
     for attempt in range(1, attempts + 1):
         try:
             return call()
@@ -792,8 +792,9 @@ class LiteLLMClient:
             for i in range(0, len(texts), batch):
                 chunk = texts[i:i + batch]
                 # _retry_transient, not litellm's num_retries: it is ignored on this path.
-                vecs.extend(_retry_transient(self.s, "embed",
-                                             lambda c=chunk: self._embed_one_batch(c, model)))
+                vecs.extend(_retry_transient(
+                    self.s, "embed", lambda c=chunk: self._embed_one_batch(c, model),
+                    attempts=self.s.effective_embedding_max_retries))
         return vecs
 
     def _embed_one_batch(self, texts: list[str], model: str) -> list[list[float]]:
@@ -845,7 +846,10 @@ class LiteLLMClient:
         with _llm_slot(self.s), _provider_transient_retryable():
             # _retry_transient, not litellm's num_retries: it is ignored on this path. This is the
             # call that cost session 6174F288 -- one read-timeout, no retry anywhere.
-            resp = _retry_transient(self.s, "rerank", lambda: litellm.rerank(
+            resp = _retry_transient(
+                self.s, "rerank",
+                attempts=self.s.effective_reranker_max_retries,
+                call=lambda: litellm.rerank(
                 model=model, query=query, documents=list(docs),
                 custom_llm_provider="litellm_proxy",  # see _chat_kwargs
                 api_base=self.s.litellm_base_url, api_key=self.s.litellm_api_key,

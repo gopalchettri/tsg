@@ -278,6 +278,20 @@ class Settings(BaseSettings):
     # single attempt with no retry. The boot line llm.retry_budget reports the effective number.
     llm_max_retries: int = Field(3, ge=0, le=3)
 
+    # TSG_EMBEDDING_MAX_RETRIES / TSG_RERANKER_MAX_RETRIES — per-call-type retry budgets. UNSET
+    # (the default) means "same as llm_max_retries", so leaving them alone changes nothing.
+    #
+    # They exist because these two paths are retried BY US, not by litellm. litellm's num_retries
+    # is honoured for chat and silently ignored for embedding and rerank: measured at num_retries=2,
+    # chat reached the provider three times and both of these reached it ONCE. llm.py retries them
+    # itself now, and since that budget is ours to set, it is worth being able to set it separately
+    # — a reranker on a slow GPU box and a chat model on a shared proxy do not want the same number.
+    #
+    # Bounded like llm_max_retries, and for the same reason: multiplied by llm_timeout_seconds,
+    # an unbounded value is how one call ties up a worker for an hour.
+    embedding_max_retries: int | None = Field(None, ge=0, le=3)
+    reranker_max_retries: int | None = Field(None, ge=0, le=3)
+
     # TSG_LLM_MAX_OUTPUT_TOKENS — cap on completion tokens per chat call (SDD §16.2 output-size
     # limit). None (default) = provider default. Sent as `max_tokens`; drop_params covers a
     # provider that rejects it. Scenario/threat JSON fits comfortably in 4096 — but on a
@@ -1041,13 +1055,19 @@ class Settings(BaseSettings):
         # fallback's, with the same timeout/retry budget each. Azure ignores the fallback.
         chains = 2 if (self.inference_fallback_model
                     and self.llm_provider != "azure_openai") else 1
-        floor = self.llm_timeout_seconds * (self.llm_max_retries + 1) * chains
+        # The LARGEST of the three budgets, not chat's. embedding_max_retries and
+        # reranker_max_retries can each exceed llm_max_retries, and a lease sized for chat while
+        # the reranker runs a longer chain is a stage reaped mid-call — the reaper cancelling a
+        # session that is still working.
+        worst_retries = max(self.llm_max_retries, self.effective_embedding_max_retries,
+                            self.effective_reranker_max_retries)
+        floor = self.llm_timeout_seconds * (worst_retries + 1) * chains
         if "stage_lease_seconds" not in self.model_fields_set:
             self.stage_lease_seconds = int(floor * 2)
         elif self.stage_lease_seconds < floor:
             raise ValueError(
                 f"stage_lease_seconds ({self.stage_lease_seconds}s) is below the safe floor "
-                f"({floor:.0f}s = llm_timeout_seconds * (llm_max_retries + 1)) — a genuinely "
+                f"({floor:.0f}s = llm_timeout_seconds * (largest retry budget + 1)) — a genuinely "
                 "slow (not crashed) call could be wrongly reaped. Raise it above the floor.")
         if "treatment_stale_seconds" not in self.model_fields_set:
             self.treatment_stale_seconds = max(self.treatment_stale_seconds, int(floor * 2))
@@ -1186,6 +1206,16 @@ class Settings(BaseSettings):
                 "running call's ticket could be pruned before its first heartbeat renews it. "
                 "Keep stale_after at least 2x heartbeat.")
         return self
+
+    @property
+    def effective_embedding_max_retries(self) -> int:
+        """embedding_max_retries, or llm_max_retries when it is unset."""
+        return self.llm_max_retries if self.embedding_max_retries is None else self.embedding_max_retries
+
+    @property
+    def effective_reranker_max_retries(self) -> int:
+        """reranker_max_retries, or llm_max_retries when it is unset."""
+        return self.llm_max_retries if self.reranker_max_retries is None else self.reranker_max_retries
 
     @model_validator(mode="after")
     def _sweep_must_finish_inside_the_busy_retry_window(self) -> Settings:

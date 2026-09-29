@@ -204,3 +204,41 @@ def test_rerank_429_still_becomes_slot_unavailable(monkeypatch):
     _stub_litellm(monkeypatch, _status(openai.RateLimitError, 429))
     with pytest.raises(LLMSlotUnavailable):
         LiteLLMClient(_settings(monkeypatch)).rerank("q", ["a"])
+
+
+# --- per-call-type budgets --------------------------------------------------------------------
+def test_embedding_and_reranker_budgets_default_to_the_shared_one(monkeypatch):
+    """Unset means "same as llm_max_retries", so adding these settings changed nothing for anyone
+    who does not set them."""
+    s = _settings(monkeypatch, TSG_LLM_MAX_RETRIES="2")
+    assert (s.embedding_max_retries, s.reranker_max_retries) == (None, None)
+    assert s.effective_embedding_max_retries == s.effective_reranker_max_retries == 2
+
+
+@pytest.mark.parametrize("method, var", [("rerank", "TSG_RERANKER_MAX_RETRIES"),
+                                         ("embed", "TSG_EMBEDDING_MAX_RETRIES")])
+def test_each_call_type_can_be_tuned_on_its_own(monkeypatch, method, var):
+    """Counted at the provider, for the same reason as the budget test above: these two paths are
+    retried by us, so what we PASS to litellm says nothing about what actually happens."""
+    seen = _stub_litellm(monkeypatch, openai.APITimeoutError(request=_REQ))
+    client = LiteLLMClient(_settings(monkeypatch, TSG_LLM_MAX_RETRIES="0", **{var: "2"}))
+    with pytest.raises(TransientProviderError):
+        client.rerank("q", ["a"]) if method == "rerank" else client.embed(["a"])
+    assert seen["calls"] == 3, f"{var} must govern {method} independently of llm_max_retries"
+
+    other = _stub_litellm(monkeypatch, openai.APITimeoutError(request=_REQ))
+    with pytest.raises(TransientProviderError):
+        client.embed(["a"]) if method == "rerank" else client.rerank("q", ["a"])
+    assert other["calls"] == 1, "tuning one call type must not change the other"
+
+
+def test_the_stage_lease_covers_the_LARGEST_retry_budget_not_chat_s(monkeypatch):
+    """A lease sized for chat while the reranker runs a longer chain is a stage reaped mid-call —
+    the reaper cancelling a session that is still working. Adding a per-type budget without this
+    would have introduced exactly the class of bug these settings were added while fixing."""
+    monkeypatch.setenv("TSG_LLM_TIMEOUT_SECONDS", "100")
+    short = _settings(monkeypatch, TSG_LLM_MAX_RETRIES="1").stage_lease_seconds
+    longer = _settings(monkeypatch, TSG_LLM_MAX_RETRIES="1",
+                       TSG_RERANKER_MAX_RETRIES="3").stage_lease_seconds
+    assert longer > short, (
+        "the derived lease ignored reranker_max_retries — a long reranker chain would outlive it")
